@@ -48,6 +48,7 @@ public:
     virtual std::string_view name() const = 0;
     virtual TemplateProduction produce(const std::filesystem::path & manifest_path, nlohmann::json manifest,
                                        const std::filesystem::path & work_directory) const = 0;
+    virtual nlohmann::json compare_structure(const std::filesystem::path & target_graph, nlohmann::json facts, const nlohmann::json & environment) const = 0;
     virtual FrameworkConfiguration source_configuration(const nlohmann::json & parameters) const = 0;
     // Shared by source selection and cost candidate eligibility. This describes
     // native configuration semantics, never service-time portability.

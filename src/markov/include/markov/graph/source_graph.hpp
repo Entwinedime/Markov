@@ -3,7 +3,7 @@
 #include "markov/contracts/batch_membership.hpp"
 #include "markov/contracts/cpu_service.hpp"
 
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <compare>
 #include <cstddef>
@@ -25,7 +25,18 @@ using BoundaryId = std::size_t;
 using SourceSpanId = std::size_t;
 
 enum class SourceDomain { CpuThread, DeviceStream, CommunicationObservation, LogicalCompletion, DeviceTaskCompletion };
-enum class SourceSpanKind { CpuObservation, CpuControl, HostWait, Compute, Dma, DeviceWait, DeviceMarker, CommunicationObservation };
+enum class SourceSpanKind {
+    CpuObservation,
+    CpuControl,
+    HostWait,
+    Compute,
+    Dma,
+    DeviceWait,
+    DeviceMarker,
+    CommunicationObservation,
+    ResourceObservation,
+    HostCommunication
+};
 
 enum class TransferDirection { HostToHost, HostToDevice, DeviceToHost, DeviceToDevice };
 
@@ -35,7 +46,6 @@ struct SourceTransfer {
     std::optional<std::size_t> source_api; // Supplementary provenance; hardware payload facts do not require an SDK hook.
 
     nlohmann::json describe() const;
-    static SourceTransfer read(const nlohmann::json & value);
     static std::string_view direction_name(TransferDirection direction);
     static TransferDirection parse_direction(std::string_view name);
 };
@@ -151,11 +161,15 @@ struct RequestPoolWork {
 struct PositionSequence {
     std::int64_t prefix_tokens;
     std::int64_t input_tokens;
+
+    bool operator==(const PositionSequence &) const = default;
 };
 
 // Compact description of the target position tensor; no per-token allocation.
 struct PositionWorkload {
     std::vector<PositionSequence> sequences;
+
+    bool operator==(const PositionWorkload &) const = default;
 
     nlohmann::json describe() const;
 };
@@ -180,6 +194,8 @@ struct SourceKernel {
     // Value-dependent work without a measured operand contract. Keep its identity;
     // full request/KV state remains on the invocation instead of each kernel.
     std::vector<std::string> value_dependencies = {};
+
+    bool operator==(const SourceKernel &) const = default;
 
     nlohmann::json describe() const;
 };
@@ -212,29 +228,6 @@ struct SourceCommunicationTask {
     nlohmann::json describe() const;
 };
 
-struct SourceTransport {
-    std::string operation;
-    std::uint32_t peer;
-    std::string transport;
-};
-
-struct SourceCommunicator {
-    std::uint64_t buffer_bytes;
-    std::uint32_t deterministic;
-    std::uint32_t op_expansion_mode;
-    std::uint32_t rank_count;
-    std::uint32_t server_count;
-    std::uint32_t module_count;
-    std::optional<std::string> device_type;
-    std::optional<std::string> hcomm_version;
-    std::optional<std::uint32_t> env_aicpu_unfold;
-    std::optional<std::uint32_t> env_aiv_mode;
-    std::vector<SourceTransport> transports;
-
-    nlohmann::json describe() const;
-    static SourceCommunicator read(const nlohmann::json & value);
-};
-
 struct SourceCollective {
     SourceSpanId span;
     std::uint32_t rank;
@@ -244,7 +237,7 @@ struct SourceCollective {
     std::string data_type;
     std::string algorithm;
     std::string group_name;
-    std::optional<SourceCommunicator> communicator;
+    nlohmann::json communicator; // Opaque native evidence, interpreted only by the producing runtime adapter.
     std::vector<SourceCommunicationTask> tasks;
 
     nlohmann::json describe() const;

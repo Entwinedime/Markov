@@ -73,11 +73,11 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
         auto & definition = *definitions.at(*span.owner_call);
         const auto & begin = boundaries.at(span.begin);
         const auto & end = boundaries.at(span.end);
-        std::optional<std::pair<std::size_t, std::size_t>> owner;
+        std::optional<std::size_t> owner;
         for (std::size_t operation = 0; operation < definition.operations.size(); ++operation) {
             const auto & workers = definition.operations[operation].workers;
-            for (std::size_t worker = 0; worker < workers.size(); ++worker) {
-                const auto & candidate = spans.at(workers[worker].source_span);
+            for (const auto & worker : workers) {
+                const auto & candidate = spans.at(worker.source_span);
                 const auto & entry = boundaries.at(candidate.begin);
                 const auto & exit = boundaries.at(candidate.end);
                 // Queue flows already bind this worker to its host operation.
@@ -89,7 +89,7 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
                     source.workspace_binding_gap = "workspace_operation_ambiguous";
                     return;
                 }
-                owner = { operation, worker };
+                owner = operation;
             }
         }
         if (!owner) {
@@ -132,15 +132,12 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
             return;
         }
         definition.workspace_uses.push_back({ pool->second,
-                                              owner->first,
-                                              owner->second,
+                                              *owner,
                                               api,
                                               span_id,
                                               *local_begin,
                                               *local_end,
                                               transition->at("requested_bytes"),
-                                              transition->at("capacity_before_bytes"),
-                                              transition->at("capacity_after_bytes"),
                                               branches.at(allocation->at("branch").get<std::string>()),
                                               allocation->at("requires_device_synchronization") });
 
@@ -192,7 +189,9 @@ void AscendWorkspaceBindings::bind_demands(TemplateSource & source, const nlohma
                     continue;
                 }
                 const auto & record = facts.at("native_api").at(use.source_api);
-                const auto capacity = cores.find({ record.at("rank"), record.at("pid"), record.at("workspace").at("device") });
+                const auto logical_device = record.at("workspace").at("device").get<std::size_t>();
+                const auto physical_device = source.deployment.devices.at(logical_device);
+                const auto capacity = cores.find({ record.at("rank"), record.at("pid"), physical_device });
                 if (capacity == cores.end()) {
                     use.demand = std::unexpected("workspace_device_geometry_not_observed");
                     continue;

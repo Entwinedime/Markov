@@ -41,9 +41,18 @@ class TransferSampling:
 
 class TransferMeasurements:
     def __init__(self, scopes: list[Path], workers: list[Path], domain: SamplingDomain) -> None:
-        self.scope_paths = scopes
         self.worker_paths = workers
         self.domain = domain
+        # CPU and transfer measurements share the same observed scope records.
+        self.scopes: dict[tuple[int, int], dict[str, Any]] = {}
+        for path in scopes:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    record = json.loads(line)
+                    identity = (record["pid"], record["scope_id"])
+                    if identity in self.scopes:
+                        raise ValueError("duplicate native transfer observation scope")
+                    self.scopes[identity] = record
 
     def consume_journals(self) -> None:
         # Normalized units retain measured copies and source coordinates. The
@@ -52,17 +61,9 @@ class TransferMeasurements:
             path.unlink()
 
     def publish(self, output: Path) -> dict[str, Any]:
-        scopes = {}
-        for path in self.scope_paths:
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    record = json.loads(line)
-                    identity = (record["pid"], record["scope_id"])
-                    if identity in scopes:
-                        raise ValueError("duplicate native transfer observation scope")
-                    scopes[identity] = record
-                    if record["completed"] and record["metadata"] is not None and not record["control"]:
-                        self.domain.observe(record["rank"], record["step"], record["metadata"])
+        for record in self.scopes.values():
+            if record["completed"] and record["metadata"] is not None and not record["control"]:
+                self.domain.observe(record["rank"], record["step"], record["metadata"])
 
         pairs: dict[tuple[int, int], dict[str, Any]] = defaultdict(dict)
         for path in self.worker_paths:
@@ -90,7 +91,7 @@ class TransferMeasurements:
             elif pair["enqueue"]["scope_id"] != pair["worker"]["scope_id"]:
                 reason = "queue_scope_mismatch"
             else:
-                scope = scopes.get((identity[0], pair["enqueue"]["scope_id"]))
+                scope = self.scopes.get((identity[0], pair["enqueue"]["scope_id"]))
                 if scope is None or not scope["completed"]:
                     reason = "completed_observation_scope_missing"
                 elif scope["metadata"] is None:
@@ -98,6 +99,8 @@ class TransferMeasurements:
 
             if reason is not None:
                 gaps.append({"identity": list(identity), "reason": reason})
+                continue
+            if scope["control"]:
                 continue
 
             worker = pair["worker"]

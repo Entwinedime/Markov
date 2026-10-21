@@ -29,15 +29,10 @@ struct BlockSubgraph {
     std::vector<BoundaryId> logical_boundaries;
     std::vector<std::array<BoundaryId, 2>> thread_paths;
     std::vector<std::size_t> edges;
-    std::set<BoundaryId> inputs;
-    std::set<BoundaryId> outputs;
     std::map<PortKind, BoundaryId> ports;
 
     TemplateDefinition build(const SourceGraph & graph, std::span<const SourceCall> calls, std::span<const RegionSubgraph> regions,
                              const std::map<SourceSpanId, SourceKernel> & kernels, std::vector<TemplateConnection> connections) const;
-
-private:
-    static void bind_collectives(TemplateDefinition & definition);
 };
 
 struct CrossBlockEdge {

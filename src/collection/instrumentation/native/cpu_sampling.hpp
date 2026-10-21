@@ -5,12 +5,12 @@
 
 namespace markov::collection {
 
-enum class CpuActivityKind { Scope, Operator, Enqueue, Worker, Submission, Query, Wait, Transfer };
+enum class CpuActivityKind { Scope, Operator, Enqueue, Worker, Submission, Query, Wait, Transfer, Function };
 
 // Runtime adapters use the same exclusion clock for their own bookkeeping.
 class CpuObserver {
 public:
-    CpuObserver();
+    explicit CpuObserver(bool force = false);
     ~CpuObserver();
     CpuObserver(const CpuObserver &) = delete;
     CpuObserver & operator=(const CpuObserver &) = delete;
@@ -47,5 +47,6 @@ private:
 
 bool cpu_sampling_active();
 bool cpu_sampling_enabled();
+bool cpu_sampling_excluded();
 
 } // namespace markov::collection

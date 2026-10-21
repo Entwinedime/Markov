@@ -68,7 +68,9 @@ class PerformanceImport:
         self.manifest = manifest
         self.output_directory = run.asset("costs", ordinal)
         task = f"fitting-{ordinal:03d}"
-        self.job = ModelingJob(environment, run.container(task), run.work("fitting", ordinal), run.log(task))
+        self.job = ModelingJob(
+            environment, run.container(task), run.work("fitting", ordinal), run.log("fitting", ordinal)
+        )
 
     def run(self) -> dict[str, Any]:
         environment = self.job.environment

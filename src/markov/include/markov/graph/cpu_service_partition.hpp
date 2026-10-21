@@ -11,8 +11,8 @@
 
 namespace markov {
 
-// The same structural partition serves source inventories and target execution.
-// Owners distinguish serving actions; neither source clocks nor costs select cuts.
+// Partition target CPU fragments at their observable causal cuts. Owners
+// distinguish serving actions; neither source clocks nor costs select cuts.
 class CpuServicePartition {
 public:
     struct Segment {
@@ -23,7 +23,6 @@ public:
         std::uint32_t rank;
     };
     struct Unit {
-        BoundaryId begin;
         BoundaryId end;
         CpuServiceDescriptor service;
         std::vector<std::size_t> members;

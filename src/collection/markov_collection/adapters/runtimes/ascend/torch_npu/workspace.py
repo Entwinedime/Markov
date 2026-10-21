@@ -17,7 +17,7 @@ class WorkspaceCapture:
             "rank": rank,
             "pid": os.getpid(),
             "memory_caching_environment": os.environ.get("PYTORCH_NO_NPU_MEMORY_CACHING"),
-            "probe_installation": RuntimeEnvironment().describe()["workspace_probe"],
+            "probe_installation": RuntimeEnvironment.workspace_probe(),
             "initial": None,
             "final": None,
         }

@@ -19,19 +19,17 @@ class CpuMeasurements:
     def __init__(
         self,
         directory: Path,
-        scope_paths: list[Path],
+        scopes: dict[tuple[int, int], dict[str, Any]],
         domain: SamplingDomain,
         boundaries: CpuBoundaryReader,
         requested: list[dict[str, Any]],
-        descriptors: list[dict[str, Any]],
     ) -> None:
         self.directory = directory
         self.paths = sorted(directory.glob("*.jsonl"))
-        self.scope_paths = scope_paths
+        self.scopes = scopes
         self.domain = domain
         self.boundaries = boundaries
         self.requested = requested
-        self.descriptors = descriptors
 
     def publish(self, output: Path, completions: list[dict[str, Any]]) -> dict[str, Any]:
         calibration_paths = sorted(self.directory.glob("*.clock.json"))
@@ -41,41 +39,58 @@ class CpuMeasurements:
             for calibration in calibrations
             for thread in calibration["threads"]
         }
-        scopes = {}
-        for path in self.scope_paths:
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    scope = json.loads(line)
-                    scopes[scope["pid"], scope["scope_id"]] = scope
-
         activities: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         kinds: Counter[str] = Counter()
         operators: Counter[str] = Counter()
         gaps = []
+        pending = set()
+        unowned = {}
         for path in self.paths:
             with path.open(encoding="utf-8") as stream:
                 for number, line in enumerate(stream, start=1):
                     record = json.loads(line)
                     begin, end = record["boundaries"]
-                    scope = scopes.get((record["pid"], record["scope_id"]))
+                    identity = record["pid"], record["scope_id"]
+                    candidate = record["kind"] == "scope" and record["name"] == "schedule_pending"
+                    if candidate:
+                        pending.add(identity)
+                    scope = self.scopes.get(identity)
+                    if scope is None:
+                        unowned.setdefault(
+                            identity, {"path": str(path), "line": number, "reason": "completed_cpu_scope_missing"}
+                        )
+                        continue
                     reason = None
-                    if scope is None or not scope["completed"]:
+                    if not scope["completed"]:
                         reason = "completed_cpu_scope_missing"
                     elif scope["metadata"] is None:
                         reason = "cpu_scope_work_not_observed"
+                    elif scope["step"] == "schedule" and scope.get("input_supported") is not True:
+                        reason = "cpu_schedule_input_work_not_observed"
+                    elif scope.get("work_contexts") is None:
+                        reason = "cpu_work_context_not_observed"
+                    elif candidate and scope["step"] != "schedule":
+                        reason = "cpu_pending_scope_commit_mismatch"
                     elif end["wall_ns"] < begin["wall_ns"] or end["thread_cpu_ns"] < begin["thread_cpu_ns"]:
                         reason = "cpu_activity_clock_order_invalid"
 
                     if reason is not None:
                         gaps.append({"path": str(path), "line": number, "reason": reason})
                         continue
+                    if scope["control"]:
+                        continue
                     if self.domain.stage(scope["metadata"]) != "measurement":
                         continue
+                    if candidate:
+                        # Only the committed host record assigns the candidate
+                        # its serving role; uncommitted polls have no work.
+                        record["name"] = scope["step"]
 
                     activities[record["pid"], record["tid"]].append(record)
                     kinds[record["kind"]] += 1
                     if record["kind"] == "operator":
                         operators[record["name"]] += 1
+        gaps.extend(location for identity, location in unowned.items() if identity not in pending)
 
         # Exclusive segments partition each recorded lane once. CPU inside a
         # native wait is retained for diagnosis, never charged as ordinary work.
@@ -144,24 +159,27 @@ class CpuMeasurements:
             "operator_names": dict(sorted(operators.items())),
             "lanes": len(activities),
             "exclusive_segments": segments,
+            "uncommitted_schedule_scopes": len(pending - self.scopes.keys()),
             "totals": dict(totals),
             "clock_calibrations": [relpath(path, output.parent) for path in calibration_paths],
             "gaps": gaps,
-            "cost_readiness": "features_undefined",
-            "cost_gap": "cpu_service_features_not_defined",
-            "perturbation": self._perturbation(scopes, completions),
+            "cost_readiness": "needs_data" if self.requested else "not_requested",
+            "cost_gap": "cpu_requested_service_intervals_not_observed" if self.requested else None,
+            "perturbation": self._perturbation(self.scopes, completions),
         }
         if self.requested and not gaps:
             units_path = output.with_name("cpu_service_units.json.gz")
             units = CpuServiceSamples(
-                scopes, activities, self.boundaries.read(activities), prefixes, self.requested, self.descriptors
+                self.scopes, activities, self.boundaries.read(activities), prefixes, self.requested
             ).publish(units_path)
             result["service_units"] = units_path.name
             result["service_coverage"] = units
-            result["cost_readiness"] = (
-                "needs_data" if units["missing_features"] or gaps else "sampled_service_intervals"
+            result["gaps"].extend(
+                {"reason": reason, "count": count} for reason, count in units["work_context_gaps"].items()
             )
-            result["cost_gap"] = "cpu_requested_service_intervals_not_observed" if units["missing_features"] else None
+            incomplete = units["missing_features"] or units["work_context_gaps"]
+            result["cost_readiness"] = "needs_data" if incomplete else "sampled_service_intervals"
+            result["cost_gap"] = "cpu_requested_service_intervals_not_observed" if incomplete else None
         write_json(output, result)
         return result
 
@@ -194,7 +212,8 @@ class CpuMeasurements:
             )
             group = "inactive" if control else "active"
             scheduling = json.dumps(scope.get("scheduling"), sort_keys=True, separators=(",", ":"))
-            work[group][scope["rank"], scope["step"], metadata["phase"], members, scheduling] += 1
+            contexts = json.dumps(scope.get("work_contexts"), sort_keys=True, separators=(",", ":"))
+            work[group][scope["rank"], scope["step"], metadata["phase"], members, scheduling, contexts] += 1
 
         pairs = []
         for row in completions:
@@ -213,7 +232,10 @@ class CpuMeasurements:
                 }
             )
         return {
-            "control": "inactive_recording_scopes_with_global_callback_installed",
+            "control": "inactive scopes except pending receive before cohort classification; global callback installed",
+            "control_scopes_recording_at_entry": sum(
+                scope["control"] and scope["cpu_recording"] for scope in scopes.values()
+            ),
             "native_window": "first Schedule entry to final native Publish return on all ranks",
             "actual_batch_work_matches": bool(work["active"]) and work["active"] == work["inactive"],
             "active_scopes": sum(work["active"].values()),

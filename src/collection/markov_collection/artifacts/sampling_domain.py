@@ -14,7 +14,7 @@ class SamplingDomain:
         self._warmup_records = 0
         self._measurement_records = 0
         self._requested = prepared["measurement_requests"]
-        self.ranks = range(len(prepared["environment"]["devices"]))
+        self.ranks = prepared["source_ranks"]
         self._completed_work: set[tuple[Any, ...]] = set()
         self._finished: dict[int, set[str]] = defaultdict(set)
         self._filter_work: set[tuple[Any, ...]] = set()

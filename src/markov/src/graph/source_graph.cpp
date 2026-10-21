@@ -23,7 +23,8 @@ constexpr std::array transfer_directions{ "host_to_host", "host_to_device", "dev
 constexpr std::array request_pool_operations{ "prefix_extend_write", "token_read", "token_write", "row_read", "relay_read", "relay_write" };
 
 constexpr std::array domains{ "cpu_thread", "device_stream", "communication_observation", "logical_completion", "device_task_completion" };
-constexpr std::array span_kinds{ "cpu_observation", "cpu_control", "host_wait", "compute", "dma", "device_wait", "device_marker", "communication_observation" };
+constexpr std::array span_kinds{ "cpu_observation",           "cpu_control",          "host_wait",         "compute", "dma", "device_wait", "device_marker",
+                                 "communication_observation", "resource_observation", "host_communication" };
 constexpr std::array relations{ "interval_extent",       "thread_order",        "stream_order",         "native_flow",
                                 "native_notify_signal",  "native_event_signal", "native_host_wait",     "native_task_dependency",
                                 "collective_submission", "completion_join",     "model_data_dependency" };
@@ -44,12 +45,6 @@ nlohmann::json SourceTransfer::describe() const {
         {  "direction",                                          direction_name(direction) },
         { "source_api", source_api ? nlohmann::json(*source_api) : nlohmann::json(nullptr) }
     };
-}
-
-SourceTransfer SourceTransfer::read(const nlohmann::json & value) {
-    return { value.at("bytes").get<std::uint64_t>(),
-             parse_direction(value.at("direction").get<std::string>()),
-             value.at("source_api").is_null() ? std::nullopt : std::optional(value.at("source_api").get<std::size_t>()) };
 }
 
 std::string_view SourceTransfer::direction_name(TransferDirection direction) { return transfer_directions[static_cast<std::size_t>(direction)]; }
@@ -189,50 +184,6 @@ nlohmann::json SourceKernel::describe() const {
     return result;
 }
 
-nlohmann::json SourceCommunicator::describe() const {
-    auto links = nlohmann::json::array();
-    for (const auto & [operation, peer, transport] : transports)
-        links.push_back({
-            { "operation", operation },
-            {      "peer",      peer },
-            { "transport", transport }
-        });
-    return {
-        {      "buffer_bytes",                                                                   buffer_bytes },
-        {     "deterministic",                                                                  deterministic },
-        { "op_expansion_mode",                                                              op_expansion_mode },
-        {        "rank_count",                                                                     rank_count },
-        {      "server_count",                                                                   server_count },
-        {      "module_count",                                                                   module_count },
-        {       "device_type",           device_type ? nlohmann::json(*device_type) : nlohmann::json(nullptr) },
-        {     "hcomm_version",       hcomm_version ? nlohmann::json(*hcomm_version) : nlohmann::json(nullptr) },
-        {  "env_aicpu_unfold", env_aicpu_unfold ? nlohmann::json(*env_aicpu_unfold) : nlohmann::json(nullptr) },
-        {      "env_aiv_mode",         env_aiv_mode ? nlohmann::json(*env_aiv_mode) : nlohmann::json(nullptr) },
-        {        "transports",                                                               std::move(links) }
-    };
-}
-
-SourceCommunicator SourceCommunicator::read(const nlohmann::json & value) {
-    SourceCommunicator result{ value.at("buffer_bytes").get<std::uint64_t>(),
-                               value.at("deterministic").get<std::uint32_t>(),
-                               value.at("op_expansion_mode").get<std::uint32_t>(),
-                               value.at("rank_count").get<std::uint32_t>(),
-                               value.at("server_count").get<std::uint32_t>(),
-                               value.at("module_count").get<std::uint32_t>(),
-                               {},
-                               {},
-                               {},
-                               {},
-                               {} };
-    if (!value.at("device_type").is_null()) result.device_type = value.at("device_type").get<std::string>();
-    if (!value.at("hcomm_version").is_null()) result.hcomm_version = value.at("hcomm_version").get<std::string>();
-    if (!value.at("env_aicpu_unfold").is_null()) result.env_aicpu_unfold = value.at("env_aicpu_unfold").get<std::uint32_t>();
-    if (!value.at("env_aiv_mode").is_null()) result.env_aiv_mode = value.at("env_aiv_mode").get<std::uint32_t>();
-    for (const auto & link : value.at("transports"))
-        result.transports.push_back({ link.at("operation").get<std::string>(), link.at("peer").get<std::uint32_t>(), link.at("transport").get<std::string>() });
-    return result;
-}
-
 nlohmann::json SourceCommunicationTask::describe() const {
     return {
         {             "span",             span },
@@ -254,16 +205,16 @@ nlohmann::json SourceCollective::describe() const {
     for (const auto & task : tasks) physical.push_back(task.describe());
 
     return {
-        {         "span",                                                              span },
-        {         "rank",                                                              rank },
-        {   "connection",                                                        connection },
-        {         "name",                                                              name },
-        {        "count",                                                             count },
-        {    "data_type",                                                         data_type },
-        {    "algorithm",                                                         algorithm },
-        {   "group_name",                                                        group_name },
-        { "communicator", communicator ? communicator->describe() : nlohmann::json(nullptr) },
-        {        "tasks",                                               std::move(physical) }
+        {         "span",                span },
+        {         "rank",                rank },
+        {   "connection",          connection },
+        {         "name",                name },
+        {        "count",               count },
+        {    "data_type",           data_type },
+        {    "algorithm",           algorithm },
+        {   "group_name",          group_name },
+        { "communicator",        communicator },
+        {        "tasks", std::move(physical) }
     };
 }
 

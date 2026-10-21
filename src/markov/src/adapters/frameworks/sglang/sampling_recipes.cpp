@@ -29,9 +29,7 @@ std::uint32_t measurement_count(const Json & value) { return static_cast<std::ui
 } // namespace
 
 nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguration & configuration, std::span<const Request> prompt_sources,
-                                                        const Json & requirements) const {
-    if (!requirements.is_array()) throw std::invalid_argument("performance sampling requirements must be an array");
-
+                                                        const Json & requirements, std::span<const std::uint32_t> observed_ranks) const {
     Json points = Json::array();
     Json grid = Json::array();
     Json assignments = Json::array();
@@ -39,16 +37,28 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
     std::map<std::string, std::expected<std::size_t, std::string>> planned;
     std::map<std::string, std::size_t> equivalent_points;
 
+    // The workflow selects uncovered demands; this adapter decides native reachability.
     for (std::size_t index = 0; index < requirements.size(); ++index) {
         const auto & requirement = requirements[index];
-        if (requirement.at("coverage") != "needs_data") {
+        // Local shard execution substitutes this whole operation. Neither its
+        // helper timing nor a physical task sample has the target boundary.
+        if (requirement.at("object").at("kind") == "collective") {
+            const bool host = requirement.at("object").at("features").at("execution") == "host_synchronous";
             unresolved.push_back({
-                { "requirement_index",                                            index },
-                {            "reason", "performance_requirement_not_ready_for_sampling" }
+                { "requirement_index",                                                                                                                          index },
+                {            "reason", host ? "host_message_service_requires_native_group_measurement" : "whole_collective_service_requires_native_group_measurement" }
             });
             continue;
         }
         const auto & features = requirement.at("object").at("features");
+        if (requirement.at("object").at("kind") == "cpu"
+            && std::ranges::find(observed_ranks, features.at("rank").get<std::uint32_t>()) == observed_ranks.end()) {
+            unresolved.push_back({
+                { "requirement_index",                                     index },
+                {            "reason", "cpu_role_not_available_in_local_capture" }
+            });
+            continue;
+        }
         const auto operands = features.find("operand_work");
         const auto * filter = operands != features.end() && operands->contains("batch_filter") ? &operands->at("batch_filter") : nullptr;
         const auto * pool = operands != features.end() && operands->contains("request_pool") ? &operands->at("request_pool") : nullptr;

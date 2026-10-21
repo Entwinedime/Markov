@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
-from markov_collection.adapters.runtimes.ascend.event_history import EventHistory
 from markov_collection.adapters.runtimes.ascend.kernel_work import AscendKernelWork
 from markov_collection.adapters.runtimes.ascend.torch_npu.allocator import WorkspaceAllocation
 from markov_collection.artifacts.json_file import read_json, write_json
@@ -31,6 +30,8 @@ class ObservationNormalizer:
         self.capture_path = capture
         self.directory = capture.parent
         self.capture = read_json(capture)
+        if self.capture["runtime_clock"] != "CLOCK_MONOTONIC_RAW":
+            raise ValueError("native API and profiler controls require the CANN raw clock")
 
         self.calls: dict[str, dict[str, Any]] = {}
         self.intervals: list[dict[str, Any]] = []
@@ -39,11 +40,13 @@ class ObservationNormalizer:
         self.gaps: list[dict[str, Any]] = []
         self.communicators: dict[tuple[int, str], dict[str, Any]] = {}
         self.trace_clock_offsets: dict[int, int] = {}
+        self.physical_ranks: dict[int, int] = {}
         self.devices: list[dict[str, Any]] = []
         self.profile_controls: list[dict[str, Any]] = []
+        self._ignored_calls: set[str] = set()
 
-    def release(self) -> None:
-        AscendCaptureArtifacts.release_observation_exports(self.capture_path)
+    def release(self, diagnostics: Path | None) -> None:
+        AscendCaptureArtifacts.release_observation_exports(self.capture_path, diagnostics)
 
     def _task_samples(
         self, collectives: dict[tuple[int, int], list[dict[str, Any]]], unresolved: Counter
@@ -66,11 +69,13 @@ class ObservationNormalizer:
             rank = detail["rank"]
             key = (rank, args["stream id"], args["task id"], args["context id"])
             matches = hardware[key]
-            if len(matches) != 1 or args["src rank"] != rank:
+            if len(matches) != 1 or args["src rank"] != self.physical_ranks[rank]:
                 unresolved["collective_physical_task_identity_ambiguous"] += 1
                 continue
 
             physical = matches[0]
+            if physical.get("observer", False):
+                continue
             owners = collectives.get((rank, physical["arguments"]["connection_id"]), [])
             if not owners:
                 owner = physical["owner_call"]
@@ -110,7 +115,7 @@ class ObservationNormalizer:
         return samples
 
     def _read_capture(self) -> None:
-        if self.capture.get("profile_retention", {}).get("raw_exports") == "released":
+        if self.capture["profile_retention"]["raw_exports"] == "released":
             raise ValueError("raw observations were released; use retained normalized facts or a diagnostic capture")
         for reference in self.capture["observations"]:
             with (self.directory / reference).open(encoding="utf-8") as stream:
@@ -141,7 +146,10 @@ class ObservationNormalizer:
         self.unowned = Counter(
             interval["kind"]
             for interval in self.intervals
-            if interval["owner_call"] is None and "profiler_control" not in interval
+            if interval["owner_call"] is None
+            and "profiler_control" not in interval
+            and not interval.get("observer", False)
+            and not interval.get("ignored", False)
         )
         if self.unowned:
             self.gaps.append(
@@ -228,10 +236,11 @@ class ObservationNormalizer:
                         r"remote rank\[(\d+)\], transporttype\[([^]]+)\]",
                         line,
                     )
-                    if transport and int(transport[3]) == reference["rank"]:
+                    if transport:
                         transports[(reference["rank"], transport[2])].append(
                             {
                                 "operation": transport[1],
+                                "local_rank": int(transport[3]),
                                 "peer": int(transport[4]),
                                 "transport": transport[5],
                                 "source": source,
@@ -282,6 +291,9 @@ class ObservationNormalizer:
 
     def _read_native_api(self) -> None:
         ranks = {call["pid"]: call["rank"] for call in self.calls.values()}
+        # CANN platform 5 exports the 16-bit STARS task field. Preserve the
+        # SDK counter and give every downstream task consumer the same key.
+        short_task_ranks = {device["rank"] for device in self.devices if device["platform_version"] == "5"}
         failures = Counter()
         for reference in self.capture["native_api"]:
             with (self.directory / reference).open(encoding="utf-8") as stream:
@@ -296,18 +308,24 @@ class ObservationNormalizer:
 
                     # Scope identity is thread-local; timestamps alone cannot establish ownership.
                     record["rank"] = ranks[record["pid"]]
+                    record["hardware_task_id"] = record["submitted_task_id"]
+                    if record["hardware_task_id"] is not None and record["rank"] in short_task_ranks:
+                        record["hardware_task_id"] &= 0xFFFF
                     scope = record["scope_call_id"]
                     record["owner_call"] = None
                     if scope is not None:
                         identity = f"{record['rank']}:{scope}"
-                        call = self.calls[identity]
-                        if (call["pid"], call["tid"]) != (record["pid"], record["tid"]):
-                            raise ValueError(f"native scope thread disagrees at {reference}:{line_number}")
-                        record["owner_call"] = identity
+                        if identity in self._ignored_calls:
+                            record["ignored"] = True
+                        else:
+                            call = self.calls[identity]
+                            if (call["pid"], call["tid"]) != (record["pid"], record["tid"]):
+                                raise ValueError(f"native scope thread disagrees at {reference}:{line_number}")
+                            record["owner_call"] = identity
 
                     record["source"] = {"native_api": reference, "line": line_number}
                     self.native_api.append(record)
-                    if record["result"] != 0:
+                    if record["result"] != 0 and not record.get("ignored", False):
                         failures[record["api"]] += 1
 
         self.native_api.sort(key=lambda record: (record["pid"], record["call_id"]))
@@ -344,7 +362,7 @@ class ObservationNormalizer:
             record["hardware_intervals"] = []
             record["copy_execution"] = None
             record["copy_interval"] = None
-            if record["api"] not in expected or record["result"] != 0:
+            if record.get("ignored", False) or record["api"] not in expected or record["result"] != 0:
                 continue
 
             if record["api"] == "rtMemcpyAsync" and record["driver_copies"]:
@@ -367,17 +385,16 @@ class ObservationNormalizer:
                 # The runtime's last task may still identify preceding compute.
                 record["copy_execution"] = "synchronous_driver"
                 # Use the exporter's recorded clock origin for parent and child.
-                # Native realtime samples remain provenance, not trace coordinates.
                 record["copy_interval"] = {
                     "begin_ns": record["trace_interval"]["begin_ns"] + copy["start_ns"] - record["start_ns"],
                     "end_ns": record["trace_interval"]["begin_ns"] + copy["end_ns"] - record["start_ns"],
                 }
                 continue
-            if record["submitted_task_id"] is None:
+            if record["hardware_task_id"] is None:
                 unresolved["task_identity_not_returned"] += 1
                 continue
 
-            key = (record["rank"], record["submitted_stream_id"], record["submitted_task_id"])
+            key = (record["rank"], record["submitted_stream_id"], record["hardware_task_id"])
             physical = hardware[key]
             if record["stream_id"] != key[1] or not physical:
                 unresolved[record["api"]] += 1
@@ -433,6 +450,8 @@ class ObservationNormalizer:
 
             # Commit the association only after hardware, API and scope identities agree.
             record["source_interval"] = sources[0]
+            if self.intervals[sources[0]].get("observer", False):
+                record["observer"] = True
             if record["owner_call"] is None:
                 record["owner_call"] = source_owner
             record["hardware_intervals"] = physical
@@ -440,6 +459,8 @@ class ObservationNormalizer:
                 record["copy_execution"] = "asynchronous_device"
             for identity in physical:
                 self.intervals[identity]["native_api"] = index
+                if record.get("observer", False):
+                    self.intervals[identity]["observer"] = True
                 if self.intervals[identity]["owner_call"] is None:
                     self.intervals[identity]["owner_call"] = record["owner_call"]
 
@@ -454,7 +475,11 @@ class ObservationNormalizer:
     def _associate_event_destruction(self) -> None:
         observed: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         for interval in self.intervals:
-            if interval["process"] == "CANN" and interval["name"] == "Runtime@EventDestroy":
+            if (
+                interval["process"] == "CANN"
+                and interval["name"] == "Runtime@EventDestroy"
+                and not interval.get("ignored", False)
+            ):
                 observed[(interval["rank"], interval["tid"])].append(interval)
 
         starts = {}
@@ -463,7 +488,7 @@ class ObservationNormalizer:
             starts[thread] = [interval["start_ns"] for interval in intervals]
 
         for record in self.native_api:
-            if record["api"] != "rtEventDestroy":
+            if record["api"] != "rtEventDestroy" or record.get("ignored", False):
                 continue
 
             # The intercepted runtime call encloses its profiler interval. Native
@@ -504,10 +529,10 @@ class ObservationNormalizer:
         native: dict[tuple[int, int, str], list[dict[str, Any]]] = defaultdict(list)
         observed: dict[tuple[int, int, str], list[dict[str, Any]]] = defaultdict(list)
         for record in self.native_api:
-            if record["api"] in names:
+            if record["api"] in names and not record.get("ignored", False):
                 native[(record["rank"], record["tid"], names[record["api"]])].append(record)
         for interval in self.intervals:
-            if interval["kind"] == "cpu" and interval["name"] in names.values():
+            if interval["kind"] == "cpu" and interval["name"] in names.values() and not interval.get("ignored", False):
                 observed[(interval["rank"], interval["tid"], interval["name"])].append(interval)
 
         for identity, sequence in native.items():
@@ -539,6 +564,8 @@ class ObservationNormalizer:
             # CPU attribution is independent of device submission. In particular,
             # a stale last-task ID must not create a hardware edge or clear its gap.
             for record, interval in zip(sequence, calls, strict=True):
+                if interval.get("observer", False):
+                    record["observer"] = True
                 if record["source_interval"] is None:
                     record["source_interval"] = interval["id"]
                     record["owner_call"] = interval["owner_call"]
@@ -551,7 +578,7 @@ class ObservationNormalizer:
 
         return identity
 
-    def _read_devices(self, rank: int, references: list[str]) -> None:
+    def _read_devices(self, rank: int, physical_rank: int, references: list[str]) -> None:
         if not references:
             self.gaps.append({"kind": "observation", "reason": "device_geometry_not_observed", "rank": rank})
             return
@@ -566,27 +593,50 @@ class ObservationNormalizer:
                     raise ValueError(f"invalid device core counts in {reference}")
 
                 # These are device capacities, not the Block Num of a launch.
-                # The vendor device ID is local to this worker's visible devices.
+                # Profiler IDs name physical devices; workspace IDs are worker-local.
                 self.devices.append(
                     {
                         "rank": rank,
+                        "physical_rank": physical_rank,
                         "pid": int(information["pid"]),
                         "device": int(device["id"]),
                         "cube_cores": cube_cores,
                         "vector_cores": vector_cores,
+                        "platform_version": information["platform_version"],
                         "source": reference,
                     }
                 )
 
+    @staticmethod
+    def _mark_observer_ranges(intervals: list[dict[str, Any]]) -> set[int]:
+        windows: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for interval in intervals:
+            if interval["kind"] == "cpu" and interval["name"] == "markov_observer":
+                windows[interval["tid"]].append((interval["start_ns"], interval["end_ns"]))
+
+        for tid, ranges in windows.items():
+            merged = []
+            for begin, end in sorted(ranges):
+                if merged and begin <= merged[-1][1]:
+                    merged[-1] = merged[-1][0], max(end, merged[-1][1])
+                else:
+                    merged.append((begin, end))
+            windows[tid] = merged
+
+        queues = set()
+        for interval in intervals:
+            if interval["kind"] != "cpu":
+                continue
+            ranges = windows[interval["tid"]]
+            position = bisect_right(ranges, interval["start_ns"], key=lambda item: item[0]) - 1
+            if position >= 0 and interval["end_ns"] <= ranges[position][1]:
+                interval["observer"] = True
+                if interval["name"].startswith("Enqueue@"):
+                    queues.add(interval["arguments"]["correlation_id"])
+        return queues
+
     def _read_trace(self, reference: dict[str, Any]) -> None:
         information = read_json(self.directory / reference["profiler_info"])
-        rank = information["rank_id"]
-        self._read_devices(rank, reference["device_info"])
-        clock = read_json(self.directory / reference["clock_start_info"])
-        # Match CANNFileParser.get_localtime_diff / ProfilerConfig.get_local_time.
-        # The export origin is not identical to a later realtime/monotonic pair.
-        self.trace_clock_offsets[rank] = timestamp_ns(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
-
         with (self.directory / reference["trace"]).open(encoding="utf-8") as stream:
             events = json.load(stream)
 
@@ -595,6 +645,21 @@ class ObservationNormalizer:
             for event in events
             if event["ph"] == "M" and event["name"] == "process_name"
         }
+
+        # The trace's distributed rank names its physical process group. Join
+        # the actual Python PID to observed calls before assigning source roles.
+        workers = {(call["pid"], call["rank"]) for call in self.calls.values()}
+        observed = {(pid, role) for pid, role in workers if processes.get(pid) == "Python"}
+        if len(observed) != 1:
+            raise ValueError(f"native profiler worker identity is ambiguous: {reference['trace']}")
+        _, rank = observed.pop()
+        physical_rank = information["rank_id"]
+        self.physical_ranks[rank] = physical_rank
+        self._read_devices(rank, physical_rank, reference["device_info"])
+        clock = read_json(self.directory / reference["clock_start_info"])
+        # Match CANNFileParser.get_localtime_diff / ProfilerConfig.get_local_time.
+        # The export origin is not identical to a later realtime/monotonic pair.
+        self.trace_clock_offsets[rank] = timestamp_ns(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
 
         # Group IDs are database-local string IDs. Resolve their names, then join
         # the trace by native connection and operation identity, never by time.
@@ -635,27 +700,41 @@ class ObservationNormalizer:
 
         markers: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
         marker_ranges: dict[str, tuple[int, int]] = {}
+        ignored_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for event in events:
-            if event["ph"] != "X" or not event["name"].startswith("markov/"):
+            if event["ph"] != "X" or not event["name"].startswith(("markov/", "markov_pending/")):
                 continue
 
-            _, step, call_id = event["name"].split("/")
+            prefix, step, call_id = event["name"].split("/")
             identity = f"{rank}:{call_id}"
+            start_ns = timestamp_ns(event["ts"])
+            end_ns = start_ns + timestamp_ns(event["dur"])
+            if prefix == "markov_pending" and identity not in self.calls:
+                self._ignored_calls.add(identity)
+                ignored_ranges[event["tid"]].append((start_ns, end_ns))
+                continue
             if self.calls[identity]["step"] != step:
                 raise ValueError(f"profiler marker disagrees with observed call {identity}")
 
-            start_ns = timestamp_ns(event["ts"])
-            markers[event["tid"]].append((start_ns, start_ns + timestamp_ns(event["dur"]), identity))
-            marker_ranges[identity] = (start_ns, start_ns + timestamp_ns(event["dur"]))
+            markers[event["tid"]].append((start_ns, end_ns, identity))
+            marker_ranges[identity] = (start_ns, end_ns)
 
         for marker_list in markers.values():
             marker_list.sort(key=lambda marker: (marker[0], self.calls[marker[2]]["call_id"]))
+        for tid, ranges in ignored_ranges.items():
+            merged = []
+            for begin, end in sorted(ranges):
+                if merged and begin <= merged[-1][1]:
+                    merged[-1] = merged[-1][0], max(end, merged[-1][1])
+                else:
+                    merged.append((begin, end))
+            ignored_ranges[tid] = merged
 
         starts: dict[tuple[int, int, int], list[int]] = defaultdict(list)
         queue_owners: dict[int, str] = {}
         local_intervals: list[dict[str, Any]] = []
         flow_events: dict[tuple[str, str], dict[str, Any]] = defaultdict(dict)
-        ignored = Counter()
+        excluded_channels = Counter()
         for event_index, event in enumerate(events):
             if event["ph"] in ("s", "f"):
                 flow_events[(event["cat"], str(event["id"]))][event["ph"]] = event
@@ -665,7 +744,7 @@ class ObservationNormalizer:
 
             process = processes[event["pid"]]
             if process not in ("Python", "CANN", "Ascend Hardware", "Communication"):
-                ignored[process] += 1
+                excluded_channels[process] += 1
                 continue
 
             start_ns = timestamp_ns(event["ts"])
@@ -733,6 +812,12 @@ class ObservationNormalizer:
                 "operator_function": operator_function,
                 "source": {"trace": reference["trace"], "event_index": event_index},
             }
+            # Device lane IDs are not CPU thread identities. Exclusion reaches
+            # device work through the native queue/flow/connection links below.
+            ranges = ignored_ranges[event["tid"]]
+            position = bisect_right(ranges, start_ns, key=lambda item: item[0]) - 1
+            if kind == "cpu" and position >= 0 and end_ns <= ranges[position][1]:
+                interval["ignored"] = True
             if process == "Communication" and event["name"].startswith("hcom_"):
                 group, operation_id = groups[(arguments["connection_id"], event["name"])]
                 arguments["group_name"] = group
@@ -764,20 +849,35 @@ class ObservationNormalizer:
             local_intervals.append(interval)
             self.intervals.append(interval)
 
+        # Auxiliary work uses the same observed queue/flow identities as serving
+        # ownership. Device clocks alone cannot identify an observer's launches.
+        observer_queues = self._mark_observer_ranges(local_intervals)
+        ignored_queues = {
+            interval["arguments"]["correlation_id"]
+            for interval in local_intervals
+            if interval["name"].startswith("Enqueue@") and interval.get("ignored", False)
+        }
+
         # Carry scope ownership across native queues before resolving device flows.
-        dequeues: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
+        dequeues: dict[int, list[tuple[int, int, str | None, bool, bool]]] = defaultdict(list)
         for interval in local_intervals:
             if interval["name"].startswith("Dequeue@"):
                 owner = queue_owners.get(interval["arguments"]["correlation_id"])
                 interval["owner_call"] = owner
-                if owner is not None:
-                    dequeues[interval["tid"]].append((interval["start_ns"], interval["end_ns"], owner))
+                observer = interval["arguments"]["correlation_id"] in observer_queues
+                ignored_queue = interval["arguments"]["correlation_id"] in ignored_queues
+                if observer:
+                    interval["observer"] = True
+                if ignored_queue:
+                    interval["ignored"] = True
+                if owner is not None or observer or ignored_queue:
+                    dequeues[interval["tid"]].append(
+                        (interval["start_ns"], interval["end_ns"], owner, observer, ignored_queue)
+                    )
 
         for sequence in dequeues.values():
-            sequence.sort()
+            sequence.sort(key=lambda item: item[0])
         for interval in local_intervals:
-            if interval["owner_call"] is not None:
-                continue
             if interval["process"] != "CANN" and interval["name"] not in (
                 "MarkovWorkspaceAllocate",
                 "MarkovWorkspaceRelease",
@@ -785,11 +885,16 @@ class ObservationNormalizer:
                 continue
 
             sequence = dequeues[interval["tid"]]
-            position = bisect_right(sequence, (interval["start_ns"], float("inf"), "")) - 1
+            position = bisect_right(sequence, interval["start_ns"], key=lambda item: item[0]) - 1
             if position >= 0:
-                begin, end, identity = sequence[position]
+                begin, end, identity, observer, ignored_queue = sequence[position]
                 if begin <= interval["start_ns"] and interval["end_ns"] <= end:
-                    interval["owner_call"] = identity
+                    if interval["owner_call"] is None:
+                        interval["owner_call"] = identity
+                    if observer:
+                        interval["observer"] = True
+                    if ignored_queue:
+                        interval["ignored"] = True
 
         # Native connection IDs locate the actual launch; queue correlation IDs
         # connect its worker to the originating host enqueue. Vendor torch flows
@@ -852,6 +957,12 @@ class ObservationNormalizer:
                 enqueue = self._flow_enqueue(self.intervals[target_ids[0]], submissions, worker_windows, enqueues)
                 if enqueue is not None:
                     host = self.intervals[enqueue]
+                    if host.get("observer", False):
+                        for index in target_ids:
+                            self.intervals[index]["observer"] = True
+                    if host.get("ignored", False):
+                        for index in target_ids:
+                            self.intervals[index]["ignored"] = True
                     # Containment validates an already identity-linked enqueue;
                     # it never chooses a device producer by temporal proximity.
                     valid = any(
@@ -865,6 +976,12 @@ class ObservationNormalizer:
                         source_ids = [enqueue]
 
             owners = {self.intervals[index]["owner_call"] for index in source_ids} - {None}
+            if source_ids and all(self.intervals[index].get("observer", False) for index in source_ids):
+                for index in target_ids:
+                    self.intervals[index]["observer"] = True
+            if source_ids and all(self.intervals[index].get("ignored", False) for index in source_ids):
+                for index in target_ids:
+                    self.intervals[index]["ignored"] = True
             if len(owners) == 1:
                 owner = owners.pop()
                 for index in target_ids:
@@ -890,12 +1007,21 @@ class ObservationNormalizer:
         # The collective root receives its owner through the native flow; propagate
         # that identity to its SDMA/notify sub-tasks without using temporal proximity.
         connection_owners: dict[int, set[str]] = defaultdict(set)
+        observer_connections: dict[int, set[bool]] = defaultdict(set)
+        ignored_connections: dict[int, set[bool]] = defaultdict(set)
         for interval in local_intervals:
             connection = interval["arguments"].get("connection_id")
             if connection is not None and interval["owner_call"] is not None:
                 connection_owners[connection].add(interval["owner_call"])
+            if connection is not None and interval["process"] == "CANN":
+                observer_connections[connection].add(interval.get("observer", False))
+                ignored_connections[connection].add(interval.get("ignored", False))
         for interval in local_intervals:
             connection = interval["arguments"].get("connection_id")
+            if observer_connections.get(connection) == {True}:
+                interval["observer"] = True
+            if ignored_connections.get(connection) == {True}:
+                interval["ignored"] = True
             if interval["owner_call"] is None and connection is not None:
                 owners = connection_owners[connection]
                 if len(owners) == 1:
@@ -927,9 +1053,14 @@ class ObservationNormalizer:
                     "counts": dict(unresolved),
                 }
             )
-        if ignored:
+        if excluded_channels:
             self.gaps.append(
-                {"kind": "scope", "reason": "vendor_analysis_channels_excluded", "rank": rank, "counts": dict(ignored)}
+                {
+                    "kind": "scope",
+                    "reason": "vendor_analysis_channels_excluded",
+                    "rank": rank,
+                    "counts": dict(excluded_channels),
+                }
             )
 
     def _flow_submission(
@@ -996,23 +1127,6 @@ class ServingNormalizer(ObservationNormalizer):
         if role not in {"base", "validation"} or self.capture["role"] != role:
             raise ValueError("serving observation role must match the native capture")
         self.role = role
-
-    def _read_event_states(self) -> list[dict[str, Any]]:
-        ranks = {call["pid"]: call["rank"] for call in self.calls.values()}
-        states = []
-        observed = set()
-        for reference in self.capture["event_history"]:
-            state = EventHistory(self.directory, reference).initial_state()
-            state["rank"] = ranks[state["pid"]]
-            if state["pid"] in observed:
-                raise ValueError(f"duplicate event entry history for worker: {state['pid']}")
-            observed.add(state["pid"])
-            self.gaps.extend({"kind": "event_state", "rank": state["rank"], **gap} for gap in state["gaps"])
-            states.append(state)
-
-        for pid in ranks.keys() - observed:
-            self.gaps.append({"kind": "event_state", "reason": "entry_history_not_observed", "rank": ranks[pid]})
-        return states
 
     def _read_workspace_states(self) -> list[dict[str, Any]]:
         states = []
@@ -1099,7 +1213,6 @@ class ServingNormalizer(ObservationNormalizer):
     def extract(self) -> Path:
         self._read_capture()
         workspace_states = self._read_workspace_states()
-        event_states = self._read_event_states()
         facts_path = self.directory / ("source_facts.json.gz" if self.role == "base" else "observation_facts.json.gz")
         write_json(
             facts_path,
@@ -1109,7 +1222,6 @@ class ServingNormalizer(ObservationNormalizer):
                 "flows": self.flows,
                 "native_api": self.native_api,
                 "workspace_states": workspace_states,
-                "event_states": event_states,
                 "profile_controls": self.profile_controls,
                 "devices": self.devices,
             },
@@ -1126,10 +1238,8 @@ class ServingNormalizer(ObservationNormalizer):
                 "native_intervals": (
                     "profiler export epoch coordinates in ns, converted from vendor decimal microseconds"
                 ),
-                "calls": "monotonic_ns; paired wall_time_ns is retained for clock association",
-                "native_api": (
-                    "monotonic_ns; trace_interval uses recorded CANN export origin, wall_time_ns is raw provenance"
-                ),
+                "calls": "perf_counter_ns; execution endpoints use associated native profiler ranges",
+                "native_api": "CLOCK_MONOTONIC_RAW; trace_interval uses recorded CANN export origin",
             },
             "coverage": {
                 "calls": len(self.calls),
@@ -1144,12 +1254,6 @@ class ServingNormalizer(ObservationNormalizer):
         if self.role == "base":
             manifest_path = self.directory / "profile_manifest.json"
             manifest.update(source_facts=facts_path.name, readiness="needs_data")
-            manifest["gaps"] = self.gaps + [
-                {
-                    "kind": "implementation",
-                    "reason": "source_dag_and_templates_not_extracted",
-                }
-            ]
         else:
             # Target observations are evaluation facts, never a template source or cost asset.
             manifest_path = self.directory / "validation_manifest.json"
@@ -1216,7 +1320,10 @@ class DeviceCostNormalizer(ObservationNormalizer):
         collectives = []
         collective_owners: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         unresolved = Counter()
+        excluded = Counter()
         for interval in self.intervals:
+            if interval.get("observer", False):
+                continue
             arguments = interval["arguments"]
             if interval["process"] != "Communication" or "count" not in arguments or "data_type" not in arguments:
                 continue
@@ -1244,6 +1351,9 @@ class DeviceCostNormalizer(ObservationNormalizer):
             collective_owners[(interval["rank"], arguments["connection_id"])].append(collectives[-1])
 
         for interval in self.intervals:
+            if interval.get("observer", False):
+                excluded[interval["kind"]] += 1
+                continue
             # Keep the physical record task separate from its CPU launch and
             # event wait. Profiler controls and collective commands stay outside
             # this cost object; their raw observations are still retained.
@@ -1292,7 +1402,8 @@ class DeviceCostNormalizer(ObservationNormalizer):
         )
         if unresolved:
             self.gaps.append({"kind": "cost", "reason": "device_work_context_not_observed", "counts": dict(unresolved)})
-        self.gaps.append({"kind": "cost", "reason": "collective_transport_service_not_separated"})
+        if collectives:
+            self.gaps.append({"kind": "cost", "reason": "collective_transport_service_not_separated"})
         self.gaps.append({"kind": "cost", "reason": "device_profiler_overhead_not_calibrated"})
 
         coverage = domain.coverage()
@@ -1322,6 +1433,7 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 "completion_coverage": completion_coverage,
                 "coverage": {
                     "samples": len(samples),
+                    "excluded_observer_work": dict(excluded),
                     "stage_kind": dict(Counter(f"{sample['stage']}/{sample['kind']}" for sample in samples)),
                     "collective_descriptors": len(collectives),
                     "task_samples": len(task_samples),

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from markov_collection.instrumentation.blocks import BlockWrapper, BoundBlock
+from markov_collection.instrumentation.cpu_sampling import CpuMethod, CpuSampling
 from markov_collection.instrumentation.recording import Observation, Recorder
 
 
@@ -15,6 +16,7 @@ from markov_collection.instrumentation.recording import Observation, Recorder
 class BoundNativeRegion(BoundBlock):
     module_type: str
     method: str
+    cpu_name: str
     tensor_inputs: tuple[str, ...]
     dimensions: tuple[tuple[str, str], ...]
     call_parameters: tuple[tuple[str, str], ...]
@@ -34,6 +36,7 @@ class BoundNativeRegion(BoundBlock):
             parameters,
             binding["module_type"],
             binding["method"],
+            binding["cpu_name"],
             tuple(binding["inputs"]),
             tuple((parameter["name"], parameter["attribute"]) for parameter in binding["parameters"]),
             tuple((parameter["name"], parameter["attribute"]) for parameter in binding["call_parameters"]),
@@ -48,11 +51,10 @@ class BoundNativeRegion(BoundBlock):
 
 class NativeRegionWrapper(BlockWrapper):
     def __init__(
-        self, binding: BoundNativeRegion, path: str, module: Any, recorder: Recorder, original: Callable[..., Any]
+        self, binding: BoundNativeRegion, module: Any, recorder: Recorder, original: Callable[..., Any]
     ) -> None:
         super().__init__((binding,), recorder.markers)
         self.binding = binding
-        self.path = path
         self.module = module
         self.recorder = recorder
         self.original = original
@@ -62,6 +64,12 @@ class NativeRegionWrapper(BlockWrapper):
         if not self.recorder.in_scope():
             return None
 
+        # Bind once; specialized wrappers only supply their native metadata.
+        arguments = self.signature.bind(*args, **kwargs)
+        arguments.apply_defaults()
+        return self.recorder, self.metadata(arguments)
+
+    def metadata(self, arguments: inspect.BoundArguments) -> dict[str, Any]:
         # Object parameters include mutable control state (for example a free
         # group flag), so read them at entry rather than at wrapper installation.
         dimensions = {}
@@ -71,8 +79,6 @@ class NativeRegionWrapper(BlockWrapper):
                 value = getattr(value, part)
             dimensions[name] = int(value)
 
-        arguments = self.signature.bind(*args, **kwargs)
-        arguments.apply_defaults()
         # Branch values are CPU scalars from the actual invocation, not
         # module constants or device tensor contents.
         call_parameters = {}
@@ -105,8 +111,7 @@ class NativeRegionWrapper(BlockWrapper):
                 raise ValueError(f"native region CPU input is on a device: {name}")
             cpu_values[name] = tensor.tolist()
 
-        return self.recorder, {
-            "module_path": self.path,
+        return {
             "module_type": self.binding.module_type,
             "method": self.binding.method,
             "module_parameters": dimensions,
@@ -115,6 +120,7 @@ class NativeRegionWrapper(BlockWrapper):
             "outputs": {},
             "cpu_values": cpu_values,
             "request_id": request_id,
+            "group_ranks": None,
         }
 
     @staticmethod
@@ -136,7 +142,6 @@ class NativeRegionWrapper(BlockWrapper):
             "shape": list(tensor.shape),
             "stride": list(tensor.stride()),
             "dtype": str(tensor.dtype),
-            "device": str(tensor.device),
         }
 
     def completed(self, observation: Observation, result: Any, *args: Any, **kwargs: Any) -> None:
@@ -164,7 +169,12 @@ class NativeRegions:
         self.model: Any = None
         self.components: dict[str, Any] = {}
 
-    def install_components(self, owner: Any, recorder: Recorder, owner_kind: str) -> None:
+    def wrapper(
+        self, binding: BoundNativeRegion, module: Any, recording: Any, original: Callable[..., Any]
+    ) -> NativeRegionWrapper | CpuMethod:
+        return NativeRegionWrapper(binding, module, recording, original)
+
+    def install_components(self, owner: Any, recording: Any, owner_kind: str) -> None:
         for bindings in self.bindings.values():
             for binding in bindings:
                 path = binding.component_path
@@ -182,21 +192,28 @@ class NativeRegions:
                 component_type = f"{type(component).__module__}.{type(component).__qualname__}"
                 if component_type == binding.module_type:
                     original = getattr(component, binding.method)
-                    wrapper = NativeRegionWrapper(binding, path, component, recorder, original)
+                    wrapper = self.wrapper(binding, component, recording, original)
                     setattr(component, binding.method, wrapper)
                     self.components[binding.identity] = component
 
-    def install(self, model: Any, recorder: Recorder) -> None:
+    def install(self, model: Any, recording: Any) -> None:
         if self.model is model:
             return
 
-        # Object paths retain layer identities. Each implementation binding uses
-        # the same wrapper lifecycle, including nested exception/parent restoration.
-        for path, module in model.named_modules():
+        # Native attributes supply layer identity; each binding uses the same
+        # wrapper lifecycle and restores its enclosing observation scope.
+        for module in model.modules():
             module_type = f"{type(module).__module__}.{type(module).__qualname__}"
             for binding in self.bindings.get(module_type, ()):
                 if not binding.component_path:
                     original = getattr(module, binding.method)
-                    wrapper = NativeRegionWrapper(binding, path, module, recorder, original)
+                    wrapper = self.wrapper(binding, module, recording, original)
                     setattr(module, binding.method, wrapper)
         self.model = model
+
+
+class CpuNativeRegions(NativeRegions):
+    def wrapper(
+        self, binding: BoundNativeRegion, module: Any, recording: CpuSampling, original: Callable[..., Any]
+    ) -> CpuMethod:
+        return CpuMethod(recording, binding.cpu_name, original)

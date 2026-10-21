@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/contracts/batch_membership.hpp"
+#include "markov/contracts/collective_work.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -50,15 +51,34 @@ struct CpuServiceDescriptor {
 };
 
 // Scheduling can scan and filter members that never enter the selected batch.
-// Counts describe that work without retaining native request identities.
+// Counts and ordered incoming lengths describe that work without retaining
+// native request identities or substituting the selected model batch.
 struct CpuScheduleWork {
     BatchTransitionState transition;
     std::size_t waiting_requests;
     std::vector<std::pair<std::size_t, std::size_t>> filters;
     std::optional<BatchMerge> merge;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> incoming_requests;
 
     auto operator<=>(const CpuScheduleWork &) const = default;
     static CpuScheduleWork read(const nlohmann::json & value);
+    nlohmann::json describe() const;
+};
+
+// Publish scans the ordered batch even when no member emits. Token counts
+// describe output materialization, without retaining payloads or mutable offsets.
+struct CpuPublicationWork {
+    struct Request {
+        std::uint64_t output_tokens;
+        std::uint64_t decode_context_tokens;
+        std::uint64_t history_tokens; // Full terminal-history slice width, not a sum over native reads.
+
+        auto operator<=>(const Request &) const = default;
+    };
+    std::vector<Request> requests;
+
+    auto operator<=>(const CpuPublicationWork &) const = default;
+    static CpuPublicationWork read(const nlohmann::json & value);
     nlohmann::json describe() const;
 };
 
@@ -74,9 +94,12 @@ struct CpuServiceWork {
     std::uint64_t context_tokens;
     std::uint64_t finished_requests;
     std::optional<CpuScheduleWork> scheduling = std::nullopt;
+    std::optional<CollectiveWork> collective = std::nullopt;
+    std::optional<CpuPublicationWork> publication = std::nullopt;
 
     auto operator<=>(const CpuServiceWork &) const = default;
-    static CpuServiceWork from_input(CpuServiceDescriptor service, StepKind step, std::uint32_t rank, const BatchInput & input);
+    static CpuServiceWork from_input(CpuServiceDescriptor service, StepKind step, std::uint32_t rank, const BatchInput & input,
+                                     std::optional<CpuPublicationWork> publication);
     static CpuServiceWork read(const nlohmann::json & value);
     nlohmann::json describe() const;
 };

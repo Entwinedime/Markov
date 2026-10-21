@@ -23,16 +23,19 @@ namespace markov {
 
 class SourceBindings;
 
-// Consumes only files explicitly referenced by a role=base manifest. This is
-// source extraction, not prediction or performance fitting. Incomplete causal
-// observations remain gaps; a parsed graph never implies costs are available.
+// Owns one observation and its graph, calls and semantic cuts for template
+// production or independent structural observation. Read each instance once;
+// incomplete causal observations remain gaps and never imply available costs.
 class AscendSourceExtractor {
 public:
     explicit AscendSourceExtractor(const SourceBindings & bindings) : bindings_(bindings) {}
 
-    nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest, const std::filesystem::path & work_directory);
+    nlohmann::json read(nlohmann::json facts);
+    nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest, const std::filesystem::path & work_directory,
+                           bool diagnostics);
     const SourceGraph & graph() const { return graph_; }
     const nlohmann::json & facts() const { return facts_; }
+    const nlohmann::json & gaps() const { return gaps_; }
     const SourceSubgraphs & subgraphs() const { return subgraphs_; }
     std::span<const SourceCall> calls() const { return calls_; }
     static std::optional<DeviceCommandWork> device_command(const nlohmann::json & interval);
@@ -73,7 +76,7 @@ private:
 
     void complete_device_work();
 
-    const SourceBindings & bindings_; // Owned by the production entry for the complete extraction.
+    const SourceBindings & bindings_; // The caller retains bindings throughout this object's lifetime.
     SourceGraph graph_;
     nlohmann::json facts_;
     SourceSubgraphs subgraphs_;

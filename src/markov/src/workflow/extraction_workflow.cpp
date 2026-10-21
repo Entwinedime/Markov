@@ -40,13 +40,12 @@ nlohmann::json ExtractionWorkflow::run(const std::filesystem::path & manifest_pa
     const auto started = std::chrono::steady_clock::now();
     auto produced = producer->produce(manifest_path, std::move(manifest), work);
     auto & current = produced.manifest;
-    auto gaps = current.at("gaps");
-    for (const auto & gap : current.at("extraction_gaps")) gaps.push_back(gap);
+    // The manifest owns full observations; the command returns a small receipt.
     nlohmann::json report{
-        {  "base_manifest",       manifest_path.string() },
-        {      "readiness",      current.at("readiness") },
-        { "graph_coverage", current.at("graph_coverage") },
-        {           "gaps",              std::move(gaps) }
+        {  "base_manifest",                                                                              manifest_path.string() },
+        {      "readiness",                                                                             current.at("readiness") },
+        { "graph_coverage",                                                                        current.at("graph_coverage") },
+        {     "gap_counts", { { "source", current.at("gaps").size() }, { "extraction", current.at("extraction_gaps").size() } } }
     };
 
     if (produced.source) {

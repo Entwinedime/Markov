@@ -43,11 +43,15 @@ struct BatchRowParameter {
     bool output;
     std::size_t slot;
     BatchRowExtent extent;
+
+    bool operator==(const BatchRowParameter &) const = default;
 };
 
 struct BatchRequestBinding {
     std::size_t request_count;
     std::size_t slot;
+
+    bool operator==(const BatchRequestBinding &) const = default;
 };
 
 // A layout binds one row family: filter, merge, requests or one request sequence. Row slots
@@ -67,6 +71,8 @@ public:
     BatchParameterLayout with_filter_binding(BatchFilterBinding binding) const;
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input,
                                                       std::optional<std::size_t> request_slot = std::nullopt) const;
+
+    bool operator==(const BatchParameterLayout &) const = default;
 
 private:
     std::optional<BatchFilterBinding> filter_;

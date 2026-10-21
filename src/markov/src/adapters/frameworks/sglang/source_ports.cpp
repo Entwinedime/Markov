@@ -9,6 +9,18 @@
 
 namespace markov {
 
+std::optional<std::string> SGLangBindings::cpu_name(const SourceCall & call) const {
+    if (call.kind != SourceCallKind::NativeRegion || !call.binding) return std::nullopt;
+    return region(*call.binding).cpu_name();
+}
+
+bool SGLangBindings::cpu_work_boundary(const SourceCall & call) const {
+    if (call.kind != SourceCallKind::NativeRegion || !call.binding) return false;
+    const auto semantic = region(*call.binding).semantic;
+    return semantic == "logical_collective" || semantic == "input_request" || semantic == "input_message" || semantic == "input_message_submit"
+           || semantic == "input_message_wait";
+}
+
 std::map<PortKind, BoundaryId> SGLangBindings::ports(const SourceGraph & graph, std::span<const SourceCall> calls, std::size_t index) const {
     const auto & call = calls[index];
     std::map<PortKind, BoundaryId> ports;

@@ -2,18 +2,42 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import signal
+from pathlib import Path
 from typing import Any
 
+from markov_collection.adapters.frameworks.sglang.parallel import SGLangShardExecution
 from markov_collection.adapters.frameworks.sglang.request_cohorts import SGLangRequestCohorts
 from markov_collection.adapters.frameworks.sglang.warmup import SGLangWarmup
 from markov_collection.adapters.runtimes.ascend.compilation import CompilationObservation
+from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.instrumentation.session import CaptureSession
 
 
 class SGLangSession(CaptureSession):
+    @property
+    def worker_ranks(self) -> range:
+        if "shard_execution" in self.prepared:
+            rank = self.prepared["shard_execution"]["rank"]
+            return range(rank, rank + 1)
+        return range(self.prepared["configuration"]["tp_size"])
+
+    def _start_engine(self) -> Any:
+        from sglang.srt.entrypoints.engine import Engine
+
+        return Engine(**SGLangShardExecution.engine_arguments(self.prepared))
+
     def prepare(self) -> None:
+        self.runtime_environment = RuntimeEnvironment().observe(self.prepared["environment"])
+        self.prepared["source_ranks"] = list(self.worker_ranks)
+        if "shard_execution" in self.prepared:
+            shard = self.prepared["shard_execution"]
+            shard["representative_layers"] = min(
+                shard["representative_layers"], self.prepared["model_configuration"]["num_hidden_layers"]
+            )
+
         if self.prepared["role"] == "performance":
             request_ids = set(self.prepared["measurement_ids"]) | set(self.prepared["warmup_ids"])
         else:
@@ -76,8 +100,7 @@ class SGLangSession(CaptureSession):
         result = CompilationObservation.windows(self.directory / "compilation", windows)
         workers = {batch["rank"]: batch["pid"] for batch in warmup["batches"]}
         phases = {
-            rank: {batch["phase"] for batch in warmup["batches"] if batch["rank"] == rank}
-            for rank in range(self.prepared["configuration"]["tp_size"])
+            rank: {batch["phase"] for batch in warmup["batches"] if batch["rank"] == rank} for rank in self.worker_ranks
         }
         live_prefills = {
             (batch["rank"], batch["point"])
@@ -127,3 +150,14 @@ class SGLangSession(CaptureSession):
         )
         if not result.success:
             raise RuntimeError(f"native request/cache reset failed: {result.message}")
+
+    async def _await_cleanup(self, request_ids: set[str], directory: Path) -> list[dict[str, Any]]:
+        paths = [directory / f"rank-{rank}-cleanup.json" for rank in self.worker_ranks]
+        # The attempt monitor owns the deadline. These files acknowledge an
+        # observed empty Schedule, rather than a driver response or reset RPC.
+        while True:
+            if all(path.exists() for path in paths):
+                records = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+                if all(request_ids.issubset(record["request_ids"]) for record in records):
+                    return records
+            await asyncio.sleep(0.01)

@@ -47,9 +47,11 @@ class Recorder:
 
         atexit.register(self.close)
 
-    def scope(self, step: str, metadata: dict[str, Any], *, binding: str | None = None) -> Observation:
+    def scope(
+        self, step: str, metadata: dict[str, Any], *, binding: str | None = None, pending: bool = False
+    ) -> Observation:
         self._sequence += 1
-        return Observation(self, self._sequence, step, metadata, binding)
+        return Observation(self, self._sequence, step, metadata, binding, pending=pending)
 
     def set_scope(self, identity: int | None) -> None:
         self._local.current = identity
@@ -61,23 +63,38 @@ class Recorder:
 
     def write(self, record: dict[str, Any]) -> None:
         with self.markers.observer():
-            if self._stream is None:
-                self.directory.mkdir(parents=True, exist_ok=True)
-                self._stream = (self.directory / f"rank-{self.rank}-pid-{os.getpid()}.jsonl").open(
-                    "a", encoding="utf-8"
-                )
-
             record["rank"] = self.rank
             record["pid"] = os.getpid()
             record["tid"] = threading.get_native_id()
+            pending = getattr(self._local, "pending", None)
+            if pending is not None:
+                pending.records.append(record)
+                return
+            self._write(record)
+            self._flush()
 
-            self._stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+    def _write(self, record: dict[str, Any]) -> None:
+        if self._stream is None:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self._stream = (self.directory / f"rank-{self.rank}-pid-{os.getpid()}.jsonl").open("a", encoding="utf-8")
 
-            # Nested records keep normal buffering. Their serialization remains
-            # observation work even while the enclosing serving scope is active.
-            if getattr(self._local, "current", None) is None:
-                self._stream.flush()
-                self.flush_native(close_window=False)
+        self._stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def _flush(self) -> None:
+        # Nested records stay buffered until their enclosing scope closes.
+        if getattr(self._local, "current", None) is None:
+            self._stream.flush()
+            self.flush_native(close_window=False)
+
+    def finish_pending(self, observation: Observation) -> None:
+        with self.markers.observer():
+            self._local.pending = None
+            if observation.committed:
+                for record in observation.records:
+                    self._write(record)
+                # Publish the complete committed group before acknowledging it.
+                self._flush()
+            observation.records.clear()
 
     def flush_native(self, *, close_window: bool) -> None:
         if self._native is not None and self._native.markov_native_flush(int(close_window)) != 0:
@@ -92,7 +109,14 @@ class Recorder:
 
 class Observation:
     def __init__(
-        self, recorder: Recorder, identity: int, step: str, metadata: dict[str, Any], binding: str | None
+        self,
+        recorder: Recorder,
+        identity: int,
+        step: str,
+        metadata: dict[str, Any],
+        binding: str | None,
+        *,
+        pending: bool = False,
     ) -> None:
         self.recorder = recorder
         self.identity = identity
@@ -100,21 +124,33 @@ class Observation:
         self.metadata = metadata
         self.binding = binding
         self.result: dict[str, Any] = {}
+        self.pending = pending
+        self.committed = not pending
+        self.records: list[dict[str, Any]] = []
+
+    def commit(self) -> None:
+        self.committed = True
 
     def __enter__(self) -> Observation:
         self.parent = getattr(self.recorder._local, "current", None)
+        if self.pending:
+            if getattr(self.recorder._local, "pending", None) is not None:
+                raise RuntimeError("a pending observation is already active")
+            self.recorder._local.pending = self
         self.recorder.set_scope(self.identity)
 
         # Marker lifecycle and scalar clock reads stay outside observer ranges.
         # Wrapping marker entry/exit would break the native profiler stack.
         try:
-            self._marker = self.recorder.markers.scope(f"markov/{self.step}/{self.identity}")
+            prefix = "markov_pending" if getattr(self.recorder._local, "pending", None) is not None else "markov"
+            self._marker = self.recorder.markers.scope(f"{prefix}/{self.step}/{self.identity}")
             self._marker.__enter__()
         except BaseException:
             self.recorder.set_scope(self.parent)
+            if self.pending:
+                self.recorder._local.pending = None
             raise
 
-        self.wall_time_ns = time.time_ns()
         self.start_ns = time.perf_counter_ns()
 
         return self
@@ -136,9 +172,10 @@ class Observation:
                 "binding": self.binding,
                 "start_ns": self.start_ns,
                 "end_ns": end_ns,
-                "wall_time_ns": self.wall_time_ns,
                 "metadata": self.metadata,
                 "result": self.result,
                 "status": "completed" if exc_type is None else "failed",
             }
         )
+        if self.pending:
+            self.recorder.finish_pending(self)

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <set>
@@ -25,18 +26,10 @@ namespace {
 
 using Json = nlohmann::json;
 
-Json object_identity(const Json & object) {
-    return {
-        {                 "kind",                 object.at("kind") },
-        {                 "name",                 object.at("name") },
-        { "measurement_boundary", object.at("measurement_boundary") },
-        {             "features",             object.at("features") }
-    };
-}
-
 std::string measurement_kind(const Json & object) {
     const auto & kind = object.at("kind");
     if (kind == "cpu") return "cpu";
+    if (kind == "collective" && object.at("features").at("execution") == "host_synchronous") return "cpu";
     if (kind == "transfer" && object.at("features").at("execution") == "synchronous_host_driver") return "transfer";
     return "device";
 }
@@ -52,11 +45,18 @@ Json measurement_trigger(const Json & requests) {
     return result;
 }
 
+Json cpu_service_scope(const Json & features) {
+    return {
+        { "service", features.at("service") },
+        {    "step",    features.at("step") },
+        {   "phase",   features.at("phase") },
+        {    "rank",    features.at("rank") }
+    };
+}
+
 struct SelectedRequirement {
     Json row;
-    std::string configuration_id;
-    std::string workload_id;
-    Json model_paths;
+    const Json & combination; // Borrowed from this run's immutable prediction.
 };
 
 struct SamplingGroup {
@@ -72,10 +72,7 @@ struct SamplingGroup {
 // CostQuery/NodeCosts; observing a model batch does not reproduce its prior state.
 class MeasurementHistory {
 public:
-    MeasurementHistory(const Project & project, const Json & prediction) {
-        const auto attempts = prediction.find("performance_sampling");
-        if (attempts != prediction.end()) attempts_ = &*attempts;
-
+    MeasurementHistory(const Project & project, const Json & prediction, const Json & attempts) : attempts_(attempts) {
         std::map<std::string, Measurement> declarations;
         for (const auto & path : project.performance_manifests) {
             const auto source = path.lexically_normal().string();
@@ -102,13 +99,20 @@ public:
                     continue;
                 }
                 const auto prepared = input::read_json(input::resolve_path(path, manifest.at("input")));
+                const auto observed = input::read_json(input::resolve_path(path, manifest.at("environment")));
+                item.environment = Environment::read(prepared.at("environment"));
+                item.environment.measurement = observed.at("runtime").at("measurement_environment");
                 item.prepared = {
-                    {     "framework",     prepared.at("framework") },
-                    {    "model_path",    prepared.at("model_path") },
-                    { "configuration", prepared.at("configuration") },
-                    {   "environment",   prepared.at("environment") }
+                    {           "framework",           prepared.at("framework") },
+                    { "model_configuration", prepared.at("model_configuration") },
+                    {       "configuration",       prepared.at("configuration") }
                 };
                 item.kind = manifest.at("measurement_kind").get<std::string>();
+                if (item.kind == "native_cpu_activity") {
+                    const auto ranks = prepared.at("source_ranks").get<std::set<std::uint32_t>>();
+                    for (const auto & features : prepared.at("cpu_services"))
+                        if (ranks.contains(features.at("rank").get<std::uint32_t>())) item.cpu_services.insert(cpu_service_scope(features));
+                }
                 for (const auto & point : prepared.at("measurement_grid")) item.cohorts.insert(measurement_trigger(point.at("requests")).dump());
                 measurements_.push_back(std::move(item));
             }
@@ -125,7 +129,7 @@ public:
     }
 
     Json previous(const Project & project, const Candidate & candidate, const CollectionAdapter & collection, const TemplateAdapter & binding,
-                  const SamplingGroup & group, const Json & trigger) const {
+                  const SamplingGroup & group, const Json & trigger, const Json * cpu_service = nullptr) const {
         auto evidence = Json::array();
         const auto target_limits = binding.control_limits(candidate.configuration);
         const auto trigger_key = trigger.dump();
@@ -134,12 +138,14 @@ public:
                                         return measurement.models.contains(path.get<std::string>());
                                     });
             if (!applicable || !matching_kind(group.kind, measurement.kind) || !measurement.cohorts.contains(trigger_key)) continue;
+            if (cpu_service && !measurement.cpu_services.contains(*cpu_service)) continue;
 
             const auto & prepared = measurement.prepared;
-            if (prepared.at("framework") != collection.name() || prepared.at("model_path") != project.model_path.string()) continue;
-            const auto & deployment = prepared.at("environment");
-            if (deployment.at("service") != candidate.environment.service || deployment.at("devices") != candidate.environment.devices
-                || deployment.at("runtime") != "docker")
+            if (prepared.at("framework") != collection.name() || project.model_configuration.is_null()
+                || prepared.at("model_configuration") != project.model_configuration)
+                continue;
+            if (!measurement.environment.shares_implementation(candidate.environment)
+                || !measurement.environment.shares_measurement(candidate.environment, MeasurementScope::HostDevice))
                 continue;
             const auto source_configuration = binding.source_configuration(prepared.at("configuration"));
             if (!binding.shares_execution_path(source_configuration, candidate.configuration)) continue;
@@ -159,20 +165,23 @@ public:
             return evidence;
         }
 
-        if (!attempts_) return evidence;
-        for (const auto & [key, attempt] : attempts_->items()) {
+        for (const auto & [key, attempt] : attempts_.items()) {
             const auto & status = attempt.at("status");
             if (status != "captured" && status != "no_candidates" && status != "failed") continue;
 
             const auto plan = Json::parse(key);
             if (plan.at("configuration_id") != candidate.id || plan.at("measurement_kind") != group.kind) continue;
+            if (cpu_service) {
+                const auto & services = plan.at("cpu_services");
+                if (std::ranges::find(services, *cpu_service) == services.end()) continue;
+            }
             for (const auto & previous : plan.at("native_work")) {
                 if (previous != trigger) continue;
                 Json record{
-                    { "sampling_key",                    key },
-                    {       "status",                 status },
-                    {     "manifest", attempt.at("manifest") },
-                    {         "work",                trigger }
+                    { "sampling_key",                     key },
+                    {       "status",                  status },
+                    {    "manifests", attempt.at("manifests") },
+                    {         "work",                 trigger }
                 };
                 const auto reason = attempt.find("reason");
                 if (reason != attempt.end()) record["reason"] = *reason;
@@ -187,9 +196,9 @@ public:
         auto sources = Json::array();
         for (const auto & measurement : measurements_) sources.push_back(measurement.manifest_path);
         return {
-            { "source_manifests",                                                                             std::move(sources) },
-            {      "unavailable",                                                                                   unavailable_ },
-            {         "boundary", "native cohort history under the same deployment and control limits; not object cost coverage" }
+            { "source_manifests",                                                                                       std::move(sources) },
+            {      "unavailable",                                                                                             unavailable_ },
+            {         "boundary", "native cohort history under the same observed environment and control limits; not object cost coverage" }
         };
     }
 
@@ -200,7 +209,9 @@ private:
         bool declared = false;
         std::string kind;
         Json prepared;
+        Environment environment;
         std::set<std::string> cohorts;
+        std::set<Json> cpu_services;
     };
 
     static bool matching_kind(std::string_view requested, std::string_view observed) {
@@ -210,18 +221,13 @@ private:
     }
 
     std::vector<Measurement> measurements_;
-    const Json * attempts_ = nullptr; // Borrowed from the immutable prediction during run().
+    const Json & attempts_; // Borrowed from the caller's durable ledger during run().
     Json unavailable_ = Json::array();
 };
 
 } // namespace
 
-PerformanceSamplingPlan::PerformanceSamplingPlan(std::span<const CollectionAdapter * const> collection_adapters,
-                                                 std::span<const TemplateAdapter * const> template_adapters)
-    : collection_adapters_(collection_adapters.begin(), collection_adapters.end()),
-      template_adapters_(template_adapters.begin(), template_adapters.end()) {}
-
-nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json & prediction) const {
+nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json & prediction, const Json & attempts) const {
     std::map<std::string, std::size_t> contexts;
     const auto & representative_groups = prediction.at("representative_collection").at("groups");
     for (std::size_t index = 0; index < representative_groups.size(); ++index)
@@ -231,11 +237,14 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
     auto pending = Json::array();
     for (const auto & combination : prediction.at("combinations")) {
         const auto requirements = combination.find("performance_requirements");
-        if (requirements == combination.end()) continue;
+        if (requirements == combination.end() || !requirements->contains("data_file")) continue;
         const auto configuration = combination.at("configuration_id").get<std::string>();
         const auto workload = combination.at("request_workload_id").get<std::string>();
-        for (const auto & row : requirements->at("objects")) {
-            if (row.at("coverage") == "candidate_available") continue;
+        std::ifstream stream;
+        stream.exceptions(std::ios::badbit | std::ios::failbit);
+        stream.open(requirements->at("data_file").get<std::string>(), std::ios::binary);
+        const auto data = Json::from_cbor(stream);
+        for (const auto & row : data.at("objects")) {
             Json consumer{
                 {    "configuration_id", configuration },
                 { "request_workload_id",      workload }
@@ -251,17 +260,14 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
             }
 
             const auto key = Json{
-                { "context",        contexts.at(configuration) },
-                {  "object", object_identity(row.at("object")) }
+                { "context", contexts.at(configuration) },
+                {  "object",           row.at("object") }
             }.dump();
-            auto [entry, inserted] = selected.try_emplace(key);
+            auto [entry, inserted] = selected.try_emplace(key, row, combination);
             auto & requirement = entry->second;
             if (inserted) {
-                requirement.row = row;
+                requirement.row["work_origin"] = data.at("origins").at(row.at("work_origin").get<std::size_t>());
                 requirement.row["consumers"] = Json::array();
-                requirement.configuration_id = configuration;
-                requirement.workload_id = workload;
-                requirement.model_paths = combination.at("cost_models");
             }
             requirement.row["consumers"].push_back(std::move(consumer));
         }
@@ -269,19 +275,20 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
 
     std::map<std::string, SamplingGroup> grouped;
     for (auto & [identity, requirement] : selected) {
+        const auto & combination = requirement.combination;
         const auto kind = measurement_kind(requirement.row.at("object"));
         const auto key = Json{
-            { "configuration_id", requirement.configuration_id },
-            {      "workload_id",      requirement.workload_id },
-            { "measurement_kind",                         kind }
+            { "configuration_id",    combination.at("configuration_id") },
+            {      "workload_id", combination.at("request_workload_id") },
+            { "measurement_kind",                                  kind }
         }.dump();
         auto [entry, inserted] = grouped.try_emplace(key);
         auto & group = entry->second;
         if (inserted) {
-            group.configuration_id = requirement.configuration_id;
-            group.workload_id = requirement.workload_id;
+            group.configuration_id = combination.at("configuration_id").get<std::string>();
+            group.workload_id = combination.at("request_workload_id").get<std::string>();
             group.kind = kind;
-            group.model_paths = std::move(requirement.model_paths);
+            group.model_paths = combination.at("cost_models");
             // A new candidate can cover other feature points in this shared
             // execution context, including combinations not yet expanded.
             for (const auto & configuration : representative_groups.at(contexts.at(group.configuration_id)).at("configuration_ids"))
@@ -290,30 +297,7 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
         group.requirements.push_back(std::move(requirement.row));
     }
 
-    // Read each applicable catalog once, and only when CPU sampling is needed.
-    // Definitions supply interval identities; target queries still own point coverage.
-    std::set<std::string> cpu_configurations;
-    for (const auto & [key, group] : grouped)
-        if (group.kind == "cpu") cpu_configurations.insert(group.configuration_id);
-
-    std::map<std::string, std::set<std::string>> catalogs;
-    for (const auto & combination : prediction.at("combinations")) {
-        const auto configuration = combination.at("configuration_id").get<std::string>();
-        if (!cpu_configurations.contains(configuration)) continue;
-        const auto requirements = combination.find("performance_requirements");
-        if (requirements != combination.end() && requirements->contains("cpu_service_catalog"))
-            catalogs[requirements->at("cpu_service_catalog").get<std::string>()].insert(configuration);
-    }
-    std::map<std::string, std::map<std::string, Json>> cpu_services;
-    for (const auto & [path, configurations] : catalogs) {
-        const auto catalog = input::read_json(path);
-        for (const auto & service : catalog.at("services")) {
-            const auto key = service.dump();
-            for (const auto & configuration : configurations) cpu_services[configuration].emplace(key, service);
-        }
-    }
-
-    const MeasurementHistory history(project, prediction);
+    const MeasurementHistory history(project, prediction, attempts);
     auto groups = Json::array();
     for (const auto & [identity, group] : grouped) {
         const auto & target = project.configuration(group.configuration_id);
@@ -345,17 +329,23 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
             auto assignments = std::move(recipe["assignments"]);
             auto requests = std::move(recipe["measurement_requests"]);
             auto grid = std::move(recipe["measurement_grid"]);
-            auto earlier = Json::array();
-            for (const auto & point : grid)
-                earlier.push_back(history.previous(project, candidate, **collection, **binding, group, measurement_trigger(point.at("requests"))));
 
             std::set<std::size_t> used;
+            std::set<Json> cpu_services;
             for (auto & assignment : assignments) {
+                const auto & object = group.requirements.at(assignment.at("requirement_index").get<std::size_t>()).at("object");
+                const auto cpu_service = object.at("kind") == "cpu" ? std::optional(cpu_service_scope(object.at("features"))) : std::nullopt;
                 auto fresh = Json::array();
                 auto previous_attempts = Json::array();
                 for (const auto & point_index : assignment.at("point_indices")) {
                     const auto index = point_index.get<std::size_t>();
-                    const auto & previous = earlier.at(index);
+                    const auto previous = history.previous(project,
+                                                           candidate,
+                                                           **collection,
+                                                           **binding,
+                                                           group,
+                                                           measurement_trigger(grid.at(index).at("requests")),
+                                                           cpu_service ? &*cpu_service : nullptr);
                     if (!previous.empty()) {
                         for (const auto & attempt : previous) previous_attempts.push_back(attempt);
                         continue;
@@ -364,6 +354,7 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
                     used.insert(index);
                 }
                 assignment["point_indices"] = std::move(fresh);
+                if (cpu_service && !assignment.at("point_indices").empty()) cpu_services.insert(*cpu_service);
                 if (assignment.at("point_indices").empty()) {
                     assignment["status"] = "previous_sampling_attempt_without_new_trigger";
                     assignment["reason"] = "previous_sampling_attempt_without_new_trigger";
@@ -383,33 +374,15 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
             if (!used.empty()) {
                 for (const auto & point : recipe.at("lifecycle_points")) {
                     const auto index = point.get<std::size_t>();
-                    if (!earlier.at(index).empty()) continue;
+                    const auto trigger = measurement_trigger(grid.at(index).at("requests"));
+                    const auto attempted = [&](const Json * service) {
+                        return !history.previous(project, candidate, **collection, **binding, group, trigger, service).empty();
+                    };
+                    const bool previous =
+                        group.kind == "cpu" ? std::ranges::all_of(cpu_services, [&](const auto & service) { return attempted(&service); }) : attempted(nullptr);
+                    if (previous) continue;
                     lifecycle_points.push_back(index);
                     used.insert(index);
-                }
-            }
-
-            std::optional<std::size_t> empty_schedule_point;
-            if (group.kind == "cpu" && !used.empty()
-                && std::ranges::any_of(cpu_services.at(group.configuration_id), [](const auto & entry) { return entry.second.at("phase") == "idle"; })) {
-                // Cover the known empty-control mechanism in the same CPU run,
-                // before later timing exposes it as a target cost requirement.
-                const Json idle{
-                    {    "phase",        "idle" },
-                    { "requests", Json::array() }
-                };
-                const auto found = std::ranges::find(requests, idle);
-                const auto index = found == requests.end() ? requests.size() : static_cast<std::size_t>(found - requests.begin());
-                if (found == requests.end()) {
-                    auto probe = (*collection)->workloads(candidate, prompts.requests, Json::array({ idle }));
-                    probe.at(0)["id"] = index;
-                    requests.push_back(idle);
-                    grid.push_back(std::move(probe.at(0)));
-                    earlier.push_back(history.previous(project, candidate, **collection, **binding, group, measurement_trigger(grid.at(index).at("requests"))));
-                }
-                if (earlier.at(index).empty()) {
-                    used.insert(index);
-                    empty_schedule_point = index;
                 }
             }
 
@@ -429,13 +402,9 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
                 {      "native_work", Json::array() }
             };
             for (const auto index : used) key["native_work"].push_back(measurement_trigger(grid.at(index).at("requests")));
-            Json cpu_points = Json::array();
-            if (group.kind == "cpu") {
-                for (const auto & requirement : group.requirements) cpu_points.push_back(requirement.at("object").at("features"));
-                // An idle recipe triggers a mechanism, not a zero-member work
-                // label: filtering may still inspect an existing native batch.
-                // Static descriptors let sampling record its actual work.
-            }
+            // A cohort does not prove that every CPU role or named interval
+            // was requested. This is attempt scope, never measured coverage.
+            if (group.kind == "cpu") key["cpu_services"] = cpu_services;
             Json planned_group{
                 {                  "key",                                                                      key.dump() },
                 {     "configuration_id",                                                                    candidate.id },
@@ -454,22 +423,16 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
                 for (const auto & index : lifecycle_points)
                     planned_group["mechanism_points"]["request_lifecycles"].push_back(relocated.at(index.get<std::size_t>()));
             }
-            if (group.kind == "cpu") {
-                planned_group["cpu_services"] = std::move(cpu_points);
-                planned_group["cpu_service_descriptors"] = Json::array();
-                for (const auto & [key, service] : cpu_services[group.configuration_id]) planned_group["cpu_service_descriptors"].push_back(service);
-                if (empty_schedule_point) planned_group["mechanism_points"]["empty_schedule"] = relocated.at(*empty_schedule_point);
-            }
             groups.push_back(std::move(planned_group));
             break;
         }
     }
     return {
-        {  "status",                                                                                                       "planned" },
-        {  "groups",                                                                                               std::move(groups) },
-        { "pending",                                                                                              std::move(pending) },
-        { "history",                                                                                              history.describe() },
-        {   "scope", "actual target points plus source CPU interval descriptors; unexpanded target feature points remain unresolved" }
+        {  "status",                                                                                              "planned" },
+        {  "groups",                                                                                      std::move(groups) },
+        { "pending",                                                                                     std::move(pending) },
+        { "history",                                                                                     history.describe() },
+        {   "scope", "actual target work including named CPU intervals; unexpanded target feature points remain unresolved" }
     };
 }
 

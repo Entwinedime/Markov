@@ -1,8 +1,6 @@
 #pragma once
 
-#include "markov/graph/source_graph.hpp"
-
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -13,19 +11,26 @@
 
 namespace markov {
 
+struct CostQuery;
+
 // Explicit conditional inputs, not a fitted performance model.
 class NodeDurations {
 public:
     void load(const std::filesystem::path & path, const std::filesystem::path & base_manifest);
     bool contains(const std::filesystem::path & manifest) const;
-    std::optional<std::int64_t> duration(const std::filesystem::path & manifest, SourceSpanId span) const;
+    std::optional<std::int64_t> duration(const std::filesystem::path & manifest, const CostQuery & query) const;
     nlohmann::json describe(const std::filesystem::path & manifest) const;
 
 private:
+    struct Rule {
+        nlohmann::json work;
+        std::int64_t duration_ns;
+    };
+
     struct Source {
         std::filesystem::path path;
         std::vector<std::string> assumptions;
-        std::map<SourceSpanId, std::int64_t> values;
+        std::vector<Rule> values;
     };
 
     std::map<std::filesystem::path, Source> sources_;

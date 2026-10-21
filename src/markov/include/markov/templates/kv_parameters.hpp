@@ -22,6 +22,8 @@ struct KvParameterAxis {
     bool output;
     std::size_t slot;
     KvParameterExtent extent;
+
+    bool operator==(const KvParameterAxis &) const = default;
 };
 
 struct KvParameterDomain {
@@ -31,6 +33,8 @@ struct KvParameterDomain {
     std::optional<bool> allocates_pages;
     std::optional<bool> release_free_empty;
     std::optional<std::size_t> release_request_slot;
+
+    bool operator==(const KvParameterDomain &) const = default;
 };
 
 class KvParameterLayout {
@@ -48,6 +52,8 @@ public:
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input,
                                                       std::optional<std::size_t> request_slot = std::nullopt) const;
     std::optional<bool> allocation_branch() const { return domain_.allocates_pages; }
+
+    bool operator==(const KvParameterLayout &) const = default;
 
 private:
     KvParameterKind kind_;

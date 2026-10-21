@@ -12,9 +12,10 @@ from markov_collection.adapters.runtimes.ascend.torch_npu.workspace import Works
 
 
 class SGLangWarmup:
-    def __init__(self, directory: Path, prefix: str) -> None:
+    def __init__(self, directory: Path, prefix: str, *, source_rank: int | None = None) -> None:
         self.directory = directory
         self.prefix = prefix
+        self._source_rank = source_rank
         self._cohort_ends: dict[int, int] | None = None
         self._snapshot_capacity: int | None = None
         directory.mkdir(parents=True, exist_ok=True)
@@ -79,7 +80,7 @@ class SGLangWarmup:
 
         record = {
             "point": index,
-            "rank": scheduler.ps.tp_rank,
+            "rank": self._rank(scheduler),
             "pid": os.getpid(),
             "phase": "prefill" if batch.forward_mode.is_extend() else "decode",
             "requests": [request.rid for request in batch.reqs],
@@ -97,9 +98,12 @@ class SGLangWarmup:
             # The native deferred reset establishes idleness. Observe the actual
             # retained workspace after each complete request-capacity cohort.
             directory = self.directory.parent / "warmup_state" / str(self._snapshot_capacity)
-            WorkspaceCapture(directory, scheduler.ps.tp_rank).begin()
+            WorkspaceCapture(directory, self._rank(scheduler)).begin()
             self._snapshot_capacity = None
         return result
+
+    def _rank(self, scheduler: Any) -> int:
+        return scheduler.ps.tp_rank if self._source_rank is None else self._source_rank
 
     @staticmethod
     def batches(directory: Path) -> list[dict[str, Any]]:

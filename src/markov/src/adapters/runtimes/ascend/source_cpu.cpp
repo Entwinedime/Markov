@@ -88,23 +88,17 @@ void AscendSourceExtractor::read_cpu_boundaries(const nlohmann::json & intervals
     }
 
     for (const auto & record : records) {
-        const auto & window = record.at("trace_interval");
-        if (window.is_null()) continue;
+        // Journal entry probes are not profiler service coordinates. Only the
+        // actual driver body supplies a new physical timing boundary here.
+        if (record.value("ignored", false) || record.at("copy_execution") != "synchronous_driver") continue;
         const auto lane = lanes.find({ record.at("rank").get<std::uint32_t>(), record.at("tid").get<std::uint64_t>() });
         if (lane == lanes.end()) continue;
+        const auto & copy = record.at("copy_interval");
         retain(lane->second,
-               window.at("begin_ns").get<std::int64_t>(),
-               window.at("end_ns").get<std::int64_t>(),
-               CpuBoundaryKind::Runtime,
-               record.at("api").get<std::string>());
-        if (record.at("copy_execution") == "synchronous_driver") {
-            const auto & copy = record.at("copy_interval");
-            retain(lane->second,
-                   copy.at("begin_ns").get<std::int64_t>(),
-                   copy.at("end_ns").get<std::int64_t>(),
-                   CpuBoundaryKind::Transfer,
-                   ascend_cpu::driver_copy);
-        }
+               copy.at("begin_ns").get<std::int64_t>(),
+               copy.at("end_ns").get<std::int64_t>(),
+               CpuBoundaryKind::Transfer,
+               ascend_cpu::driver_copy);
     }
     for (const auto id : host_waits_) {
         const auto & span = graph_.spans()[id];
@@ -121,6 +115,21 @@ void AscendSourceExtractor::read_cpu_boundaries(const nlohmann::json & intervals
         retain_span(id, kind, name);
     }
     for (auto & [point, description] : descriptions) graph_.observe_cpu_boundary(point, std::move(description.first));
+
+    // Framework regions name otherwise unnamed, already observed points. They
+    // neither override physical names nor introduce another service cut.
+    for (const auto & call : calls_) {
+        if (!call.marker) continue;
+        const auto name = bindings_.cpu_name(call);
+        if (!name) continue;
+        const auto & marker = graph_.spans()[*call.marker];
+        const auto role = control_lanes.contains(graph_.boundaries()[marker.begin].lane) ? CpuThreadRole::Control : CpuThreadRole::Worker;
+        for (const auto & [point, edge] : {
+                 std::pair{ marker.begin, CpuBoundaryEdge::Begin },
+                 std::pair{   marker.end,   CpuBoundaryEdge::End }
+        })
+            if (!graph_.cpu_boundaries().contains(point)) graph_.observe_cpu_boundary(point, { role, CpuBoundaryKind::Function, edge, *name });
+    }
 }
 
 void AscendSourceExtractor::retain_cpu_window(SourceSpanId identity) {
@@ -134,7 +143,7 @@ void AscendSourceExtractor::read_cpu_service_boundaries() {
     // Native scope ends may differ from logical host completion. Retain both:
     // adapters bind ownership, while these observable points anchor sampling.
     for (const auto & call : calls_)
-        if (!call.is_annotation() && call.marker) retain_cpu_window(*call.marker);
+        if (call.marker && (!call.is_annotation() || bindings_.cpu_work_boundary(call))) retain_cpu_window(*call.marker);
 
     // Operation windows delimit replaceable CPU work. Nested helper returns
     // outside these interfaces do not define additional service units.
@@ -237,7 +246,8 @@ void AscendSourceExtractor::extract_worker_cpu() {
     std::map<std::size_t, std::vector<Endpoint>> lanes;
     for (SourceSpanId identity = 0; identity < graph_.spans().size(); ++identity) {
         const auto & span = graph_.spans()[identity];
-        if (span.kind != SourceSpanKind::CpuObservation || !span.owner_call) continue;
+        if ((span.kind != SourceSpanKind::CpuObservation && span.kind != SourceSpanKind::ResourceObservation) || !span.owner_call || observer_work(identity))
+            continue;
         const auto & begin = graph_.boundaries()[span.begin];
         const auto & end = graph_.boundaries()[span.end];
         if (control_lanes.contains(begin.lane) || begin.observed_time_ns == end.observed_time_ns) continue;

@@ -1,7 +1,8 @@
 #pragma once
 
 #include "markov/contracts/control.hpp"
-#include "markov/contracts/service_work.hpp"
+#include "markov/contracts/cpu_service.hpp"
+#include "markov/graph/source_graph.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -28,8 +29,8 @@ struct PeriodicOutputPolicy {
 
 // A qualified shared output region scans ordered members and packs outputs.
 // Its source span is a retained work anchor, not an indivisible CPU cost unit.
-// The native interval and context window determine incremental offsets from
-// published progress; no second mutable request state is needed.
+// Keep only its reuse conditions and anchor. Output token state belongs to
+// the controller and the original framework, not to a second payload model.
 class PublicationParameterLayout {
     friend class TemplateAssetCodec;
 
@@ -40,7 +41,8 @@ public:
           context_limit_(context_limit),
           sender_enabled_(sender_enabled) {}
 
-    std::expected<PublicationWork, std::string> evaluate(const BatchInput & input) const;
+    std::expected<SourceSpanId, std::string> qualify(const BatchInput & input) const;
+    std::expected<CpuPublicationWork, std::string> cpu_work(const BatchInput & input) const;
     bool can_reuse_members_from(const PublicationParameterLayout & donor) const;
 
 private:

@@ -26,6 +26,7 @@ public:
           access_(access),
           single_request_only_(single_request_only) {}
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input, std::uint32_t capacity) const;
+    bool operator==(const RequestPoolParameterLayout &) const = default;
 
 private:
     TensorParameterLayout shapes_;

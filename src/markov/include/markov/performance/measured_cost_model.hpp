@@ -42,4 +42,9 @@ private:
     std::map<Features, std::int64_t> entries_;
 };
 
+using CommunicationCostModel = MeasuredCostModel<CommunicationCostFeatures, CostQueryKind::Communication, NodeCostBasis::CommunicationCandidate>;
+using CpuCostModel = MeasuredCostModel<CpuServiceWork, CostQueryKind::Cpu, NodeCostBasis::CpuCandidate>;
+using DeviceCommandCostModel = MeasuredCostModel<DeviceCommandWork, CostQueryKind::DeviceCommand, NodeCostBasis::DeviceCommandCandidate>;
+using TransferCostModel = MeasuredCostModel<TransferCostFeatures, CostQueryKind::Transfer, NodeCostBasis::TransferCandidate>;
+
 } // namespace markov

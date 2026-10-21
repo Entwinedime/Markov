@@ -4,9 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
 #include <stdexcept>
-#include <utility>
 #include <variant>
 
 namespace markov {
@@ -52,7 +50,8 @@ nlohmann::json KTransformersCollectionAdapter::configuration(const FrameworkConf
     };
 }
 
-nlohmann::json KTransformersCollectionAdapter::instrumentation() const {
+nlohmann::json KTransformersCollectionAdapter::instrumentation(bool structural) const {
+    if (!structural) return nlohmann::json::object();
     // Native KT wrappers already run in Python; no standard template binding is
     // claimed by this capture-only adapter.
     return {
@@ -62,25 +61,14 @@ nlohmann::json KTransformersCollectionAdapter::instrumentation() const {
     };
 }
 
+nlohmann::json KTransformersCollectionAdapter::capture_executions(const Candidate &, bool) const { return nlohmann::json::array({ nullptr }); }
+
 nlohmann::json KTransformersCollectionAdapter::workloads(const Candidate &, std::span<const Request>, const nlohmann::json &) const {
     throw std::invalid_argument("independent sampling currently implements SGLang");
 }
 
-nlohmann::json KTransformersCollectionAdapter::sampling_requests(const Candidate &, std::span<const Request>, const nlohmann::json & requirements) const {
-    auto unresolved = nlohmann::json::array();
-    for (std::size_t index = 0; index < requirements.size(); ++index)
-        unresolved.push_back({
-            { "requirement_index",                                            index },
-            {            "reason", "framework_performance_sampling_not_implemented" }
-        });
-    return {
-        { "measurement_requests", nlohmann::json::array() },
-        {     "measurement_grid", nlohmann::json::array() },
-        {          "assignments", nlohmann::json::array() },
-        {     "lifecycle_points", nlohmann::json::array() },
-        {       "lifecycle_gaps", nlohmann::json::array() },
-        {           "unresolved",   std::move(unresolved) }
-    };
+nlohmann::json KTransformersCollectionAdapter::sampling_requests(const Candidate &, std::span<const Request>, const nlohmann::json &) const {
+    throw std::invalid_argument("independent sampling currently implements SGLang");
 }
 
 nlohmann::json KTransformersCollectionAdapter::collectives(const Candidate &, std::span<const std::filesystem::path>) const {

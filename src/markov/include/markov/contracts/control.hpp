@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -19,7 +20,7 @@ using RequestId = std::size_t; // Index in the current immutable workload, not a
 using WorkId = std::uint64_t;
 
 enum class StepKind { Schedule, Prepare, Prefill, Decode, Publish };
-enum class PortKind { Selected, Prepared, Submitted, DeviceDone, Published };
+enum class PortKind { Selected, Prepared, Submitted, DeviceDone, ResultProcessed };
 enum class BatchPhase { Prefill, Decode, Idle };
 
 struct PortRef {
@@ -33,10 +34,16 @@ struct RequestSlice {
     RequestId request_id;
     std::uint32_t input_tokens;
     std::uint32_t context_tokens;
-    std::uint32_t generated_tokens;      // Output tokens already published when this batch was formed.
-    bool finishes;                       // Expected publication effect; committed only at the Published port.
+    std::uint32_t generated_tokens;      // Tokens already generated when this batch was formed; output can be buffered.
+    bool finishes;                       // Expected generation effect; committed at ResultProcessed.
     std::uint32_t pool_slot = 0;         // Nonzero logical reservation assigned before invocation; zero is padding.
     std::vector<std::uint32_t> kv_pages; // Logical target page identities reserved through this invocation.
+};
+
+struct IncomingRequest {
+    RequestId request_id;
+    std::uint32_t prompt_tokens;
+    std::uint32_t output_tokens;
 };
 
 // Describes work, not a second copy of the controller's request state.
@@ -49,6 +56,7 @@ struct BatchInput {
     std::vector<BatchFilter> filters; // Ordered native batch selections, including no-op and empty results.
     std::optional<BatchMerge> merge = std::nullopt;
     AdmissionWork admission_work;
+    std::vector<IncomingRequest> incoming_requests = {}; // This poll's raw cohort, independent of the selected model batch.
 };
 
 struct PortDependency {
@@ -59,19 +67,9 @@ struct PortDependency {
 struct InvokeStep {
     WorkId work_id; // Assigned once by the controller; acceptance is not completion.
     StepKind step;
-    BatchInput input;
-    std::vector<PortRef> dependencies; // Entry gates, applied per rank.
+    std::shared_ptr<const BatchInput> input; // Steps own one immutable batch snapshot through acceptance.
+    std::vector<PortRef> dependencies;       // Entry gates, applied per rank.
     std::vector<PortDependency> port_dependencies;
-};
-
-struct CompleteRequest {
-    RequestId request_id;
-    PortRef published;
-};
-
-// Input has become visible to scheduling; admission can still wait for capacity.
-struct ReceiveRequest {
-    RequestId request_id;
 };
 
 struct UnsupportedControl {
@@ -79,7 +77,7 @@ struct UnsupportedControl {
 };
 
 // An empty action list yields to the runtime. It does not busy-poll or charge time.
-using ControlAction = std::variant<InvokeStep, CompleteRequest, ReceiveRequest, UnsupportedControl>;
+using ControlAction = std::variant<InvokeStep, UnsupportedControl>;
 
 struct RequestArrived {
     RequestId request_id;
@@ -92,6 +90,26 @@ struct WorkPortCompleted {
 struct ControlEvent {
     std::int64_t time_ns;
     std::variant<RequestArrived, WorkPortCompleted> payload;
+};
+
+// An actual token-bearing handoff at the modeled output boundary. This does
+// not advance the controller's generation/KV state.
+struct RequestOutput {
+    RequestId request_id;
+    std::uint64_t tokens;
+    std::uint64_t cumulative_tokens;
+    bool finishes;
+};
+
+// Input processing has returned for this request. This only anchors metrics;
+// the controller already owns its single reservation in the frozen raw cohort.
+struct RequestReady {
+    RequestId request_id;
+};
+
+struct ExecutionEvent {
+    std::int64_t time_ns;
+    std::variant<RequestArrived, WorkPortCompleted, RequestReady, RequestOutput> payload;
 };
 
 struct ControllerSummary {
@@ -124,6 +142,9 @@ public:
 
     // All events at time_ns are ordered and delivered together, before a new decision.
     virtual std::vector<ControlAction> handle(std::span<const ControlEvent> events) = 0;
+    // Only these ports can be referenced by a later decision. The runtime
+    // retains their scheduled times without retaining their execution graphs.
+    virtual std::vector<PortRef> retained_ports() const = 0;
     virtual ControllerSummary finish() const = 0;
 };
 

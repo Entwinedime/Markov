@@ -57,12 +57,13 @@ class ValidationWorkflow:
             except CaptureProcessingFailed:
                 pass  # The recorded failure remains the authoritative outcome.
             capture = state["capture"]
-            if capture["manifest"] is None:
+            if capture["status"] != "captured":
                 item.update(status=capture["status"], reason=capture.get("reason", "validation_incomplete"))
                 write_json(directory / "run.json", state)
                 break
 
-            item.update(status="captured", manifest=capture["manifest"])
+            (manifest,) = capture["manifests"]
+            item.update(status="captured", manifest=manifest)
             item.pop("reason", None)
             write_json(directory / "run.json", state)
 
@@ -75,6 +76,6 @@ class ValidationWorkflow:
             relative = Path("results/comparison.json")
             write_json(directory / relative, comparison)
             state["comparison"] = str(relative)
-            compared = comparison["status"] == "complete"
+            compared = comparison["ports_complete"]
         finished = all(item["status"] == "captured" for item in validation["observations"])
         return compared, finished

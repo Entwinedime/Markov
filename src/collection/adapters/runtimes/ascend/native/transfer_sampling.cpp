@@ -31,16 +31,23 @@ struct DriverCopy {
     std::int64_t end;
 };
 
+struct QueueOrigin {
+    std::uint64_t scope_id;
+    bool observer;
+};
+
 struct QueueCall {
     std::uint64_t correlation_id;
     std::uint64_t scope_id;
     std::uint64_t tid;
     bool worker;
+    bool observer;
     std::int64_t begin;
     std::int64_t end = 0;
     int result = -1;
     std::vector<DriverCopy> copies;
     QueueCall * previous = nullptr;
+    std::unique_ptr<markov::collection::CpuObserver> exclusion;
     std::unique_ptr<markov::collection::CpuScope> cpu_scope;
 };
 
@@ -59,15 +66,16 @@ public:
     bool enabled() const { return enabled_.load(); }
 
     static std::uint64_t scope(std::uint64_t identity) { return std::exchange(scope_, identity); }
-    static bool worker_active() { return active_ != nullptr && active_->worker; }
+    static bool worker_active() { return active_ != nullptr && active_->worker && !active_->observer; }
 
     QueueCall * begin(std::uint64_t correlation_id, bool worker) {
         if (!enabled()) return nullptr;
 
         std::unique_ptr<QueueCall> call;
         std::uint64_t scope_id;
+        bool observer = markov::collection::cpu_sampling_excluded() || (active_ != nullptr && active_->observer);
         {
-            const markov::collection::CpuObserver observer;
+            const markov::collection::CpuObserver bookkeeping;
             scope_id = scope_;
             if (scope_id == 0 && active_ != nullptr) scope_id = active_->scope_id;
             {
@@ -76,20 +84,34 @@ public:
                     const auto found = pending_.find(correlation_id);
                     if (found == pending_.end()) return nullptr;
 
-                    scope_id = found->second;
+                    scope_id = found->second.scope_id;
+                    observer = found->second.observer;
                     pending_.erase(found);
                 }
                 else {
                     if (scope_id == 0) return nullptr;
-                    pending_.emplace(correlation_id, scope_id);
+                    pending_.emplace(correlation_id, QueueOrigin{ scope_id, observer });
                 }
             }
 
-            call = std::make_unique<QueueCall>(
-                QueueCall{ correlation_id, scope_id, static_cast<std::uint64_t>(syscall(SYS_gettid)), worker, wall_ns(), 0, -1, {}, active_, nullptr });
+            call = std::make_unique<QueueCall>(QueueCall{ correlation_id,
+                                                          scope_id,
+                                                          static_cast<std::uint64_t>(syscall(SYS_gettid)),
+                                                          worker,
+                                                          observer,
+                                                          wall_ns(),
+                                                          0,
+                                                          -1,
+                                                          {},
+                                                          active_,
+                                                          nullptr,
+                                                          nullptr });
         }
 
-        if (markov::collection::cpu_sampling_enabled())
+        // The original enqueue identity carries exclusion to the worker. Its
+        // CPU clocks and driver copies must not become business samples.
+        if (observer) call->exclusion = std::make_unique<markov::collection::CpuObserver>(true);
+        else if (markov::collection::cpu_sampling_enabled())
             call->cpu_scope = std::make_unique<markov::collection::CpuScope>(scope_id,
                                                                              worker ? markov::collection::CpuActivityKind::Worker
                                                                                     : markov::collection::CpuActivityKind::Enqueue,
@@ -106,8 +128,10 @@ public:
         std::unique_ptr<QueueCall> call(handle);
         call->end = wall_ns();
         call->cpu_scope.reset();
+        call->exclusion.reset();
         call->result = result;
         active_ = call->previous;
+        if (call->observer) return;
 
         const std::lock_guard lock(mutex_);
         records_.push_back(std::move(*call));
@@ -146,7 +170,7 @@ private:
     std::atomic_bool enabled_{ false };
     std::filesystem::path directory_;
     std::mutex mutex_;
-    std::unordered_map<std::uint64_t, std::uint64_t> pending_;
+    std::unordered_map<std::uint64_t, QueueOrigin> pending_;
     std::vector<QueueCall> records_;
 };
 

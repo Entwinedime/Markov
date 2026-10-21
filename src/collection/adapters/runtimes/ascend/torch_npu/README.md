@@ -22,6 +22,6 @@ SGLang 镜像装配该适配，KT 镜像不装配。cached 分配、扩容、复
 
 同步传输采样由相邻 native 库的 `transfer_sampling` 实现。Python 只读原生 batch 元数据并设置观察 scope；入队将该身份与原生 correlation ID 关联，worker 取回同一身份。队列区间只用于配对、确认成功和检查叶子归属，不产生 CPU 服务成本。同步 `drvMemcpy` 叶子保留完整单调墙钟首尾，不扣除 I/O 等待，也不拿外层 `rtMemcpyAsync` 或整个 worker 的墙钟替代传输时延。
 
-队列入口为 `markov_native_queue_begin(correlation_id, worker)`。部署时须将 native 库与使用同一队列头文件重编译的 torch_npu 一同安装；历史四参数入口不能用于此 transfer 采样。实际安装来源由 `markov_workspace_build.json` 记录，队列配对和完整 driver 记录仍需运行核对，不能由镜像名称推定精度资格。
+队列入口为 `markov_native_queue_begin(correlation_id, worker)`。部署时须将 native 库与使用同一队列头文件重编译的 torch_npu 一同安装。实际安装来源由 `markov_workspace_build.json` 记录，队列配对和完整 driver 记录仍需运行核对，不能由镜像名称推定精度资格。
 
 只有已跟踪的队列 worker、已配对成功的入队和完整观察 scope 能提供同步传输样本。没有队列身份、失败或不完整的记录保留为缺口；不会按时间邻近推断归属。采样不启用 CPU operator profiler，不记录提交计数、CPU 等待/探针扣减或完整 Enqueue 服务时间。现有结构采集的 task、queue、event、wait 和 workspace 因果继续由原生 trace 与 journal 提供。

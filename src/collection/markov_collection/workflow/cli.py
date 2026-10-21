@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from markov_collection.adapters.runtimes.ascend.capture import AscendCaptureRuntime
 from markov_collection.artifacts.json_file import read_json
 from markov_collection.workflow.collection import CollectionWorkflow
 
@@ -96,7 +97,7 @@ def main() -> None:
     parser = command_line.parser
 
     root = Path(__file__).resolve().parents[4]
-    workflow = CollectionWorkflow(root)
+    workflow = CollectionWorkflow(root, AscendCaptureRuntime())
     if arguments.command in {"predict", "explore"}:
         from markov_collection.workflow.prediction import PredictionWorkflow
 
@@ -178,8 +179,8 @@ def main() -> None:
 
     display = result
     if "prediction" in result:
-        # Persisted reports retain full requirements and provenance. The CLI
-        # shows current task progress and references those existing reports.
+        # Reports summarize the run; full requests and machine handoffs have
+        # separate durable owners. The CLI shows progress and their references.
         display = {}
         for field in (
             "run",
@@ -190,23 +191,37 @@ def main() -> None:
             "live_attempt",
             "active_wall_time_ns",
             "prediction_live",
+            "comparison_live",
             "performance_live",
             "workflow_busy",
             "requested_changes_applied",
+            "requested_comparison_applied",
             "active_representative",
-            "active_performance",
             "collection_performed",
             "collection",
             "collection_usage",
+            "assumptions",
+            "request_results",
             "prediction",
             "performance_plan",
             "capture",
             "comparison",
+            "comparison_task",
             "summary",
             "validation",
         ):
             if field in result:
                 display[field] = result[field]
+
+        active = result["active_performance"]
+        display["active_performance"] = (
+            {
+                field: result["performance_sampling"][active][field]
+                for field in ("configuration_id", "measurement_kind", "status")
+            }
+            if active is not None
+            else None
+        )
 
         display["combinations"] = []
         for combination in result.get("combinations", []):
@@ -227,11 +242,8 @@ def main() -> None:
             summary["metrics"] = None
             summary["request_count"] = None
             if metrics is not None:
-                summary["metrics"] = {}
-                for field, value in metrics.items():
-                    if field != "requests":
-                        summary["metrics"][field] = value
-                summary["request_count"] = len(metrics["requests"])
+                summary["metrics"] = metrics
+                summary["request_count"] = metrics["request_count"]
             display["combinations"].append(summary)
 
     exploration = result.get("validation") is not None
@@ -241,6 +253,7 @@ def main() -> None:
             ("workflow_busy", "existing workflow is running"),
             ("live_attempt", "native collection is running"),
             ("prediction_live", "prediction is running"),
+            ("comparison_live", "comparison is running"),
             ("performance_live", "cost fitting is running"),
         ):
             if result.get(field):
@@ -255,6 +268,8 @@ def main() -> None:
         print(json.dumps(display, indent=2))
     if result.get("status") == "failed" and arguments.command != "status":
         raise SystemExit(1)
+    if arguments.command == "compare" and result.get("requested_comparison_applied") is False:
+        raise SystemExit(2)
     if (
         (arguments.command == "compare" or exploration)
         and arguments.command != "status"

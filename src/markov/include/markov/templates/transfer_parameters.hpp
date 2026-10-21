@@ -18,6 +18,8 @@ struct TransferParameterLayout {
     std::size_t finished_count = 0;
     std::uint64_t element_bytes = 0;
 
+    bool operator==(const TransferParameterLayout &) const = default;
+
     std::expected<SourceTransfer, std::string> evaluate(const SourceTransfer & source, const BatchInput & input) const;
 };
 

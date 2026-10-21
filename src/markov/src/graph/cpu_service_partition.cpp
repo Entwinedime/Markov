@@ -118,7 +118,6 @@ std::vector<CpuServicePartition::Unit> CpuServicePartition::units() const {
         const auto * final = names_[end];
         if (first && final && first->role == final->role)
             result.push_back({
-                begin,
                 end,
                 { *first, *final },
                 std::move(members)

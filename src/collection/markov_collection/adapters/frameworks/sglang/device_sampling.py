@@ -138,7 +138,9 @@ def install(prepared: dict[str, Any]) -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     observer = DeviceSamplingObserver(
-        Path(os.environ["MARKOV_OBSERVATIONS"]), set(prepared["measurement_ids"]) | set(prepared["warmup_ids"])
+        Path(os.environ["MARKOV_OBSERVATIONS"]),
+        set(prepared["measurement_ids"]) | set(prepared["warmup_ids"]),
+        source_rank=prepared.get("shard_execution", {}).get("rank"),
     )
     batch = "sglang.srt.managers.schedule_batch.ScheduleBatch"
     scheduler = "sglang.srt.managers.scheduler.Scheduler"

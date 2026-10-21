@@ -3,6 +3,8 @@
 #include "markov/adapters/configuration.hpp"
 #include "markov/contracts/request.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -33,6 +35,7 @@ struct Project {
     std::filesystem::path path;
     std::filesystem::path model_path;
     std::filesystem::path tokenizer_path;
+    nlohmann::json model_configuration;
     std::vector<Candidate> configurations;
     std::vector<RequestWorkload> request_workloads;
     std::vector<TemplateInput> templates;

@@ -24,6 +24,7 @@ SimulationRuntime::SimulationRuntime(std::span<const Request> requests, Controll
       templates_(templates),
       costs_(costs),
       workspace_(templates.workspace_pools()),
+      execution_graph_(graph_path),
       graph_path_(std::move(graph_path)),
       request_timings_(requests.size()) {}
 
@@ -32,30 +33,23 @@ bool SimulationRuntime::LaterEvent::operator()(const QueuedEvent & a, const Queu
     return a.sequence > b.sequence;
 }
 
-void SimulationRuntime::enqueue(ControlEvent event) { events_.push({ std::move(event), next_event_sequence_++ }); }
+void SimulationRuntime::enqueue(ExecutionEvent event) { events_.push({ std::move(event), next_event_sequence_++ }); }
 
-std::optional<nlohmann::json> SimulationRuntime::accept(std::span<const ControlAction> actions) {
+std::optional<nlohmann::json> SimulationRuntime::accept(std::vector<ControlAction> actions) {
     std::vector<InvokeStep> invocations;
-    for (const auto & action : actions) {
+    for (auto & action : actions) {
         if (const auto * gap = std::get_if<UnsupportedControl>(&action))
             return report("unsupported",
                           Json::array({
                               { { "kind", "control" }, { "reason", gap->reason }, { "time_ns", time_ns_ } }
             }));
 
-        if (const auto * completion = std::get_if<CompleteRequest>(&action)) {
-            request_timings_[completion->request_id].completed_ns = work_.at(completion->published.work_id).completed_ports.at(PortKind::Published);
-            continue;
-        }
-
-        if (const auto * reception = std::get_if<ReceiveRequest>(&action)) {
-            request_timings_[reception->request_id].ready_ns = time_ns_;
-            continue;
-        }
-
-        invocations.push_back(std::get<InvokeStep>(action));
+        invocations.push_back(std::move(std::get<InvokeStep>(action)));
     }
-    if (invocations.empty()) return std::nullopt;
+    if (invocations.empty()) {
+        execution_graph_.retain(assembly_.frontier(), controller_.retained_ports());
+        return std::nullopt;
+    }
 
     auto batch = templates_.instantiate(invocations, request_capacity_);
     if (!batch) {
@@ -70,16 +64,12 @@ std::optional<nlohmann::json> SimulationRuntime::accept(std::span<const ControlA
         return report(missing_observation ? "needs_data" : "unsupported", Json::array({ std::move(description) }));
     }
 
-    std::vector<Work> staged;
-    for (std::size_t index = 0; index < invocations.size(); ++index) staged.push_back({ invocations[index], std::move((*batch)[index]), {} });
-
     std::vector<TemplateInstance *> instances;
-    for (auto & work : staged)
-        for (auto & instance : work.instances) instances.push_back(&instance);
     auto workspace = workspace_;
-    for (auto & work : staged) {
-        for (auto & instance : work.instances) {
-            const auto advanced = workspace.advance(instance, templates_, work.invocation.input);
+    for (std::size_t index = 0; index < invocations.size(); ++index) {
+        for (auto & instance : (*batch)[index]) {
+            instances.push_back(&instance);
+            const auto advanced = workspace.advance(instance, templates_, *invocations[index].input, graph_path_.has_value());
             if (!advanced)
                 return report("unsupported",
                               Json::array({
@@ -87,31 +77,27 @@ std::optional<nlohmann::json> SimulationRuntime::accept(std::span<const ControlA
                 }));
         }
     }
-    const auto connected = assembly_.connect(instances);
+    auto assembly = assembly_;
+    const auto connected = assembly.connect(instances);
     if (!connected)
         return report("unsupported",
                       Json::array({
                           { { "kind", "structure" }, { "reason", connected.error() }, { "time_ns", time_ns_ } }
         }));
     if (!execution_graph_.append(instances, invocations, time_ns_)) {
-        return report("unsupported",
-                      Json::array({
-                          { { "kind", "structure" }, { "reason", "target_dependency_cycle" }, { "time_ns", time_ns_ } }
+        record_batch(invocations);
+        auto result = report("unsupported",
+                             Json::array({
+                                 { { "kind", "structure" }, { "reason", "target_dependency_cycle" }, { "time_ns", time_ns_ } }
         }));
+        execution_graph_.release_batch();
+        return result;
     }
 
-    // Commit once after the whole batch has a valid graph. The current
-    // non-overlap controller cannot admit the next model batch before completion.
-    workspace_ = std::move(workspace);
-    for (auto & work : staged) {
-        const auto id = work.invocation.work_id;
-        if (!work_.emplace(id, std::move(work)).second) throw std::logic_error("duplicate dynamic work identity");
-    }
-    if (invocations.front().input.phase != BatchPhase::Idle) ++batches_;
-
-    // The graph consumes this batch's context synchronously. Earlier batches
-    // already have costs and need no rebuilt historical invocation lookup.
+    // Costs and completion times belong to this batch only. No failed batch
+    // publishes controller events, resource frontiers or workspace effects.
     auto completions = execution_graph_.schedule(costs_, invocations);
+    record_batch(invocations);
     if (!completions) {
         const auto & gap = completions.error();
         Json description{
@@ -123,10 +109,29 @@ std::optional<nlohmann::json> SimulationRuntime::accept(std::span<const ControlA
             { "source_manifest", gap.source_manifest ? Json(gap.source_manifest->string()) : Json(nullptr) },
             {         "time_ns",                                                                  time_ns_ }
         };
-        if (!gap.service_work.is_null()) description["service_work"] = gap.service_work;
-        return report("needs_data", Json::array({ std::move(description) }));
+        if (!gap.cost_query.is_null()) description["cost_query"] = gap.cost_query;
+        auto result = report("needs_data", Json::array({ std::move(description) }));
+        execution_graph_.release_batch();
+        return result;
     }
-    for (auto & event : *completions) enqueue(std::move(event));
+
+    workspace_ = std::move(workspace);
+    assembly_ = std::move(assembly);
+    execution_graph_.retain(assembly_.frontier(), controller_.retained_ports());
+    execution_graph_.release_batch();
+
+    // Instances are local to acceptance. Output events own their small effects;
+    // only control-port bookkeeping remains attached to dynamic work.
+    for (const auto & invocation : invocations) {
+        if (!work_.emplace(invocation.work_id, Work{}).second) throw std::logic_error("duplicate dynamic work identity");
+    }
+    work_count_ += invocations.size();
+    peak_work_ = std::max(peak_work_, work_.size());
+    if (invocations.front().input->phase != BatchPhase::Idle) ++batches_;
+    for (auto & event : *completions) {
+        if (const auto * completion = std::get_if<WorkPortCompleted>(&event.payload)) ++work_.at(completion->port.work_id).pending_ports;
+        enqueue(std::move(event));
+    }
     return std::nullopt;
 }
 
@@ -139,7 +144,15 @@ nlohmann::json SimulationRuntime::run(ServingLimits limits) {
         time_ns_ = events_.top().event.time_ns;
         std::vector<ControlEvent> simultaneous;
         while (!events_.empty() && events_.top().event.time_ns == time_ns_) {
-            simultaneous.push_back(events_.top().event);
+            const auto & event = events_.top().event;
+            if (const auto * output = std::get_if<RequestOutput>(&event.payload)) {
+                auto & timing = request_timings_[output->request_id];
+                if (!timing.first_published_ns) timing.first_published_ns = event.time_ns;
+                if (output->finishes) timing.completed_ns = event.time_ns;
+            }
+            else if (const auto * ready = std::get_if<RequestReady>(&event.payload)) request_timings_[ready->request_id].ready_ns = event.time_ns;
+            else if (const auto * arrival = std::get_if<RequestArrived>(&event.payload)) simultaneous.push_back({ event.time_ns, *arrival });
+            else simultaneous.push_back({ event.time_ns, std::get<WorkPortCompleted>(event.payload) });
             events_.pop();
         }
 
@@ -149,17 +162,16 @@ nlohmann::json SimulationRuntime::run(ServingLimits limits) {
             const auto * completion = std::get_if<WorkPortCompleted>(&event.payload);
             if (!completion) continue;
             auto & work = work_.at(completion->port.work_id);
-            work.completed_ports.emplace(completion->port.port, time_ns_);
-            if (completion->port.port == PortKind::Published) {
-                for (const auto & request : work.invocation.input.requests) {
-                    auto & timing = request_timings_[request.request_id];
-                    if (!timing.first_published_ns) timing.first_published_ns = time_ns_;
-                }
-            }
+            --work.pending_ports;
         }
 
-        const auto actions = controller_.handle(simultaneous);
-        if (auto stopped = accept(actions)) return std::move(*stopped);
+        if (!simultaneous.empty())
+            if (auto stopped = accept(controller_.handle(simultaneous))) return std::move(*stopped);
+
+        const auto retained = controller_.retained_ports();
+        std::erase_if(work_, [&](const auto & entry) {
+            return entry.second.pending_ports == 0 && std::ranges::none_of(retained, [&](const auto & port) { return port.work_id == entry.first; });
+        });
     }
 
     if (controller_.finish().completed_requests != requests_.size()) {
@@ -174,7 +186,7 @@ nlohmann::json SimulationRuntime::run(ServingLimits limits) {
 
 nlohmann::json SimulationRuntime::describe_invocation(const InvokeStep & invocation) const {
     auto requests = Json::array();
-    for (const auto & request : invocation.input.requests) {
+    for (const auto & request : invocation.input->requests) {
         requests.push_back({
             {               "id", requests_[request.request_id].id },
             {     "input_tokens",             request.input_tokens },
@@ -187,10 +199,10 @@ nlohmann::json SimulationRuntime::describe_invocation(const InvokeStep & invocat
     }
 
     auto filters = Json::array();
-    for (const auto & filter : invocation.input.filters) filters.push_back(filter.describe());
-    const auto & input = invocation.input;
+    for (const auto & filter : invocation.input->filters) filters.push_back(filter.describe());
+    const auto & input = *invocation.input;
     const ServingContract serving;
-    return {
+    Json result = {
         { "work_id", invocation.work_id },
         { "step", serving.block(invocation.step).name },
         { "phase", serving.phase_name(input.phase) },
@@ -202,69 +214,96 @@ nlohmann::json SimulationRuntime::describe_invocation(const InvokeStep & invocat
         { "admission_work", input.admission_work.describe(input.admission, input.phase == BatchPhase::Prefill ? input.requests.size() : 0) },
         { "batch_merge", input.merge ? input.merge->describe() : Json(nullptr) }
     };
+    if (invocation.step == StepKind::Schedule) {
+        auto incoming = Json::array();
+        for (const auto & request : input.incoming_requests)
+            incoming.push_back({
+                {            "id", requests_[request.request_id].id },
+                {    "request_id",               request.request_id },
+                { "prompt_tokens",            request.prompt_tokens },
+                { "output_tokens",            request.output_tokens }
+            });
+        result["incoming_requests"] = std::move(incoming);
+    }
+    return result;
 }
 
-nlohmann::json SimulationRuntime::report(std::string_view status, const nlohmann::json & gaps) const {
+void SimulationRuntime::record_batch(std::span<const InvokeStep> invocations) {
+    Json description = nullptr;
+    if (graph_path_) {
+        description = Json::array();
+        for (const auto & invocation : invocations) description.push_back(describe_invocation(invocation));
+    }
+    execution_graph_.record_batch(description);
+}
+
+std::optional<nlohmann::json> SimulationRuntime::request_result(RequestId id) const {
+    const auto & request = requests_[id];
+    const auto & timing = request_timings_[id];
+    if (!timing.completed_ns) return std::nullopt;
+    const auto ready = *timing.ready_ns;
+    const auto first = *timing.first_published_ns;
+    const auto last = *timing.completed_ns;
+    return Json{
+        {                        "id",                                                                                                         request.id },
+        {      "scheduled_arrival_ns",                                                                                            request.arrival_time_ns },
+        {        "scheduler_ready_ns",                                                                                                              ready },
+        {        "first_published_ns",                                                                                                              first },
+        {              "completed_ns",                                                                                                               last },
+        {                   "ttft_ns",                                                                                                      first - ready },
+        {        "request_latency_ns",                                                                                                       last - ready },
+        {            "driver_ttft_ns",                                                                                    first - request.arrival_time_ns },
+        { "driver_request_latency_ns",                                                                                     last - request.arrival_time_ns },
+        {                   "tpot_ns", request.output_tokens == 1 ? Json(nullptr) : Json(static_cast<double>(last - first) / (request.output_tokens - 1)) }
+    };
+}
+
+nlohmann::json SimulationRuntime::report(std::string_view status, const nlohmann::json & gaps) {
+    execution_graph_.finish();
     Json metrics = nullptr;
     if (status == "complete") {
         const auto start_ns = std::min_element(requests_.begin(), requests_.end(), [](const Request & a, const Request & b) {
                                   return a.arrival_time_ns < b.arrival_time_ns;
                               })->arrival_time_ns;
-        const auto window_ns = time_ns_ - start_ns;
-
-        auto requests = Json::array();
         std::uint64_t tokens = 0;
+        auto last_published_ns = start_ns;
         for (RequestId id = 0; id < requests_.size(); ++id) {
             const auto & request = requests_[id];
             const auto & timing = request_timings_[id];
-            const auto ready = *timing.ready_ns;
-            const auto first = *timing.first_published_ns;
             const auto last = *timing.completed_ns;
             tokens += request.output_tokens;
-            requests.push_back({
-                {                        "id",                                                                                                         request.id },
-                {      "scheduled_arrival_ns",                                                                                            request.arrival_time_ns },
-                {        "scheduler_ready_ns",                                                                                                              ready },
-                {        "first_published_ns",                                                                                                              first },
-                {              "completed_ns",                                                                                                               last },
-                {                   "ttft_ns",                                                                                                      first - ready },
-                {        "request_latency_ns",                                                                                                       last - ready },
-                {            "driver_ttft_ns",                                                                                    first - request.arrival_time_ns },
-                { "driver_request_latency_ns",                                                                                     last - request.arrival_time_ns },
-                {                   "tpot_ns", request.output_tokens == 1 ? Json(nullptr) : Json(static_cast<double>(last - first) / (request.output_tokens - 1)) }
-            });
+            last_published_ns = std::max(last_published_ns, last);
         }
 
+        // Private asynchronous tails can outlive the final visible response.
+        const auto window_ns = last_published_ns - start_ns;
         metrics = {
             {        "window_time_ns",                                                                            window_ns },
             { "output_tokens_per_sec", window_ns == 0 ? Json(nullptr) : Json(static_cast<double>(tokens) * 1e9 / window_ns) },
-            {              "requests",                                                                             requests }
+            {         "request_count",                                                                     requests_.size() }
         };
     }
 
     Json result = {
-        {            "status",                                                                      status                              },
-        {             "scope",                                                                                                 "modeled" },
-        {           "metrics",                                                                                                   metrics },
-        {              "gaps",                                                                                                      gaps },
-        {      "timing_basis",             costs_.has_models() ? "empirical_candidates_with_conditional_inputs" : "given_node_durations" },
-        {       "assumptions",
-         { "explicit givens and/or empirical candidates; conditional execution, not a qualified performance prediction",
-         "modeled CPU service is charged at retained causal cuts; explicit given durations are conditional inputs, not measured costs",
-         "device compute, communication, transfers including synchronous host copies, and device commands require costs",
-         "waits follow dependencies; annotations carry no service charge",
-         "initial modeled resources contain no in-flight work",
-         "HTTP, tokenizer, initialization, warmup and idle polling are outside scope" }                                                 },
-        { "execution_summary", { { "work_nodes", work_.size() }, { "batch_invocations", batches_ }, { "simulated_until_ns", time_ns_ } } }
+        {            "status",                                                          status                              },
+        {             "scope",                                                                                     "modeled" },
+        {           "metrics",                                                                                       metrics },
+        {              "gaps",                                                                                          gaps },
+        {      "timing_basis", costs_.has_models() ? "empirical_candidates_with_conditional_inputs" : "given_node_durations" },
+        {       "assumptions",                                                                                 Json::array() },
+        { "execution_summary",
+         { { "work_nodes", work_count_ },
+         { "batch_invocations", batches_ },
+         { "simulated_until_ns", time_ns_ },
+         { "active_work", work_.size() },
+         { "peak_active_work", peak_work_ } }                                                                               }
     };
 
     result["structure"] = {
-        {        "status",                                    status },
-        { "qualification", "pending_source_and_transform_validation" }
+        { "status", status }
     };
-
     result["structure"]["graph"] = execution_graph_.describe();
-    result["performance_requirements"] = execution_graph_.performance_requirements(graph_path_.has_value());
+    result["performance_requirements"] = requirements().summary();
     result["performance_requirements"]["expansion_complete"] = status == "complete";
     result["performance_requirements"]["timing_basis"] = result["timing_basis"];
     auto workspace = Json::array();
@@ -275,13 +314,7 @@ nlohmann::json SimulationRuntime::report(std::string_view status, const nlohmann
         });
     result["structure"]["workspace_capacities"] = std::move(workspace);
 
-    if (graph_path_) {
-        std::filesystem::create_directories(graph_path_->parent_path());
-        auto invocations = Json::array();
-        for (const auto & [id, work] : work_) invocations.push_back(describe_invocation(work.invocation));
-        execution_graph_.write(*graph_path_, invocations);
-        result["structure"]["graph"]["artifact"] = graph_path_->string();
-    }
+    if (graph_path_) { result["structure"]["graph"]["artifact"] = graph_path_->string(); }
 
     return result;
 }

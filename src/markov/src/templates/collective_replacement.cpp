@@ -9,344 +9,67 @@
 #include <set>
 #include <span>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace markov {
-namespace {
-
-struct CollectiveMember {
-    const TemplateDefinition * definition;
-    const TemplateCollective * collective;
-};
-
-class CollectiveGroup {
-public:
-    std::vector<CollectiveMember> members;
-
-    static std::expected<std::vector<CollectiveGroup>, std::string> observe(std::span<const TemplateDefinition * const> definitions, std::uint32_t rank_count) {
-        std::vector<CollectiveMember> entries;
-        std::map<BoundaryId, std::size_t> owners;
-        for (const auto * definition : definitions) {
-            for (const auto & collective : definition->collectives) {
-                const auto member = entries.size();
-                entries.push_back({ definition, &collective });
-                for (const auto index : collective.task_nodes) {
-                    const auto & node = definition->graph[index];
-                    owners.emplace(definition->boundary_observations[node.begin].source_boundary, member);
-                    owners.emplace(definition->boundary_observations[node.end].source_boundary, member);
-                }
-            }
-        }
-
-        // Native notifications, rather than rank-local operation order, identify a group.
-        std::vector<std::set<std::size_t>> peers(entries.size());
-        for (const auto * definition : definitions) {
-            for (std::size_t index = 0; index < definition->graph.connection_count(); ++index) {
-                const auto connection = definition->connection(index);
-                if (connection.relation != SourceRelation::NativeNotifySignal) continue;
-                const auto local = owners.find(definition->boundary_observations[connection.local_boundary].source_boundary);
-                if (local == owners.end()) continue;
-                const auto remote = owners.find(connection.remote_source_boundary);
-                if (remote == owners.end()) return std::unexpected("collective_notification_peer_not_observed");
-                const auto remote_call = entries[remote->second].definition->source_call;
-                if (std::ranges::find(connection.remote_source_calls, remote_call) == connection.remote_source_calls.end())
-                    return std::unexpected("collective_notification_owner_not_observed");
-
-                peers[local->second].insert(remote->second);
-                peers[remote->second].insert(local->second);
-            }
-        }
-
-        std::vector<CollectiveGroup> groups;
-        std::vector<bool> visited(entries.size());
-        for (std::size_t first = 0; first < entries.size(); ++first) {
-            if (visited[first]) continue;
-            std::vector<std::size_t> pending{ first };
-            visited[first] = true;
-            for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-                for (const auto peer : peers[pending[cursor]]) {
-                    if (visited[peer]) continue;
-                    visited[peer] = true;
-                    pending.push_back(peer);
-                }
-            }
-
-            std::set<std::uint32_t> ranks;
-            CollectiveGroup group;
-            for (const auto index : pending) {
-                const auto & member = entries[index];
-                if (!ranks.insert(member.definition->rank).second || pending.size() != rank_count) return std::unexpected("collective_rank_group_incomplete");
-                group.members.push_back(member);
-            }
-            std::ranges::sort(group.members, {}, [](const CollectiveMember & member) { return member.definition->rank; });
-            groups.push_back(std::move(group));
-        }
-        return groups;
-    }
-
-    std::expected<std::uint64_t, std::string> count(const BatchInput & target) const {
-        std::optional<std::uint64_t> count;
-        std::optional<CommunicationOperation> operation;
-        for (const auto & member : members) {
-            const auto & collective = *member.collective;
-            const auto & rule = member.definition->graph.collective_rule(collective.envelope_node);
-            if (!rule.count) return std::unexpected("collective_parameter_relation_missing");
-            if (!rule.work) return std::unexpected(rule.work.error());
-            const auto requested = rule.count->count(target);
-            if ((count && *count != requested) || (operation && *operation != rule.work->operation())) return std::unexpected("collective_rank_work_disagrees");
-            count = requested;
-            operation = rule.work->operation();
-        }
-        return *count;
-    }
-
-    std::expected<std::vector<std::vector<SourceCommunicationTask>>, std::string> work(std::uint64_t count) const {
-        std::vector<std::vector<SourceCommunicationTask>> result;
-        for (const auto & member : members) {
-            const auto & rule = member.definition->graph.collective_rule(member.collective->envelope_node);
-            auto tasks = rule.work->evaluate(member.collective->tasks, count);
-            if (!tasks) return std::unexpected(tasks.error());
-            result.push_back(std::move(*tasks));
-        }
-        return result;
-    }
-
-    bool compatible(const CollectiveGroup & donor) const {
-        if (members.size() != donor.members.size()) return false;
-        for (std::size_t index = 0; index < members.size(); ++index) {
-            const auto & source = *members[index].collective;
-            const auto & other = *donor.members[index].collective;
-            const auto & source_rule = members[index].definition->graph.collective_rule(source.envelope_node);
-            const auto & other_rule = donor.members[index].definition->graph.collective_rule(other.envelope_node);
-            if (!source_rule.count || !other_rule.count || !source_rule.work || !other_rule.work) return false;
-            if (source_rule.count->width != other_rule.count->width || source_rule.work->operation() != other_rule.work->operation()
-                || source.data_type != other.data_type)
-                return false;
-        }
-        return true;
-    }
-};
-
-class CollectiveOperation {
-public:
-    const TemplateDefinition * definition;
-    TemplateSubgraphRegion region;
-    TemplateCollectiveOperationPorts ports;
-
-    static std::expected<CollectiveOperation, std::string> observe(const CollectiveMember & member) {
-        const auto & source = *member.definition;
-        const auto operation = std::ranges::find_if(source.operations, [&member](const TemplateOperation & item) {
-            return item.collective_spans.size() == 1 && item.collective_spans.front() == member.collective->source_span;
-        });
-        if (operation == source.operations.end()) return std::unexpected("collective_operation_not_observed");
-
-        auto region = source.operation_region(*operation);
-        auto ports = source.collective_operation_ports(*operation, region);
-        if (!ports) return std::unexpected(ports.error());
-        return CollectiveOperation{ &source, std::move(region), std::move(*ports) };
-    }
-};
-
-class CollectiveReplacement {
-public:
-    TemplateOperationRewrite rewrite;
-    std::map<std::size_t, std::size_t> boundary_mapping;
-    std::vector<std::size_t> removed_connections;
-    std::vector<std::size_t> donor_connections;
-
-    static std::expected<CollectiveReplacement, std::string> plan(const CollectiveOperation & recipient, const CollectiveOperation & donor,
-                                                                  std::span<const SourceCommunicationTask> work) {
-        const auto & source = *recipient.definition;
-        const auto & from = *donor.definition;
-        const auto & region = recipient.region;
-        const auto & donor_region = donor.region;
-        const auto * ports = &recipient.ports;
-        const auto * donor_ports = &donor.ports;
-        if (ports->resources.size() != donor_ports->resources.size()) return std::unexpected("collective_operation_interface_disagrees");
-
-        std::map<std::size_t, std::size_t> mapping{
-            { donor_ports->enclosing_completion, ports->enclosing_completion }
-        };
-        std::map<std::size_t, std::size_t> lanes;
-        for (const auto & port : donor_ports->resources) {
-            const auto target = std::ranges::find(ports->resources, port.resource, &TemplateRegionPort::resource);
-            if (target == ports->resources.end() || (target->device_done && !port.device_done))
-                return std::unexpected("collective_operation_interface_disagrees");
-            mapping.emplace(port.entry, target->entry);
-            mapping.emplace(port.exit, target->exit);
-            // A donor-only completion has no target consumer and remains internal.
-            if (port.device_done && target->device_done) mapping.emplace(*port.device_done, *target->device_done);
-            lanes.emplace(from.graph.boundary(port.entry).lane, source.graph.boundary(target->entry).lane);
-            lanes.emplace(from.graph.boundary(port.exit).lane, source.graph.boundary(target->exit).lane);
-        }
-
-        // Physical streams keep their native resource. Unexported joins and
-        // observation lanes receive identities local to the inserted operation.
-        CollectiveReplacement result;
-        for (const auto point : donor_region.boundaries) {
-            const auto lane_index = from.graph.boundary(point).lane;
-            if (lanes.contains(lane_index)) continue;
-            const auto & lane = from.lanes[lane_index].source;
-            if (lane.domain != SourceDomain::CpuThread && lane.domain != SourceDomain::DeviceStream) {
-                lanes.emplace(lane_index, source.lanes.size() + result.rewrite.inserted_lanes.size());
-                result.rewrite.inserted_lanes.push_back(from.lanes[lane_index]);
-                continue;
-            }
-            std::set<std::size_t> candidates;
-            for (const auto target : region.boundaries) {
-                const auto index = source.graph.boundary(target).lane;
-                const auto & other = source.lanes[index].source;
-                if (other.domain == lane.domain && (lane.domain != SourceDomain::DeviceStream || other.native_id == lane.native_id)) candidates.insert(index);
-            }
-            if (candidates.size() != 1) return std::unexpected("collective_lane_role_not_matched");
-            lanes.emplace(lane_index, *candidates.begin());
-        }
-
-        result.rewrite.nodes = region.nodes;
-        result.rewrite.dependencies = region.internal_dependencies;
-        auto imported = donor_region.internal_dependencies;
-        // Resource entries and exported event ends retain the recipient's
-        // endpoints. Only the enclosing device join needs new contributors.
-        for (const auto index : region.outgoing_dependencies)
-            if (source.graph.dependencies()[index].relation == SourceRelation::CompletionJoin) result.rewrite.dependencies.push_back(index);
-        for (const auto index : donor_region.outgoing_dependencies)
-            if (from.graph.dependencies()[index].relation == SourceRelation::CompletionJoin) imported.push_back(index);
-
-        result.boundary_mapping = result.rewrite.insert_subgraph(from, source, donor_region.nodes, imported, std::move(mapping), lanes);
-        std::map<SourceSpanId, const SourceCommunicationTask *> tasks;
-        for (const auto & task : work) tasks.emplace(task.span, &task);
-        for (auto & inserted : result.rewrite.inserted_nodes) {
-            if (inserted.observation().communication) inserted.communication_override = *tasks.at(inserted.observation().source_span);
-            if (inserted.observation().kernel) return std::unexpected("collective_region_contains_compute");
-            if (inserted.node.kind == SourceSpanKind::Dma && !inserted.observation().communication)
-                return std::unexpected("collective_region_contains_unbound_transfer");
-        }
-        result.removed_connections = ports->notification_connections;
-        result.donor_connections = donor_ports->notification_connections;
-        return result;
-    }
-};
-
-} // namespace
 
 std::expected<void, TemplateGap> TemplateBank::parameterize_communications(std::span<TemplateInstance> instances, const InvokeStep & invocation) const {
-    std::vector<const TemplateDefinition *> definitions;
-    for (const auto & instance : instances) definitions.push_back(instance.definition);
-    const auto groups = CollectiveGroup::observe(definitions, source_.ranks);
-    if (!groups) return std::unexpected(TemplateGap{ TemplateGapKind::Observation, groups.error(), invocation.step, invocation.input.phase, 0 });
-
-    std::optional<std::vector<CollectiveGroup>> donors;
-    // Many model layers compare the same observed candidate operations. Their
-    // source cuts and ports stay fixed throughout this invocation.
-    std::map<const TemplateCollective *, std::expected<CollectiveOperation, std::string>> donor_operations;
-    for (const auto & group : *groups) {
-        const auto count = group.count(invocation.input);
-        if (!count) return std::unexpected(TemplateGap{ TemplateGapKind::Rule, count.error(), invocation.step, invocation.input.phase, 0 });
-        auto work = group.work(*count);
-        if (work) {
-            for (std::size_t index = 0; index < group.members.size(); ++index) {
-                auto & instance = instances[group.members[index].definition->rank];
-                for (auto & task : (*work)[index]) instance.communication_overrides.emplace(task.span, std::move(task));
-            }
-            continue;
-        }
-
-        // The recipient interface is independent of donor selection. Resolve it
-        // once; a different donor cannot repair an invalid cut in this operation.
-        std::vector<CollectiveOperation> recipients;
-        for (const auto & member : group.members) {
-            auto operation = CollectiveOperation::observe(member);
-            if (!operation)
-                return std::unexpected(
-                    TemplateGap{ TemplateGapKind::Rule, operation.error(), invocation.step, invocation.input.phase, member.definition->rank });
-            recipients.push_back(std::move(*operation));
-        }
-
-        // Only existing, producer-qualified groups can supply another topology.
-        // No native gap string controls selection and no observation is requested.
-        if (!donors) {
-            donors.emplace();
-            // Serving phase does not define collective work. Keep each native
-            // invocation's rank group intact, then match its operation and layout.
-            using Cohort = std::tuple<StepKind, BatchPhase, std::optional<std::uint64_t>>;
-            std::map<Cohort, std::vector<const TemplateDefinition *>> cohorts;
-            for (const auto & [key, candidates] : source_.definitions) {
-                for (const auto & definition : candidates) cohorts[{ std::get<0>(key), std::get<1>(key), definition.source_batch }].push_back(&definition);
-            }
-            for (const auto & [batch, cohort] : cohorts) {
-                auto observed = CollectiveGroup::observe(cohort, source_.ranks);
-                if (observed) donors->insert(donors->end(), observed->begin(), observed->end());
-            }
-        }
-
-        std::optional<std::vector<CollectiveReplacement>> replacements;
-        const CollectiveGroup * selected = nullptr;
-        std::string gap = work.error();
-        for (const auto & donor : *donors) {
-            if (!group.compatible(donor)) continue;
-            // Phase determines how the recipient derives its count, not the
-            // physical collective topology. Donors evaluate that same work.
-            auto donor_work = donor.work(*count);
-            if (!donor_work) continue;
-            std::vector<CollectiveReplacement> candidate;
-            for (std::size_t index = 0; index < group.members.size(); ++index) {
-                const auto & member = donor.members[index];
-                auto operation = donor_operations.find(member.collective);
-                if (operation == donor_operations.end()) operation = donor_operations.emplace(member.collective, CollectiveOperation::observe(member)).first;
-                if (!operation->second) {
-                    gap = operation->second.error();
-                    break;
-                }
-                auto replacement = CollectiveReplacement::plan(recipients[index], *operation->second, (*donor_work)[index]);
-                if (!replacement) {
-                    gap = replacement.error();
-                    break;
-                }
-                candidate.push_back(std::move(*replacement));
-            }
-            if (candidate.size() != group.members.size()) continue;
-            replacements = std::move(candidate);
-            selected = &donor;
-            break;
-        }
-        if (!replacements) return std::unexpected(TemplateGap{ TemplateGapKind::Rule, gap, invocation.step, invocation.input.phase, 0 });
-
-        // Instances still belong to the uncommitted cohort. Any later failure
-        // discards all ranks before assembly can publish nodes or resource frontiers.
-        std::map<BoundaryId, TemplateEndpoint> endpoints;
-        for (std::size_t index = 0; index < group.members.size(); ++index) {
-            const auto rank = group.members[index].definition->rank;
-            auto & instance = instances[rank];
-            auto & replacement = (*replacements)[index];
-            const auto offsets = instance.topology.apply_operations(*instance.definition, std::span(&replacement.rewrite, 1));
-            if (!offsets) return std::unexpected(TemplateGap{ TemplateGapKind::Rule, offsets.error(), invocation.step, invocation.input.phase, rank });
-            for (auto & [from, to] : replacement.boundary_mapping) {
-                if (to >= instance.definition->graph.boundary_count()) to += offsets->front();
-                endpoints.emplace(selected->members[index].definition->boundary_observations[from].source_boundary,
-                                  TemplateEndpoint{ instance.work_id, rank, to });
-            }
-            std::set<std::size_t> removed_boundaries;
-            for (const auto connection : replacement.removed_connections) removed_boundaries.insert(instance.definition->connection(connection).local_boundary);
-            std::erase_if(instance.connections, [&removed_boundaries](const TemplateTargetConnection & target) {
-                return target.connection.relation == SourceRelation::NativeNotifySignal && removed_boundaries.contains(target.connection.local_boundary);
-            });
-        }
-        for (std::size_t index = 0; index < group.members.size(); ++index) {
-            auto & instance = instances[group.members[index].definition->rank];
-            const auto & replacement = (*replacements)[index];
-            const auto & donor = *selected->members[index].definition;
-            for (const auto index : replacement.donor_connections) {
-                auto connection = donor.connection(index);
-                connection.local_boundary = replacement.boundary_mapping.at(connection.local_boundary);
-                instance.connections.push_back({
-                    std::move(connection),
-                    { TemplateConnectionRule::NativeBoundary, { endpoints.at(donor.connection(index).remote_source_boundary) } }
-                });
-            }
+    using LocalMember = std::pair<TemplateInstance *, std::size_t>;
+    std::map<std::pair<std::string, std::optional<std::uint32_t>>, std::vector<LocalMember>> interfaces;
+    for (auto & instance : instances) {
+        const auto & ports = instance.topology.collective_interfaces();
+        for (std::size_t index = 0; index < ports.size(); ++index) {
+            const auto & port = ports[index];
+            const auto & source = port.definition->collective_interfaces[port.interface];
+            interfaces[{ source.position, port.model_layer }].emplace_back(&instance, index);
         }
     }
+    // Every declared TP operation includes this cohort's full rank group.
+    // Reserve its owner once: local interfaces borrow these stable work values.
+    instances.front().collective_groups.reserve(interfaces.size());
+    for (const auto & [position, members] : interfaces) {
+        const auto & first = members.front().first->topology.collective_interfaces()[members.front().second];
+        const auto & source = first.definition->collective_interfaces[first.interface];
+        const auto count = source.count ? source.count->count(*invocation.input) : 0;
+        TemplateCollectiveGroup group{
+            { source.operation == CommunicationOperation::Broadcast   ? "broadcast"
+              : source.operation == CommunicationOperation::AllReduce ? "all_reduce"
+                                                                      : "all_gather",
+             {},
+             source.count ? std::vector<std::uint64_t>{ count / source.count->width, source.count->width } : std::vector<std::uint64_t>{},
+             source.data_type },
+            {},
+            {}
+        };
+        if (source.host_message) {
+            group.work.host_message = HostMessageWork{ source.host_message->root, std::nullopt, {} };
+            for (const auto & request : invocation.input->incoming_requests)
+                group.work.host_message->incoming_requests.emplace_back(request.prompt_tokens, request.output_tokens);
+        }
+        std::set<std::uint32_t> ranks;
+        for (const auto & [instance, index] : members) {
+            const auto & port = instance->topology.collective_interfaces()[index];
+            const auto & peer = port.definition->collective_interfaces[port.interface];
+            if (members.size() != instances.size() || members.size() != source.group_size || !ranks.insert(instance->rank).second
+                || peer.operation != source.operation || peer.group_size != source.group_size || peer.data_type != source.data_type
+                || peer.count != source.count || peer.host_message != source.host_message)
+                return std::unexpected(
+                    TemplateGap{ TemplateGapKind::Rule, "collective_participant_work_not_paired", invocation.step, invocation.input->phase, instance->rank });
+            group.work.ranks.push_back(instance->rank);
+            group.ready.push_back({ instance->work_id, instance->rank, port.ready });
+            group.done.push_back({ instance->work_id, instance->rank, port.done });
+        }
+        if (source.host_message)
+            for (const auto & [entry_rank, done_rank] : source.host_message->completion_entry_dependencies) {
+                const auto entry = std::ranges::find(group.ready, entry_rank, &TemplateEndpoint::rank);
+                const auto done = std::ranges::find(group.done, done_rank, &TemplateEndpoint::rank);
+                group.completion_entry_dependencies.emplace_back(*entry, *done);
+            }
+        auto & owned = instances.front().collective_groups.emplace_back(std::move(group));
+        for (const auto & [instance, index] : members) instance->topology.bind_collective_work(index, owned.work);
+    }
+
     return {};
 }
 

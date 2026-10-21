@@ -19,6 +19,7 @@ public:
     std::string_view name() const override { return "sglang"; }
     TemplateProduction produce(const std::filesystem::path & manifest_path, nlohmann::json manifest,
                                const std::filesystem::path & work_directory) const override;
+    nlohmann::json compare_structure(const std::filesystem::path & target_graph, nlohmann::json facts, const nlohmann::json & environment) const override;
     FrameworkConfiguration source_configuration(const nlohmann::json & parameters) const override;
     bool shares_execution_path(const FrameworkConfiguration & source, const FrameworkConfiguration & target) const override;
     std::expected<ServingLimits, std::string_view> control_limits(const FrameworkConfiguration & configuration) const override;

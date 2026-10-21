@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -20,12 +21,14 @@ TemplateNodeRole TemplateNode::role() const {
     case SourceSpanKind::Compute:
     case SourceSpanKind::Dma:
     case SourceSpanKind::DeviceMarker:
+    case SourceSpanKind::HostCommunication:
         return TemplateNodeRole::Service;
     case SourceSpanKind::HostWait:
     case SourceSpanKind::DeviceWait:
         return TemplateNodeRole::Wait;
     case SourceSpanKind::CpuObservation:
     case SourceSpanKind::CommunicationObservation:
+    case SourceSpanKind::ResourceObservation:
         return TemplateNodeRole::Annotation;
     }
     std::unreachable();
@@ -82,7 +85,6 @@ TemplateSubgraphRegion TemplateDefinition::operation_region(const TemplateOperat
     windows.insert(windows.end(), operation.workers.begin(), operation.workers.end());
 
     std::set<SourceSpanId> observed_members(operation.device_spans.begin(), operation.device_spans.end());
-    observed_members.insert(operation.collective_spans.begin(), operation.collective_spans.end());
     return execution_region(windows, observed_members);
 }
 
@@ -146,20 +148,108 @@ TemplateSubgraphRegion TemplateDefinition::execution_region(std::span<const Temp
     return complete_region(std::move(region));
 }
 
-TemplateSubgraphRegion TemplateDefinition::semantic_region(const TemplateRegion & source) const {
-    TemplateSubgraphRegion region;
-    region.nodes = source.nodes;
-    std::set<std::size_t> points(source.inputs.begin(), source.inputs.end());
-    points.insert(source.outputs.begin(), source.outputs.end());
-    for (const auto index : region.nodes) {
-        points.insert(graph[index].begin);
-        points.insert(graph[index].end);
-    }
-    region.boundaries.assign(points.begin(), points.end());
-    return complete_region(std::move(region));
+std::size_t TemplateDefinition::declare_sequence(std::vector<std::size_t> members, TemplateSequenceParameter parameter, std::vector<std::size_t> expanded) {
+    const auto index = sequences.size();
+    sequences.push_back({ std::move(members), std::move(expanded), parameter, {}, {}, std::nullopt, std::nullopt });
+    return index;
 }
 
-TemplateSubgraphRegion TemplateDefinition::complete_region(TemplateSubgraphRegion region) const {
+const TemplateSubgraphRegion & TemplateDefinition::sequence_step(const TemplateRegionSequence & sequence, std::size_t step) const {
+    return step % 2 == 0 ? static_cast<const TemplateSubgraphRegion &>(regions[sequence.source_members[step / 2]]) : sequence.separators[step / 2];
+}
+
+void TemplateDefinition::finalize_regions() {
+    std::set<std::size_t> replacements;
+    for (const auto region : { transition_region, running_update_region })
+        if (region) replacements.insert(*region);
+    if (kv_region) replacements.insert(kv_region->region);
+    for (const auto & [role, region] : filter_regions) replacements.insert(region);
+    auto required = replacements;
+    for (const auto & sequence : sequences) required.insert(sequence.source_members.begin(), sequence.source_members.end());
+
+    // An added resource can only anchor to a sibling that covers all existing
+    // outside work on that resource. Complete those candidates, not every scope.
+    std::map<TemplateResource, std::vector<std::size_t>> resources;
+    for (std::size_t index = 0; index < graph.size(); ++index) {
+        const auto node = graph[index];
+        if (node.role() != TemplateNodeRole::Annotation) resources[lanes[graph.boundary(node.begin).lane].resource()].push_back(index);
+    }
+    for (const auto recipient : replacements) {
+        const auto & region = regions[recipient];
+        for (const auto & [resource, members] : resources) {
+            std::vector<std::size_t> outside;
+            std::ranges::set_difference(members, region.nodes, std::back_inserter(outside));
+            if (outside.empty()) continue;
+            for (std::size_t candidate = 0; candidate < regions.size(); ++candidate) {
+                const auto & sibling = regions[candidate];
+                if (candidate == recipient || sibling.parent_call != region.parent_call || !std::ranges::includes(sibling.nodes, outside)) continue;
+                if (std::ranges::any_of(sibling.nodes, [&](auto node) { return std::ranges::binary_search(region.nodes, node); })) continue;
+                required.insert(candidate);
+            }
+        }
+    }
+    for (const auto index : required) {
+        auto & region = regions[index];
+        std::set<std::size_t> points(region.inputs.begin(), region.inputs.end());
+        points.insert(region.outputs.begin(), region.outputs.end());
+        if (region.cpu_scope) {
+            points.insert(region.cpu_scope->begin);
+            points.insert(region.cpu_scope->end);
+        }
+        for (const auto index : region.nodes) {
+            points.insert(graph[index].begin);
+            points.insert(graph[index].end);
+        }
+        region.boundaries.assign(points.begin(), points.end());
+        auto & cut = static_cast<TemplateSubgraphRegion &>(region);
+        cut = complete_region(std::move(cut), region.cpu_scope);
+    }
+    for (auto & sequence : sequences) bind_sequence(sequence);
+}
+
+bool TemplateDefinition::contains_region(std::size_t ancestor, std::size_t region) const {
+    const auto call = regions[ancestor].source_call;
+    for (auto current = regions[region].source_call; current != source_call;) {
+        if (current == call) return true;
+        current = std::ranges::find(regions, current, &TemplateRegion::source_call)->parent_call;
+    }
+    return false;
+}
+
+std::optional<std::size_t> TemplateDefinition::region_owner(std::span<const std::size_t> nodes) const {
+    if (nodes.empty()) return std::nullopt;
+    std::optional<std::size_t> owner;
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        const auto & region = regions[index];
+        if (!std::ranges::includes(region.nodes, nodes)) continue;
+        if (!owner || contains_region(*owner, index)) owner = index;
+    }
+    return owner;
+}
+
+std::optional<TemplateSemanticScope> TemplateDefinition::semantic_scope(std::optional<std::size_t> call, std::optional<std::size_t> root) const {
+    if (!call) return std::nullopt;
+    TemplateSemanticScope result;
+    const auto stop = root.value_or(source_call);
+    while (*call != stop) {
+        const auto region = std::ranges::find(regions, *call, &TemplateRegion::source_call);
+        if (region == regions.end()) return std::nullopt;
+        if (!region->semantic.empty()) result.path.push_back(region->semantic);
+        if (!result.request_slot) result.request_slot = region->request_slot;
+        if (!result.input_slot) result.input_slot = region->input_slot;
+        if (!result.model_layer)
+            for (const auto & interface : collective_interfaces)
+                if (interface.model_region && regions[*interface.model_region].source_call == *call) {
+                    result.model_layer = interface.model_layer;
+                    break;
+                }
+        call = region->parent_call;
+    }
+    std::ranges::reverse(result.path);
+    return result;
+}
+
+TemplateSubgraphRegion TemplateDefinition::complete_region(TemplateSubgraphRegion region, std::optional<TemplateRegionScope> control) const {
     // Membership may come from a native operation window or an instrumented
     // semantic scope. Both use the same dependency and external-port partition.
     std::set<std::size_t> points(region.boundaries.begin(), region.boundaries.end());
@@ -211,6 +301,7 @@ TemplateSubgraphRegion TemplateDefinition::complete_region(TemplateSubgraphRegio
         if (!source && target) region.incoming_rotary_dependencies.push_back(index);
         if (source && !target) region.outgoing_rotary_dependencies.push_back(index);
     }
+    region.resource_ports = bind_region_ports(region, control);
     return region;
 }
 
@@ -269,10 +360,10 @@ bool TemplateDefinition::is_region_wait_import(const TemplateDependency & edge, 
     return false;
 }
 
-std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::region_ports(const TemplateSubgraphRegion & region) const {
+std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::bind_region_ports(TemplateSubgraphRegion & region,
+                                                                                                  std::optional<TemplateRegionScope> control) const {
     if (!region.crossing_nodes.empty() || !region.incoming_rotary_dependencies.empty() || !region.outgoing_rotary_dependencies.empty())
-        return std::unexpected("region_crossing_interface_not_supported");
-
+        region.replacement_gap = "region_crossing_interface_not_supported";
     std::map<TemplateResource, std::set<std::size_t>> entries, exits, completion_exports;
     for (const auto index : region.external_connections) {
         const auto & connection = this->connection(index);
@@ -284,8 +375,10 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
         }
         if (!connection.resource
             || !((connection.relation == SourceRelation::ThreadOrder && connection.resource->domain == SourceDomain::CpuThread)
-                 || (connection.relation == SourceRelation::StreamOrder && connection.resource->domain == SourceDomain::DeviceStream)))
-            return std::unexpected("region_external_relation_not_supported");
+                 || (connection.relation == SourceRelation::StreamOrder && connection.resource->domain == SourceDomain::DeviceStream))) {
+            region.replacement_gap = "region_external_relation_not_supported";
+            continue; // Data, completion and notification interfaces keep their own crossing records.
+        }
 
         // The producer identifies the stream from the receiving task when the
         // local exit is a completion join. Keep the original connection intact.
@@ -298,8 +391,10 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
         if (is_region_wait_import(edge, region)) continue;
         const auto & lane = lanes[graph.boundary(edge.target).lane].resource();
         if (!((edge.relation == SourceRelation::ThreadOrder && lane.domain == SourceDomain::CpuThread)
-              || (edge.relation == SourceRelation::StreamOrder && lane.domain == SourceDomain::DeviceStream)))
-            return std::unexpected("region_entry_relation_not_supported");
+              || (edge.relation == SourceRelation::StreamOrder && lane.domain == SourceDomain::DeviceStream))) {
+            region.replacement_gap = "region_entry_relation_not_supported";
+            continue;
+        }
         entries[lane].insert(edge.target);
     }
     for (const auto index : region.outgoing_dependencies) {
@@ -324,8 +419,10 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
         const auto point = edge.relation == SourceRelation::StreamOrder ? edge.target : edge.source;
         const auto & lane = lanes[graph.boundary(point).lane].resource();
         if (!((edge.relation == SourceRelation::ThreadOrder && lane.domain == SourceDomain::CpuThread)
-              || (edge.relation == SourceRelation::StreamOrder && lane.domain == SourceDomain::DeviceStream)))
-            return std::unexpected("region_exit_relation_not_supported");
+              || (edge.relation == SourceRelation::StreamOrder && lane.domain == SourceDomain::DeviceStream))) {
+            region.replacement_gap = "region_exit_relation_not_supported";
+            continue;
+        }
         exits[lane].insert(edge.source);
     }
     DependencyPaths<std::size_t> successors;
@@ -333,7 +430,25 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
         const auto & edge = graph.dependencies()[index];
         successors.connect(edge.source, edge.target);
     }
+    std::map<TemplateResource, std::set<std::size_t>> starts, ends;
+    for (const auto index : region.nodes) {
+        const auto node = graph[index];
+        successors.connect(node.begin, node.end);
+        const auto resource = lanes[graph.boundary(node.begin).lane].resource();
+        if (resource.domain != SourceDomain::CpuThread && resource.domain != SourceDomain::DeviceStream) continue;
+        starts[resource].insert(node.begin);
+        ends[resource].insert(node.end);
+    }
     const auto predecessors = successors.reversed();
+    for (const auto & [resource, points] : starts) {
+        if (!entries.contains(resource)) entries.emplace(resource, successors.frontier(points));
+        if (!exits.contains(resource)) exits.emplace(resource, predecessors.frontier(ends.at(resource)));
+    }
+    if (control) {
+        const auto resource = lanes[graph.boundary(control->begin).lane].resource();
+        entries[resource] = { control->begin };
+        exits[resource] = { control->end };
+    }
 
     // Device completion is a property of the work, even when the source has
     // no external host wait. Derive it from causality so another cut can use
@@ -351,8 +466,8 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
         candidates = predecessors.frontier(std::move(candidates));
         if (candidates.size() != 1) return std::unexpected("region_terminal_work_not_unique");
         const auto exported = completion_exports.find(resource);
-        if (exported != completion_exports.end() && exported->second != candidates) return std::unexpected("region_external_completion_not_terminal");
-        if (resource.domain == SourceDomain::DeviceStream) completion_exports.emplace(resource, candidates);
+        if (exported != completion_exports.end() && exported->second != candidates) region.replacement_gap = "region_external_completion_not_terminal";
+        if (resource.domain == SourceDomain::DeviceStream) completion_exports[resource] = candidates;
         exits.emplace(resource, std::move(candidates));
     }
     for (const auto & [resource, points] : completion_exports) {
@@ -361,7 +476,6 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
     if (entries.empty() || entries.size() != exits.size()) return std::unexpected("region_resource_interface_not_paired");
 
     std::vector<TemplateRegionPort> result;
-    std::set<std::size_t> exposed;
     for (const auto & [resource, incoming] : entries) {
         const auto found = exits.find(resource);
         if (incoming.size() != 1 || found == exits.end() || found->second.size() != 1) return std::unexpected("region_resource_interface_not_unique");
@@ -383,21 +497,8 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
                 if (!joined) return std::unexpected("region_completion_join_not_qualified");
             }
             result.back().device_done = done;
-            exposed.insert(done);
         }
-        exposed.insert(*incoming.begin());
-        exposed.insert(*found->second.begin());
     }
-    for (const auto index : region.retained_dependencies) {
-        const auto & edge = graph.dependencies()[index];
-        // An outside service may touch the region at just one endpoint. Only
-        // its endpoints inside the cut need an explicit replacement mapping.
-        if ((std::ranges::binary_search(region.boundaries, edge.source) && !exposed.contains(edge.source))
-            || (std::ranges::binary_search(region.boundaries, edge.target) && !exposed.contains(edge.target)))
-            return std::unexpected("region_retained_work_has_internal_endpoint");
-    }
-    for (const auto & [port, point] : ports)
-        if (std::ranges::binary_search(region.boundaries, point)) return std::unexpected("region_contains_serving_port");
 
     for (const auto index : region.nodes) {
         const auto & node = graph[index];
@@ -419,7 +520,27 @@ std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::
             if (!reached.contains(node.begin) || !ancestors.contains(node.end)) return std::unexpected("region_work_outside_resource_path");
         }
     }
+    std::set<std::size_t> exposed;
+    for (const auto & port : result) {
+        exposed.insert(port.entry);
+        exposed.insert(port.exit);
+        if (port.device_done) exposed.insert(*port.device_done);
+    }
+    for (const auto index : region.retained_dependencies) {
+        const auto edge = graph.dependencies()[index];
+        if ((std::ranges::binary_search(region.boundaries, edge.source) && !exposed.contains(edge.source))
+            || (std::ranges::binary_search(region.boundaries, edge.target) && !exposed.contains(edge.target)))
+            region.replacement_gap = "region_retained_work_has_internal_endpoint";
+    }
+    for (const auto & [port, point] : ports)
+        if (std::ranges::binary_search(region.boundaries, point)) region.replacement_gap = "region_contains_serving_port";
+
     return result;
+}
+
+std::expected<std::vector<TemplateRegionPort>, std::string> TemplateDefinition::region_ports(const TemplateSubgraphRegion & region) const {
+    if (region.replacement_gap) return std::unexpected(*region.replacement_gap);
+    return region.resource_ports;
 }
 
 
@@ -531,117 +652,6 @@ std::expected<TemplateDeviceOperationPorts, std::string> TemplateDefinition::dev
 }
 
 
-std::expected<TemplateCollectiveOperationPorts, std::string> TemplateDefinition::collective_operation_ports(const TemplateOperation & operation,
-                                                                                                            const TemplateSubgraphRegion & region) const {
-    if (operation.collective_spans.size() != 1 || !region.crossing_nodes.empty() || !region.incoming_rotary_dependencies.empty()
-        || !region.outgoing_rotary_dependencies.empty())
-        return std::unexpected("collective_operation_region_not_qualified");
-    const auto found = std::ranges::find_if(collectives, [&operation](const TemplateCollective & collective) {
-        return collective.source_span == operation.collective_spans.front();
-    });
-    if (found == collectives.end() || !found->serial_completion) return std::unexpected("collective_operation_completion_not_qualified");
-
-    std::set<SourceSpanId> members;
-    std::set<std::size_t> task_begins, task_ends;
-    for (const auto index : found->task_nodes) {
-        const auto & node = graph[index];
-        members.insert(observation(node).source_span);
-        task_begins.insert(node.begin);
-        task_ends.insert(node.end);
-    }
-    const std::set<SourceSpanId> devices(operation.device_spans.begin(), operation.device_spans.end());
-    if (!std::ranges::includes(devices, members)) return std::unexpected("collective_operation_members_not_qualified");
-
-    std::set<std::size_t> begins, ends, consumers;
-    for (const auto index : region.nodes) {
-        const auto & node = graph[index];
-        if (!devices.contains(observation(node).source_span)) continue;
-        begins.insert(node.begin);
-        ends.insert(node.end);
-    }
-    std::set<std::size_t> cpu_entries{ operation.host.begin }, cpu_exits{ operation.host.end };
-    for (const auto & worker : operation.workers) {
-        cpu_entries.insert(worker.begin);
-        cpu_exits.insert(worker.end);
-    }
-
-    std::map<TemplateResource, std::set<std::size_t>> entries, exits, completions;
-    for (const auto index : region.incoming_dependencies) {
-        const auto & edge = graph.dependencies()[index];
-        if (edge.relation == SourceRelation::ThreadOrder && cpu_entries.contains(edge.target)) {
-            entries[lanes[graph.boundary(edge.target).lane].resource()].insert(edge.target);
-            continue;
-        }
-        if (edge.relation == SourceRelation::StreamOrder && begins.contains(edge.target)) {
-            entries[lanes[graph.boundary(edge.target).lane].resource()].insert(edge.target);
-            continue;
-        }
-        return std::unexpected("collective_operation_entry_not_qualified");
-    }
-    for (const auto index : region.outgoing_dependencies) {
-        const auto & edge = graph.dependencies()[index];
-        if (edge.relation == SourceRelation::ThreadOrder && cpu_exits.contains(edge.source)) {
-            exits[lanes[graph.boundary(edge.source).lane].resource()].insert(edge.source);
-            continue;
-        }
-        if (edge.relation == SourceRelation::StreamOrder) {
-            exits[lanes[graph.boundary(edge.target).lane].resource()].insert(edge.source);
-            continue;
-        }
-        if ((edge.relation == SourceRelation::NativeEventSignal || edge.relation == SourceRelation::NativeHostWait) && ends.contains(edge.source)) {
-            completions[lanes[graph.boundary(edge.source).lane].resource()].insert(edge.source);
-            continue;
-        }
-        if (edge.relation == SourceRelation::CompletionJoin && ends.contains(edge.source)
-            && lanes[graph.boundary(edge.target).lane].source.domain == SourceDomain::LogicalCompletion) {
-            consumers.insert(edge.target);
-            continue;
-        }
-        return std::unexpected("collective_operation_exit_not_qualified");
-    }
-    // The first use of a resource can inherit its predecessor from an earlier
-    // serving block. It is the same operation port as a local ordering edge.
-    std::vector<std::size_t> notifications;
-    for (const auto index : region.external_connections) {
-        const auto & edge = this->connection(index);
-        if (edge.relation == SourceRelation::NativeNotifySignal && (task_begins.contains(edge.local_boundary) || task_ends.contains(edge.local_boundary))) {
-            notifications.push_back(index);
-            continue;
-        }
-        if (!edge.resource
-            || !((edge.relation == SourceRelation::ThreadOrder && edge.resource->domain == SourceDomain::CpuThread)
-                 || (edge.relation == SourceRelation::StreamOrder && edge.resource->domain == SourceDomain::DeviceStream)))
-            return std::unexpected("collective_operation_group_interface_not_qualified");
-        auto & points = edge.direction == TemplateConnectionDirection::Incoming ? entries : exits;
-        points[*edge.resource].insert(edge.local_boundary);
-    }
-    if (entries.empty() || entries.size() != exits.size() || consumers.size() != 1)
-        return std::unexpected("collective_operation_resource_interface_not_qualified");
-
-    std::vector<TemplateRegionPort> resources;
-    for (const auto & [resource, incoming] : entries) {
-        const auto outgoing = exits.find(resource);
-        if (incoming.size() != 1 || outgoing == exits.end() || outgoing->second.size() != 1)
-            return std::unexpected("collective_operation_resource_interface_not_qualified");
-        TemplateRegionPort port{ resource, *incoming.begin(), *outgoing->second.begin() };
-        const auto exported = completions.find(resource);
-        if (exported != completions.end()) {
-            if (exported->second.size() != 1) return std::unexpected("collective_operation_completion_not_qualified");
-            port.device_done = *exported->second.begin();
-            const bool joined = std::ranges::any_of(region.internal_dependencies, [&](const auto index) {
-                const auto & edge = graph.dependencies()[index];
-                return edge.relation == SourceRelation::CompletionJoin && edge.source == *port.device_done && edge.target == port.exit;
-            });
-            if (!joined) return std::unexpected("collective_operation_completion_not_qualified");
-        }
-        resources.push_back(port);
-    }
-
-    // This is a local interface qualification only. The group planner must
-    // prove that every notification peer is in the same selected rank group.
-    return TemplateCollectiveOperationPorts{ std::move(resources), *consumers.begin(), std::move(notifications) };
-}
-
 std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_view_materialization_removal(const TemplateOperation & operation,
                                                                                                            std::optional<std::size_t> view_producer) const {
     const auto region = operation_region(operation);
@@ -650,16 +660,6 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_vi
         return std::unexpected("position_shared_consumers_not_qualified");
     if (!view_producer) return std::unexpected("position_view_producer_missing");
 
-    auto removal = plan_device_operation_removal(operation);
-    if (!removal) return removal;
-    removal->rotary_dependencies = region.outgoing_rotary_dependencies;
-    removal->rotary_producer = *view_producer;
-    return removal;
-}
-
-std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_device_operation_removal(const TemplateOperation & operation) const {
-    const auto region = operation_region(operation);
-    if (operation.device_spans.size() != 1 || !region.crossing_nodes.empty()) return std::unexpected("operation_boundary_not_supported");
     const auto device =
         std::find_if(graph.begin(), graph.end(), [&](const auto & node) { return observation(node).source_span == operation.device_spans.front(); });
     if (device == graph.end()) return std::unexpected("operation_device_node_missing");
@@ -721,6 +721,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_de
         if (edge.relation != SourceRelation::ThreadOrder || !endpoints.contains(edge.local_boundary))
             return std::unexpected("operation_template_connection_not_supported");
     }
+    removal.rotary_dependencies = region.outgoing_rotary_dependencies;
+    removal.rotary_producer = *view_producer;
     return removal;
 }
 
@@ -728,8 +730,8 @@ std::partial_ordering TemplateDefinition::region_order(const TemplateRegion & fi
     if (first.source_call == second.source_call || first.parent_call != second.parent_call) return std::partial_ordering::unordered;
     if (std::ranges::any_of(first.nodes, [&](const auto index) { return std::ranges::binary_search(second.nodes, index); }))
         return std::partial_ordering::unordered;
-    const auto first_ports = region_ports(semantic_region(first));
-    const auto second_ports = region_ports(semantic_region(second));
+    const auto first_ports = region_ports(first);
+    const auto second_ports = region_ports(second);
     if (!first_ports || !second_ports) return std::partial_ordering::unordered;
 
     // Qualify both directions from one pair of cuts. Only a native path on
@@ -755,7 +757,7 @@ std::partial_ordering TemplateDefinition::region_order(const TemplateRegion & fi
 
 std::expected<std::optional<TemplateRegionResourceAnchor>, std::string> TemplateDefinition::region_resource_anchor(const TemplateRegion & region,
                                                                                                                    const TemplateResource & resource) const {
-    const auto recipient = semantic_region(region);
+    const auto & recipient = region;
     std::vector<std::size_t> outside;
     for (std::size_t index = 0; index < graph.size(); ++index) {
         const auto & node = graph[index];
@@ -768,7 +770,7 @@ std::expected<std::optional<TemplateRegionResourceAnchor>, std::string> Template
     std::optional<TemplateRegionResourceAnchor> anchor;
     for (const auto & candidate : regions) {
         if (candidate.source_call == region.source_call || candidate.parent_call != region.parent_call) continue;
-        const auto cut = semantic_region(candidate);
+        const auto & cut = candidate;
         if (!std::ranges::includes(cut.nodes, outside)) continue;
         if (std::ranges::any_of(cut.nodes, [&](const auto index) { return std::ranges::binary_search(recipient.nodes, index); })) continue;
         const auto ports = region_ports(cut);
@@ -792,7 +794,7 @@ std::expected<TemplateOperationRewrite, std::string>
     const bool transition_prefix =
         transition_region && donor.transition_region && &region == &regions[*transition_region] && &donor_region == &donor.regions[*donor.transition_region];
     if (rank != donor.rank || step != donor.step || (phase != donor.phase && !transition_prefix)) return std::unexpected("region_context_not_matched");
-    return plan_subgraph_replacement(semantic_region(region), donor, donor.semantic_region(donor_region), &region);
+    return plan_subgraph_replacement(region, donor, donor_region, &region, donor_region.source_call);
 }
 
 std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_workspace_replacement(const TemplateWorkspaceUse & use,
@@ -805,7 +807,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_wo
 std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_subgraph_replacement(const TemplateSubgraphRegion & recipient_cut,
                                                                                                    const TemplateDefinition & donor,
                                                                                                    const TemplateSubgraphRegion & donor_cut,
-                                                                                                   const TemplateRegion * region) const {
+                                                                                                   const TemplateRegion * region,
+                                                                                                   std::optional<std::size_t> donor_root) const {
     if (source_manifest != donor.source_manifest && (!has_resource_roles() || !donor.has_resource_roles()))
         return std::unexpected("cross_source_resource_role_not_qualified");
 
@@ -920,7 +923,13 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_su
         result.added_dependencies.push_back({ relation, port.entry, done });
         if (done != port.exit) result.added_dependencies.push_back({ SourceRelation::CompletionJoin, done, port.exit });
     }
-    const auto mapping = result.insert_subgraph(donor, *this, donor_cut.nodes, donor_cut.internal_dependencies, std::move(points), lane_mapping);
+    const auto recipient_owner = region_owner(recipient_cut.nodes);
+    const auto donor_owner = donor.region_owner(donor_cut.nodes);
+    const auto roots = std::pair{ donor_root.value_or(donor_owner ? donor.regions[*donor_owner].source_call : donor.source_call),
+                                  region            ? region->source_call
+                                  : recipient_owner ? regions[*recipient_owner].source_call
+                                                    : source_call };
+    const auto mapping = result.insert_subgraph(donor, *this, donor_cut.nodes, donor_cut.internal_dependencies, std::move(points), lane_mapping, roots);
     for (const auto & [completion, predecessor] : wait_predecessors)
         result.added_dependencies.push_back({ SourceRelation::NativeHostWait, predecessor, mapping.at(completion) });
     for (auto & port : result.added_resource_ports) {
@@ -979,6 +988,10 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_op
     TemplateOperationRewrite replacement;
     replacement.nodes = source_region.nodes;
     replacement.dependencies = source_region.internal_dependencies;
+    const auto recipient_owner = region_owner(source_region.nodes);
+    const auto donor_owner = donor.region_owner(donor_region.nodes);
+    const auto scope_roots = std::pair{ donor_owner ? donor.regions[*donor_owner].source_call : donor.source_call,
+                                        recipient_owner ? regions[*recipient_owner].source_call : source_call };
     if (donor_operation.device_spans.empty()) {
         if (!donor.operation_view_service(donor_operation)) return std::unexpected("operation_cpu_view_not_qualified");
         replacement.insert_subgraph(donor,
@@ -989,7 +1002,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_op
                                         { donor_operation.host.begin, operation.host.begin },
                                         {   donor_operation.host.end,   operation.host.end }
         },
-                                    { { donor.graph.boundary(donor_operation.host.begin).lane, graph.boundary(operation.host.begin).lane } });
+                                    { { donor.graph.boundary(donor_operation.host.begin).lane, graph.boundary(operation.host.begin).lane } },
+                                    scope_roots);
 
         // A metadata view submits no device or worker work. Bypass those old
         // extents while retaining their externally referenced order frontiers.
@@ -1033,7 +1047,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_op
             if (!lane_mapping.contains(lane)) return std::unexpected("operation_additional_resource_not_supported");
         }
 
-        replacement.insert_subgraph(donor, *this, donor_region.nodes, donor_region.internal_dependencies, std::move(boundary_mapping), lane_mapping);
+        replacement
+            .insert_subgraph(donor, *this, donor_region.nodes, donor_region.internal_dependencies, std::move(boundary_mapping), lane_mapping, scope_roots);
     }
 
     // Keep old intermediate completion identities addressable by their existing
@@ -1065,7 +1080,8 @@ bool TemplateDefinition::is_cpu_region(std::span<const std::size_t> nodes) const
     std::optional<std::size_t> cpu_lane;
     for (const auto index : nodes) {
         const auto & node = graph[index];
-        if (node.kind != SourceSpanKind::CpuObservation && node.kind != SourceSpanKind::CpuControl) return false;
+        if (node.kind != SourceSpanKind::CpuObservation && node.kind != SourceSpanKind::ResourceObservation && node.kind != SourceSpanKind::CpuControl)
+            return false;
         const auto lane = graph.boundary(node.begin).lane;
         if (lanes[lane].source.domain != SourceDomain::CpuThread || graph.boundary(node.end).lane != lane || (cpu_lane && *cpu_lane != lane)) return false;
         cpu_lane = lane;

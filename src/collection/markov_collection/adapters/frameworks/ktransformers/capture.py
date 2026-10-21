@@ -270,7 +270,7 @@ class KTransformersCapture(CaptureSession):
             "--model_path",
             self.prepared["model_path"],
             "--model_name",
-            self._model_configuration()["architectures"][0],
+            self.prepared["model_configuration"]["architectures"][0],
             "--device",
             "npu:0",
             "--log_dir",
@@ -299,7 +299,7 @@ class KTransformersCapture(CaptureSession):
                 "framework": "ktransformers",
                 "framework_version": importlib.metadata.version("ktransformers"),
                 "configuration": self.prepared["configuration"],
-                "model_configuration": self._model_configuration(),
+                "model_configuration": self.prepared["model_configuration"],
                 "effective_server_args": {
                     name: getattr(arguments, name)
                     for name in (

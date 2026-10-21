@@ -51,7 +51,7 @@
     "performance_manifests": []
   },
   "output": {
-    "directory": "../../../data/redesign/sglang",
+    "directory": "../../../data",
     "diagnostics": false
   }
 }

@@ -112,6 +112,8 @@ SourceSubgraphs BlockExtractor::extract() const {
         const auto & span = graph_.spans()[identity];
         if (!span.owner_call) continue;
 
+        // Omit pure CPU provenance. Resource observations carry state effects
+        // and must remain members through sharing and target transformations.
         const bool retained = span.kind != SourceSpanKind::CpuObservation || markers[identity];
         if (retained) {
             members[*span.owner_call].push_back(identity);
@@ -168,8 +170,6 @@ SourceSubgraphs BlockExtractor::extract() const {
 
     // Shared owners retain internal edges; ownership changes expose template boundaries.
     std::vector<std::vector<std::size_t>> internal_edges(calls_.size());
-    std::vector<std::set<BoundaryId>> inputs(calls_.size());
-    std::vector<std::set<BoundaryId>> outputs(calls_.size());
     for (std::size_t index = 0; index < graph_.edges().size(); ++index) {
         const auto & edge = graph_.edges()[index];
         if (edge.relation == SourceRelation::IntervalExtent && !extents.contains({ edge.source, edge.target })) continue;
@@ -181,10 +181,6 @@ SourceSubgraphs BlockExtractor::extract() const {
 
         for (const auto owner : sources) {
             if (std::binary_search(targets.begin(), targets.end(), owner)) internal_edges[owner].push_back(index);
-            else outputs[owner].insert(edge.source);
-        }
-        for (const auto owner : targets) {
-            if (!std::binary_search(sources.begin(), sources.end(), owner)) inputs[owner].insert(edge.target);
         }
 
         if (sources == targets) continue;
@@ -213,8 +209,6 @@ SourceSubgraphs BlockExtractor::extract() const {
                                   std::move(logical_members[index]),
                                   std::move(internal_thread_paths[index]),
                                   std::move(internal_edges[index]),
-                                  std::move(inputs[index]),
-                                  std::move(outputs[index]),
                                   std::move(ports) });
     }
     return result;

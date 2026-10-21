@@ -2,6 +2,7 @@
 
 #include "markov/contracts/control.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -18,14 +19,12 @@ public:
 
     void initialize(std::span<const Request> requests, ServingLimits limits) override;
     std::vector<ControlAction> handle(std::span<const ControlEvent> events) override;
+    std::vector<PortRef> retained_ports() const override;
     ControllerSummary finish() const override;
 
 private:
-    enum class RequestPhase { NotReceived, Waiting, Active, Finished };
-
     struct Progress {
-        RequestPhase phase = RequestPhase::NotReceived;
-        std::uint32_t published_tokens = 0;
+        std::uint32_t generated_tokens = 0;
         std::optional<std::uint32_t> pool_slot;
         std::vector<std::uint32_t> kv_pages;
     };
@@ -42,13 +41,14 @@ private:
     double admission_ratio_;
 
     std::vector<Progress> progress_;
+    std::size_t completed_requests_ = 0;
     std::deque<std::uint32_t> free_request_slots_;
     std::deque<std::uint32_t> free_pages_;
     std::deque<RequestId> incoming_;
     std::deque<RequestId> waiting_;
 
     struct PendingBatch {
-        BatchInput input;
+        std::vector<RequestId> members; // Empty for an Idle scheduling decision.
         PortRef completion;
     };
     std::optional<PendingBatch> reserved_batch_;

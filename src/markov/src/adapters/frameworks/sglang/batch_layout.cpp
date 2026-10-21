@@ -31,16 +31,8 @@ std::expected<std::optional<BatchParameterLayout>, std::string> BatchLayout::bin
     });
 }
 
-std::expected<std::optional<BatchParameterLayout>, std::string> BatchLayout::bind(const SourceKernel & source, std::span<const BatchFilter> filters,
-                                                                                  const std::optional<BatchMerge> & observed_merge,
-                                                                                  std::optional<NativeFilterSelection> selection) const {
-    auto filtered = filter(source, filters, selection);
-    if (selection || !filtered || *filtered) return filtered;
-    return bind_merge(source, observed_merge);
-}
-
-std::expected<std::optional<BatchParameterLayout>, std::string> BatchLayout::filter(const SourceKernel & source, std::span<const BatchFilter> source_filters,
-                                                                                    std::optional<NativeFilterSelection> selection) const {
+std::expected<std::optional<BatchParameterLayout>, std::string>
+    BatchLayout::bind_filter(const SourceKernel & source, std::span<const BatchFilter> source_filters, std::optional<NativeFilterSelection> selection) const {
     if (source.name != "aclnnIndex_IndexAiCore_Index" || source.operation != "Index") return std::optional<BatchParameterLayout>{};
 
     // Native parent scopes establish which control action owns this filter.

@@ -70,7 +70,7 @@ RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::m
         const auto host = operation.host_span;
         const auto requests = scalar ? 1 : static_cast<std::uint64_t>(root.tensors[2][0]);
         const BatchOperationVariant variant{ destination, requests, scalar ? 1U : 2U, scalar ? 1 : std::numeric_limits<std::uint64_t>::max() };
-        indexed_writes_.emplace(host, IndexedWriteSource{ variant, write_span, write, broadcast });
+        indexed_writes_.emplace(host, IndexedWriteSource{ variant, write_span, write });
         if (broadcast) broadcasts_.emplace(*broadcast, host);
     }
 }

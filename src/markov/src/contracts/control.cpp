@@ -7,6 +7,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace markov {
@@ -29,6 +30,11 @@ nlohmann::json AdmissionEntryState::describe() const {
 
 std::size_t AdmissionWork::horizon_checks() const { return std::accumulate(request_horizon_checks.begin(), request_horizon_checks.end(), std::size_t{ 0 }); }
 
+std::string_view AdmissionWork::stop_name(AdmissionStop stop) {
+    static constexpr std::array names{ "queue_exhausted", "closed", "no_waiting_requests", "request_capacity", "memory_budget", "input_budget" };
+    return names[static_cast<std::size_t>(stop)];
+}
+
 bool AdmissionWork::parameterized_cpu_path(const AdmissionEntryState & entry, std::size_t admitted_requests) const {
     if (admitted_requests == 0) {
         if (candidate_checks != 0 || !request_horizon_checks.empty()) return false;
@@ -48,7 +54,6 @@ bool AdmissionWork::parameterized_cpu_path(const AdmissionEntryState & entry, st
 }
 
 nlohmann::json AdmissionWork::describe(const AdmissionEntryState & entry, std::size_t admitted_requests) const {
-    static constexpr std::array names{ "queue_exhausted", "closed", "no_waiting_requests", "request_capacity", "memory_budget", "input_budget" };
     // Native compaction and the post-Prepare pending-token sum only run when a
     // new prefill batch exists. Derive their sizes instead of storing queue state.
     return {
@@ -56,7 +61,7 @@ nlohmann::json AdmissionWork::describe(const AdmissionEntryState & entry, std::s
         {           "request_checks",                                           request_horizon_checks.size() },
         {           "horizon_checks",                                                        horizon_checks() },
         {   "request_horizon_checks",                                                  request_horizon_checks },
-        {                     "stop",                                   names[static_cast<std::size_t>(stop)] },
+        {                     "stop",                                                         stop_name(stop) },
         {   "queue_compaction_items",                     admitted_requests == 0 ? 0 : entry.waiting_requests },
         { "pending_statistics_items", admitted_requests == 0 ? 0 : entry.waiting_requests - admitted_requests }
     };
@@ -92,7 +97,7 @@ std::span<const BlockDefinition> ServingContract::steps() const {
     static constexpr std::array schedule_ports{ PortKind::Selected };
     static constexpr std::array prepare_ports{ PortKind::Prepared };
     static constexpr std::array execution_ports{ PortKind::Submitted, PortKind::DeviceDone };
-    static constexpr std::array publish_ports{ PortKind::Published };
+    static constexpr std::array publish_ports{ PortKind::ResultProcessed };
 
     static constexpr std::array schedule_inputs{
         BlockParameter{ "visible_requests",      BlockParameterKind::RequestIds },
@@ -105,7 +110,7 @@ std::span<const BlockDefinition> ServingContract::steps() const {
         BlockParameter{ "requests",  BlockParameterKind::RequestBatch }
     };
 
-    static constexpr BlockDefinition schedule{ StepKind::Schedule, "schedule",         "arrival or previous published",
+    static constexpr BlockDefinition schedule{ StepKind::Schedule, "schedule",         "arrival or previous result_processed",
                                                schedule_ports,     PortKind::Selected, "commit batch selection or an empty scheduling decision",
                                                schedule_inputs };
     static constexpr BlockDefinition prepare{ StepKind::Prepare, "prepare", "selected", prepare_ports, PortKind::Prepared, "input and KV metadata ready",
@@ -114,10 +119,15 @@ std::span<const BlockDefinition> ServingContract::steps() const {
                                               execution_ports,   PortKind::Submitted, "device_done makes prefill result ready",
                                               batch_inputs };
     static constexpr BlockDefinition decode{
-        StepKind::Decode, "decode", "prepared and previous published", execution_ports, PortKind::Submitted, "device_done makes next result ready", batch_inputs
+        StepKind::Decode, "decode", "prepared and previous result_processed", execution_ports, PortKind::Submitted, "device_done makes next result ready",
+        batch_inputs
     };
-    static constexpr BlockDefinition publish{ StepKind::Publish, "publish",           "submitted; device_done gates published",
-                                              publish_ports,     PortKind::Published, "advance tokens, expose result, release finished request KV",
+    static constexpr BlockDefinition publish{ StepKind::Publish,
+                                              "publish",
+                                              "submitted; device_done gates result_processed",
+                                              publish_ports,
+                                              PortKind::ResultProcessed,
+                                              "commit generated tokens and finished request KV; emit request_output only on token handoff",
                                               batch_inputs };
 
     static constexpr std::array contracts{ schedule, prepare, prefill, decode, publish };
@@ -184,6 +194,11 @@ nlohmann::json ServingContract::describe() const {
             { "cpu_completion", port_name(definition.cpu_completion) },
             {         "effect",                    definition.effect }
         });
+        if (definition.kind == StepKind::Publish)
+            definitions.back()["request_output"] = {
+                { "boundary", "sending role batch_output return after token handoff to detokenizer" },
+                {  "members",               "only requests with a positive emitted token increment" }
+            };
     }
 
     return definitions;
@@ -199,8 +214,8 @@ std::string_view ServingContract::port_name(PortKind port) const {
         return "submitted";
     case PortKind::DeviceDone:
         return "device_done";
-    case PortKind::Published:
-        return "published";
+    case PortKind::ResultProcessed:
+        return "result_processed";
     }
 
     std::unreachable();

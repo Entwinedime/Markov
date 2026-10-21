@@ -7,12 +7,10 @@ import importlib.metadata
 import os
 import signal
 import time
-from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.session import SGLangSession
 from markov_collection.adapters.runtimes.ascend.cpu_boundaries import AscendCpuBoundaries
-from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.adapters.runtimes.ascend.transfer_sampling import TransferMeasurements
 from markov_collection.artifacts.cpu_measurements import CpuMeasurements
 from markov_collection.artifacts.json_file import write_json
@@ -47,20 +45,13 @@ class SGLangSampling(SGLangSession):
         super().prepare()
 
     def run(self) -> None:
-        from sglang.srt.entrypoints.engine import Engine
-
         grid = self.prepared["measurement_grid"]
         repetitions = self.prepared["repetitions"]
         device = self.prepared["measurement_kind"] == "device"
         os.environ["SGLANG_PLUGINS"] = "markov"
 
         engine_started_ns = time.perf_counter_ns()
-        engine = Engine(
-            model_path=self.prepared["model_path"],
-            tokenizer_path=self.prepared["tokenizer_path"],
-            skip_tokenizer_init=True,
-            **self.prepared["configuration"],
-        )
+        engine = self._start_engine()
         engine_ready_ns = time.perf_counter_ns()
         signal.signal(signal.SIGQUIT, self._handle_worker_failure)
         try:
@@ -95,7 +86,7 @@ class SGLangSampling(SGLangSession):
                 {
                     "framework": "sglang",
                     "framework_version": importlib.metadata.version("sglang"),
-                    "runtime": RuntimeEnvironment().describe(),
+                    "runtime": self.runtime_environment,
                     "effective_server_args": dataclasses.asdict(engine.tokenizer_manager.server_args),
                     "profiler_enabled": device,
                     "native_api_journal_enabled": device,
@@ -164,7 +155,7 @@ class SGLangSampling(SGLangSession):
         }
         cpu_measurements = None
         if self.prepared["measurement_kind"] == "cpu":
-            cpu_measurements = self._publish_cpu(manifest, scopes, domain, completions)
+            cpu_measurements = self._publish_cpu(manifest, transfers.scopes, domain, completions)
         write_json(self.directory / "performance_manifest.json", manifest)
         transfers.consume_journals()
         if cpu_measurements is not None and manifest["readiness"] == "ready":
@@ -173,7 +164,7 @@ class SGLangSampling(SGLangSession):
     def _publish_cpu(
         self,
         manifest: dict[str, Any],
-        scopes: list[Path],
+        scopes: dict[tuple[int, int], dict[str, Any]],
         domain: SamplingDomain,
         completions: list[dict[str, Any]],
     ) -> CpuMeasurements:
@@ -184,7 +175,6 @@ class SGLangSampling(SGLangSession):
             domain,
             AscendCpuBoundaries(),
             self.prepared["cpu_services"],
-            self.prepared["cpu_service_descriptors"],
         )
         summary = measurements.publish(summary_path, completions)
         manifest.update(
@@ -192,7 +182,6 @@ class SGLangSampling(SGLangSession):
                 "measurement_kind": "native_cpu_activity",
                 "cpu_activities": [str(path.relative_to(self.directory)) for path in measurements.paths],
                 "cpu_measurements": summary_path.name,
-                "readiness": "needs_data",
                 "clock": {
                     "wall_ns": "CLOCK_MONOTONIC at native activity boundaries",
                     "thread_cpu_ns": "CLOCK_THREAD_CPUTIME_ID with marked observer CPU excluded",
@@ -208,7 +197,8 @@ class SGLangSampling(SGLangSession):
         if summary["cost_gap"] is not None:
             manifest["gaps"].append({"kind": "cost", "reason": summary["cost_gap"]})
         manifest["gaps"].extend(summary["gaps"])
-        manifest["readiness"] = "needs_data" if manifest["gaps"] else "ready"
+        if manifest["gaps"]:
+            manifest["readiness"] = "needs_data"
         return measurements
 
     def _measure(self, engine: Any, grid: list[dict[str, Any]], repetitions: int) -> list[dict[str, Any]]:
@@ -217,19 +207,18 @@ class SGLangSampling(SGLangSession):
             # Observe actual batches; client batch size alone does not prove
             # that the native scheduler warmed the requested execution path.
             self._cohorts.generate(point["requests"], f"markov-measure-warmup/{point['id']}")
-            self._reset(engine)
+            self._complete_cohort(engine, f"markov-measure-warmup/{point['id']}", len(point["requests"]))
 
             for repetition in range(repetitions):
                 control = None
                 control_identity = f"markov-control/{point['id']}/{repetition}"
                 if self.prepared["measurement_kind"] == "cpu":
-                    # Undeclared IDs pass through native serving without active
-                    # cost scopes. The global callback remains installed: this
-                    # pair measures active-recorder perturbation, not its full
-                    # difference from a process without callbacks.
+                    # Compare declared control cohorts with the active recorder.
+                    # The global callback remains installed, so this pair does
+                    # not measure the difference from a process without callbacks.
                     control_started_ns = time.perf_counter_ns()
                     self._cohorts.generate(point["requests"], control_identity)
-                    self._reset(engine)
+                    self._complete_cohort(engine, control_identity, len(point["requests"]))
                     control = {"started_ns": control_started_ns, "ended_ns": time.perf_counter_ns()}
 
                 started_ns = time.perf_counter_ns()
@@ -237,7 +226,7 @@ class SGLangSampling(SGLangSession):
                 response = self._cohorts.generate(point["requests"], identity)
                 # A client response can precede the final native publication.
                 # Qualification encloses that completion; costs keep their own scopes.
-                self._reset(engine)
+                self._complete_cohort(engine, identity, len(point["requests"]))
                 ended_ns = time.perf_counter_ns()
                 completions.append(
                     {
@@ -259,3 +248,9 @@ class SGLangSampling(SGLangSession):
                     }
                 )
         return completions
+
+    def _complete_cohort(self, engine: Any, identity: str, members: int) -> None:
+        if self.prepared["measurement_kind"] != "device":
+            request_ids = {f"{identity}/{slot}" for slot in range(members)}
+            engine.loop.run_until_complete(self._await_cleanup(request_ids, self.directory / "transfer_scopes"))
+        self._reset(engine)

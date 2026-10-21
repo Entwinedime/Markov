@@ -27,10 +27,12 @@ public:
                       std::optional<std::filesystem::path> graph_path);
 
     nlohmann::json run(ServingLimits limits);
+    std::optional<nlohmann::json> request_result(RequestId id) const;
+    const CostRequirements & requirements() const { return execution_graph_.requirements(); }
 
 private:
     struct QueuedEvent {
-        ControlEvent event;
+        ExecutionEvent event;
         std::uint64_t sequence;
     };
 
@@ -39,9 +41,7 @@ private:
     };
 
     struct Work {
-        InvokeStep invocation;
-        std::vector<TemplateInstance> instances;
-        std::map<PortKind, std::int64_t> completed_ports;
+        std::size_t pending_ports = 0;
     };
 
     struct RequestTiming {
@@ -50,10 +50,11 @@ private:
         std::optional<std::int64_t> completed_ns;
     };
 
-    std::optional<nlohmann::json> accept(std::span<const ControlAction> actions);
-    void enqueue(ControlEvent event);
+    std::optional<nlohmann::json> accept(std::vector<ControlAction> actions);
+    void enqueue(ExecutionEvent event);
     nlohmann::json describe_invocation(const InvokeStep & invocation) const;
-    nlohmann::json report(std::string_view status, const nlohmann::json & gaps) const;
+    void record_batch(std::span<const InvokeStep> invocations);
+    nlohmann::json report(std::string_view status, const nlohmann::json & gaps);
 
     std::span<const Request> requests_; // Borrowed from the selected workload for this simulation.
     Controller & controller_;
@@ -70,6 +71,8 @@ private:
     std::priority_queue<QueuedEvent, std::vector<QueuedEvent>, LaterEvent> events_;
 
     std::map<WorkId, Work> work_;
+    std::size_t work_count_ = 0;
+    std::size_t peak_work_ = 0;
     std::size_t batches_ = 0;
     std::uint32_t request_capacity_ = 0;
 

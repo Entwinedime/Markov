@@ -79,9 +79,12 @@ Project ProjectReader::read(const std::filesystem::path & path) const {
     fields(data, { "model", "configurations", "request_workloads", "collection", "assets", "output" });
 
     const auto & model = data.at("model");
-    fields(model, { "path", "tokenizer_path" });
+    fields(model, { "path", "tokenizer_path", "configuration" });
     project.model_path = resolve_path(project.path, model.at("path"));
     project.tokenizer_path = model.contains("tokenizer_path") ? resolve_path(project.path, model.at("tokenizer_path")) : project.model_path;
+    project.model_configuration = model.value("configuration", Json(nullptr));
+    if (!project.model_configuration.is_null() && (!project.model_configuration.is_object() || project.model_configuration.empty()))
+        throw std::invalid_argument("model.configuration must be a nonempty native model configuration");
 
     const auto & configurations = data.at("configurations");
     if (!configurations.is_array() || configurations.empty()) throw std::invalid_argument("configurations must be a nonempty array");
@@ -98,21 +101,8 @@ Project ProjectReader::read(const std::filesystem::path & path) const {
         const auto kind = binding.framework();
         const auto config_path = resolve_path(project.path, item.at("config"));
 
-        const auto & environment = item.at("environment");
-        fields(environment, { "runtime", "service", "devices" });
-        if (environment.value("runtime", std::string("docker")) != "docker") throw std::invalid_argument("environment.runtime must be docker");
-        Environment deployment{ string_value(environment.at("service")), {} };
-        if (deployment.service != binding.service()) throw std::invalid_argument("environment.service differs from framework");
-        const auto & devices = environment.at("devices");
-        if (!devices.is_array() || devices.empty()) throw std::invalid_argument("environment.devices must be a nonempty array");
-        std::set<std::uint32_t> device_ids;
-        for (const auto & value : devices) {
-            const auto device = static_cast<std::uint32_t>(integer(value, 0, std::numeric_limits<std::uint32_t>::max()));
-            if (!device_ids.insert(device).second) throw std::invalid_argument("duplicate device number");
-            deployment.devices.push_back(device);
-        }
-
-        project.configurations.push_back({ id, kind, std::move(deployment), config_path, binding.read_configuration(config_path, read_json(config_path)) });
+        project.configurations.push_back(
+            { id, kind, Environment::read(item.at("environment")), config_path, binding.read_configuration(config_path, read_json(config_path)) });
     }
 
     const auto & workloads = data.at("request_workloads");

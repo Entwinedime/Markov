@@ -4,13 +4,14 @@
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/source_graph.hpp"
 
-#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace markov {
@@ -32,15 +33,6 @@ struct SourceAdmissionPolicy {
     static SourceAdmissionPolicy read(const nlohmann::json & value);
 };
 
-struct SourceWorkerControls {
-    double waiting_timeout_seconds;
-    double running_timeout_seconds;
-    bool test_retract;
-    bool require_mlp_sync;
-
-    static SourceWorkerControls read(const nlohmann::json & value);
-};
-
 struct SourceBatchFilter {
     std::vector<std::string> before;
     std::vector<std::string> after;
@@ -58,6 +50,10 @@ struct SourceCall {
     std::optional<std::uint64_t> batch_id;
     std::optional<BatchPhase> phase;
     std::vector<SourceRequest> requests;
+    std::vector<SourceIncomingRequest> incoming_requests;
+    std::optional<bool> input_supported;
+    std::optional<std::size_t> input_ready_call;
+    std::vector<std::pair<std::string, std::size_t>> request_ready_calls;
 
     std::optional<SourceSpanId> marker;
     std::int64_t observed_start_ns; // Native monotonic entry, only for ordering source observations.
@@ -66,10 +62,8 @@ struct SourceCall {
     std::vector<SourcePublication> publications;
     std::optional<std::string> binding;
     std::vector<SourceBatchFilter> batch_filters;
-    nlohmann::json module = nullptr; // Opaque observation; interpreted once by the template producer.
     std::optional<SourceOutputPolicy> output_policy = std::nullopt;
     std::optional<SourceAdmissionPolicy> admission_policy = std::nullopt;
-    std::optional<SourceWorkerControls> worker_controls = std::nullopt;
 
     bool is_annotation() const { return kind != SourceCallKind::Serving; }
 

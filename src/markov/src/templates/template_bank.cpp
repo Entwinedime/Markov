@@ -16,7 +16,23 @@ using Json = nlohmann::json;
 
 } // namespace
 
-void TemplateBank::bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources) {
+TemplateBank::TemplateBank(TemplateSource source) : source_(std::move(source)) {
+    for (auto & [key, definitions] : source_.definitions)
+        for (auto & definition : definitions) definition.source_manifest = source_.manifest_path;
+    bind_sources({});
+}
+
+bool TemplateBank::shares_source_contract(const TemplateBank & bank) const {
+    const auto & source = bank.source_;
+    return source.model_configuration == source_.model_configuration && source.configuration == source_.configuration
+           && source.rank_bindings == source_.rank_bindings && source.page_size_tokens == source_.page_size_tokens
+           && source.sequence_capacity_tokens == source_.sequence_capacity_tokens && *source.admission_policy == *source_.admission_policy
+           && source.resolution == source_.resolution && source.deployment.shares_implementation(source_.deployment)
+           && source.deployment.measurement == source_.deployment.measurement;
+}
+
+void TemplateBank::bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources,
+                                std::optional<std::uint32_t> request_capacity) {
     operation_sources_.assign(operation_sources.begin(), operation_sources.end());
     donors_.clear();
     banks_ = { this };
@@ -25,18 +41,29 @@ void TemplateBank::bind_sources(std::span<const TemplateBank * const> banks, std
 
     for (const auto * bank : banks) {
         if (bank == this) continue;
-        const auto & source = bank->source_;
         // Local rewrites may share observations under the same native setup.
         // Configuration migration remains a separate, explicitly qualified rule.
-        if (source.model_path != source_.model_path || source.configuration != source_.configuration || source.ranks != source_.ranks
-            || source.page_size_tokens != source_.page_size_tokens || source.sequence_capacity_tokens != source_.sequence_capacity_tokens
-            || *source.admission_policy != *source_.admission_policy || source.resolution != source_.resolution
-            || source.deployment.service != source_.deployment.service || source.deployment.devices != source_.deployment.devices)
-            continue;
+        if (!shares_source_contract(*bank)) continue;
 
         banks_.push_back(bank);
-        for (const auto & [key, definitions] : source.definitions)
+        for (const auto & [key, definitions] : bank->source_.definitions)
             for (const auto & definition : definitions) donors_[key].push_back(&definition);
+    }
+
+    // Each role contributes its own post-warmup state. A root source cannot
+    // initialize resources whose native worker role was never observed.
+    workspace_pools_.clear();
+    const auto capacity = request_capacity.value_or(source_.request_pool_domain.maximum);
+    for (std::uint32_t rank = 0; rank < source_.rank_count(); ++rank) {
+        const auto role = source_.rank_bindings[rank].source_rank;
+        const auto donor = std::ranges::find_if(banks_, [&](const auto * bank) {
+            return bank->source_.source_rank == role && bank->qualify_initialization(capacity).has_value();
+        });
+        if (donor == banks_.end()) continue;
+        for (auto pool : (*donor)->source_.workspace_pools) {
+            pool.resource.rank = rank;
+            workspace_pools_.push_back(pool);
+        }
     }
 }
 
@@ -200,7 +227,7 @@ std::expected<std::optional<TemplateOperationRewrite>, std::string> TemplateBank
             // An already-empty running batch skips this call entirely. The
             // producer qualified a CPU-only empty return; retain its external
             // ordering points, but remove the observed work and internal edges.
-            const auto cut = source.semantic_region(source.regions[*source.running_update_region]);
+            const auto & cut = source.regions[*source.running_update_region];
             const auto ports = source.region_ports(cut);
             if (!ports) return std::unexpected(ports.error());
             if (ports->size() != 1 || (ports->front().resource).domain != SourceDomain::CpuThread)
@@ -245,42 +272,41 @@ std::expected<std::optional<TemplateOperationRewrite>, std::string> TemplateBank
 std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::plan_publication_members(const TemplateDefinition & source,
                                                                                                          const BatchInput & target) const {
     std::vector<TemplateOperationRewrite> rewrites;
-    if (source.publication_regions.empty()) return rewrites;
-    auto work = source.publication_layout->evaluate(target);
-    if (!work) return std::unexpected(work.error());
+    if (!source.publication_sequence) return rewrites;
+    const auto & source_members = source.sequences[*source.publication_sequence].source_members;
 
     // Reuse qualified member cuts across calls of the same phase/rank and
     // policy. Shared output and aggregate release remain with the recipient.
     std::vector<const TemplateDefinition *> donors{ &source };
     for (const auto * candidate : donors_.at({ source.step, source.phase, source.rank })) {
-        if (candidate != &source && !candidate->publication_regions.empty()
-            && source.publication_layout->can_reuse_members_from(*candidate->publication_layout))
+        if (candidate != &source && candidate->publication_sequence && source.publication_layout->can_reuse_members_from(*candidate->publication_layout))
             donors.push_back(candidate);
     }
 
-    bool changed = source.publication_regions.size() != target.requests.size();
+    bool changed = source_members.size() != target.requests.size();
     std::vector<TemplateRegionReference> members;
     for (std::size_t slot = 0; slot < target.requests.size(); ++slot) {
         const auto finishes = target.requests[slot].finishes;
-        if (slot < source.publication_regions.size() && source.publication_finishes[slot] == finishes) {
-            members.push_back({ &source, source.publication_regions[slot] });
+        if (slot < source_members.size() && source.publication_finishes[slot] == finishes) {
+            members.push_back({ &source, *source.publication_sequence, slot });
             continue;
         }
 
         bool selected = false;
         std::string gap = "publication_member_branch_not_qualified";
         for (const auto * donor : donors) {
-            for (std::size_t donor_slot = 0; donor_slot < donor->publication_regions.size(); ++donor_slot) {
+            const auto & donor_members = donor->sequences[*donor->publication_sequence].source_members;
+            for (std::size_t donor_slot = 0; donor_slot < donor_members.size(); ++donor_slot) {
                 if (donor->publication_finishes[donor_slot] != std::optional(finishes)) continue;
                 // A member is selected by its own interface. Its predecessor
                 // belongs to the assembled sequence, not the old recipient slot.
-                const auto ports = donor->region_ports(donor->semantic_region(donor->regions[donor->publication_regions[donor_slot]]));
+                const auto ports = donor->region_ports(donor->regions[donor_members[donor_slot]]);
                 if (!ports) {
                     gap = ports.error();
                     continue;
                 }
 
-                members.push_back({ donor, donor->publication_regions[donor_slot] });
+                members.push_back({ donor, *donor->publication_sequence, donor_slot });
                 selected = true;
                 break;
             }
@@ -291,11 +317,66 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
         changed = true;
     }
     if (changed) {
-        auto sequence = source.plan_region_sequence(source.publication_regions, members);
+        auto sequence = source.plan_region_sequence(*source.publication_sequence, members);
         if (!sequence) return std::unexpected(sequence.error());
         rewrites.push_back(std::move(*sequence));
     }
     return rewrites;
+}
+
+std::expected<std::optional<TemplateOperationRewrite>, std::string> TemplateBank::plan_incoming_requests(const TemplateDefinition & source,
+                                                                                                         const BatchInput & target) {
+    if (source.step != StepKind::Schedule || source.source_incoming_requests.size() == target.incoming_requests.size()) return std::nullopt;
+    if (!source.incoming_request_sequence) return std::unexpected("input_request_sequence_not_observed");
+
+    const auto index = *source.incoming_request_sequence;
+    const auto & sequence = source.sequences[index];
+    std::vector<TemplateRegionReference> members;
+    for (std::size_t slot = 0; slot < target.incoming_requests.size(); ++slot)
+        members.push_back({ &source, index, std::min(slot, sequence.source_members.size() - 1) });
+    return source.plan_region_sequence(index, members);
+}
+
+std::expected<void, std::string> TemplateBank::bind_input_reception(TemplateTopology & topology, const TemplateDefinition & source,
+                                                                    const BatchInput & target) const {
+    if (source.step != StepKind::Schedule || source.source_incoming_requests.empty() == target.incoming_requests.empty()) return {};
+    if (!source.input_reception_sequence) return std::unexpected("input_reception_prefix_not_observed");
+
+    std::string gap = "input_reception_variant_not_qualified";
+    for (const auto & [key, donors] : donors_) {
+        if (std::get<0>(key) != source.step || std::get<2>(key) != source.rank) continue;
+        for (const auto * donor : donors) {
+            if (!donor->input_reception || !*donor->input_reception || !donor->input_reception_sequence
+                || donor->source_incoming_requests.empty() != target.incoming_requests.empty())
+                continue;
+            auto members = plan_incoming_requests(*donor, target);
+            if (!members) {
+                gap = members.error();
+                continue;
+            }
+            TemplateTopology prepared(*donor);
+            if (*members) {
+                const auto expanded = prepared.apply_operations(*donor, std::span(&**members, 1));
+                if (!expanded) {
+                    gap = expanded.error();
+                    continue;
+                }
+            }
+
+            const auto index = *donor->input_reception_sequence;
+            std::vector<TemplateRegionReference> prefix;
+            for (std::size_t slot = 0; slot < donor->sequences[index].source_members.size(); ++slot) prefix.push_back({ donor, index, slot });
+            const auto plan = source.plan_region_sequence(*source.input_reception_sequence, prefix);
+            if (!plan) {
+                gap = plan.error();
+                continue;
+            }
+            const auto bound = topology.replace_sequence(source, *plan->sequence, *donor, prepared);
+            if (bound) return {};
+            gap = bound.error();
+        }
+    }
+    return std::unexpected(gap);
 }
 
 std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::plan_materializations(const TemplateDefinition & source,
@@ -306,6 +387,12 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
     auto operations = plan_batch_operations(source, target);
     if (!operations) return std::unexpected(operations.error());
     auto rewrites = std::move(*operations);
+
+    if (source.source_incoming_requests.empty() == target.incoming_requests.empty()) {
+        auto incoming = plan_incoming_requests(source, target);
+        if (!incoming) return std::unexpected(incoming.error());
+        if (*incoming) rewrites.push_back(std::move(**incoming));
+    }
 
     // Production declares which copies become views for one request. The core
     // qualifies their cuts and preserves the declared producer's readiness.
@@ -319,21 +406,22 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
 
     if (source.source_requests.size() != target.requests.size()) {
         const bool admission = source.step == StepKind::Schedule && source.phase == BatchPhase::Prefill;
-        const auto & regions = admission ? source.admission_regions : source.request_initialization_regions;
+        const auto sequence_id = admission ? source.admission_sequence : source.request_initialization_sequence;
         if (admission) {
-            if (regions.empty() || !target.admission_work.parameterized_cpu_path(target.admission, target.requests.size()))
+            if (!sequence_id || !target.admission_work.parameterized_cpu_path(target.admission, target.requests.size()))
                 return std::unexpected("admission_member_sequence_not_qualified");
             // The first admission member initializes native state; only an
             // observed later member supplies the insertion branch for extra slots.
-            if (target.requests.size() > 1 && regions.size() < 2) return std::unexpected("admission_insertion_member_not_observed");
+            if (target.requests.size() > 1 && source.sequences[*sequence_id].source_members.size() < 2)
+                return std::unexpected("admission_insertion_member_not_observed");
         }
-        if (!regions.empty()) {
+        if (sequence_id) {
+            const auto & regions = source.sequences[*sequence_id].source_members;
             std::vector<TemplateRegionReference> members;
             for (std::size_t slot = 0; slot < target.requests.size(); ++slot) {
-                const auto index = regions[std::min(slot, regions.size() - 1)];
-                members.push_back({ &source, index });
+                members.push_back({ &source, *sequence_id, std::min(slot, regions.size() - 1) });
             }
-            auto sequence = source.plan_region_sequence(regions, members);
+            auto sequence = source.plan_region_sequence(*sequence_id, members);
             if (!sequence) return std::unexpected(sequence.error());
             rewrites.push_back(std::move(*sequence));
         }
@@ -353,6 +441,16 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
 
     if (*kv_region) rewrites.push_back(std::move(**kv_region));
 
+    // Repeat the transformed child work, never the original observed graph.
+    if (source.model_sequence) {
+        const auto & layers = source.sequences[*source.model_sequence];
+        std::vector<TemplateRegionReference> members;
+        for (const auto member : layers.members) members.push_back({ &source, *source.model_sequence, member });
+        auto sequence = source.plan_region_sequence(*source.model_sequence, members);
+        if (!sequence) return std::unexpected(sequence.error());
+        rewrites.push_back(std::move(*sequence));
+    }
+
     return rewrites;
 }
 
@@ -360,139 +458,158 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
 std::expected<std::vector<std::vector<TemplateInstance>>, TemplateGap> TemplateBank::instantiate(std::span<const InvokeStep> invocations,
                                                                                                  std::uint32_t request_capacity) const {
     const auto & first = invocations.front();
-    auto qualification = qualify(request_capacity);
-    if (qualification) qualification = qualify_initialization(request_capacity);
-    if (!qualification) {
-        auto gap = qualification.error();
-        gap.step = first.step;
-        gap.phase = first.input.phase;
-        return std::unexpected(std::move(gap));
-    }
+    // Source identity, capacities and initialization were qualified once by
+    // configuration selection. Only target work changes between invocations.
 
     // Check the entire invocation group before selecting or assembling any
     // subgraph. Exact source-shape matches must obey this capacity as well.
     for (const auto & invocation : invocations) {
-        for (const auto & request : invocation.input.requests) {
+        for (const auto & request : invocation.input->requests) {
             const auto sequence = static_cast<std::uint64_t>(request.context_tokens) + request.input_tokens;
             if (sequence > *source_.sequence_capacity_tokens)
-                return std::unexpected(TemplateGap{ TemplateGapKind::Rule, "sequence_capacity_exceeded", invocation.step, invocation.input.phase, 0 });
+                return std::unexpected(TemplateGap{ TemplateGapKind::Rule, "sequence_capacity_exceeded", invocation.step, invocation.input->phase, 0 });
         }
     }
 
     std::optional<std::pair<std::tuple<std::size_t, std::uint32_t, MatchStage>, TemplateGap>> failure;
-    for (const auto * bank : banks_) {
-        const auto * anchor_source = &bank->source_;
-        // Only the selected root initializes target resources. Later cohorts
-        // execute against WorkspaceState, never their source's initial capacity.
-        if (anchor_source->workspace_binding_gap) {
-            if (!failure)
-                failure = std::pair{
-                    std::tuple(std::size_t{ 0 },
-                    std::uint32_t{ 0 },
-                    MatchStage::Source),
-                    TemplateGap{ TemplateGapKind::Observation, *anchor_source->workspace_binding_gap, first.step, first.input.phase, 0 }
-                };
-            continue;
-        }
-        const auto found = anchor_source->definitions.find({ first.step, first.input.phase, 0 });
-        if (found == anchor_source->definitions.end()) continue;
-        if (found->second.empty()) {
-            if (!failure)
-                failure = std::pair{
-                    std::tuple(std::size_t{ 0 },
-                    std::uint32_t{ 0 },
-                    MatchStage::Source),
-                    TemplateGap{ TemplateGapKind::Rule, "native_transform_rule_missing", first.step, first.input.phase, 0 }
-                };
-            continue;
-        }
-
-        if (anchor_source != &source_) {
-            // A whole-batch source change must preserve target resource roles,
-            // including frontiers left by the preceding source's work.
-            bool resources_qualified = true;
-            for (const auto * candidate : { &source_, anchor_source })
-                for (const auto & [key, definitions] : candidate->definitions)
-                    for (const auto & definition : definitions)
-                        if (!definition.has_resource_roles()) resources_qualified = false;
-            if (!resources_qualified) {
+    struct LocalCohort {
+        const TemplateSource * source;
+        std::optional<std::uint64_t> batch;
+    };
+    struct RoleCandidates {
+        std::vector<LocalCohort> cohorts;
+        std::size_t cursor = 0;
+        std::vector<TemplateInstance> selected;
+    };
+    std::vector<RoleCandidates> roles(source_.rank_count());
+    for (std::uint32_t rank = 0; rank < source_.rank_count(); ++rank) {
+        const auto role = source_.rank_bindings[rank].source_rank;
+        for (const auto * bank : banks_) {
+            const auto & anchor_source = bank->source_;
+            if (anchor_source.source_rank != role) continue;
+            if (anchor_source.workspace_binding_gap) {
                 if (!failure)
                     failure = std::pair{
                         std::tuple(std::size_t{ 0 },
-                        std::uint32_t{ 0 },
-                        MatchStage::Source),
-                        TemplateGap{ TemplateGapKind::Rule, "cross_source_resource_role_not_qualified", first.step, first.input.phase, 0 }
+                        rank, MatchStage::Source),
+                        TemplateGap{ TemplateGapKind::Observation, *anchor_source.workspace_binding_gap, first.step, first.input->phase, rank }
                     };
                 continue;
             }
-        }
-        std::set<std::optional<std::uint64_t>> attempted;
-        for (const auto & anchor : found->second) {
-            if (!attempted.insert(anchor.source_batch).second) continue;
+            const auto found = anchor_source.definitions.find({ first.step, first.input->phase, role });
+            if (found == anchor_source.definitions.end()) continue;
 
-            // Native cross-rank endpoints belong to one observed batch. Qualify
-            // the complete cohort before any instance reaches graph assembly.
-            std::vector<std::vector<TemplateInstance>> selected(invocations.size());
-            bool qualified = true;
-            for (std::size_t index = 0; index < invocations.size(); ++index) {
-                for (std::uint32_t rank = 0; rank < source_.ranks; ++rank) {
-                    auto instance = instantiate_step(*anchor_source, invocations[index], anchor.source_batch, rank, request_capacity);
-                    if (!instance) {
-                        // Preserve the rejection reached furthest through the
-                        // cohort; an incompatible branch must not hide a rule gap.
-                        const auto progress = std::tuple(index, rank, instance.error().stage);
-                        if (!failure || progress > failure->first) failure = std::pair(progress, instance.error().gap);
-                        qualified = false;
-                        break;
-                    }
-                    selected[index].push_back(std::move(*instance));
-                }
-                if (!qualified) break;
+            // Independent sessions have unrelated native resource IDs. A role
+            // source must export common roles before it can be substituted.
+            if (&anchor_source != &source_ && std::ranges::any_of(anchor_source.definitions, [](const auto & entry) {
+                    return std::ranges::any_of(entry.second, [](const auto & definition) { return !definition.has_resource_roles(); });
+                })) {
+                if (!failure)
+                    failure = std::pair{
+                        std::tuple(std::size_t{ 0 },
+                        rank, MatchStage::Source),
+                        TemplateGap{ TemplateGapKind::Rule, "cross_source_resource_role_not_qualified", first.step, first.input->phase, rank }
+                    };
+                continue;
+            }
 
-                // Communication is qualified after every rank's local topology is
-                // available, while the entire cohort still belongs to this candidate.
-                const auto communication = parameterize_communications(selected[index], invocations[index]);
-                if (!communication) {
-                    const auto progress = std::tuple(index, source_.ranks, MatchStage::Communication);
-                    if (!failure || progress > failure->first) failure = std::pair(progress, communication.error());
-                    qualified = false;
-                    break;
-                }
-            }
-            if (qualified) {
-                // Bind resource uses after local and joint communication rewrites.
-                // A donor contributes its own provenance and target endpoints.
-                for (std::size_t index = 0; index < selected.size() && qualified; ++index) {
-                    for (auto & instance : selected[index]) {
-                        const auto bound = instance.bind_workspace_uses(invocations[index].input);
-                        if (bound) continue;
-                        const auto & invocation = invocations[index];
-                        const auto rank = instance.definition->rank;
-                        const auto progress = std::tuple(index, rank, MatchStage::Structure);
-                        if (!failure || progress > failure->first)
-                            failure = std::pair(progress, TemplateGap{ TemplateGapKind::Rule, bound.error(), invocation.step, invocation.input.phase, rank });
-                        qualified = false;
-                        break;
-                    }
-                }
-            }
-            if (qualified) return selected;
+            std::set<std::optional<std::uint64_t>> attempted;
+            for (const auto & anchor : found->second)
+                if (attempted.insert(anchor.source_batch).second) roles[rank].cohorts.push_back({ &anchor_source, anchor.source_batch });
         }
+        if (!roles[rank].cohorts.empty()) {
+            failure.reset();
+            continue;
+        }
+        if (failure) return std::unexpected(failure->second);
+        return std::unexpected(TemplateGap{ TemplateGapKind::Observation, "native_worker_role_not_observed", first.step, first.input->phase, rank });
     }
-    if (!failure) return std::unexpected(TemplateGap{ TemplateGapKind::Observation, "native_step_not_observed", first.step, first.input.phase, 0 });
-    return std::unexpected(failure->second);
+
+    // Materialize one local cohort per rank, lazily trying alternatives. Each
+    // role retains its complete native lifecycle; source batch IDs are local.
+    std::size_t rank = 0;
+    while (true) {
+        while (rank < roles.size()) {
+            auto & role = roles[rank];
+            if (role.cursor == role.cohorts.size()) {
+                role.cursor = 0;
+                if (rank == 0) return std::unexpected(failure->second);
+                --rank;
+                ++roles[rank].cursor;
+                roles[rank].selected.clear();
+                continue;
+            }
+            if (role.selected.empty()) {
+                const auto & cohort = role.cohorts[role.cursor];
+                for (std::size_t index = 0; index < invocations.size(); ++index) {
+                    auto instance = instantiate_step(*cohort.source, invocations[index], cohort.batch, static_cast<std::uint32_t>(rank), request_capacity);
+                    if (!instance) {
+                        const auto progress = std::tuple(index, static_cast<std::uint32_t>(rank), instance.error().stage);
+                        if (!failure || progress > failure->first) failure = std::pair(progress, instance.error().gap);
+                        break;
+                    }
+                    const auto bound = instance->bind_workspace_uses(*invocations[index].input);
+                    if (!bound) {
+                        const auto progress = std::tuple(index, static_cast<std::uint32_t>(rank), MatchStage::Structure);
+                        if (!failure || progress > failure->first)
+                            failure = std::pair(progress,
+                                                TemplateGap{ TemplateGapKind::Rule,
+                                                             bound.error(),
+                                                             invocations[index].step,
+                                                             invocations[index].input->phase,
+                                                             static_cast<std::uint32_t>(rank) });
+                        break;
+                    }
+                    role.selected.push_back(std::move(*instance));
+                }
+                if (role.selected.size() != invocations.size()) {
+                    role.selected.clear();
+                    ++role.cursor;
+                    continue;
+                }
+            }
+            ++rank;
+        }
+
+        // Joint rewriting borrows immutable local plans. A rejected interface
+        // combination must not mutate the candidates used by the next attempt.
+        std::vector<std::vector<TemplateInstance>> selected(invocations.size());
+        for (std::size_t index = 0; index < invocations.size(); ++index)
+            for (const auto & role : roles) selected[index].push_back(role.selected[index]);
+
+        bool qualified = true;
+        for (std::size_t index = 0; index < invocations.size(); ++index) {
+            const auto communication = parameterize_communications(selected[index], invocations[index]);
+            if (communication) continue;
+            const auto progress = std::tuple(index, source_.rank_count(), MatchStage::Communication);
+            if (!failure || progress > failure->first) failure = std::pair(progress, communication.error());
+            qualified = false;
+            break;
+        }
+        if (qualified) return selected;
+
+        --rank;
+        ++roles[rank].cursor;
+        roles[rank].selected.clear();
+    }
 }
 
 std::expected<void, TemplateBank::SelectionFailure> TemplateBank::qualify_source(const TemplateDefinition & source, const InvokeStep & invocation) {
-    const auto & input = invocation.input;
+    const auto & input = *invocation.input;
     const auto rank = source.rank;
+    if (invocation.step == StepKind::Schedule) {
+        if (!source.input_reception)
+            return std::unexpected(SelectionFailure{ MatchStage::Input, TemplateGapKind::Observation, source.input_reception.error(), invocation, rank });
+        if (!*source.input_reception)
+            return std::unexpected(SelectionFailure{ MatchStage::Input, TemplateGapKind::Rule, "native_input_request_path_not_supported", invocation, rank });
+    }
     const bool same_count = source.source_requests.size() == input.requests.size();
     if (!same_count) {
         // Count changes need both parameterized device work and movable request
         // loops. The rewrite planner still qualifies their full interfaces.
-        if (!source.length_domain || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Schedule && source.admission_regions.empty())
-            || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Prepare && source.request_initialization_regions.empty())
-            || (invocation.step == StepKind::Publish && (source.publication_regions.empty() || !source.publication_layout)))
+        if (!source.length_domain || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Schedule && !source.admission_sequence)
+            || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Prepare && !source.request_initialization_sequence)
+            || (invocation.step == StepKind::Publish && (!source.publication_sequence || !source.publication_layout)))
             return std::unexpected(
                 SelectionFailure{ MatchStage::RequestCount, TemplateGapKind::Rule, "request_count_transform_not_implemented", invocation, rank });
     }
@@ -503,7 +620,7 @@ std::expected<void, TemplateBank::SelectionFailure> TemplateBank::qualify_source
             if (!finishes)
                 return std::unexpected(
                     SelectionFailure{ MatchStage::Publication, TemplateGapKind::Observation, "native_publication_branch_not_observed", invocation, rank });
-            if (*finishes != input.requests[slot].finishes && source.publication_regions.empty())
+            if (*finishes != input.requests[slot].finishes && !source.publication_sequence)
                 return std::unexpected(
                     SelectionFailure{ MatchStage::Publication, TemplateGapKind::Rule, "publication_member_branch_rewrite_not_implemented", invocation, rank });
         }
@@ -532,8 +649,9 @@ std::expected<void, TemplateBank::SelectionFailure> TemplateBank::qualify_source
             const auto after = source.output_policy->evaluate(target.generated_tokens, target.finishes);
             if (source.publication_cpu_progress && !after.emits && before == after) continue;
             if (source.publication_layout) {
-                const auto output = source.publication_layout->evaluate(input);
-                if (output) continue;
+                // This contract qualifies every target member at once.
+                const auto output = source.publication_layout->qualify(input);
+                if (output) return {};
                 return std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, output.error(), invocation, rank });
             }
             return std::unexpected(
@@ -565,7 +683,7 @@ std::expected<void, TemplateBank::SelectionFailure> TemplateBank::qualify_source
     // Decode carries running members but admits no new prefill requests.
     const auto admitted = input.phase == BatchPhase::Prefill ? input.requests.size() : 0;
     const bool parameterized = source.admission_cpu_request_count
-                               && (*source.admission_cpu_request_count == admitted || (admitted > 0 && !source.admission_regions.empty()))
+                               && (*source.admission_cpu_request_count == admitted || (admitted > 0 && source.admission_sequence))
                                && input.admission_work.parameterized_cpu_path(input.admission, admitted);
     if (*source.admission != input.admission && !parameterized)
         return std::unexpected(
@@ -594,33 +712,41 @@ std::expected<TemplateInstance, TemplateBank::SelectionFailure> TemplateBank::in
                                                                                                const InvokeStep & invocation,
                                                                                                std::optional<std::uint64_t> source_batch, std::uint32_t rank,
                                                                                                std::uint32_t request_capacity) const {
-    const auto found = anchor_source.definitions.find({ invocation.step, invocation.input.phase, rank });
+    const auto & binding = anchor_source.rank_bindings.at(rank);
+    const auto found = anchor_source.definitions.find({ invocation.step, invocation.input->phase, binding.source_rank });
     if (found == anchor_source.definitions.end())
         return std::unexpected(SelectionFailure{ MatchStage::Source, TemplateGapKind::Observation, "native_step_not_observed", invocation, rank });
-    if (found->second.empty())
-        return std::unexpected(SelectionFailure{ MatchStage::Source, TemplateGapKind::Rule, "native_transform_rule_missing", invocation, rank });
 
     SelectionFailure failure{ MatchStage::Source, TemplateGapKind::Observation, "native_batch_step_not_observed", invocation, rank };
     for (const auto & source : found->second) {
-        // One native batch owns the cross-rank cohort. Local shape matches must
-        // not stitch unrelated source iterations together.
+        // Anchor the model lifecycle to one local cohort; qualified input and
+        // member cuts are composed separately before the roles are paired.
         if (source.source_batch != source_batch) continue;
         auto qualified = qualify_source(source, invocation);
+        if (qualified && invocation.step == StepKind::Publish && !invocation.input->requests.empty() && binding.publishes_outputs
+            && (!source.output_policy || !source.output_boundary))
+            qualified = std::unexpected(
+                SelectionFailure{ MatchStage::Publication, TemplateGapKind::Observation, "request_output_boundary_not_observed", invocation, rank });
         if (qualified) {
-            auto candidate = instantiate_source(source, invocation, request_capacity);
+            auto candidate = instantiate_source(source, invocation, request_capacity, rank, binding);
             if (candidate) return std::move(*candidate);
             qualified = std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, candidate.error(), invocation, rank });
         }
-        const auto & rejected = qualified.error();
+        auto rejected = qualified.error();
+        rejected.gap.rank = rank;
         if (rejected.stage > failure.stage || (rejected.stage == failure.stage && rejected.gap.kind > failure.gap.kind)) failure = rejected;
     }
     return std::unexpected(std::move(failure));
 }
 
 std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(const TemplateDefinition & source, const InvokeStep & invocation,
-                                                                              std::uint32_t request_capacity) const {
-    TemplateInstance instance(invocation.work_id, source);
-    const auto rewrites = plan_materializations(source, invocation.input);
+                                                                              std::uint32_t request_capacity, std::uint32_t target_rank,
+                                                                              const TemplateRankBinding & rank_binding) const {
+    TemplateInstance instance(invocation.work_id, source, target_rank, rank_binding);
+    const auto reception = bind_input_reception(instance.topology, source, *invocation.input);
+    if (!reception) return std::unexpected(reception.error());
+
+    const auto rewrites = plan_materializations(source, *invocation.input);
     if (!rewrites) return std::unexpected(rewrites.error());
     const auto applied = instance.topology.apply_operations(source, *rewrites);
     if (!applied) return std::unexpected(applied.error());
@@ -630,20 +756,20 @@ std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(co
         const auto & node_observation = source.observation(node);
         const auto transfer = source.transfer_layouts.find(node_observation.source_span);
         if (node_observation.transfer && transfer != source.transfer_layouts.end()) {
-            auto target = transfer->second.evaluate(*node_observation.transfer, invocation.input);
+            auto target = transfer->second.evaluate(*node_observation.transfer, *invocation.input);
             if (!target) return std::unexpected(target.error());
             instance.transfer_overrides.emplace(node_observation.source_span, *target);
         }
 
-        if (!node_observation.kernel || instance.kernel_overrides.contains(node_observation.source_span)) continue;
-        auto target = transform_kernel(node_observation, source, invocation, request_capacity);
+        if (!node_observation.kernel) continue;
+        auto target = transform_kernel(node, source, invocation, request_capacity);
         if (!target) return std::unexpected(target.error());
         if (!*target) continue;
 
         // Compiled model rules already carry identity relations; only
         // materialized descriptor changes need an extra override record.
         const auto & kernel = **target;
-        if (source.model_kernel_layouts.contains(node_observation.source_span) && kernel.input_shapes == node_observation.kernel->input_shapes
+        if (source.graph.model_rule(node.observation_slot) && kernel.input_shapes == node_observation.kernel->input_shapes
             && kernel.output_shapes == node_observation.kernel->output_shapes && !kernel.logits_token_indices && !kernel.positions
             && kernel.value_dependencies.empty())
             continue;
@@ -651,13 +777,11 @@ std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(co
     }
 
     if (source.publication_layout) {
-        auto output = source.publication_layout->evaluate(invocation.input);
+        auto output = source.publication_layout->qualify(*invocation.input);
         if (!output) return std::unexpected(output.error());
-        const bool retained = std::ranges::any_of(instance.topology.nodes(), [&](std::size_t index) {
-            return source.observation(source.graph[index]).source_span == output->source_span;
-        });
+        const bool retained =
+            std::ranges::any_of(instance.topology.nodes(), [&](std::size_t index) { return source.observation(source.graph[index]).source_span == *output; });
         if (!retained) return std::unexpected("publication_output_region_replacement_not_qualified");
-        instance.publication_work = *output;
     }
 
     const auto inserted = parameterize_insertions(instance.topology, invocation, request_capacity);
@@ -665,16 +789,17 @@ std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(co
     return instance;
 }
 
-std::expected<std::optional<SourceKernel>, std::string> TemplateBank::transform_kernel(const TemplateNodeObservation & observation,
-                                                                                       const TemplateDefinition & source, const InvokeStep & invocation,
-                                                                                       std::uint32_t request_capacity, std::optional<std::size_t> request_slot,
+std::expected<std::optional<SourceKernel>, std::string> TemplateBank::transform_kernel(const TemplateNode & node, const TemplateDefinition & source,
+                                                                                       const InvokeStep & invocation, std::uint32_t request_capacity,
+                                                                                       std::optional<std::size_t> request_slot,
                                                                                        std::optional<BatchFilterBinding> filter_binding) const {
     // Production binds component semantics before generic shape matching.
     // Inserted nodes use their donor's binding with this instance's target state.
+    const auto & observation = source.observation(node);
     const auto kv = source.kv_kernel_layouts.find(observation.source_span);
     if (kv != source.kv_kernel_layouts.end()) {
         if (!kv->second) return std::unexpected(kv->second.error());
-        auto target = kv->second->evaluate(*observation.kernel, invocation.input, request_slot);
+        auto target = kv->second->evaluate(*observation.kernel, *invocation.input, request_slot);
         if (!target) return std::unexpected(target.error());
         return std::move(*target);
     }
@@ -682,21 +807,20 @@ std::expected<std::optional<SourceKernel>, std::string> TemplateBank::transform_
     const auto batch = source.batch_kernel_layouts.find(observation.source_span);
     if (batch != source.batch_kernel_layouts.end()) {
         if (!batch->second) return std::unexpected(batch->second.error());
-        auto target = filter_binding ? batch->second->with_filter_binding(*filter_binding).evaluate(*observation.kernel, invocation.input, request_slot)
-                                     : batch->second->evaluate(*observation.kernel, invocation.input, request_slot);
+        auto target = filter_binding ? batch->second->with_filter_binding(*filter_binding).evaluate(*observation.kernel, *invocation.input, request_slot)
+                                     : batch->second->evaluate(*observation.kernel, *invocation.input, request_slot);
         if (!target) return std::unexpected(target.error());
         return std::move(*target);
     }
 
     const auto attention = source.attention_kernel_layouts.find(observation.source_span);
-    if (attention != source.attention_kernel_layouts.end()) return attention->second->evaluate(*observation.kernel, invocation.input);
-    const auto model = source.model_kernel_layouts.find(observation.source_span);
-    if (model != source.model_kernel_layouts.end()) return source.graph.model_rule(model->second).evaluate(*observation.kernel, invocation.input);
+    if (attention != source.attention_kernel_layouts.end()) return attention->second->evaluate(*observation.kernel, *invocation.input);
+    if (const auto * model = source.graph.model_rule(node.observation_slot)) return model->evaluate(*observation.kernel, *invocation.input);
 
     const auto pool = source.request_pool_layouts.find(observation.source_span);
     if (pool != source.request_pool_layouts.end()) {
         if (!pool->second) return std::unexpected(pool->second.error());
-        auto target = pool->second->evaluate(*observation.kernel, invocation.input, request_capacity);
+        auto target = pool->second->evaluate(*observation.kernel, *invocation.input, request_capacity);
         if (!target) return std::unexpected(target.error());
         return std::move(*target);
     }
@@ -717,7 +841,7 @@ std::expected<void, std::string> TemplateBank::parameterize_insertions(TemplateT
                     if (inserted.filter_binding)
                         layout.extent = *inserted.filter_binding == BatchFilterBinding::Transition ? TransferExtent::TransitionRetainedRequests
                                                                                                    : TransferExtent::RunningRetainedRequests;
-                    auto target = layout.evaluate(*inserted.observation().transfer, invocation.input);
+                    auto target = layout.evaluate(*inserted.observation().transfer, *invocation.input);
                     if (!target) return std::unexpected(target.error());
                     topology.bind_inserted_transfer(index, *target);
                 }
@@ -727,8 +851,7 @@ std::expected<void, std::string> TemplateBank::parameterize_insertions(TemplateT
             if (inserted.node.kind == SourceSpanKind::Compute) return std::unexpected("inserted_kernel_observation_missing");
             continue;
         }
-        auto target =
-            transform_kernel(inserted.observation(), *inserted.definition, invocation, request_capacity, inserted.request_slot, inserted.filter_binding);
+        auto target = transform_kernel(inserted.node, *inserted.definition, invocation, request_capacity, inserted.request_slot, inserted.filter_binding);
         if (!target) return std::unexpected(target.error());
         if (!*target) return std::unexpected("inserted_kernel_parameter_relation_missing");
         topology.bind_inserted_kernel(index, std::move(**target));
@@ -806,7 +929,7 @@ std::expected<void, TemplateGap> TemplateBank::qualify_initialization(std::uint3
     return {};
 }
 
-nlohmann::json TemplateBank::describe(bool diagnostics) const {
+nlohmann::json TemplateBank::describe() const {
     std::size_t workspace_uses = 0;
     std::size_t workspace_synchronizations = 0;
     std::size_t workspace_demand_rules = 0;
@@ -829,28 +952,30 @@ nlohmann::json TemplateBank::describe(bool diagnostics) const {
         });
 
 
-    std::size_t observed_groups = 0;
     std::size_t source_instances = 0;
     std::size_t shared_regions = 0;
+    std::size_t regions_with_cut = 0;
+    std::size_t source_sequences = 0;
     std::size_t model_rule_observations = 0;
     std::size_t attention_rule_observations = 0;
-    std::size_t collective_rule_observations = 0;
+    std::set<std::string> observed_semantics;
     std::map<std::string, std::size_t> structure_kinds;
+    std::map<std::string, std::size_t> fragment_kinds;
     std::map<SourceSpanKind, std::size_t> definition_nodes;
     std::map<SourceSpanKind, std::size_t> source_nodes;
-    for (const auto & structure : source_.region_structures) {
-        ++structure_kinds[structure.semantic];
-        for (const auto & node : structure.nodes) ++definition_nodes[node.kind];
-    }
     std::set<TemplateResource> resources;
     for (const auto & [key, instances] : source_.definitions) {
-        if (!instances.empty()) ++observed_groups;
         source_instances += instances.size();
 
         // Each row is a source call. A step/phase/rank bucket is not a
         // structural family, and repeated observations are not new variants.
         for (const auto & source : instances) {
-            for (const auto & node : source.graph) ++source_nodes[node.kind];
+            observed_semantics.insert("serving." + std::string(ServingContract{}.block(source.step).name));
+            for (const auto & region : source.regions) observed_semantics.insert(region.semantic);
+            for (const auto & node : source.graph) {
+                ++source_nodes[node.kind];
+                if (source.graph.model_rule(node.observation_slot)) ++model_rule_observations;
+            }
             for (const auto & lane : source.lanes)
                 if (lane.source.domain == SourceDomain::CpuThread || lane.source.domain == SourceDomain::DeviceStream) resources.insert(lane.resource());
             for (const auto & wait : source.stream_waits) resources.insert(wait.resources.begin(), wait.resources.end());
@@ -858,14 +983,18 @@ nlohmann::json TemplateBank::describe(bool diagnostics) const {
                 if (connection.resource) resources.insert(*connection.resource);
 
             shared_regions += source.graph.shared_regions();
-            model_rule_observations += source.model_kernel_layouts.size();
+            regions_with_cut += std::ranges::count_if(source.regions, [](const auto & region) { return !region.boundaries.empty(); });
+            source_sequences += source.sequences.size();
             attention_rule_observations += source.attention_kernel_layouts.size();
-            collective_rule_observations += source.collectives.size();
         }
     }
 
-    auto resource_bindings = Json::array();
-    for (const auto & resource : resources) resource_bindings.push_back(resource.describe());
+    // Anonymous sequence fragments share storage without declaring new flow semantics.
+    for (const auto & structure : source_.region_structures) {
+        auto & kinds = observed_semantics.contains(structure.semantic) ? structure_kinds : fragment_kinds;
+        ++kinds[structure.semantic];
+        for (const auto & node : structure.nodes) ++definition_nodes[node.kind];
+    }
 
     auto source_node_counts = Json::object();
     auto definition_node_counts = Json::object();
@@ -917,7 +1046,7 @@ nlohmann::json TemplateBank::describe(bool diagnostics) const {
     for (const auto & gap : source_.gaps) ++source_gaps[gap.at("kind").get<std::string>()][gap.at("reason").get<std::string>()];
 
     Json result{
-        {                  "initialization",                                        initialization_status                                            },
+        {                  "initialization",                                      initialization_status                                            },
         {                       "workspace",
          { { "source_binding", source_.workspace_binding_gap ? "needs_data" : "available" },
          { "binding_gap", source_.workspace_binding_gap ? Json(*source_.workspace_binding_gap) : Json(nullptr) },
@@ -926,37 +1055,39 @@ nlohmann::json TemplateBank::describe(bool diagnostics) const {
          { "demand_rules", workspace_demand_rules },
          { "demand_rule_definitions", source_.workspace_rules.size() },
          { "demand_gaps", workspace_demand_gaps },
-         { "required_device_synchronizations", workspace_synchronizations },
-         { "target_state", "partial" } }                                                                                                             },
-        {        "sequence_capacity_tokens",               source_.sequence_capacity_tokens ? Json(*source_.sequence_capacity_tokens) : Json(nullptr) },
-        {            "static_qualification",                                                                                     source_qualification },
+         { "required_device_synchronizations", workspace_synchronizations } }                                                                      },
+        {        "sequence_capacity_tokens",             source_.sequence_capacity_tokens ? Json(*source_.sequence_capacity_tokens) : Json(nullptr) },
+        {            "static_qualification",                                                                                   source_qualification },
         {             "request_pool_domain",
          { { "maximum", source_.request_pool_domain.maximum },
-         { "shrink_gap", source_.request_pool_domain.shrink_gap ? Json(*source_.request_pool_domain.shrink_gap) : Json(nullptr) } }                  },
-        {                "admission_policy",                                                                                                admission },
-        {                        "manifest",                                                                           source_.manifest_path.string() },
-        {                      "resolution",                                                                                       source_.resolution },
-        {                "page_size_tokens",                                                                                 source_.page_size_tokens },
-        { "observed_step_phase_rank_groups",                                                                                          observed_groups },
-        {                "source_instances",                                                                                         source_instances },
+         { "shrink_gap", source_.request_pool_domain.shrink_gap ? Json(*source_.request_pool_domain.shrink_gap) : Json(nullptr) } }                },
+        {                "admission_policy",                                                                                              admission },
+        {                        "manifest",                                                                         source_.manifest_path.string() },
+        {                     "source_rank",                                                                                    source_.source_rank },
+        {                      "resolution",                                                                                     source_.resolution },
+        {                "page_size_tokens",                                                                               source_.page_size_tokens },
+        { "observed_step_phase_rank_groups",                                                                             source_.definitions.size() },
+        {                "source_instances",                                                                                       source_instances },
         {        "region_structure_sharing",
          { { "definitions", source_.region_structures.size() },
          { "regions", shared_regions },
+         { "regions_with_cut", regions_with_cut },
+         { "source_sequences", source_sequences },
          { "semantic_kinds", structure_kinds.size() },
          { "definitions_by_semantic", structure_kinds },
+         { "fragment_kinds", fragment_kinds.size() },
+         { "fragment_definitions_by_label", fragment_kinds },
          { "source_nodes_by_kind", source_node_counts },
          { "definition_nodes_by_kind", definition_node_counts },
-         { "scope", "semantic_self_work_rules_resources_and_interfaces" },
-         { "composition", "source_region_tree_and_target_bindings" } }                                                                               },
-        {       "attention_parameter_rules",   { { "definitions", source_.attention_rules.size() }, { "observations", attention_rule_observations } } },
-        {           "model_parameter_rules",           { { "definitions", source_.model_rules.size() }, { "observations", model_rule_observations } } },
-        {      "collective_parameter_rules", { { "definitions", source_.collective_rules.size() }, { "observations", collective_rule_observations } } },
-        {               "resource_bindings",                                                                                        resource_bindings },
-        {              "source_gap_summary",                            { { "records", source_.gaps.size() }, { "by_kind_and_reason", source_gaps } } },
-        {                      "transforms",                                                                                       source_.transforms },
-        {                          "limits",                                                                                           source_.limits }
+         { "scope", "semantic_self_work_rules_and_local_resource_aliases" },
+         { "composition", "source_region_tree_and_target_bindings" } }                                                                             },
+        {       "attention_parameter_rules", { { "definitions", source_.attention_rules.size() }, { "observations", attention_rule_observations } } },
+        {           "model_parameter_rules",         { { "definitions", source_.model_rules.size() }, { "observations", model_rule_observations } } },
+        {          "resource_binding_count",                                                                                       resources.size() },
+        {              "source_gap_summary",                          { { "records", source_.gaps.size() }, { "by_kind_and_reason", source_gaps } } },
+        {                      "transforms",                                                                                     source_.transforms },
+        {                          "limits",                                                                                         source_.limits }
     };
-    if (diagnostics) { result["source_gaps"] = source_.gaps; }
     return result;
 }
 

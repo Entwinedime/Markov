@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.batch_observer import SGLangProfileObserver
+from markov_collection.adapters.frameworks.sglang.input_broadcast import NativeInputMessage, SGLangInputBroadcast
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.instrumentation.blocks import BlockWrapper, BoundBlock
 from markov_collection.instrumentation.native_regions import BoundNativeRegion, NativeRegions, NativeRegionWrapper
@@ -16,9 +19,15 @@ from markov_collection.instrumentation.recording import Observation, Recorder
 
 class SGLangObserver(SGLangProfileObserver):
     def __init__(
-        self, directory: Path, request_ids: set[str], regions: dict[str, Any], *, capture_cleanup: bool = False
+        self,
+        directory: Path,
+        request_ids: set[str],
+        regions: dict[str, Any],
+        *,
+        capture_cleanup: bool = False,
+        source_rank: int | None = None,
     ) -> None:
-        super().__init__(directory, request_ids)
+        super().__init__(directory, request_ids, source_rank=source_rank)
         self.capture_cleanup = capture_cleanup
         self._cleaned_ids: set[str] = set()
         self._schedule_filters: list[dict[str, list[str]]] | None = None
@@ -59,18 +68,19 @@ class SGLangBlockWrapper(BlockWrapper):
 
 
 class SGLangScheduleWrapper(SGLangBlockWrapper):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.scheduler: Any = None
+        self.pending: Observation | None = None
+        self.awaiting_idle = False
+
     def context(self, scheduler: Any, *args: Any, **kwargs: Any) -> tuple[Recorder, dict[str, Any]] | None:
-        visible = scheduler.waiting_queue + scheduler.running_batch.reqs
-        if scheduler.last_batch is not None:
-            visible = visible + scheduler.last_batch.reqs
-        # Base discovery retains native cleanup at group boundaries. Validation and
-        # independent sampling retain their last-publication scope.
+        visible = self.observer._visible_requests(scheduler)
+        # Base discovery retains native cleanup at group boundaries. Target
+        # validation ends its observation at the last publication.
         finished = self.observer._finished_ids == self.observer.request_ids
         if self.observer._cleaned_ids == self.observer.request_ids or (finished and not self.observer.capture_cleanup):
             return None
-        if not any(req.rid in self.observer.request_ids for req in visible):
-            return None
-
         self.observer._schedule_filters = []
         from sglang.srt.environ import envs
         from sglang.srt.managers import scheduler as scheduler_module
@@ -79,14 +89,26 @@ class SGLangScheduleWrapper(SGLangBlockWrapper):
         # Warmup may already have decayed the worker's ratio. Keep the observed
         # entry value separate from the policy parameters used by a target run.
         ratio = scheduler.new_token_ratio_tracker
+        receiver = scheduler.request_receiver
         return self.observer._recorder(scheduler.ps.tp_rank), {
             "visible_requests": [req.rid for req in visible],
             # Read the worker and loaded module, not launcher environment defaults.
             "worker_controls": {
+                "physical_tp_size": scheduler.tp_worker.tp_size,
+                "physical_tp_rank": scheduler.tp_worker.tp_rank,
+                "scheduler_tp_size": scheduler.ps.tp_size,
+                "scheduler_tp_rank": scheduler.ps.tp_rank,
+                "receiver_tp_size": receiver.ps.tp_size,
+                "receiver_tp_rank": receiver.ps.tp_rank,
                 "waiting_timeout_seconds": envs.SGLANG_REQ_WAITING_TIMEOUT.get(),
                 "running_timeout_seconds": envs.SGLANG_REQ_RUNNING_TIMEOUT.get(),
                 "test_retract": scheduler_module.TEST_RETRACT,
                 "require_mlp_sync": scheduler.require_mlp_sync,
+                "max_recv_per_poll": receiver.max_recv_per_poll,
+                "recv_skipper": receiver.recv_skipper is not None,
+                "input_blocker": receiver.input_blocker is not None,
+                "scripted_scheduler_hook": receiver.scripted_scheduler_hook is not None,
+                "idle_sleeper": scheduler.idle_sleeper is not None,
             },
             "admission_policy": {
                 "initial_ratio": ratio.init,
@@ -97,6 +119,86 @@ class SGLangScheduleWrapper(SGLangBlockWrapper):
                 "reserve_tokens_per_request": IGNORE_EOS_RESERVE_TOKENS,
             },
         }
+
+    def receive(self, original: Callable[..., Any], receiver: Any, *args: Any, **kwargs: Any) -> Any:
+        with self.markers.observer():
+            context = None
+            if self.scheduler is not None and self.observer.recorder is not None:
+                context = self.context(self.scheduler)
+            if context is not None:
+                recorder, metadata = context
+                self.pending = recorder.scope("schedule", metadata, binding=self.blocks[0].identity, pending=True)
+                self.pending.result.update(input_requests=[], request_ready=[], input_ready=None, input_supported=True)
+                if any(rid in self.observer.request_ids for rid in metadata["visible_requests"]):
+                    self.pending.commit()
+        if self.pending is None:
+            return original(receiver, *args, **kwargs)
+
+        self.pending.__enter__()
+        try:
+            result = original(receiver, *args, **kwargs)
+            with self.markers.observer():
+                incoming, supported = self.observer._input_requests(result)
+                self.pending.result["input_requests"] = incoming
+                self.pending.result["input_supported"] = supported
+                if any(request["id"] in self.observer.request_ids for request in incoming):
+                    self.pending.commit()
+            return result
+        except BaseException:
+            self._close(sys.exc_info())
+            raise
+
+    def process(self, original: Callable[..., Any], scheduler: Any, *args: Any, **kwargs: Any) -> Any:
+        self.scheduler = scheduler
+        try:
+            result = original(scheduler, *args, **kwargs)
+            with self.markers.observer():
+                if self.pending is not None:
+                    self.pending.result["input_supported"] &= self.observer._inputs_accepted(
+                        scheduler, self.pending.result["input_requests"]
+                    )
+            return result
+        except BaseException:
+            self._close(sys.exc_info())
+            raise
+
+    def invoke(self, original: Callable[..., Any], scheduler: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.pending is None:
+            return original(scheduler, *args, **kwargs)
+        with self.markers.observer():
+            self.pending.metadata["visible_requests"] = [req.rid for req in self.observer._visible_requests(scheduler)]
+        try:
+            result = original(scheduler, *args, **kwargs)
+            with self.markers.observer():
+                self.completed(self.pending, result, scheduler, *args, **kwargs)
+                self.awaiting_idle = result is None
+            if result is not None:
+                self._close()
+            return result
+        except BaseException:
+            self._close(sys.exc_info())
+            raise
+
+    def idle(self, original: Callable[..., Any], scheduler: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            result = original(scheduler, *args, **kwargs)
+            if self.awaiting_idle:
+                self._close()
+            return result
+        except BaseException:
+            self._close(sys.exc_info())
+            raise
+
+    def _close(self, error: tuple[Any, Any, Any] = (None, None, None)) -> None:
+        observation = self.pending
+        self.pending = None
+        self.awaiting_idle = False
+        self.observer._schedule_filters = None
+        if observation is not None:
+            observation.__exit__(*error)
+            if observation.committed:
+                with self.markers.observer():
+                    self.closed(observation)
 
     def completed(self, observation: Observation, result: Any, *args: Any, **kwargs: Any) -> None:
         observation.result["batch_id"] = self.observer._batch_ids[id(result)] if result is not None else None
@@ -155,7 +257,6 @@ class SGLangBatchWrapper(BlockWrapper):
             }
 
         return self.observer.recorder, {
-            "module_path": self.binding["method"] + ":self",
             "module_type": self.binding["module_type"],
             "method": self.binding["method"],
             "module_parameters": {},
@@ -164,6 +265,7 @@ class SGLangBatchWrapper(BlockWrapper):
             "outputs": {},
             "cpu_values": {},
             "request_id": None,
+            "group_ranks": None,
         }
 
     def completed(self, observation: Observation, result: Any, batch: Any, *args: Any, **kwargs: Any) -> None:
@@ -229,16 +331,12 @@ class SGLangPublishWrapper(SGLangExecutionWrapper):
 
 
 class SGLangOutputWrapper(NativeRegionWrapper):
-    def context(self, *args: Any, **kwargs: Any) -> tuple[Recorder, dict[str, Any]] | None:
-        context = super().context(*args, **kwargs)
-        if context is None:
-            return None
+    def metadata(self, arguments: inspect.BoundArguments) -> dict[str, Any]:
+        metadata = super().metadata(arguments)
 
         from sglang.srt.managers.schedule_batch import INIT_INCREMENTAL_DETOKENIZATION_OFFSET
         from sglang.srt.managers.scheduler_components.output_streamer import DEFAULT_FORCE_STREAM_INTERVAL
 
-        arguments = self.signature.bind(*args, **kwargs)
-        arguments.apply_defaults()
         self._requests = arguments.arguments["reqs"]
         skipped = arguments.arguments["skip_req"]
         self._output_work = {
@@ -250,7 +348,7 @@ class SGLangOutputWrapper(NativeRegionWrapper):
             "request_time_stats": self.module.server_args.enable_request_time_stats_logging,
             "before": [self.request_state(request, request is skipped) for request in self._requests],
         }
-        return context
+        return metadata
 
     @staticmethod
     def request_state(request: Any, skipped: bool) -> dict[str, Any]:
@@ -290,10 +388,8 @@ class SGLangOutputWrapper(NativeRegionWrapper):
 
 
 class SGLangInputResolutionWrapper(NativeRegionWrapper):
-    def context(self, *args: Any, **kwargs: Any) -> tuple[Recorder, dict[str, Any]] | None:
-        context = super().context(*args, **kwargs)
-        if context is None:
-            return None
+    def metadata(self, arguments: inspect.BoundArguments) -> dict[str, Any]:
+        metadata = super().metadata(arguments)
 
         # Retain metadata, not the staging tensor: observation must not extend
         # its lifetime or change the asynchronous copy's ownership.
@@ -302,17 +398,41 @@ class SGLangInputResolutionWrapper(NativeRegionWrapper):
         if tensor is not None:
             self._input_copy = {
                 "source_address": tensor.data_ptr(),
-                "source_is_pinned": tensor.is_pinned(),
                 "bytes": tensor.numel() * tensor.element_size(),
             }
-        return context
+        return metadata
 
     def completed(self, observation: Observation, result: Any, *args: Any, **kwargs: Any) -> None:
         super().completed(observation, result, *args, **kwargs)
         observation.result["input_copy"] = self._input_copy
-        observation.result["input_ids"] = self.tensor_layout(self.module.input_ids)
         if self._input_copy is not None:
             self._input_copy["destination_address"] = self.module.input_ids.data_ptr()
+
+
+class SGLangCollectiveWrapper(NativeRegionWrapper):
+    def metadata(self, arguments: inspect.BoundArguments) -> dict[str, Any]:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        parameters = {"dim": arguments.arguments["dim"]} if self.binding.method == "all_gather" else {}
+
+        # Observe the same logical interface around native or substituted work.
+        # Parent identity and layouts are facts; elapsed time is not a cost.
+        return {
+            "module_type": self.binding.module_type,
+            "method": self.binding.method,
+            "module_parameters": {
+                "logical_tp_size": parallel.tp_size,
+                "logical_rank": parallel.tp_rank,
+                "physical_tp_size": self.module.world_size,
+            },
+            "group_ranks": list(self.module.ranks),
+            "call_parameters": parameters,
+            "inputs": {"input_": self.tensor_layout(arguments.arguments["input_"])},
+            "outputs": {},
+            "cpu_values": {},
+            "request_id": None,
+        }
 
 
 class SGLangRegionHook:
@@ -336,12 +456,98 @@ class SGLangRegionHook:
                 # Retain the native hook-chain function; wrapper construction
                 # observes its signature but never advances serving state.
                 native = original.__get__(component, type(component))
-                wrapper = self.wrapper_type(self.binding, self.binding.identity, component, recorder, native)
+                wrapper = self.wrapper_type(self.binding, component, recorder, native)
 
         if not active:
             return original(component, *args, **kwargs)
 
         return wrapper(*args, **kwargs)
+
+
+class SGLangInputRegionHook(SGLangRegionHook):
+    def __init__(
+        self,
+        observer: SGLangObserver,
+        contract: dict[str, Any],
+        binding: dict[str, Any],
+        *,
+        schedule: SGLangScheduleWrapper,
+    ) -> None:
+        super().__init__(observer, contract, binding, NativeRegionWrapper)
+        self.semantic = binding["semantic"]
+        self.schedule = schedule
+
+    def invoke(self, original: Callable[..., Any], component: Any, *args: Any, **kwargs: Any) -> Any:
+        with self.observer.markers.observer():
+            recorder = self.observer.recorder
+            active = self.schedule.pending is not None and recorder is not None
+            if active:
+                native = original.__get__(component, type(component))
+                wrapper = NativeRegionWrapper(self.binding, component, recorder, native)
+        if not active:
+            return original(component, *args, **kwargs)
+
+        with wrapper.scope(*args, **kwargs) as observation:
+            result = native(*args, **kwargs)
+            with self.observer.markers.observer():
+                wrapper.completed(observation, result, *args, **kwargs)
+                if self.semantic == "input_request":
+                    self.schedule.pending.result["request_ready"].append(
+                        {"id": observation.metadata["request_id"], "call_id": observation.identity}
+                    )
+                elif self.semantic == "input_process":
+                    self.schedule.pending.result["input_ready"] = observation.identity
+        return result
+
+
+class SGLangInputMessageHook(BlockWrapper):
+    def __init__(
+        self,
+        observer: SGLangObserver,
+        contract: dict[str, Any],
+        binding: dict[str, Any],
+        channel: SGLangInputBroadcast,
+    ) -> None:
+        parameters = tuple(parameter["name"] for parameter in contract["definition"]["parameters"])
+        self.binding = BoundNativeRegion.read(binding, (*parameters, "message"))
+        super().__init__((self.binding,), observer.markers)
+        self.observer = observer
+        self.channel = channel
+        self.semantic = binding["semantic"]
+
+    def context(self, call: NativeInputMessage) -> tuple[Recorder, dict[str, Any]]:
+        return self.observer.recorder, {
+            "module_type": self.binding.module_type,
+            "method": self.binding.method,
+            "module_parameters": {},
+            "call_parameters": {},
+            "inputs": {},
+            "outputs": {},
+            "cpu_values": {},
+            "request_id": None,
+            "group_ranks": call.message["group_ranks"],
+            "message": call.message,
+        }
+
+    def invoke(self, original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        with self.markers.observer():
+            recorder = self.observer.recorder
+            call = (
+                self.channel.describe(self.semantic, original, *args, **kwargs)
+                if recorder is not None and recorder.in_scope()
+                else None
+            )
+        if call is None:
+            return original(*args, **kwargs)
+
+        # Both child ranges belong to this actual synchronous call. Submission
+        # return bounds enqueue completion; it is not a worker-start timestamp.
+        with self.scope(call) as observation:
+            result = self.channel.invoke_message(self.semantic, call, original, *args, **kwargs)
+            if self.semantic == "input_message_submit":
+                with self.markers.observer():
+                    observation.result["returns_work"] = call.work is not None
+        return result
 
 
 def install(prepared: dict[str, Any]) -> None:
@@ -352,41 +558,19 @@ def install(prepared: dict[str, Any]) -> None:
         {request["id"] for request in prepared["requests"]},
         prepared["native_regions"],
         capture_cleanup=prepared["role"] == "base",
+        source_rank=prepared.get("shard_execution", {}).get("rank"),
     )
 
-    # Inline hooks stay inside the serving wrapper on a shared target.
-    from markov_collection.adapters.frameworks.sglang.inline import (
-        SGLangAdmissionBudget,
-        SGLangAdmissionPrefix,
-        SGLangBatchTransition,
-        SGLangDecodeUpdatePrefix,
-        SGLangInlineMethod,
-        SGLangLastLocation,
-        SGLangLastLocations,
-        SGLangPrefillStatistics,
-        SGLangRequestPublication,
-    )
+    # Inline locations are shared with independent CPU clocks. Only this
+    # observation path reads semantic parameters and adds native work counters.
+    from markov_collection.adapters.frameworks.sglang.inline import SGLangInlineMethod, SGLangInlineObservation
 
     regions = prepared["native_regions"]
-    inline_regions = {
-        "batch_transition": SGLangBatchTransition,
-        "decode_update_prefix": SGLangDecodeUpdatePrefix,
-        "admission_prefix": SGLangAdmissionPrefix,
-        "admission_budget": SGLangAdmissionBudget,
-        "prefill_statistics": SGLangPrefillStatistics,
-        "request_publication": SGLangRequestPublication,
-        "last_locations": SGLangLastLocations,
-        "last_location": SGLangLastLocation,
-    }
-    methods = {}
-    for binding in regions["bindings"]:
-        region_type = inline_regions.get(binding["semantic"])
-        if region_type is not None:
-            region = region_type(observer, regions, binding)
-            methods.setdefault(binding["hook"], []).append(region)
-
-    for hook, method_regions in methods.items():
-        method = SGLangInlineMethod(method_regions, observer.markers)
+    input_broadcast = next(binding for binding in regions["bindings"] if binding["semantic"] == "input_broadcast")
+    channel = SGLangInputBroadcast(input_broadcast["id"], observer.markers)
+    for hook, method_regions in SGLangInlineMethod.group(regions).items():
+        scopes = {region.binding["id"]: SGLangInlineObservation(observer, regions, region) for region in method_regions}
+        method = SGLangInlineMethod(method_regions, observer.markers, scopes, record_work=True)
         HookRegistry.register(hook, method.invoke, HookType.AROUND)
 
     definitions = {definition["step"]: definition for definition in prepared["blocks"]}
@@ -401,21 +585,49 @@ def install(prepared: dict[str, Any]) -> None:
         hooks.setdefault(binding["hook"], []).append(binding)
 
     # One native hook may implement several phase-specific standard blocks.
+    schedule = None
+    schedule_hook = None
     for hook, bindings in hooks.items():
         wrapper = wrappers[bindings[0]["wrapper"]](observer, definitions, bindings)
-        HookRegistry.register(hook, wrapper.invoke, HookType.AROUND)
+        if bindings[0]["wrapper"] == "schedule":
+            schedule = wrapper
+            schedule_hook = hook
+        else:
+            HookRegistry.register(hook, wrapper.invoke, HookType.AROUND)
 
     region_wrappers = {
         "batch_output": SGLangOutputWrapper,
         "input_resolution": SGLangInputResolutionWrapper,
+        "logical_collective": SGLangCollectiveWrapper,
+    }
+    input_semantics = {
+        "input_receive",
+        "input_pull",
+        "input_broadcast",
+        "input_process",
+        "input_request",
+        "idle_suffix",
     }
     for binding in regions["bindings"]:
-        if binding["semantic"] in region_wrappers:
+        if binding["semantic"] in input_semantics:
+            wrapper = SGLangInputRegionHook(observer, regions, binding, schedule=schedule)
+            HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
+        elif binding["semantic"] in {"input_message", "input_message_submit", "input_message_wait"}:
+            wrapper = SGLangInputMessageHook(observer, regions, binding, channel)
+            HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
+        elif binding["semantic"] in region_wrappers:
             wrapper = SGLangRegionHook(observer, regions, binding, region_wrappers[binding["semantic"]])
             HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
         elif binding["semantic"] in {"batch_filter", "batch_merge"}:
             wrapper = SGLangBatchWrapper(observer, regions, binding)
             HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
+
+    HookRegistry.register(input_broadcast["hook"], channel.invoke, HookType.AROUND)
+    scheduler = "sglang.srt.managers.scheduler.Scheduler"
+    HookRegistry.register(schedule_hook, schedule.receive, HookType.AROUND)
+    HookRegistry.register(f"{scheduler}.process_input_requests", schedule.process, HookType.AROUND)
+    HookRegistry.register(f"{scheduler}.get_next_batch_to_run", schedule.invoke, HookType.AROUND)
+    HookRegistry.register(f"{scheduler}.on_idle", schedule.idle, HookType.AROUND)
 
     HookRegistry.register(
         "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation", observer.forward, HookType.AROUND

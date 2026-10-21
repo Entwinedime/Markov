@@ -12,13 +12,10 @@
 #include <runtime/rt_stars.h>
 #include <runtime/stream.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -36,9 +33,10 @@ namespace {
 
 using markov::collection::native_symbol;
 
-std::int64_t clock_ns(clockid_t clock) {
+std::int64_t clock_ns() {
     timespec value;
-    clock_gettime(clock, &value);
+    // CANN converts this clock using its recorded clockMonotonicRaw origin.
+    clock_gettime(CLOCK_MONOTONIC_RAW, &value);
     return static_cast<std::int64_t>(value.tv_sec) * 1'000'000'000 + value.tv_nsec;
 }
 
@@ -189,21 +187,16 @@ struct ApiRecord {
     std::optional<CopyAddresses> copy_addresses;
     std::optional<std::uint32_t> submitted_task_id;
     std::optional<std::uint32_t> submitted_stream_id;
-    std::int64_t wall_time_ns;
     std::int64_t start_ns;
     std::int64_t end_ns;
     rtError_t result;
     std::optional<FftsSubmission> ffts;
     std::vector<DriverCopy> driver_copies;
     std::optional<WorkspaceTransition> workspace;
-    std::optional<rtEventStatus_t> event_status;
-    bool initial_event;
 };
 
-enum class ObservationMode { Off, EventHistory, Journal };
-
-// Before the serving window, retain only event lifecycle history. Device
-// sampling includes its declared warmups; transfer sampling writes no journal.
+// Only explicitly opened observation windows produce journal records.
+// Device sampling includes its declared warmups; host sampling writes no journal.
 // Buffering keeps file I/O out of each API; explicit scope/profile flushes persist
 // records before multiprocessing shutdown can bypass destructors.
 class NativeJournal {
@@ -215,16 +208,10 @@ public:
 
     void begin_window(const char * directory) {
         directory_ = directory;
-        window_begin_ns_ = clock_ns(CLOCK_MONOTONIC);
-        mode_.store(ObservationMode::Journal);
+        enabled_.store(true);
     }
 
-    bool enabled() const { return mode_.load() == ObservationMode::Journal; }
-    bool initial_events() const { return mode_.load() == ObservationMode::EventHistory; }
-    bool observes_events() const {
-        const auto mode = mode_.load();
-        return mode == ObservationMode::EventHistory || mode == ObservationMode::Journal;
-    }
+    bool enabled() const { return enabled_.load(); }
     std::uint64_t next_id() { return sequence_.fetch_add(1); }
 
     std::uint64_t & current_scope() {
@@ -238,7 +225,7 @@ public:
     }
 
     void flush(bool close_window) {
-        if (close_window) mode_.store(ObservationMode::Off);
+        if (close_window) enabled_.store(false);
 
         // Release the journal lock before file I/O so API observers can keep appending.
         std::vector<ApiRecord> records;
@@ -247,24 +234,13 @@ public:
             records.swap(records_);
         }
 
-        if (records.empty() && !window_begin_ns_) return;
+        if (records.empty()) return;
 
         std::filesystem::create_directories(directory_);
         const auto filename = "pid-" + std::to_string(getpid()) + ".jsonl";
-        std::ofstream journal(directory_ / filename, std::ios::app);
-        journal.exceptions(std::ios::failbit | std::ios::badbit);
-        std::ofstream history;
-        history.exceptions(std::ios::failbit | std::ios::badbit);
-        if (window_begin_ns_ || std::any_of(records.begin(), records.end(), [](const auto & record) { return record.initial_event; })) {
-            std::filesystem::create_directories(directory_ / "initial_events");
-            history.open(directory_ / "initial_events" / filename, std::ios::app);
-        }
-        if (window_begin_ns_) {
-            history << "{\"pid\":" << getpid() << ",\"window_begin_ns\":" << *window_begin_ns_ << "}\n";
-            window_begin_ns_.reset();
-        }
+        std::ofstream stream(directory_ / filename, std::ios::app);
+        stream.exceptions(std::ios::failbit | std::ios::badbit);
         for (const auto & record : records) {
-            auto & stream = record.initial_event ? history : journal;
             // API names are fixed symbols; every other value is numeric/null.
             stream << "{\"api\":\"" << record.api << "\",\"call_id\":" << record.call_id << ",\"pid\":" << getpid() << ",\"tid\":" << record.tid
                    << ",\"scope_call_id\":";
@@ -305,13 +281,7 @@ public:
             if (record.submitted_stream_id) stream << *record.submitted_stream_id;
             else stream << "null";
 
-            stream << ",\"wall_time_ns\":" << record.wall_time_ns << ",\"start_ns\":" << record.start_ns << ",\"end_ns\":" << record.end_ns
-                   << ",\"result\":" << record.result;
-            if (std::strcmp(record.api, "rtEventQueryStatus") == 0) {
-                stream << ",\"event_status\":";
-                if (record.event_status) stream << static_cast<std::int32_t>(*record.event_status);
-                else stream << "null";
-            }
+            stream << ",\"start_ns\":" << record.start_ns << ",\"end_ns\":" << record.end_ns << ",\"result\":" << record.result;
             if (record.ffts) {
                 stream << ",\"ffts\":";
                 record.ffts->write(stream);
@@ -334,20 +304,12 @@ public:
     }
 
 private:
-    NativeJournal() {
-        // Only capture processes request this journal. Retain event lifecycle
-        // facts before warmup finishes, without recording the warmup workload.
-        if (const auto * directory = std::getenv("MARKOV_NATIVE_OBSERVATIONS")) {
-            directory_ = directory;
-            mode_.store(ObservationMode::EventHistory);
-        }
-    }
+    NativeJournal() = default;
 
-    std::atomic<ObservationMode> mode_{ ObservationMode::Off };
+    std::atomic_bool enabled_{ false };
     std::atomic_uint64_t sequence_{ 1 };
 
     std::filesystem::path directory_;
-    std::optional<std::int64_t> window_begin_ns_;
     std::mutex mutex_;
     std::vector<ApiRecord> records_;
 };
@@ -371,12 +333,9 @@ public:
                    0,
                    0,
                    0,
-                   0,
                    std::nullopt,
                    {},
-                   std::nullopt,
-                   std::nullopt,
-                   NativeJournal::instance().initial_events() },
+                   std::nullopt },
           submits_task_(submits_task) {
         if (stream != nullptr) {
             static const auto get_id = native_symbol<decltype(&rtGetStreamId)>("rtGetStreamId");
@@ -386,8 +345,7 @@ public:
 
         // These wall boundaries associate the API with device work and waits.
         // CPU service is measured separately by the thread-clock sampler.
-        record_.wall_time_ns = clock_ns(CLOCK_REALTIME);
-        record_.start_ns = clock_ns(CLOCK_MONOTONIC);
+        record_.start_ns = clock_ns();
     }
 
     std::vector<DriverCopy> & driver_copies() { return record_.driver_copies; }
@@ -402,11 +360,10 @@ public:
         finish(result);
     }
 
-    void finish(rtError_t result, std::optional<FftsSubmission> ffts = std::nullopt, std::optional<rtEventStatus_t> event_status = std::nullopt) {
-        record_.end_ns = clock_ns(CLOCK_MONOTONIC);
+    void finish(rtError_t result, std::optional<FftsSubmission> ffts = std::nullopt) {
+        record_.end_ns = clock_ns();
         record_.result = result;
         record_.ffts = std::move(ffts);
-        record_.event_status = event_status;
 
         if (submits_task_ && result == RT_ERROR_NONE) {
             // The SDK reports the calling thread's last submitted task. Query
@@ -466,9 +423,9 @@ extern "C" int markov_native_flush(int close_window) {
 extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
     static const auto original = native_symbol<decltype(&rtEventRecord)>("rtEventRecord");
     const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Submission, "rtEventRecord");
-    if (!NativeJournal::instance().observes_events()) return original(event, stream);
+    if (!NativeJournal::instance().enabled()) return original(event, stream);
 
-    ApiObservation observation("rtEventRecord", stream, event, NativeJournal::instance().enabled());
+    ApiObservation observation("rtEventRecord", stream, event, true);
     const auto result = original(event, stream);
     observation.finish(result);
     return result;
@@ -477,13 +434,12 @@ extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
 extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * status) {
     static const auto original = native_symbol<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
     const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Query, "rtEventQueryStatus");
-    if (!NativeJournal::instance().observes_events()) return original(event, status);
+    if (!NativeJournal::instance().enabled()) return original(event, status);
 
-    // Preserve the native query and returned state; observing completion must
-    // neither synchronize the event nor manufacture a device submission.
+    // Observe the native call without synchronizing or manufacturing a submission.
     ApiObservation observation("rtEventQueryStatus", nullptr, event);
     const auto result = original(event, status);
-    observation.finish(result, std::nullopt, result == RT_ERROR_NONE ? std::optional(*status) : std::nullopt);
+    observation.finish(result);
     return result;
 }
 
@@ -561,7 +517,7 @@ extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
 extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
     static const auto original = native_symbol<decltype(&rtEventDestroy)>("rtEventDestroy");
 
-    if (!NativeJournal::instance().observes_events()) return original(event);
+    if (!NativeJournal::instance().enabled()) return original(event);
 
     ApiObservation observation("rtEventDestroy", nullptr, event);
     const auto result = original(event);
@@ -607,9 +563,9 @@ extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes
         return result;
     }
 
-    const auto start = clock_ns(CLOCK_MONOTONIC);
+    const auto start = clock_ns();
     const auto result = original(destination, maximum_bytes, source, bytes);
-    const auto end = clock_ns(CLOCK_MONOTONIC);
+    const auto end = clock_ns();
 
     // The driver contract is synchronous. Its entry is after the runtime's
     // internal stream wait, not the beginning of that wait or a pure CPU cost.

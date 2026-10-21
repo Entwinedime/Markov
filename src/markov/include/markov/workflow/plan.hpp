@@ -22,11 +22,12 @@ public:
     nlohmann::json describe(const Project & project) const;
     nlohmann::json collection_plan(const Project & project) const;
     nlohmann::json prepare_prediction(const Project & project) const;
-    nlohmann::json prepare_performance(const Project & project, const nlohmann::json & prediction) const;
+    nlohmann::json prepare_performance(const Project & project, const nlohmann::json & prediction, const nlohmann::json & attempts) const;
 
     // Explicit diagnostic acquisition. Exploration chooses its own representative
     // inputs; it must not call this once per target workload as a coverage fallback.
-    nlohmann::json prepare_collection(const Project & project, const Candidate & configuration, std::span<const Request> requests) const;
+    nlohmann::json prepare_collection(const Project & project, const Candidate & configuration, std::span<const Request> requests,
+                                      bool reference = false) const;
     nlohmann::json prepare_representative(const Project & project, const Candidate & configuration) const;
     nlohmann::json prepare_target(const Project & project, const Candidate & configuration, const RequestWorkload & workload, std::int64_t budget_sec,
                                   std::string_view purpose) const;
@@ -36,7 +37,7 @@ public:
 
 private:
     const CollectionAdapter & collection_adapter(Framework framework) const;
-    nlohmann::json prepare_inputs(const Project & project, const Candidate & configuration) const;
+    nlohmann::json prepare_inputs(const Project & project, const Candidate & configuration, bool reference = false) const;
 
     // Both adapter lists are owned by the entry point throughout preparation.
     std::span<const TemplateAdapter * const> adapters_;

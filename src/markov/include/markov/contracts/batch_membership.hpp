@@ -5,6 +5,7 @@
 #include <compare>
 #include <cstddef>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace markov {
@@ -41,6 +42,7 @@ struct AdmissionWork {
     AdmissionStop stop = AdmissionStop::QueueExhausted;
 
     bool operator==(const AdmissionWork &) const = default;
+    static std::string_view stop_name(AdmissionStop stop);
     std::size_t horizon_checks() const;
     bool parameterized_cpu_path(const AdmissionEntryState & entry, std::size_t admitted_requests) const;
     nlohmann::json describe(const AdmissionEntryState & entry, std::size_t admitted_requests) const;

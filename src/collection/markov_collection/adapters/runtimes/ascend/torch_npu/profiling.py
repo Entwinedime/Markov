@@ -45,19 +45,20 @@ class AscendProfileWindow:
     def _control(self, operation: str) -> Iterator[None]:
         # These are runtime lifecycle observations, not serving blocks. The
         # native profiler may not export a marker enclosing its own stop call.
+        # Use the same raw clock as the API journal and CANN export origin.
         record = {
             "operation": operation,
             "rank": self._rank,
             "pid": os.getpid(),
             "tid": threading.get_native_id(),
-            "start_ns": time.perf_counter_ns(),
+            "start_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
             "completed": False,
         }
         try:
             yield
             record["completed"] = True
         finally:
-            record["end_ns"] = time.perf_counter_ns()
+            record["end_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
             self._controls.append(record)
             directory = self.directory.parent / "profile_controls"
             write_json(directory / f"rank-{self._rank}-pid-{os.getpid()}.json", self._controls)

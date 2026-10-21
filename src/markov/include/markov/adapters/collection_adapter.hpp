@@ -19,10 +19,13 @@ public:
 
     virtual Framework framework() const = 0;
     virtual std::string_view name() const = 0;
-    virtual std::string_view service() const = 0;
     virtual FrameworkConfiguration read_configuration(const std::filesystem::path & path, const nlohmann::json & data) const = 0;
     virtual nlohmann::json configuration(const FrameworkConfiguration & configuration) const = 0;
-    virtual nlohmann::json instrumentation() const = 0;
+    virtual nlohmann::json instrumentation(bool structural) const = 0;
+    // Capture strategies belong to the framework. References keep the native
+    // deployment. Each descriptor is one native session; null selects ordinary
+    // native execution. The workflow preserves completed sessions on resume.
+    virtual nlohmann::json capture_executions(const Candidate & candidate, bool reference) const = 0;
     virtual bool supports_target_observation() const = 0;
     // Pure request planning: required points and bounded lifecycle opportunities.
     // Proposed work still requires actual native feature coverage.

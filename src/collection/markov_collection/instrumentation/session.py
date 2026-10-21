@@ -15,6 +15,10 @@ class CaptureSession(ABC):
         self._worker_failed = False
 
     def prepare(self) -> None:
+        actual = read_json(Path(self.prepared["model_path"]) / "config.json")
+        if actual != self.prepared["model_configuration"]:
+            raise ValueError("native model configuration differs from the capture input snapshot")
+
         write_json(self.directory / "prepared_input.json", self.prepared)
         os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
         os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
@@ -22,9 +26,6 @@ class CaptureSession(ABC):
     def _handle_worker_failure(self, signum: int, frame: Any) -> None:
         self._worker_failed = True
         raise RuntimeError("native scheduler worker failed; see the collection process log")
-
-    def _model_configuration(self) -> dict[str, Any]:
-        return read_json(Path(self.prepared["model_path"]) / "config.json")
 
     @abstractmethod
     def run(self) -> None:

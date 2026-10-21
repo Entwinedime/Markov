@@ -25,14 +25,12 @@ namespace {
 
 using Json = nlohmann::json;
 
-// Addresses are used only during encoding. Files contain table indices; decoded
-// references borrow owners restored before this table is populated.
+// Each direction builds only its lookup: address indices for encoding, indexed
+// owners for decoding. Decoded references borrow already restored owners.
 template <class T> class AssetReferences {
 public:
-    void add(const T & value) {
-        indices_.emplace(&value, values_.size());
-        values_.push_back(&value);
-    }
+    void index(const T & value) { indices_.emplace(&value, indices_.size()); }
+    void restore(const T & value) { values_.push_back(&value); }
     Json encode(const T * value) const {
         if (!value) return nullptr;
 
@@ -130,20 +128,23 @@ private:
     Json write(const WorkspaceDemandLayout * value) const { return workspace_rules_.encode(value); }
     const WorkspaceDemandLayout * read(const Json & data, std::type_identity<const WorkspaceDemandLayout *>) const { return workspace_rules_.decode(data); }
     const ModelParameterRule * read(const Json & data, std::type_identity<const ModelParameterRule *>) const { return model_rules_.decode(data); }
-    Json write(const CollectiveParameterRule * value) const { return collective_rules_.encode(value); }
-    const CollectiveParameterRule * read(const Json & data, std::type_identity<const CollectiveParameterRule *>) const {
-        return collective_rules_.decode(data);
-    }
     Json write(const TemplateRegionStructure * value) const { return structures_.encode(value); }
     const TemplateRegionStructure * read(const Json & data, std::type_identity<const TemplateRegionStructure *>) const { return structures_.decode(data); }
     Json write(const SourceKernel * value) const { return kernels_.encode(value); }
     const SourceKernel * read(const Json & data, std::type_identity<const SourceKernel *>) const { return kernels_.decode(data); }
     Json write(const SourceTransfer * value) const { return transfers_.encode(value); }
     const SourceTransfer * read(const Json & data, std::type_identity<const SourceTransfer *>) const { return transfers_.decode(data); }
-    Json write(const SourceCommunicationTask * value) const { return tasks_.encode(value); }
-    const SourceCommunicationTask * read(const Json & data, std::type_identity<const SourceCommunicationTask *>) const { return tasks_.decode(data); }
 
-    static constexpr auto members(std::type_identity<Environment>) { return std::tuple{ &Environment::service, &Environment::devices }; }
+    static constexpr auto members(std::type_identity<Environment>) {
+        return std::tuple{ &Environment::service, &Environment::devices, &Environment::image_id, &Environment::measurement };
+    }
+
+    static constexpr auto members(std::type_identity<TemplateRankBinding>) {
+        return std::tuple{ &TemplateRankBinding::source_rank,
+                           &TemplateRankBinding::completion_ports,
+                           &TemplateRankBinding::publishes_outputs,
+                           &TemplateRankBinding::receives_inputs };
+    }
 
     static constexpr auto members(std::type_identity<AdmissionPolicy>) {
         return std::tuple{ &AdmissionPolicy::initial_ratio,
@@ -201,13 +202,6 @@ private:
                            &SourceKernel::attention,     &SourceKernel::value_dependencies };
     }
 
-    static constexpr auto members(std::type_identity<SourceCommunicationTask>) {
-        return std::tuple{ &SourceCommunicationTask::span,        &SourceCommunicationTask::source_detail,   &SourceCommunicationTask::stream,
-                           &SourceCommunicationTask::task,        &SourceCommunicationTask::context,         &SourceCommunicationTask::operation,
-                           &SourceCommunicationTask::bytes,       &SourceCommunicationTask::data_type,       &SourceCommunicationTask::transport,
-                           &SourceCommunicationTask::source_rank, &SourceCommunicationTask::destination_rank };
-    }
-
     static constexpr auto members(std::type_identity<SourceRequest>) {
         return std::tuple{ &SourceRequest::id,
                            &SourceRequest::input_tokens,
@@ -216,23 +210,18 @@ private:
                            &SourceRequest::generated_tokens };
     }
 
+    static constexpr auto members(std::type_identity<SourceIncomingRequest>) {
+        return std::tuple{ &SourceIncomingRequest::id, &SourceIncomingRequest::prompt_tokens, &SourceIncomingRequest::output_tokens };
+    }
+
 
     static constexpr auto members(std::type_identity<TensorParameterAxis>) {
         return std::tuple{ &TensorParameterAxis::slot, &TensorParameterAxis::multiplier, &TensorParameterAxis::extent, &TensorParameterAxis::axis };
     }
 
-    static constexpr auto members(std::type_identity<CommunicationCountDomain>) {
-        return std::tuple{ &CommunicationCountDomain::minimum, &CommunicationCountDomain::maximum, &CommunicationCountDomain::gap };
-    }
-
-    static constexpr auto members(std::type_identity<CommunicationTaskBytes>) {
-        return std::tuple{ &CommunicationTaskBytes::task, &CommunicationTaskBytes::extent };
-    }
-
     static constexpr auto members(std::type_identity<CollectiveCountRule>) { return std::tuple{ &CollectiveCountRule::rows, &CollectiveCountRule::width }; }
-
-    static constexpr auto members(std::type_identity<CollectiveParameterRule>) {
-        return std::tuple{ &CollectiveParameterRule::count, &CollectiveParameterRule::work };
+    static constexpr auto members(std::type_identity<HostMessageRule>) {
+        return std::tuple{ &HostMessageRule::root, &HostMessageRule::completion_entry_dependencies };
     }
 
     static constexpr auto members(std::type_identity<BatchOperationVariant>) {
@@ -320,14 +309,11 @@ private:
     static constexpr auto members(std::type_identity<TemplateWorkspaceUse>) {
         return std::tuple{ &TemplateWorkspaceUse::pool,
                            &TemplateWorkspaceUse::operation,
-                           &TemplateWorkspaceUse::worker,
                            &TemplateWorkspaceUse::source_api,
                            &TemplateWorkspaceUse::marker,
                            &TemplateWorkspaceUse::begin,
                            &TemplateWorkspaceUse::end,
                            &TemplateWorkspaceUse::requested_bytes,
-                           &TemplateWorkspaceUse::capacity_before_bytes,
-                           &TemplateWorkspaceUse::capacity_after_bytes,
                            &TemplateWorkspaceUse::branch,
                            &TemplateWorkspaceUse::requires_device_synchronization,
                            &TemplateWorkspaceUse::demand };
@@ -353,23 +339,17 @@ private:
         return std::tuple{ &TemplateConnectionContract::relation, &TemplateConnectionContract::direction, &TemplateConnectionContract::local_boundary };
     }
 
-    static constexpr auto members(std::type_identity<TemplateInterface>) {
-        return std::tuple{ &TemplateInterface::connection, &TemplateInterface::remote_boundary };
+    static constexpr auto members(std::type_identity<TemplateConnectionEndpoint>) {
+        return std::tuple{ &TemplateConnectionEndpoint::contract, &TemplateConnectionEndpoint::remote_source_boundary };
     }
 
     static constexpr auto members(std::type_identity<TemplateResourceSlot>) {
         return std::tuple{ &TemplateResourceSlot::domain, &TemplateResourceSlot::rank, &TemplateResourceSlot::role };
     }
 
-    static constexpr auto members(std::type_identity<TemplateRemoteBoundary>) {
-        return std::tuple{ &TemplateRemoteBoundary::lane, &TemplateRemoteBoundary::local_boundary };
-    }
-
     static constexpr auto members(std::type_identity<TemplateRegionStructure>) {
-        return std::tuple{ &TemplateRegionStructure::resources,         &TemplateRegionStructure::boundaries,       &TemplateRegionStructure::nodes,
-                           &TemplateRegionStructure::dependencies,      &TemplateRegionStructure::connections,      &TemplateRegionStructure::dependency_ports,
-                           &TemplateRegionStructure::remote_boundaries, &TemplateRegionStructure::collective_rules, &TemplateRegionStructure::model_rules,
-                           &TemplateRegionStructure::semantic };
+        return std::tuple{ &TemplateRegionStructure::resources,    &TemplateRegionStructure::boundaries,  &TemplateRegionStructure::nodes,
+                           &TemplateRegionStructure::dependencies, &TemplateRegionStructure::model_rules, &TemplateRegionStructure::semantic };
     }
 
     static constexpr auto members(std::type_identity<TemplateConnectionObservation>) {
@@ -381,9 +361,81 @@ private:
 
     static constexpr auto members(std::type_identity<TemplateRegionScope>) { return std::tuple{ &TemplateRegionScope::begin, &TemplateRegionScope::end }; }
 
+    static constexpr auto members(std::type_identity<TemplateRegionSequence>) {
+        return std::tuple{ &TemplateRegionSequence::source_members,    &TemplateRegionSequence::members, &TemplateRegionSequence::parameter,
+                           &TemplateRegionSequence::separators,        &TemplateRegionSequence::inputs,  &TemplateRegionSequence::gap,
+                           &TemplateRegionSequence::repeated_separator };
+    }
+    static constexpr auto members(std::type_identity<TemplateSequenceInput>) {
+        return std::tuple{ &TemplateSequenceInput::step,
+                           &TemplateSequenceInput::dependency,
+                           &TemplateSequenceInput::previous_resource,
+                           &TemplateSequenceInput::producer_step };
+    }
+    static constexpr auto members(std::type_identity<TemplateDependencyOrigin>) {
+        return std::tuple{ &TemplateDependencyOrigin::kind, &TemplateDependencyOrigin::slot };
+    }
+
+    static constexpr auto members(std::type_identity<TemplateCollectiveInterface>) {
+        return std::tuple{ &TemplateCollectiveInterface::position,
+                           &TemplateCollectiveInterface::operation,
+                           &TemplateCollectiveInterface::count,
+                           &TemplateCollectiveInterface::data_type,
+                           &TemplateCollectiveInterface::group_size,
+                           &TemplateCollectiveInterface::host,
+                           &TemplateCollectiveInterface::owner_region,
+                           &TemplateCollectiveInterface::lane,
+                           &TemplateCollectiveInterface::inputs,
+                           &TemplateCollectiveInterface::outputs,
+                           &TemplateCollectiveInterface::model_region,
+                           &TemplateCollectiveInterface::model_layer,
+                           &TemplateCollectiveInterface::substitute_nodes,
+                           &TemplateCollectiveInterface::transport_boundaries,
+                           &TemplateCollectiveInterface::launch_inputs,
+                           &TemplateCollectiveInterface::seam_dependencies,
+                           &TemplateCollectiveInterface::host_message };
+    }
+
     static constexpr auto members(std::type_identity<TemplateRegion>) {
-        return std::tuple{ &TemplateRegion::source_call, &TemplateRegion::parent_call, &TemplateRegion::semantic,     &TemplateRegion::nodes,
-                           &TemplateRegion::inputs,      &TemplateRegion::outputs,     &TemplateRegion::request_slot, &TemplateRegion::cpu_scope };
+        return std::tuple{ &TemplateRegion::semantic,     &TemplateRegion::inputs,    &TemplateRegion::outputs,
+                           &TemplateRegion::request_slot, &TemplateRegion::cpu_scope, &TemplateRegion::input_slot };
+    }
+    static constexpr auto members(std::type_identity<TemplateRegionPort>) {
+        return std::tuple{ &TemplateRegionPort::resource, &TemplateRegionPort::entry, &TemplateRegionPort::exit, &TemplateRegionPort::device_done };
+    }
+    static constexpr auto cut_fields() {
+        return std::tuple{ &TemplateSubgraphRegion::boundaries,
+                           &TemplateSubgraphRegion::crossing_nodes,
+                           &TemplateSubgraphRegion::retained_dependencies,
+                           &TemplateSubgraphRegion::internal_dependencies,
+                           &TemplateSubgraphRegion::incoming_dependencies,
+                           &TemplateSubgraphRegion::outgoing_dependencies,
+                           &TemplateSubgraphRegion::external_connections,
+                           &TemplateSubgraphRegion::incoming_rotary_dependencies,
+                           &TemplateSubgraphRegion::outgoing_rotary_dependencies,
+                           &TemplateSubgraphRegion::resource_ports,
+                           &TemplateSubgraphRegion::replacement_gap };
+    }
+    static constexpr auto members(std::type_identity<TemplateSubgraphRegion>) {
+        return std::tuple_cat(std::tuple{ &TemplateSubgraphRegion::nodes }, cut_fields());
+    }
+    Json write(const TemplateRegion & value) const {
+        auto result = record(value.source_call, value.parent_call, value.nodes, nullptr);
+        if (!value.boundaries.empty()) result[3] = std::apply([&](auto... field) { return record(value.*field...); }, cut_fields());
+        std::apply([&](auto... field) { (result.push_back(write(value.*field)), ...); }, members(std::type_identity<TemplateRegion>{}));
+        return result;
+    }
+    TemplateRegion read(const Json & data, std::type_identity<TemplateRegion>) const {
+        TemplateRegion result(read<std::size_t>(data.at(0)), read<std::size_t>(data.at(1)));
+        result.nodes = read<std::vector<std::size_t>>(data.at(2));
+        std::size_t index = 0;
+        if (!data.at(3).is_null())
+            std::apply([&](auto... field) { ((result.*field = read<std::remove_cvref_t<decltype(result.*field)>>(data.at(3).at(index++))), ...); },
+                       cut_fields());
+        index = 4;
+        std::apply([&](auto... field) { ((result.*field = read<std::remove_cvref_t<decltype(result.*field)>>(data.at(index++))), ...); },
+                   members(std::type_identity<TemplateRegion>{}));
+        return result;
     }
 
     static constexpr auto members(std::type_identity<RotaryPositionDependency>) {
@@ -395,31 +447,14 @@ private:
     }
 
     static constexpr auto members(std::type_identity<TemplateOperation>) {
-        return std::tuple{ &TemplateOperation::name,
-                           &TemplateOperation::host,
-                           &TemplateOperation::workers,
-                           &TemplateOperation::device_spans,
-                           &TemplateOperation::collective_spans };
+        return std::tuple{ &TemplateOperation::name, &TemplateOperation::host, &TemplateOperation::workers, &TemplateOperation::device_spans };
     }
 
-    static constexpr auto members(std::type_identity<TemplateCollective>) {
-        return std::tuple{ &TemplateCollective::source_span,   &TemplateCollective::data_type,  &TemplateCollective::tasks,
-                           &TemplateCollective::envelope_node, &TemplateCollective::task_nodes, &TemplateCollective::serial_completion };
-    }
-
-    Json write(const RequestLengthDomain & value) const {
-        return {
-            {   "minimum_input_tokens",   value.minimum_input_tokens },
-            {   "maximum_input_tokens",   value.maximum_input_tokens },
-            { "minimum_context_tokens", value.minimum_context_tokens },
-            { "maximum_context_tokens", value.maximum_context_tokens }
-        };
-    }
-    RequestLengthDomain read(const Json & data, std::type_identity<RequestLengthDomain>) const {
-        return { read<std::uint32_t>(data.at("minimum_input_tokens")),
-                 read<std::uint32_t>(data.at("maximum_input_tokens")),
-                 read<std::uint32_t>(data.at("minimum_context_tokens")),
-                 read<std::uint32_t>(data.at("maximum_context_tokens")) };
+    static constexpr auto members(std::type_identity<RequestLengthDomain>) {
+        return std::tuple{ &RequestLengthDomain::minimum_input_tokens,
+                           &RequestLengthDomain::maximum_input_tokens,
+                           &RequestLengthDomain::minimum_context_tokens,
+                           &RequestLengthDomain::maximum_context_tokens };
     }
 
     static constexpr auto members(std::type_identity<KvRegionBranch>) {
@@ -444,11 +479,6 @@ private:
     ModelParameterRule read(const Json & data, std::type_identity<ModelParameterRule>) const {
         auto shapes = read<TensorParameterLayout>(data.at(0));
         return { std::move(shapes.inputs_), std::move(shapes.outputs_), shapes.page_size_tokens_, read<ModelWorkload>(data.at(1)) };
-    }
-
-    static constexpr auto members(std::type_identity<CommunicationWorkLayout>) {
-        return std::tuple{ &CommunicationWorkLayout::operation_, &CommunicationWorkLayout::element_bytes_, &CommunicationWorkLayout::partitions_,
-                           &CommunicationWorkLayout::alignment_, &CommunicationWorkLayout::domains_,       &CommunicationWorkLayout::relations_ };
     }
 
     static constexpr auto members(std::type_identity<AttentionParameterRule>) {
@@ -479,229 +509,151 @@ private:
         return std::tuple{ &TemplateGraph::Location::region, &TemplateGraph::Location::member };
     }
 
-    static constexpr auto members(std::type_identity<TemplateGraph::RemoteBoundaryBinding>) {
-        return std::tuple{ &TemplateGraph::RemoteBoundaryBinding::source_boundary, &TemplateGraph::RemoteBoundaryBinding::local_boundary };
-    }
-
-    static constexpr auto members(std::type_identity<TemplateGraph::ObservedConnection>) {
-        return std::tuple{ &TemplateGraph::ObservedConnection::contract,
-                           &TemplateGraph::ObservedConnection::remote_source_boundary,
-                           &TemplateGraph::ObservedConnection::remote_lane };
-    }
-
     static constexpr auto members(std::type_identity<TemplateGraph::Binding>) {
-        return std::tuple{ &TemplateGraph::Binding::structure,
-                           &TemplateGraph::Binding::boundaries,
-                           &TemplateGraph::Binding::remote_boundaries,
-                           &TemplateGraph::Binding::lanes,
-                           &TemplateGraph::Binding::source_region };
+        return std::tuple{ &TemplateGraph::Binding::structure, &TemplateGraph::Binding::boundaries, &TemplateGraph::Binding::lanes };
     }
 
     Json write(const DeviceCommandWork & value) const { return value.describe(); }
     DeviceCommandWork read(const Json & data, std::type_identity<DeviceCommandWork>) const { return DeviceCommandWork::read(data); }
 
     static constexpr auto members(std::type_identity<TemplateNodeObservation>) {
-        return std::tuple{ &TemplateNodeObservation::source_span,   &TemplateNodeObservation::kernel,   &TemplateNodeObservation::source_scope,
-                           &TemplateNodeObservation::communication, &TemplateNodeObservation::transfer, &TemplateNodeObservation::device_command };
+        return std::tuple{ &TemplateNodeObservation::source_span,
+                           &TemplateNodeObservation::kernel,
+                           &TemplateNodeObservation::source_scope,
+                           &TemplateNodeObservation::transfer,
+                           &TemplateNodeObservation::device_command };
     }
 
-    Json write(const TemplateGraph & value) const {
-        return record(value.local_boundaries_,
-                      value.boundary_locations_,
-                      value.local_,
-                      value.locations_,
-                      value.bindings_,
-                      value.local_dependencies_,
-                      value.dependency_locations_,
-                      value.local_connections_,
-                      value.connection_locations_,
-                      value.model_rules_,
-                      value.collective_rules_);
+    static constexpr auto members(std::type_identity<TemplateGraph>) {
+        return std::tuple{ &TemplateGraph::local_boundaries_,
+                           &TemplateGraph::boundary_locations_,
+                           &TemplateGraph::local_,
+                           &TemplateGraph::locations_,
+                           &TemplateGraph::bindings_,
+                           &TemplateGraph::local_dependencies_,
+                           &TemplateGraph::dependency_locations_,
+                           &TemplateGraph::connections_,
+                           &TemplateGraph::model_rules_ };
     }
     TemplateGraph read(const Json & data, std::type_identity<TemplateGraph>) const {
         TemplateGraph result;
-        result.local_boundaries_ = read<std::vector<TemplateBoundary>>(data.at(0));
-        result.boundary_locations_ = read<std::vector<TemplateGraph::Location>>(data.at(1));
-        result.local_ = read<std::vector<TemplateNode>>(data.at(2));
-        result.locations_ = read<std::vector<TemplateGraph::Location>>(data.at(3));
-        result.bindings_ = read<std::vector<TemplateGraph::Binding>>(data.at(4));
-        result.local_dependencies_ = read<std::vector<TemplateDependency>>(data.at(5));
-        result.dependency_locations_ = read<std::vector<TemplateGraph::Location>>(data.at(6));
-        result.local_connections_ = read<std::vector<TemplateGraph::ObservedConnection>>(data.at(7));
-        result.connection_locations_ = read<std::vector<TemplateGraph::Location>>(data.at(8));
-        result.model_rules_ = read<std::map<std::size_t, const ModelParameterRule *>>(data.at(9));
-        result.collective_rules_ = read<std::map<std::size_t, const CollectiveParameterRule *>>(data.at(10));
-
+        std::size_t index = 0;
+        std::apply([&](auto... field) { ((result.*field = read<std::remove_cvref_t<decltype(result.*field)>>(data.at(index++))), ...); },
+                   members(std::type_identity<TemplateGraph>{}));
         return result;
     }
 
-    Json write(const TemplateDefinition & value) {
-        tasks_ = {};
-        for (const auto & collective : value.collectives)
-            for (const auto & task : collective.tasks) tasks_.add(task);
-
-        return {
-            {                           "step",                           write(value.step) },
-            {                          "phase",                          write(value.phase) },
-            {                           "rank",                           write(value.rank) },
-            {                    "source_call",                    write(value.source_call) },
-            {                   "source_batch",                   write(value.source_batch) },
-            {        "source_invocation_order",                   write(value.source_order) },
-            {                     "transition",                     write(value.transition) },
-            {              "transition_region",              write(value.transition_region) },
-            { "transition_latch_parameterized", write(value.transition_latch_parameterized) },
-            {      "transition_cpu_parameters",      write(value.transition_cpu_parameters) },
-            {    "transition_merge_parameters",    write(value.transition_merge_parameters) },
-            {          "running_update_region",          write(value.running_update_region) },
-            {                      "admission",                      write(value.admission) },
-            {                 "admission_work",                 write(value.admission_work) },
-            {    "admission_cpu_request_count",    write(value.admission_cpu_request_count) },
-            {              "admission_regions",              write(value.admission_regions) },
-            {                        "filters",                        write(value.filters) },
-            {                 "filter_regions",                 write(value.filter_regions) },
-            {                          "merge",                          write(value.merge) },
-            {                          "entry",                          write(value.entry) },
-            {                          "ports",                          write(value.ports) },
-            {                "source_requests",                write(value.source_requests) },
-            {                  "length_domain",                  write(value.length_domain) },
-            {           "publication_finishes",           write(value.publication_finishes) },
-            {                  "output_policy",                  write(value.output_policy) },
-            {             "publication_layout",             write(value.publication_layout) },
-            {            "publication_regions",            write(value.publication_regions) },
-            { "request_initialization_regions", write(value.request_initialization_regions) },
-            {       "publication_cpu_progress",       write(value.publication_cpu_progress) },
-            {                          "lanes",                          write(value.lanes) },
-            {          "boundary_observations",          write(value.boundary_observations) },
-            {                 "cpu_boundaries",                 write(value.cpu_boundaries) },
-            {                          "graph",                          write(value.graph) },
-            {              "node_observations",              write(value.node_observations) },
-            {                        "regions",                        write(value.regions) },
-            {                      "kv_region",                      write(value.kv_region) },
-            {                     "operations",                     write(value.operations) },
-            {                 "workspace_uses",                 write(value.workspace_uses) },
-            {               "batch_operations",               write(value.batch_operations) },
-            {               "transfer_layouts",               write(value.transfer_layouts) },
-            {                    "collectives",                    write(value.collectives) },
-            {           "model_kernel_layouts",           write(value.model_kernel_layouts) },
-            {       "attention_kernel_layouts",       write(value.attention_kernel_layouts) },
-            {              "kv_kernel_layouts",              write(value.kv_kernel_layouts) },
-            {           "request_pool_layouts",           write(value.request_pool_layouts) },
-            {           "batch_kernel_layouts",           write(value.batch_kernel_layouts) },
-            {                   "stream_waits",                   write(value.stream_waits) },
-            {   "rotary_position_dependencies",   write(value.rotary_position_dependencies) },
-            {           "single_request_views",           write(value.single_request_views) },
-            {        "connection_observations",        write(value.connection_observations) },
-            {                         "inputs",                         write(value.inputs) },
-            {                        "outputs",                        write(value.outputs) }
+    // Declare each named field once for both directions. Source-owned records
+    // and reference tables are restored before these borrowing fields.
+    static constexpr auto definition_fields() {
+        using T = TemplateDefinition;
+        return std::tuple{
+            std::pair{                    "source_batch",                    &T::source_batch },
+            std::pair{         "source_invocation_order",                    &T::source_order },
+            std::pair{                      "transition",                      &T::transition },
+            std::pair{               "transition_region",               &T::transition_region },
+            std::pair{  "transition_latch_parameterized",  &T::transition_latch_parameterized },
+            std::pair{       "transition_cpu_parameters",       &T::transition_cpu_parameters },
+            std::pair{     "transition_merge_parameters",     &T::transition_merge_parameters },
+            std::pair{           "running_update_region",           &T::running_update_region },
+            std::pair{                       "admission",                       &T::admission },
+            std::pair{                  "admission_work",                  &T::admission_work },
+            std::pair{     "admission_cpu_request_count",     &T::admission_cpu_request_count },
+            std::pair{              "admission_sequence",              &T::admission_sequence },
+            std::pair{                         "filters",                         &T::filters },
+            std::pair{                  "filter_regions",                  &T::filter_regions },
+            std::pair{                           "merge",                           &T::merge },
+            std::pair{                           "entry",                           &T::entry },
+            std::pair{                           "ports",                           &T::ports },
+            std::pair{                 "source_requests",                 &T::source_requests },
+            std::pair{        "source_incoming_requests",        &T::source_incoming_requests },
+            std::pair{                 "input_reception",                 &T::input_reception },
+            std::pair{          "incoming_request_ready",          &T::incoming_request_ready },
+            std::pair{       "incoming_request_sequence",       &T::incoming_request_sequence },
+            std::pair{        "input_reception_sequence",        &T::input_reception_sequence },
+            std::pair{                   "length_domain",                   &T::length_domain },
+            std::pair{            "publication_finishes",            &T::publication_finishes },
+            std::pair{                   "output_policy",                   &T::output_policy },
+            std::pair{                 "output_boundary",                 &T::output_boundary },
+            std::pair{              "publication_layout",              &T::publication_layout },
+            std::pair{            "publication_sequence",            &T::publication_sequence },
+            std::pair{ "request_initialization_sequence", &T::request_initialization_sequence },
+            std::pair{        "publication_cpu_progress",        &T::publication_cpu_progress },
+            std::pair{                           "lanes",                           &T::lanes },
+            std::pair{           "boundary_observations",           &T::boundary_observations },
+            std::pair{                  "cpu_boundaries",                  &T::cpu_boundaries },
+            std::pair{                           "graph",                           &T::graph },
+            std::pair{               "node_observations",               &T::node_observations },
+            std::pair{                         "regions",                         &T::regions },
+            std::pair{                       "sequences",                       &T::sequences },
+            std::pair{                  "model_sequence",                  &T::model_sequence },
+            std::pair{                       "kv_region",                       &T::kv_region },
+            std::pair{                      "operations",                      &T::operations },
+            std::pair{                  "workspace_uses",                  &T::workspace_uses },
+            std::pair{                "batch_operations",                &T::batch_operations },
+            std::pair{                "transfer_layouts",                &T::transfer_layouts },
+            std::pair{           "collective_interfaces",           &T::collective_interfaces },
+            std::pair{        "attention_kernel_layouts",        &T::attention_kernel_layouts },
+            std::pair{               "kv_kernel_layouts",               &T::kv_kernel_layouts },
+            std::pair{            "request_pool_layouts",            &T::request_pool_layouts },
+            std::pair{            "batch_kernel_layouts",            &T::batch_kernel_layouts },
+            std::pair{                    "stream_waits",                    &T::stream_waits },
+            std::pair{    "rotary_position_dependencies",    &T::rotary_position_dependencies },
+            std::pair{            "single_request_views",            &T::single_request_views },
+            std::pair{         "connection_observations",         &T::connection_observations }
         };
+    }
+
+    Json write(const TemplateDefinition & value) {
+        Json result{
+            {        "step",        write(value.step) },
+            {       "phase",       write(value.phase) },
+            {        "rank",        write(value.rank) },
+            { "source_call", write(value.source_call) }
+        };
+        std::apply([&](auto... field) { ((result[field.first] = write(value.*field.second)), ...); }, definition_fields());
+        return result;
     }
     TemplateDefinition definition(const Json & data) {
         TemplateDefinition result(read<StepKind>(data.at("step")),
                                   read<BatchPhase>(data.at("phase")),
                                   read<std::uint32_t>(data.at("rank")),
                                   read<std::size_t>(data.at("source_call")));
-        // Communication observations borrow tasks from these owning collectives.
-        result.collectives = read<std::vector<TemplateCollective>>(data.at("collectives"));
-        tasks_ = {};
-        for (const auto & collective : result.collectives)
-            for (const auto & task : collective.tasks) tasks_.add(task);
-
-        result.source_batch = read<std::optional<std::uint64_t>>(data.at("source_batch"));
-        result.source_order = read<std::uint64_t>(data.at("source_invocation_order"));
-
-        result.transition = read<std::optional<BatchTransitionState>>(data.at("transition"));
-        result.transition_region = read<std::optional<std::size_t>>(data.at("transition_region"));
-        result.transition_latch_parameterized = read<bool>(data.at("transition_latch_parameterized"));
-        result.transition_cpu_parameters = read<bool>(data.at("transition_cpu_parameters"));
-        result.transition_merge_parameters = read<bool>(data.at("transition_merge_parameters"));
-        result.running_update_region = read<std::optional<std::size_t>>(data.at("running_update_region"));
-
-        result.admission = read<std::optional<AdmissionEntryState>>(data.at("admission"));
-        result.admission_work = read<std::optional<AdmissionWork>>(data.at("admission_work"));
-        result.admission_cpu_request_count = read<std::optional<std::size_t>>(data.at("admission_cpu_request_count"));
-        result.admission_regions = read<std::vector<std::size_t>>(data.at("admission_regions"));
-        result.filters = read<std::vector<BatchFilter>>(data.at("filters"));
-        result.filter_regions = read<std::map<BatchFilterBinding, std::size_t>>(data.at("filter_regions"));
-        result.merge = read<std::optional<BatchMerge>>(data.at("merge"));
-
-        result.entry = read<std::size_t>(data.at("entry"));
-        result.ports = read<std::map<PortKind, std::size_t>>(data.at("ports"));
-        result.source_requests = read<std::vector<SourceRequest>>(data.at("source_requests"));
-        result.length_domain = read<std::optional<RequestLengthDomain>>(data.at("length_domain"));
-
-        result.publication_finishes = read<std::vector<std::optional<bool>>>(data.at("publication_finishes"));
-        result.output_policy = read<std::optional<PeriodicOutputPolicy>>(data.at("output_policy"));
-        result.publication_layout = read<std::optional<PublicationParameterLayout>>(data.at("publication_layout"));
-        result.publication_regions = read<std::vector<std::size_t>>(data.at("publication_regions"));
-        result.request_initialization_regions = read<std::vector<std::size_t>>(data.at("request_initialization_regions"));
-        result.publication_cpu_progress = read<bool>(data.at("publication_cpu_progress"));
-
-        result.lanes = read<std::vector<TemplateLane>>(data.at("lanes"));
-        result.boundary_observations = read<std::vector<TemplateBoundaryObservation>>(data.at("boundary_observations"));
-        result.cpu_boundaries = read<std::map<std::size_t, CpuBoundary>>(data.at("cpu_boundaries"));
-        result.graph = read<TemplateGraph>(data.at("graph"));
-        result.node_observations = read<std::vector<TemplateNodeObservation>>(data.at("node_observations"));
-
-        result.regions = read<std::vector<TemplateRegion>>(data.at("regions"));
-        result.kv_region = read<std::optional<KvRegionBranch>>(data.at("kv_region"));
-        result.operations = read<std::vector<TemplateOperation>>(data.at("operations"));
-        result.workspace_uses = read<std::vector<TemplateWorkspaceUse>>(data.at("workspace_uses"));
-        result.batch_operations = read<std::map<SourceSpanId, BatchOperationVariant>>(data.at("batch_operations"));
-        result.transfer_layouts = read<std::map<SourceSpanId, TransferParameterLayout>>(data.at("transfer_layouts"));
-
-        result.model_kernel_layouts = read<std::map<SourceSpanId, std::size_t>>(data.at("model_kernel_layouts"));
-        result.attention_kernel_layouts = read<std::map<SourceSpanId, const AttentionParameterRule *>>(data.at("attention_kernel_layouts"));
-        result.kv_kernel_layouts = read<std::map<SourceSpanId, std::expected<KvParameterLayout, std::string>>>(data.at("kv_kernel_layouts"));
-        result.request_pool_layouts = read<std::map<SourceSpanId, std::expected<RequestPoolParameterLayout, std::string>>>(data.at("request_pool_layouts"));
-        result.batch_kernel_layouts = read<std::map<SourceSpanId, std::expected<BatchParameterLayout, std::string>>>(data.at("batch_kernel_layouts"));
-
-        result.stream_waits = read<std::vector<TemplateStreamWait>>(data.at("stream_waits"));
-        result.rotary_position_dependencies = read<std::vector<RotaryPositionDependency>>(data.at("rotary_position_dependencies"));
-        result.single_request_views = read<std::map<std::size_t, std::optional<std::size_t>>>(data.at("single_request_views"));
-        result.connection_observations = read<std::vector<TemplateConnectionObservation>>(data.at("connection_observations"));
-        result.inputs = read<std::vector<BoundaryId>>(data.at("inputs"));
-        result.outputs = read<std::vector<BoundaryId>>(data.at("outputs"));
-
+        std::apply([&](auto... field) { ((result.*field.second = read<std::remove_cvref_t<decltype(result.*field.second)>>(data.at(field.first))), ...); },
+                   definition_fields());
         return result;
     }
 
     AssetReferences<ModelParameterRule> model_rules_;
     AssetReferences<WorkspaceDemandLayout> workspace_rules_;
     AssetReferences<AttentionParameterRule> attention_rules_;
-    AssetReferences<CollectiveParameterRule> collective_rules_;
     AssetReferences<TemplateRegionStructure> structures_;
     AssetReferences<SourceKernel> kernels_;
     AssetReferences<SourceTransfer> transfers_;
-    AssetReferences<SourceCommunicationTask> tasks_;
 };
 
 Json TemplateAssetCodec::encode(const TemplateSource & source) {
-    for (const auto & [span, kernel] : source.kernels) kernels_.add(kernel);
-    for (const auto & [span, transfer] : source.transfers) transfers_.add(transfer);
+    for (const auto & [span, kernel] : source.kernels) kernels_.index(kernel);
+    for (const auto & [span, transfer] : source.transfers) transfers_.index(transfer);
 
     auto model_rules = Json::array();
     for (const auto & rule : source.model_rules) {
-        model_rules_.add(rule);
+        model_rules_.index(rule);
         model_rules.push_back(write(rule));
-    }
-    auto collective_rules = Json::array();
-    for (const auto & rule : source.collective_rules) {
-        collective_rules_.add(rule);
-        collective_rules.push_back(write(rule));
     }
     auto workspace_rules = Json::array();
     for (const auto & rule : source.workspace_rules) {
-        workspace_rules_.add(rule);
+        workspace_rules_.index(rule);
         workspace_rules.push_back(write(rule));
     }
     auto attention_rules = Json::array();
     for (const auto & rule : source.attention_rules) {
-        attention_rules_.add(rule);
+        attention_rules_.index(rule);
         attention_rules.push_back(write(rule));
     }
     auto structures = Json::array();
     for (const auto & structure : source.region_structures) {
-        structures_.add(structure);
+        structures_.index(structure);
         structures.push_back(write(structure));
     }
 
@@ -711,9 +663,10 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
 
     return {
         {              "manifest_path",            source.manifest_path.string() },
-        {                 "model_path",                        source.model_path },
+        {        "model_configuration",               source.model_configuration },
         {              "configuration",                     source.configuration },
-        {                      "ranks",                             source.ranks },
+        {                "source_rank",                       source.source_rank },
+        {              "rank_bindings",              write(source.rank_bindings) },
         {           "page_size_tokens",                  source.page_size_tokens },
         {                 "deployment",                 write(source.deployment) },
         {                 "resolution",                        source.resolution },
@@ -727,7 +680,6 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
         {                "model_rules",                   std::move(model_rules) },
         {            "workspace_rules",               std::move(workspace_rules) },
         {            "attention_rules",               std::move(attention_rules) },
-        {           "collective_rules",              std::move(collective_rules) },
         {          "region_structures",                    std::move(structures) },
         {                "definitions",                   std::move(definitions) },
         {                       "gaps",                              source.gaps },
@@ -742,9 +694,10 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
 TemplateSource TemplateAssetCodec::decode(const Json & data) {
     TemplateSource result;
     result.manifest_path = data.at("manifest_path").get<std::string>();
-    result.model_path = data.at("model_path").get<std::string>();
+    result.model_configuration = data.at("model_configuration");
     result.configuration = data.at("configuration");
-    result.ranks = read<std::uint32_t>(data.at("ranks"));
+    result.source_rank = read<std::uint32_t>(data.at("source_rank"));
+    result.rank_bindings = read<std::vector<TemplateRankBinding>>(data.at("rank_bindings"));
     result.page_size_tokens = read<std::uint32_t>(data.at("page_size_tokens"));
     result.deployment = read<Environment>(data.at("deployment"));
     result.resolution = read<std::string>(data.at("resolution"));
@@ -754,28 +707,24 @@ TemplateSource TemplateAssetCodec::decode(const Json & data) {
 
     // Owners must be stable before restoring the indices embedded in definitions.
     result.kernels = read<std::map<SourceSpanId, SourceKernel>>(data.at("kernels"));
-    for (const auto & [span, kernel] : result.kernels) kernels_.add(kernel);
+    for (const auto & [span, kernel] : result.kernels) kernels_.restore(kernel);
     result.transfers = read<std::map<SourceSpanId, SourceTransfer>>(data.at("transfers"));
-    for (const auto & [span, transfer] : result.transfers) transfers_.add(transfer);
+    for (const auto & [span, transfer] : result.transfers) transfers_.restore(transfer);
     for (const auto & row : data.at("model_rules")) {
         const auto [entry, inserted] = result.model_rules.insert(read<ModelParameterRule>(row));
-        model_rules_.add(*entry);
-    }
-    for (const auto & row : data.at("collective_rules")) {
-        const auto [entry, inserted] = result.collective_rules.insert(read<CollectiveParameterRule>(row));
-        collective_rules_.add(*entry);
+        model_rules_.restore(*entry);
     }
     for (const auto & row : data.at("workspace_rules")) {
         const auto [entry, inserted] = result.workspace_rules.insert(read<WorkspaceDemandLayout>(row));
-        workspace_rules_.add(*entry);
+        workspace_rules_.restore(*entry);
     }
     for (const auto & row : data.at("attention_rules")) {
         const auto [entry, inserted] = result.attention_rules.insert(read<AttentionParameterRule>(row));
-        attention_rules_.add(*entry);
+        attention_rules_.restore(*entry);
     }
     for (const auto & row : data.at("region_structures")) {
         const auto [entry, inserted] = result.region_structures.insert(read<TemplateRegionStructure>(row));
-        structures_.add(*entry);
+        structures_.restore(*entry);
     }
     for (const auto & row : data.at("definitions")) {
         auto value = definition(row);

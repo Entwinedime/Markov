@@ -6,58 +6,94 @@ import ast
 import inspect
 import textwrap
 import types
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
 from markov_collection.instrumentation.blocks import BlockWrapper, BoundBlock
-from markov_collection.instrumentation.recording import ProfilerMarkers, Recorder
+from markov_collection.instrumentation.recording import Recorder
 
 
-class SGLangInlineRegion(BlockWrapper):
-    def __init__(self, observer: Any, contract: dict[str, Any], binding: dict[str, Any]) -> None:
-        parameters = tuple(parameter["name"] for parameter in contract["definition"]["parameters"])
-        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),), observer.markers)
-        self.observer = observer
+class SGLangInlineRegion(ABC):
+    """One native location shared by semantic observation and timing wrappers."""
+
+    def __init__(self, binding: dict[str, Any]) -> None:
         self.binding = binding
 
     @abstractmethod
-    def parameters(self, *args: Any) -> tuple[dict[str, int], str | None]:
-        """Read only host metadata for this inline region."""
+    def parameters(self, observer: Any, *args: Any) -> tuple[dict[str, int], str | None]:
+        """Read host metadata only when semantic observation requests it."""
 
     @abstractmethod
-    def rewrite(self, method: ast.FunctionDef) -> None:
-        """Wrap one declared native statement or loop body in place."""
+    def locate(self, method: ast.FunctionDef) -> None:
+        """Wrap the declared native body without adding semantic bookkeeping."""
+
+    def record_work(self, method: ast.FunctionDef) -> None:
+        """Add source-only counters when this location needs them."""
+        return None
+
+    def wrap_prefix(self, method: ast.FunctionDef, boundary_call: str, arguments: list[str]) -> None:
+        SGLangInlineMethod.wrap_prefix(method, self.binding["id"], boundary_call, arguments)
+
+
+class SGLangInlineObservation(BlockWrapper):
+    def __init__(self, observer: Any, contract: dict[str, Any], region: SGLangInlineRegion) -> None:
+        parameters = tuple(parameter["name"] for parameter in contract["definition"]["parameters"])
+        binding = region.binding
+        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),), observer.markers)
+        self.observer = observer
+        self.region = region
 
     def context(self, *args: Any) -> tuple[Recorder, dict[str, Any]] | None:
         recorder = self.observer.recorder
         if recorder is None or not recorder.in_scope():
             return None
 
-        parameters, request_id = self.parameters(*args)
+        parameters, request_id = self.region.parameters(self.observer, *args)
+        binding = self.region.binding
         return recorder, {
-            "module_path": self.binding["id"],
-            "module_type": self.binding["module_type"],
-            "method": self.binding["method"],
+            "module_type": binding["module_type"],
+            "method": binding["method"],
             "module_parameters": {},
             "call_parameters": parameters,
             "inputs": {},
             "outputs": {},
             "cpu_values": {},
             "request_id": request_id,
+            "group_ranks": None,
         }
-
-    def wrap_prefix(self, method: ast.FunctionDef, boundary_call: str, arguments: list[str]) -> None:
-        SGLangInlineMethod.wrap_prefix(method, self.binding["id"], boundary_call, arguments)
 
 
 class SGLangInlineMethod:
     """Compile all declared regions of one native method in a single rewrite."""
 
-    def __init__(self, regions: list[SGLangInlineRegion], markers: ProfilerMarkers) -> None:
+    def __init__(
+        self, regions: list[SGLangInlineRegion], markers: Any, scopes: dict[str, Any], *, record_work: bool
+    ) -> None:
         self.regions = regions
         self.markers = markers
+        self.scopes = scopes
+        self.record_work = record_work
         self.instrumented: Callable[..., Any] | None = None
+
+    @staticmethod
+    def group(contract: dict[str, Any]) -> dict[str, list[SGLangInlineRegion]]:
+        locations = {
+            "batch_transition": SGLangBatchTransition,
+            "decode_update_prefix": SGLangDecodeUpdatePrefix,
+            "admission_prefix": SGLangAdmissionPrefix,
+            "admission_budget": SGLangAdmissionBudget,
+            "prefill_statistics": SGLangPrefillStatistics,
+            "request_publication": SGLangRequestPublication,
+            "last_locations": SGLangLastLocations,
+            "last_location": SGLangLastLocation,
+        }
+        methods: dict[str, list[SGLangInlineRegion]] = {}
+        for binding in contract["bindings"]:
+            location = locations.get(binding["semantic"])
+            if location is not None:
+                methods.setdefault(binding["hook"], []).append(location(binding))
+        return methods
 
     @staticmethod
     def wrap_prefix(method: ast.FunctionDef, identity: str, boundary_call: str, arguments: list[str]) -> None:
@@ -81,10 +117,6 @@ class SGLangInlineMethod:
             SGLangInlineMethod.scope_statement(identity, method.body[start:boundary], arguments),
             *method.body[boundary:],
         ]
-
-    @staticmethod
-    def wrap_transition(method: ast.FunctionDef, binding: dict[str, Any]) -> None:
-        SGLangInlineMethod.wrap_prefix(method, binding["id"], "self.get_new_batch_prefill()", ["self"])
 
     @staticmethod
     def scope_statement(identity: str, body: list[ast.stmt], arguments: list[str]) -> ast.With:
@@ -138,7 +170,9 @@ class SGLangInlineMethod:
             raise ValueError("inline observation requires a native body without a closure")
 
         for region in self.regions:
-            region.rewrite(method)
+            region.locate(method)
+            if self.record_work:
+                region.record_work(method)
         ast.increment_lineno(tree, line - 1)
 
         # Capture only the region scopes. Native globals remain the original live
@@ -150,11 +184,11 @@ class SGLangInlineMethod:
         code = compile(module, native.__code__.co_filename, "exec")
         exec(code, namespace)
         bind = types.FunctionType(namespace["_markov_bind"].__code__, native.__globals__)
-        return bind({region.binding["id"]: region.scope for region in self.regions})
+        return bind({identity: observation.scope for identity, observation in self.scopes.items()})
 
     def invoke(self, original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if self.instrumented is None:
-            # Compiling the semantic wrapper is observer work.
+            # Resolving and compiling a native location is observation work.
             with self.markers.observer():
                 self.instrumented = self.instrument(original)
 
@@ -162,15 +196,15 @@ class SGLangInlineMethod:
 
 
 class SGLangRequestPublication(SGLangInlineRegion):
-    def parameters(self, req: Any, index: int) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, req: Any, index: int) -> tuple[dict[str, int], str | None]:
         return {"request_index": index}, req.rid
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         SGLangInlineMethod.wrap_publication(method, self.binding)
 
 
 class SGLangBatchTransition(SGLangInlineRegion):
-    def parameters(self, scheduler: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, scheduler: Any) -> tuple[dict[str, int], str | None]:
         previous = scheduler.last_batch
         pending = previous is not None and previous.forward_mode.is_extend()
         return {
@@ -180,21 +214,22 @@ class SGLangBatchTransition(SGLangInlineRegion):
             "batch_is_full": int(scheduler.running_batch.batch_is_full),
         }, None
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
-        SGLangInlineMethod.wrap_transition(method, self.binding)
+    def locate(self, method: ast.FunctionDef) -> None:
+        self.wrap_prefix(method, "self.get_new_batch_prefill()", ["self"])
 
 
 class SGLangAdmissionPrefix(SGLangInlineRegion):
-    def parameters(self, scheduler: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, scheduler: Any) -> tuple[dict[str, int], str | None]:
         return {
             "waiting_requests": len(scheduler.waiting_queue),
             "running_requests": len(scheduler.running_batch.reqs),
             "batch_is_full": int(scheduler.running_batch.batch_is_full),
         }, None
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         self.wrap_prefix(method, "new_batch.prepare_for_extend()", ["self"])
 
+    def record_work(self, method: ast.FunctionDef) -> None:
         region = next(statement for statement in method.body if isinstance(statement, ast.With))
         region.items[0].optional_vars = ast.Name(id="_markov_admission", ctx=ast.Store())
         initialize = ast.parse(
@@ -278,31 +313,33 @@ class SGLangAdmissionPrefix(SGLangInlineRegion):
 
 
 class SGLangAdmissionBudget(SGLangInlineRegion):
-    def parameters(self, adder: Any, req: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, adder: Any, req: Any) -> tuple[dict[str, int], str | None]:
         return {
             "running_requests": len(adder.running_batch.reqs) if adder.running_batch is not None else 0,
             "accepted_requests": len(adder.can_run_list),
             "input_tokens": req.extend_input_len,
         }, None
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
+        # The same whole-call range is used by source metadata and CPU clocks.
+        method.body = [SGLangInlineMethod.scope_statement(self.binding["id"], method.body, ["self", "req"])]
+
+    def record_work(self, method: ast.FunctionDef) -> None:
+        region = method.body[0]
         expected = ast.dump(ast.parse("enumerate(self.req_states)", mode="eval").body)
-        loops = [node for node in ast.walk(method) if isinstance(node, ast.For) and ast.dump(node.iter) == expected]
+        loops = [node for node in ast.walk(region) if isinstance(node, ast.For) and ast.dump(node.iter) == expected]
         if len(loops) != 1:
             raise ValueError("native admission horizon loop does not match the declared binding")
 
-        # One region per budget call, not one event per comparison. Rejected
-        # candidates belong to admission and need not be members of the batch.
+        # Counts belong to source observation, not the independent timing body.
         loops[0].body[:0] = ast.parse(
             'if _markov_budget is not None:\n    _markov_budget.result["horizon_checks"] += 1\n'
         ).body
-        self.record_returns(method)
-        region = SGLangInlineMethod.scope_statement(self.binding["id"], method.body, ["self", "req"])
+        self.record_returns(region)
         region.items[0].optional_vars = ast.Name(id="_markov_budget", ctx=ast.Store())
         region.body[:0] = ast.parse(
             'if _markov_budget is not None:\n    _markov_budget.result["horizon_checks"] = 0\n'
         ).body
-        method.body = [region]
 
     def record_returns(self, node: ast.AST) -> None:
         # Keep nested helpers intact. Their returns do not finish this budget
@@ -318,7 +355,6 @@ class SGLangAdmissionBudget(SGLangInlineRegion):
                         "_markov_budget_return = None\n"
                         "if _markov_budget is not None:\n"
                         "    _markov_budget.result.update({\n"
-                        f'        "return_site": {statement.lineno},\n'
                         '        "native_result": _markov_budget_return.name,\n'
                         '        "candidate_accepted": bool(self.can_run_list and self.can_run_list[-1] is req),\n'
                         "    })\n"
@@ -336,14 +372,14 @@ class SGLangAdmissionBudget(SGLangInlineRegion):
 
 
 class SGLangPrefillStatistics(SGLangInlineRegion):
-    def parameters(self, scheduler: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, scheduler: Any) -> tuple[dict[str, int], str | None]:
         return {
             "waiting_requests": len(scheduler.waiting_queue),
             "running_requests": len(scheduler.running_batch.reqs),
             "has_chunked_request": int(scheduler.chunked_req is not None),
         }, None
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         assignments = [
             index
             for index, statement in enumerate(method.body)
@@ -363,19 +399,19 @@ class SGLangPrefillStatistics(SGLangInlineRegion):
 
 
 class SGLangDecodeUpdatePrefix(SGLangInlineRegion):
-    def parameters(self, batch: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, batch: Any) -> tuple[dict[str, int], str | None]:
         return {
             "request_count": len(batch.reqs),
             "batch_is_full": int(batch.batch_is_full),
-            "filter_prefix_count": len(self.observer._schedule_filters),
+            "filter_prefix_count": len(observer._schedule_filters),
         }, None
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         self.wrap_prefix(method, "batch.prepare_for_decode()", ["batch"])
 
 
 class SGLangLastLocations(SGLangInlineRegion):
-    def parameters(self, batch: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, batch: Any) -> tuple[dict[str, int], str | None]:
         return {
             "request_count": len(batch.reqs),
             "cold_prefix": int(all(len(req.prefix_indices) == 0 for req in batch.reqs)),
@@ -399,7 +435,7 @@ class SGLangLastLocations(SGLangInlineRegion):
 
         return assignments[0]
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         assignment = self.assignment(method)
         # Preserve the comprehension itself, including its local variable scope.
         # Cat remains outside this region with its own existing operation cut.
@@ -413,11 +449,11 @@ class SGLangLastLocations(SGLangInlineRegion):
 
 
 class SGLangLastLocation(SGLangLastLocations):
-    def parameters(self, batch: Any, index: int, prefix: Any) -> tuple[dict[str, int], str | None]:
+    def parameters(self, observer: Any, batch: Any, index: int, prefix: Any) -> tuple[dict[str, int], str | None]:
         req = batch.reqs[index]
         return {"request_index": index, "cold_prefix": int(len(prefix) == 0)}, req.rid
 
-    def rewrite(self, method: ast.FunctionDef) -> None:
+    def locate(self, method: ast.FunctionDef) -> None:
         assignment = self.assignment(method)
         comprehension = assignment.value
         helper = ast.parse("def _markov_last_location(t, _markov_request_index):\n    pass\n").body[0]

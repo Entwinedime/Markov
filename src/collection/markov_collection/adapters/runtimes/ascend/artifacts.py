@@ -1,7 +1,10 @@
 """Publish Ascend profiler exports and worker journals from one attempt."""
 
+from __future__ import annotations
+
 import json
 import shutil
+from os.path import relpath
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +53,6 @@ class AscendCaptureArtifacts:
         # PID reuse must not import an older communicator initialization.
         communication_logs = []
         log_directory = self.directory / "communication_logs"
-        log_directory.mkdir(exist_ok=True)
         for observation in sorted((self.directory / "observations").glob("*.jsonl")):
             with observation.open(encoding="utf-8") as stream:
                 first = json.loads(next(stream))
@@ -63,6 +65,7 @@ class AscendCaptureArtifacts:
                     continue
 
                 destination = log_directory / log.name
+                log_directory.mkdir(exist_ok=True)
                 destination.write_bytes(content)
                 communication_logs.append(
                     {"rank": rank, "pid": pid, "path": str(destination.relative_to(self.directory))}
@@ -71,6 +74,7 @@ class AscendCaptureArtifacts:
         capture = {
             "role": self.prepared["role"],
             "framework": self.prepared["framework"],
+            "runtime_clock": "CLOCK_MONOTONIC_RAW",
             "input": "prepared_input.json",
             "environment": "native_environment.json",
             "responses": "responses.json" if self.prepared["role"] != "performance" else "measurement_completions.json",
@@ -81,10 +85,6 @@ class AscendCaptureArtifacts:
             "native_api": [
                 str(path.relative_to(self.directory))
                 for path in sorted((self.directory / "native_api").glob("*.jsonl"))
-            ],
-            "event_history": [
-                str(path.relative_to(self.directory))
-                for path in sorted((self.directory / "native_api" / "initial_events").glob("*.jsonl"))
             ],
             "profile_controls": [
                 str(path.relative_to(self.directory))
@@ -113,13 +113,14 @@ class AscendCaptureArtifacts:
         write_json(self.directory / "native_capture.json", capture)
 
     @staticmethod
-    def release_observation_exports(capture_path: Path) -> None:
+    def release_observation_exports(capture_path: Path, diagnostics: Path | None) -> None:
         capture = read_json(capture_path)
-        if "profile_retention" not in capture:
-            return
         directory = capture_path.parent.resolve()
         prepared = read_json(directory / capture["input"])
         if prepared["diagnostics"]:
+            if diagnostics is None:
+                raise ValueError("diagnostic capture processing requires --diagnostics-directory")
+            AscendCaptureArtifacts.retain_observation_exports(capture_path, capture, diagnostics)
             return
 
         retention = capture["profile_retention"]
@@ -127,7 +128,6 @@ class AscendCaptureArtifacts:
         journal_roots = {
             "observations": "observations",
             "native_api": "native_api",
-            "event_history": "native_api",
             "profile_controls": "profile_controls",
             "workspace_states": "workspace_states",
             "communication_logs": "communication_logs",
@@ -180,3 +180,51 @@ class AscendCaptureArtifacts:
         retention.pop("release_directories")
         retention["retained_bytes"] = sum(path.stat().st_size for path in profile.rglob("*") if path.is_file())
         write_json(capture_path, capture)
+
+    @staticmethod
+    def retain_observation_exports(capture_path: Path, capture: dict[str, Any], diagnostics: Path) -> None:
+        directory = capture_path.parent.resolve()
+        roots = {
+            "native_profile",
+            "observations",
+            "native_api",
+            "profile_controls",
+            "workspace_states",
+            "communication_logs",
+        }
+        owned = {
+            name for name in roots if (directory / name).is_dir() and (directory / name).resolve() == directory / name
+        }
+        prefix = Path(relpath(diagnostics, directory))
+
+        # The processing receipt stays unacknowledged until every file arrives.
+        # A retry overwrites any interrupted copy using the same published paths.
+        for field in ("observations", "native_api", "profile_controls", "workspace_states"):
+            capture[field] = [
+                AscendCaptureArtifacts.diagnostic_reference(path, owned, prefix) for path in capture[field]
+            ]
+        for log in capture["communication_logs"]:
+            log["path"] = AscendCaptureArtifacts.diagnostic_reference(log["path"], owned, prefix)
+        for trace in capture["traces"]:
+            for key, value in trace.items():
+                trace[key] = (
+                    [AscendCaptureArtifacts.diagnostic_reference(path, owned, prefix) for path in value]
+                    if isinstance(value, list)
+                    else AscendCaptureArtifacts.diagnostic_reference(value, owned, prefix)
+                )
+        capture["profile_retention"]["diagnostics"] = str(prefix)
+        write_json(capture_path, capture)
+
+        diagnostics.mkdir(parents=True, exist_ok=True)
+        for name in sorted(owned):
+            source = directory / name
+            # The processor uses separate bind mounts for capture/diagnostics;
+            # a rename cannot cross them. Retire each source only after copy.
+            shutil.copytree(source, diagnostics / name, dirs_exist_ok=True)
+            shutil.rmtree(source)
+
+    @staticmethod
+    def diagnostic_reference(reference: str, roots: set[str], prefix: Path) -> str:
+        path = Path(reference)
+        # Borrowed references and already relocated paths keep their identity.
+        return str(prefix / path) if not path.is_absolute() and path.parts[0] in roots else reference

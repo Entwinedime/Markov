@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from markov_collection.artifacts.json_file import read_json, write_json
 from markov_collection.workflow.container_environment import ContainerEnvironment
@@ -18,17 +18,28 @@ from markov_collection.workflow.modeling_job import ModelingJob, ModelingJobFail
 from markov_collection.workflow.run_directory import RunDirectory
 
 
+class CaptureRuntime(Protocol):
+    def device_environment(self, devices: list[int]) -> dict[str, str]: ...
+    def command(self, root: Path, directory: Path, prepared: dict[str, Any], entrypoint: list[str]) -> list[str]: ...
+
+
 class CaptureProcessingFailed(RuntimeError):
     """A processor published a terminal failure for the recorded attempt."""
 
 
 class CollectionWorkflow:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, runtime: CaptureRuntime) -> None:
         self.root = root
+        self.runtime = runtime
         self.environment = ContainerEnvironment(root)
 
     def _preparation_mounts(
-        self, project: Path, measurements: Path | None, communication: bool, prediction_result: Path | None
+        self,
+        project: Path,
+        measurements: Path | None,
+        communication: bool,
+        prediction_result: Path | None,
+        run_state: Path | None,
     ) -> list[str]:
         # Discover file dependencies only. The C++ reader owns input validation
         # and framework semantics; host absolute paths keep their declared names.
@@ -40,15 +51,17 @@ class CollectionWorkflow:
                 paths[target.parent / item[field]] = self.environment.host_path(str(project.parent / item[field]))
         if measurements is not None:
             paths[Path(self.environment.container_path(measurements))] = measurements
+        if run_state is not None:
+            paths[Path(self.environment.container_path(run_state))] = run_state
 
         if prediction_result is not None:
             paths[Path(self.environment.container_path(prediction_result))] = prediction_result
             prediction = read_json(prediction_result)
             for combination in prediction["combinations"]:
                 requirements = combination.get("performance_requirements")
-                if requirements is not None and "cpu_service_catalog" in requirements:
-                    catalog = Path(requirements["cpu_service_catalog"])
-                    paths[catalog] = self.environment.host_path(str(catalog))
+                if requirements is not None and "data_file" in requirements:
+                    path = Path(requirements["data_file"])
+                    paths[path] = self.environment.host_path(str(path))
 
             # Planning reads provenance and native cohorts, never raw timing
             # exports. Missing optional history stays unknown in the C++ plan.
@@ -67,10 +80,11 @@ class CollectionWorkflow:
 
                 paths[manifest_path] = source
                 manifest = read_json(source)
-                if "input" in manifest:
-                    prepared = self.environment.host_path(str(source.parent / manifest["input"]))
-                    if prepared.is_file():
-                        paths[manifest_path.parent / manifest["input"]] = prepared
+                for field in ("input", "environment"):
+                    if field in manifest:
+                        observation = self.environment.host_path(str(source.parent / manifest[field]))
+                        if observation.is_file():
+                            paths[manifest_path.parent / manifest[field]] = observation
 
         if communication:
             for reference in inputs.get("assets", {}).get("performance_manifests", []):
@@ -105,6 +119,7 @@ class CollectionWorkflow:
         purpose: str | None = None,
         representative: bool = False,
         prediction_result: Path | None = None,
+        run_state: Path | None = None,
     ) -> dict[str, Any]:
         command = "prepare" if role == "base" else "prepare-sampling"
         if representative:
@@ -131,6 +146,8 @@ class CollectionWorkflow:
             arguments += ["--measurement-requests", self.environment.container_path(measurement_requests)]
         if prediction_result is not None:
             arguments += ["--prediction-result", self.environment.container_path(prediction_result)]
+        if run_state is not None:
+            arguments += ["--run-state", self.environment.container_path(run_state)]
 
         result = subprocess.run(
             [
@@ -140,7 +157,7 @@ class CollectionWorkflow:
                 "--pull=never",
                 "--network=none",
                 *self._preparation_mounts(
-                    project, measurement_requests, command == "prepare-communication", prediction_result
+                    project, measurement_requests, command == "prepare-communication", prediction_result, run_state
                 ),
                 "--workdir",
                 "/workspace/trace-sim",
@@ -152,7 +169,10 @@ class CollectionWorkflow:
             text=True,
             capture_output=True,
         )
-        return json.loads(result.stdout)
+        prepared = json.loads(result.stdout)
+        if role not in {"prediction", "performance_plan"}:
+            self.environment.snapshot_capture(prepared)
+        return prepared
 
     def profile(
         self,
@@ -214,37 +234,64 @@ class CollectionWorkflow:
         *,
         max_wall_time_sec: int | None = None,
     ) -> None:
-        """Register one capture without changing its parent's prediction phase."""
+        """Register an ordered capture plan without changing its parent's phase."""
         write_json(directory / "work/prepared_input.json", prepared)
         state["capture"] = {
             "role": prepared["role"],
             "attempt_index": len(state["attempts"]),
             "phase": "planned",
             "status": "needs_data",
-            "manifest": None,
+            "manifests": [],
+            "execution_count": len(prepared["capture_executions"]),
             "max_wall_time_sec": max_wall_time_sec,
+            "initial_consumed_wall_time_ns": state["collection"][prepared["role"]]["consumed_wall_time_ns"],
         }
 
-    def collect(self, directory: Path, state: dict[str, Any]) -> None:
+    def collect(self, directory: Path, state: dict[str, Any], *, launch: bool = True) -> None:
         acquisition = state["capture"]
-        if acquisition["manifest"] is None:
+        run = RunDirectory(directory, state["id"])
+        if state["attempts"] and state["attempts"][-1]["manifest"] in acquisition["manifests"]:
+            # Publication preceded a host interruption; releasing this receipt
+            # does not repeat the completed role or re-run its processor.
+            self._consume_processing(directory, state)
+            run.consume_work("processing", len(state["attempts"]))
+
+        while len(acquisition["manifests"]) < acquisition["execution_count"]:
+            completed = len(acquisition["manifests"])
             if len(state["attempts"]) == acquisition["attempt_index"]:
+                if not launch:
+                    return
                 self._collect(read_json(directory / "work/prepared_input.json"), directory, state)
             elif state["attempts"][-1]["status"] == "prepared":
+                if not launch:
+                    return
                 self._launch(directory, state)
             elif state["attempts"][-1]["status"] == "completed":
                 self._finalize(directory, state)
 
-        # The parent ledger now owns the manifest. Completed processor receipts
-        # can disappear; a failed or still active processor keeps its work.
-        write_json(directory / "run.json", state)
-        if acquisition["manifest"] is not None:
-            (directory / "work/prepared_input.json").unlink(missing_ok=True)
-            RunDirectory(directory, state["id"]).consume_work("processing", acquisition["attempt_index"] + 1)
+            # Each successful role is durable before its receipt is consumed or
+            # another Engine can start. Failures leave the same plan selected.
+            write_json(directory / "run.json", state)
+            if len(acquisition["manifests"]) == completed:
+                return
+            self._consume_processing(directory, state)
+            run.consume_work("processing", len(state["attempts"]))
+
+        (directory / "work/prepared_input.json").unlink(missing_ok=True)
 
     def _collect(self, prepared: dict[str, Any], directory: Path, state: dict[str, Any]) -> None:
         acquisition = state["capture"]
         role = acquisition["role"]
+        executions = prepared.pop("capture_executions")
+        execution = executions[len(acquisition["manifests"])]
+        if execution is not None:
+            prepared["shard_execution"] = execution
+            if role == "performance" and prepared["measurement_kind"] == "cpu":
+                # Keep the full task inventory in work/prepared_input.json;
+                # this manifest owns only its native role's requested services.
+                prepared["cpu_services"] = [
+                    service for service in prepared["cpu_services"] if service["rank"] == execution["rank"]
+                ]
         permission = state["collection"][role]
         if not permission["allow_run"]:
             acquisition.update(phase="finished", status="needs_data", reason=f"{role}_collection_disabled")
@@ -261,7 +308,8 @@ class CollectionWorkflow:
         remaining_ns = permission["max_wall_time_sec"] * 1_000_000_000 - permission["consumed_wall_time_ns"]
         limit = acquisition["max_wall_time_sec"]
         if limit is not None:
-            remaining_ns = min(remaining_ns, limit * 1_000_000_000)
+            consumed_ns = permission["consumed_wall_time_ns"] - acquisition["initial_consumed_wall_time_ns"]
+            remaining_ns = min(remaining_ns, limit * 1_000_000_000 - consumed_ns)
             prepared["permission"] = {**prepared["permission"], "max_wall_time_sec": limit}
         if remaining_ns <= 0:
             acquisition.update(phase="finished", status="needs_data", reason=f"{role}_collection_budget_exhausted")
@@ -269,9 +317,11 @@ class CollectionWorkflow:
             return
 
         environment = prepared["environment"]
-        native_entrypoint = self.environment.native_entrypoint(environment["service"])
+        native_entrypoint = self.environment.native_entrypoint(environment["image_id"])
         run = RunDirectory(directory, state["id"])
         ordinal = len(state["attempts"]) + 1
+        if prepared["diagnostics"]:
+            prepared["diagnostics_directory"] = self.environment.container_path(run.diagnostics(role, ordinal))
         attempt_directory = run.capture(role, ordinal)
         # Before the attempt is registered, an interrupted preparation may have
         # left this directory; no native process has been launched for it yet.
@@ -287,27 +337,29 @@ class CollectionWorkflow:
             "created_at_ns": time.time_ns(),
             "status": "prepared",
             "pid": None,
+            "manifest": None,
         }
 
-        # Persist the attempt identity before launch so resume can recover its container.
+        write_json(
+            attempt_directory / "attempt_input.json",
+            {
+                "command": self.runtime.command(
+                    Path(self.environment.container_path(self.root)),
+                    Path(self.environment.container_path(attempt_directory)),
+                    prepared,
+                    native_entrypoint,
+                ),
+                "created_at_ns": attempt["created_at_ns"],
+                "remaining_wall_time_ns": remaining_ns,
+                "log": self.environment.container_path(run.log("native", ordinal)),
+            },
+        )
+
+        # Publish complete launch inputs before the parent can persist this owner.
         state["attempts"].append(attempt)
         acquisition["phase"] = "planned"
         acquisition["status"] = "needs_data"
         acquisition.pop("reason", None)
-        write_json(
-            attempt_directory / "attempt_input.json",
-            {
-                "framework": prepared["framework"],
-                "role": role,
-                "measurement_kind": prepared["measurement_kind"] if role == "performance" else None,
-                "observation_purpose": prepared["observation_purpose"] if role == "validation" else None,
-                "created_at_ns": attempt["created_at_ns"],
-                "remaining_wall_time_ns": remaining_ns,
-                "native_entrypoint": native_entrypoint,
-                "log": self.environment.container_path(run.log(f"native-{ordinal:03d}")),
-            },
-        )
-
         write_json(directory / "run.json", state)
         self._launch(directory, state)
 
@@ -326,12 +378,16 @@ class CollectionWorkflow:
         configuration = read_json(attempt_directory / "attempt_input.json")
         configuration["created_at_ns"] = time.time_ns()
         write_json(attempt_directory / "attempt_input.json", configuration)
+        compose_override = attempt_directory / "container.json"
+        write_json(compose_override, {"services": {environment["service"]: {"image": environment["image_id"]}}})
         remaining_ns = configuration["remaining_wall_time_ns"]
         attempt.update(status="collecting", created_at_ns=configuration["created_at_ns"], pid=None)
         acquisition.update(phase="collecting", status="needs_data")
         write_json(directory / "run.json", state)
 
         command = self.environment.compose + [
+            "-f",
+            str(compose_override),
             "run",
             "-d",
             "-T",
@@ -340,8 +396,10 @@ class CollectionWorkflow:
             container,
             "--entrypoint",
             "python3",
-            "-e",
-            "ASCEND_VISIBLE_DEVICES=" + ",".join(str(device) for device in environment["devices"]),
+        ]
+        for name, value in self.runtime.device_environment(environment["devices"]).items():
+            command += ["-e", f"{name}={value}"]
+        command += [
             "-e",
             "PYTHONPATH=/workspace/trace-sim/src/collection",
             environment["service"],
@@ -357,10 +415,10 @@ class CollectionWorkflow:
             command = ["docker", "start", container]
 
         started_ns = time.perf_counter_ns()
-        launch_log = run.log(f"launch-{ordinal:03d}")
+        launch_log = run.log("launch", ordinal)
         launch_log.parent.mkdir(parents=True, exist_ok=True)
         print(
-            f"Capturing {acquisition['role']}, attempt {ordinal}; log: {run.log(f'native-{ordinal:03d}')}",
+            f"Capturing {acquisition['role']}, attempt {ordinal}; log: {run.log('native', ordinal)}",
             file=sys.stderr,
             flush=True,
         )
@@ -405,34 +463,31 @@ class CollectionWorkflow:
             finally:
                 write_json(directory / "run.json", state)
 
-        if acquisition["status"] == "captured":
+        if attempt["status"] == "completed":
             self._finalize(directory, state)
 
     def _finalize(self, directory: Path, state: dict[str, Any]) -> None:
         acquisition = state["capture"]
-        failure = self._reconcile_processing(state)
+        failure = self.reconcile_processing(directory, state)
         write_json(directory / "run.json", state)
         if failure is not None:
             raise CaptureProcessingFailed(failure["message"])
-        if acquisition["manifest"] is not None:
+        attempt = state["attempts"][-1]
+        if attempt["manifest"] is not None:
             return
 
-        if acquisition["role"] == "performance":
-            prepared = read_json(Path(state["attempts"][-1]["directory"]) / "prepared_input.json")
-            if prepared["measurement_kind"] in {"transfer", "cpu"}:
-                raise RuntimeError("native host sampler exited without publishing its performance manifest")
+        if acquisition["role"] == "performance" and attempt["measurement_kind"] in {"transfer", "cpu"}:
+            raise RuntimeError("native host sampler exited without publishing its performance manifest")
 
         acquisition["phase"] = "processing"
 
         write_json(directory / "run.json", state)
-        attempt = state["attempts"][-1]
         capture = Path(attempt["directory"]) / "native_capture.json"
         run = RunDirectory(directory, state["id"])
         ordinal = len(state["attempts"])
-        task = f"processing-{ordinal:03d}"
-        print(f"Processing {acquisition['role']}; log: {run.log(task)}", file=sys.stderr, flush=True)
+        print(f"Processing {acquisition['role']}; log: {run.log('processing', ordinal)}", file=sys.stderr, flush=True)
         work = Path(attempt["processing_directory"])
-        job = ModelingJob(self.environment, run.container(task), work, run.log(task))
+        job = self._processing_job(directory, state)
         arguments = [
             "python3",
             "-m",
@@ -445,8 +500,12 @@ class CollectionWorkflow:
             self.environment.container_path(work),
         ]
         outputs = {capture.parent}
+        prepared = read_json(capture.parent / "prepared_input.json")
+        if prepared["diagnostics"]:
+            diagnostics = run.diagnostics(acquisition["role"], ordinal)
+            outputs.add(diagnostics)
+            arguments += ["--diagnostics-directory", self.environment.container_path(diagnostics)]
         if acquisition["role"] == "base":
-            prepared = read_json(capture.parent / "prepared_input.json")
             templates = run.asset("templates", ordinal)
             intermediates = run.diagnostics("base", ordinal) if prepared["diagnostics"] else work / "source"
             outputs.update({templates, intermediates})
@@ -459,11 +518,11 @@ class CollectionWorkflow:
 
         try:
             job.run(arguments, {self.root / "build/markov/markov", self.root / "src/collection"}, outputs)
-            self._reconcile_processing(state)
-            if acquisition["manifest"] is None:
+            self.reconcile_processing(directory, state)
+            if attempt["manifest"] is None:
                 raise RuntimeError("capture processor exited without publishing its result")
         except (subprocess.CalledProcessError, ModelingJobFailed):
-            failure = self._reconcile_processing(state)
+            failure = self.reconcile_processing(directory, state)
             if failure is not None:
                 write_json(directory / "run.json", state)
                 raise CaptureProcessingFailed(failure["message"]) from None
@@ -477,18 +536,44 @@ class CollectionWorkflow:
 
         write_json(directory / "run.json", state)
 
-    def _reconcile_processing(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    def _processing_job(self, directory: Path, state: dict[str, Any]) -> ModelingJob:
+        run = RunDirectory(directory, state["id"])
+        ordinal = len(state["attempts"])
+        return ModelingJob(
+            self.environment,
+            run.container(f"processing-{ordinal:03d}"),
+            Path(state["attempts"][-1]["processing_directory"]),
+            run.log("processing", ordinal),
+        )
+
+    def _consume_processing(self, directory: Path, state: dict[str, Any]) -> None:
+        attempt = state["attempts"][-1]
+        # Host samplers publish their own manifest and never start a processor.
+        if attempt["role"] != "performance" or attempt["measurement_kind"] not in {"transfer", "cpu"}:
+            self._processing_job(directory, state).consume()
+        self.environment.consume_container(attempt["container"])
+
+    def reconcile_processing(self, directory: Path, state: dict[str, Any]) -> dict[str, Any] | None:
         acquisition = state["capture"]
         role = acquisition["role"]
         if (
             len(state["attempts"]) <= acquisition["attempt_index"]
             or state["attempts"][-1]["status"] != "completed"
-            or acquisition["manifest"] is not None
+            or state["attempts"][-1]["manifest"] is not None
         ):
             return None
 
         attempt = state["attempts"][-1]
-        directory = Path(attempt["directory"])
+        capture_directory = Path(attempt["directory"])
+        # Receipts can appear before the producer exits. Keep its owner until
+        # both success and failure have terminal process evidence.
+        native_host = role == "performance" and attempt["measurement_kind"] in {"transfer", "cpu"}
+        if not native_host:
+            job = self._processing_job(directory, state)
+            container = self.environment.container_state(job.name)
+            if container is not None and (container["Running"] or container["Status"] == "created"):
+                return None
+
         try:
             failure = read_json(Path(attempt["processing_directory"]) / "processing_failure.json")
         except FileNotFoundError:
@@ -500,9 +585,8 @@ class CollectionWorkflow:
 
         # Native completion and processing outcome are separate facts. Status and
         # resume consume the same terminal records without launching another job.
-        native_host = role == "performance" and attempt["measurement_kind"] in {"transfer", "cpu"}
         result_path = (
-            directory / "performance_manifest.json"
+            capture_directory / "performance_manifest.json"
             if native_host
             else Path(attempt["processing_directory"]) / "processing_result.json"
         )
@@ -512,13 +596,16 @@ class CollectionWorkflow:
             return None
 
         manifest = (
-            directory / "performance_manifest.json"
+            capture_directory / "performance_manifest.json"
             if native_host
             else self.environment.host_path(result[f"{role}_manifest"])
         )
-        acquisition.update(manifest=str(manifest), readiness=result["readiness"])
+        attempt.update(manifest=str(manifest), readiness=result["readiness"])
         attempt.pop("processing_failure", None)
-        acquisition.update(phase="finished", status="captured")
+        acquisition["manifests"].append(str(manifest))
+        acquisition["attempt_index"] = len(state["attempts"])
+        complete = len(acquisition["manifests"]) == acquisition["execution_count"]
+        acquisition.update(phase="finished" if complete else "planned", status="captured" if complete else "needs_data")
         acquisition.pop("reason", None)
 
         return None
@@ -554,8 +641,8 @@ class CollectionWorkflow:
         return self._result(directory, state)
 
     def retry_native(self, directory: Path, state: dict[str, Any]) -> None:
-        # Only an explicit resume retries a terminated native acquisition.
-        # Selection preserves the failed attempt and its consumed budget.
+        # Explicit resume retries only the unfinished role. Keep the full
+        # capture plan, prior manifests and all consumed time across attempts.
         acquisition = state["capture"]
         permission = state["collection"][acquisition["role"]]
         if (
@@ -569,12 +656,9 @@ class CollectionWorkflow:
             and state["attempts"][-1]["status"] in {"failed", "interrupted", "budget_exhausted"}
             and len(state["attempts"]) > acquisition["attempt_index"]
         ):
-            self.select(
-                read_json(Path(state["attempts"][-1]["directory"]) / "prepared_input.json"),
-                directory,
-                state,
-                max_wall_time_sec=acquisition["max_wall_time_sec"],
-            )
+            acquisition.update(attempt_index=len(state["attempts"]), phase="planned", status="needs_data")
+            acquisition.pop("reason", None)
+            write_json(directory / "run.json", state)
 
     def _revise_budget(self, directory: Path, state: dict[str, Any], budgets: dict[str, int]) -> None:
         role = state["capture"]["role"]
@@ -584,10 +668,6 @@ class CollectionWorkflow:
         seconds = budgets[role]
         if seconds <= 0 or seconds * 1_000_000_000 < state["collection"][role]["consumed_wall_time_ns"]:
             raise ValueError(f"{role} total budget must be positive and cover its consumed time")
-        prepared = read_json(directory / "inputs/prepared_input.json")
-        if prepared["environment"] is None:
-            raise ValueError("enabled collection requires the task's declared environment")
-
         permission = {"allow_run": True, "max_wall_time_sec": seconds}
         state["collection"][role].update(permission)
 
@@ -615,7 +695,7 @@ class CollectionWorkflow:
 
         acquisition.update(phase="finished", status="needs_data")
         if status == "completed":
-            acquisition.update(phase="processing", status="captured")
+            acquisition["phase"] = "processing"
         elif status == "failed":
             acquisition.update(status="failed", reason=f"{role}_collection_failed")
         elif status == "interrupted":
@@ -705,7 +785,7 @@ class CollectionWorkflow:
 
     def _result(self, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
         live, active_ns = self.reconcile(state)
-        self._reconcile_processing(state)
+        self.reconcile_processing(directory, state)
         acquisition = state["capture"]
         return {
             **state,

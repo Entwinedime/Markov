@@ -1,9 +1,12 @@
 #include "markov/templates/templates.hpp"
 
 #include <algorithm>
+#include <compare>
+#include <cstddef>
 #include <map>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -11,6 +14,13 @@
 namespace markov {
 
 namespace {
+
+template <class Rule> std::strong_ordering compare_rules(const std::map<std::size_t, const Rule *> & left, const std::map<std::size_t, const Rule *> & right) {
+    return std::lexicographical_compare_three_way(left.begin(), left.end(), right.begin(), right.end(), [](const auto & a, const auto & b) {
+        if (const auto order = a.first <=> b.first; order != 0) return order;
+        return *a.second <=> *b.second;
+    });
+}
 
 // Hierarchy and physical ownership are resolved before graph canonicalization.
 // Only these value arrays survive the source-call traversal.
@@ -57,15 +67,42 @@ public:
             if (region == root) continue;
             for (const auto index : source.regions[regions[region]].nodes) node_owners[index] = region + 1;
         }
-        members.resize(region_count);
+        for (const auto region : regions) semantics.push_back(source.regions[region].semantic);
+        semantics.push_back("serving." + std::string(ServingContract{}.block(source.step).name));
+        for (const auto & sequence : source.sequences) {
+            if (sequence.gap) continue;
+            const auto parent = source.regions[sequence.source_members.front()].parent_call;
+            const auto enclosing = std::ranges::find(source.regions, parent, &TemplateRegion::source_call);
+            const auto semantic = enclosing == source.regions.end() ? semantics[root] : enclosing->semantic;
+            for (const auto & seam : sequence.separators) {
+                if (seam.nodes.empty()) continue;
+                const auto owner = semantics.size();
+                semantics.push_back(semantic + "/between");
+                order.push_back(owner);
+                // A repeated seam is part of the parent's composition. Its
+                // physical work leaves the fixed parent body exactly once.
+                for (const auto node : seam.nodes) node_owners[node] = owner + 1;
+            }
+        }
+        members.resize(semantics.size());
         for (std::size_t index = 0; index < node_count; ++index) members[node_owners[index] - 1].push_back(index);
     }
 
     std::vector<std::vector<std::size_t>> members;
     std::vector<std::size_t> order;
+    std::vector<std::string> semantics;
 };
 
 } // namespace
+
+std::strong_ordering TemplateRegionStructure::operator<=>(const TemplateRegionStructure & other) const {
+    const auto fields = std::tie(resources, boundaries, nodes, dependencies, semantic);
+    const auto peer_fields = std::tie(other.resources, other.boundaries, other.nodes, other.dependencies, other.semantic);
+    if (const auto order = fields <=> peer_fields; order != 0) return order;
+
+    // Borrowed rule addresses establish ownership, never reusable structure identity.
+    return compare_rules(model_rules, other.model_rules);
+}
 
 TemplateNode TemplateGraph::resolve(std::size_t index, const Location & location) const {
     if (location.region == 0) return local_[location.member];
@@ -86,18 +123,10 @@ TemplateDependency TemplateGraph::resolve_dependency(const Location & location) 
     if (location.region == 0) return local_dependencies_[location.member];
 
     const auto & binding = bindings_[location.region - 1];
-    if (location.member < binding.structure->dependencies.size()) {
-        auto edge = binding.structure->dependencies[location.member];
-        edge.source = binding.boundaries[edge.source];
-        edge.target = binding.boundaries[edge.target];
-        return edge;
-    }
-
-    const auto & port = binding.structure->dependency_ports[location.member - binding.structure->dependencies.size()];
-    const auto local = binding.boundaries[port.connection.local_boundary];
-    const auto remote = *binding.remote_boundaries[port.remote_boundary].local_boundary;
-    const bool incoming = port.connection.direction == TemplateConnectionDirection::Incoming;
-    return { port.connection.relation, incoming ? remote : local, incoming ? local : remote };
+    auto edge = binding.structure->dependencies[location.member];
+    edge.source = binding.boundaries[edge.source];
+    edge.target = binding.boundaries[edge.target];
+    return edge;
 }
 
 TemplateDependency TemplateGraph::dependency(std::size_t index) const {
@@ -116,41 +145,35 @@ TemplateBoundary TemplateGraph::boundary(std::size_t index) const {
 
     const auto & binding = bindings_[location.region - 1];
     const auto point = binding.structure->boundaries[location.member];
-    return { *binding.lanes[point.lane] };
+    return { binding.lanes[point.lane] };
 }
 
-TemplateConnectionEndpoint TemplateGraph::connection(std::size_t index) const {
-    if (connection_locations_.empty() || connection_locations_[index].region == 0) {
-        const auto & observed = local_connections_[connection_locations_.empty() ? index : connection_locations_[index].member];
-        return { observed.contract, observed.remote_source_boundary };
-    }
+TemplateConnectionEndpoint TemplateGraph::connection(std::size_t index) const { return connections_[index]; }
 
-    const auto & location = connection_locations_[index];
-    const auto & binding = bindings_[location.region - 1];
-    const auto & port = binding.structure->connections[location.member];
-    auto contract = port.connection;
-    contract.local_boundary = binding.boundaries[contract.local_boundary];
-    return { contract, binding.remote_boundaries[port.remote_boundary].source_boundary };
+const ModelParameterRule * TemplateGraph::model_rule(std::size_t node) const {
+    const bool shared = !locations_.empty() && locations_[node].region != 0;
+    const auto & rules = shared ? bindings_[locations_[node].region - 1].structure->model_rules : model_rules_;
+    const auto found = rules.find(shared ? locations_[node].member : node);
+    return found == rules.end() ? nullptr : found->second;
 }
 
-const ModelParameterRule & TemplateGraph::model_rule(std::size_t node) const {
-    if (locations_.empty() || locations_[node].region == 0) return *model_rules_.at(node);
-
+const TemplateRegionStructure * TemplateGraph::structure(std::size_t node) const {
     const auto & location = locations_[node];
-    return *bindings_[location.region - 1].structure->model_rules.at(location.member);
+    return location.region == 0 ? nullptr : bindings_[location.region - 1].structure;
 }
 
-const CollectiveParameterRule & TemplateGraph::collective_rule(std::size_t node) const {
-    if (locations_.empty() || locations_[node].region == 0) return *collective_rules_.at(node);
-
+std::optional<std::size_t> TemplateGraph::local_boundary(std::size_t node, std::size_t boundary) const {
     const auto & location = locations_[node];
-    return *bindings_[location.region - 1].structure->collective_rules.at(location.member);
+    if (location.region == 0) return std::nullopt;
+    const auto & points = bindings_[location.region - 1].boundaries;
+    const auto found = std::ranges::find(points, boundary);
+    if (found == points.end()) return std::nullopt;
+    return static_cast<std::size_t>(found - points.begin());
 }
 
 void TemplateGraph::share(const TemplateDefinition & source, std::span<const std::size_t> regions, TemplateRegionStructures & pool) {
     RegionPartition partition(source, regions, local_.size());
-    const auto root = regions.size();
-    const auto region_count = root + 1;
+    const auto region_count = partition.members.size();
     auto & region_members = partition.members;
     const auto & order = partition.order;
 
@@ -177,7 +200,7 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         const auto [position, inserted] = joins.try_emplace(edge.target, owner);
         if (!inserted && position->second != owner) position->second.reset();
     }
-    for (const auto & observed : local_connections_) {
+    for (const auto & observed : connections_) {
         const auto & connection = observed.contract;
         if (connection.direction != TemplateConnectionDirection::Incoming) continue;
         const auto found = joins.find(connection.local_boundary);
@@ -190,40 +213,19 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
     }
 
     std::vector<std::vector<std::size_t>> region_edges(region_count);
-    for (std::size_t index = 0; index < local_dependencies_.size(); ++index) {
-        const auto & edge = local_dependencies_[index];
-        const auto from = boundary_owners.find(edge.source);
-        const auto to = boundary_owners.find(edge.target);
-        if (from == boundary_owners.end() || to == boundary_owners.end() || !from->second || from->second != to->second) continue;
-        region_edges[*from->second - 1].push_back(index);
-    }
-
-    std::vector<std::vector<std::pair<std::size_t, TemplateConnectionDirection>>> region_ports(region_count);
+    // Share only same-owner internal edges. Cross-region edges keep their two
+    // original endpoints once in this invocation, independent of peer count.
     for (std::size_t index = 0; index < local_dependencies_.size(); ++index) {
         const auto & edge = local_dependencies_[index];
         const auto from = boundary_owners.find(edge.source);
         const auto to = boundary_owners.find(edge.target);
         const auto source_owner = from == boundary_owners.end() ? std::nullopt : from->second;
         const auto target_owner = to == boundary_owners.end() ? std::nullopt : to->second;
-        if (source_owner == target_owner) continue;
-        if (source_owner) region_ports[*source_owner - 1].emplace_back(index, TemplateConnectionDirection::Outgoing);
-        if (target_owner) region_ports[*target_owner - 1].emplace_back(index, TemplateConnectionDirection::Incoming);
+        if (source_owner && source_owner == target_owner) region_edges[*source_owner - 1].push_back(index);
     }
-
-    std::vector<std::vector<std::size_t>> region_connections(region_count);
-    for (std::size_t index = 0; index < local_connections_.size(); ++index) {
-        const auto owner = boundary_owners.find(local_connections_[index].contract.local_boundary);
-        if (owner != boundary_owners.end() && owner->second) region_connections[*owner->second - 1].push_back(index);
-    }
-    connection_locations_.resize(local_connections_.size());
-
-    std::map<BoundaryId, std::size_t> source_points;
-    for (std::size_t index = 0; index < source.boundary_observations.size(); ++index)
-        source_points.emplace(source.boundary_observations[index].source_boundary, index);
 
     locations_.resize(local_.size());
     dependency_locations_.resize(local_dependencies_.size());
-    std::vector<std::size_t> binding_regions;
     // Child invocation count and selection belong to the existing region tree,
     // not the identity of the parent's own reusable work.
     for (const auto region : order) {
@@ -246,10 +248,9 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         });
 
         Binding binding;
-        binding.source_region = region == root ? std::nullopt : std::optional(regions[region]);
         std::map<std::size_t, std::size_t> points;
         TemplateRegionStructure structure;
-        structure.semantic = region == root ? "serving." + std::string(ServingContract{}.block(source.step).name) : source.regions[regions[region]].semantic;
+        structure.semantic = partition.semantics[region];
         structure.nodes.reserve(members.size());
         for (const auto index : members) {
             auto node = local_[index];
@@ -264,11 +265,6 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
             if (rule != model_rules_.end()) {
                 structure.model_rules.emplace(node.observation_slot, rule->second);
                 model_rules_.erase(rule);
-            }
-            const auto collective = collective_rules_.find(index);
-            if (collective != collective_rules_.end()) {
-                structure.collective_rules.emplace(node.observation_slot, collective->second);
-                collective_rules_.erase(collective);
             }
             locations_[index] = { bindings_.size() + 1, structure.nodes.size() };
             structure.nodes.push_back(node);
@@ -291,55 +287,6 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
             structure.dependencies.push_back(edge);
         }
 
-        // Both forms use one remote endpoint table, so aliases across a local
-        // dependency and a cross-definition connection are preserved as well.
-        std::vector<std::tuple<TemplateConnectionContract, bool, std::size_t>> ports;
-        for (const auto index : region_connections[region]) {
-            auto contract = local_connections_[index].contract;
-            contract.local_boundary = points.at(contract.local_boundary);
-            ports.emplace_back(contract, true, index);
-        }
-        for (const auto & [index, direction] : region_ports[region]) {
-            const auto & edge = local_dependencies_[index];
-            const auto local = direction == TemplateConnectionDirection::Incoming ? edge.target : edge.source;
-            ports.emplace_back(TemplateConnectionContract{ edge.relation, direction, points.at(local) }, false, index);
-        }
-        std::ranges::sort(ports);
-
-        std::map<BoundaryId, std::size_t> remote_points;
-        std::vector<SourceLane> remote_lanes;
-        for (const auto & [contract, external, index] : ports) {
-            BoundaryId remote;
-            SourceLane lane;
-            if (external) {
-                remote = local_connections_[index].remote_source_boundary;
-                lane = local_connections_[index].remote_lane;
-            }
-            else {
-                const auto & edge = local_dependencies_[index];
-                const auto point = contract.direction == TemplateConnectionDirection::Incoming ? edge.source : edge.target;
-                remote = source.boundary_observations[point].source_boundary;
-                lane = source.lanes[local_boundaries_[point].lane].source;
-            }
-            const auto [point, inserted] = remote_points.try_emplace(remote, binding.remote_boundaries.size());
-            if (inserted) {
-                const auto local = source_points.find(remote);
-                binding.remote_boundaries.push_back({ remote, local == source_points.end() ? std::nullopt : std::optional(local->second) });
-                remote_lanes.push_back(lane);
-            }
-
-            if (external) {
-                connection_locations_[index] = { bindings_.size() + 1, structure.connections.size() };
-                structure.connections.push_back({ contract, point->second });
-            }
-            else {
-                // The two cuts reference one source edge slot, never two edges.
-                if (dependency_locations_[index].region == 0)
-                    dependency_locations_[index] = { bindings_.size() + 1, structure.dependencies.size() + structure.dependency_ports.size() };
-                structure.dependency_ports.push_back({ contract, point->second });
-            }
-        }
-
         // Native resources establish aliasing. Shared slots retain domain and
         // relative rank only; zero always denotes this serving definition's rank.
         std::map<TemplateResource, std::size_t> resources;
@@ -358,37 +305,18 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
             structure.boundaries.push_back({ resource->second });
         }
 
-        for (std::size_t index = 0; index < binding.remote_boundaries.size(); ++index) {
-            const auto & remote = binding.remote_boundaries[index];
-            const auto & lane = remote_lanes[index];
-            const auto [resource, inserted] = resources.try_emplace(TemplateResource{ lane.domain, lane.rank, lane.native_id }, structure.resources.size());
-            if (inserted) {
-                binding.lanes.push_back(remote.local_boundary ? std::optional(local_boundaries_[*remote.local_boundary].lane) : std::nullopt);
-                const auto [rank, added] = ranks.try_emplace(lane.rank, ranks.size());
-                const auto role = remote.local_boundary ? source.lanes[local_boundaries_[*remote.local_boundary].lane].role : std::nullopt;
-                structure.resources.push_back({ lane.domain, rank->second, role });
-            }
-            std::optional<std::size_t> local_alias;
-            if (remote.local_boundary) {
-                const auto local = points.find(*remote.local_boundary);
-                if (local != points.end()) local_alias = local->second;
-            }
-            structure.remote_boundaries.push_back({ resource->second, local_alias });
-        }
-
         const auto [position, inserted] = pool.insert(std::move(structure));
         binding.structure = &*position;
-        binding_regions.push_back(region);
         bindings_.push_back(std::move(binding));
     }
 
     boundary_locations_.resize(local_boundaries_.size());
-    for (std::size_t region = 0; region < bindings_.size(); ++region) {
-        const auto & binding = bindings_[region];
+    for (std::size_t slot = 0; slot < bindings_.size(); ++slot) {
+        const auto & binding = bindings_[slot];
         for (std::size_t member = 0; member < binding.boundaries.size(); ++member) {
             const auto point = binding.boundaries[member];
             // Ambiguous endpoints stay source-local; no region acquires ownership.
-            if (boundary_owners.at(point) == binding_regions[region] + 1) boundary_locations_[point] = { region + 1, member };
+            if (boundary_owners.at(point) == order[slot] + 1) boundary_locations_[point] = { slot + 1, member };
         }
     }
     std::vector<TemplateBoundary> remaining_boundaries;
@@ -399,16 +327,12 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
     }
     local_boundaries_ = std::move(remaining_boundaries);
 
-    // Only unshared records remain local. Original indices and all external
-    // relations still resolve to their original source-local endpoints.
-    std::vector<TemplateNode> remaining_nodes;
-    for (std::size_t index = 0; index < local_.size(); ++index) {
-        if (locations_[index].region != 0) continue;
-        locations_[index].member = remaining_nodes.size();
-        remaining_nodes.push_back(local_[index]);
-    }
-    local_ = std::move(remaining_nodes);
+    // Every node has one region owner, including the serving root. Release the
+    // producer storage; all original node indices now resolve through bindings.
+    local_ = std::vector<TemplateNode>{};
 
+    // Every remaining edge retains its original source-local endpoints, so
+    // aliases between local dependencies and external connections stay intact.
     std::vector<TemplateDependency> remaining_edges;
     for (std::size_t index = 0; index < local_dependencies_.size(); ++index) {
         if (dependency_locations_[index].region != 0) continue;
@@ -416,14 +340,6 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         remaining_edges.push_back(local_dependencies_[index]);
     }
     local_dependencies_ = std::move(remaining_edges);
-
-    std::vector<ObservedConnection> remaining_connections;
-    for (std::size_t index = 0; index < local_connections_.size(); ++index) {
-        if (connection_locations_[index].region != 0) continue;
-        connection_locations_[index].member = remaining_connections.size();
-        remaining_connections.push_back(local_connections_[index]);
-    }
-    local_connections_ = std::move(remaining_connections);
 }
 
 } // namespace markov

@@ -8,6 +8,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,11 @@ from markov_collection.workflow.validation import ValidationWorkflow
 
 
 class PredictionProcessing:
-    def __init__(self, project: Path, directory: Path, catalogs: Path) -> None:
+    def __init__(self, project: Path, directory: Path, requirements: Path, requests: Path) -> None:
         self.project = project
         self.directory = directory
-        self.catalogs = catalogs
+        self.requirements = requirements
+        self.requests = requests
 
     def run(self) -> dict[str, Any]:
         # This lock belongs to the container, so a stopped host cannot start a
@@ -45,8 +47,10 @@ class PredictionProcessing:
                     "predict",
                     "--project",
                     str(self.project),
-                    "--catalog-directory",
-                    str(self.catalogs),
+                    "--requirements-directory",
+                    str(self.requirements),
+                    "--request-results",
+                    str(self.requests),
                 ],
                 check=True,
                 stdout=subprocess.PIPE,
@@ -76,12 +80,12 @@ class PredictionWorkflow:
         # Overrides become part of the one normalized input snapshot. All
         # actual planning and execution still pass through the C++ reader.
         if model_path is not None:
-            inputs["model"] = {"path": str(model_path), "tokenizer_path": str(model_path)}
+            location = self.environment.container_path(model_path)
+            inputs["model"] = {"path": location, "tokenizer_path": location, "configuration": None}
         if devices is not None:
             for item in inputs["configurations"]:
-                if item["environment"] is None:
-                    raise ValueError("device overrides require a declared deployment environment")
                 item["environment"]["devices"] = devices
+        self.environment.snapshot_project(inputs)
         run = RunDirectory.create(
             self.environment.host_path(inputs["output"]["directory"]),
             inputs["configurations"][0]["framework"],
@@ -108,6 +112,7 @@ class PredictionWorkflow:
             "attempts": [],
             "capture": None,
             "comparison": None,
+            "comparison_task": {"ordinal": 0},
             "summary": None,
             "validation": None,
             "prediction": {"round": 0, "result": None},
@@ -138,6 +143,8 @@ class PredictionWorkflow:
             result = read_json(directory / state["prediction"]["result"])
 
         live, active_ns = self.collection.reconcile(state)
+        if state["capture"] is not None:
+            self.collection.reconcile_processing(directory, state)
         if result:
             result["collection_performed"] = bool(state["attempts"])
             result["collection_usage"] = {
@@ -147,6 +154,7 @@ class PredictionWorkflow:
 
         prediction_job = self._prediction_job(directory, state)
         prediction_live = prediction_job is not None and prediction_job.running()
+        comparison_job = self._comparison_job(directory, state)
 
         return {
             **result,
@@ -155,6 +163,7 @@ class PredictionWorkflow:
             "live_attempt": live,
             "active_wall_time_ns": active_ns,
             "prediction_live": prediction_live,
+            "comparison_live": comparison_job is not None and comparison_job.running(),
             "performance_live": self._performance_live(directory, state),
         }
 
@@ -165,38 +174,82 @@ class PredictionWorkflow:
 
         run = RunDirectory(directory, state["id"])
         task = f"prediction-{ordinal:03d}"
-        return ModelingJob(self.environment, run.container(task), run.work("prediction", ordinal), run.log(task))
+        return ModelingJob(
+            self.environment, run.container(task), run.work("prediction", ordinal), run.log("prediction", ordinal)
+        )
 
     def status(self, directory: Path) -> dict[str, Any]:
         state = read_json(directory / "run.json")
         return self._result(directory, state)
 
-    def compare(self, directory: Path, manifests: list[Path]) -> dict[str, Any]:
-        with (directory / "run.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            state = read_json(directory / "run.json")
-            if state["task_status"] != "finished":
-                raise ValueError("comparison requires a finished prediction task")
-            comparison = ServingComparison(
-                self.environment, directory / "inputs/project.json", directory / state["prediction"]["result"]
-            ).run(manifests)
+    def _comparison_job(self, directory: Path, state: dict[str, Any]) -> ModelingJob | None:
+        task = state["comparison_task"]
+        if "manifests" not in task:
+            return None
+        ordinal = task["ordinal"]
+        run = RunDirectory(directory, state["id"])
+        return ModelingJob(
+            self.environment,
+            run.container(f"comparison-{ordinal:03d}"),
+            run.work("comparison", ordinal),
+            run.log("comparison", ordinal),
+        )
+
+    def _consume_comparison(self, directory: Path, state: dict[str, Any]) -> None:
+        task = state["comparison_task"]
+        if task["phase"] not in {"published", "failed"}:
+            raise ValueError("comparison work has not been acknowledged")
+        # Keep the owner until both cleanup steps finish. Missing resources are
+        # safe on resume because the published outcome already owns the result.
+        self._comparison_job(directory, state).consume()
+        RunDirectory(directory, state["id"]).consume_work("comparison", task["ordinal"])
+        state["comparison_task"] = {"ordinal": task["ordinal"]}
+        if task["phase"] == "failed":
+            state["comparison_task"]["failure"] = task["failure"]
+        write_json(directory / "run.json", state)
+
+    def _compare(self, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
+        task = state["comparison_task"]
+        if task["phase"] == "failed":
+            failure = task["failure"]
+            self._consume_comparison(directory, state)
+            raise ModelingJobFailed(failure)
+        if task["phase"] == "processing":
+            if task["prediction"] != state["prediction"]:
+                raise ValueError("the active comparison requires its fixed prediction")
+            consumer = ServingComparison(
+                self.environment, directory / "inputs/project.json", directory / task["prediction"]["result"]
+            )
+            try:
+                comparison = consumer.run(
+                    [Path(path) for path in task["manifests"]], self._comparison_job(directory, state)
+                )
+            except ModelingJobFailed as error:
+                # Only a proven terminal exit ends this owner. Host interruptions
+                # and infrastructure errors preserve the same named job.
+                task.update(phase="failed", failure=str(error))
+                write_json(directory / "run.json", state)
+                self._consume_comparison(directory, state)
+                raise
             relative = Path("results/comparison.json")
             write_json(directory / relative, comparison)
             state["comparison"] = str(relative)
-            if state["validation"] is not None:
-                # Exploration includes independent comparison in its outcome.
-                # Imported ports do not rewrite native attempts or their budget.
-                state["status"] = "complete" if comparison["status"] == "complete" else "needs_data"
+            if state["validation"] is not None and "ports" in consumer.purposes:
+                state["status"] = "complete" if comparison["ports_complete"] else "needs_data"
                 if state["status"] == "complete":
                     state.pop("reason", None)
                 else:
                     state["reason"] = "independent_validation_incomplete"
+            task["phase"] = "published"
             write_json(directory / "run.json", state)
-            self._summarize(directory, state)
+        else:
+            comparison = read_json(directory / state["comparison"])
 
+        self._consume_comparison(directory, state)
+        self._summarize(directory, state)
         return {
             "run": str(directory),
-            "comparison": str(directory / relative),
+            "comparison": str(directory / state["comparison"]),
             "status": comparison["status"],
             "combinations": [
                 {key: value for key, value in row.items() if key not in {"requests", "gaps"}}
@@ -204,8 +257,39 @@ class PredictionWorkflow:
             ],
         }
 
+    def compare(self, directory: Path, manifests: list[Path]) -> dict[str, Any]:
+        references = sorted(str(path.resolve()) for path in manifests)
+        if not references or len(references) != len(set(references)):
+            raise ValueError("comparison requires distinct validation manifests")
+        with (directory / "run.lock").open("a", encoding="utf-8") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {**self.status(directory), "workflow_busy": True, "requested_comparison_applied": False}
+            state = read_json(directory / "run.json")
+            if state["task_status"] != "finished":
+                raise ValueError("comparison requires a finished prediction task")
+            task = state["comparison_task"]
+            if "manifests" in task:
+                if task["manifests"] != references:
+                    raise ValueError("resume the active comparison before requesting different validation manifests")
+                return self._compare(directory, state)
+            # Reject invalid observation identities before creating a durable owner.
+            ServingComparison(
+                self.environment, directory / "inputs/project.json", directory / state["prediction"]["result"]
+            ).observations([Path(path) for path in references])
+            state["comparison_task"] = {
+                "ordinal": task["ordinal"] + 1,
+                "manifests": references,
+                "prediction": dict(state["prediction"]),
+                "phase": "processing",
+            }
+            # Persist the sole owner before Docker can create its container.
+            write_json(directory / "run.json", state)
+            return self._compare(directory, state)
+
     def _performance_live(self, directory: Path, state: dict[str, Any]) -> bool:
-        for manifest, imported in state.get("performance_imports", {}).items():
+        for manifest, imported in state["performance_imports"].items():
             if imported["cost_models"] is None:
                 fitting = PerformanceImport(
                     self.environment,
@@ -239,6 +323,16 @@ class PredictionWorkflow:
                 return result
 
             state = read_json(directory / "run.json")
+            comparison_job = self._comparison_job(directory, state)
+            if comparison_job is not None:
+                # The comparison owns fixed inputs until publication and cleanup.
+                # Revisions requested during that handoff never alter its inputs.
+                if not comparison_job.running():
+                    self._compare(directory, state)
+                result = self._result(directory, state)
+                if revisions:
+                    result["requested_changes_applied"] = False
+                return result
             self._apply_input_revision(directory, state)
             live, _ = self.collection.reconcile(state)
             write_json(directory / "run.json", state)
@@ -260,11 +354,10 @@ class PredictionWorkflow:
                 and active is not None
                 and len(state["attempts"]) > state["capture"]["attempt_index"]
             ):
-                self._collect_representative(directory, state)
+                self._collect_representative(directory, state, launch=False)
             active_performance = state["active_performance"]
-            if revisions and completed and active_performance is not None:
-                if len(state["attempts"]) > state["capture"]["attempt_index"]:
-                    self._collect_performance(directory, state)
+            if revisions and active_performance is not None:
+                self._collect_performance(directory, state, launch=False)
 
             if revisions:
                 self._revise_assets(
@@ -356,6 +449,26 @@ class PredictionWorkflow:
             if read_json(path)["role"] != role:
                 raise ValueError(f"resume import requires role={role}: {path}")
 
+        # Retire the fixed round before its identity can be replaced by a revision.
+        if state["task_status"] == "predicting":
+            try:
+                result = self._simulate(directory, state)
+            except ModelingJobFailed:
+                pass  # The terminal failure is recorded and its owner retired.
+            else:
+                state["task_status"] = "selecting"
+                self._publish(directory, state, result)
+        self._consume_prediction(directory, state)
+
+        # Retire started fitting owners before their declarations can disappear.
+        for manifest, imported in state["performance_imports"].items():
+            if imported["cost_models"] is not None or "failure" in imported:
+                continue
+            try:
+                self._performance_import(directory, state, manifest, existing_only=True)
+            except ModelingJobFailed:
+                pass  # The old terminal failure does not reject the new inputs.
+
         project_path = directory / "inputs/project.json"
         project = read_json(project_path)
         for role, seconds in budgets.items():
@@ -369,9 +482,9 @@ class PredictionWorkflow:
             # A completed automatic handoff belongs to this task. Replacing
             # declared imports must not discard its measured data or fitted job.
             for sampling in state["performance_sampling"].values():
-                manifest = sampling.get("manifest")
-                if sampling["status"] in ("captured", "no_candidates") and manifest not in manifests:
-                    manifests.append(manifest)
+                for manifest in sampling["manifests"]:
+                    if manifest not in manifests:
+                        manifests.append(manifest)
             project["assets"]["performance_manifests"] = manifests
 
         if cost_models is not None:
@@ -422,33 +535,52 @@ class PredictionWorkflow:
         if project is None:
             return
 
-        for name in ("prediction.json", "comparison.json", "summary.md", "sampling-plan.json"):
+        for name in (
+            "prediction.json",
+            "requests.jsonl",
+            "comparison.json",
+            "comparison-requests.jsonl",
+            "summary.md",
+            "sampling-plan.json",
+        ):
             (directory / "results" / name).unlink(missing_ok=True)
         write_json(directory / "inputs/project.json", project)
         del state["pending_input"]
         write_json(directory / "run.json", state)
 
-    def _performance_import(self, directory: Path, state: dict[str, Any], manifest: str) -> list[str]:
+    def _performance_import(
+        self, directory: Path, state: dict[str, Any], manifest: str, *, existing_only: bool = False
+    ) -> list[str]:
         imports = state["performance_imports"]
         if manifest not in imports:
             imports[manifest] = {"ordinal": len(imports) + 1, "cost_models": None}
             write_json(directory / "run.json", state)
 
         imported = imports[manifest]
-        if imported["cost_models"] is None:
+        fitting = PerformanceImport(
+            self.environment,
+            self.environment.host_path(manifest),
+            RunDirectory(directory, state["id"]),
+            imported["ordinal"],
+        )
+        if imported["cost_models"] is None and "failure" not in imported:
+            if existing_only and self.environment.container_state(fitting.job.name) is None:
+                return []
             print(f"Fitting performance source {imported['ordinal']}", file=sys.stderr, flush=True)
-            result = PerformanceImport(
-                self.environment,
-                self.environment.host_path(manifest),
-                RunDirectory(directory, state["id"]),
-                imported["ordinal"],
-            ).run()
-            imported["cost_models"] = result["cost_models"]
-            imported["units"] = result["units"]
+            try:
+                result = fitting.run()
+            except ModelingJobFailed as error:
+                imported["failure"] = str(error)
+            else:
+                imported["cost_models"] = result["cost_models"]
+                imported["units"] = result["units"]
             write_json(directory / "run.json", state)
-            # The task ledger now owns the candidate references; a fit receipt
-            # is no longer needed for recovery after this handoff.
-            RunDirectory(directory, state["id"]).consume_work("fitting", imported["ordinal"])
+        # Replay the same acknowledgement after a host interruption. The ledger
+        # owns the fitted assets or terminal failure before its writer retires.
+        fitting.job.consume()
+        RunDirectory(directory, state["id"]).consume_work("fitting", imported["ordinal"])
+        if "failure" in imported:
+            raise ModelingJobFailed(imported["failure"])
         return imported["cost_models"]
 
     def _performance_models(self, directory: Path, state: dict[str, Any], inputs: dict[str, Any]) -> list[str]:
@@ -464,11 +596,13 @@ class PredictionWorkflow:
     def _simulate(self, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
         run = RunDirectory(directory, state["id"])
         ordinal = state["prediction"]["round"]
-        if state["task_status"] != "predicting":
+        resuming = state["task_status"] == "predicting"
+        if not resuming:
             ordinal += 1
             print(f"Predicting combinations, round {ordinal}", file=sys.stderr, flush=True)
         round_directory = run.work("prediction", ordinal)
-        if state["task_status"] != "predicting":
+        project = round_directory / "project.json"
+        if not resuming:
             # A host may stop after creating the directory and before saving the
             # round identity; no worker has been launched at this point.
             round_directory.mkdir(parents=True, exist_ok=True)
@@ -481,13 +615,9 @@ class PredictionWorkflow:
             inputs["output"]["directory"] = self.environment.container_path(run.diagnostics("prediction", ordinal))
             for candidate in inputs["configurations"]:
                 candidate["config"] = self.environment.container_path(directory / "inputs" / candidate["config"])
-            write_json(round_directory / "project.json", inputs)
-            state["prediction"]["round"] = ordinal
-            state["task_status"] = "predicting"
-            write_json(directory / "run.json", state)
-
-        project = round_directory / "project.json"
-        inputs = read_json(project)
+            write_json(project, inputs)
+        else:
+            inputs = read_json(project)
 
         # Expose only declared prediction inputs; the full repository is not mounted.
         mounts = {
@@ -515,31 +645,47 @@ class PredictionWorkflow:
                 if asset is not None and (manifest.parent / asset).is_file():
                     mounts.add((manifest.parent / asset).resolve())
 
-        self._prediction_job(directory, state).run(
-            [
-                "python3",
-                "-m",
-                "markov_collection.workflow.prediction",
-                "--project",
-                self.environment.container_path(project),
-                "--directory",
-                self.environment.container_path(round_directory),
-                "--catalog-directory",
-                self.environment.container_path(run.catalogs),
-            ],
-            mounts,
-            {run.catalogs, run.diagnostics("prediction", ordinal)}
-            if inputs["output"]["diagnostics"]
-            else {run.catalogs},
-        )
+        if not resuming:
+            state["prediction"]["round"] = ordinal
+            state["task_status"] = "predicting"
+            write_json(directory / "run.json", state)
+
+        try:
+            self._prediction_job(directory, state).run(
+                [
+                    "python3",
+                    "-m",
+                    "markov_collection.workflow.prediction",
+                    "--project",
+                    self.environment.container_path(project),
+                    "--directory",
+                    self.environment.container_path(round_directory),
+                    "--requirements-directory",
+                    self.environment.container_path(run.work("requirements", ordinal)),
+                    "--request-results",
+                    self.environment.container_path(round_directory / "requests.jsonl"),
+                ],
+                mounts,
+                {run.work("requirements", ordinal), run.diagnostics("prediction", ordinal)}
+                if inputs["output"]["diagnostics"]
+                else {run.work("requirements", ordinal)},
+            )
+        except ModelingJobFailed as error:
+            state.update(task_status="finished", status="failed", reason=str(error))
+            write_json(directory / "run.json", state)
+            self._consume_prediction(directory, state)
+            raise
 
         return read_json(round_directory / "result.json")
 
+    def _consume_prediction(self, directory: Path, state: dict[str, Any]) -> None:
+        job = self._prediction_job(directory, state)
+        if job is not None:
+            job.consume()
+            RunDirectory(directory, state["id"]).consume_work("prediction", state["prediction"]["round"])
+
     def _publish(self, directory: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
         result["collection_performed"] = bool(state["attempts"])
-        # The next sampling plan consumes the same durable attempt history.
-        # Regrouping missing objects must not restart an unchanged native point.
-        result["performance_sampling"] = state["performance_sampling"]
         usage = {
             role: {"consumed_wall_time_ns": permission["consumed_wall_time_ns"]}
             for role, permission in state["collection"].items()
@@ -547,7 +693,7 @@ class PredictionWorkflow:
 
         result["collection_usage"] = usage
         collection_failures = {}
-        for group in result["representative_collection"].get("groups", []):
+        for group in result["representative_collection"]["groups"]:
             reason = state["representatives"].get(group["representative_configuration_id"])
             if reason is not None:
                 for configuration in group["configuration_ids"]:
@@ -561,14 +707,24 @@ class PredictionWorkflow:
                 if collection_gap not in candidate["gaps"]:
                     candidate["gaps"].append(collection_gap)
         relative = Path("results/prediction.json")
+        requests = (
+            RunDirectory(directory, state["id"]).work("prediction", state["prediction"]["round"]) / "requests.jsonl"
+        )
+        if "request_results" in result:
+            target = directory / "results/requests.jsonl"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if requests.is_file():
+                requests.replace(target)
+            result["request_results"] = self.environment.container_path(target)
         write_json(directory / relative, result)
         state["prediction"]["result"] = str(relative)
 
         write_json(directory / "run.json", state)
 
-        # The immutable asset references are now in the published result and the
-        # ledger points to it. No later stage reads this round's full result.
-        RunDirectory(directory, state["id"]).consume_work("prediction", state["prediction"]["round"])
+        # Requests and references are durable before the receipt is consumed.
+        # Unresolved requirements live separately and survive this acknowledgement.
+        self._consume_prediction(directory, state)
+        self._prune_handoffs(directory, state)
 
     def _finish(
         self, directory: Path, state: dict[str, Any], result: dict[str, Any], reason: str | None = None
@@ -581,11 +737,13 @@ class PredictionWorkflow:
                 break
         # Incomplete predictions remain open to asset/budget repair. Independent
         # validation starts only after every prediction has been fixed.
+        pending_capture = state["active_representative"] is not None or state["active_performance"] is not None
+        if pending_capture:
+            state["status"] = "needs_data"
         validate = state["validation"] is not None and state["status"] == "complete"
         state["task_status"] = "validating" if validate else "finished"
         if validate:
             state["status"] = "needs_data"
-            state["performance_plan"] = None
         if reason is not None:
             state["reason"] = reason
         else:
@@ -621,56 +779,89 @@ class PredictionWorkflow:
         write_json(directory / "run.json", state)
 
     def _cleanup(self, directory: Path, state: dict[str, Any]) -> None:
-        # All processing handoffs have completed. Catalogs and diagnostics are
-        # outside work/. Resume repeats cleanup if the host stopped after the
-        # terminal ledger publication, without repeating the actual processing.
-        if state["status"] == "complete":
-            state["performance_plan"] = None
+        # A conditional run may finish using givens while sampling is pending.
+        # Terminal execution never acknowledges an unresolved machine handoff.
         write_json(directory / "run.json", state)
         if state["performance_plan"] is None:
             (directory / "results/sampling-plan.json").unlink(missing_ok=True)
         run = RunDirectory(directory, state["id"])
-        run.consume_work("prediction", state["prediction"]["round"])
-        for imported in state["performance_imports"].values():
-            if imported["cost_models"] is not None:
+        self._consume_prediction(directory, state)
+        for manifest, imported in state["performance_imports"].items():
+            if imported["cost_models"] is not None or "failure" in imported:
+                PerformanceImport(
+                    self.environment, self.environment.host_path(manifest), run, imported["ordinal"]
+                ).job.consume()
                 run.consume_work("fitting", imported["ordinal"])
 
-        planning = directory / "work/planning"
-        if planning.exists():
-            shutil.rmtree(planning)
-        (directory / "work/prepared_input.json").unlink(missing_ok=True)
-        work = directory / "work"
-        if work.exists():
-            for path in reversed(sorted(work.rglob("*"))):
-                if path.is_dir() and not any(path.iterdir()):
-                    path.rmdir()
-            if not any(work.iterdir()):
-                work.rmdir()
+        self._prune_handoffs(directory, state)
+        if state["active_representative"] is None and state["active_performance"] is None:
+            (directory / "work/prepared_input.json").unlink(missing_ok=True)
+        for kind in ("work", "assets", "diagnostics", "logs"):
+            root = directory / kind
+            if root.exists():
+                for path in reversed(sorted(root.rglob("*"))):
+                    if path.is_dir() and not any(path.iterdir()):
+                        path.rmdir()
+                if not any(root.iterdir()):
+                    root.rmdir()
 
-    def _collect_representative(self, directory: Path, state: dict[str, Any]) -> None:
+    def _prune_handoffs(self, directory: Path, state: dict[str, Any]) -> None:
+        retained = {"requirements": state["prediction"]["round"]}
+        if state["performance_plan"] is not None:
+            retained["planning"] = state["performance_plan"]["round"]
+        for kind in ("requirements", "planning"):
+            parent = directory / "work" / kind
+            if parent.exists():
+                for path in parent.iterdir():
+                    if path.is_dir() and path.name != f"{retained.get(kind, 0):03d}":
+                        shutil.rmtree(path)
+
+    def _bind_capture_environment(self, project: dict[str, Any], configuration_id: str, manifest: str) -> None:
+        path = self.environment.host_path(manifest)
+        capture = read_json(path)
+        observed = read_json(path.parent / capture["environment"])["runtime"]["measurement_environment"]
+        candidate = next(item for item in project["configurations"] if item["id"] == configuration_id)
+        environment = candidate["environment"]
+        if environment["measurement"] is None:
+            environment["measurement"] = observed
+            return
+
+        for part, value in observed.items():
+            if environment["measurement"][part] is None:
+                environment["measurement"][part] = value
+
+    def _collect_representative(self, directory: Path, state: dict[str, Any], *, launch: bool = True) -> None:
         active = state["active_representative"]
         try:
-            self.collection.collect(directory, state)
+            self.collection.collect(directory, state, launch=launch)
         except CaptureProcessingFailed:
             # The attempt retains the processor's error and captured inputs.
             # Isolate this group; never turn a host interruption into a failure.
             pass
 
-        if state["capture"]["manifest"] is None:
-            state["representatives"][active] = state["capture"].get("reason", "representative_collection_incomplete")
-        else:
+        capture = state["capture"]
+        if capture["manifests"]:
             project_path = directory / "inputs/project.json"
             project = read_json(project_path)
-            manifest = self.environment.container_path(Path(state["capture"]["manifest"]))
             # Publishing the input can precede the state write on interruption.
-            if not any(asset["manifest"] == manifest for asset in project["assets"]["templates"]):
-                project["assets"]["templates"].append({"manifest": manifest, "node_durations": None})
-                write_json(project_path, project)
+            for path in capture["manifests"]:
+                manifest = self.environment.container_path(Path(path))
+                if not any(asset["manifest"] == manifest for asset in project["assets"]["templates"]):
+                    project["assets"]["templates"].append({"manifest": manifest, "node_durations": None})
+                self._bind_capture_environment(project, active, manifest)
+            write_json(project_path, project)
 
-        # Failed collection changes only the group's outcome, not simulation
-        # inputs. Persist the reusable-result phase across a host interruption.
-        phase = "planned" if state["capture"]["manifest"] is not None else "selecting"
-        state.update(active_representative=None, task_status=phase, status="needs_data")
+        if capture["status"] != "captured":
+            if not launch:
+                return
+            reason = capture.get("reason", "representative_collection_incomplete")
+            state["representatives"][active] = reason
+            # Keep ownership and the full execution plan for explicit resume.
+            self._finish(directory, state, read_json(directory / state["prediction"]["result"]), reason)
+            return
+
+        state["representatives"][active] = None
+        state.update(active_representative=None, task_status="planned", status="needs_data")
         state.pop("reason", None)
         write_json(directory / "run.json", state)
 
@@ -689,13 +880,30 @@ class PredictionWorkflow:
                 "performance_plan",
                 "transfer",
                 prediction_result=directory / state["prediction"]["result"],
+                run_state=directory / "run.json",
             )
-            # One current plan explains unresolved sampling decisions. Retain it
-            # for incomplete runs; a complete prediction no longer consumes it.
-            relative = Path("results/sampling-plan.json")
-            write_json(directory / relative, plan)
-            state["performance_plan"] = {"round": round_name, "path": str(relative)}
+            # Only unresolved work needs a durable plan. Full recipes have one
+            # machine owner; results only summarize them.
+            state["performance_plan"] = None
+            if plan["groups"] or plan["pending"]:
+                relative = (
+                    RunDirectory(directory, state["id"]).work("planning", round_name).relative_to(directory)
+                    / "sampling-plan.json.gz"
+                )
+                write_json(directory / relative, plan, compact=True)
+                state["performance_plan"] = {"round": round_name, "path": str(relative)}
+                summary = {
+                    "scope": plan["scope"],
+                    "group_count": len(plan["groups"]),
+                    "groups_by_kind": dict(Counter(group["measurement_kind"] for group in plan["groups"])),
+                    "groups_by_status": dict(Counter(group["status"] for group in plan["groups"])),
+                    "object_count": sum(len(group["requirements"]) for group in plan["groups"]) + len(plan["pending"]),
+                    "pending_by_reason": dict(Counter(row["reason"] for row in plan["pending"])),
+                    "machine_plan": str(Path("..") / relative),
+                }
+                write_json(directory / "results/sampling-plan.json", summary)
             write_json(directory / "run.json", state)
+            self._prune_handoffs(directory, state)
         else:
             plan = read_json(directory / recorded["path"])
 
@@ -719,7 +927,7 @@ class PredictionWorkflow:
                 "configuration_id": group["configuration_id"],
                 "measurement_kind": group["measurement_kind"],
                 "status": "selected",
-                "manifest": None,
+                "manifests": [],
             }
             try:
                 prepared = self.collection.prepare(
@@ -740,8 +948,19 @@ class PredictionWorkflow:
 
             prepared["measurement_kind"] = group["measurement_kind"]
             if group["measurement_kind"] == "cpu":
-                prepared["cpu_services"] = group["cpu_services"]
-                prepared["cpu_service_descriptors"] = group["cpu_service_descriptors"]
+                # Select existing adapter sessions for the requested CPU roles;
+                # native whole-group sessions remain intact.
+                prepared["cpu_services"] = [
+                    group["requirements"][assignment["requirement_index"]]["object"]["features"]
+                    for assignment in group["assignments"]
+                    if assignment["point_indices"]
+                ]
+                ranks = {service["rank"] for service in prepared["cpu_services"]}
+                prepared["capture_executions"] = [
+                    execution
+                    for execution in prepared["capture_executions"]
+                    if execution is None or execution["rank"] in ranks
+                ]
             prepared["repetitions"] = 3
             self.collection.select(prepared, directory, state)
             state["performance_sampling"][key] = sampling
@@ -754,44 +973,45 @@ class PredictionWorkflow:
 
         return False, "performance_sampling_no_new_evidence" if ready else None
 
-    def _collect_performance(self, directory: Path, state: dict[str, Any]) -> None:
+    def _collect_performance(self, directory: Path, state: dict[str, Any], *, launch: bool = True) -> None:
         key = state["active_performance"]
         sampling = state["performance_sampling"][key]
         sampling["status"] = "selected"
         sampling.pop("reason", None)
         try:
-            self.collection.collect(directory, state)
+            self.collection.collect(directory, state, launch=launch)
         except CaptureProcessingFailed:
             pass
 
-        manifest = state["capture"]["manifest"]
+        capture = state["capture"]
+        sampling["manifests"] = [self.environment.container_path(Path(path)) for path in capture["manifests"]]
+        write_json(directory / "run.json", state)
         models: list[str] = []
-        if manifest is None:
-            sampling.update(status="failed", reason=state["capture"].get("reason", "performance_collection_incomplete"))
-            if sampling["reason"] == "performance_collection_budget_exhausted":
-                # Keep this group's owner for explicit resume. The failed native
-                # attempt and its consumed quota remain in the collection ledger.
-                self._finish(directory, state, read_json(directory / state["prediction"]["result"]), sampling["reason"])
-                return
-        else:
-            manifest = self.environment.container_path(Path(manifest))
+        for manifest in sampling["manifests"]:
             # The active handoff remains durable while fitting. A resumed host
             # consumes the same isolated job and never recaptures this group.
-            sampling["manifest"] = manifest
-            write_json(directory / "run.json", state)
             try:
-                models = self._performance_import(directory, state, manifest)
+                models.extend(self._performance_import(directory, state, manifest))
             except ModelingJobFailed as error:
                 # Only a proven terminal fit failure ends this group. Host
                 # interruption and infrastructure errors keep the active handoff.
                 sampling.update(status="failed", reason=str(error))
+                break
             else:
                 sampling["status"] = "captured" if models else "no_candidates"
                 project_path = directory / "inputs/project.json"
                 project = read_json(project_path)
+                self._bind_capture_environment(project, sampling["configuration_id"], manifest)
                 if manifest not in project["assets"]["performance_manifests"]:
                     project["assets"]["performance_manifests"].append(manifest)
-                    write_json(project_path, project)
+                write_json(project_path, project)
+
+        if capture["status"] != "captured":
+            if not launch:
+                return
+            sampling.update(status="failed", reason=capture.get("reason", "performance_collection_incomplete"))
+            self._finish(directory, state, read_json(directory / state["prediction"]["result"]), sampling["reason"])
+            return
 
         state.update(active_performance=None, task_status="planned" if models else "selecting", status="needs_data")
         state.pop("reason", None)
@@ -800,6 +1020,8 @@ class PredictionWorkflow:
     def _continue(self, directory: Path, state: dict[str, Any]) -> None:
         if state["active_representative"] is not None:
             self._collect_representative(directory, state)
+            if state["task_status"] == "finished":
+                return
         if state["active_performance"] is not None:
             self._collect_performance(directory, state)
             if state["task_status"] == "finished":
@@ -832,7 +1054,7 @@ class PredictionWorkflow:
                 else:
                     # Source groups keep priority and get one attempt each.
                     # Rule and cost gaps do not request another structure capture.
-                    for group in result["representative_collection"].get("groups", []):
+                    for group in result["representative_collection"]["groups"]:
                         representative = group["representative_configuration_id"]
                         if (
                             not missing.intersection(group["configuration_ids"])
@@ -877,6 +1099,8 @@ class PredictionWorkflow:
             self._publish(directory, state, result)
 
             self._collect_representative(directory, state)
+            if state["task_status"] == "finished":
+                return
             if state["task_status"] != "selecting":
                 result = self._simulate(directory, state)
 
@@ -885,10 +1109,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one isolated prediction processing round")
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--catalog-directory", type=Path, required=True)
+    parser.add_argument("--requirements-directory", type=Path, required=True)
+    parser.add_argument("--request-results", type=Path, required=True)
     arguments = parser.parse_args()
 
-    PredictionProcessing(arguments.project, arguments.directory, arguments.catalog_directory).run()
+    PredictionProcessing(
+        arguments.project,
+        arguments.directory,
+        arguments.requirements_directory,
+        arguments.request_results,
+    ).run()
 
 
 if __name__ == "__main__":

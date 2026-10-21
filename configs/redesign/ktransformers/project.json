@@ -49,7 +49,7 @@
     "performance_manifests": []
   },
   "output": {
-    "directory": "../../../data/redesign/ktransformers",
+    "directory": "../../../data",
     "diagnostics": false
   }
 }

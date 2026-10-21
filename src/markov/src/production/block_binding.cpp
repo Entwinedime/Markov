@@ -7,17 +7,19 @@
 
 namespace markov {
 
+std::string NativeRegionBinding::cpu_name() const { return std::string(semantic) + "/" + std::string(method); }
+
 std::optional<SourceTensorLayout> SourceTensorLayout::read(const nlohmann::json & value) {
     if (value.is_null()) return std::nullopt;
     return SourceTensorLayout{ value.at("shape").get<std::vector<std::int64_t>>(),
                                value.at("stride").get<std::vector<std::int64_t>>(),
-                               value.at("dtype").get<std::string>(),
-                               value.at("device").get<std::string>() };
+                               value.at("dtype").get<std::string>() };
 }
 
-SourceNativeRegion NativeRegionBinding::read(const nlohmann::json & metadata) const {
+SourceNativeRegion NativeRegionBinding::read(const nlohmann::json & record) const {
+    const auto & metadata = record.at("metadata");
     SourceNativeRegion region{
-        std::string(semantic), metadata.at("module_type").get<std::string>(), metadata.at("method").get<std::string>(), {}, {}, {}, {}, {}
+        std::string(semantic), metadata.at("module_type").get<std::string>(), metadata.at("method").get<std::string>(), record.at("result"), {}, {}, {}, {}, {}
     };
     if (region.module_type != module_type || region.method != method) {
         throw std::invalid_argument("model region native implementation disagrees with binding: " + std::string(identity));
@@ -36,9 +38,6 @@ SourceNativeRegion NativeRegionBinding::read(const nlohmann::json & metadata) co
     for (const auto & output : outputs) region.outputs.emplace(output.name, SourceTensorLayout::read(metadata.at("outputs").at(std::string(output.name))));
 
     for (const auto name : cpu_inputs) region.cpu_values.emplace(name, metadata.at("cpu_values").at(std::string(name)).get<std::vector<std::int64_t>>());
-
-    const auto observed = metadata.find("result");
-    if (observed != metadata.end()) region.result = observed->get<nlohmann::json::object_t>();
 
     return region;
 }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -19,6 +20,7 @@ void LightweightController::initialize(std::span<const Request> requests, Servin
     limits_ = limits;
 
     progress_.assign(requests.size(), Progress{});
+    completed_requests_ = 0;
     free_request_slots_.clear();
     for (std::uint32_t slot = 1; slot <= limits_.request_capacity; ++slot) free_request_slots_.push_back(slot);
 
@@ -49,49 +51,47 @@ std::vector<ControlAction> LightweightController::handle(std::span<const Control
         const auto & completion = std::get<WorkPortCompleted>(event.payload);
         if (!reserved_batch_ || completion.port != reserved_batch_->completion) continue;
 
-        // Only the publication port changes token visibility or frees logical KV.
-        for (const auto & slice : reserved_batch_->input.requests) {
-            auto & progress = progress_[slice.request_id];
-            ++progress.published_tokens;
-            if (progress.published_tokens == requests_[slice.request_id].output_tokens) {
-                progress.phase = RequestPhase::Finished;
+        // Result processing commits generation progress and frees logical KV.
+        for (const auto request_id : reserved_batch_->members) {
+            auto & progress = progress_[request_id];
+            ++progress.generated_tokens;
+            if (progress.generated_tokens == requests_[request_id].output_tokens) {
+                ++completed_requests_;
                 free_request_slots_.push_back(*progress.pool_slot);
                 progress.pool_slot.reset();
                 // Pages are logical identities. Reuse order does not reproduce
                 // a backend free-list tensor; its operations remain in templates.
                 free_pages_.insert(free_pages_.end(), progress.kv_pages.begin(), progress.kv_pages.end());
                 progress.kv_pages.clear();
-                actions.emplace_back(CompleteRequest{ slice.request_id, completion.port });
             }
-            else { progress.phase = RequestPhase::Active; }
         }
 
         previous_completion_ = completion.port;
 
-        if (reserved_batch_->input.phase == BatchPhase::Idle && std::ranges::none_of(progress_, [](const auto & request) {
-                return request.phase == RequestPhase::Waiting || request.phase == RequestPhase::Active;
-            }))
-            admission_ratio_ = admission_policy_.initial_ratio;
+        // An Idle decision has already filtered all running members.
+        if (reserved_batch_->members.empty() && waiting_.empty()) admission_ratio_ = admission_policy_.initial_ratio;
 
         reserved_batch_.reset();
     }
 
     if (reserved_batch_) { return actions; }
 
-    // A non-overlap reader consumes new inputs between native batch returns.
-    // Keep their logical arrival separate from entry into the scheduling queue.
+    // Freeze the already-arrived raw cohort at this logical poll. Later
+    // arrivals remain queued while this Schedule and its batch are in flight.
+    std::vector<IncomingRequest> incoming;
     while (!incoming_.empty()) {
         const auto request = incoming_.front();
         incoming_.pop_front();
-        progress_[request].phase = RequestPhase::Waiting;
         waiting_.push_back(request);
-        actions.emplace_back(ReceiveRequest{ request });
+        const auto prompt = std::get<std::vector<std::uint32_t>>(requests_[request].input).size();
+        incoming.push_back({ request, static_cast<std::uint32_t>(prompt), requests_[request].output_tokens });
     }
 
-    if (finish().completed_requests == requests_.size()) return actions;
+    if (completed_requests_ == requests_.size()) return actions;
 
     auto batch = select_batch();
-    if (batch.requests.empty() && batch.filters.empty()) { return actions; }
+    batch.incoming_requests = std::move(incoming);
+    if (batch.requests.empty() && batch.filters.empty() && batch.incoming_requests.empty()) { return actions; }
 
     // Admission is an estimate. Check actual page demand before mutating either
     // request slots or page ownership; retraction is outside this policy.
@@ -144,12 +144,12 @@ BatchInput LightweightController::select_batch() {
     batch.phase = running_members_.empty() ? BatchPhase::Idle : BatchPhase::Decode;
     for (const auto request_id : running_members_) {
         const auto prompt_tokens = std::get<std::vector<std::uint32_t>>(requests_[request_id].input).size();
-        const auto context_tokens = prompt_tokens + progress_[request_id].published_tokens - 1;
+        const auto context_tokens = prompt_tokens + progress_[request_id].generated_tokens - 1;
         batch.requests.push_back({ request_id,
                                    1,
                                    static_cast<std::uint32_t>(context_tokens),
-                                   progress_[request_id].published_tokens,
-                                   progress_[request_id].published_tokens + 1 == requests_[request_id].output_tokens,
+                                   progress_[request_id].generated_tokens,
+                                   progress_[request_id].generated_tokens + 1 == requests_[request_id].output_tokens,
                                    0,
                                    {} });
     }
@@ -159,13 +159,17 @@ BatchInput LightweightController::select_batch() {
 
 BatchFilter LightweightController::filter_members(std::vector<RequestId> & members) {
     BatchFilter filter{ members.size(), {} };
-    std::vector<RequestId> retained;
+    std::size_t kept = 0;
+
+    // Keep original batch positions while compacting the controller's members.
     for (std::size_t slot = 0; slot < members.size(); ++slot) {
-        if (progress_[members[slot]].phase == RequestPhase::Finished) continue;
+        const auto id = members[slot];
+        if (progress_[id].generated_tokens == requests_[id].output_tokens) continue;
         filter.retained_indices.push_back(slot);
-        retained.push_back(members[slot]);
+        members[kept++] = id;
     }
-    members = std::move(retained);
+
+    members.resize(kept);
     return filter;
 }
 
@@ -190,8 +194,8 @@ void LightweightController::admit_prefill(BatchInput & batch) {
         std::uint64_t occupied;
     };
     const auto horizon = [this](RequestId id) {
-        return Horizon{ requests_[id].output_tokens - progress_[id].published_tokens,
-                        std::get<std::vector<std::uint32_t>>(requests_[id].input).size() + progress_[id].published_tokens };
+        return Horizon{ requests_[id].output_tokens - progress_[id].generated_tokens,
+                        std::get<std::vector<std::uint32_t>>(requests_[id].input).size() + progress_[id].generated_tokens };
     };
 
     const auto available = static_cast<std::int64_t>(free_pages_.size() * page_size_tokens_);
@@ -293,49 +297,56 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
         slice.kv_pages = progress.kv_pages;
     }
 
+    // All steps consume the same completed snapshot; their vector moves cannot
+    // invalidate it, and no mutable controller state is shared with execution.
+    auto batch = std::make_shared<const BatchInput>(std::move(input));
     const auto schedule_id = next_work_id_++;
     std::vector<PortRef> schedule_dependencies;
     if (previous_completion_) schedule_dependencies.push_back(*previous_completion_);
 
-    if (input.phase == BatchPhase::Idle) {
+    if (batch->phase == BatchPhase::Idle) {
         reserved_batch_ = PendingBatch{
-            input,
+            {},
             { schedule_id, PortKind::Selected }
         };
-        return {
-            InvokeStep{ schedule_id, StepKind::Schedule, input, std::move(schedule_dependencies), {} }
-        };
+        std::vector<ControlAction> actions;
+        actions.emplace_back(InvokeStep{ schedule_id, StepKind::Schedule, std::move(batch), std::move(schedule_dependencies), {} });
+        return actions;
     }
 
     const auto prepare_id = next_work_id_++;
     const auto execute_id = next_work_id_++;
     const auto publish_id = next_work_id_++;
-    const auto execute_step = input.phase == BatchPhase::Prefill ? StepKind::Prefill : StepKind::Decode;
+    const auto execute_step = batch->phase == BatchPhase::Prefill ? StepKind::Prefill : StepKind::Decode;
     reserved_batch_ = PendingBatch{
-        input,
-        { publish_id, PortKind::Published }
+        {},
+        { publish_id, PortKind::ResultProcessed }
     };
-    if (input.phase == BatchPhase::Prefill) {
-        pending_prefill_.emplace();
-        for (const auto & request : input.requests) pending_prefill_->push_back(request.request_id);
-    }
+    for (const auto & request : batch->requests) reserved_batch_->members.push_back(request.request_id);
+    if (batch->phase == BatchPhase::Prefill) pending_prefill_ = reserved_batch_->members;
 
     std::vector<ControlAction> actions;
-    actions.emplace_back(InvokeStep{ schedule_id, StepKind::Schedule, input, std::move(schedule_dependencies), {} });
-    actions.emplace_back(InvokeStep{ prepare_id, StepKind::Prepare, input, { { schedule_id, PortKind::Selected } }, {} });
-    actions.emplace_back(InvokeStep{ execute_id, execute_step, input, { { prepare_id, PortKind::Prepared } }, {} });
+    actions.emplace_back(InvokeStep{ schedule_id, StepKind::Schedule, batch, std::move(schedule_dependencies), {} });
+    actions.emplace_back(InvokeStep{ prepare_id, StepKind::Prepare, batch, { { schedule_id, PortKind::Selected } }, {} });
+    actions.emplace_back(InvokeStep{ execute_id, execute_step, batch, { { prepare_id, PortKind::Prepared } }, {} });
 
-    // Submission opens publication; device completion gates its visible result.
+    // Submission opens processing; device completion gates the control return.
+    // Token handoff keeps its observed data and synchronization dependencies.
     actions.emplace_back(InvokeStep{ publish_id,
                                      StepKind::Publish,
-                                     input,
+                                     std::move(batch),
                                      { { execute_id, PortKind::Submitted } },
-                                     { { { execute_id, PortKind::DeviceDone }, PortKind::Published } } });
+                                     { { { execute_id, PortKind::DeviceDone }, PortKind::ResultProcessed } } });
     return actions;
 }
 
-ControllerSummary LightweightController::finish() const {
-    return { static_cast<std::size_t>(std::ranges::count(progress_, RequestPhase::Finished, &Progress::phase)) };
+std::vector<PortRef> LightweightController::retained_ports() const {
+    std::vector<PortRef> ports;
+    if (previous_completion_) ports.push_back(*previous_completion_);
+    if (reserved_batch_) ports.push_back(reserved_batch_->completion);
+    return ports;
 }
+
+ControllerSummary LightweightController::finish() const { return { completed_requests_ }; }
 
 } // namespace markov

@@ -15,8 +15,8 @@ namespace markov {
 // Native measurement inputs only; never runs sampling or supplies node costs.
 class SGLangSamplingRecipes {
 public:
-    nlohmann::json sampling_requests(const SGLangConfiguration & configuration, std::span<const Request> prompt_sources,
-                                     const nlohmann::json & requirements) const;
+    nlohmann::json sampling_requests(const SGLangConfiguration & configuration, std::span<const Request> prompt_sources, const nlohmann::json & requirements,
+                                     std::span<const std::uint32_t> observed_ranks) const;
     nlohmann::json workloads(const SGLangConfiguration & configuration, std::span<const Request> prompt_sources,
                              const nlohmann::json & measurement_requests) const;
     nlohmann::json collectives(const SGLangConfiguration & configuration, const Environment & environment,

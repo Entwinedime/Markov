@@ -8,9 +8,11 @@
 #include "markov/workflow/prediction_workflow.hpp"
 #include "markov/workflow/project.hpp"
 #include "markov/workflow/project_reader.hpp"
+#include "markov/workflow/structure_comparison_workflow.hpp"
 
 #include <array>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <set>
@@ -19,8 +21,9 @@
 #include <string_view>
 
 namespace {
-constexpr std::string_view usage = "Usage: markov {plan|predict|prepare-prediction} --project project.json\n"
-                                   "       markov predict --project project.json [--catalog-directory DIR]\n"
+constexpr std::string_view usage = "Usage: markov {plan|prepare-prediction} --project project.json\n"
+                                   "       markov predict --project FILE --requirements-directory DIR --request-results FILE\n"
+                                   "       markov compare-structure --project FILE --prediction-result FILE --validation-manifest FILE\n"
                                    "       markov fit-costs --performance-manifest performance_manifest.json [--unit "
                                    "all|kernel|communication|transfer|command|cpu]\n"
                                    "       markov evaluate-costs --model-candidate candidate.json --performance-manifest performance_manifest.json\n"
@@ -29,7 +32,7 @@ constexpr std::string_view usage = "Usage: markov {plan|predict|prepare-predicti
                                    "       markov prepare-target --project project.json --configuration ID --workload ID --budget-sec N "
                                    "[--purpose ports|structure]\n"
                                    "       markov prepare-sampling --project project.json --configuration ID --workload ID --measurement-requests FILE\n"
-                                   "       markov prepare-performance --project project.json --prediction-result FILE\n"
+                                   "       markov prepare-performance --project project.json --prediction-result FILE --run-state FILE\n"
                                    "       markov prepare-communication --project project.json --configuration ID\n"
                                    "       markov extract --base-manifest profile_manifest.json "
                                    "[--output-directory DIR] [--work-directory DIR]\n";
@@ -43,9 +46,19 @@ int main(int argc, char ** argv) {
     try {
         if (argc < 4 || argc % 2 != 0) throw std::invalid_argument(std::string(usage));
         const std::string_view command = argv[1];
-        const std::set<std::string_view> commands{ "plan",    "predict",        "prepare-prediction", "prepare-representative",
-                                                   "prepare", "prepare-target", "prepare-sampling",   "prepare-communication",
-                                                   "extract", "fit-costs",      "evaluate-costs",     "prepare-performance" };
+        const std::set<std::string_view> commands{ "plan",
+                                                   "predict",
+                                                   "prepare-prediction",
+                                                   "prepare-representative",
+                                                   "prepare",
+                                                   "prepare-target",
+                                                   "prepare-sampling",
+                                                   "prepare-communication",
+                                                   "extract",
+                                                   "fit-costs",
+                                                   "evaluate-costs",
+                                                   "prepare-performance",
+                                                   "compare-structure" };
         if (!commands.contains(command)) throw std::invalid_argument(std::string(usage));
 
         const bool source_command = command == "extract";
@@ -58,14 +71,15 @@ int main(int argc, char ** argv) {
         if (command == "prepare" || command == "prepare-target" || command == "prepare-sampling") required.insert("--workload");
         if (command == "prepare-target") required.insert("--budget-sec");
         if (command == "prepare-sampling") required.insert("--measurement-requests");
-        if (command == "prepare-performance") required.insert("--prediction-result");
+        if (command == "prepare-performance") required.insert({ "--prediction-result", "--run-state" });
+        if (command == "compare-structure") required.insert({ "--prediction-result", "--validation-manifest" });
+        if (command == "predict") required.insert({ "--requirements-directory", "--request-results" });
         std::map<std::string_view, std::string> options;
         for (int index = 2; index < argc; index += 2) {
             const bool optional_unit = command == "fit-costs" && std::string_view(argv[index]) == "--unit";
             const bool optional_purpose = command == "prepare-target" && std::string_view(argv[index]) == "--purpose";
             const auto option = std::string_view(argv[index]);
-            const bool output_path = (source_command && (option == "--output-directory" || option == "--work-directory"))
-                                     || (command == "predict" && option == "--catalog-directory");
+            const bool output_path = source_command && (option == "--output-directory" || option == "--work-directory");
             if ((!required.contains(argv[index]) && !optional_unit && !optional_purpose && !output_path)
                 || !options.emplace(argv[index], argv[index + 1]).second)
                 throw std::invalid_argument("unknown or duplicate argument: " + std::string(argv[index]));
@@ -103,13 +117,20 @@ int main(int argc, char ** argv) {
         const markov::Planner planner(adapters, collection_adapters);
         nlohmann::json result;
         if (command == "predict") {
-            result = markov::PredictionWorkflow(adapters).run(project,
-                                                              planner.collection_plan(project),
-                                                              options.contains("--catalog-directory") ? options.at("--catalog-directory") : "");
+            // Resolve command-line outputs once before the workflow owns them.
+            const markov::PredictionOutputs outputs{ std::filesystem::absolute(options.at("--requirements-directory")).lexically_normal(),
+                                                     std::filesystem::absolute(options.at("--request-results")).lexically_normal() };
+            result = markov::PredictionWorkflow(adapters).run(project, planner.collection_plan(project), outputs);
         }
+        else if (command == "compare-structure")
+            result = markov::StructureComparisonWorkflow(adapters, collection_adapters)
+                         .run(project, options.at("--prediction-result"), options.at("--validation-manifest"));
         else if (command == "plan") result = planner.describe(project);
         else if (command == "prepare-prediction") result = planner.prepare_prediction(project);
-        else if (command == "prepare-performance") result = planner.prepare_performance(project, markov::input::read_json(options.at("--prediction-result")));
+        else if (command == "prepare-performance") {
+            const auto state = markov::input::read_json(options.at("--run-state"));
+            result = planner.prepare_performance(project, markov::input::read_json(options.at("--prediction-result")), state.at("performance_sampling"));
+        }
         else {
             const auto & configuration = project.configuration(options.at("--configuration"));
             if (command == "prepare-communication") result = planner.prepare_communication(project, configuration);

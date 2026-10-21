@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -69,14 +70,11 @@ enum class WorkspaceBranch { Reuse, Allocate, Grow, Release };
 struct TemplateWorkspaceUse {
     std::size_t pool;
     std::size_t operation;
-    std::size_t worker;
     std::size_t source_api;
     SourceSpanId marker;
     std::size_t begin; // Local allocator observation boundaries, inside its worker operation.
     std::size_t end;
     std::uint64_t requested_bytes;
-    std::uint64_t capacity_before_bytes;
-    std::uint64_t capacity_after_bytes;
     WorkspaceBranch branch;
     bool requires_device_synchronization;
     // A qualified rule borrows the source owner; otherwise retain the producer's reason.
@@ -108,13 +106,36 @@ struct TemplateInsertedBoundary {
     BoundaryId source_boundary;
     const std::filesystem::path * source_manifest;
     const CpuBoundary * cpu = nullptr;
+
+    bool same_cpu_boundary(const TemplateInsertedBoundary & other) const { return cpu == other.cpu || (cpu && other.cpu && *cpu == *other.cpu); }
 };
 
 struct TemplateDefinition;
+struct TemplateRankBinding;
 
 struct TemplateRegionReference {
     const TemplateDefinition * definition;
-    std::size_t region;
+    std::size_t sequence;
+    std::size_t member;
+};
+
+enum class TemplateSequenceParameter { Request, IncomingRequest, ModelLayer, InputReception };
+
+struct TemplateSubgraphRegion;
+struct TemplateSequenceInput;
+struct TemplateRegionSequence {
+    std::vector<std::size_t> source_members;
+    std::vector<std::size_t> members; // Fixed model expansion; request membership is supplied by the controller.
+    TemplateSequenceParameter parameter = TemplateSequenceParameter::Request;
+    std::vector<TemplateSubgraphRegion> separators;
+    std::vector<TemplateSequenceInput> inputs;
+    std::optional<std::string> gap;
+    std::optional<std::size_t> repeated_separator;
+};
+
+struct TemplateSequenceRewrite {
+    const TemplateRegionSequence * source; // Borrowed from the immutable source definition.
+    std::vector<TemplateRegionReference> members;
 };
 
 struct TemplateStreamWait {
@@ -155,14 +176,7 @@ struct TemplateConnectionContract {
     auto operator<=>(const TemplateConnectionContract &) const = default;
 };
 
-// One interface cut, within a serving definition or across definitions.
-// Remote slots preserve aliases without assigning outside work to this region.
-struct TemplateInterface {
-    TemplateConnectionContract connection;
-    std::size_t remote_boundary;
-    auto operator<=>(const TemplateInterface &) const = default;
-};
-
+// Actual peers belong to one source invocation, not its shared self structure.
 struct TemplateConnectionEndpoint {
     TemplateConnectionContract contract;
     BoundaryId remote_source_boundary;
@@ -170,38 +184,29 @@ struct TemplateConnectionEndpoint {
 
 struct TemplateResourceSlot {
     SourceDomain domain;
-    std::size_t rank; // Zero is this definition's rank; peer slots preserve rank aliases.
+    std::size_t rank; // Relative rank; zero is this serving definition's rank.
     std::optional<TemplateResourceRole> role = std::nullopt;
     auto operator<=>(const TemplateResourceSlot &) const = default;
 };
 
-struct TemplateRemoteBoundary {
-    std::size_t lane;
-    std::optional<std::size_t> local_boundary; // Alias to a region-local endpoint, when present.
-    auto operator<=>(const TemplateRemoteBoundary &) const = default;
-};
-
 // Local resource slots and qualified model rules belong to the shared graph.
-// Actual lanes and peer identities remain bindings; sharing does not qualify a target.
+// Actual lanes and cross-region peers remain source bindings. Shared self work
+// does not establish interchangeable interfaces or qualify a target rewrite.
 struct TemplateRegionStructure {
     std::vector<TemplateResourceSlot> resources;
     std::vector<TemplateBoundary> boundaries; // Lane indexes a local resource slot.
     std::vector<TemplateNode> nodes;
     std::vector<TemplateDependency> dependencies;
-    std::vector<TemplateInterface> connections;
-    std::vector<TemplateInterface> dependency_ports;
-    std::vector<TemplateRemoteBoundary> remote_boundaries; // Shares resource slots with local boundaries.
-    std::map<std::size_t, const CollectiveParameterRule *> collective_rules;
     std::map<std::size_t, const ModelParameterRule *> model_rules; // Source-owned canonical rules, indexed by local node.
     std::string semantic;
-    auto operator<=>(const TemplateRegionStructure &) const = default;
+    std::strong_ordering operator<=>(const TemplateRegionStructure & other) const;
 };
 
 using TemplateRegionStructures = std::set<TemplateRegionStructure>;
 
 // Iteration addresses source node slots; dependencies address source edge slots.
-// Node and dependency views restore endpoints through the same region binding.
-// Boundary reads resolve local resource slots to the selected observation lanes.
+// Node and internal-dependency views restore endpoints through region bindings.
+// Cross-region edges and external connections retain source-local endpoints once.
 class TemplateGraph {
     friend class TemplateAssetCodec;
 
@@ -277,40 +282,29 @@ public:
     void add_boundary(TemplateBoundary point) { local_boundaries_.push_back(point); }
     void add_dependency(TemplateDependency edge) { local_dependencies_.push_back(edge); }
     Dependencies dependencies() const { return Dependencies(*this); }
-    std::size_t connection_count() const { return connection_locations_.empty() ? local_connections_.size() : connection_locations_.size(); }
+    std::size_t connection_count() const { return connections_.size(); }
     TemplateConnectionEndpoint connection(std::size_t index) const;
-    void add_connection(TemplateConnectionContract contract, BoundaryId remote, SourceLane lane) { local_connections_.push_back({ contract, remote, lane }); }
+    void add_connection(TemplateConnectionContract contract, BoundaryId remote) { connections_.push_back({ contract, remote }); }
     void bind_model_rule(std::size_t node, const ModelParameterRule & rule) { model_rules_.emplace(node, &rule); }
-    const ModelParameterRule & model_rule(std::size_t node) const;
-    void bind_collective_rule(std::size_t node, const CollectiveParameterRule & rule) { collective_rules_.emplace(node, &rule); }
-    const CollectiveParameterRule & collective_rule(std::size_t node) const;
+    const ModelParameterRule * model_rule(std::size_t node) const;
 
     // Producer finalization, once, after parameter binding. Regions share only
     // their own work; TemplateDefinition::regions retains the invocation tree.
     // The source-owned pool outlives every definition and target instance.
     void share(const TemplateDefinition & source, std::span<const std::size_t> regions, TemplateRegionStructures & pool);
     std::size_t shared_regions() const { return bindings_.size(); }
+    const TemplateRegionStructure * structure(std::size_t node) const;
+    std::optional<std::size_t> local_boundary(std::size_t node, std::size_t boundary) const;
 
 private:
     struct Location {
         std::size_t region; // Zero denotes unshared records; bindings use one-based indices.
-        std::size_t member; // Dependencies index internal edges, then dependency ports.
-    };
-    struct RemoteBoundaryBinding {
-        BoundaryId source_boundary;
-        std::optional<std::size_t> local_boundary; // Present when the endpoint belongs to this serving definition.
-    };
-    struct ObservedConnection {
-        TemplateConnectionContract contract;
-        BoundaryId remote_source_boundary;
-        SourceLane remote_lane;
+        std::size_t member;
     };
     struct Binding {
         const TemplateRegionStructure * structure;
         std::vector<std::size_t> boundaries;
-        std::vector<RemoteBoundaryBinding> remote_boundaries;
-        std::vector<std::optional<std::size_t>> lanes; // Peer-only resources have no lane in this definition.
-        std::optional<std::size_t> source_region;      // Empty for the enclosing serving root.
+        std::vector<std::size_t> lanes;
     };
 
     TemplateNode resolve(std::size_t index, const Location & location) const;
@@ -324,20 +318,30 @@ private:
     std::vector<Binding> bindings_;
     std::vector<TemplateDependency> local_dependencies_;
     std::vector<Location> dependency_locations_;
-    std::vector<ObservedConnection> local_connections_;
-    std::vector<Location> connection_locations_;
+    std::vector<TemplateConnectionEndpoint> connections_;
     std::map<std::size_t, const ModelParameterRule *> model_rules_;
-    std::map<std::size_t, const CollectiveParameterRule *> collective_rules_;
 };
 
 struct TemplateNodeObservation {
     SourceSpanId source_span;
     const SourceKernel * kernel; // Borrowed from TemplateSource::kernels.
     std::optional<std::size_t> source_scope;
-    const SourceCommunicationTask * communication = nullptr; // Borrowed from this source definition's collective tasks.
-    const SourceTransfer * transfer = nullptr;               // Borrowed from TemplateSource::transfers.
+    const SourceTransfer * transfer = nullptr; // Borrowed from TemplateSource::transfers.
     std::optional<DeviceCommandWork> device_command = std::nullopt;
 };
+
+using TemplateSemanticPath = std::shared_ptr<const std::vector<std::string_view>>;
+
+struct TemplateSemanticScope {
+    std::vector<std::string_view> path;
+    std::optional<std::size_t> request_slot;
+    std::optional<std::uint32_t> model_layer;
+    std::optional<std::size_t> input_slot;
+};
+
+// Cut membership proves ancestry. Rebinding replaces only that cut's prefix;
+// observed semantic names below it remain shared by the relocated work.
+TemplateSemanticPath rebase_semantic_path(const TemplateSemanticPath & path, std::size_t prefix_size, std::span<const std::string_view> target_prefix);
 
 // Each insertion owns its target descriptor. Donor observations and definition
 // remain immutable in the bank, including when the same span is reused twice.
@@ -346,17 +350,20 @@ struct TemplateInsertedNode {
     TemplateNode node;
     const TemplateDefinition * definition;
     std::optional<SourceKernel> kernel_override = std::nullopt;
-    std::optional<SourceCommunicationTask> communication_override = std::nullopt;
     std::optional<TemplateStreamWait> stream_wait = std::nullopt;
     std::optional<SourceTransfer> transfer_override = std::nullopt;
     std::optional<std::size_t> request_slot = std::nullopt;          // Target request for relocated member work and parameters.
     std::optional<BatchFilterBinding> filter_binding = std::nullopt; // Target call role for a relocated filtering helper.
+    std::optional<std::uint32_t> model_layer = std::nullopt;
+    // The source recipient's semantic owner; donor provenance does not confer ownership.
+    std::optional<std::size_t> recipient_region = std::nullopt;
+    TemplateSemanticPath semantic_path = {};              // Complete target path, shared per observed scope/cut; null remains unknown.
+    std::optional<std::size_t> input_slot = std::nullopt; // Incoming cohort member, independent of the selected model batch.
 
     const TemplateNodeObservation & observation() const;
 
     const SourceTransfer * transfer() const { return transfer_override ? &*transfer_override : observation().transfer; }
     const SourceKernel * kernel() const { return kernel_override ? &*kernel_override : observation().kernel; }
-    const SourceCommunicationTask * communication() const { return communication_override ? &*communication_override : observation().communication; }
 };
 
 struct TemplateConnection {
@@ -383,15 +390,93 @@ struct TemplateRegionScope {
     std::size_t end;
 };
 
-struct TemplateRegion {
+struct TemplateRegionPort {
+    TemplateResource resource;
+    std::size_t entry;
+    std::size_t exit;
+    std::optional<std::size_t> device_done = std::nullopt;
+};
+
+// A local cut owns work and internal edges, while retaining each crossing
+// interface explicitly. Sharing endpoints never transfers an outside service.
+struct TemplateSubgraphRegion {
+    std::vector<std::size_t> nodes;
+    std::vector<std::size_t> boundaries;
+    std::vector<std::size_t> crossing_nodes;
+    std::vector<std::size_t> retained_dependencies;
+    std::vector<std::size_t> internal_dependencies;
+    std::vector<std::size_t> incoming_dependencies;
+    std::vector<std::size_t> outgoing_dependencies;
+    std::vector<std::size_t> external_connections;
+    std::vector<std::size_t> incoming_rotary_dependencies;
+    std::vector<std::size_t> outgoing_rotary_dependencies;
+    std::expected<std::vector<TemplateRegionPort>, std::string> resource_ports = std::unexpected("region_cut_not_declared");
+    std::optional<std::string> replacement_gap; // Finite replacement may require a narrower interface than repetition.
+};
+
+enum class TemplateDependencyKind { Local, ModelData };
+
+struct TemplateDependencyOrigin {
+    TemplateDependencyKind kind;
+    std::size_t slot;
+    auto operator<=>(const TemplateDependencyOrigin &) const = default;
+};
+
+struct TemplateSequenceInput {
+    std::size_t step; // Alternating source member/separator slots.
+    TemplateDependencyOrigin dependency;
+    // A resource tail advances with repetition. An interior export instead
+    // belongs to one unique target producer; an external input has neither.
+    std::optional<TemplateResource> previous_resource;
+    std::optional<std::size_t> producer_step;
+};
+
+// Production completes this one cut after all derived dependencies and resource
+// roles are bound. The invocation tree and the cut share one membership array.
+struct TemplateRegion : TemplateSubgraphRegion {
+    TemplateRegion(std::size_t call, std::size_t parent) : source_call(call), parent_call(parent) {}
+
     std::size_t source_call;
     std::size_t parent_call;
     std::string semantic;
-    std::vector<std::size_t> nodes; // Indices in the enclosing definition; never additional executable nodes.
     std::vector<std::size_t> inputs;
     std::vector<std::size_t> outputs;
     std::optional<std::size_t> request_slot = std::nullopt;      // Producer-resolved slot in source_requests, inherited by nested regions.
     std::optional<TemplateRegionScope> cpu_scope = std::nullopt; // Observed profiler region, including wrapper bookkeeping; not a CPU service duration.
+    std::optional<std::size_t> input_slot = std::nullopt;
+};
+
+// The producer binds a native semantic call at its qualified transport cut.
+// CPU preparation and local layout remain ordinary observed work.
+struct TemplateCollectiveInterface {
+    std::string position;
+    CommunicationOperation operation;
+    std::optional<CollectiveCountRule> count;
+    std::string data_type;
+    std::uint32_t group_size;
+    TemplateRegionScope host; // Observation/context cuts, never a generated CPU service.
+    std::size_t owner_region;
+    std::size_t lane;
+    std::vector<std::size_t> inputs;
+    std::vector<std::size_t> outputs;
+    std::optional<std::size_t> model_region;
+    std::optional<std::uint32_t> model_layer;
+    std::vector<std::size_t> substitute_nodes = {};     // Only transport and explicitly observed auxiliary device services.
+    std::vector<std::size_t> transport_boundaries = {}; // Actual transport points, including pure internal task joins.
+    std::vector<std::size_t> launch_inputs = {};        // Native CPU submission cuts; independent of device data readiness.
+    std::vector<std::size_t> seam_dependencies = {};    // Observed stream edges split when PG1 submits no physical transport task.
+    std::optional<HostMessageRule> host_message = std::nullopt;
+};
+
+struct TemplateCollectiveInstance {
+    const TemplateDefinition * definition;
+    std::size_t interface;
+    TemplateRegionScope host;
+    std::size_t ready;
+    std::size_t done;
+    std::optional<std::uint32_t> model_layer;
+    const CollectiveWork * work = nullptr; // Borrowed from this batch's owning logical group.
+    std::optional<std::size_t> recipient_region = std::nullopt;
 };
 
 struct RotaryPositionDependency {
@@ -410,33 +495,6 @@ struct TemplateOperation {
     TemplateOperationWindow host;
     std::vector<TemplateOperationWindow> workers;
     std::vector<SourceSpanId> device_spans;
-    std::vector<SourceSpanId> collective_spans = {};
-};
-
-// A view into one definition. Boundary membership is distinct from node
-// ownership because external CPU services can share an operation endpoint.
-struct TemplateSubgraphRegion {
-    std::vector<std::size_t> nodes;
-    std::vector<std::size_t> boundaries;
-    std::vector<std::size_t> crossing_nodes;
-    // Outside work can share endpoints with the region; its extent must survive.
-    std::vector<std::size_t> retained_dependencies;
-    std::vector<std::size_t> internal_dependencies;
-    std::vector<std::size_t> incoming_dependencies;
-    std::vector<std::size_t> outgoing_dependencies;
-    std::vector<std::size_t> external_connections;
-    std::vector<std::size_t> incoming_rotary_dependencies;
-    std::vector<std::size_t> outgoing_rotary_dependencies;
-};
-
-// A resource entry/exit for the currently qualified region replacement rules.
-// Cross-rank notifications and arbitrary completion exports remain separate
-// interfaces; this is not a complete shared model-region contract.
-struct TemplateRegionPort {
-    TemplateResource resource;
-    std::size_t entry;
-    std::size_t exit;
-    std::optional<std::size_t> device_done = std::nullopt;
 };
 
 struct TemplateRegionResourceAnchor {
@@ -445,19 +503,28 @@ struct TemplateRegionResourceAnchor {
     bool predecessor;
 };
 
+struct TemplateOwnedDependency : TemplateDependency {
+    TemplateOwnedDependency(TemplateDependency edge, std::optional<std::size_t> owner = std::nullopt,
+                            std::optional<TemplateDependencyOrigin> original = std::nullopt)
+        : TemplateDependency(edge),
+          recipient_region(owner),
+          origin(original) {}
+    TemplateOwnedDependency(SourceRelation relation, std::size_t source, std::size_t target, std::optional<std::size_t> owner = std::nullopt)
+        : TemplateOwnedDependency(TemplateDependency{ relation, source, target }, owner) {}
+    std::optional<std::size_t> recipient_region;
+    std::optional<TemplateDependencyOrigin> origin; // Recipient edge identity survives endpoint relocation; copied donor edges have none.
+};
+
+struct TemplateOwnedResourcePort : TemplateRegionPort {
+    TemplateOwnedResourcePort(TemplateRegionPort port, std::optional<std::size_t> owner) : TemplateRegionPort(port), recipient_region(owner) {}
+    std::optional<std::size_t> recipient_region;
+};
+
 // Ports of a qualified serial device operation; CPU windows stay on TemplateOperation.
 struct TemplateDeviceOperationPorts {
     std::size_t stream_entry;
     std::size_t stream_exit;
     std::size_t device_done;
-};
-
-// A collective operation includes its stream commands as well as HCCL tasks.
-// Cross-rank notifications are rebound by the joint planner.
-struct TemplateCollectiveOperationPorts {
-    std::vector<TemplateRegionPort> resources;
-    std::size_t enclosing_completion;
-    std::vector<std::size_t> notification_connections;
 };
 
 struct TemplateOperationRewrite {
@@ -469,29 +536,21 @@ struct TemplateOperationRewrite {
     std::optional<std::size_t> rotary_producer = std::nullopt;
     std::vector<TemplateInsertedNode> inserted_nodes;
     std::vector<TemplateInsertedBoundary> inserted_boundaries;
+    // Reused interfaces keep their target identity and take the donor's actual
+    // observation. Multiple proposals remain visible until joint validation.
+    std::vector<std::pair<std::size_t, TemplateInsertedBoundary>> rebound_boundaries;
     std::vector<TemplateLane> inserted_lanes;
     std::vector<TemplateRegionPort> added_resource_ports;
+    std::optional<TemplateSequenceRewrite> sequence;
 
     // External ports are explicitly bound; unmapped internal points are allocated
     // in this plan after the recipient's source boundaries. Lane mapping is explicit.
-    // Kernel/communication observations remain owned by the bank, not this plan.
+    // Kernel/transfer observations remain owned by the bank, not this plan.
     std::map<std::size_t, std::size_t> insert_subgraph(const TemplateDefinition & donor, const TemplateDefinition & recipient,
                                                        std::span<const std::size_t> nodes, std::span<const std::size_t> dependencies,
                                                        std::map<std::size_t, std::size_t> boundary_mapping,
-                                                       const std::map<std::size_t, std::size_t> & lane_mapping);
-};
-
-// Observation metadata references existing local nodes; it creates no extra
-// communication service and does not imply a qualified target transformation.
-struct TemplateCollective {
-    SourceSpanId source_span;
-    std::string data_type;
-    std::vector<SourceCommunicationTask> tasks;
-    std::size_t envelope_node;
-    std::vector<std::size_t> task_nodes;
-    // One physical task entry/exit and a unique join of all member completions.
-    // The actual boundaries and dependencies remain in the graph.
-    bool serial_completion = false;
+                                                       const std::map<std::size_t, std::size_t> & lane_mapping,
+                                                       std::optional<std::pair<std::size_t, std::size_t>> scope_roots = std::nullopt);
 };
 
 // Preserves request multiplicity and a producer-qualified length branch.
@@ -535,7 +594,14 @@ struct TemplateDefinition {
 
     TemplateSubgraphRegion operation_region(const TemplateOperation & operation) const;
     TemplateSubgraphRegion workspace_region(const TemplateWorkspaceUse & use) const;
-    TemplateSubgraphRegion semantic_region(const TemplateRegion & source) const;
+    void finalize_regions();
+    void qualify_sequences();
+    std::size_t declare_sequence(std::vector<std::size_t> members, TemplateSequenceParameter parameter = TemplateSequenceParameter::Request,
+                                 std::vector<std::size_t> expanded = {});
+    const TemplateSubgraphRegion & sequence_step(const TemplateRegionSequence & sequence, std::size_t step) const;
+    bool contains_region(std::size_t ancestor, std::size_t region) const;
+    std::optional<std::size_t> region_owner(std::span<const std::size_t> nodes) const;
+    std::optional<TemplateSemanticScope> semantic_scope(std::optional<std::size_t> call, std::optional<std::size_t> root = std::nullopt) const;
     bool is_cpu_region(const TemplateRegion & region) const;
     bool is_cpu_region(std::span<const std::size_t> nodes) const;
     bool has_resource_roles() const;
@@ -546,8 +612,6 @@ struct TemplateDefinition {
                                                                                                    const TemplateResource & resource) const;
     std::expected<TemplateDeviceOperationPorts, std::string> device_operation_ports(const TemplateOperation & operation,
                                                                                     const TemplateSubgraphRegion & region) const;
-    std::expected<TemplateCollectiveOperationPorts, std::string> collective_operation_ports(const TemplateOperation & operation,
-                                                                                            const TemplateSubgraphRegion & region) const;
     bool is_resource_wait_import(const TemplateConnection & connection) const;
     bool is_region_wait_import(const TemplateDependency & edge, const TemplateSubgraphRegion & region) const;
     bool matches_transition(const BatchInput & target) const;
@@ -556,8 +620,7 @@ struct TemplateDefinition {
                                                                                  const TemplateRegion & donor_region) const;
     std::expected<TemplateOperationRewrite, std::string> plan_workspace_replacement(const TemplateWorkspaceUse & use, const TemplateDefinition & donor,
                                                                                     const TemplateWorkspaceUse & donor_use) const;
-    std::expected<TemplateOperationRewrite, std::string> plan_region_sequence(std::span<const std::size_t> source_members,
-                                                                              std::span<const TemplateRegionReference> members) const;
+    std::expected<TemplateOperationRewrite, std::string> plan_region_sequence(std::size_t sequence, std::span<const TemplateRegionReference> members) const;
     std::optional<std::size_t> operation_view_service(const TemplateOperation & operation) const;
     std::expected<TemplateOperationRewrite, std::string> plan_view_materialization_removal(const TemplateOperation & operation,
                                                                                            std::optional<std::size_t> view_producer) const;
@@ -579,22 +642,28 @@ struct TemplateDefinition {
     std::optional<AdmissionEntryState> admission;
     std::optional<AdmissionWork> admission_work;
     std::optional<std::size_t> admission_cpu_request_count; // Qualified CPU-only admission; zero denotes a pre-adder early return.
-    std::vector<std::size_t> admission_regions;             // Ordered accepted candidates; first initializes state, later members insert.
+    std::optional<std::size_t> admission_sequence;          // Ordered accepted candidates; first initializes state, later members insert.
     std::vector<BatchFilter> filters;
     std::map<BatchFilterBinding, std::size_t> filter_regions; // Producer-qualified calls to the same membership helper.
     std::optional<BatchMerge> merge;
 
     std::size_t entry;
-    std::map<PortKind, std::size_t> ports; // Indices in boundaries, as are node/dependency endpoints and inputs/outputs.
+    std::map<PortKind, std::size_t> ports; // Local boundaries, shared with node and dependency endpoints.
     std::vector<SourceRequest> source_requests;
+    std::vector<SourceIncomingRequest> source_incoming_requests;
+    std::expected<bool, std::string> input_reception = std::unexpected("native_input_reception_not_observed"); // False means a known unsupported input path.
+    std::vector<std::pair<std::size_t, std::size_t>> incoming_request_ready;                                   // Incoming slot -> actual native handler return.
+    std::optional<std::size_t> incoming_request_sequence;
+    std::optional<std::size_t> input_reception_sequence; // Native input prefix, independent of the later batch selection.
     std::optional<RequestLengthDomain> length_domain;
     // One observation per request slot; unknown is distinct from unfinished.
     std::vector<std::optional<bool>> publication_finishes;
     std::optional<PeriodicOutputPolicy> output_policy;
+    std::optional<std::size_t> output_boundary; // Qualified token handoff, distinct from the control return.
     std::optional<PublicationParameterLayout> publication_layout;
-    std::vector<std::size_t> publication_regions;            // Ordered, producer-qualified request publication bodies.
-    std::vector<std::size_t> request_initialization_regions; // Ordered, interchangeable cold request initializers.
-    bool publication_cpu_progress = false;                   // Unfinished, non-emitting Decode with preserved CPU work and observed waits.
+    std::optional<std::size_t> publication_sequence;
+    std::optional<std::size_t> request_initialization_sequence;
+    bool publication_cpu_progress = false; // Unfinished, non-emitting Decode with preserved CPU work and observed waits.
 
     std::vector<TemplateLane> lanes;
     std::vector<TemplateBoundaryObservation> boundary_observations; // Same local indices; owned by this source definition.
@@ -610,13 +679,14 @@ struct TemplateDefinition {
     }
 
     std::vector<TemplateRegion> regions;
+    std::vector<TemplateRegionSequence> sequences;
+    std::optional<std::size_t> model_sequence;
     std::optional<KvRegionBranch> kv_region;
     std::vector<TemplateOperation> operations;
     std::vector<TemplateWorkspaceUse> workspace_uses;
     std::map<SourceSpanId, BatchOperationVariant> batch_operations;
     std::map<SourceSpanId, TransferParameterLayout> transfer_layouts;
-    std::vector<TemplateCollective> collectives;
-    std::map<SourceSpanId, std::size_t> model_kernel_layouts;
+    std::vector<TemplateCollectiveInterface> collective_interfaces;
     std::map<SourceSpanId, const AttentionParameterRule *> attention_kernel_layouts;
     std::map<SourceSpanId, std::expected<KvParameterLayout, std::string>> kv_kernel_layouts;
     std::map<SourceSpanId, std::expected<RequestPoolParameterLayout, std::string>> request_pool_layouts;
@@ -628,17 +698,18 @@ struct TemplateDefinition {
     std::map<std::size_t, std::optional<std::size_t>> single_request_views;
     std::vector<TemplateConnectionObservation> connection_observations;
     TemplateConnection connection(std::size_t index) const;
-    std::vector<BoundaryId> inputs;
-    std::vector<BoundaryId> outputs;
 
 private:
     TemplateSubgraphRegion execution_region(std::span<const TemplateOperationWindow> windows, const std::set<SourceSpanId> & observed_members) const;
     std::expected<TemplateOperationRewrite, std::string> plan_subgraph_replacement(const TemplateSubgraphRegion & recipient_cut,
                                                                                    const TemplateDefinition & donor, const TemplateSubgraphRegion & donor_cut,
-                                                                                   const TemplateRegion * region) const;
-    TemplateSubgraphRegion complete_region(TemplateSubgraphRegion region) const;
-    std::expected<TemplateSubgraphRegion, std::string> cpu_sequence_separator(std::size_t entry, std::size_t exit, std::size_t parent) const;
-    std::expected<TemplateOperationRewrite, std::string> plan_device_operation_removal(const TemplateOperation & operation) const;
+                                                                                   const TemplateRegion * region,
+                                                                                   std::optional<std::size_t> donor_root = std::nullopt) const;
+    TemplateSubgraphRegion complete_region(TemplateSubgraphRegion region, std::optional<TemplateRegionScope> control = std::nullopt) const;
+    TemplateSubgraphRegion sequence_separator(const TemplateRegionSequence & sequence, std::size_t previous, std::size_t next) const;
+    void bind_sequence(TemplateRegionSequence & sequence) const;
+    std::expected<std::vector<TemplateRegionPort>, std::string> bind_region_ports(TemplateSubgraphRegion & region,
+                                                                                  std::optional<TemplateRegionScope> control) const;
 };
 
 // Executable membership belongs to the instance; source identities and port
@@ -646,31 +717,43 @@ private:
 class TemplateTopology {
 public:
     explicit TemplateTopology(const TemplateDefinition & definition);
-    // Returned offsets relocate each plan's inserted endpoints into this instance.
-    std::expected<std::vector<std::size_t>, std::string> apply_operations(const TemplateDefinition & definition,
-                                                                          std::span<const TemplateOperationRewrite> removals);
+    std::expected<void, std::string> apply_operations(const TemplateDefinition & definition, std::span<const TemplateOperationRewrite> removals);
+    std::expected<void, std::string> replace_sequence(const TemplateDefinition & definition, const TemplateSequenceRewrite & sequence,
+                                                      const TemplateDefinition & donor, const TemplateTopology & prepared);
 
     const std::vector<std::size_t> & nodes() const { return nodes_; }
     const std::vector<std::size_t> & dependencies() const { return dependencies_; }
-    const std::vector<TemplateDependency> & added_dependencies() const { return added_dependencies_; }
+    const std::vector<TemplateOwnedDependency> & added_dependencies() const { return added_dependencies_; }
     const std::vector<RotaryPositionDependency> & rotary_dependencies() const { return rotary_dependencies_; }
     const std::vector<TemplateInsertedNode> & inserted_nodes() const { return inserted_nodes_; }
     const std::vector<TemplateInsertedBoundary> & inserted_boundaries() const { return inserted_boundaries_; }
+    const std::map<std::size_t, TemplateInsertedBoundary> & rebound_boundaries() const { return rebound_boundaries_; }
+    TemplateInsertedBoundary boundary_observation(const TemplateDefinition & definition, std::size_t boundary) const;
     const std::vector<TemplateLane> & inserted_lanes() const { return inserted_lanes_; }
-    const std::vector<TemplateRegionPort> & added_resource_ports() const { return added_resource_ports_; }
+    const std::vector<TemplateOwnedResourcePort> & added_resource_ports() const { return added_resource_ports_; }
+    const std::vector<TemplateCollectiveInstance> & collective_interfaces() const { return collective_interfaces_; }
+    const std::vector<std::pair<std::size_t, std::size_t>> & incoming_request_ready() const { return incoming_request_ready_; }
+    std::size_t boundary_alias(std::size_t boundary, bool incoming = false) const;
     std::vector<std::vector<std::size_t>> successors(const TemplateDefinition & definition) const;
     void bind_inserted_kernel(std::size_t index, SourceKernel kernel);
     void bind_inserted_transfer(std::size_t index, SourceTransfer transfer);
+    void bind_collective_work(std::size_t index, const CollectiveWork & work);
 
 private:
+    class SequenceExpansion;
+    std::expected<void, std::string> apply_sequence(const TemplateDefinition & definition, const TemplateSequenceRewrite & sequence);
     std::vector<std::size_t> nodes_;
     std::vector<std::size_t> dependencies_;
-    std::vector<TemplateDependency> added_dependencies_;
+    std::vector<TemplateOwnedDependency> added_dependencies_;
     std::vector<RotaryPositionDependency> rotary_dependencies_;
     std::vector<TemplateInsertedNode> inserted_nodes_;
     std::vector<TemplateInsertedBoundary> inserted_boundaries_;
+    std::map<std::size_t, TemplateInsertedBoundary> rebound_boundaries_;
     std::vector<TemplateLane> inserted_lanes_;
-    std::vector<TemplateRegionPort> added_resource_ports_;
+    std::vector<TemplateOwnedResourcePort> added_resource_ports_;
+    std::vector<TemplateCollectiveInstance> collective_interfaces_;
+    std::vector<std::pair<std::size_t, std::size_t>> incoming_request_ready_;
+    std::map<std::size_t, std::pair<std::size_t, std::size_t>> boundary_aliases_;
     std::size_t source_boundary_count_;
     std::size_t source_lane_count_;
 };
@@ -683,11 +766,19 @@ struct TemplateEndpoint {
     auto operator<=>(const TemplateEndpoint &) const = default;
 };
 
+struct TemplateCollectiveGroup {
+    CollectiveWork work;
+    std::vector<TemplateEndpoint> ready;
+    std::vector<TemplateEndpoint> done;
+    std::vector<std::pair<TemplateEndpoint, TemplateEndpoint>> completion_entry_dependencies = {};
+};
+
 // Observed shared points retain their source identity. Inserted points belong
 // only to one target instance, even when they reuse the same donor evidence.
 struct TemplateSourceIdentity {
     std::string_view manifest; // Borrowed from an immutable bank definition.
     std::size_t local;
+    std::uint32_t replica;
 
     auto operator<=>(const TemplateSourceIdentity &) const = default;
 };
@@ -717,21 +808,23 @@ struct TemplateWorkspaceUseInstance {
     std::size_t begin;
     std::size_t end;
     std::optional<WorkspaceDemand> demand;
+    nlohmann::json effect = nullptr; // Diagnostics of this accepted use; capacities remain owned by WorkspaceState.
 };
 
 struct TemplateInstance {
-    TemplateInstance(WorkId work, const TemplateDefinition & source);
+    TemplateInstance(WorkId work, const TemplateDefinition & source, std::uint32_t target_rank, const TemplateRankBinding & rank_binding);
 
     WorkId work_id;
-    const TemplateDefinition * definition; // Bank-owned immutable definition; the bank outlives all runtime work.
+    std::uint32_t rank;
+    const TemplateRankBinding * rank_binding; // Bank-owned control participation and output role, separate from local dependency gates.
+    const TemplateDefinition * definition;    // Bank-owned immutable definition; the bank outlives all runtime work.
     TemplateTopology topology;
     // Target connections own their membership and local endpoints independently of the source.
     std::vector<TemplateTargetConnection> connections;
     std::map<SourceSpanId, SourceKernel> kernel_overrides;
     std::map<SourceSpanId, SourceTransfer> transfer_overrides;
     std::vector<TemplateWorkspaceUseInstance> workspace_uses; // Only uses present in the final target topology; no capacity mutation.
-    std::optional<PublicationWork> publication_work;
-    std::map<SourceSpanId, SourceCommunicationTask> communication_overrides;
+    std::vector<TemplateCollectiveGroup> collective_groups;   // One owner per logical operation; all participants retain local interfaces.
     std::vector<TemplateTargetStreamWait> stream_waits;
     std::map<std::size_t, TemplateConnectionInstance> resource_imports;
     // Cross-instance ordering introduced by a qualified new resource interface.
@@ -742,11 +835,12 @@ struct TemplateInstance {
     std::expected<void, std::string> bind_workspace_uses(const BatchInput & input);
 
     TemplateBoundary boundary(std::size_t index) const;
-    const TemplateLane & lane(std::size_t index) const;
+    TemplateLane lane(std::size_t index) const;
+    TemplateResource resource(TemplateResource source) const;
+    TemplateSourceIdentity source_identity(std::size_t local) const;
     TemplateBoundaryIdentity boundary_identity(std::size_t index) const;
     const SourceKernel * kernel(const TemplateNode & node) const;
     const SourceTransfer * transfer(const TemplateNode & node) const;
-    const SourceCommunicationTask * communication(const TemplateNode & node) const;
 
 private:
     std::expected<void, std::string> append_workspace_use(const TemplateDefinition & source, const TemplateNode & node, const BatchInput & input);
@@ -767,6 +861,7 @@ struct TemplateGap {
 class TemplateAssembly {
 public:
     std::expected<void, std::string> connect(std::span<TemplateInstance *> instances);
+    std::vector<TemplateEndpoint> frontier() const;
 
 private:
     static void prune_frontier(std::map<TemplateBoundaryIdentity, TemplateEndpoint> & candidates, const DependencyPaths<TemplateBoundaryIdentity> & paths);
@@ -774,6 +869,15 @@ private:
     // An absent resource has no prior modeled work. An empty value is an observed
     // resource whose export is unknown, and must not be treated as initially idle.
     std::map<TemplateResource, std::vector<TemplateEndpoint>> frontiers_;
+};
+
+struct TemplateRankBinding {
+    std::uint32_t source_rank;
+    std::vector<PortKind> completion_ports;
+    bool publishes_outputs;
+    bool receives_inputs;
+
+    auto operator<=>(const TemplateRankBinding &) const = default;
 };
 
 // Produced once and then owned by the consumer. Nodes borrow immutable kernel
@@ -786,9 +890,10 @@ struct TemplateSource {
     TemplateSource & operator=(TemplateSource &&) = default;
 
     std::filesystem::path manifest_path;
-    std::string model_path;
+    nlohmann::json model_configuration;
     nlohmann::json configuration;
-    std::uint32_t ranks;
+    std::uint32_t source_rank;
+    std::vector<TemplateRankBinding> rank_bindings;
     std::uint32_t page_size_tokens;
     Environment deployment;
     std::string resolution;
@@ -801,7 +906,6 @@ struct TemplateSource {
     std::set<ModelParameterRule> model_rules;
     std::set<WorkspaceDemandLayout> workspace_rules;
     std::set<AttentionParameterRule> attention_rules;
-    std::set<CollectiveParameterRule> collective_rules;
     TemplateRegionStructures region_structures;
     std::map<std::tuple<StepKind, BatchPhase, std::uint32_t>, std::vector<TemplateDefinition>> definitions;
     nlohmann::json gaps;
@@ -812,21 +916,21 @@ struct TemplateSource {
     std::optional<std::uint32_t> sequence_capacity_tokens; // Processed tokens, including the current query.
     std::vector<std::string> transforms;
     std::vector<std::string> limits;
+
+    std::uint32_t rank_count() const { return static_cast<std::uint32_t>(rank_bindings.size()); }
 };
 
-// Source definitions are immutable. Selection preserves the observed rank/batch
-// cohort; target descriptors and topology change only through qualified rules.
+// Each local role keeps its observed native batch cohort. Independent role
+// sessions meet through target work and interfaces, never source batch IDs.
 class TemplateBank {
 public:
-    explicit TemplateBank(TemplateSource source) : source_(std::move(source)) {
-        for (auto & [key, definitions] : source_.definitions)
-            for (auto & definition : definitions) definition.source_manifest = source_.manifest_path;
-        bind_sources({});
-    }
+    explicit TemplateBank(TemplateSource source);
 
     // Borrowed sources are qualified by the caller; all owners remain alive during prediction.
-    // Each batch still selects one complete native cohort before local rewrites.
-    void bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources = {});
+    void bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources = {},
+                      std::optional<std::uint32_t> request_capacity = std::nullopt);
+
+    bool shares_source_contract(const TemplateBank & bank) const;
 
     const TemplateSource & source() const { return source_; }
 
@@ -836,13 +940,13 @@ public:
 
     std::uint32_t page_size_tokens() const;
     const std::expected<AdmissionPolicy, TemplateGap> & admission_policy() const;
-    std::span<const TemplateWorkspacePool> workspace_pools() const { return source_.workspace_pools; }
+    std::span<const TemplateWorkspacePool> workspace_pools() const { return workspace_pools_; }
     const TemplateWorkspacePool & workspace_pool(const TemplateDefinition & definition, std::size_t index) const;
     std::expected<TemplateOperationRewrite, std::string> plan_workspace_replacement(const TemplateInstance & instance, const TemplateWorkspaceUseInstance & use,
                                                                                     WorkspaceBranch branch, const BatchInput & input) const;
     std::expected<void, TemplateGap> qualify(std::uint32_t request_capacity) const;
     std::expected<void, TemplateGap> qualify_initialization(std::uint32_t request_capacity) const;
-    nlohmann::json describe(bool diagnostics) const;
+    nlohmann::json describe() const;
 
 private:
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_materializations(const TemplateDefinition & source, const BatchInput & target) const;
@@ -850,7 +954,7 @@ private:
     std::expected<void, std::string> parameterize_insertions(TemplateTopology & topology, const InvokeStep & invocation, std::uint32_t request_capacity) const;
 
     // Failure order follows qualification, never the spelling of a gap reason.
-    enum class MatchStage { Source, RequestCount, Publication, Shape, Structure, Communication };
+    enum class MatchStage { Source, Input, RequestCount, Publication, Shape, Structure, Communication };
     struct SelectionFailure {
         MatchStage stage;
         TemplateGap gap;
@@ -858,7 +962,7 @@ private:
         SelectionFailure(MatchStage stage, TemplateGap gap) : stage(stage), gap(std::move(gap)) {}
         SelectionFailure(MatchStage stage, TemplateGapKind kind, std::string reason, const InvokeStep & invocation, std::uint32_t rank)
             : stage(stage),
-              gap{ kind, std::move(reason), invocation.step, invocation.input.phase, rank } {}
+              gap{ kind, std::move(reason), invocation.step, invocation.input->phase, rank } {}
     };
 
     static std::expected<void, SelectionFailure> qualify_source(const TemplateDefinition & source, const InvokeStep & invocation);
@@ -868,9 +972,13 @@ private:
                                                                        std::uint32_t request_capacity) const;
 
     std::expected<void, TemplateGap> parameterize_communications(std::span<TemplateInstance> instances, const InvokeStep & invocation) const;
+    std::expected<void, std::string> bind_input_reception(TemplateTopology & topology, const TemplateDefinition & source, const BatchInput & target) const;
+    static std::expected<std::optional<TemplateOperationRewrite>, std::string> plan_incoming_requests(const TemplateDefinition & source,
+                                                                                                      const BatchInput & target);
 
     std::expected<TemplateInstance, std::string> instantiate_source(const TemplateDefinition & source, const InvokeStep & invocation,
-                                                                    std::uint32_t request_capacity) const;
+                                                                    std::uint32_t request_capacity, std::uint32_t target_rank,
+                                                                    const TemplateRankBinding & rank_binding) const;
 
     std::expected<std::optional<TemplateOperationRewrite>, std::string> plan_kv_region(const TemplateDefinition & source, const BatchInput & target) const;
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_publication_members(const TemplateDefinition & source,
@@ -880,12 +988,13 @@ private:
                                                                      const BatchInput & target) const;
     std::expected<std::optional<TemplateOperationRewrite>, std::string> plan_running_update(const TemplateDefinition & source, const BatchInput & target) const;
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_batch_operations(const TemplateDefinition & source, const BatchInput & target) const;
-    std::expected<std::optional<SourceKernel>, std::string> transform_kernel(const TemplateNodeObservation & observation, const TemplateDefinition & source,
+    std::expected<std::optional<SourceKernel>, std::string> transform_kernel(const TemplateNode & node, const TemplateDefinition & source,
                                                                              const InvokeStep & invocation, std::uint32_t request_capacity,
                                                                              std::optional<std::size_t> request_slot = std::nullopt,
                                                                              std::optional<BatchFilterBinding> filter_binding = std::nullopt) const;
 
     TemplateSource source_;
+    std::vector<TemplateWorkspacePool> workspace_pools_;
     std::vector<const TemplateDefinition *> operation_sources_; // Borrowed from workflow-owned banks; only declared independent operations.
     std::vector<const TemplateBank *> banks_;                   // Qualified local donors may lack an initialization contract.
     std::map<std::tuple<StepKind, BatchPhase, std::uint32_t>, std::vector<const TemplateDefinition *>> donors_;

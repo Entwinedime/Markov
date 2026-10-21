@@ -13,10 +13,11 @@ from markov_collection.artifacts.json_file import write_json
 
 
 class ServingPortObserver(SGLangBatchObserver):
-    def __init__(self, directory: Path, request_ids: set[str]) -> None:
-        super().__init__(request_ids)
+    def __init__(self, directory: Path, request_ids: set[str], *, source_rank: int | None = None) -> None:
+        super().__init__(request_ids, source_rank=source_rank)
         self.directory = directory
         self._ports: list[dict[str, Any]] = []
+        self._outputs: list[dict[str, Any]] = []
         self._arrivals: list[dict[str, Any]] = []
 
     @staticmethod
@@ -70,7 +71,9 @@ class ServingPortObserver(SGLangBatchObserver):
         requests = [
             {"id": req.rid, "generated_tokens": len(req.output_ids), "finished": req.finished()} for req in batch.reqs
         ]
-        self._ports.append({"port": "published", **timing, "metadata": metadata, "result": {"requests": requests}})
+        self._ports.append(
+            {"port": "result_processed", **timing, "metadata": metadata, "result": {"requests": requests}}
+        )
 
         self._finished_ids.update(
             request["id"] for request in requests if request["finished"] and request["id"] in self.request_ids
@@ -78,11 +81,12 @@ class ServingPortObserver(SGLangBatchObserver):
         if self._finished_ids == self.request_ids:
             # All workers and the request driver share this host's MONOTONIC
             # clock. This does not establish a clock relation across machines.
-            rank = scheduler.ps.tp_rank
+            rank = self.source_rank(scheduler.ps.tp_rank)
             write_json(
                 self.directory / f"rank-{rank}-ports.json",
                 {
                     "rank": rank,
+                    "publishes_outputs": scheduler.send_to_detokenizer.socket is not None,
                     "pid": os.getpid(),
                     "clock": {
                         "name": "perf_counter_ns",
@@ -90,9 +94,35 @@ class ServingPortObserver(SGLangBatchObserver):
                     },
                     "arrivals": self._arrivals,
                     "ports": self._ports,
+                    "outputs": self._outputs,
                 },
             )
 
+        return result
+
+    def output(self, original: Callable[..., Any], streamer: Any, reqs: list[Any], *args: Any, **kwargs: Any) -> Any:
+        if streamer.send_to_detokenizer.socket is None:
+            return original(streamer, reqs, *args, **kwargs)
+
+        requests = [(req, req.send_token_offset) for req in reqs if req.rid in self.request_ids]
+        if not requests:
+            return original(streamer, reqs, *args, **kwargs)
+
+        result = original(streamer, reqs, *args, **kwargs)
+        at_ns = time.perf_counter_ns()
+        # The native sender has returned. Offsets identify the requests whose
+        # token payload was handed downstream; an empty batch is not output.
+        for request, previous in requests:
+            if request.send_token_offset > previous:
+                self._outputs.append(
+                    {
+                        "request_id": request.rid,
+                        "at_ns": at_ns,
+                        "tokens": request.send_token_offset - previous,
+                        "cumulative_tokens": request.send_token_offset,
+                        "finished": request.finished(),
+                    }
+                )
         return result
 
 
@@ -100,9 +130,16 @@ def install(prepared: dict[str, Any]) -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     observer = ServingPortObserver(
-        Path(os.environ["MARKOV_OBSERVATIONS"]), {request["id"] for request in prepared["requests"]}
+        Path(os.environ["MARKOV_OBSERVATIONS"]),
+        {request["id"] for request in prepared["requests"]},
+        source_rank=prepared.get("shard_execution", {}).get("rank"),
     )
     scheduler = "sglang.srt.managers.scheduler.Scheduler"
     HookRegistry.register(f"{scheduler}.handle_generate_request", observer.arrive, HookType.AROUND)
     HookRegistry.register(f"{scheduler}.run_batch", observer.execute, HookType.AROUND)
     HookRegistry.register(f"{scheduler}.process_batch_result", observer.publish, HookType.AROUND)
+    HookRegistry.register(
+        "sglang.srt.managers.scheduler_components.output_streamer.SchedulerOutputStreamer.stream_output",
+        observer.output,
+        HookType.AROUND,
+    )

@@ -26,14 +26,4 @@ SourceAdmissionPolicy SourceAdmissionPolicy::read(const nlohmann::json & value) 
     return observed;
 }
 
-SourceWorkerControls SourceWorkerControls::read(const nlohmann::json & value) {
-    SourceWorkerControls observed{ value.at("waiting_timeout_seconds").get<double>(),
-                                   value.at("running_timeout_seconds").get<double>(),
-                                   value.at("test_retract").get<bool>(),
-                                   value.at("require_mlp_sync").get<bool>() };
-    if (!std::isfinite(observed.waiting_timeout_seconds) || !std::isfinite(observed.running_timeout_seconds))
-        throw std::invalid_argument("native request timeouts must be finite seconds");
-    return observed;
-}
-
 } // namespace markov

@@ -52,40 +52,6 @@ class NativeAttempt:
             except ChildProcessError:
                 return
 
-    def _command(self) -> list[str]:
-        build = self.root / "build/collection/ascend" / self.configuration["framework"]
-        role = self.configuration["role"]
-        ports = role == "validation" and self.configuration["observation_purpose"] == "ports"
-        setup = ""
-        if not ports:
-            setup = (
-                'cmake -S src/collection/adapters/runtimes/ascend/native -B "$3" -DCMAKE_BUILD_TYPE=Release && '
-                'cmake --build "$3" -j2 && '
-            )
-
-        # Port observation shares the native lifecycle without building or
-        # loading the structure journal and device instrumentation.
-        setup += "python3 -m pip install --no-deps --no-build-isolation -e . && "
-        if not ports:
-            setup += 'export LD_PRELOAD="$3/libmarkov_native_observation.so${LD_PRELOAD:+:$LD_PRELOAD}" && '
-            if role in {"base", "validation"} or self.configuration["measurement_kind"] in {"device", "communication"}:
-                setup += 'export MARKOV_NATIVE_OBSERVATIONS="$2/native_api" && '
-
-        module = "markov_collection.workflow.capture"
-        if role == "performance" and self.configuration["measurement_kind"] == "communication":
-            module = "markov_collection.adapters.runtimes.ascend.collective_sampling"
-
-        return self.configuration["native_entrypoint"] + [
-            "bash",
-            "-lc",
-            setup + 'exec python3 -m "$4" --input "$1" --output "$2"',
-            "markov-capture",
-            str(self.directory / "prepared_input.json"),
-            str(self.directory),
-            str(build),
-            module,
-        ]
-
     def run(self) -> int:
         if os.getpid() != 1:
             raise RuntimeError("native attempt requires PID 1 in a dedicated container with a private PID namespace")
@@ -94,7 +60,10 @@ class NativeAttempt:
         signal.signal(signal.SIGINT, self._interrupt)
         self._save()
 
-        with (self.root / "data/collection.lock").open("a", encoding="utf-8") as lease:
+        # The shared lease also exists when run outputs use an external path.
+        lease_path = self.root / "data/collection.lock"
+        lease_path.parent.mkdir(exist_ok=True)
+        with lease_path.open("a", encoding="utf-8") as lease:
             try:
                 fcntl.flock(lease, fcntl.LOCK_EX)
 
@@ -107,8 +76,10 @@ class NativeAttempt:
                 if remaining_ns <= 0:
                     raise subprocess.TimeoutExpired("container bootstrap", 0)
 
-                with Path(self.configuration["log"]).open("w", encoding="utf-8") as log:
-                    process = subprocess.Popen(self._command(), stdout=log, stderr=subprocess.STDOUT)
+                log_path = Path(self.configuration["log"])
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("w", encoding="utf-8") as log:
+                    process = subprocess.Popen(self.configuration["command"], stdout=log, stderr=subprocess.STDOUT)
                     deadline_ns = self.started_ns + remaining_ns
                     code = process.wait(timeout=max(0, deadline_ns - time.perf_counter_ns()) / 1_000_000_000)
 

@@ -149,7 +149,7 @@ public:
 
 private:
     static const char * kind_name(CpuActivityKind kind) {
-        constexpr std::array names{ "scope", "operator", "enqueue", "worker", "submission", "query", "wait", "transfer" };
+        constexpr std::array names{ "scope", "operator", "enqueue", "worker", "submission", "query", "wait", "transfer", "function" };
         return names[static_cast<std::size_t>(kind)];
     }
 
@@ -173,8 +173,9 @@ struct CpuActivity::Record {
 
 bool cpu_sampling_active() { return CpuSampling::instance().enabled() && thread_clock.scope != 0 && thread_clock.observers == 0; }
 bool cpu_sampling_enabled() { return CpuSampling::instance().enabled(); }
+bool cpu_sampling_excluded() { return thread_clock.observers != 0; }
 
-CpuObserver::CpuObserver() : active_(cpu_sampling_enabled() && thread_clock.scope != 0) {
+CpuObserver::CpuObserver(bool force) : active_(force || (cpu_sampling_enabled() && thread_clock.scope != 0)) {
     if (active_) thread_clock.pause();
 }
 
@@ -217,6 +218,13 @@ extern "C" void * markov_cpu_scope_begin(std::uint64_t identity, const char * na
 }
 
 extern "C" void markov_cpu_scope_end(void * handle) { delete static_cast<markov::collection::CpuScope *>(handle); }
+
+extern "C" void * markov_cpu_function_begin(const char * name, std::uint64_t context_id) {
+    if (!markov::collection::cpu_sampling_active()) return nullptr;
+    return new markov::collection::CpuActivity(markov::collection::CpuActivityKind::Function, name, context_id);
+}
+
+extern "C" void markov_cpu_function_end(void * handle) { delete static_cast<markov::collection::CpuActivity *>(handle); }
 
 extern "C" void markov_cpu_observer_begin() { markov::collection::thread_clock.pause(); }
 extern "C" void markov_cpu_observer_end() { markov::collection::thread_clock.resume(); }

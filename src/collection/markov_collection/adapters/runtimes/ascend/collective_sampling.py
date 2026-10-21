@@ -117,6 +117,7 @@ class NativeCollectiveSampling(CaptureSession):
         if not self.prepared["permission"]["allow_run"]:
             raise ValueError("performance collection permission is disabled")
 
+        runtime_environment = RuntimeEnvironment().observe(self.prepared["environment"])
         artifacts = AscendCaptureArtifacts(self.prepared, self.directory)
         write_json(self.directory / "prepared_input.json", self.prepared)
         with socket.socket() as listener:
@@ -133,7 +134,7 @@ class NativeCollectiveSampling(CaptureSession):
                 "framework_version": importlib.metadata.version(self.prepared["framework"]),
                 "configuration": self.prepared["configuration"],
                 "deployment": self.prepared["environment"],
-                "runtime": RuntimeEnvironment().describe(),
+                "runtime": runtime_environment,
                 "backend": "hccl",
                 "workers": [f"rank-{rank}-environment.json" for rank in range(world_size)],
                 "profiler_enabled": True,

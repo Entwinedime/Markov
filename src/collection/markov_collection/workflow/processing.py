@@ -14,7 +14,7 @@ from markov_collection.artifacts.json_file import read_json, write_json
 
 class CaptureNormalizer(Protocol):
     def extract(self) -> Path: ...
-    def release(self) -> None: ...
+    def release(self, diagnostics: Path | None) -> None: ...
 
 
 class CaptureProcessing:
@@ -25,12 +25,14 @@ class CaptureProcessing:
         directory: Path,
         template_directory: Path | None,
         work_directory: Path | None,
+        diagnostics_directory: Path | None,
     ) -> None:
         self.role = role
         self.normalizer = normalizer
         self.directory = directory
         self.template_directory = template_directory
         self.work_directory = work_directory
+        self.diagnostics_directory = diagnostics_directory
         self.root = Path(__file__).resolve().parents[4]
 
     def run(self) -> dict[str, Any]:
@@ -46,7 +48,7 @@ class CaptureProcessing:
             failure.unlink(missing_ok=True)
             try:
                 result = self._process()
-                self.normalizer.release()
+                self.normalizer.release(self.diagnostics_directory)
             except Exception as error:
                 # Only the processor can declare its work terminal. Host command
                 # failures and interrupts do not manufacture this record.
@@ -96,6 +98,7 @@ def main() -> None:
     parser.add_argument("--directory", type=Path, help="processing receipts and lock")
     parser.add_argument("--template-directory", type=Path, help="published compiled templates")
     parser.add_argument("--work-directory", type=Path, help="optional source graph diagnostics")
+    parser.add_argument("--diagnostics-directory", type=Path, help="retained raw observations")
     arguments = parser.parse_args()
 
     # This process entry point composes the installed adapters. The persisted
@@ -128,6 +131,7 @@ def main() -> None:
         arguments.directory or arguments.capture.parent,
         arguments.template_directory,
         arguments.work_directory,
+        arguments.diagnostics_directory,
     ).run()
     print(json.dumps(result))
 

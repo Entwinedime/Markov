@@ -97,6 +97,17 @@ struct CommunicationCostFeatures {
     nlohmann::json describe() const;
 };
 
+// One participant's transport service. Host completion envelopes do not infer
+// a precise background launch. Ordinary CPU intervals retain this work only
+// as context, keeping their own measurement boundary.
+struct CollectiveCostFeatures {
+    CollectiveWork work;
+    std::uint32_t rank;
+
+    nlohmann::json describe() const;
+    auto operator<=>(const CollectiveCostFeatures &) const = default;
+};
+
 enum class TransferExecution { DeviceAsync, SynchronousHostDriver };
 
 // Device work and complete synchronous host calls have different boundaries.
@@ -121,6 +132,7 @@ struct KernelCostQuery {
 
     static KernelCostQuery from_work(const SourceKernel & work);
     nlohmann::json describe() const;
+    auto operator<=>(const KernelCostQuery &) const = default;
 };
 
 // An unknown physical service remains explicit instead of receiving a default.
@@ -128,14 +140,15 @@ struct UnresolvedCostQuery {
     SourceSpanKind node_kind;
 
     nlohmann::json describe() const;
+    auto operator<=>(const UnresolvedCostQuery &) const = default;
 };
 
-enum class CostQueryKind { Undefined, Kernel, Communication, Transfer, DeviceCommand, Cpu };
+enum class CostQueryKind { Undefined, Kernel, Communication, Collective, Transfer, DeviceCommand, Cpu };
 
 enum class CostQueryIssue { None, FeaturesUndefined };
 
-using CostQueryFeatures =
-    std::variant<KernelCostQuery, CommunicationCostFeatures, TransferCostFeatures, DeviceCommandWork, CpuServiceWork, UnresolvedCostQuery>;
+using CostQueryFeatures = std::variant<KernelCostQuery, CommunicationCostFeatures, CollectiveCostFeatures, TransferCostFeatures, DeviceCommandWork,
+                                       CpuServiceWork, UnresolvedCostQuery>;
 
 // One physical service has one cost query. Coverage and execution share it.
 struct CostQuery {
@@ -147,6 +160,7 @@ struct CostQuery {
     static CostQuery from_work(const ServiceWork & work);
     static std::string_view kind_name(CostQueryKind kind);
     nlohmann::json describe() const;
+    auto operator<=>(const CostQuery &) const = default;
 };
 
 } // namespace markov

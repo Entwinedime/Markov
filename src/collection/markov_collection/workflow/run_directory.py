@@ -32,10 +32,6 @@ class RunDirectory:
     def inputs(self) -> Path:
         return self.root / "inputs"
 
-    @property
-    def catalogs(self) -> Path:
-        return self.root / "assets/catalogs"
-
     def capture(self, role: str, ordinal: int) -> Path:
         return self.root / "captures" / role / f"{ordinal:03d}"
 
@@ -48,8 +44,8 @@ class RunDirectory:
     def diagnostics(self, kind: str, ordinal: int) -> Path:
         return self.root / "diagnostics" / kind / f"{ordinal:03d}"
 
-    def log(self, task: str) -> Path:
-        return self.root / "logs" / f"{task}.log"
+    def log(self, phase: str, ordinal: int) -> Path:
+        return self.root / "logs" / phase / f"{ordinal:03d}.log"
 
     def container(self, task: str) -> str:
         # Process names are global; output directories and user labels are not.

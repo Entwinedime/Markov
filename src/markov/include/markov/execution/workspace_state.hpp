@@ -15,7 +15,7 @@ namespace markov {
 class WorkspaceState {
 public:
     explicit WorkspaceState(std::span<const TemplateWorkspacePool> pools);
-    std::expected<void, std::string> advance(TemplateInstance & instance, const TemplateBank & templates, const BatchInput & input);
+    std::expected<void, std::string> advance(TemplateInstance & instance, const TemplateBank & templates, const BatchInput & input, bool diagnostics = false);
     const std::map<TemplateResource, std::uint64_t> & capacities() const { return capacities_; }
 
 private:

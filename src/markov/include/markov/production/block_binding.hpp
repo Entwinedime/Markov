@@ -20,7 +20,6 @@ struct SourceTensorLayout {
     std::vector<std::int64_t> shape;
     std::vector<std::int64_t> stride;
     std::string dtype;
-    std::string device;
 
     static std::optional<SourceTensorLayout> read(const nlohmann::json & value);
 };
@@ -29,13 +28,13 @@ struct SourceNativeRegion {
     std::string semantic;
     std::string module_type;
     std::string method;
+    const nlohmann::json & result; // Immutable capture record, borrowed throughout template production.
     std::map<std::string, std::int64_t> parameters;
     std::map<std::string, std::int64_t> call_parameters;
     std::map<std::string, std::optional<SourceTensorLayout>> inputs;
     std::map<std::string, std::optional<SourceTensorLayout>> outputs;
     std::map<std::string, std::vector<std::int64_t>> cpu_values;
     std::optional<std::string> request_id = std::nullopt;
-    nlohmann::json result = nullptr;
 };
 
 enum class NativePortAnchor { ScheduleDecision, ParentScheduleReturn, ScopeReturn, OwnedDeviceCompletion };
@@ -66,14 +65,15 @@ struct NativeRegionOutput {
 };
 
 struct NativeRegionBinding {
-    SourceNativeRegion read(const nlohmann::json & metadata) const;
+    SourceNativeRegion read(const nlohmann::json & record) const;
+    std::string cpu_name() const;
 
     std::string_view identity;
     std::string_view semantic;
     std::string_view module_type;
     std::string_view method;
-    std::span<const std::string_view> inputs;
-    std::span<const NativeRegionParameter> parameters;
+    std::span<const std::string_view> inputs{};
+    std::span<const NativeRegionParameter> parameters{};
     std::span<const NativeRegionParameter> call_parameters{};
     std::span<const NativeRegionOutput> outputs{};
     std::span<const NativeRegionParameter> module_inputs{};

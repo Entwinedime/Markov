@@ -5,33 +5,24 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib.metadata
-import json
 import os
 import signal
 import time
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.session import SGLangSession
-from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.artifacts.json_file import write_json
 
 
 class SGLangCapture(SGLangSession):
     def run(self) -> None:
-        from sglang.srt.entrypoints.engine import Engine
-
         requests = self.prepared["requests"]
         profiling = self.prepared["role"] != "validation" or self.prepared["observation_purpose"] == "structure"
         os.environ["SGLANG_PLUGINS"] = "markov"
 
         # Host wall times describe collection overhead, never target node costs.
         engine_started_ns = time.perf_counter_ns()
-        engine = Engine(
-            model_path=self.prepared["model_path"],
-            tokenizer_path=self.prepared["tokenizer_path"],
-            skip_tokenizer_init=True,
-            **self.prepared["configuration"],
-        )
+        engine = self._start_engine()
         engine_ready_ns = time.perf_counter_ns()
         signal.signal(signal.SIGQUIT, self._handle_worker_failure)
         try:
@@ -56,7 +47,9 @@ class SGLangCapture(SGLangSession):
                 request_timing, responses = engine.loop.run_until_complete(self._execute(engine))
                 cleanup = []
                 if self.prepared["role"] == "base":
-                    cleanup = engine.loop.run_until_complete(self._await_cleanup(request_ids))
+                    cleanup = engine.loop.run_until_complete(
+                        self._await_cleanup(request_ids, self.directory / "observations")
+                    )
             finally:
                 observation_finished_ns = time.perf_counter_ns()
                 if not self._worker_failed:
@@ -89,9 +82,9 @@ class SGLangCapture(SGLangSession):
                 {
                     "framework": "sglang",
                     "framework_version": importlib.metadata.version("sglang"),
-                    "runtime": RuntimeEnvironment().describe(),
+                    "runtime": self.runtime_environment,
                     "configuration": self.prepared["configuration"],
-                    "model_configuration": self._model_configuration(),
+                    "model_configuration": self.prepared["model_configuration"],
                     "effective_server_args": dataclasses.asdict(engine.tokenizer_manager.server_args),
                     "collection_completion": cleanup,
                     "profiler_enabled": profiling,
@@ -135,7 +128,7 @@ class SGLangCapture(SGLangSession):
                 "input": "prepared_input.json",
                 "environment": "native_environment.json",
                 "responses": "responses.json",
-                "expected_ranks": list(range(self.prepared["configuration"]["tp_size"])),
+                "expected_ranks": list(self.worker_ranks),
                 "ports": [
                     str(path.relative_to(self.directory))
                     for path in sorted((self.directory / "observations").glob("rank-*-ports.json"))
@@ -143,7 +136,14 @@ class SGLangCapture(SGLangSession):
                 "boundaries": {
                     "arrival": "Scheduler.handle_generate_request ScopeReturn; native request ready for scheduling",
                     "submitted": "Scheduler.run_batch ScopeReturn; not device completion",
-                    "published": "Scheduler.process_batch_result ScopeReturn",
+                    "result_processed": (
+                        "Scheduler.process_batch_result ScopeReturn; internal generation and control progress"
+                    ),
+                    "request_output": (
+                        "SchedulerOutputStreamer.stream_output ScopeReturn on a sending role; "
+                        "only requests with a positive native send_token_offset increment; "
+                        "token handoff to detokenizer, excluding downstream processing and HTTP"
+                    ),
                     "observation": (
                         "timestamp immediately after native return, before metadata or journal writing; "
                         "not profiler marker.end"
@@ -156,20 +156,6 @@ class SGLangCapture(SGLangSession):
                 },
             },
         )
-
-    async def _await_cleanup(self, request_ids: set[str]) -> list[dict[str, Any]]:
-        paths = [
-            self.directory / "observations" / f"rank-{rank}-cleanup.json"
-            for rank in range(self.prepared["configuration"]["tp_size"])
-        ]
-        # The outer attempt owns the deadline and terminates this process on
-        # budget exhaustion; polling cadence never stands in for completion.
-        while True:
-            if all(path.exists() for path in paths):
-                records = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
-                if all(request_ids.issubset(record["request_ids"]) for record in records):
-                    return records
-            await asyncio.sleep(0.01)
 
     def _resolve_representative_requests(self, engine: Any) -> None:
         recipe = self.prepared["representative_recipe"]
@@ -254,7 +240,7 @@ class SGLangCapture(SGLangSession):
             # A response proves publication, not removal from running_batch.
             # Cumulative identities prevent a previous group's ack satisfying this barrier.
             completed_ids.update(request["id"] for request in requests)
-            completions.append(await self._await_cleanup(completed_ids))
+            completions.append(await self._await_cleanup(completed_ids, self.directory / "observations"))
 
         write_json(self.directory / "group_completions.json", completions)
         write_json(self.directory / "prepared_input.json", self.prepared)

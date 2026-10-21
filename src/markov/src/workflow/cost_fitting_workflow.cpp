@@ -1,12 +1,9 @@
 #include "markov/workflow/cost_fitting_workflow.hpp"
 
 #include "markov/contracts/json_input.hpp"
-#include "markov/performance/communication_cost_model.hpp"
-#include "markov/performance/cpu_cost_model.hpp"
-#include "markov/performance/device_command_cost_model.hpp"
 #include "markov/performance/kernel_cost_model.hpp"
 #include "markov/performance/measured_cost_fitter.hpp"
-#include "markov/performance/transfer_cost_model.hpp"
+#include "markov/performance/measured_cost_model.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -28,9 +25,15 @@ struct CostFittingWorkflow::Observation {
     nlohmann::json measurements;
     std::filesystem::path cpu_path;
     nlohmann::json cpu_samples;
-    nlohmann::json readiness;
     nlohmann::json gaps;
     std::set<std::filesystem::path> device_sources;
+
+    const nlohmann::json & readiness(std::string_view unit) const {
+        if (unit == "cpu") return manifest.at("cpu_service_readiness");
+
+        const auto & kind = manifest.at("measurement_kind");
+        return manifest.at(kind == "native_serving_timing" || kind == "native_cpu_activity" ? "cpu_worker_readiness" : "readiness");
+    }
 };
 
 struct CostFittingWorkflow::Measurements {
@@ -59,12 +62,14 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
         throw std::invalid_argument("serving cost fitting requires observed steady measurement windows");
 
     source.context = {
-        {         "framework",         environment.at("framework") },
-        { "framework_version", environment.at("framework_version") },
-        {        "model_path",           prepared.at("model_path") },
-        {     "configuration",        prepared.at("configuration") },
-        {        "deployment",          prepared.at("environment") },
-        {           "runtime",           environment.at("runtime") }
+        {        "measurement_kind",                                                    kind },
+        {               "framework",                             environment.at("framework") },
+        {       "framework_version",                     environment.at("framework_version") },
+        {              "model_path",                               prepared.at("model_path") },
+        {     "model_configuration",                      prepared.at("model_configuration") },
+        {           "configuration",                            prepared.at("configuration") },
+        {              "deployment",                              prepared.at("environment") },
+        { "measurement_environment", environment.at("runtime").at("measurement_environment") }
     };
     source.gaps = manifest.at("gaps");
     const bool host_transfer = kind == "native_serving_timing" || kind == "native_cpu_activity";
@@ -90,13 +95,11 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
             });
         }
         source.context["workers"] = std::move(workers);
-        source.readiness = manifest.at("cpu_worker_readiness");
         const auto & gaps = manifest.at("cpu_worker_gaps");
         source.gaps.insert(source.gaps.end(), gaps.begin(), gaps.end());
         return source;
     }
 
-    source.readiness = manifest.at("readiness");
     source.device_sources.insert(source.measurements_path);
     // Journal locators preserve capture identity after raw payload retention ends.
     const auto capture_path = input::resolve_path(manifest_path, manifest.at("native_capture"));
@@ -285,7 +288,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "native public runtime entries are associated with CANN implementation ranges by the runtime adapter",
                         "opaque SDK readiness CPU, including any polling, overlaps its retained device dependency; internal CPU placement is not reconstructed",
                         "median rounded down to integral ns; repeated layers remain one native run, not independent validation",
-                        "descheduling and unobserved external contention excluded; recorded deployment only; independent accuracy not established" };
+                        "descheduling and unobserved external contention excluded; recorded measurement environment; independent accuracy not established" };
     }
     else if (unit == "command") {
         entries = data.commands.fit();
@@ -293,7 +296,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
         assumptions = { "physical device record command span only; CPU submission and dependent waits remain separate",
                         "exact adapter-provided task type; event identity, stream and rank omitted",
                         "median rounded down to integral ns; no outlier removal, interpolation or extrapolation",
-                        "profiler resolution, overhead and internal stalls not removed; recorded deployment only; service transfer not established" };
+                        "profiler resolution, overhead and internal stalls not removed; recorded measurement environment; accuracy not established" };
     }
     else if (unit == "transfer") {
         entries = data.transfers.fit();
@@ -307,7 +310,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "median rounded down to integral ns; no outlier removal",
                         host_transfer ? "driver observation clock/probe overhead and contention not removed; thread CPU is not a wall-time correction"
                                       : "profiler overhead, internal stalls and contention not removed",
-                        "rank and host-memory properties omitted; recorded deployment only; service transfer not established" };
+                        "rank and host-memory properties omitted; recorded measurement environment; accuracy not established" };
     }
     else if (unit == "communication") {
         entries = data.communication.fit();
@@ -316,7 +319,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "physical device span; profiler overhead and internal transport stalls not removed",
                         "median rounded down to integral ns; no outlier removal",
                         "exact task kind, operation, bytes, dtype, transport and rank endpoints; no interpolation or extrapolation",
-                        "recorded deployment only; concurrent contention and runtime transfer not established" };
+                        "recorded measurement environment; concurrent contention and runtime transfer not established" };
     }
     else if (unit == "kernel") {
         entries = data.kernels.fit();
@@ -326,22 +329,22 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "exact kernel, tensor, launch, tensor-traversal policy and observed attention features; no interpolation or extrapolation",
                         "producer-declared fixed tensor traversals may omit semantic operand values; this is a conditional cost assumption",
                         "unmodeled loops/indexed accesses, rank, phase and cache state remain unqualified; independent validation required",
-                        "recorded deployment only; runtime equivalence and target launch mapping not established" };
+                        "recorded measurement environment; runtime equivalence and target launch mapping not established" };
     }
 
     // Fitting never upgrades measurement readiness or absorbs waits into cost.
     return {
-        {                  "kind",                                                                           kind },
-        {                  "unit",                                                                           "ns" },
-        {                "status",                                   entries.empty() ? "needs_data" : "candidate" },
-        {       "source_manifest",    std::filesystem::absolute(source.manifest_path).lexically_normal().string() },
-        {        "sample_sources",                                                                   data.sources },
-        {      "observed_context",                                                                 source.context },
-        { "measurement_readiness", unit == "cpu" ? source.manifest.at("cpu_service_readiness") : source.readiness },
-        {      "measurement_gaps",                                                                    source.gaps },
-        {               "entries",                                                                        entries },
-        {              "excluded",                                                                  data.excluded },
-        {           "assumptions",                                                                    assumptions }
+        {                  "kind",                                                                        kind },
+        {                  "unit",                                                                        "ns" },
+        {                "status",                                entries.empty() ? "needs_data" : "candidate" },
+        {       "source_manifest", std::filesystem::absolute(source.manifest_path).lexically_normal().string() },
+        {        "sample_sources",                                                                data.sources },
+        {      "observed_context",                                                              source.context },
+        { "measurement_readiness",                                                      source.readiness(unit) },
+        {      "measurement_gaps",                                                                 source.gaps },
+        {               "entries",                                                                     entries },
+        {              "excluded",                                                               data.excluded },
+        {           "assumptions",                                                                 assumptions }
     };
 }
 
@@ -383,7 +386,7 @@ nlohmann::json CostFittingWorkflow::evaluate(const std::filesystem::path & candi
         {            "measurement_manifest",   std::filesystem::absolute(manifest_path).lexically_normal().string() },
         {           "sample_files_disjoint",                                                                   true },
         {          "observed_context_equal",                     candidate.at("observed_context") == source.context },
-        {           "measurement_readiness",                                                       source.readiness },
+        {           "measurement_readiness",                                                 source.readiness(unit) },
         {                "measurement_gaps",                                                            source.gaps },
         { "candidate_measurement_readiness",                                  candidate.at("measurement_readiness") },
         {      "candidate_measurement_gaps",                                       candidate.at("measurement_gaps") },

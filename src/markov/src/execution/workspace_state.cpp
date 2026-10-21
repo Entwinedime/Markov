@@ -1,18 +1,38 @@
 #include "markov/execution/workspace_state.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <queue>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace markov {
+namespace {
+
+std::string_view branch_name(WorkspaceBranch branch) {
+    switch (branch) {
+    case WorkspaceBranch::Reuse:
+        return "reuse";
+    case WorkspaceBranch::Allocate:
+        return "allocate";
+    case WorkspaceBranch::Grow:
+        return "grow";
+    case WorkspaceBranch::Release:
+        return "release";
+    }
+    std::unreachable();
+}
+
+} // namespace
 
 WorkspaceState::WorkspaceState(std::span<const TemplateWorkspacePool> pools) {
     for (const auto & pool : pools) capacities_.emplace(pool.resource, pool.initial_capacity_bytes);
 }
 
-std::expected<void, std::string> WorkspaceState::advance(TemplateInstance & instance, const TemplateBank & templates, const BatchInput & input) {
+std::expected<void, std::string> WorkspaceState::advance(TemplateInstance & instance, const TemplateBank & templates, const BatchInput & input,
+                                                         bool diagnostics) {
     if (instance.workspace_uses.empty()) return {};
 
     const auto & definition = *instance.definition;
@@ -43,15 +63,16 @@ std::expected<void, std::string> WorkspaceState::advance(TemplateInstance & inst
     std::map<TemplateResource, std::size_t> previous;
     std::vector<TemplateOperationRewrite> replacements;
     for (const auto index : ordered) {
-        const auto & target = instance.workspace_uses[index];
+        auto & target = instance.workspace_uses[index];
         const auto & observed = target.definition->workspace_uses[target.source_use];
         const auto & pool = templates.workspace_pool(*target.definition, observed.pool);
-        const auto capacity = capacities_.find(pool.resource);
+        const auto resource = instance.resource(pool.resource);
+        const auto capacity = capacities_.find(resource);
         if (capacity == capacities_.end()) return std::unexpected("workspace_initial_resource_not_qualified");
 
         // A topological enumeration alone does not prove an order between
         // independent uses. Require an actual path on each shared pool.
-        if (const auto prior = previous.find(pool.resource); prior != previous.end()) {
+        if (const auto prior = previous.find(resource); prior != previous.end()) {
             std::vector<bool> reached(count);
             std::vector<std::size_t> pending{ prior->second };
             reached[prior->second] = true;
@@ -66,7 +87,7 @@ std::expected<void, std::string> WorkspaceState::advance(TemplateInstance & inst
             }
             if (!reached[target.begin]) return std::unexpected("workspace_use_order_not_qualified");
         }
-        previous[pool.resource] = target.end;
+        previous[resource] = target.end;
 
         auto branch = WorkspaceBranch::Release;
         std::uint64_t next_capacity = 0;
@@ -90,12 +111,43 @@ std::expected<void, std::string> WorkspaceState::advance(TemplateInstance & inst
             if (!replacement) return std::unexpected(replacement.error());
             replacements.push_back(std::move(*replacement));
         }
+        if (diagnostics) {
+            target.effect = {
+                {                            "pool",        resource.describe()                                                    },
+                {                    "demand_bytes", target.demand ? nlohmann::json(target.demand->bytes) : nlohmann::json(nullptr) },
+                {           "capacity_before_bytes",                                                               capacity->second },
+                {            "capacity_after_bytes",                                                                  next_capacity },
+                {                          "branch",                                                            branch_name(branch) },
+                { "requires_device_synchronization",
+                 branch == observed.branch ? nlohmann::json(observed.requires_device_synchronization) : nlohmann::json(nullptr)    }
+            };
+        }
         capacity->second = next_capacity;
     }
     if (!replacements.empty()) {
         const auto applied = instance.topology.apply_operations(definition, replacements);
         if (!applied) return std::unexpected(applied.error());
-        return instance.bind_workspace_uses(input);
+        // Rebinding resolves the actual donor uses. Keep diagnostics only across
+        // the same qualified allocator cut and pool; donor state is not replayed.
+        auto recorded = diagnostics ? std::move(instance.workspace_uses) : std::vector<TemplateWorkspaceUseInstance>{};
+        const auto bound = instance.bind_workspace_uses(input);
+        if (!bound) return bound;
+        if (diagnostics) {
+            for (auto & target : instance.workspace_uses) {
+                const auto same_cut = [&](const auto & prior) { return prior.begin == target.begin && prior.end == target.end; };
+                if (std::ranges::count_if(recorded, same_cut) != 1) continue;
+                auto & prior = *std::ranges::find_if(recorded, same_cut);
+                const auto & selected = target.definition->workspace_uses[target.source_use];
+                const auto & original = prior.definition->workspace_uses[prior.source_use];
+                const auto pool = instance.resource(templates.workspace_pool(*target.definition, selected.pool).resource);
+                const auto previous_pool = instance.resource(templates.workspace_pool(*prior.definition, original.pool).resource);
+                if (pool != previous_pool || prior.effect.is_null()) continue;
+                target.effect = std::move(prior.effect);
+                target.effect["requires_device_synchronization"] = nullptr;
+                if (target.effect.at("branch") == branch_name(selected.branch))
+                    target.effect["requires_device_synchronization"] = selected.requires_device_synchronization;
+            }
+        }
     }
     return {};
 }

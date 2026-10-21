@@ -20,8 +20,7 @@ struct SourceRequest;
 struct IndexedWriteSource {
     BatchOperationVariant variant;
     SourceSpanId write_span;
-    const SourceKernel * write; // Bank-owned immutable observation.
-    std::optional<SourceSpanId> broadcast_span;
+    const SourceKernel * write; // Borrowed from the source kernels during production.
 };
 
 // Fixed Ascend dense path: resize the request table, views and FutureMap relay, not

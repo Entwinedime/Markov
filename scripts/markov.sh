@@ -10,7 +10,7 @@ Usage: scripts/markov.sh plan --project project.json
        scripts/markov.sh predict --project project.json
        scripts/markov.sh explore --project project.json --budget-sec seconds-per-combination
        scripts/markov.sh compare --run run-directory --validation-manifest FILE [--validation-manifest FILE ...]
-       scripts/markov.sh prepare-performance --project project.json --prediction-result prediction.json
+       scripts/markov.sh prepare-performance --project project.json --prediction-result prediction.json --run-state run.json
        scripts/markov.sh profile --project project.json --configuration ID --workload ID
        scripts/markov.sh profile --project project.json --configuration ID --representative
        scripts/markov.sh observe-target --project project.json --configuration ID --workload ID --budget-sec seconds [--purpose ports|structure]
@@ -23,8 +23,8 @@ Usage: scripts/markov.sh plan --project project.json
        scripts/markov.sh evaluate-costs --model-candidate candidate.json --performance-manifest held-out-manifest.json
 
 plan describes configuration/workload combinations without collecting. predict
-uses declared compiled templates and explicit cost candidates or source-bound givens. Representative
-collection runs once per missing-source group when its base budget permits.
+uses declared compiled templates and explicit cost candidates or given target-work durations. Representative
+collection executes a bounded native role set per missing-source group within the shared base budget.
 Rule/cost gaps never trigger structure capture. Actual cost requirements form a
 shared sampling plan; permitted measurements reuse the cumulative performance budget.
 Cost coverage is checked per instantiated target; missing data remains explicit.
@@ -38,6 +38,7 @@ Transfer/device samples require explicit nonempty measurement requests.
 predict/explore plan CPU sampling from template demands and observed native work.
 fit-costs produces CPU, kernel, physical communication, memory-transfer or device-command candidates.
 --unit all fits every unit declared by one independent measurement manifest.
+It returns a bundle with a candidates array; select one unit for a single candidate.
 Explicit cost candidates can enter conditional prediction under their declared query policies.
 All candidates preserve measurement gaps and do not establish cost qualification.
 evaluate-costs compares a fixed candidate with separate unit samples without fitting.

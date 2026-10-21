@@ -1,18 +1,13 @@
 #include "markov/workflow/prediction_workflow.hpp"
 
-#include "markov/workflow/cpu_sampling_catalog.hpp"
-
 #include "markov/adapters/template_adapter.hpp"
 #include "markov/contracts/json_input.hpp"
 #include "markov/controller/lightweight_controller.hpp"
 #include "markov/execution/simulation.hpp"
-#include "markov/performance/communication_cost_model.hpp"
-#include "markov/performance/cpu_cost_model.hpp"
-#include "markov/performance/device_command_cost_model.hpp"
 #include "markov/performance/kernel_cost_model.hpp"
+#include "markov/performance/measured_cost_model.hpp"
 #include "markov/performance/node_costs.hpp"
 #include "markov/performance/node_durations.hpp"
-#include "markov/performance/transfer_cost_model.hpp"
 #include "markov/templates/template_asset.hpp"
 #include "markov/templates/templates.hpp"
 
@@ -21,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -44,10 +40,10 @@ struct LoadedCostModel {
     std::filesystem::path path;
     std::unique_ptr<CostModel> model;
     std::string framework;
-    std::filesystem::path model_path;
+    Json model_configuration;
     FrameworkConfiguration configuration;
-    std::string runtime;
     Environment deployment;
+    MeasurementScope measurement_scope;
 };
 
 Json incomplete(std::string_view status, std::string_view kind, std::string_view reason) {
@@ -59,9 +55,30 @@ Json incomplete(std::string_view status, std::string_view kind, std::string_view
     };
 }
 
+void publish_requirements(const std::filesystem::path & path, const Json & data) {
+    std::filesystem::create_directories(path.parent_path());
+    auto pending = path;
+    pending += ".tmp";
+    std::ofstream stream;
+    stream.exceptions(std::ios::failbit | std::ios::badbit);
+    stream.open(pending, std::ios::binary);
+    Json::to_cbor(data, stream);
+    stream.close();
+    std::filesystem::rename(pending, path);
+}
+
 } // namespace
 
-nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json collection_plan, const std::filesystem::path & catalog_directory) const {
+nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json collection_plan, const PredictionOutputs & outputs) const {
+    // Requests are a formal result, streamed once rather than embedded in every
+    // report. Publication waits for all combinations, including partial outcomes.
+    std::filesystem::create_directories(outputs.requests.parent_path());
+    auto pending_requests = outputs.requests;
+    pending_requests += ".tmp";
+    std::ofstream request_results;
+    request_results.exceptions(std::ios::failbit | std::ios::badbit);
+    request_results.open(pending_requests);
+
     std::vector<LoadedTemplate> sources;
     NodeDurations durations;
     auto asset_reports = Json::array();
@@ -103,35 +120,36 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             }
             else throw std::invalid_argument("unknown cost model kind: " + kind);
             const auto & context = metadata.at("observed_context");
-            const auto & deployment = context.at("deployment");
+            auto deployment = context.at("deployment");
+            deployment["measurement"] = context.at("measurement_environment");
+            const bool host =
+                kind == "empirical_cpu_service_median" || (kind == "empirical_transfer_median" && context.at("measurement_kind") != "native_device_work");
+            const auto scope = host ? MeasurementScope::HostDevice : MeasurementScope::Device;
             const auto adapter =
                 std::ranges::find_if(adapters_, [&](const TemplateAdapter * item) { return item->name() == context.at("framework").get<std::string_view>(); });
             if (adapter == adapters_.end()) throw std::invalid_argument("cost model framework adapter is not available");
-            LoadedCostModel loaded{
-                path,
-                std::move(model),
-                context.at("framework").get<std::string>(),
-                context.at("model_path").get<std::string>(),
-                (*adapter)->source_configuration(context.at("configuration")),
-                deployment.at("runtime").get<std::string>(),
-                { deployment.at("service").get<std::string>(), deployment.at("devices").get<std::vector<std::uint32_t>>() }
-            };
+            LoadedCostModel loaded{ path,
+                                    std::move(model),
+                                    context.at("framework").get<std::string>(),
+                                    context.at("model_configuration"),
+                                    (*adapter)->source_configuration(context.at("configuration")),
+                                    Environment::read(deployment),
+                                    scope };
             // Fitted values are self-contained. Source paths remain provenance;
             // prediction neither rereads samples nor refits the declared model.
             report.update({
-                {                "status","loaded"                                          },
-                {                  "kind",                                 kind },
-                {         "qualification",                    "not_established" },
-                { "measurement_readiness", metadata.at("measurement_readiness") },
-                {      "measurement_gaps",      metadata.at("measurement_gaps") },
-                {           "assumptions",           metadata.at("assumptions") },
-                {      "observed_context",                              context },
-                {       "source_manifest",       metadata.at("source_manifest") },
-                {        "sample_sources",        metadata.at("sample_sources") },
-                {          "query_policy",                         query_policy },
+                {                "status", "loaded"                                          },
+                {                  "kind",                                               kind },
+                {         "qualification",                                  "not_established" },
+                { "measurement_readiness",               metadata.at("measurement_readiness") },
+                { "measurement_gap_count",             metadata.at("measurement_gaps").size() },
+                {           "assumptions",                         metadata.at("assumptions") },
+                {       "source_manifest",                     metadata.at("source_manifest") },
+                {   "sample_source_count",               metadata.at("sample_sources").size() },
+                {          "query_policy",                                       query_policy },
                 {         "applicability",
-                 "same model/framework/deployment and adapter-qualified execution path; target unit work must match; runtime and service transfer not "
-                 "established"                                                 }
+                 "same model, immutable implementation, adapter-qualified execution path and relevant observed CPU/device/runtime conditions; target unit "
+                 "work must match; deployment locations do not establish timing equivalence" }
             });
             models.push_back(std::move(loaded));
         }
@@ -167,14 +185,14 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             const auto started = std::chrono::steady_clock::now();
             auto source = TemplateAsset::read(input.manifest.parent_path() / asset->get<std::string>());
             template_load_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-            if (source.manifest_path != input.manifest || source.model_path != project.model_path)
-                throw std::invalid_argument("compiled source identity or model differs from the declared asset");
+            if (source.manifest_path != input.manifest || project.model_configuration.is_null() || source.model_configuration != project.model_configuration)
+                throw std::invalid_argument("compiled source identity or native model configuration differs from the declared asset");
 
             LoadedTemplate loaded{ &input,
                                    (*adapter)->source_configuration(source.configuration),
                                    std::make_unique<TemplateBank>(std::move(source)),
                                    std::nullopt };
-            report["source"] = loaded.bank->describe(project.diagnostics);
+            report["source"] = loaded.bank->describe();
 
             // A bad cost input must not turn reusable structure into a request
             // for native collection. Preserve the source and isolate the error.
@@ -202,15 +220,12 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
     for (const auto & source : sources) banks.push_back({ source.bank.get(), &source.configuration });
 
     auto source_coverage = Json::array();
-    CpuSamplingCatalog cpu_catalogs(catalog_directory.empty() ? project.output_directory / "catalogs" : catalog_directory);
     auto combinations = Json::array();
     std::size_t combination_index = 0;
     for (const auto & candidate : project.configurations) {
         std::vector<const CostModel *> applicable_models;
         auto model_paths = Json::array();
         auto model_context_gaps = Json::array();
-        std::vector<const TemplateBank *> donors;
-        std::vector<const TemplateDefinition *> operation_sources;
         const LoadedTemplate * selected = nullptr;
         std::optional<ServingLimits> limits;
         std::optional<Json> configuration_gap;
@@ -220,11 +235,12 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             const auto & binding = **adapter;
             for (const auto & model : models) {
                 std::string_view reason;
-                if (model.model_path != project.model_path || model.framework != binding.name()) reason = "cost_model_implementation_mismatch";
+                if (project.model_configuration.is_null() || model.model_configuration != project.model_configuration || model.framework != binding.name()
+                    || !model.deployment.shares_implementation(candidate.environment))
+                    reason = "cost_model_implementation_mismatch";
                 else if (!binding.shares_execution_path(model.configuration, candidate.configuration)) reason = "cost_model_configuration_mismatch";
-                else if (model.deployment.devices != candidate.environment.devices || model.deployment.service != candidate.environment.service
-                         || model.runtime != "docker")
-                    reason = "cost_model_deployment_mismatch";
+                if (reason.empty() && !model.deployment.shares_measurement(candidate.environment, model.measurement_scope))
+                    reason = "cost_model_measurement_environment_not_matched";
 
                 // Configuration compatibility permits a query, not a timing
                 // guarantee. Actual unit keys still decide cost availability.
@@ -243,8 +259,6 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             else limits = *control;
 
             const auto selection = binding.select_sources(candidate, banks);
-            donors = selection.donors;
-            operation_sources = selection.operation_sources;
             auto coverage = selection.describe();
             coverage["configuration_id"] = candidate.id;
             source_coverage.push_back(std::move(coverage));
@@ -260,8 +274,8 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                 const bool missing = selection.gap->kind == TemplateGapKind::Observation;
                 configuration_gap = incomplete(missing ? "needs_data" : "unsupported", missing ? "observation" : "rule", selection.gap->reason);
             }
+            if (selected && limits) selected->bank->bind_sources(selection.donors, selection.operation_sources, limits->request_capacity);
         }
-        if (selected) selected->bank->bind_sources(donors, operation_sources);
 
         for (const auto & workload : project.request_workloads) {
             Json result;
@@ -274,18 +288,31 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                 else if (selected->duration_error) result = incomplete("failed", "node_durations", *selected->duration_error);
                 else if (model_error) result = incomplete("failed", "cost_model", *model_error);
                 else {
-                    const auto cpu_catalog = cpu_catalogs.publish(*selected->bank, donors, operation_sources);
                     // All mutable serving state belongs to this one combination.
                     LightweightController controller(selected->bank->page_size_tokens(), *selected->bank->admission_policy());
                     const NodeCosts costs(durations, applicable_models);
-                    const auto graph_path = project.output_directory / ("combination_" + std::to_string(combination_index) + "_graph.json");
+                    const auto graph_path = project.output_directory / ("combination_" + std::to_string(combination_index) + "_graph.jsonl");
                     SimulationRuntime runtime(workload.requests,
                                               controller,
                                               *selected->bank,
                                               costs,
                                               project.diagnostics ? std::optional(graph_path) : std::nullopt);
                     result = runtime.run(*limits);
-                    result["performance_requirements"]["cpu_service_catalog"] = cpu_catalog.string();
+                    auto & requirements = result["performance_requirements"];
+                    const auto covered = requirements.at("coverage").value("candidate_available", std::size_t(0));
+                    if (covered != requirements.at("object_count").get<std::size_t>()) {
+                        const auto path = outputs.requirements / ("combination_" + std::to_string(combination_index) + ".cbor");
+                        publish_requirements(path, runtime.requirements().data());
+                        requirements["data_file"] = path.string();
+                    }
+
+                    for (RequestId id = 0; id < workload.requests.size(); ++id) {
+                        auto row = runtime.request_result(id);
+                        if (!row) continue;
+                        (*row)["configuration_id"] = candidate.id;
+                        (*row)["request_workload_id"] = workload.id;
+                        request_results << *row << '\n';
+                    }
                 }
             }
             catch (const std::exception & error) {
@@ -295,6 +322,8 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             result["configuration_id"] = candidate.id;
             result["request_workload_id"] = workload.id;
             result["scope"] = "modeled";
+            if (selected && (candidate.environment.measurement.is_null() || candidate.environment.measurement.at("device").is_null()))
+                result["assumptions"].push_back("target device conditions are unspecified; structure is conditional on the source template hardware");
             // The anchor is distinct from the graph's actual source set.
             // Per-source cost inputs are reported once in assets.
             result["provenance"] = {
@@ -308,10 +337,20 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
         }
     }
 
+    request_results.close();
+    std::filesystem::rename(pending_requests, outputs.requests);
     collection_plan["source_coverage"] = std::move(source_coverage);
     return {
-        {               "task_status",                                                                                                "finished" },
+        {               "task_status",                                                          "finished"                                      },
         {              "combinations",                                                                                              combinations },
+        {           "request_results",                                                                                 outputs.requests.string() },
+        {               "assumptions",
+         { "explicit givens and/or empirical candidates; conditional execution, not a qualified performance prediction",
+         "modeled CPU service is charged at retained causal cuts; explicit given durations are conditional inputs, not measured costs",
+         "device compute, communication, transfers including synchronous host copies, and device commands require costs",
+         "waits follow dependencies; annotations carry no service charge",
+         "initial modeled resources contain no in-flight work",
+         "HTTP, tokenizer, initialization, warmup and idle polling are outside scope" }                                                         },
         {                    "assets",                                                                                             asset_reports },
         {               "cost_models",                                                                                             model_reports },
         {      "collection_performed",                                                                                                     false },

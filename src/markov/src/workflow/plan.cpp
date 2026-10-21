@@ -17,8 +17,8 @@
 
 namespace markov {
 
-nlohmann::json Planner::prepare_performance(const Project & project, const nlohmann::json & prediction) const {
-    return PerformanceSamplingPlan(collection_adapters_, adapters_).run(project, prediction);
+nlohmann::json Planner::prepare_performance(const Project & project, const nlohmann::json & prediction, const nlohmann::json & attempts) const {
+    return PerformanceSamplingPlan(collection_adapters_, adapters_).run(project, prediction, attempts);
 }
 
 namespace {
@@ -29,14 +29,6 @@ Json permission(const CollectionPermission & value) {
     return {
         {         "allow_run",         value.allow_run },
         { "max_wall_time_sec", value.max_wall_time_sec }
-    };
-}
-
-Json environment(const Environment & value) {
-    return {
-        { "runtime",      "docker" },
-        { "service", value.service },
-        { "devices", value.devices }
     };
 }
 
@@ -166,29 +158,37 @@ nlohmann::json Planner::collection_plan(const Project & project) const {
     };
 }
 
-nlohmann::json Planner::prepare_inputs(const Project & project, const Candidate & candidate) const {
+nlohmann::json Planner::prepare_inputs(const Project & project, const Candidate & candidate, bool reference) const {
     const auto & adapter = collection_adapter(candidate.framework);
     const auto snapshot = adapter.configuration(candidate.configuration);
     auto values = snapshot.at("parameters");
     values.update(snapshot.at("model_assets"));
-    return {
-        {             "role",                                                                                                             "base" },
-        {        "framework",                                                                                                     adapter.name() },
-        { "configuration_id",                                                                                                       candidate.id },
-        {       "model_path",                                                                                        project.model_path.string() },
-        {   "tokenizer_path",                                                                                    project.tokenizer_path.string() },
-        {    "configuration",                                                                                                  std::move(values) },
-        {      "environment",                                                                                 environment(candidate.environment) },
-        {       "permission",                                                                                permission(project.base_collection) },
-        {      "permissions", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
-        {      "diagnostics",                                                                                                project.diagnostics },
-        { "output_directory",                                                                                  project.output_directory.string() }
+    Json result{
+        {                "role",                                                                                                             "base" },
+        {           "framework",                                                                                                     adapter.name() },
+        {    "configuration_id",                                                                                                       candidate.id },
+        {          "model_path",                                                                                        project.model_path.string() },
+        { "model_configuration",                                                                                        project.model_configuration },
+        {      "tokenizer_path",                                                                                    project.tokenizer_path.string() },
+        {       "configuration",                                                                                                  std::move(values) },
+        {         "environment",                                                                                   candidate.environment.describe() },
+        {          "permission",                                                                                permission(project.base_collection) },
+        {         "permissions", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
+        {         "diagnostics",                                                                                                project.diagnostics },
+        {    "output_directory",                                                                                  project.output_directory.string() }
     };
+
+    auto executions = adapter.capture_executions(candidate, reference);
+    if (std::ranges::any_of(executions, [](const auto & execution) { return !execution.is_null(); })) {
+        result["environment"]["devices"] = Json::array({ candidate.environment.devices.front() });
+    }
+    result["capture_executions"] = std::move(executions);
+    return result;
 }
 
-nlohmann::json Planner::prepare_collection(const Project & project, const Candidate & candidate, std::span<const Request> input) const {
-    auto result = prepare_inputs(project, candidate);
-    result.update(collection_adapter(candidate.framework).instrumentation());
+nlohmann::json Planner::prepare_collection(const Project & project, const Candidate & candidate, std::span<const Request> input, bool reference) const {
+    auto result = prepare_inputs(project, candidate, reference);
+    result.update(collection_adapter(candidate.framework).instrumentation(true));
     result["requests"] = requests(input, true);
     return result;
 }
@@ -231,7 +231,7 @@ nlohmann::json Planner::prepare_target(const Project & project, const Candidate 
     if (budget_sec <= 0 || budget_sec > std::numeric_limits<std::int64_t>::max() / 1'000'000'000)
         throw std::invalid_argument("target observation requires a positive nanosecond-representable budget");
 
-    auto result = prepare_collection(project, candidate, workload.requests);
+    auto result = prepare_collection(project, candidate, workload.requests, true);
     result["role"] = "validation";
     result["observation_purpose"] = std::string(purpose);
     result["candidate_id"] = candidate.id;
@@ -240,7 +240,6 @@ nlohmann::json Planner::prepare_target(const Project & project, const Candidate 
     result["permissions"] = {
         { "validation", result["permission"] }
     };
-    result["output_directory"] = project.output_directory.string();
     return result;
 }
 
@@ -253,10 +252,10 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
         const auto & adapter = collection_adapter(candidate.framework);
         configuration_files[filename] = adapter.configuration(candidate.configuration);
         configurations.push_back({
-            {          "id",                       candidate.id },
-            {   "framework",                     adapter.name() },
-            { "environment", environment(candidate.environment) },
-            {      "config",                           filename }
+            {          "id",                     candidate.id },
+            {   "framework",                   adapter.name() },
+            { "environment", candidate.environment.describe() },
+            {      "config",                         filename }
         });
     }
 
@@ -286,17 +285,20 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
     auto models = Json::array();
     for (const auto & path : project.cost_models) models.push_back(path.string());
     Json input{
-        {             "model",                 { { "path", project.model_path.string() }, { "tokenizer_path", project.tokenizer_path.string() } } },
-        {    "configurations",                                                                                                     configurations },
-        { "request_workloads",                                                                                                          workloads },
-        {        "collection", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
-        {            "assets",               { { "templates", templates }, { "performance_manifests", performances }, { "cost_models", models } } },
-        {            "output",                     { { "directory", project.output_directory.string() }, { "diagnostics", project.diagnostics } } }
+        {             "model",
+         { { "path", project.model_path.string() },
+         { "tokenizer_path", project.tokenizer_path.string() },
+         { "configuration", project.model_configuration } }                                                                                                         },
+        {    "configurations",                                                                                                             std::move(configurations) },
+        { "request_workloads",                                                                                                                  std::move(workloads) },
+        {        "collection",                    { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
+        {            "assets", { { "templates", std::move(templates) }, { "performance_manifests", std::move(performances) }, { "cost_models", std::move(models) } } },
+        {            "output",                                        { { "directory", project.output_directory.string() }, { "diagnostics", project.diagnostics } } }
     };
     return {
-        {           "project",               input },
-        {    "configurations", configuration_files },
-        { "request_workloads",      workload_files }
+        {           "project",               std::move(input) },
+        {    "configurations", std::move(configuration_files) },
+        { "request_workloads",      std::move(workload_files) }
     };
 }
 
@@ -308,6 +310,7 @@ nlohmann::json Planner::prepare_sampling(const Project & project, const Candidat
     prepared["permission"] = permission(project.performance_collection);
     prepared["measurement_grid"] = std::move(grid);
     prepared["measurement_requests"] = measurement_requests;
+    prepared.update(collection_adapter(candidate.framework).instrumentation(false));
     return prepared;
 }
 
@@ -316,7 +319,7 @@ nlohmann::json Planner::prepare_communication(const Project & project, const Can
     if (grid.empty() && project.performance_collection.allow_run)
         throw std::invalid_argument("communication sampling needs independent device measurements with collective work domains");
 
-    auto prepared = prepare_inputs(project, candidate);
+    auto prepared = prepare_inputs(project, candidate, true);
     prepared["role"] = "performance";
     prepared["permission"] = permission(project.performance_collection);
     prepared["measurement_grid"] = std::move(grid);

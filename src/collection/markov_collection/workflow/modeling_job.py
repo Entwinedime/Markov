@@ -23,6 +23,10 @@ class ModelingJob:
         state = self.environment.container_state(self.name)
         return state is not None and state["Running"]
 
+    def consume(self) -> None:
+        """Release a terminal container after its result or failure is acknowledged."""
+        self.environment.consume_container(self.name)
+
     def run(self, arguments: list[str], inputs: set[Path], outputs: set[Path] | None = None) -> None:
         command = [
             "docker",
@@ -52,8 +56,12 @@ class ModelingJob:
         # snapshot, rather than appending the same history on every resume.
         self.log.parent.mkdir(parents=True, exist_ok=True)
         with self.log.open("w", encoding="utf-8") as log:
-            if self.environment.container_state(self.name) is None:
+            state = self.environment.container_state(self.name)
+            if state is None:
                 subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
+            elif state["Status"] == "created":
+                # Docker may have created the job before its client was interrupted.
+                subprocess.run(["docker", "start", self.name], check=True, stdout=log, stderr=subprocess.STDOUT)
             subprocess.run(["docker", "wait", self.name], check=True, stdout=log, stderr=subprocess.STDOUT)
             subprocess.run(["docker", "logs", self.name], check=True, stdout=log, stderr=subprocess.STDOUT)
             state = self.environment.container_state(self.name)

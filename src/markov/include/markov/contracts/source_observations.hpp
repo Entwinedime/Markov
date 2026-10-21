@@ -15,4 +15,10 @@ struct SourceRequest {
     std::uint32_t generated_tokens;
 };
 
+struct SourceIncomingRequest {
+    std::string id;
+    std::uint32_t prompt_tokens;
+    std::uint32_t output_tokens;
+};
+
 } // namespace markov

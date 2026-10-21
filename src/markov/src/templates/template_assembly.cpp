@@ -18,15 +18,28 @@ TemplateBoundary TemplateInstance::boundary(std::size_t index) const {
     return topology.inserted_boundaries().at(index - definition->graph.boundary_count()).boundary;
 }
 
-const TemplateLane & TemplateInstance::lane(std::size_t index) const {
-    if (index < definition->lanes.size()) return definition->lanes[index];
-    return topology.inserted_lanes().at(index - definition->lanes.size());
+TemplateResource TemplateInstance::resource(TemplateResource source) const {
+    if (source.rank == definition->rank) source.rank = rank;
+    return source;
+}
+
+TemplateLane TemplateInstance::lane(std::size_t index) const {
+    auto result = index < definition->lanes.size() ? definition->lanes[index] : topology.inserted_lanes().at(index - definition->lanes.size());
+    result.source.rank = resource(result.resource()).rank;
+    return result;
 }
 
 TemplateBoundaryIdentity TemplateInstance::boundary_identity(std::size_t index) const {
-    if (index < definition->graph.boundary_count())
-        return TemplateSourceIdentity{ definition->source_manifest.native(), definition->boundary_observations[index].source_boundary };
-    return TemplateEndpoint{ work_id, definition->rank, index };
+    const auto alias = topology.boundary_alias(index);
+    if (alias != index) return TemplateEndpoint{ work_id, rank, alias };
+    if (index < definition->graph.boundary_count()) return source_identity(definition->boundary_observations[index].source_boundary);
+    return TemplateEndpoint{ work_id, rank, index };
+}
+
+TemplateSourceIdentity TemplateInstance::source_identity(std::size_t local) const {
+    // Repeated calls retain source aliases within their target rank. Reusing
+    // one physical shard for another rank creates a separate replica namespace.
+    return { definition->source_manifest.native(), local, rank == definition->rank ? 0U : rank + 1 };
 }
 
 const SourceKernel * TemplateInstance::kernel(const TemplateNode & node) const {
@@ -41,20 +54,23 @@ const SourceTransfer * TemplateInstance::transfer(const TemplateNode & node) con
     return found == transfer_overrides.end() ? observed.transfer : &found->second;
 }
 
-const SourceCommunicationTask * TemplateInstance::communication(const TemplateNode & node) const {
-    const auto & observed = definition->observation(node);
-    const auto found = communication_overrides.find(observed.source_span);
-    return found == communication_overrides.end() ? observed.communication : &found->second;
-}
-
-TemplateInstance::TemplateInstance(WorkId work, const TemplateDefinition & source) : work_id(work), definition(&source), topology(source) {
+TemplateInstance::TemplateInstance(WorkId work, const TemplateDefinition & source, std::uint32_t target_rank, const TemplateRankBinding & rank_binding)
+    : work_id(work),
+      rank(target_rank),
+      rank_binding(&rank_binding),
+      definition(&source),
+      topology(source) {
     connections.reserve(source.graph.connection_count());
-    for (std::size_t index = 0; index < source.graph.connection_count(); ++index) connections.push_back({ source.connection(index), {} });
+    for (std::size_t index = 0; index < source.graph.connection_count(); ++index) {
+        auto connection = source.connection(index);
+        if (connection.resource) connection.resource = resource(*connection.resource);
+        connections.push_back({ std::move(connection), {} });
+    }
 }
 
 std::expected<void, std::string> TemplateInstance::append_workspace_use(const TemplateDefinition & source, const TemplateNode & node,
                                                                         const BatchInput & input) {
-    if (node.kind != SourceSpanKind::CpuObservation) return {};
+    if (node.kind != SourceSpanKind::ResourceObservation) return {};
     const auto marker = source.observation(node).source_span;
     const auto found = std::ranges::find(source.workspace_uses, marker, &TemplateWorkspaceUse::marker);
     if (found == source.workspace_uses.end()) return {};
@@ -107,6 +123,8 @@ void TemplateInstance::collect_stream_waits() {
     for (const auto & inserted : topology.inserted_nodes()) {
         if (inserted.stream_wait) stream_waits.push_back({ *inserted.stream_wait, {} });
     }
+    for (auto & target : stream_waits)
+        for (auto & source : target.wait.resources) source = resource(source);
 }
 
 void TemplateAssembly::prune_frontier(std::map<TemplateBoundaryIdentity, TemplateEndpoint> & candidates,
@@ -165,7 +183,8 @@ std::expected<void, std::string> TemplateInstance::bind_inserted_waits() {
         const auto after = reachable_boundaries(successors, { node.end });
         const auto target = std::ranges::find_if(stream_waits, [&node](const auto & candidate) { return candidate.wait.completion == node.end; });
 
-        for (const auto & resource : inserted.stream_wait->resources) {
+        for (const auto & observed_resource : inserted.stream_wait->resources) {
+            const auto resource = this->resource(observed_resource);
             std::set<std::size_t> submitted;
             bool observed_worker = false;
             for (const auto & edge : submissions) {
@@ -185,10 +204,16 @@ std::expected<void, std::string> TemplateInstance::bind_inserted_waits() {
             for (const auto point : submitted) pending.insert(pending.end(), predecessors[point].begin(), predecessors[point].end());
             const auto ancestors = reachable_boundaries(predecessors, std::move(pending));
             for (const auto point : submitted)
-                if (!ancestors[point]) target->binding.peers.push_back({ work_id, definition->rank, point });
+                if (!ancestors[point]) target->binding.peers.push_back({ work_id, rank, point });
         }
     }
     return {};
+}
+
+std::vector<TemplateEndpoint> TemplateAssembly::frontier() const {
+    std::vector<TemplateEndpoint> result;
+    for (const auto & [resource, endpoints] : frontiers_) result.insert(result.end(), endpoints.begin(), endpoints.end());
+    return result;
 }
 
 std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateInstance *> instances) {
@@ -201,8 +226,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
     std::set<TemplateSourceIdentity> wait_imports;
     for (auto * instance : instances) {
         for (const auto & target : instance->connections) {
-            if (instance->definition->is_resource_wait_import(target.connection))
-                wait_imports.insert({ instance->definition->source_manifest.native(), target.connection.source_edge });
+            if (instance->definition->is_resource_wait_import(target.connection)) wait_imports.insert(instance->source_identity(target.connection.source_edge));
         }
         instance->collect_stream_waits();
         const auto bound = instance->bind_inserted_waits();
@@ -211,12 +235,14 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
     for (auto * instance : instances) {
         std::erase_if(instance->connections, [&](const auto & target) {
             return target.connection.direction == TemplateConnectionDirection::Outgoing
-                   && wait_imports.contains({ instance->definition->source_manifest.native(), target.connection.source_edge });
+                   && wait_imports.contains(instance->source_identity(target.connection.source_edge));
         });
     }
 
     std::map<TemplateSourceIdentity, std::vector<ObservedEndpoint>> endpoints;
     std::map<WorkId, std::size_t> invocation_order;
+    std::map<std::pair<WorkId, std::uint32_t>, const TemplateInstance *> targets;
+    for (const auto * instance : instances) targets.emplace(std::pair(instance->work_id, instance->rank), instance);
     std::map<TemplateSourceIdentity, std::map<std::int64_t, TemplateSourceIdentity>> cpu_order;
     for (const auto * instance : instances) {
         invocation_order.try_emplace(instance->work_id, invocation_order.size());
@@ -224,14 +250,14 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
         for (std::size_t local = 0; local < definition.graph.boundary_count(); ++local) {
             const auto & boundary = definition.graph.boundary(local);
             const auto & observation = definition.boundary_observations[local];
-            const TemplateSourceIdentity identity{ definition.source_manifest.native(), observation.source_boundary };
+            const auto identity = instance->source_identity(observation.source_boundary);
             endpoints[identity].push_back({
                 definition.source_call,
-                { instance->work_id, definition.rank, local }
+                { instance->work_id, instance->rank, local }
             });
             const auto & lane = definition.lanes[boundary.lane];
             if (lane.source.domain == SourceDomain::CpuThread)
-                cpu_order[{ definition.source_manifest.native(), lane.source_lane }].emplace(observation.observed_time_ns, identity);
+                cpu_order[instance->source_identity(lane.source_lane)].emplace(observation.observed_time_ns, identity);
         }
     }
 
@@ -241,13 +267,17 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             auto & binding = target.binding;
             // A joint rewrite has already bound inserted endpoints in target space.
             if (binding.rule != TemplateConnectionRule::Unresolved) continue;
-            const auto found = endpoints.find({ instance->definition->source_manifest.native(), connection.remote_source_boundary });
+            const auto found = endpoints.find(instance->source_identity(connection.remote_source_boundary));
             if (found != endpoints.end()) {
                 // A boundary reference alone does not establish native ownership.
                 for (const auto & endpoint : found->second) {
                     if (std::find(connection.remote_source_calls.begin(), connection.remote_source_calls.end(), endpoint.source_call)
-                        != connection.remote_source_calls.end())
-                        binding.peers.push_back(endpoint.target);
+                        != connection.remote_source_calls.end()) {
+                        auto peer = endpoint.target;
+                        const auto * owner = targets.at({ peer.work_id, peer.rank });
+                        peer.boundary = owner->topology.boundary_alias(peer.boundary, connection.direction == TemplateConnectionDirection::Outgoing);
+                        binding.peers.push_back(peer);
+                    }
                 }
             }
             if (!binding.peers.empty()) {
@@ -262,7 +292,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             const auto & definition = *instance->definition;
             const auto & boundary = definition.graph.boundary(connection.local_boundary);
             const auto & lane = definition.lanes[boundary.lane];
-            const auto & order = cpu_order.at({ definition.source_manifest.native(), lane.source_lane });
+            const auto & order = cpu_order.at(instance->source_identity(lane.source_lane));
             auto neighbor = order.find(definition.boundary_observations[connection.local_boundary].observed_time_ns);
             if (connection.direction == TemplateConnectionDirection::Incoming) {
                 if (neighbor == order.begin()) continue;
@@ -273,10 +303,20 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
                 if (neighbor == order.end()) continue;
             }
 
-            for (const auto & endpoint : endpoints.at(neighbor->second)) binding.peers.push_back(endpoint.target);
+            for (const auto & endpoint : endpoints.at(neighbor->second)) {
+                auto peer = endpoint.target;
+                const auto * owner = targets.at({ peer.work_id, peer.rank });
+                peer.boundary = owner->topology.boundary_alias(peer.boundary, connection.direction == TemplateConnectionDirection::Outgoing);
+                binding.peers.push_back(peer);
+            }
             binding.rule = TemplateConnectionRule::CpuThreadProjection;
         }
     }
+
+    for (auto * instance : instances)
+        for (auto & target : instance->connections)
+            target.connection.local_boundary =
+                instance->topology.boundary_alias(target.connection.local_boundary, target.connection.direction == TemplateConnectionDirection::Incoming);
 
     std::map<TemplateResource, std::map<TemplateBoundaryIdentity, TemplateEndpoint>> exports;
     for (auto * instance : instances) {
@@ -293,7 +333,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
                     && (connection.relation == SourceRelation::ThreadOrder || connection.relation == SourceRelation::StreamOrder
                         || connection.relation == SourceRelation::NativeHostWait)) {
                     exports[resource].emplace(instance->boundary_identity(connection.local_boundary),
-                                              TemplateEndpoint{ instance->work_id, definition.rank, connection.local_boundary });
+                                              TemplateEndpoint{ instance->work_id, instance->rank, connection.local_boundary });
                     binding.rule = TemplateConnectionRule::ResourceExport;
                 }
                 continue;
@@ -323,10 +363,8 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
     std::vector<ResourceWork> resource_work;
     std::set<TemplateResource> introduced_resources;
     for (const auto * instance : instances) {
-        for (const auto & port : instance->topology.added_resource_ports()) introduced_resources.insert(port.resource);
+        for (const auto & port : instance->topology.added_resource_ports()) introduced_resources.insert(instance->resource(port.resource));
     }
-    std::map<std::pair<WorkId, std::uint32_t>, const TemplateInstance *> targets;
-    for (const auto * instance : instances) targets.emplace(std::pair(instance->work_id, instance->definition->rank), instance);
     for (auto * instance : instances) {
         const auto & definition = *instance->definition;
         for (const auto index : instance->topology.nodes()) {
@@ -338,7 +376,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             const auto & lane = instance->lane(boundary.lane).resource();
             if (lane.domain != SourceDomain::CpuThread && lane.domain != SourceDomain::DeviceStream) continue;
 
-            exports[lane].emplace(instance->boundary_identity(node.end), TemplateEndpoint{ instance->work_id, definition.rank, node.end });
+            exports[lane].emplace(instance->boundary_identity(node.end), TemplateEndpoint{ instance->work_id, instance->rank, node.end });
         }
         for (const auto & inserted : instance->topology.inserted_nodes()) {
             const auto & node = inserted.node;
@@ -348,7 +386,12 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             const auto & boundary = instance->boundary(node.end);
             const auto & lane = instance->lane(boundary.lane).resource();
             if (lane.domain != SourceDomain::CpuThread && lane.domain != SourceDomain::DeviceStream) continue;
-            exports[lane].emplace(instance->boundary_identity(node.end), TemplateEndpoint{ instance->work_id, definition.rank, node.end });
+            exports[lane].emplace(instance->boundary_identity(node.end), TemplateEndpoint{ instance->work_id, instance->rank, node.end });
+        }
+        for (const auto & port : instance->topology.collective_interfaces()) {
+            const auto resource = instance->lane(instance->boundary(port.done).lane).resource();
+            if (introduced_resources.contains(resource)) resource_work.push_back({ resource, instance, port.ready, port.done });
+            exports[resource].emplace(instance->boundary_identity(port.done), TemplateEndpoint{ instance->work_id, instance->rank, port.done });
         }
         for (const auto index : instance->topology.dependencies()) {
             const auto & edge = definition.graph.dependencies()[index];
@@ -381,7 +424,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
         std::map<std::pair<TemplateResource, WorkId>, std::map<TemplateBoundaryIdentity, TemplateEndpoint>> entries;
         for (const auto & work : resource_work) {
             entries[{ work.resource, work.instance->work_id }].emplace(work.instance->boundary_identity(work.begin),
-                                                                       TemplateEndpoint{ work.instance->work_id, work.instance->definition->rank, work.begin });
+                                                                       TemplateEndpoint{ work.instance->work_id, work.instance->rank, work.begin });
         }
         for (auto & [resource_work_id, candidates] : entries) {
             prune_frontier(candidates, successors);
@@ -395,7 +438,10 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
     // This path is the qualified non-overlap cohort: submissions on the same
     // worker/stream remain FIFO across its sequential serving actions.
     for (auto * instance : instances) {
-        for (const auto & port : instance->topology.added_resource_ports()) {
+        for (auto port : instance->topology.added_resource_ports()) {
+            port.resource = instance->resource(port.resource);
+            port.entry = instance->topology.boundary_alias(port.entry, true);
+            port.exit = instance->topology.boundary_alias(port.exit);
             auto & binding = instance->resource_imports[port.entry];
             const auto previous = frontiers_.find(port.resource);
             binding.rule = TemplateConnectionRule::InitialResource;
@@ -409,13 +455,13 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             for (const auto & work : resource_work) {
                 if (work.resource != port.resource || work.instance->work_id == instance->work_id) continue;
                 if (invocation_order.at(work.instance->work_id) < invocation_order.at(instance->work_id)) {
-                    binding.peers.push_back({ work.instance->work_id, work.instance->definition->rank, work.end });
+                    binding.peers.push_back({ work.instance->work_id, work.instance->rank, work.end });
                     if (binding.rule != TemplateConnectionRule::Unresolved) binding.rule = TemplateConnectionRule::ResourcePredecessor;
                 }
                 else {
-                    if (!resource_entries.contains({ work.instance->work_id, work.instance->definition->rank, work.begin })) continue;
+                    if (!resource_entries.contains({ work.instance->work_id, work.instance->rank, work.begin })) continue;
                     work.instance->resource_dependencies.push_back({
-                        { instance->work_id, instance->definition->rank, port.exit },
+                        { instance->work_id, instance->rank, port.exit },
                         work.begin
                     });
                     predecessors.connect(work.instance->boundary_identity(work.begin), instance->boundary_identity(port.exit));
@@ -425,8 +471,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
                 const auto local = targets.find({ peer.work_id, peer.rank });
                 if (local != targets.end()) predecessors.connect(instance->boundary_identity(port.entry), local->second->boundary_identity(peer.boundary));
             }
-            exports[port.resource].emplace(instance->boundary_identity(port.exit),
-                                           TemplateEndpoint{ instance->work_id, instance->definition->rank, port.exit });
+            exports[port.resource].emplace(instance->boundary_identity(port.exit), TemplateEndpoint{ instance->work_id, instance->rank, port.exit });
         }
     }
 
