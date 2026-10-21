@@ -11,59 +11,45 @@ readonly RUN_URL="https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-asce
 readonly EXTENSION_ZIP="batch_invariant-torch_ops_extension-1.0.0.zip"
 readonly EXTENSION_URL="https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${EXTENSION_ZIP}"
 
-CUSTOM_OP_ROOT=""
-CUSTOM_OP_LIB=""
-CUSTOM_OP_API_SO=""
+# 加载固定镜像的 CANN 环境，清除可能干扰安装的自定义路径。
+set +u
+# shellcheck disable=SC1091
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+set -u
+unset ASCEND_CUSTOM_OPP_PATH
 
-log() {
-    echo "[batch_invariant_ops] $*"
-}
+# 从 CANN 环境取得 vendor 路径。
+if [ -z "${ASCEND_OPP_PATH:-}" ]; then
+    echo "ASCEND_OPP_PATH is not set by CANN set_env.sh" >&2
+    exit 1
+fi
+CUSTOM_OP_ROOT="${ASCEND_OPP_PATH}/vendors/batch_invariant"
+CUSTOM_OP_LIB="${CUSTOM_OP_ROOT}/op_api/lib"
+CUSTOM_OP_API_SO="${CUSTOM_OP_LIB}/libcust_opapi.so"
 
-# 加载 CANN 编译环境，并避免已有自定义 OPP 路径影响 run 包安装。
-prepare_environment() {
-    set +u
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    set -u
-    unset ASCEND_CUSTOM_OPP_PATH
-}
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
 
-# 从 CANN 环境推导 vendor 路径，避免把具体 CANN 安装目录写死在脚本中。
-configure_custom_op_paths() {
-    if [ -z "${ASCEND_OPP_PATH:-}" ]; then
-        echo "ASCEND_OPP_PATH is not set by CANN set_env.sh" >&2
-        exit 1
-    fi
-    CUSTOM_OP_ROOT="${ASCEND_OPP_PATH}/vendors/batch_invariant"
-    CUSTOM_OP_LIB="${CUSTOM_OP_ROOT}/op_api/lib"
-    CUSTOM_OP_API_SO="${CUSTOM_OP_LIB}/libcust_opapi.so"
-}
+# 安装 AscendC 算子及其 torch extension。
+printf '[batch_invariant_ops] Installing AscendC custom ops\n'
+curl -fsSL -O "$RUN_URL"
+chmod +x "$RUN_PACKAGE"
+"./$RUN_PACKAGE"
+export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OP_ROOT"
+export LD_LIBRARY_PATH="${CUSTOM_OP_LIB}:${LD_LIBRARY_PATH:-}"
 
-# 安装 AscendC 自定义算子 run 包。
-install_custom_ops() {
-    log "Installing AscendC custom ops"
-    curl -fsSL -k -O "$RUN_URL"
-    chmod +x "$RUN_PACKAGE"
-    "./$RUN_PACKAGE"
-    export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OP_ROOT"
-    export LD_LIBRARY_PATH="${CUSTOM_OP_LIB}:${LD_LIBRARY_PATH:-}"
-}
+printf '[batch_invariant_ops] Building torch extension\n'
+curl -fsSL -O "$EXTENSION_URL"
+unzip -q "$EXTENSION_ZIP"
+cd torch_ops_extension/batch_invariant_ops
+USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py build_ext
+USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py bdist_wheel
+python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl
 
-# 构建并安装 torch extension。该 wheel 负责注册 torch.ops.batch_invariant_ops。
-install_torch_extension() {
-    log "Building torch extension"
-    curl -fsSL -k -O "$EXTENSION_URL"
-    unzip -q "$EXTENSION_ZIP"
-    cd torch_ops_extension/batch_invariant_ops
-    USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py build_ext
-    USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py bdist_wheel
-    python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl
-}
-
-# 在构建时确认 SGLang deterministic NPU wrapper 需要的符号已经注册。
-verify_installation() {
-    log "Verifying torch.ops symbols"
-    python3 - <<'PY'
+# 分别核对 torch 注册与独立加载的 AscendC 符号。
+printf '[batch_invariant_ops] Verifying torch.ops symbols\n'
+python3 - <<'PY'
 import batch_invariant_ops  # noqa: F401
 import torch
 
@@ -77,8 +63,8 @@ for name in (
     getattr(torch.ops.batch_invariant_ops, name)
 PY
 
-    log "Verifying AscendC custom op library"
-    CUSTOM_OP_API_SO="$CUSTOM_OP_API_SO" python3 - <<'PY'
+printf '[batch_invariant_ops] Verifying AscendC custom op library\n'
+CUSTOM_OP_API_SO="$CUSTOM_OP_API_SO" python3 - <<'PY'
 import ctypes
 import os
 
@@ -95,22 +81,7 @@ for name in (
 ):
     getattr(lib, name)
 PY
-}
 
-main() {
-    prepare_environment
-    configure_custom_op_paths
-    rm -rf "$WORK_DIR"
-    mkdir -p "$WORK_DIR"
-    cd "$WORK_DIR"
-
-    install_custom_ops
-    install_torch_extension
-    verify_installation
-
-    cd /
-    rm -rf "$WORK_DIR"
-    log "Installation complete"
-}
-
-main "$@"
+cd /
+rm -rf "$WORK_DIR"
+printf '[batch_invariant_ops] Installation complete\n'
