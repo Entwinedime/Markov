@@ -215,6 +215,8 @@ class Exploration:
             return
         draft = self.directory / "work" / name
         draft.mkdir(parents=True, exist_ok=True)
+        arguments = ["templates"]
+        inputs = []
         for rank in range(domain["tp"]):
             key = f"{name}-rank-{rank}"
             if key not in self.state["sources"]:
@@ -251,16 +253,16 @@ class Exploration:
                     "processing",
                 )
             source = capture / f"rank-{rank}.json"
-            asset = draft / f"rank-{rank}.json"
-            self.step(
-                self.environment.tool_command(
-                    ["templates", "--source", str(source), "--physical", str(physical), "--output", str(asset)],
-                    [source, physical],
-                    asset,
-                    self.available("processing"),
-                ),
-                "processing",
-            )
+            arguments += ["--source", str(source), "--physical", str(physical)]
+            inputs += [source, physical]
+
+        # Compile all roles against one catalog, keeping each role's resource and execution bindings independent.
+        asset = draft / "templates.json"
+        arguments += ["--output", str(asset)]
+        self.step(
+            self.environment.tool_command(arguments, inputs, asset, self.available("processing")),
+            "processing",
+        )
 
         # A domain becomes reusable only after every role's asset has been published together.
         assets.parent.mkdir(parents=True, exist_ok=True)
@@ -270,7 +272,7 @@ class Exploration:
         for configuration in self.specification["configurations"]:
             domain = self.configurations[configuration["id"]]
             assets = self.directory / "assets" / domain
-            paths = [assets / f"rank-{rank}.json" for rank in range(configuration["tp"])]
+            asset = assets / "templates.json"
             for workload in self.specification["workloads"]:
                 key = f"{configuration['id']}/{workload['id']}"
                 if key in self.state["results"] and (self.directory / self.state["results"][key]).exists():
@@ -292,16 +294,13 @@ class Exploration:
                 )
                 base = "diagnostics" if self.details else "results"
                 result = self.directory / base / (key + ".json")
-                arguments = ["simulate"]
-                for path in paths:
-                    arguments += ["--templates", str(path)]
-                arguments += ["--input", str(target), "--output", str(result)]
+                arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(result)]
                 if self.details:
                     arguments.append("--details")
                 try:
                     self.step(
                         self.environment.tool_command(
-                            arguments, [*paths, target], result, self.available("processing")
+                            arguments, [asset, target], result, self.available("processing")
                         ),
                         "processing",
                     )

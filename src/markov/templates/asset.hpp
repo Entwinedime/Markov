@@ -30,13 +30,15 @@ public:
 class ArgumentTree {
 public:
     explicit ArgumentTree(nlohmann::json source);
-    nlohmann::json instantiate(std::span<const std::size_t> values, const Parameters & parameters, const GroupValues & groups) const;
+    nlohmann::json instantiate(std::span<const std::size_t> values, const Parameters & parameters, const GroupValues & groups,
+                               const std::vector<nlohmann::json> & literals) const;
 
 private:
     void compile(const nlohmann::json & source, const nlohmann::json::json_pointer & path);
 
     nlohmann::json source_;
     std::vector<std::pair<nlohmann::json::json_pointer, std::size_t>> references_;
+    std::vector<std::pair<nlohmann::json::json_pointer, std::size_t>> literal_references_;
     std::vector<std::pair<nlohmann::json::json_pointer, std::vector<Expression>>> shapes_;
     std::vector<std::pair<nlohmann::json::json_pointer, Expression>> scalars_;
     std::vector<std::pair<nlohmann::json::json_pointer, std::string>> groups_;
@@ -164,6 +166,7 @@ using ExecutionBinding = std::variant<BoundExecution, std::size_t>;
 // Session bindings are outside shared identity and do not supply target dynamic defaults.
 struct FixedBindings {
     Parameters values;
+    std::vector<nlohmann::json> literals;
     std::optional<std::size_t> host_resource;
     std::map<std::size_t, std::size_t> external_resources;
     std::map<std::size_t, ExecutionBinding> execution;
@@ -190,10 +193,28 @@ struct TemplateFrame {
     const FixedBindings & bindings;
 };
 
-// Parse and validate the asset at this boundary; expansion consumes typed contracts.
+// Shared work is parsed once; each source role borrows the catalog for its entire lifetime.
+class TemplateCatalog {
+public:
+    explicit TemplateCatalog(nlohmann::json document);
+
+    const TemplateDefinition & definition(std::size_t identity) const;
+    const TemplateLayout & layout(std::size_t identity) const;
+    const ExecutionPattern & execution_pattern(std::size_t identity) const;
+    std::size_t layout_count() const;
+
+private:
+    void validate() const;
+
+    std::vector<TemplateDefinition> definitions_;
+    std::vector<TemplateLayout> layouts_;
+    std::vector<ExecutionPattern> execution_patterns_;
+};
+
+// Parse role-local bindings at this boundary; expansion consumes the shared typed catalog.
 class TemplateAsset {
 public:
-    explicit TemplateAsset(nlohmann::json document);
+    TemplateAsset(const TemplateCatalog & catalog, nlohmann::json document);
 
     const TemplateDefinition & definition(std::size_t identity) const;
     const TemplateLayout & layout(std::size_t identity) const;
@@ -216,17 +237,14 @@ private:
     BoundExecution bound_execution(const nlohmann::json & source) const;
     void validate_bindings(std::size_t layout, const FixedBindings & bindings) const;
     void validate_calls(std::size_t layout, std::vector<CallVisit> & visiting) const;
-    void validate() const;
 
+    const TemplateCatalog & catalog_;
     nlohmann::json environment_;
     nlohmann::json physical_coverage_;
     nlohmann::json runtime_coverage_;
     std::vector<std::string> execution_resources_;
-    std::vector<ExecutionPattern> execution_patterns_;
     std::vector<ExecutionSelection> execution_variants_;
 
-    std::vector<TemplateDefinition> definitions_;
-    std::vector<TemplateLayout> layouts_;
     std::vector<TemplateEntry> entries_;
     std::vector<RegionSelection> entrypoints_;
 };

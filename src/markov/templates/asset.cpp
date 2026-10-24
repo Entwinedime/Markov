@@ -25,6 +25,7 @@ ArgumentTree::ArgumentTree(nlohmann::json source) : source_(std::move(source)) {
 
     // Keep the static tree once; dynamic slots are filled from compiled references on each call.
     for (const auto & [path, _] : references_) source_[path] = nullptr;
+    for (const auto & [path, _] : literal_references_) source_[path] = nullptr;
     for (const auto & [path, _] : shapes_) source_[path] = nullptr;
     for (const auto & [path, _] : scalars_) source_[path] = nullptr;
     for (const auto & [path, _] : groups_) source_[path] = nullptr;
@@ -32,6 +33,11 @@ ArgumentTree::ArgumentTree(nlohmann::json source) : source_(std::move(source)) {
 
 void ArgumentTree::compile(const nlohmann::json & source, const nlohmann::json::json_pointer & path) {
     if (source.is_object() && source.size() == 1) {
+        if (source.contains("literal")) {
+            literal_references_.emplace_back(path, source.at("literal").get<std::size_t>());
+            return;
+        }
+
         if (source.contains("scalar")) {
             scalars_.emplace_back(path, Expression::read(source.at("scalar")));
             return;
@@ -63,7 +69,8 @@ void ArgumentTree::compile(const nlohmann::json & source, const nlohmann::json::
     }
 }
 
-nlohmann::json ArgumentTree::instantiate(std::span<const std::size_t> values, const Parameters & parameters, const GroupValues & groups) const {
+nlohmann::json ArgumentTree::instantiate(std::span<const std::size_t> values, const Parameters & parameters, const GroupValues & groups,
+                                         const std::vector<nlohmann::json> & literals) const {
     auto result = source_;
     for (const auto & [path, identity] : references_) {
         if (identity >= values.size()) throw std::invalid_argument("argument references an undefined template value");
@@ -72,6 +79,7 @@ nlohmann::json ArgumentTree::instantiate(std::span<const std::size_t> values, co
         };
     }
 
+    for (const auto & [path, identity] : literal_references_) result[path] = literals.at(identity);
     for (const auto & [path, shape] : shapes_) result[path] = evaluate_shape(shape, parameters);
     for (const auto & [path, scalar] : scalars_) result[path] = scalar.evaluate(parameters);
 
@@ -92,11 +100,7 @@ bool TemplateDefinition::host_only() const {
            && relations.expressions().empty();
 }
 
-TemplateAsset::TemplateAsset(nlohmann::json document)
-    : environment_(std::move(document.at("environment"))),
-      physical_coverage_(std::move(document.at("physical_coverage"))),
-      runtime_coverage_(std::move(document.at("runtime_coverage"))),
-      execution_resources_(document.at("execution_resources").get<std::vector<std::string>>()) {
+TemplateCatalog::TemplateCatalog(nlohmann::json document) {
     for (const auto & source : document.at("execution_patterns")) execution_patterns_.push_back(ExecutionPattern::read(source));
 
     // Definitions describe local work independently of the caller's layout and concrete bindings.
@@ -224,6 +228,15 @@ TemplateAsset::TemplateAsset(nlohmann::json document)
         layouts_.push_back(std::move(layout));
     }
 
+    validate();
+}
+
+TemplateAsset::TemplateAsset(const TemplateCatalog & catalog, nlohmann::json document)
+    : catalog_(catalog),
+      environment_(std::move(document.at("environment"))),
+      physical_coverage_(std::move(document.at("physical_coverage"))),
+      runtime_coverage_(std::move(document.at("runtime_coverage"))),
+      execution_resources_(document.at("execution_resources").get<std::vector<std::string>>()) {
     for (const auto & source : document.at("execution_variants")) {
         ExecutionSelection selection{ source.at("definition").get<std::size_t>(), source.at("operation").get<std::size_t>(), {} };
         for (const auto & choice : source.at("choices")) {
@@ -243,8 +256,12 @@ TemplateAsset::TemplateAsset(nlohmann::json document)
                                  source.at("entry").get<std::size_t>(),
                                  source.at("path").get<std::vector<std::size_t>>() });
 
-    validate();
     for (const auto & entry : entries_) validate_bindings(entry.layout, entry.bindings);
+
+    // A shared catalog may include another role's families; only this role's reachable calls need its entrypoints.
+    std::vector<CallVisit> visiting(catalog_.layout_count());
+    for (const auto & entry : entries_) validate_calls(entry.layout, visiting);
+    for (const auto & selection : entrypoints_) validate_calls(frame(selection).layout, visiting);
 }
 
 BoundExecution TemplateAsset::bound_execution(const nlohmann::json & source) const {
@@ -254,7 +271,7 @@ BoundExecution TemplateAsset::bound_execution(const nlohmann::json & source) con
     }
 
     const auto pattern = source.at("pattern").get<std::size_t>();
-    const auto & execution = execution_patterns_.at(pattern);
+    const auto & execution = catalog_.execution_pattern(pattern);
     if (resources.size() != execution.sequences.size()) throw std::invalid_argument("execution resource binding arity mismatch");
     for (const auto & signal : execution.signals) {
         if (execution_resources_[resources[signal.resource]] != "event") throw std::invalid_argument("event signal requires an event resource");
@@ -273,6 +290,7 @@ BoundExecution TemplateAsset::bound_execution(const nlohmann::json & source) con
 
 FixedBindings TemplateAsset::fixed_bindings(const nlohmann::json & source) const {
     FixedBindings result;
+    result.literals = source.at("literals").get<std::vector<nlohmann::json>>();
     if (!source.at("host_resource").is_null()) {
         const auto resource = source.at("host_resource").get<std::size_t>();
         if (execution_resources_.at(resource) != "thread") throw std::invalid_argument("region host service requires a thread resource");
@@ -306,9 +324,9 @@ FixedBindings TemplateAsset::fixed_bindings(const nlohmann::json & source) const
 }
 
 void TemplateAsset::validate_bindings(std::size_t identity, const FixedBindings & bindings) const {
-    const auto & layout = layouts_.at(identity);
+    const auto & layout = catalog_.layout(identity);
     for (const auto & [operation, binding] : bindings.execution) {
-        if (operation >= definitions_.at(layout.definition).operations.size()) throw std::invalid_argument("execution operation is outside its definition");
+        if (operation >= catalog_.definition(layout.definition).operations.size()) throw std::invalid_argument("execution operation is outside its definition");
         if (const auto * group = std::get_if<std::size_t>(&binding)) {
             const auto & selection = execution_variants_.at(*group);
             if (selection.definition != layout.definition || selection.operation != operation)
@@ -332,7 +350,7 @@ void TemplateAsset::validate_bindings(std::size_t identity, const FixedBindings 
     if (child != bindings.children.size()) throw std::invalid_argument("source child bindings do not match their layout");
 }
 
-void TemplateAsset::validate() const {
+void TemplateCatalog::validate() const {
     for (const auto & definition : definitions_) {
         if ((definition.call_role || definition.call_count) && !definition.dynamic_calls)
             throw std::invalid_argument("target call declarations require a dynamic caller");
@@ -396,9 +414,6 @@ void TemplateAsset::validate() const {
             }
         }
     }
-
-    std::vector<CallVisit> visiting(layouts_.size());
-    for (std::size_t identity = 0; identity < layouts_.size(); ++identity) validate_calls(identity, visiting);
 }
 
 void TemplateAsset::validate_calls(std::size_t identity, std::vector<CallVisit> & visiting) const {
@@ -406,9 +421,9 @@ void TemplateAsset::validate_calls(std::size_t identity, std::vector<CallVisit> 
     if (visiting[identity] == CallVisit::Active) throw std::invalid_argument("template call families contain a cycle");
     visiting[identity] = CallVisit::Active;
 
-    const auto & source = layouts_.at(identity);
+    const auto & source = catalog_.layout(identity);
     std::vector<std::string> roles;
-    if (const auto & role = definitions_.at(source.definition).call_role) roles.push_back(*role);
+    if (const auto & role = catalog_.definition(source.definition).call_role) roles.push_back(*role);
     for (const auto & step : source.body) {
         if (const auto * call = std::get_if<CallStep>(&step)) {
             if (call->family) roles.push_back(*call->family);
@@ -429,8 +444,13 @@ void TemplateAsset::validate_calls(std::size_t identity, std::vector<CallVisit> 
     visiting[identity] = CallVisit::Complete;
 }
 
-const TemplateDefinition & TemplateAsset::definition(std::size_t identity) const { return definitions_.at(identity); }
-const TemplateLayout & TemplateAsset::layout(std::size_t identity) const { return layouts_.at(identity); }
+const TemplateDefinition & TemplateCatalog::definition(std::size_t identity) const { return definitions_.at(identity); }
+const TemplateLayout & TemplateCatalog::layout(std::size_t identity) const { return layouts_.at(identity); }
+const ExecutionPattern & TemplateCatalog::execution_pattern(std::size_t identity) const { return execution_patterns_.at(identity); }
+std::size_t TemplateCatalog::layout_count() const { return layouts_.size(); }
+
+const TemplateDefinition & TemplateAsset::definition(std::size_t identity) const { return catalog_.definition(identity); }
+const TemplateLayout & TemplateAsset::layout(std::size_t identity) const { return catalog_.layout(identity); }
 const TemplateEntry & TemplateAsset::entry(std::size_t identity) const { return entries_.at(identity); }
 
 TemplateFrame TemplateAsset::frame(const RegionSelection & selection) const {
@@ -459,7 +479,7 @@ const nlohmann::json & TemplateAsset::environment() const { return environment_;
 const nlohmann::json & TemplateAsset::physical_coverage() const { return physical_coverage_; }
 const nlohmann::json & TemplateAsset::runtime_coverage() const { return runtime_coverage_; }
 const std::vector<std::string> & TemplateAsset::execution_resources() const { return execution_resources_; }
-const ExecutionPattern & TemplateAsset::execution_pattern(std::size_t identity) const { return execution_patterns_.at(identity); }
+const ExecutionPattern & TemplateAsset::execution_pattern(std::size_t identity) const { return catalog_.execution_pattern(identity); }
 
 const BoundExecution & TemplateAsset::execution_binding(const ExecutionBinding & binding, const Parameters & parameters) const {
     if (const auto * fixed = std::get_if<BoundExecution>(&binding)) return *fixed;

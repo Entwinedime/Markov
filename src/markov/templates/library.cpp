@@ -1,15 +1,21 @@
 #include "markov/templates/library.hpp"
 
+#include "markov/contracts/input_group.hpp"
+#include "markov/production/execution_source.hpp"
 #include "markov/templates/group_execution.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace markov {
 namespace {
@@ -139,10 +145,22 @@ public:
     }
 
     nlohmann::json arguments(const nlohmann::json & source) {
-        if (source.is_object() && source.size() == 1 && source.contains("value"))
+        if (source.is_object() && source.size() == 1) {
+            if (source.contains("value"))
+                return {
+                    { "value", value(source.at("value").get<std::size_t>()) }
+                };
+            if (source.contains("shape") || source.contains("scalar") || source.contains("input_group")) return source;
+        }
+
+        // Fixed numeric operands belong to this call; geometry expressions retain their declared relations.
+        if (source.is_number()) {
+            const auto identity = literals.size();
+            literals.push_back(source);
             return {
-                { "value", value(source.at("value").get<std::size_t>()) }
+                { "literal", identity }
             };
+        }
 
         auto result = source;
         if (result.is_structured()) {
@@ -167,6 +185,7 @@ public:
     }
 
     nlohmann::json values = nlohmann::json::array();
+    std::vector<nlohmann::json> literals;
     std::vector<std::size_t> resources;
 
 private:
@@ -179,19 +198,83 @@ private:
 
 } // namespace
 
-TemplateLibrary::TemplateLibrary(const nlohmann::json & source)
+// Compile bottom-up so parent layouts reuse already-normalized child definitions.
+class SourceTemplates {
+public:
+    SourceTemplates(const nlohmann::json & source, TemplateLibrary & library);
+    nlohmann::json document();
+
+private:
+    struct Region {
+        std::vector<std::size_t> children;
+        std::vector<std::size_t> operations;
+
+        std::vector<std::size_t> inputs;
+        std::vector<std::size_t> outputs;
+        std::vector<std::size_t> resources;
+
+        std::size_t layout = 0;
+        nlohmann::json frame;
+
+        std::map<std::size_t, nlohmann::json> declarations;
+        GroupValues input_groups;
+        std::map<std::size_t, std::size_t> call_indices;
+    };
+
+    struct Item {
+        std::size_t position;
+        bool operation;
+        std::size_t identity;
+    };
+
+    struct Repetition {
+        std::string kind;
+        nlohmann::json count;
+        std::vector<std::size_t> members;
+        std::vector<std::size_t> producers;
+    };
+
+    void index();
+    void compile(std::size_t region);
+    std::pair<nlohmann::json, std::vector<std::size_t>> execution_selections() const;
+    static void publish_selections(nlohmann::json & frame, std::span<const std::size_t> groups);
+    std::optional<std::size_t> host_resource(std::size_t region, const std::vector<Item> & items);
+    std::map<std::size_t, std::map<std::string, Repetition>> repetitions(const std::vector<Item> & items) const;
+
+    bool contains(std::size_t region, std::size_t operation) const;
+    bool contains_region(std::size_t region, std::size_t child) const;
+    void use(std::size_t region, std::size_t value);
+
+    // The producer owns this immutable source throughout library compilation.
+    const nlohmann::json & source_;
+    TemplateLibrary & library_;
+    ExecutionSource execution_;
+
+    std::set<std::size_t> external_resources_;
+    std::map<std::size_t, const nlohmann::json *> values_;
+    std::map<std::string, const nlohmann::json *> modules_;
+    std::vector<Region> regions_;
+    std::vector<std::size_t> roots_;
+
+    std::vector<nlohmann::json> execution_candidates_;
+    std::set<std::size_t> external_events_;
+};
+
+
+SourceTemplates::SourceTemplates(const nlohmann::json & source, TemplateLibrary & library)
     : source_(source),
+      library_(library),
       external_resources_(source.at("external_resources").get<std::set<std::size_t>>()),
       regions_(source.at("regions").size()) {
     index();
     for (const auto root : roots_) compile(root);
 }
 
-bool TemplateLibrary::contains(std::size_t region, std::size_t operation) const {
+bool SourceTemplates::contains(std::size_t region, std::size_t operation) const {
     return contains_region(region, source_.at("operations").at(operation).at("region").get<std::size_t>());
 }
 
-bool TemplateLibrary::contains_region(std::size_t region, std::size_t child) const {
+bool SourceTemplates::contains_region(std::size_t region, std::size_t child) const {
     while (child != region) {
         const auto & parent = source_.at("regions").at(child).at("parent");
         if (parent.is_null()) return false;
@@ -201,7 +284,7 @@ bool TemplateLibrary::contains_region(std::size_t region, std::size_t child) con
     return true;
 }
 
-void TemplateLibrary::use(std::size_t region, std::size_t value) {
+void SourceTemplates::use(std::size_t region, std::size_t value) {
     const auto & producer = values_.at(value)->at("producer");
     auto owner = region;
 
@@ -223,7 +306,7 @@ void TemplateLibrary::use(std::size_t region, std::size_t value) {
     }
 }
 
-void TemplateLibrary::index() {
+void SourceTemplates::index() {
     for (const auto & value : source_.at("values")) values_.emplace(value.at("id").get<std::size_t>(), &value);
     for (const auto & module : source_.at("modules")) modules_.emplace(module.at("path").get<std::string>(), &module);
 
@@ -285,7 +368,7 @@ void TemplateLibrary::index() {
     }
 }
 
-std::map<std::size_t, std::map<std::string, TemplateLibrary::Repetition>> TemplateLibrary::repetitions(const std::vector<Item> & items) const {
+std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> SourceTemplates::repetitions(const std::vector<Item> & items) const {
     std::map<std::size_t, std::map<std::string, Repetition>> result;
     for (std::size_t position = 0; position < items.size(); ++position) {
         const auto & item = items[position];
@@ -326,7 +409,8 @@ std::map<std::size_t, std::map<std::string, TemplateLibrary::Repetition>> Templa
                     if (!repetition.producers.empty()) {
                         const auto & prototype = regions_[repetition.producers.front()];
                         if (region.layout != prototype.layout
-                            || region.frame.value("bindings", nlohmann::json::object()) != prototype.frame.value("bindings", nlohmann::json::object()))
+                            || region.frame.value("bindings", nlohmann::json::object()) != prototype.frame.value("bindings", nlohmann::json::object())
+                            || region.frame.at("literals") != prototype.frame.at("literals"))
                             throw std::invalid_argument("group element producers do not share one template and fixed bindings");
                         if (execution_signature(region.frame) != execution_signature(prototype.frame))
                             throw std::invalid_argument("group element producers have different observed execution effects");
@@ -349,7 +433,7 @@ std::map<std::size_t, std::map<std::string, TemplateLibrary::Repetition>> Templa
     return result;
 }
 
-std::optional<std::size_t> TemplateLibrary::host_resource(std::size_t identity, const std::vector<Item> & items) {
+std::optional<std::size_t> SourceTemplates::host_resource(std::size_t identity, const std::vector<Item> & items) {
     const auto & record = source_.at("regions")[identity];
     const auto & scope = record.at("host_scope");
 
@@ -369,7 +453,7 @@ std::optional<std::size_t> TemplateLibrary::host_resource(std::size_t identity, 
     return execution_.resource("thread", scope.at("thread").get<std::int64_t>());
 }
 
-void TemplateLibrary::compile(std::size_t identity) {
+void SourceTemplates::compile(std::size_t identity) {
     auto & region = regions_[identity];
     const auto & record = source_.at("regions")[identity];
     const auto & metadata = record.at("metadata");
@@ -520,7 +604,7 @@ void TemplateLibrary::compile(std::size_t identity) {
                 for (const auto & requirement : prototype.pattern.at("requirements")) {
                     if (requirement.at("kind") == "event_wait") external_events_.insert(prototype.resources.at(requirement.at("resource").get<std::size_t>()));
                 }
-                const auto pattern = execution_patterns_.try_emplace(std::move(prototype.pattern), execution_patterns_.size()).first->second;
+                const auto pattern = library_.execution_patterns_.try_emplace(std::move(prototype.pattern), library_.execution_patterns_.size()).first->second;
                 if (!region.frame.contains("execution")) region.frame["execution"] = nlohmann::json::array();
                 region.frame["execution"].push_back({
                     {   "operation",          definition.at("body").size() },
@@ -617,6 +701,7 @@ void TemplateLibrary::compile(std::size_t identity) {
     definition["values"] = std::move(own.values);
     definition["resources"] = own.resources.size();
     layout["resources"] = local.resources.size();
+    region.frame["literals"] = std::move(own.literals);
 
     // These are session bindings, never part of a shared definition or layout identity.
     region.frame["external_resources"] = nlohmann::json::object();
@@ -625,32 +710,33 @@ void TemplateLibrary::compile(std::size_t identity) {
     }
     region.resources = std::move(local.resources);
 
-    const auto definition_id = definitions_.try_emplace(std::move(definition), definitions_.size()).first->second;
+    const auto definition_id = library_.definitions_.try_emplace(std::move(definition), library_.definitions_.size()).first->second;
     layout["definition"] = definition_id;
     if (region.frame.contains("execution")) {
         for (auto & binding : region.frame["execution"]) {
             if (!binding.contains("guards")) continue;
             binding["candidate"] = execution_candidates_.size();
             execution_candidates_.push_back({
-                { "definition",           definition_id },
-                {  "operation", binding.at("operation") },
-                {     "guards",    binding.at("guards") },
-                {    "pattern",   binding.at("pattern") },
-                {  "resources", binding.at("resources") }
+                { "definition",               definition_id },
+                {   "literals", region.frame.at("literals") },
+                {  "operation",     binding.at("operation") },
+                {     "guards",        binding.at("guards") },
+                {    "pattern",       binding.at("pattern") },
+                {  "resources",     binding.at("resources") }
             });
             if (binding.contains("reduction")) execution_candidates_.back()["reduction"] = binding.at("reduction");
         }
     }
-    region.layout = layouts_.try_emplace(std::move(layout), layouts_.size()).first->second;
+    region.layout = library_.layouts_.try_emplace(std::move(layout), library_.layouts_.size()).first->second;
 }
 
-std::pair<nlohmann::json, std::vector<std::size_t>> TemplateLibrary::execution_selections() const {
+std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_selections() const {
     auto groups = nlohmann::json::array();
     std::vector<std::size_t> selected;
     std::map<nlohmann::json, std::size_t> identities;
     std::vector<std::set<nlohmann::json>> alternatives;
-    std::vector<const nlohmann::json *> patterns(execution_patterns_.size());
-    for (const auto & [pattern, identity] : execution_patterns_) patterns[identity] = &pattern;
+    std::vector<const nlohmann::json *> patterns(library_.execution_patterns_.size());
+    for (const auto & [pattern, identity] : library_.execution_patterns_) patterns[identity] = &pattern;
 
     std::vector<std::pair<nlohmann::json, nlohmann::json>> signatures;
     std::map<nlohmann::json, std::set<nlohmann::json>> contexts;
@@ -674,6 +760,7 @@ std::pair<nlohmann::json, std::vector<std::size_t>> TemplateLibrary::execution_s
                                            : resources.at(pattern.at("nodes").at(call.at("entry").get<std::size_t>()).at("resource").get<std::size_t>());
         nlohmann::json key{
             { "definition", candidate.at("definition") },
+            {   "literals",   candidate.at("literals") },
             {  "operation",  candidate.at("operation") },
             { "conditions",                 conditions },
             {     "caller",                     caller }
@@ -698,6 +785,9 @@ std::pair<nlohmann::json, std::vector<std::size_t>> TemplateLibrary::execution_s
         const auto [position, added] = identities.try_emplace(key, identities.size());
         const auto identity = position->second;
         if (added) {
+
+            // Fixed operands distinguish calling contexts without copying them into the published selection.
+            key.erase("literals");
             key["choices"] = nlohmann::json::array();
             groups.push_back(std::move(key));
             alternatives.emplace_back();
@@ -721,7 +811,7 @@ std::pair<nlohmann::json, std::vector<std::size_t>> TemplateLibrary::execution_s
     return { std::move(groups), std::move(selected) };
 }
 
-void TemplateLibrary::publish_selections(nlohmann::json & frame, std::span<const std::size_t> groups) {
+void SourceTemplates::publish_selections(nlohmann::json & frame, std::span<const std::size_t> groups) {
     if (frame.contains("execution")) {
         for (auto & binding : frame["execution"]) {
 
@@ -738,31 +828,23 @@ void TemplateLibrary::publish_selections(nlohmann::json & frame, std::span<const
     }
 }
 
-nlohmann::json TemplateLibrary::document() const {
+nlohmann::json SourceTemplates::document() {
     auto [variants, groups] = execution_selections();
     nlohmann::json result{
-        {         "environment",                               source_.at("environment") },
-        {   "physical_coverage",                         source_.at("physical_coverage") },
-        {    "runtime_coverage",                          source_.at("runtime_coverage") },
-        { "execution_resources",                                  execution_.resources() },
-        {  "execution_patterns", std::vector<nlohmann::json>(execution_patterns_.size()) },
-        {         "definitions",        std::vector<nlohmann::json>(definitions_.size()) },
-        {             "layouts",            std::vector<nlohmann::json>(layouts_.size()) },
-        {             "entries",                                 nlohmann::json::array() },
-        {         "entrypoints",                                 nlohmann::json::array() },
-        {              "inputs",                                 nlohmann::json::array() },
-        {               "scope",                         "hierarchical_source_templates" }
+        {         "environment",       source_.at("environment") },
+        {   "physical_coverage", source_.at("physical_coverage") },
+        {    "runtime_coverage",  source_.at("runtime_coverage") },
+        { "execution_resources",          execution_.resources() },
+        {  "execution_variants",             std::move(variants) },
+        {             "entries",         nlohmann::json::array() },
+        {         "entrypoints",         nlohmann::json::array() },
+        {              "inputs",         nlohmann::json::array() }
     };
-    result["execution_variants"] = std::move(variants);
-
-    for (const auto & [definition, identity] : definitions_) result["definitions"][identity] = definition;
-    for (const auto & [layout, identity] : layouts_) result["layouts"][identity] = layout;
-    for (const auto & [pattern, identity] : execution_patterns_) result["execution_patterns"][identity] = pattern;
 
     std::set<std::size_t> inputs;
     for (const auto root : roots_) {
-        const auto & region = regions_[root];
-        auto entry = region.frame;
+        auto & region = regions_[root];
+        auto entry = std::move(region.frame);
         publish_selections(entry, groups);
         entry.update({
             { "source_region",             root },
@@ -817,6 +899,28 @@ nlohmann::json TemplateLibrary::document() const {
     }
 
     return result;
+}
+
+void TemplateLibrary::add(const nlohmann::json & source) {
+    SourceTemplates compiled(source, *this);
+    roles_.push_back(compiled.document());
+}
+
+nlohmann::json TemplateLibrary::document() && {
+    nlohmann::json catalog{
+        {        "definitions",        std::vector<nlohmann::json>(definitions_.size()) },
+        {            "layouts",            std::vector<nlohmann::json>(layouts_.size()) },
+        { "execution_patterns", std::vector<nlohmann::json>(execution_patterns_.size()) }
+    };
+    for (const auto & [definition, identity] : definitions_) catalog["definitions"][identity] = definition;
+    for (const auto & [layout, identity] : layouts_) catalog["layouts"][identity] = layout;
+    for (const auto & [pattern, identity] : execution_patterns_) catalog["execution_patterns"][identity] = pattern;
+
+    return {
+        {   "scope", "hierarchical_source_templates" },
+        { "catalog",              std::move(catalog) },
+        {   "roles",               std::move(roles_) }
+    };
 }
 
 } // namespace markov

@@ -151,12 +151,20 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     return result;
 }
 
+markov::TemplateAsset select_role(const markov::TemplateCatalog & catalog, nlohmann::json & document, const nlohmann::json & target) {
+    const auto rank = target.contains("source_rank") ? integer(target.at("source_rank")) : 0;
+    auto & roles = document.at("roles");
+    const auto selected = std::ranges::find_if(roles, [rank](const auto & role) { return role.at("environment").at("rank") == rank; });
+    if (selected == roles.end()) throw std::invalid_argument("template catalog has no selected source rank");
+    return { catalog, std::move(*selected) };
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
         if (argc >= 2 && std::string(argv[1]) == "simulate") {
-            std::vector<std::filesystem::path> paths;
+            std::filesystem::path template_path;
             std::filesystem::path input;
             std::filesystem::path output;
             bool details = false;
@@ -168,17 +176,18 @@ int main(int argc, char ** argv) {
                 }
                 if (index + 1 == argc) throw std::invalid_argument("simulate option has no value");
                 const std::string value = argv[++index];
-                if (option == "--templates") paths.emplace_back(value);
+                if (option == "--templates" && template_path.empty()) template_path = value;
                 else if (option == "--input" && input.empty()) input = value;
                 else if (option == "--output" && output.empty()) output = value;
                 else throw std::invalid_argument("unknown or repeated simulate option: " + option);
             }
-            if (paths.empty() || input.empty() || output.empty()) throw std::invalid_argument("simulate requires templates, input and output");
+            if (template_path.empty() || input.empty() || output.empty()) throw std::invalid_argument("simulate requires templates, input and output");
+            auto document = read_json(template_path);
+            const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             std::vector<markov::TemplateAsset> assets;
-            for (const auto & path : paths) assets.emplace_back(read_json(path));
+            for (auto & role : document.at("roles")) assets.emplace_back(catalog, std::move(role));
             const auto result = simulate(assets, read_json(input), details);
-            paths.push_back(input);
-            write_json(output, result, paths, !details);
+            write_json(output, result, { template_path, input }, !details);
             std::cout << nlohmann::json{
                 {          "scope",                                result.at("scope") },
                 {         "status",                               result.at("status") },
@@ -190,28 +199,66 @@ int main(int argc, char ** argv) {
             return 0;
         }
 
+        if (argc >= 2 && std::string(argv[1]) == "templates") {
+            std::vector<std::pair<std::filesystem::path, std::filesystem::path>> sources;
+            std::filesystem::path output;
+            for (int index = 2; index < argc; ++index) {
+                const std::string option = argv[index];
+                if (index + 1 == argc) throw std::invalid_argument("templates option has no value");
+                const std::filesystem::path value = argv[++index];
+                if (option == "--source") sources.emplace_back(value, std::filesystem::path{});
+                else if (option == "--physical" && !sources.empty() && sources.back().second.empty()) sources.back().second = value;
+                else if (option == "--output" && output.empty()) output = value;
+                else throw std::invalid_argument("unknown or repeated templates option: " + option);
+            }
+            if (sources.empty() || output.empty()) throw std::invalid_argument("templates requires sources and output");
+
+            markov::TemplateLibrary library;
+            std::vector<std::filesystem::path> inputs;
+            for (const auto & [source, physical_path] : sources) {
+                const markov::SourceGraph graph(read_json(source));
+                const auto gaps = graph.summary().at("contract_gaps");
+                if (!gaps.empty()) throw std::invalid_argument("source contract has gaps in " + source.string() + ": " + gaps.front().dump());
+                inputs.push_back(source);
+
+                const auto physical = physical_path.empty() ? nlohmann::json(nullptr) : read_json(physical_path);
+                library.add(markov::SourceProjection(graph).document(physical_path.empty() ? nullptr : &physical));
+                if (!physical_path.empty()) inputs.push_back(physical_path);
+            }
+            const auto result = std::move(library).document();
+            write_json(output, result, inputs);
+            std::cout << nlohmann::json{
+                {        "definitions",        result.at("catalog").at("definitions").size() },
+                {            "layouts",            result.at("catalog").at("layouts").size() },
+                { "execution_patterns", result.at("catalog").at("execution_patterns").size() },
+                {              "roles",                            result.at("roles").size() }
+            }.dump(2) << '\n';
+            return 0;
+        }
+
         const bool inspect = argc == 4 && std::string(argv[1]) == "inspect" && std::string(argv[2]) == "--source";
         const bool with_physical = argc == 8 && std::string(argv[4]) == "--physical" && std::string(argv[6]) == "--output";
         const bool source_output = (argc == 6 && std::string(argv[4]) == "--output") || with_physical;
         const bool produce = source_output && std::string(argv[1]) == "produce" && std::string(argv[2]) == "--source";
-        const bool templates = source_output && std::string(argv[1]) == "templates" && std::string(argv[2]) == "--source";
         const bool expand = argc == 8 && std::string(argv[1]) == "expand" && std::string(argv[2]) == "--templates" && std::string(argv[4]) == "--target"
                             && std::string(argv[6]) == "--output";
         const bool composition = argc == 8 && std::string(argv[1]) == "compose" && std::string(argv[2]) == "--templates" && std::string(argv[4]) == "--target"
                                  && std::string(argv[6]) == "--output";
-        if (!inspect && !produce && !templates && !expand && !composition) {
+        if (!inspect && !produce && !expand && !composition) {
             std::cerr << "Usage: markov inspect --source observations.json\n"
                          "       markov produce --source observations.json [--physical physical.json] --output source-graph.json\n"
-                         "       markov templates --source observations.json [--physical physical.json] --output templates.json\n"
+                         "       markov templates --source observations.json [--physical physical.json] [--source ...] --output templates.json\n"
                          "       markov expand --templates templates.json --target target.json --output region.json\n"
                          "       markov compose --templates templates.json --target calls.json --output graph.json\n"
-                         "       markov simulate --templates rank.json [--templates rank.json ...] --input serving.json --output result.json [--details]\n";
+                         "       markov simulate --templates templates.json --input serving.json --output result.json [--details]\n";
             return 2;
         }
 
         if (composition) {
-            const markov::TemplateAsset asset(read_json(argv[3]));
+            auto document = read_json(argv[3]);
+            const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto target = read_json(argv[5]);
+            const auto asset = select_role(catalog, document, target);
             const auto result = compose(asset, target);
             write_json(argv[7], result, { argv[3], argv[5] });
             std::cout << nlohmann::json{
@@ -227,8 +274,10 @@ int main(int argc, char ** argv) {
         }
 
         if (expand) {
-            const markov::TemplateAsset asset(read_json(argv[3]));
+            auto document = read_json(argv[3]);
+            const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto target = read_json(argv[5]);
+            const auto asset = select_role(catalog, document, target);
             auto instance = markov::TemplateInstance::select(asset,
                                                              target.at("role").get<std::string>(),
                                                              target.at("phase").get<std::string>(),
@@ -263,16 +312,17 @@ int main(int argc, char ** argv) {
         if (!gaps.empty()) throw std::invalid_argument("source contract has " + std::to_string(gaps.size()) + " gaps; first: " + gaps.front().dump());
 
         const auto physical = with_physical ? read_json(argv[5]) : nlohmann::json(nullptr);
-        auto result = markov::SourceProjection(graph).document(with_physical ? &physical : nullptr);
-        if (templates) result = markov::TemplateLibrary(result).document();
+        const auto result = markov::SourceProjection(graph).document(with_physical ? &physical : nullptr);
 
         if (with_physical) write_json(argv[7], result, { argv[3], argv[5] });
         else write_json(argv[5], result, { argv[3] });
 
-        auto report = templates ? nlohmann::json{ { "definitions", result.at("definitions").size() }, { "layouts", result.at("layouts").size() }, { "entries", result.at("entries").size() } }
-                                      : nlohmann::json{ { "operations", result.at("operations").size() }, { "values", result.at("values").size() }, { "dependencies", result.at("dependencies").size() } };
+        auto report = nlohmann::json{
+            {   "operations",   result.at("operations").size() },
+            {       "values",       result.at("values").size() },
+            { "dependencies", result.at("dependencies").size() }
+        };
         report["physical_coverage"] = result.at("physical_coverage").at("status");
-        if (templates) report["execution_variants"] = result.at("execution_variants").size();
         report["runtime_coverage"] = result.at("runtime_coverage").at("status");
         if (with_physical) report["unowned_work_kinds"] = result.at("physical_coverage").at("unowned").size();
         std::cout << report.dump(2) << '\n';

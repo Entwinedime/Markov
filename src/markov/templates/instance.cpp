@@ -404,8 +404,8 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
             }
 
             auto work = prototype.properties;
-            work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups);
-            work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups);
+            work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
+            work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
             if (const auto found = bindings.execution.find(own->operation); found != bindings.execution.end()) {
                 const auto & execution = asset_.execution_binding(found->second, parameters);
                 const auto & pattern = asset_.execution_pattern(execution.pattern);
