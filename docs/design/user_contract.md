@@ -112,7 +112,7 @@ ResultProcessed 推进生成进度和控制状态，RequestOutput 只记录实�
 data/<UTC时间>_automatic-graph/
 ├── inputs/                  任务、环境身份及逐组合输入
 ├── captures/<角色-尝试>/    会话摘要、操作来源及规范物理事实
-├── assets/<实现域>/         每个逻辑 rank 的模板资产
+├── assets/<实现域>/templates.json  共享模板目录与各逻辑 rank 的独立绑定
 ├── results/summary.md       人读入口、组合结果与累计费用
 ├── results/<配置>/         默认的逐组合精简结果，含完整请求结果
 ├── diagnostics/<配置>/     --details 时保存完整目标结果

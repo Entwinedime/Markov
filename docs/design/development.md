@@ -64,6 +64,8 @@ C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架
 
 ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求/KV 状态，workflow 仅保留在途快照与程序。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组连接通信，不默认使用全部 rank。
 
+TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
+
 本地 deprecated 源码只供查阅，由 Git 忽略，不作为远端交付内容，也不进入 build、import 或 fallback。验证矩阵、批量编排和窗口判据留在 example，正式业务不导入示例。
 
 ## 来源与区域命令
@@ -123,20 +125,20 @@ scripts/markov.sh expand \
 
 `produce` 和 `templates` 可在 `--source` 后接 `--physical path/to/physical.json`，消费同一捕获的设备事实。`physical_coverage` 区分未观察、全部已归属及部分未归属，并聚合列出缺少公开操作的工作。此结果只说明归属，不能代替资源顺序或读写端口的资格；区域输出用 `source_physical_coverage` 保留来源整体状态。
 
-完整 serving 使用带物理事实编译的全部 rank 资产：
+完整 serving 使用带物理事实编译的来源域模板目录：
 
 ```bash
 scripts/markov.sh templates \
   --source data/YOUR_RUN/captures/source/rank-0.json \
   --physical data/YOUR_RUN/captures/source/physical.json \
-  --output data/YOUR_RUN/assets/rank-0.json
+  --output data/YOUR_RUN/assets/templates.json
 scripts/markov.sh simulate \
-  --templates data/YOUR_RUN/assets/rank-0.json \
+  --templates data/YOUR_RUN/assets/templates.json \
   --input example/automatic_graph/serving.json \
   --output data/YOUR_RUN/results/serving.json
 ```
 
-逻辑 TP 重复 `--templates` 提供各 rank 资产。`simulate` 接受目标请求及给定耗时，由完成端口驱动后续组批；`--details` 额外保留图、批次和输出事件。`compose --templates ... --target ... --output ...` 按目标 `invocations` 的命名端口连接区域，只是公开诊断，不维护另一套 serving 控制。
+逻辑 TP 在同一 `templates` 命令中重复 `--source`，每项后可接本次捕获的 `--physical`；输出一份共享 catalog 和独立 roles，`simulate` 只接收这一份文件。旧内部资产须从来源明确重建，不兼容读取。`simulate` 接受目标请求及给定耗时，由完成端口驱动后续组批；`--details` 额外保留图、批次和输出事件。`expand`/`compose` 的目标可用 `source_rank` 选择来源角色，默认 0；`compose` 按目标 `invocations` 的命名端口连接区域，只是公开诊断，不维护另一套 serving 控制。
 
 同一物理输入还包含搬运和等待的 `runtime_actions`。`runtime_coverage` 报告其操作归属，内部的 `native_arguments` 单独报告 API 参数观察及缺失名称；区域输出分别携带 `source_runtime_coverage` 与 `source_runtime_arguments`。没有物理观察时明确为 `not_observed`，参数覆盖不完整时保留 `partial`，二者都不能当成完整资源因果资格。
 

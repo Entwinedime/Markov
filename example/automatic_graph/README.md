@@ -45,7 +45,7 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 data/<UTC时间>_automatic-graph/
   inputs/                       原任务、环境身份及逐组合输入
   captures/<角色-尝试>/         会话摘要、操作来源及规范物理事实
-  assets/<实现域>/              每个逻辑 rank 的正式模板
+  assets/<实现域>/templates.json  共享定义/布局/执行模式与独立角色绑定
   results/summary.md             人读入口、失败与累计费用
   results/<配置>/<请求集>.json   默认的精简组合结果及逐请求结果
   diagnostics/                  --details 时的完整组合结果
@@ -101,18 +101,18 @@ scripts/markov.sh produce \
 scripts/markov.sh templates \
   --source data/YOUR_RUN/captures/source/rank-0.json \
   --physical data/YOUR_RUN/captures/source/physical.json \
-  --output data/YOUR_RUN/assets/rank-0.json
+  --output data/YOUR_RUN/assets/templates.json
 scripts/markov.sh simulate \
-  --templates data/YOUR_RUN/assets/rank-0.json \
+  --templates data/YOUR_RUN/assets/templates.json \
   --input example/automatic_graph/serving.json \
   --output data/YOUR_RUN/results/serving.json
 ```
 
-直接调用脚本前须已有当前核心构建，可用 `scripts/build.sh` 制作。逻辑 TP 重复传入 `--templates`，每个 rank 对应自己的资产。只有语义来源时可省略 `--physical` 建立逻辑诊断库，不能据此执行完整物理 serving。
+直接调用脚本前须已有当前核心构建，可用 `scripts/build.sh` 制作。逻辑 TP 在一次 `templates` 中重复 `--source`，每项后接对应的 `--physical`；随后向 `simulate` 传入这一份来源域模板。共享 catalog 只保存一份相同结构，roles 保留各 rank 的独立入口和资源绑定；旧内部资产需从来源重建。只有语义来源时可省略 `--physical` 建立逻辑诊断库，不能据此执行完整物理 serving。
 
 `inspect` 报告声明的形状、条件和状态缺口；`produce` 发布公开图。模板分开自身工作定义、子调用组合布局、具体调用绑定与物理执行变体；层号、动态成员和目标实例不自动形成新定义。`simulate` 依据目标状态和完成事件持续展开，CPU 服务、设备工作、等待及输出端口各有边界。
 
-`expand --templates ... --target ... --output ...` 用于单区域诊断。例如模型 Decode 的目标参数可包含 `M`（新增 token）、`B`（本批成员）、`R`（请求池容量）和 `max_sequence_tokens`。固定模型绑定来自资产；动态参数和子调用仍须满足模板合同。`compose` 按具名端口连接多个区域，不另建调度器。
+`expand --templates ... --target ... --output ...` 用于单区域诊断。例如模型 Decode 的目标参数可包含 `M`（新增 token）、`B`（本批成员）、`R`（请求池容量）和 `max_sequence_tokens`。固定模型绑定来自资产；动态参数和子调用仍须满足模板合同。`expand`/`compose` 的目标可用 `source_rank` 选择来源角色，默认 0；`compose` 按具名端口连接多个区域，不另建调度器。
 
 ## 辅助入口
 
