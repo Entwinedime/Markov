@@ -23,6 +23,8 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 `MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，目标 TP 不要求现场拥有同样数量的卡。
 
+配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_device` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
+
 示例预算是有限上限，不保证任意模型或配置都能在其中完成。初始化、统一预热、观察、导出、处理和失败均计入累计额度；额度不足时保留状态并停止，不隐式扩大预算或循环补采。
 
 ## 来源复用与结果含义

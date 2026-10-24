@@ -19,12 +19,17 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | `deployment.physical_device` | 执行采集的单张物理设备，非负整数；不代表目标 TP |
 | `budget` | `native_seconds`、`processing_seconds`、`temporary_bytes`、`retained_bytes` 四项累计额度，非负整数 |
 | `configurations[]` | 候选配置；每项有唯一 `id`、`tp`、`attention_backend`、`max_running_requests`、`max_total_tokens`、`page_size`、`max_prefill_tokens` |
+| `configurations[].placement.devices` | 可选的单机目标设备列表；按逻辑 TP rank 排列，数量等于 TP，元素是互异的非负整数 |
 | `workloads[]` | 请求集合；每项有唯一 `id` 和非空 `requests` |
 | `node_durations_ns` | 执行节点种类到非负整数纳秒的映射，明确给定模拟假设 |
 
 配置和 workload 的 ID 使用字母、数字、下划线或连字符，供结果路径使用。正计数参数在有符号 64 位整数范围内，KV 容量至少容纳一页。未知字段拒绝，不静默忽略未实现的 chunk、overlap、缓存或其他选项；不保留旧字段兼容。
 
 模型路径须在部署的原生容器中可访问，镜像及模型文件由部署准备。任务保存实际模型配置和镜像身份，恢复不重新解释镜像标签。
+
+`placement` 声明目标绑定，和采集用的 `deployment.physical_device` 分开；省略时按逻辑 rank 依次绑定目标设备 `0..TP-1`。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个 TP 参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
+
+只改变这些设备绑定不会重采本地计算模板；若实际传输或局部实现改变，仍需相应来源。当前给定耗时不随设备标签变化自动产生带宽、争用或异构设备模型。
 
 ## 当前配置复用边界
 
