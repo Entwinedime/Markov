@@ -12,6 +12,8 @@ scripts/build.sh
 
 已有匹配基础镜像时可跳过第一步。基础镜像只提供原生依赖，最终推理镜像还需安装当前 SGLang 和采集包；镜像标签就绪不表示构建或运行已经验收。KT 在正式适配接入前没有镜像服务入口。
 
+宿主代理使用回环地址时，构建命令前加 `MARKOV_BUILD_NETWORK=host`，使构建进程能访问该代理；默认网络下的 `127.0.0.1` 指向构建容器自身。该选项只决定依赖下载网络，不改变纯预测的隔离环境。
+
 modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohmann-json≥3.11；关闭语言扩展。正式目标为 `markov_core` 和 `markov`，Release 程序位于 `build/automatic-graph/markov`。构建、C++ 运行与静态工具均使用 modeling 容器。
 
 公开脚本固定 Compose project `markov-next-redesign`；`MARKOV_IMAGE_PREFIX` 选择已有镜像前缀，默认 `markov-next`。修改编译器或工具链时使用新的构建目录。
@@ -135,6 +137,8 @@ scripts/markov.sh simulate \
 逻辑 TP 重复 `--templates` 提供各 rank 资产。`simulate` 接受目标请求及给定耗时，由完成端口驱动后续组批；`--details` 额外保留图、批次和输出事件。`compose --templates ... --target ... --output ...` 按目标 `invocations` 的命名端口连接区域，只是公开诊断，不维护另一套 serving 控制。
 
 同一物理输入还包含搬运和等待的 `runtime_actions`。`runtime_coverage` 报告其操作归属，内部的 `native_arguments` 单独报告 API 参数观察及缺失名称；区域输出分别携带 `source_runtime_coverage` 与 `source_runtime_arguments`。没有物理观察时明确为 `not_observed`，参数覆盖不完整时保留 `partial`，二者都不能当成完整资源因果资格。
+
+同步回调与 API 按相同线程、归属和事件种类的一一调用顺序交接参数，允许回调出现在 API 前或后；数量不符或调用交错时保留缺口，不能依最近时间关联。私有 ELF 符号不可用不影响回调已观测到的 stream；是否排空队列仍需独立的原生协议依据。
 
 Ascend SDK 工具由 `src/collection/adapters/runtimes/ascend` 的独立 CMake 工程在所选推理容器内构建，`MARKOV_ASCEND_INCLUDE_DIR` 指向同一环境的 SDK。`markov_ascend_observer` 由推理进程预加载，记录实际参数并提供 workspace 预留桥，使用安装环境的 Torch 头文件及 ABI；`markov_ascend_matmul_selection` 仅查询无设备数据的矩阵描述符，匹配供应商字符串 ABI。二者独立于 modeling 容器中的核心 C++23 构建，不进入 `markov_core` 或纯预测依赖。
 
