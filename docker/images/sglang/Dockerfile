@@ -8,10 +8,9 @@ COPY third_party/sglang /opt/trace-sim/third_party/sglang
 
 RUN bash /opt/trace-sim/src/collection/adapters/frameworks/sglang/ascend/install.sh /opt/trace-sim
 
-COPY src/collection/adapters/runtimes/ascend/torch_npu /opt/trace-sim/src/collection/adapters/runtimes/ascend/torch_npu
-
-ARG MAX_JOBS=16
-RUN bash /opt/trace-sim/src/collection/adapters/runtimes/ascend/torch_npu/install.sh
+COPY pyproject.toml /opt/markov/collector/pyproject.toml
+COPY src/collection/markov_collection /opt/markov/collector/src/collection/markov_collection
+RUN python3 -m pip install --no-deps --no-build-isolation /opt/markov/collector
 
 WORKDIR /workspace/trace-sim
 

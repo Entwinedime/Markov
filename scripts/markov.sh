@@ -4,55 +4,6 @@ set -euo pipefail
 MARKOV_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$MARKOV_ROOT"
 
-if [[ "${1:-}" == "--help" ]]; then
-    cat <<'HELP'
-Usage: scripts/markov.sh plan --project project.json
-       scripts/markov.sh predict --project project.json
-       scripts/markov.sh explore --project project.json --budget-sec seconds-per-combination
-       scripts/markov.sh compare --run run-directory --validation-manifest FILE [--validation-manifest FILE ...]
-       scripts/markov.sh prepare-performance --project project.json --prediction-result prediction.json --run-state run.json
-       scripts/markov.sh profile --project project.json --configuration ID --workload ID
-       scripts/markov.sh profile --project project.json --configuration ID --representative
-       scripts/markov.sh observe-target --project project.json --configuration ID --workload ID --budget-sec seconds [--purpose ports|structure]
-       scripts/markov.sh sample --project project.json --configuration ID --workload ID --kind transfer|device --measurement-requests work-domains.json [--repetitions N]
-       scripts/markov.sh sample --project project.json --configuration ID --kind communication [--repetitions N]
-       scripts/markov.sh status --run run-directory
-       scripts/markov.sh resume --run run-directory [--cost-model FILE ...]
-       scripts/markov.sh extract --base-manifest profile_manifest.json
-       scripts/markov.sh fit-costs --performance-manifest performance_manifest.json [--unit all|kernel|communication|transfer|command|cpu]
-       scripts/markov.sh evaluate-costs --model-candidate candidate.json --performance-manifest held-out-manifest.json
-
-plan describes configuration/workload combinations without collecting. predict
-uses declared compiled templates and explicit cost candidates or given target-work durations. Representative
-collection executes a bounded native role set per missing-source group within the shared base budget.
-Rule/cost gaps never trigger structure capture. Actual cost requirements form a
-shared sampling plan; permitted measurements reuse the cumulative performance budget.
-Cost coverage is checked per instantiated target; missing data remains explicit.
-profile --representative executes the candidate recipe within the base budget.
-profile and sample are explicit diagnostic acquisition commands; observe-target
-produces validation-only facts, using direct return ports by default. --purpose structure
-retains full profiler/semantic observations. extract rebuilds compiled templates from observations.
-status/resume share the task's cumulative budgets. resume --template-assets FILE
-replaces the explicit template list; paths in that JSON array are relative to FILE.
-Transfer/device samples require explicit nonempty measurement requests.
-predict/explore plan CPU sampling from template demands and observed native work.
-fit-costs produces CPU, kernel, physical communication, memory-transfer or device-command candidates.
---unit all fits every unit declared by one independent measurement manifest.
-It returns a bundle with a candidates array; select one unit for a single candidate.
-Explicit cost candidates can enter conditional prediction under their declared query policies.
-All candidates preserve measurement gaps and do not establish cost qualification.
-evaluate-costs compares a fixed candidate with separate unit samples without fitting.
-
-HELP
-    exit 0
-fi
-
-case "${1:-}" in
-    observe-target|predict|explore|compare|profile|sample|resume|status)
-        export PYTHONPATH="${MARKOV_ROOT}/src/collection${PYTHONPATH:+:${PYTHONPATH}}"
-        exec python3 -m markov_collection.workflow.cli "$@"
-        ;;
-esac
-
 exec docker compose -p markov-next-redesign -f docker/compose/inference.yml \
-    run --rm --no-deps modeling build/markov/markov "$@"
+    run --rm --no-deps modeling \
+    flock --shared --no-fork build/automatic-graph.lock build/automatic-graph/markov "$@"

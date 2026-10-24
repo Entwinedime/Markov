@@ -1,0 +1,30 @@
+{
+  "purpose": "Serving structure example with explicit duration assumptions; these are not measured performance data.",
+  "configuration": {
+    "max_running_requests": 3,
+    "max_total_tokens": 1024,
+    "page_size": 128,
+    "max_prefill_tokens": 1024
+  },
+  "requests": [
+    {"id": "A", "arrival_ns": 0, "prompt_tokens": 127, "output_tokens": 2},
+    {"id": "B", "arrival_ns": 1000000, "prompt_tokens": 129, "output_tokens": 1},
+    {"id": "C", "arrival_ns": 2000000, "prompt_tokens": 65, "output_tokens": 1}
+  ],
+  "node_durations_ns": {
+    "host": 10,
+    "enqueue": 1,
+    "submit": 1,
+    "device": 100,
+    "copy": 1,
+    "copy_async": 1,
+    "transfer": 100,
+    "wait_stream": 0,
+    "wait_entry": 0,
+    "queue_return": 0,
+    "record_event": 1,
+    "wait_event": 1,
+    "barrier": 0,
+    "communication": 100
+  }
+}
