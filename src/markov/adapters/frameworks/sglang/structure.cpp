@@ -83,7 +83,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action) {
         programs.push_back(ranks_[rank]->expand(action.batch, action.effects));
         work.push_back({ rank, begin, graph_.operations.size() });
     }
-    parallel_.connect(work, topology_);
+    parallel_.connect(work, topology_, action.task);
 
     for (std::size_t region = region_begin; region < graph_.regions.size(); ++region) graph_.regions[region]["batch"] = batch_count_;
     ++batch_count_;

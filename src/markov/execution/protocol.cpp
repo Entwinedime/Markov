@@ -241,7 +241,6 @@ void ExecutionGraph::connect_communication(std::span<const std::size_t> operatio
         { ExecutionKind::Communication, resource, std::nullopt, "collective" },
         { ExecutionOwner::Kind::Region, region }
     });
-    sequence(node, resource);
 
     // One collective consumes every participant's readiness and releases every participant's stream.
     for (const auto operation : operations) {
@@ -337,7 +336,7 @@ std::vector<std::size_t> ExecutionGraph::retire(std::span<const ValueAccess> val
     value_ready_ = std::move(ready);
     std::erase_if(storage_frontiers_, [&](const auto & item) { return !retained_storage.contains(item.first); });
 
-    // These identities name already evaluated completions, including asynchronous work after the batch return.
+    // Frontiers may still be running; the executor retains them after this graph releases its history.
     std::set<std::size_t> frontier;
     for (const auto & [_, node] : tails_) frontier.insert(node);
     for (const auto & [_, node] : value_ready_) frontier.insert(node);

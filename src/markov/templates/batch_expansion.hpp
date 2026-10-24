@@ -20,6 +20,8 @@ public:
     // Idle work returns readiness ports without publishing tokens or changing request ownership.
     virtual std::vector<std::size_t> idle() = 0;
     virtual const RegionGraph & graph() const = 0;
+
+    // Release historical IR while pinning live state and message bindings; node ports keep their global identities.
     virtual std::vector<std::size_t> retire() = 0;
 };
 

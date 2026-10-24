@@ -102,7 +102,7 @@ public:
     void connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region);
     void connect_accesses(std::span<const ValueAccess> values, std::span<const nlohmann::json> types, std::span<const Operation> operations);
 
-    // Retire evaluated work, retaining only state readiness and execution resource frontiers.
+    // Release historical IR, retaining state readiness and possibly unfinished execution frontiers.
     std::vector<std::size_t> retire(std::span<const ValueAccess> values, const std::map<std::size_t, std::size_t> & retained_values,
                                     const std::set<std::size_t> & retained_storage);
 

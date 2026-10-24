@@ -5,6 +5,7 @@
 #include <map>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace markov {
 
@@ -39,14 +40,13 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
     struct PendingWork {
         ServingAction action;
-        BatchProgram program;
+        std::vector<std::size_t> returned_pages;
         nlohmann::json decision;
     };
     std::map<TaskIdentity, PendingWork> pending;
 
     while (!controller_.done() || !pending.empty()) {
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
-            if (pending.contains(action->task)) throw std::logic_error("control reused an in-flight task identity");
             nlohmann::json decision;
             if (details) {
                 decision = describe_batch(action->batch);
@@ -65,39 +65,34 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
             // Keep the key before moving the snapshot; function argument evaluation must not move it first.
             const auto identity = action->task;
-            pending.emplace(identity, PendingWork{ std::move(*action), std::move(program), std::move(decision) });
+            pending.emplace(identity, PendingWork{ std::move(*action), std::move(program.returned_pages), std::move(decision) });
             continue;
         }
 
         // Native control finishes in the idle interval, rather than after the next arrival.
-        const auto event_ns = executor_.next_event_ns();
         const auto arrival_ns = controller_.next_arrival_ns(executor_.now_ns());
-        if (!event_ns) {
+        if (pending.empty()) {
             if (!arrival_ns) throw std::logic_error("serving has no runnable work, completion or request arrival");
-            auto ready_ns = executor_.now_ns();
+            const auto scheduled_ns = executor_.now_ns();
             const auto completions = expansion_.idle();
+            const auto ready_ns = executor_.idle_until(expansion_.graph(), completions, *arrival_ns);
             if (!completions.empty()) {
-                ready_ns = executor_.evaluate(expansion_.graph(), completions);
                 if (details)
                     result["controls"].push_back({
-                        { "scheduled_ns", executor_.now_ns() },
-                        { "completed_ns",           ready_ns }
+                        { "scheduled_ns", scheduled_ns },
+                        { "completed_ns",     ready_ns }
                     });
                 if (!details) executor_.retain(expansion_.retire());
             }
-
-            // Requests arriving while control is busy participate in its next scheduling decision.
-            executor_.advance_to(std::max(ready_ns, *arrival_ns));
             continue;
         }
 
-        // An arrival can enable another control group while earlier work remains in flight.
-        if (arrival_ns && *arrival_ns > executor_.now_ns() && *arrival_ns < *event_ns) {
-            executor_.advance_to(*arrival_ns);
-            continue;
-        }
+        // Progress internal work only as far as a visible completion or the next future arrival.
+        const auto deadline_ns = arrival_ns && *arrival_ns > executor_.now_ns() ? arrival_ns : std::nullopt;
+        const auto next = executor_.advance_until(deadline_ns);
+        if (!next) continue;
 
-        const auto event = executor_.next_event();
+        const auto & event = *next;
         auto & work = pending.at(event.task);
         if (event.kind == ExecutionEvent::Kind::Published) {
             record_publication(result, work.action.effects, event.time_ns, details);
@@ -106,18 +101,19 @@ nlohmann::json ServingWorkflow::run(bool details) {
         }
 
         // Publication does not release pages; result-processing completion commits those effects.
-        controller_.finish(work.action, work.program.returned_pages, event.time_ns);
+        controller_.finish(work.action, work.returned_pages, event.time_ns);
         record_completion(result, work.decision, work.action.effects, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));
         pending.erase(event.task);
 
-        // In-flight actions retain their program and ports until their own completion, not another batch's return.
-        if (!details && pending.empty()) executor_.retain(expansion_.retire());
+        // The executor keeps unfinished work and notifications; the expansion pins all live state bindings.
+        if (!details) executor_.retain(expansion_.retire());
     }
 
     result["control_status"] = "complete";
     result["free_pages"] = controller_.free_pages();
     result["completed_ns"] = executor_.now_ns();
+    if (details) result["execution_timeline"] = executor_.timeline();
     return result;
 }
 

@@ -18,7 +18,7 @@ void ParallelComposition::require_geometry(std::span<const std::size_t> referenc
     }
 }
 
-void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology) {
+void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task) {
     std::map<std::string, std::vector<std::vector<std::size_t>>> groups;
     for (const auto & rank : ranks) {
         for (auto operation = rank.begin; operation < rank.end; ++operation) {
@@ -66,13 +66,15 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
             auto bound = specification;
             bound["group"] = group;
             graph_.regions.push_back({
-                {              "id",       region },
-                {          "parent",      nullptr },
-                {            "role", "collective" },
-                {   "communication",        bound },
-                { "rank_operations",   operations },
-                {          "inputs",       inputs },
-                {         "outputs",      outputs }
+                {              "id",                                                     region },
+                {          "parent",                                                    nullptr },
+                {            "role",                                               "collective" },
+                {            "task", { { "group", task.group }, { "sequence", task.sequence } } },
+                {            "call",                                                      index },
+                {   "communication",                                                      bound },
+                { "rank_operations",                                                 operations },
+                {          "inputs",                                                     inputs },
+                {         "outputs",                                                    outputs }
             });
             graph_.execution.connect_communication(operations, resource->second, region);
         }
