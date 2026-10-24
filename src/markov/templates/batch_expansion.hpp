@@ -14,8 +14,8 @@ public:
     virtual ~BatchExpansion() = default;
 
     // Native occupancy and budget units accompany each controller decision.
-    virtual AdmissionConstraints admission() const = 0;
-    virtual BatchProgram expand(const Batch & batch, const BatchEffects & effects) = 0;
+    virtual GroupAdmission admission() const = 0;
+    virtual BatchProgram expand(const ServingAction & action) = 0;
 
     // Idle work returns readiness ports without publishing tokens or changing request ownership.
     virtual std::vector<std::size_t> idle() = 0;

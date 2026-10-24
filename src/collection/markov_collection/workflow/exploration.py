@@ -280,6 +280,8 @@ class Exploration:
                     name: configuration[name]
                     for name in ("max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens")
                 }
+                if "placement" in configuration:
+                    settings["placement"] = configuration["placement"]
                 write_json(
                     target,
                     {
@@ -440,6 +442,7 @@ def read_specification(path: Path) -> dict[str, Any]:
                 "max_total_tokens",
                 "page_size",
                 "max_prefill_tokens",
+                "placement",
             },
             "configuration",
         )
@@ -448,6 +451,18 @@ def read_specification(path: Path) -> dict[str, Any]:
                 raise ValueError(f"configuration {name} is outside its positive integer range")
         if configuration["max_total_tokens"] < configuration["page_size"]:
             raise ValueError("configuration KV capacity needs at least one page")
+
+        if "placement" in configuration:
+            placement = configuration["placement"]
+            check_fields(placement, {"devices"}, "placement")
+            devices = placement["devices"]
+            if (
+                not isinstance(devices, list)
+                or len(devices) != configuration["tp"]
+                or any(type(device) is not int or not 0 <= device <= maximum for device in devices)
+                or len(set(devices)) != len(devices)
+            ):
+                raise ValueError("TP placement needs one distinct nonnegative device per logical rank")
 
     # Reject malformed workloads before paying for a native source; per-configuration capacity remains a result.
     for workload in document["workloads"]:

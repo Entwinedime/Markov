@@ -12,7 +12,8 @@
     {"id": "small", "tp": 1, "attention_backend": "ascend", "max_running_requests": 2,
      "max_total_tokens": 1024, "page_size": 128, "max_prefill_tokens": 1024},
     {"id": "larger", "tp": 1, "attention_backend": "ascend", "max_running_requests": 3,
-     "max_total_tokens": 4096, "page_size": 128, "max_prefill_tokens": 4096}
+     "max_total_tokens": 4096, "page_size": 128, "max_prefill_tokens": 4096,
+     "placement": {"devices": [1]}}
   ],
   "workloads": [
     {"id": "together", "requests": [

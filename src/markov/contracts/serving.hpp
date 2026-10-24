@@ -1,7 +1,9 @@
 #pragma once
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,6 +34,16 @@ struct AdmissionConstraints {
     std::int64_t prefill_token_granularity;
 };
 
+using GroupAdmission = std::map<std::string, AdmissionConstraints>;
+
+// Group-local sequences remain unique when independent controllers share one executor.
+struct TaskIdentity {
+    std::string group;
+    std::size_t sequence;
+
+    auto operator<=>(const TaskIdentity &) const = default;
+};
+
 // Each member carries only the page changes needed for this batch.
 struct BatchMember {
     std::size_t request;
@@ -47,6 +59,7 @@ struct BatchMember {
 struct Batch {
     Phase phase;
     std::int64_t scheduled_ns;
+    std::int64_t request_capacity;
     std::int64_t free_pages_before;
     std::int64_t allocated_pages;
     std::vector<BatchMember> members;
@@ -54,12 +67,14 @@ struct Batch {
     std::int64_t new_tokens() const;
 };
 
+// Control progress can complete without producing a user-visible token.
 struct RequestCompletion {
     std::size_t request;
     std::size_t slot;
     std::int64_t generated_tokens;
     std::int64_t resident_tokens;
     bool finished;
+    bool emits_output;
     std::vector<std::size_t> released_pages;
 };
 
@@ -68,9 +83,16 @@ struct BatchEffects {
     std::vector<RequestCompletion> members;
 };
 
-// Publication is visible before this batch's result-processing return.
+// Decisions and effects travel together; only execution feedback commits mutable control state.
+struct ServingAction {
+    TaskIdentity task;
+    Batch batch;
+    BatchEffects effects;
+};
+
+// Intermediate work can complete without publishing a user-visible token.
 struct BatchProgram {
-    std::size_t publication;
+    std::optional<std::size_t> publication;
     std::vector<std::size_t> completions;
     std::vector<std::size_t> returned_pages;
 };

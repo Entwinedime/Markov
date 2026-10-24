@@ -5,29 +5,30 @@
 #include <deque>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "markov/contracts/serving.hpp"
+#include "markov/controller/control.hpp"
 
 namespace markov {
 
 // Planning is read-only; start and finish commit allocation and completion effects.
-class ServingController {
+class ServingController final : public ServingControl {
 public:
-    ServingController(ServingSettings settings, std::vector<Request> requests);
+    ServingController(ServingSettings settings, std::vector<Request> requests, std::string group);
 
-    std::optional<Batch> plan(std::int64_t now_ns, AdmissionConstraints admission) const;
+    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
 
     // Submit the current plan only after its target graph has been assembled successfully.
-    void start(Batch batch);
-    BatchEffects effects(const Batch & batch) const;
-    void finish(const BatchEffects & effects, std::span<const std::size_t> returned_pages, std::int64_t completed_ns);
+    void start(const ServingAction & action) override;
+    void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) override;
 
-    std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const;
-    bool done() const;
-    std::size_t free_pages() const;
-    std::size_t request_count() const;
-    const Request & request(std::size_t identity) const;
+    std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const override;
+    bool done() const override;
+    std::size_t free_pages() const override;
+    std::size_t request_count() const override;
+    const Request & request(std::size_t identity) const override;
 
 private:
     struct RequestState {
@@ -41,8 +42,10 @@ private:
     };
 
     std::int64_t pages_for(std::int64_t tokens) const;
+    BatchEffects effects(const Batch & batch) const;
 
     ServingSettings settings_;
+    std::string group_;
     std::vector<RequestState> requests_;
 
     std::vector<std::size_t> active_;
@@ -51,7 +54,8 @@ private:
 
     std::size_t waiting_ = 0;
     std::int64_t last_event_ns_ = 0;
-    std::optional<Batch> in_flight_;
+    std::size_t next_task_ = 0;
+    std::optional<TaskIdentity> in_flight_;
 };
 
 } // namespace markov

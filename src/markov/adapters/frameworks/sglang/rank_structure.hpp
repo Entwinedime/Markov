@@ -42,6 +42,7 @@ private:
     TargetGraph graph_;
     BatchViews views_;
     std::size_t rank_;
+    bool publishes_;
 
     std::optional<std::size_t> free_pages_;
     std::optional<std::size_t> request_map_;

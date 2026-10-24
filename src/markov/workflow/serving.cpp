@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <map>
+#include <stdexcept>
 #include <utility>
 
 namespace markov {
 
-ServingWorkflow::ServingWorkflow(ServingSettings settings, std::vector<Request> requests, BatchExpansion & expansion, const NodeDurations & durations)
-    : settings_(settings),
-      controller_(settings, std::move(requests)),
+ServingWorkflow::ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations)
+    : controller_(controller),
       expansion_(expansion),
       executor_(durations) {}
 
@@ -35,23 +36,44 @@ nlohmann::json ServingWorkflow::run(bool details) {
         result["outputs"] = nlohmann::json::array();
         result["controls"] = nlohmann::json::array();
     }
-    BatchEffects effects;
-    BatchProgram program{};
-    nlohmann::json decision;
 
-    while (!controller_.done()) {
-        if (auto batch = controller_.plan(executor_.now_ns(), expansion_.admission())) {
-            effects = controller_.effects(*batch);
-            if (details) decision = describe_batch(*batch);
+    struct PendingWork {
+        ServingAction action;
+        BatchProgram program;
+        nlohmann::json decision;
+    };
+    std::map<TaskIdentity, PendingWork> pending;
+
+    while (!controller_.done() || !pending.empty()) {
+        if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
+            if (pending.contains(action->task)) throw std::logic_error("control reused an in-flight task identity");
+            nlohmann::json decision;
+            if (details) {
+                decision = describe_batch(action->batch);
+                decision["task"] = {
+                    {    "group",    action->task.group },
+                    { "sequence", action->task.sequence }
+                };
+            }
 
             // Construction and duration resolution succeed before request/page ownership changes.
-            program = expansion_.expand(*batch, effects);
-            executor_.submit(expansion_.graph(), program);
-            controller_.start(std::move(*batch));
+            auto program = expansion_.expand(*action);
+            if (!program.publication && std::ranges::any_of(action->effects.members, &RequestCompletion::emits_output))
+                throw std::invalid_argument("declared request output has no publication port");
+            executor_.submit(expansion_.graph(), action->task, program);
+            controller_.start(*action);
+
+            // Keep the key before moving the snapshot; function argument evaluation must not move it first.
+            const auto identity = action->task;
+            pending.emplace(identity, PendingWork{ std::move(*action), std::move(program), std::move(decision) });
+            continue;
         }
 
         // Native control finishes in the idle interval, rather than after the next arrival.
-        if (!executor_.has_events()) {
+        const auto event_ns = executor_.next_event_ns();
+        const auto arrival_ns = controller_.next_arrival_ns(executor_.now_ns());
+        if (!event_ns) {
+            if (!arrival_ns) throw std::logic_error("serving has no runnable work, completion or request arrival");
             auto ready_ns = executor_.now_ns();
             const auto completions = expansion_.idle();
             if (!completions.empty()) {
@@ -65,22 +87,32 @@ nlohmann::json ServingWorkflow::run(bool details) {
             }
 
             // Requests arriving while control is busy participate in its next scheduling decision.
-            executor_.advance_to(std::max(ready_ns, controller_.next_arrival_ns(executor_.now_ns()).value()));
+            executor_.advance_to(std::max(ready_ns, *arrival_ns));
+            continue;
+        }
+
+        // An arrival can enable another control group while earlier work remains in flight.
+        if (arrival_ns && *arrival_ns > executor_.now_ns() && *arrival_ns < *event_ns) {
+            executor_.advance_to(*arrival_ns);
             continue;
         }
 
         const auto event = executor_.next_event();
+        auto & work = pending.at(event.task);
         if (event.kind == ExecutionEvent::Kind::Published) {
-            record_publication(result, effects, event.time_ns, details);
-            if (details) decision["published_ns"] = event.time_ns;
+            record_publication(result, work.action.effects, event.time_ns, details);
+            if (details) work.decision["published_ns"] = event.time_ns;
             continue;
         }
 
         // Publication does not release pages; result-processing completion commits those effects.
-        controller_.finish(effects, program.returned_pages, event.time_ns);
-        record_completion(result, decision, effects, event.time_ns, details);
-        if (details) result["decisions"].push_back(std::move(decision));
-        else executor_.retain(expansion_.retire());
+        controller_.finish(work.action, work.program.returned_pages, event.time_ns);
+        record_completion(result, work.decision, work.action.effects, event.time_ns, details);
+        if (details) result["decisions"].push_back(std::move(work.decision));
+        pending.erase(event.task);
+
+        // In-flight actions retain their program and ports until their own completion, not another batch's return.
+        if (!details && pending.empty()) executor_.retain(expansion_.retire());
     }
 
     result["control_status"] = "complete";
@@ -95,7 +127,7 @@ nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
         {      "scheduled_ns",                                   batch.scheduled_ns },
         {                 "M",                                   batch.new_tokens() },
         {                 "B",                                 batch.members.size() },
-        {                 "R",                       settings_.max_running_requests },
+        {                 "R",                               batch.request_capacity },
         { "free_pages_before",                              batch.free_pages_before },
         {   "allocated_pages",                                batch.allocated_pages },
         {           "members",                              nlohmann::json::array() }
@@ -116,6 +148,8 @@ nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
 
 void ServingWorkflow::record_publication(nlohmann::json & result, const BatchEffects & effects, std::int64_t time_ns, bool details) const {
     for (const auto & member : effects.members) {
+        if (!member.emits_output) continue;
+
         auto & request = result["requests"][member.request];
         if (member.generated_tokens == 1) request["first_output_ns"] = time_ns;
         request["last_output_ns"] = time_ns;

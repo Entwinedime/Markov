@@ -1,6 +1,7 @@
 #include "markov/execution/executor.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -9,14 +10,17 @@ namespace markov {
 
 Executor::Executor(const NodeDurations & durations) : durations_(durations) {}
 
-void Executor::submit(const RegionGraph & graph, const BatchProgram & program) {
+void Executor::submit(const RegionGraph & graph, const TaskIdentity & task, const BatchProgram & program) {
+    if (program.completions.empty()) throw std::invalid_argument("work needs a completion port");
     const auto completed = evaluate(graph, program.completions);
 
     // Publication and result completion are distinct graph ports, even when their times coincide.
-    const auto published = finish_time(program.publication);
-    if (published > completed) throw std::invalid_argument("batch result completion precedes its publication");
-    events_.push_back({ ExecutionEvent::Kind::Published, published });
-    events_.push_back({ ExecutionEvent::Kind::Completed, completed });
+    if (program.publication) {
+        const auto published = finish_time(*program.publication);
+        if (published > completed) throw std::invalid_argument("batch result completion precedes its publication");
+        events_.emplace(published, ExecutionEvent{ published, task, ExecutionEvent::Kind::Published });
+    }
+    events_.emplace(completed, ExecutionEvent{ completed, task, ExecutionEvent::Kind::Completed });
 }
 
 std::int64_t Executor::evaluate(const RegionGraph & graph, std::span<const std::size_t> completions) {
@@ -85,16 +89,19 @@ void Executor::retain(std::span<const std::size_t> frontiers) {
     consumed_edges_ = 0;
 }
 
-bool Executor::has_events() const { return !events_.empty(); }
+std::optional<std::int64_t> Executor::next_event_ns() const { return events_.empty() ? std::nullopt : std::optional(events_.begin()->first); }
 
 ExecutionEvent Executor::next_event() {
-    const auto event = events_.front();
-    events_.pop_front();
-    now_ns_ = event.time_ns;
+    const auto event = events_.begin()->second;
+    events_.erase(events_.begin());
+    advance_to(event.time_ns);
     return event;
 }
 
-void Executor::advance_to(std::int64_t time_ns) { now_ns_ = time_ns; }
+void Executor::advance_to(std::int64_t time_ns) {
+    if (time_ns < now_ns_) throw std::invalid_argument("execution time must not move backwards");
+    now_ns_ = time_ns;
+}
 std::int64_t Executor::now_ns() const { return now_ns_; }
 
 } // namespace markov

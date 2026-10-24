@@ -1,5 +1,6 @@
 #include "markov/templates/parallel_composition.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -17,16 +18,20 @@ void ParallelComposition::require_geometry(std::span<const std::size_t> referenc
     }
 }
 
-void ParallelComposition::connect(std::span<const RankWork> ranks) {
+void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology) {
     std::map<std::string, std::vector<std::vector<std::size_t>>> groups;
-    for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
-        for (auto operation = ranks[rank].begin; operation < ranks[rank].end; ++operation) {
+    for (const auto & rank : ranks) {
+        for (auto operation = rank.begin; operation < rank.end; ++operation) {
             const auto & work = graph_.work[operation];
             if (!work.contains("communication")) continue;
             const auto & spec = work.at("communication");
-            if (spec.at("size").get<std::size_t>() != ranks.size()) throw std::invalid_argument("collective participant count differs from target ranks");
-            auto & calls = groups.try_emplace(spec.at("group").get<std::string>(), ranks.size()).first->second;
-            calls[rank].push_back(operation);
+            const auto & group = topology.group(rank.rank, spec.at("group").get<std::string>());
+            if (spec.at("size").get<std::size_t>() != group.members.size())
+                throw std::invalid_argument("collective participant count differs from its target group");
+
+            const auto member = static_cast<std::size_t>(std::ranges::find(group.members, rank.rank) - group.members.begin());
+            auto & calls = groups.try_emplace(group.id, group.members.size()).first->second;
+            calls[member].push_back(operation);
         }
     }
 
@@ -58,14 +63,16 @@ void ParallelComposition::connect(std::span<const RankWork> ranks) {
             }
 
             const auto region = graph_.regions.size();
+            auto bound = specification;
+            bound["group"] = group;
             graph_.regions.push_back({
-                {              "id",        region },
-                {          "parent",       nullptr },
-                {            "role",  "collective" },
-                {   "communication", specification },
-                { "rank_operations",    operations },
-                {          "inputs",        inputs },
-                {         "outputs",       outputs }
+                {              "id",       region },
+                {          "parent",      nullptr },
+                {            "role", "collective" },
+                {   "communication",        bound },
+                { "rank_operations",   operations },
+                {          "inputs",       inputs },
+                {         "outputs",      outputs }
             });
             graph_.execution.connect_communication(operations, resource->second, region);
         }

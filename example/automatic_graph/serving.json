@@ -1,5 +1,4 @@
 {
-  "purpose": "Serving structure example with explicit duration assumptions; these are not measured performance data.",
   "configuration": {
     "max_running_requests": 3,
     "max_total_tokens": 1024,

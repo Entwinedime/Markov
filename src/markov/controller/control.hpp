@@ -1,0 +1,32 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+
+#include "markov/contracts/serving.hpp"
+
+namespace markov {
+
+// A control implementation owns request progress and allocation; workflow only delivers execution feedback.
+class ServingControl {
+public:
+    virtual ~ServingControl() = default;
+
+    virtual std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const = 0;
+
+    // Construction must succeed before start; finish commits only the corresponding completion effects.
+    virtual void start(const ServingAction & action) = 0;
+    virtual void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) = 0;
+
+    virtual std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const = 0;
+    virtual bool done() const = 0;
+
+    // Results read the owner's state without keeping another request or page ledger.
+    virtual std::size_t free_pages() const = 0;
+    virtual std::size_t request_count() const = 0;
+    virtual const Request & request(std::size_t identity) const = 0;
+};
+
+} // namespace markov

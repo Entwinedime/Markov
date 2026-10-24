@@ -10,11 +10,14 @@
 
 namespace markov::sglang {
 
-ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests)
-    : parallel_(graph_),
+ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests,
+                                   const ParallelTopology & topology)
+    : topology_(topology),
+      parallel_(graph_),
       prefill_token_granularity_(settings.page_size),
       assets_(assets.size()) {
     if (assets.empty()) throw std::invalid_argument("serving requires rank assets");
+    if (topology_.ranks().size() != assets.size()) throw std::invalid_argument("rank placement does not match its source bindings");
     const auto addressable_pages = (static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1) / settings.page_size;
     if (settings.max_total_tokens / settings.page_size >= addressable_pages)
         throw std::invalid_argument("target KV indices exceed the native int32 range including reserved page zero");
@@ -56,13 +59,18 @@ ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, Servin
     }
 }
 
-AdmissionConstraints ServingStructure::admission() const {
+GroupAdmission ServingStructure::admission() const {
 
     // PrefillAdder._update_prefill_budget charges whole pages on the fixed-output, cold-cache path.
-    return { ranks_.front()->admission_members(), prefill_token_granularity_ };
+    GroupAdmission result;
+    for (const auto & group : topology_.groups()) {
+        result.emplace(group.id, AdmissionConstraints{ ranks_[group.members.front()]->admission_members(), prefill_token_granularity_ });
+    }
+    return result;
 }
 
-BatchProgram ServingStructure::expand(const Batch & batch, const BatchEffects & effects) {
+BatchProgram ServingStructure::expand(const ServingAction & action) {
+    const auto & group = topology_.group(action.task.group);
     const auto operation_begin = graph_.operations.size();
     const auto node_begin = graph_.execution.nodes().size();
     const auto dependency_begin = graph_.execution.dependencies().size();
@@ -70,12 +78,12 @@ BatchProgram ServingStructure::expand(const Batch & batch, const BatchEffects & 
     std::vector<RankWork> work;
     std::vector<RankProgram> programs;
 
-    for (auto & rank : ranks_) {
+    for (const auto rank : group.members) {
         const auto begin = graph_.operations.size();
-        programs.push_back(rank->expand(batch, effects));
-        work.push_back({ begin, graph_.operations.size() });
+        programs.push_back(ranks_[rank]->expand(action.batch, action.effects));
+        work.push_back({ rank, begin, graph_.operations.size() });
     }
-    parallel_.connect(work);
+    parallel_.connect(work, topology_);
 
     for (std::size_t region = region_begin; region < graph_.regions.size(); ++region) graph_.regions[region]["batch"] = batch_count_;
     ++batch_count_;
@@ -83,9 +91,15 @@ BatchProgram ServingStructure::expand(const Batch & batch, const BatchEffects & 
     node_count_ += graph_.execution.nodes().size() - node_begin;
     dependency_count_ += graph_.execution.dependencies().size() - dependency_begin;
 
-    // Only rank zero publishes; the next decision waits for all native result handlers.
-    BatchProgram result{ programs.front().publication.value(), {}, std::move(programs.front().returned_pages) };
-    for (const auto & program : programs) result.completions.push_back(program.completion);
+    // Publication follows observed role ports; local completion remains necessary at every participating rank.
+    BatchProgram result{ std::nullopt, {}, std::move(programs.front().returned_pages) };
+    for (const auto & program : programs) {
+        if (program.publication) {
+            if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
+            result.publication = program.publication;
+        }
+        result.completions.push_back(program.completion);
+    }
     return result;
 }
 
@@ -126,6 +140,7 @@ nlohmann::json ServingStructure::summary() const {
         {             "dtype",             implementation.at("dtype") },
         { "attention_backend", implementation.at("attention_backend") },
         {        "logical_tp",                         assets_.size() },
+        {          "topology",                   topology_.document() },
         {            "counts",
          { { "batches", batch_count_ },
          { "control_decisions", control_count_ },
@@ -161,6 +176,7 @@ nlohmann::json ServingStructure::document() const {
     result["scope"] = "serving_structure";
     result["environment"] = assets_.front()->environment();
     result["environment"].erase("rank");
+    result["topology"] = topology_.document();
     return result;
 }
 

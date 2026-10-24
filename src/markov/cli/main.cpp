@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,8 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/adapters/frameworks/sglang/structure.hpp"
+#include "markov/contracts/topology.hpp"
+#include "markov/controller/serving.hpp"
 #include "markov/execution/durations.hpp"
 #include "markov/graph/source_graph.hpp"
 #include "markov/production/source_projection.hpp"
@@ -92,10 +95,33 @@ void check_fields(const nlohmann::json & source, std::initializer_list<std::stri
     }
 }
 
+markov::ParallelTopology tensor_parallel_topology(const nlohmann::json & configuration, std::size_t rank_count) {
+    const nlohmann::json * devices = nullptr;
+    if (configuration.contains("placement")) {
+        const auto & placement = configuration.at("placement");
+        check_fields(placement, { "devices" }, "placement");
+        devices = &placement.at("devices");
+        if (!devices->is_array() || devices->size() != rank_count) throw std::invalid_argument("placement needs one device per TP rank");
+    }
+
+    std::vector<markov::RankPlacement> ranks;
+    std::vector<std::size_t> members;
+    std::set<std::size_t> used;
+    for (std::size_t rank = 0; rank < rank_count; ++rank) {
+        const auto device = devices == nullptr ? static_cast<std::int64_t>(rank) : integer(devices->at(rank));
+        if (device < 0 || !used.insert(static_cast<std::size_t>(device)).second)
+            throw std::invalid_argument("TP placement needs distinct nonnegative devices on one host");
+
+        ranks.push_back({ "local", static_cast<std::size_t>(device) });
+        members.push_back(rank);
+    }
+    return { std::move(ranks), { { "model", "tp", std::move(members) } } };
+}
+
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
     check_fields(input, { "configuration", "requests", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
-    check_fields(configuration, { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens" }, "configuration");
+    check_fields(configuration, { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "placement" }, "configuration");
     const markov::ServingSettings settings{ integer(configuration.at("max_running_requests")),
                                             integer(configuration.at("max_total_tokens")),
                                             integer(configuration.at("page_size")),
@@ -112,8 +138,11 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     }
 
     const markov::GivenDurations durations(input.at("node_durations_ns"));
-    markov::sglang::ServingStructure expansion(assets, settings, requests);
-    markov::ServingWorkflow workflow(settings, std::move(requests), expansion, durations);
+    const auto topology = tensor_parallel_topology(configuration, assets.size());
+    const auto control_group = topology.groups().front().id;
+    markov::sglang::ServingStructure expansion(assets, settings, requests, topology);
+    markov::ServingController controller(settings, std::move(requests), control_group);
+    markov::ServingWorkflow workflow(controller, expansion, durations);
     auto result = workflow.run(details);
     result["configuration"] = configuration;
     result["duration_source"] = "given_execution_kind_ns";

@@ -9,20 +9,21 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/adapters/frameworks/sglang/rank_structure.hpp"
+#include "markov/contracts/topology.hpp"
 #include "markov/templates/batch_expansion.hpp"
 #include "markov/templates/parallel_composition.hpp"
 
 namespace markov::sglang {
 
-// One controller decision drives all native roles; ranks only retain their own graph ports.
+// Controller actions select rank groups; each rank retains only its local graph ports.
 class ServingStructure final : public BatchExpansion {
 public:
-    ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests);
+    ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests, const ParallelTopology & topology);
     ServingStructure(const ServingStructure &) = delete;
     ServingStructure & operator=(const ServingStructure &) = delete;
 
-    AdmissionConstraints admission() const override;
-    BatchProgram expand(const Batch & batch, const BatchEffects & effects) override;
+    GroupAdmission admission() const override;
+    BatchProgram expand(const ServingAction & action) override;
     std::vector<std::size_t> idle() override;
     const RegionGraph & graph() const override;
     std::vector<std::size_t> retire() override;
@@ -31,6 +32,9 @@ public:
 
 private:
     RegionGraph graph_;
+
+    // Assembly owns the common target topology; the adapter borrows its immutable bindings.
+    const ParallelTopology & topology_;
     ParallelComposition parallel_;
     std::int64_t prefill_token_granularity_;
     std::vector<const TemplateAsset *> assets_;

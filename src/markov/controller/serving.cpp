@@ -9,7 +9,9 @@
 
 namespace markov {
 
-ServingController::ServingController(ServingSettings settings, std::vector<Request> requests) : settings_(settings) {
+ServingController::ServingController(ServingSettings settings, std::vector<Request> requests, std::string group)
+    : settings_(settings),
+      group_(std::move(group)) {
     const auto capacity = settings.max_total_tokens / settings.page_size;
     std::set<std::string> identities;
     std::stable_sort(requests.begin(), requests.end(), [](const Request & left, const Request & right) { return left.arrival_ns < right.arrival_ns; });
@@ -35,9 +37,11 @@ ServingController::ServingController(ServingSettings settings, std::vector<Reque
 
 std::int64_t ServingController::pages_for(std::int64_t tokens) const { return tokens == 0 ? 0 : (tokens - 1) / settings_.page_size + 1; }
 
-std::optional<Batch> ServingController::plan(std::int64_t now_ns, AdmissionConstraints admission) const {
+std::optional<ServingAction> ServingController::plan(std::int64_t now_ns, const GroupAdmission & groups) const {
     if (now_ns < last_event_ns_) throw std::invalid_argument("control time must not move backwards");
     if (in_flight_) return std::nullopt;
+
+    const auto & admission = groups.at(group_);
 
     // Reserve each active request's peak pages; actual ownership grows only with KV residency.
     auto remaining = settings_.max_total_tokens / settings_.page_size;
@@ -67,7 +71,12 @@ std::optional<Batch> ServingController::plan(std::int64_t now_ns, AdmissionConst
     // Describe ownership changes without mutating the controller until start().
     const bool prefill = !admitted.empty();
     const auto & selected = prefill ? admitted : active_;
-    Batch batch{ prefill ? Phase::Prefill : Phase::Decode, now_ns, static_cast<std::int64_t>(free_pages_.size()), 0, {} };
+    Batch batch{ .phase = prefill ? Phase::Prefill : Phase::Decode,
+                 .scheduled_ns = now_ns,
+                 .request_capacity = settings_.max_running_requests,
+                 .free_pages_before = static_cast<std::int64_t>(free_pages_.size()),
+                 .allocated_pages = 0,
+                 .members = {} };
     for (std::size_t index = 0; index < selected.size(); ++index) {
         const auto identity = selected[index];
         const auto & state = requests_[identity];
@@ -84,11 +93,17 @@ std::optional<Batch> ServingController::plan(std::int64_t now_ns, AdmissionConst
         batch.members.push_back(std::move(member));
     }
 
-    return batch;
+    auto completion = effects(batch);
+    return ServingAction{
+        { group_, next_task_ },
+        std::move(batch),
+        std::move(completion)
+    };
 }
 
-void ServingController::start(Batch batch) {
-    if (in_flight_) throw std::logic_error("only one model batch may be in flight");
+void ServingController::start(const ServingAction & action) {
+    if (in_flight_ || action.task != TaskIdentity{ group_, next_task_ }) throw std::logic_error("action is not the current control plan");
+    const auto & batch = action.batch;
     if (batch.scheduled_ns < last_event_ns_) throw std::invalid_argument("cannot submit a plan before the last completion");
 
     for (const auto & member : batch.members) {
@@ -105,7 +120,8 @@ void ServingController::start(Batch batch) {
 
     free_pages_.erase(free_pages_.begin(), free_pages_.begin() + batch.allocated_pages);
     last_event_ns_ = batch.scheduled_ns;
-    in_flight_ = std::move(batch);
+    in_flight_ = action.task;
+    ++next_task_;
 }
 
 BatchEffects ServingController::effects(const Batch & batch) const {
@@ -120,17 +136,23 @@ BatchEffects ServingController::effects(const Batch & batch) const {
             released.insert(released.end(), member.new_pages.begin(), member.new_pages.end());
         }
 
-        result.members.push_back({ member.request, member.slot, generated, state.resident_tokens + member.new_tokens, finished, std::move(released) });
+        result.members.push_back({ .request = member.request,
+                                   .slot = member.slot,
+                                   .generated_tokens = generated,
+                                   .resident_tokens = state.resident_tokens + member.new_tokens,
+                                   .finished = finished,
+                                   .emits_output = true,
+                                   .released_pages = std::move(released) });
     }
 
     return result;
 }
 
-void ServingController::finish(const BatchEffects & effects, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) {
-    if (!in_flight_) throw std::logic_error("no model batch is in flight");
+void ServingController::finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) {
+    if (in_flight_ != action.task) throw std::logic_error("completion does not belong to the in-flight action");
     if (completed_ns < last_event_ns_) throw std::invalid_argument("batch completion precedes submission");
 
-    for (const auto & member : effects.members) {
+    for (const auto & member : action.effects.members) {
         auto & state = requests_.at(member.request);
         state.resident_tokens = member.resident_tokens;
         state.generated_tokens = member.generated_tokens;

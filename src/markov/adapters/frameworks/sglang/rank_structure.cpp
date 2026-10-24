@@ -62,7 +62,8 @@ RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settin
       shared_(graph),
       graph_(asset, graph, execution_offset),
       views_(graph_),
-      rank_(rank) {}
+      rank_(rank),
+      publishes_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "request_output"; })) {}
 
 RankProgram RankStructure::expand(const Batch & batch, const BatchEffects & effects) {
     const auto begin = graph_.graph().regions.size();
@@ -246,8 +247,8 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
 
     // Native publication precedes the Decode group's final page-pool update.
     std::optional<std::size_t> publication;
-    if (rank_ == 0) {
-        result_call.parameters["published_requests"] = static_cast<std::int64_t>(effects.members.size());
+    if (publishes_) {
+        result_call.parameters["published_requests"] = std::ranges::count_if(effects.members, &RequestCompletion::emits_output);
         const auto region = graph_.append("request_output", phase, result_call).region;
         publication = graph_.graph().execution.region_call(region).returned;
     }

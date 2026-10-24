@@ -16,6 +16,7 @@ add_library(markov_core
     src/markov/contracts/expression.cpp
     src/markov/contracts/input_group.cpp
     src/markov/contracts/serving.cpp
+    src/markov/contracts/topology.cpp
     src/markov/contracts/integer_data.cpp
     src/markov/graph/access.cpp
     src/markov/graph/region_graph.cpp
