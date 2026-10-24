@@ -40,31 +40,32 @@ class NativeRuntimeCalls:
             process = int(path.stem.removesuffix("-callbacks"))
             for identity, call in enumerate(json.loads(path.read_text())):
                 call["source"] = {"process": process, "callback": identity}
-                call.update(self.synchronization_protocol(call))
+                call["queue_scope"] = self.queue_scope(call)
+                call["kind"] = {
+                    "stream": "wait_stream",
+                    "device": "wait_device",
+                    "record_event": "record_event",
+                    "wait_event": "wait_event",
+                }[call["kind"]]
                 self.callbacks[f"markov.runtime/{process}/{identity}"] = call
 
-        self.callback_apis = {call["api"] for call in self.callbacks.values() if call["api"] is not None}
+        self.callback_kinds = {call["kind"] for call in self.callbacks.values()}
 
     @staticmethod
-    def synchronization_protocol(call: dict[str, Any]) -> dict[str, Any]:
-        event_apis = {"record_event": "aclrtRecordEvent", "wait_event": "aclrtStreamWaitEvent"}
-        if call["kind"] in event_apis:
-            return {"api": event_apis[call["kind"]], "position": "after", "queue_scope": None}
+    def queue_scope(call: dict[str, Any]) -> str | None:
         if call["kind"] == "device":
             drained = any(
                 name.startswith(("c10_npu::npuSynchronizeDevice(", "c10_npu::npuSynchronizeUsedDevices("))
                 for name in call["callers"]
             )
-            return {
-                "api": "aclrtSynchronizeDeviceWithTimeout",
-                "position": "after",
-                "queue_scope": "device" if drained else None,
-            }
+            return "device" if drained else None
+        if call["kind"] != "stream":
+            return None
 
         entry_points = (
-            ("c10_npu::acl::AclrtSynchronizeStreamWithTimeout(", "aclrtSynchronizeStreamWithTimeout", "before"),
-            ("c10_npu::stream_synchronize(", "aclrtSynchronizeStream", "before"),
-            ("at_npu::native::copy_between_host_and_device_opapi(", "aclrtSynchronizeStream", "after"),
+            ("c10_npu::acl::AclrtSynchronizeStreamWithTimeout(", 1),
+            ("c10_npu::stream_synchronize(", 1),
+            ("at_npu::native::copy_between_host_and_device_opapi(", 0),
         )
 
         # Only the immediate native caller proves the stream conversion; an outer copy may contain another wait.
@@ -77,16 +78,13 @@ class NativeRuntimeCalls:
         )
         callers = call["callers"]
         for index, name in enumerate(callers):
-            for prefix, api, position in entry_points:
+            for prefix, offset in entry_points:
                 if name.startswith(prefix):
-                    caller = name if position == "after" else (callers[index + 1] if index + 1 < len(callers) else "")
-                    return {
-                        "api": api,
-                        "position": position,
-                        "queue_scope": call["queue_scope"] if caller.startswith(accessors) else None,
-                    }
+                    position = index + offset
+                    caller = callers[position] if position < len(callers) else ""
+                    return call["queue_scope"] if caller.startswith(accessors) else None
 
-        return {"api": None, "position": None, "queue_scope": None}
+        return None
 
     def arguments(self, event: dict[str, Any], timestamp_ns: int) -> dict[str, Any] | None:
         arguments = event["args"]
@@ -123,8 +121,8 @@ class NativeRuntimeCalls:
         }
 
     @staticmethod
-    def scope_key(thread: int, api: str, owner: dict[str, Any]) -> tuple[Any, ...]:
-        return (thread, api, *(owner[name] for name in ("operation", "region", "baseline", "observer", "auxiliary")))
+    def scope_key(thread: int, kind: str, owner: dict[str, Any]) -> tuple[Any, ...]:
+        return (thread, kind, *(owner[name] for name in ("operation", "region", "baseline", "observer", "auxiliary")))
 
     @staticmethod
     def callback_origin(action: dict[str, Any]) -> int:
@@ -143,15 +141,15 @@ class NativeRuntimeCalls:
         for identity, event in enumerate(events):
             callback = self.callbacks.get(event.get("name"))
             if callback is not None:
-                key = self.scope_key(event["tid"], callback["api"], owners[identity])
+                key = self.scope_key(event["tid"], callback["kind"], owners[identity])
                 markers[key].append(identity)
 
         for action in actions:
-            if action["native_api"] in self.callback_apis:
+            if action["kind"] in self.callback_kinds:
                 identity = self.callback_origin(action)
                 event = events[identity]
                 thread = event.get("args", {}).get("Thread Id", event["tid"])
-                key = self.scope_key(thread, action["native_api"], owners[action["source_event"]])
+                key = self.scope_key(thread, action["kind"], owners[action["source_event"]])
                 calls[key].append(action)
 
         for key, identities in markers.items():
@@ -164,12 +162,10 @@ class NativeRuntimeCalls:
 
             ordered = []
             for identity, action in zip(identities, actions_in_scope, strict=True):
-                pair = [events[identity], events[self.callback_origin(action)]]
-                if self.callbacks[events[identity]["name"]]["position"] == "after":
-                    pair.reverse()
+                pair = sorted([events[identity], events[self.callback_origin(action)]], key=event_time_ns)
                 ordered.extend(pair)
 
-            # The native callback protocol alternates one marker and one API in the same owning scope.
+            # One callback belongs to each call, in thread order; stripped caller symbols cannot erase its arguments.
             if any(
                 event_time_ns(left) + event_time_ns(left, "dur") > event_time_ns(right)
                 for left, right in pairwise(ordered)
