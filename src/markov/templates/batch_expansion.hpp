@@ -1,0 +1,26 @@
+#pragma once
+
+#include <cstddef>
+#include <vector>
+
+#include "markov/contracts/serving.hpp"
+#include "markov/graph/region_graph.hpp"
+
+namespace markov {
+
+// Framework adapters translate controller snapshots into the shared target graph.
+class BatchExpansion {
+public:
+    virtual ~BatchExpansion() = default;
+
+    // Native occupancy and budget units accompany each controller decision.
+    virtual AdmissionConstraints admission() const = 0;
+    virtual BatchProgram expand(const Batch & batch, const BatchEffects & effects) = 0;
+
+    // Idle work returns readiness ports without publishing tokens or changing request ownership.
+    virtual std::vector<std::size_t> idle() = 0;
+    virtual const RegionGraph & graph() const = 0;
+    virtual std::vector<std::size_t> retire() = 0;
+};
+
+} // namespace markov
