@@ -62,7 +62,7 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 
 C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
 
-ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求/KV 状态，workflow 仅保留在途快照与程序。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组连接通信，不默认使用全部 rank。
+ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求/KV 状态，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
 
 TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
 
