@@ -1,181 +1,77 @@
-"""Scalar observations and profiler identities, without tensor snapshots or synchronization."""
+"""Own observation identities and semantic scopes without owning native tensors."""
 
 from __future__ import annotations
 
-import atexit
-import ctypes
-import json
-import os
 import threading
 import time
-from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
+
+from markov_collection.artifacts.json_file import write_json
 
 
-class ProfilerMarkers(ABC):
-    @abstractmethod
-    def scope(self, name: str) -> AbstractContextManager:
-        """Return a native profiler range without starting or synchronizing it."""
-
-    def observer(self) -> AbstractContextManager:
-        """Identify collection work separately from the observed native body."""
-        return self.scope("markov_observer")
-
-
-class Recorder:
-    def __init__(self, directory: Path, rank: int, markers: ProfilerMarkers) -> None:
-        self.markers = markers
-        self.directory = directory
-        self.rank = rank
-        self._stream: TextIO | None = None
-        self._sequence = 0
-        self._local = threading.local()
-        self._native: ctypes.CDLL | None = None
-
-        native_directory = os.environ.get("MARKOV_NATIVE_OBSERVATIONS")
-        if native_directory is not None:
-            self._native = ctypes.CDLL(None)
-            self._native.markov_native_begin_window.argtypes = [ctypes.c_char_p]
-            self._native.markov_native_begin_window.restype = None
-            self._native.markov_native_flush.argtypes = [ctypes.c_int]
-            self._native.markov_native_flush.restype = ctypes.c_int
-            self._native.markov_native_set_scope.argtypes = [ctypes.c_uint64]
-            self._native.markov_native_set_scope.restype = None
-            self._native.markov_native_begin_window(os.fsencode(native_directory))
-
-        atexit.register(self.close)
-
-    def scope(
-        self, step: str, metadata: dict[str, Any], *, binding: str | None = None, pending: bool = False
-    ) -> Observation:
-        self._sequence += 1
-        return Observation(self, self._sequence, step, metadata, binding, pending=pending)
-
-    def set_scope(self, identity: int | None) -> None:
-        self._local.current = identity
-        if self._native is not None:
-            self._native.markov_native_set_scope(0 if identity is None else identity)
-
-    def in_scope(self) -> bool:
-        return getattr(self._local, "current", None) is not None
-
-    def write(self, record: dict[str, Any]) -> None:
-        with self.markers.observer():
-            record["rank"] = self.rank
-            record["pid"] = os.getpid()
-            record["tid"] = threading.get_native_id()
-            pending = getattr(self._local, "pending", None)
-            if pending is not None:
-                pending.records.append(record)
-                return
-            self._write(record)
-            self._flush()
-
-    def _write(self, record: dict[str, Any]) -> None:
-        if self._stream is None:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            self._stream = (self.directory / f"rank-{self.rank}-pid-{os.getpid()}.jsonl").open("a", encoding="utf-8")
-
-        self._stream.write(json.dumps(record, separators=(",", ":")) + "\n")
-
-    def _flush(self) -> None:
-        # Nested records stay buffered until their enclosing scope closes.
-        if getattr(self._local, "current", None) is None:
-            self._stream.flush()
-            self.flush_native(close_window=False)
-
-    def finish_pending(self, observation: Observation) -> None:
-        with self.markers.observer():
-            self._local.pending = None
-            if observation.committed:
-                for record in observation.records:
-                    self._write(record)
-                # Publish the complete committed group before acknowledging it.
-                self._flush()
-            observation.records.clear()
-
-    def flush_native(self, *, close_window: bool) -> None:
-        if self._native is not None and self._native.markov_native_flush(int(close_window)) != 0:
-            raise RuntimeError("native observation could not be persisted; see the worker log")
-
-    def close(self) -> None:
-        self.flush_native(close_window=True)
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-
-class Observation:
-    def __init__(
-        self,
-        recorder: Recorder,
-        identity: int,
-        step: str,
-        metadata: dict[str, Any],
-        binding: str | None,
-        *,
-        pending: bool = False,
-    ) -> None:
-        self.recorder = recorder
-        self.identity = identity
-        self.step = step
+class Scope:
+    def __init__(self, recording: Recording, role: str, metadata: dict[str, Any]) -> None:
+        self.recording = recording
         self.metadata = metadata
-        self.binding = binding
-        self.result: dict[str, Any] = {}
-        self.pending = pending
-        self.committed = not pending
-        self.records: list[dict[str, Any]] = []
+        self.role = role
 
-    def commit(self) -> None:
-        self.committed = True
+    def __enter__(self) -> Scope:
+        parent = self.recording.current_scope.get()
+        self.identity = len(self.recording.regions)
+        self.record = {
+            "id": self.identity,
+            "parent": parent,
+            "role": self.role,
+            "metadata": self.metadata,
+            "operation_begin": len(self.recording.operations),
+            "started_ns": time.perf_counter_ns(),
+            "thread": threading.get_native_id(),
+            "started_cpu_ns": time.thread_time_ns(),
+        }
+        self.recording.regions.append(self.record)
 
-    def __enter__(self) -> Observation:
-        self.parent = getattr(self.recorder._local, "current", None)
-        if self.pending:
-            if getattr(self.recorder._local, "pending", None) is not None:
-                raise RuntimeError("a pending observation is already active")
-            self.recorder._local.pending = self
-        self.recorder.set_scope(self.identity)
-
-        # Marker lifecycle and scalar clock reads stay outside observer ranges.
-        # Wrapping marker entry/exit would break the native profiler stack.
-        try:
-            prefix = "markov_pending" if getattr(self.recorder._local, "pending", None) is not None else "markov"
-            self._marker = self.recorder.markers.scope(f"{prefix}/{self.step}/{self.identity}")
-            self._marker.__enter__()
-        except BaseException:
-            self.recorder.set_scope(self.parent)
-            if self.pending:
-                self.recorder._local.pending = None
-            raise
-
-        self.start_ns = time.perf_counter_ns()
-
+        # Restore this exact parent token on exit so nested calls retain their original owner.
+        self.token = self.recording.current_scope.set(self.identity)
+        self.marker = self.recording.markers.scope(f"markov.region/{self.identity}")
+        self.marker.__enter__()
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        end_ns = time.perf_counter_ns()
-
-        # Restore the enclosing scope before persisting this observation.
+    def __exit__(self, kind: Any, error: Any, traceback: Any) -> None:
         try:
-            self._marker.__exit__(exc_type, exc_value, traceback)
+            self.marker.__exit__(kind, error, traceback)
         finally:
-            self.recorder.set_scope(self.parent)
+            self.record["ended_ns"] = time.perf_counter_ns()
+            self.record["ended_cpu_ns"] = time.thread_time_ns()
+            self.record["completed"] = error is None
 
-        self.recorder.write(
-            {
-                "call_id": self.identity,
-                "parent_id": self.parent,
-                "step": self.step,
-                "binding": self.binding,
-                "start_ns": self.start_ns,
-                "end_ns": end_ns,
-                "metadata": self.metadata,
-                "result": self.result,
-                "status": "completed" if exc_type is None else "failed",
-            }
-        )
-        if self.pending:
-            self.recorder.finish_pending(self)
+            self.recording.current_scope.reset(self.token)
+
+
+class Recording:
+    def __init__(self, markers: Any) -> None:
+        self.markers = markers
+        self.current_scope: ContextVar[int | None] = ContextVar("markov_scope", default=None)
+
+        self.regions: list[dict[str, Any]] = []
+        self.operations: list[dict[str, Any]] = []
+        self.values: list[dict[str, Any]] = []
+        self.modules: list[dict[str, Any]] = []
+        self.batches: list[dict[str, Any]] = []
+
+    def scope(self, role: str, **metadata: Any) -> Scope:
+        return Scope(self, role, metadata)
+
+    def document(self, environment: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "environment": environment,
+            "modules": self.modules,
+            "batches": self.batches,
+            "regions": self.regions,
+            "values": self.values,
+            "operations": self.operations,
+        }
+
+    def write(self, path: Path, environment: dict[str, Any]) -> None:
+        write_json(path, self.document(environment))

@@ -1,1 +1,1 @@
-"""Explicit native collection; importing this package starts no work."""
+"""Native observations consumed by Markov's C++ production pipeline."""

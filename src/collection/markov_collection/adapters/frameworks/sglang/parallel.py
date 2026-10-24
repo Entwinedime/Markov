@@ -1,191 +1,213 @@
-"""Execute one native tensor-parallel shard inside a single-worker engine."""
+"""Observe native logical TP shards using one physical worker and explicit collective ports."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.instrumentation.calls import NativeCall
 
 
-class SGLangShardExecution:
-    def __init__(self, description: dict[str, Any], markers: Any, diagnostics_directory: Path | None) -> None:
-        self.description = description
-        self.diagnostics_directory = diagnostics_directory
-        self.markers = markers
-        self.tp_size = description["tp_size"]
-        self.rank = description["rank"]
-        if self.tp_size < 1 or not 0 <= self.rank < self.tp_size:
-            raise ValueError("invalid logical tensor-parallel shard")
+class CollectiveCall(NativeCall):
+    @staticmethod
+    def gather_view_condition(shape: list[Any], size: int, dimension: int) -> list[Any]:
+        axis = dimension + len(shape) if dimension < 0 else dimension
+        if not 0 <= axis < len(shape):
+            raise ValueError("all-gather axis is outside its input rank")
 
-        self._depth = 0
-        self._communicators: dict[Any, Any] = {}
+        # The moved TP axis can merge with the gather axis when their strides agree or either axis is singleton.
+        return [
+            "or",
+            ["eq", size, 1],
+            ["eq", ["mul", 1, *shape[:axis]], 1],
+            ["eq", shape[axis], 1],
+            ["eq", ["mul", 1, *shape], 0],
+        ]
 
     @staticmethod
-    def engine_arguments(prepared: dict[str, Any]) -> dict[str, Any]:
-        arguments = {
-            "model_path": prepared["model_path"],
-            "tokenizer_path": prepared["tokenizer_path"],
-            "skip_tokenizer_init": True,
-            **prepared["configuration"],
+    def bind_transports(
+        regions: list[dict[str, Any]], operations: list[dict[str, Any]], values: list[dict[str, Any]]
+    ) -> None:
+        calls: dict[int, list[dict[str, Any]]] = {}
+        native = {"all_reduce": "c10d.allreduce_.default", "all_gather": "c10d._allgather_base_.default"}
+        for operation in operations:
+            if operation["name"] in native.values():
+                calls.setdefault(operation["region"], []).append(operation)
+
+        for region in regions:
+            metadata = region["metadata"]
+            if metadata.get("interface") != "collective":
+                continue
+
+            primitive = metadata["communication"]["primitive"]
+            (transport,) = [operation for operation in calls[region["id"]] if operation["name"] == native[primitive]]
+
+            # Mark the actual backend call; all-gather's later layout work remains local device work.
+            transport["communication"] = True
+            if primitive == "all_gather":
+                source = values[metadata["inputs"][0]]
+                shape = source["shape_relation"]
+                if shape is None:
+                    continue
+
+                spec = metadata["communication"]
+                output = values[metadata["outputs"][0]]
+                buffer = values[transport["inputs"][0]]
+                metadata["execution_guards"] = [
+                    {
+                        "condition": CollectiveCall.gather_view_condition(shape, spec["size"], spec["dimension"]),
+                        "expected": output["storage"] == buffer["storage"],
+                    }
+                ]
+
+    def __init__(self, shard: SingleDeviceShard, kind: str, original: Any) -> None:
+        super().__init__(
+            shard.values.recording,
+            shard.values,
+            f"sglang.NpuCommunicator.{kind}",
+            original,
+            {},
+            interface="collective",
+            mutations=(0,) if kind == "all_reduce" else (),
+        )
+        self.shard = shard
+        self.kind = kind
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> str | None:
+        metadata["communication"] = {
+            "primitive": self.kind,
+            "group": "tp",
+            "size": self.shard.size,
+            "dimension": args[1] if self.kind == "all_gather" else None,
         }
-        if "shard_execution" in prepared:
-            import json
+        shapes = self.values.shapes
+        if args[0] in shapes.unavailable:
+            shapes.unavailable[result] = self.path
+            shapes.tensors.pop(result, None)
+            return f"collective input relation unavailable: {shapes.unavailable[args[0]]}"
 
-            # Only the native worker count and representative repetition change.
-            # Native parallel modules still construct the original model's shard.
-            shard = prepared["shard_execution"]
-            arguments.update(
-                tp_size=1,
-                load_format="dummy",
-                json_model_override_args=json.dumps({"num_hidden_layers": shard["representative_layers"]}),
-            )
-        return arguments
+        shape = list(shapes.tensor(args[0]).shape)
+        if self.kind == "all_gather":
+            shape[args[1]] *= self.shard.size
+        self.values.bind_shape(result, shape)
 
-    def execute(self, original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return None
+
+
+class SingleDeviceShard:
+    def __init__(self, size: int, rank: int, values: Any) -> None:
+        if size < 2 or not 0 <= rank < size:
+            raise ValueError("invalid logical tensor-parallel role")
+
+        self.size = size
+        self.rank = rank
+        self.values = values
+
+        self.depth = 0
+        self.communicators: dict[Any, Any] = {}
+
+    def execute(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         from sglang.srt.runtime_context import get_parallel
 
+        # Limit logical topology overrides to native model and memory-pool execution.
         with get_parallel().override(
-            tp_size=self.tp_size,
+            tp_size=self.size,
             tp_rank=self.rank,
-            attn_tp_size=self.tp_size,
+            attn_tp_size=self.size,
             attn_tp_rank=self.rank,
-            moe_tp_size=self.tp_size,
+            moe_tp_size=self.size,
             moe_tp_rank=self.rank,
         ):
-            self._depth += 1
+            self.depth += 1
             try:
                 return original(*args, **kwargs)
             finally:
-                self._depth -= 1
+                self.depth -= 1
 
-    def attention_size(self, original: Callable[..., int]) -> int:
-        return self.tp_size if self._depth else original()
+    def attention_size(self, original: Any) -> int:
+        return self.size if self.depth else original()
 
-    def load_model(self, original: Callable[..., Any], runner: Any) -> Any:
-        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-        from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    def communicator(self, group: Any) -> Any:
+        from sglang.srt.distributed.device_communicators.npu_communicator import NpuCommunicator
 
-        result = self.execute(original, runner)
-        if self.diagnostics_directory is None:
-            return result
-
-        components = (ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding, RadixAttention)
-        modules = []
-        for path, module in runner.model.named_modules():
-            if not isinstance(module, components):
-                continue
-
-            fields = {
-                name: getattr(module, name)
-                for name in (
-                    "tp_size",
-                    "tp_rank",
-                    "input_size",
-                    "output_size",
-                    "head_dim",
-                    "tp_q_head_num",
-                    "tp_k_head_num",
-                    "tp_v_head_num",
-                    "num_embeddings",
-                    "num_embeddings_per_partition",
-                )
-                if hasattr(module, name)
-            }
-            if hasattr(module, "weight"):
-                fields["weight_shape"] = list(module.weight.shape)
-                fields["weight_dtype"] = str(module.weight.dtype)
-            modules.append({"path": path, "type": type(module).__name__, **fields})
-
-        write_json(
-            self.diagnostics_directory / "shard_execution" / f"rank-{self.rank}-layout.json",
-            {"description": self.description, "physical_tp_size": runner.tp_size, "modules": modules},
-        )
-        return result
-
-    def all_reduce(self, original: Callable[..., Any], group: Any, tensor: Any) -> Any:
-        if not self._depth or self.tp_size == 1 or group.world_size != 1:
-            return original(group, tensor)
-
-        return self._communicator(group).all_reduce(tensor)
-
-    def all_gather(self, original: Callable[..., Any], group: Any, tensor: Any, dim: int = -1) -> Any:
-        if not self._depth or self.tp_size == 1 or group.world_size != 1:
-            return original(group, tensor, dim)
-
-        return self._communicator(group).all_gather(tensor, dim)
-
-    def _communicator(self, group: Any) -> Any:
-        with self.markers.observer():
-            from sglang.srt.distributed.device_communicators.npu_communicator import NpuCommunicator
-
-            physical_group = group.device_group
-            communicator = self._communicators.get(physical_group)
-            if communicator is None:
-                communicator = NpuCommunicator(physical_group)
+        with self.values.auxiliary():
+            physical = group.device_group
+            if physical not in self.communicators:
+                communicator = NpuCommunicator(physical)
                 if communicator.world_size != 1:
-                    raise ValueError("single-card collective transport requires a physical group of one")
-                # PG1 retains the local native protocol, without qualifying
-                # logical-TP numerical results or communication timing. Native
-                # allocation and layout conversion retain the logical output.
-                communicator.world_size = self.tp_size
-                self._communicators[physical_group] = communicator
+                    raise ValueError("single-device shard requires a physical process group of one")
+                communicator.world_size = self.size
+                self.communicators[physical] = communicator
 
-        return communicator
+            return self.communicators[physical]
 
-    def all_gather_into_tensor(
-        self,
-        original: Callable[..., Any],
-        output_tensor: Any,
-        input_tensor: Any,
-        group: Any = None,
-        async_op: bool = False,
+    def all_reduce(self, original: Any, group: Any, input_: Any) -> Any:
+        if not self.depth or group.world_size != 1:
+            return original(group, input_)
+
+        call = CollectiveCall(self, "all_reduce", self.communicator(group).all_reduce)
+        return call(input_)
+
+    def all_gather(self, original: Any, group: Any, input_: Any, dim: int = -1, output_tensor_list: Any = None) -> Any:
+        if not self.depth or group.world_size != 1:
+            return original(group, input_, dim, output_tensor_list)
+        if output_tensor_list is not None:
+            raise NotImplementedError("single-device shard supports tensor-result all-gather")
+
+        call = CollectiveCall(self, "all_gather", self.communicator(group).all_gather)
+        return call(input_, dim)
+
+    def gather_into_tensor(
+        self, original: Any, output_tensor: Any, input_tensor: Any, group: Any = None, async_op: bool = False
     ) -> Any:
-        if not self._depth or self.tp_size == 1 or group not in self._communicators:
+        import torch
+
+        if not self.depth or group not in self.communicators:
             return original(output_tensor, input_tensor, group=group, async_op=async_op)
         if async_op:
-            raise ValueError("single-card native all-gather requires synchronous transport")
+            raise ValueError("single-device all-gather transport supports synchronous calls only")
 
-        with self.markers.observer():
-            chunks = output_tensor.view(self.tp_size, *input_tensor.shape)
+        with self.values.auxiliary():
+            chunks = output_tensor.view(self.size, *input_tensor.shape)
             physical_output = chunks[0]
 
-        # Keep native enqueue, stream events and Work.wait outside observation
-        # overhead. This one-rank operation is not target communication timing.
-        result = original(physical_output, input_tensor, group=group, async_op=False)
-        with self.markers.observer():
-            # Supply valid dummy contents without replacing the communicator's
-            # subsequent logical-T reshape, movedim and final layout copy.
+        # c10d redispatches its public API through TorchFunction; the physical buffer is already sliced.
+        with torch._C.DisableTorchFunction():
+            result = original(physical_output, input_tensor, group=group, async_op=False)
+
+        # Fill absent peers only for local execution; auxiliary work is excluded from source structure.
+        with self.values.auxiliary():
             chunks[1:].copy_(input_tensor)
+
         return result
+
+    def install_transport(self) -> None:
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        targets = {
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.all_reduce,
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.all_gather,
+            "torch.distributed.all_gather_into_tensor": self.gather_into_tensor,
+        }
+        for target, hook in targets.items():
+            HookRegistry.register(target, hook, HookType.AROUND)
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-        if self.tp_size > 1:
-            from markov_collection.adapters.frameworks.sglang.input_parallel import SGLangInputParallel
-            from markov_collection.adapters.frameworks.sglang.output_parallel import SGLangOutputParallel
+        from markov_collection.adapters.frameworks.sglang.roles import WorkerRole
 
-            self._input = SGLangInputParallel(self.tp_size, self.rank, self.markers)
-            self._input.install()
-            SGLangOutputParallel(self.tp_size, self.rank, self.markers).install()
+        WorkerRole(self.size, self.rank, self.values).install()
+        self.install_transport()
 
-        hooks = {
-            "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.load_model,
+        targets = {
+            "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.execute,
             "sglang.srt.model_executor.model_runner.ModelRunner.init_memory_pool": self.execute,
             "sglang.srt.model_executor.model_runner.ModelRunner.init_attention_backend": self.execute,
             "sglang.srt.model_executor.model_runner.ModelRunner.forward": self.execute,
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new": self.execute,
             "sglang.srt.layers.dp_attention.get_attention_tp_size": self.attention_size,
-            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.all_reduce,
-            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.all_gather,
-            "torch.distributed.all_gather_into_tensor": self.all_gather_into_tensor,
         }
-        for target, hook in hooks.items():
+        for target, hook in targets.items():
             HookRegistry.register(target, hook, HookType.AROUND)
-
-    def install_input_dispatch(self) -> None:
-        if self.tp_size > 1:
-            self._input.install_dispatch()

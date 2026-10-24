@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# Packaging changes and build outputs belong only to the image-local copy.
-set -euo pipefail
 
-if (($# != 1)); then
-    printf 'usage: %s <trace-sim-root>\n' "$0" >&2
-    exit 2
-fi
+# Install from an image-local copy; the official checkout remains untouched.
+set -euo pipefail
 
 MARKOV_SGLANG_SOURCE=/opt/markov/sglang
 mkdir -p "$MARKOV_SGLANG_SOURCE"
 cp -a "$1/third_party/sglang/." "$MARKOV_SGLANG_SOURCE/"
 
+# The vendor environment script reads variables that may be unset under nounset.
 set +u
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -u

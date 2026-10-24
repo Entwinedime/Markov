@@ -1,163 +1,151 @@
-"""Shared bounded warmup, steady-window observation and native failure handling."""
+"""Native SGLang session; the framework owns requests, KV and worker lifetimes."""
 
 from __future__ import annotations
 
-import asyncio
 import json
-import signal
+import os
+import time
 from pathlib import Path
-from typing import Any
 
-from markov_collection.adapters.frameworks.sglang.parallel import SGLangShardExecution
-from markov_collection.adapters.frameworks.sglang.request_cohorts import SGLangRequestCohorts
-from markov_collection.adapters.frameworks.sglang.warmup import SGLangWarmup
-from markov_collection.adapters.runtimes.ascend.compilation import CompilationObservation
-from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
-from markov_collection.instrumentation.session import CaptureSession
+from markov_collection.artifacts.json_file import write_json
 
 
-class SGLangSession(CaptureSession):
-    @property
-    def worker_ranks(self) -> range:
-        if "shard_execution" in self.prepared:
-            rank = self.prepared["shard_execution"]["rank"]
-            return range(rank, rank + 1)
-        return range(self.prepared["configuration"]["tp_size"])
+class NativeServingSession:
+    def __init__(
+        self,
+        model: str,
+        requests: tuple[tuple[int, int], ...],
+        output: Path,
+        profile: bool,
+        tp_size: int,
+        rank: int,
+        *,
+        configuration: dict[str, int],
+        matrix_selection: dict[str, object],
+        native_library: str,
+        dtype: str = "bfloat16",
+        attention_backend: str = "ascend",
+    ) -> None:
+        self.model = model
+        self.requests = requests
+        self.output = output.resolve()
+        self.profile = profile
+        self.tp_size = tp_size
+        self.rank = rank
+        self.dtype = dtype
+        self.attention_backend = attention_backend
+        self.configuration = configuration
+        self.matrix_selection = matrix_selection
+        self.native_library = native_library
 
-    def _start_engine(self) -> Any:
+    @staticmethod
+    def warmup_requests(page_size: int) -> tuple[tuple[int, int], ...]:
+
+        # Keep warmup independent of target requests while covering page and batch transitions.
+        return (
+            (max(1, page_size - 1), 4),
+            (page_size + 1, 1),
+            (page_size // 2 + 1, 3),
+            (page_size // 4 + 1, 2),
+            (1, 1),
+        )
+
+    def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
+        response = engine.generate(
+            input_ids=[[1] * prompt for prompt, _ in requests],
+            sampling_params=[
+                {"max_new_tokens": output, "temperature": 0, "ignore_eos": True} for _, output in requests
+            ],
+            rid=[f"{prefix}{index}" for index in range(len(requests))],
+            stream=True,
+        )
+
+        # Consume native streaming to completion; publication then contains actual token-visible ports.
+        for _ in response:
+            pass
+
+    @staticmethod
+    def reset(engine: object) -> None:
+        response = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
+        if not response.success:
+            raise RuntimeError(f"native idle/cache reset failed: {response.message}")
+
+    def run(self) -> None:
+        warmup = self.warmup_requests(self.configuration["page_size"])
+        self.output.mkdir(parents=True, exist_ok=True)
+        (self.output / "runtime").mkdir(exist_ok=True)
+        description = self.output / "session.json"
+        session = {
+            "output": str(self.output),
+            "source_requests": [f"capture/{index}" for index in range(len(self.requests))],
+            "baseline_requests": [f"baseline/{index}" for index in range(len(self.requests))],
+            "matrix_selection": self.matrix_selection,
+            "native_library": self.native_library,
+        }
+        if self.tp_size > 1:
+            session["shard"] = {"size": self.tp_size, "rank": self.rank}
+        if description.exists():
+            raise FileExistsError(f"native session already exists: {description}")
+        write_json(description, session)
+        os.environ["MARKOV_GRAPH_SESSION"] = str(description)
+        os.environ["SGLANG_PLUGINS"] = "markov"
+
         from sglang.srt.entrypoints.engine import Engine
 
-        return Engine(**SGLangShardExecution.engine_arguments(self.prepared))
-
-    def prepare(self) -> None:
-        self.runtime_environment = RuntimeEnvironment().observe(self.prepared["environment"])
-        self.prepared["source_ranks"] = list(self.worker_ranks)
-        if "shard_execution" in self.prepared:
-            shard = self.prepared["shard_execution"]
-            shard["representative_layers"] = min(
-                shard["representative_layers"], self.prepared["model_configuration"]["num_hidden_layers"]
-            )
-
-        if self.prepared["role"] == "performance":
-            request_ids = set(self.prepared["measurement_ids"]) | set(self.prepared["warmup_ids"])
-        else:
-            request_ids = {request["id"] for request in self.prepared["requests"]}
-        prefix = "markov-warmup/"
-        while any(identity.startswith(prefix) for identity in request_ids):
-            prefix = "_" + prefix
-
-        self.prepared["warmup_prefix"] = prefix
-        super().prepare()
-
-    def _warmup(self, engine: Any) -> dict[str, Any]:
-        actual = engine.tokenizer_manager.server_args
-        page_size = actual.page_size
-        capacity = actual.max_running_requests
-        prefix = self.prepared["warmup_prefix"]
-        points = SGLangWarmup.points(page_size, capacity)
-        self._cohorts = SGLangRequestCohorts(engine)
-        for index, point in enumerate(points):
-            requests = [
-                {
-                    "input_tokens": [1] * request["prompt_tokens"],
-                    "output_tokens": request["output_tokens"],
-                    "release_after_tokens": request["release_after_tokens"],
-                }
-                for request in point["requests"]
-            ]
-            self._cohorts.generate(requests, f"{prefix}{index}")
-            self._reset(engine)
-
-        # Native tokenizer setup installs an asyncio SIGQUIT handler on first use.
-        engine.loop.remove_signal_handler(signal.SIGQUIT)
-        signal.signal(signal.SIGQUIT, self._handle_worker_failure)
-
-        return {
-            "strategy": "paged_extent_bins",
-            "page_size_tokens": page_size,
-            "request_capacity": capacity,
-            "points": points,
-            "logical_kv": "empty",
-            "in_flight": False,
-        }
-
-    def _steady_windows(self, windows: list[dict[str, int]], warmup: dict[str, Any]) -> dict[str, Any]:
-        # A client reset reply can precede another rank's journal publication.
-        # Read the native warmup observations when qualifying the completed
-        # window, rather than retaining a premature host-side snapshot.
-        warmup["batches"] = SGLangWarmup.batches(self.directory / "warmup")
-        warmup["workspace"] = [
-            {
-                "request_capacity": count,
-                "states": [
-                    json.loads(path.read_text(encoding="utf-8"))
-                    for path in sorted((self.directory / "warmup_state" / str(count)).glob("*.json"))
-                ],
-            }
-            for count in sorted({point["request_capacity"] for point in warmup["points"]})
-        ]
-
-        result = CompilationObservation.windows(self.directory / "compilation", windows)
-        workers = {batch["rank"]: batch["pid"] for batch in warmup["batches"]}
-        phases = {
-            rank: {batch["phase"] for batch in warmup["batches"] if batch["rank"] == rank} for rank in self.worker_ranks
-        }
-        live_prefills = {
-            (batch["rank"], batch["point"])
-            for batch in warmup["batches"]
-            if batch["phase"] == "prefill"
-            and batch["running_requests"]
-            and f"{self.prepared['warmup_prefix']}{batch['point']}/1" in batch["requests"]
-        }
-        missing_live = [
-            {"rank": rank, "point": index}
-            for rank in phases
-            for index, point in enumerate(warmup["points"])
-            if point["mechanism"] == "running_prefill" and (rank, index) not in live_prefills
-        ]
-        missing = [
-            rank
-            for rank, observed in phases.items()
-            if observed != {"prefill", "decode"} or workers[rank] not in result["observed_processes"]
-        ]
-        result["unconfirmed_ranks"] = missing
-
-        # Cache state is a separate fact from observed compilation coverage.
-        state_ranks = set(phases)
-        for cohort in warmup["workspace"]:
-            state_ranks.intersection_update(
-                state["rank"]
-                for state in cohort["states"]
-                if state["initial"] is not None and state["probe_installation"] is not None
-            )
-        state_missing = sorted(set(phases) - state_ranks)
-        result["unconfirmed_initial_state_ranks"] = state_missing
-        result["unconfirmed_live_admissions"] = missing_live
-
-        if missing:
-            result["status"] = "observer_not_confirmed"
-        elif state_missing:
-            result["status"] = "initial_state_not_observed"
-        elif missing_live:
-            result["status"] = "warmup_live_admission_not_observed"
-        return result
-
-    def _reset(self, engine: Any) -> None:
-        # Client replies can precede native batch cleanup. The native deferred
-        # RPC waits for scheduler idleness; the attempt monitor owns the deadline.
-        result = engine.loop.run_until_complete(
-            engine.tokenizer_manager.flush_cache(timeout_s=self.prepared["permission"]["max_wall_time_sec"])
+        started = time.perf_counter_ns()
+        engine = Engine(
+            model_path=self.model,
+            skip_tokenizer_init=True,
+            device="npu",
+            dtype=self.dtype,
+            tp_size=1,
+            load_format="dummy",
+            attention_backend=self.attention_backend,
+            **self.configuration,
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+            disable_overlap_schedule=True,
+            disable_cuda_graph=True,
+            mem_fraction_static=0.8,
+            log_level="warning",
         )
-        if not result.success:
-            raise RuntimeError(f"native request/cache reset failed: {result.message}")
+        initialized = time.perf_counter_ns()
+        try:
+            self.generate(engine, "warmup/", warmup)
+            self.reset(engine)
+            warmed = time.perf_counter_ns()
+            if self.profile:
+                engine.start_profile(
+                    output_dir=str(self.output / "native"),
+                    activities=["CPU", "GPU"],
+                    record_shapes=False,
+                    with_stack=False,
+                )
+            try:
+                self.generate(engine, "baseline/", self.requests)
+                self.reset(engine)
+                self.generate(engine, "capture/", self.requests)
+                self.reset(engine)
+            finally:
+                if self.profile:
+                    engine.stop_profile()
+            captured = time.perf_counter_ns()
+        finally:
+            engine.shutdown()
 
-    async def _await_cleanup(self, request_ids: set[str], directory: Path) -> list[dict[str, Any]]:
-        paths = [directory / f"rank-{rank}-cleanup.json" for rank in self.worker_ranks]
-        # The attempt monitor owns the deadline. These files acknowledge an
-        # observed empty Schedule, rather than a driver response or reset RPC.
-        while True:
-            if all(path.exists() for path in paths):
-                records = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
-                if all(request_ids.issubset(record["request_ids"]) for record in records):
-                    return records
-            await asyncio.sleep(0.01)
+        summary = {
+            "initialization_ns": initialized - started,
+            "warmup_ns": warmed - initialized,
+            "warmup_requests": warmup,
+            "capture_and_export_ns": captured - warmed,
+            "profile": self.profile,
+            "model": self.model,
+            "weight_source": "native_dummy_loader_full_model",
+            "logical_tp": self.tp_size,
+            "rank": self.rank,
+            "configuration": self.configuration,
+            "matrix_selection": self.matrix_selection,
+            "worker_limits": engine._scheduler_init_result.scheduler_infos,
+        }
+        write_json(self.output / "session-summary.json", summary, indent=2)
+        print(json.dumps(summary))
