@@ -14,12 +14,16 @@
 
 namespace markov {
 
+// Target parameters follow a declared role binding, independently of a source layout's call positions.
+using ScopedParameters = std::map<std::string, std::map<std::int64_t, Parameters>>;
+
 struct Invocation {
     Parameters parameters;
     Parameters bindings;
     ParameterGroups input_groups;
     std::map<std::size_t, Invocation> calls;
     ParameterGroups sequences;
+    ScopedParameters parameter_scopes;
 
     static Invocation read(const nlohmann::json & source);
 };
@@ -47,9 +51,9 @@ private:
                      std::string phase);
     std::size_t expand(std::size_t layout, const FixedBindings & bindings, Invocation invocation, Parameters parameters, std::optional<std::size_t> parent,
                        const std::vector<std::size_t> & resources, std::vector<std::optional<std::size_t>> slots, GroupValues input_groups,
-                       const ParameterGroups & sequences);
+                       const ParameterGroups & sequences, const ScopedParameters & scopes);
     std::size_t expand_call(const std::string & role, const Invocation & invocation, const Parameters & parameters, std::size_t parent,
-                            const ValuePorts & ports, const ParameterGroups & sequences);
+                            const ValuePorts & ports, const ParameterGroups & sequences, const ScopedParameters & scopes);
     void require_value(std::size_t value, const nlohmann::json & specification);
     void bind_inputs(const TargetInputs & inputs);
 

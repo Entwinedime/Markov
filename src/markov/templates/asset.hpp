@@ -60,6 +60,7 @@ struct TemplateOperation {
     ArgumentTree keywords;
     nlohmann::json properties;
     std::vector<std::string> input_groups;
+    std::optional<ArgumentTree> communication;
 };
 
 struct LayoutGuard {

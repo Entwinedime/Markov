@@ -10,7 +10,7 @@
 namespace markov::sglang {
 
 ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests,
-                                   const ServingTopology & topology)
+                                   const ServingTopology & topology, const nlohmann::json & routes)
     : topology_(topology),
       parallel_(graph_),
       prefill_token_granularity_(settings.page_size),
@@ -29,12 +29,21 @@ ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, Servin
         assets_[rank] = &asset;
     }
 
+    const bool experts = std::ranges::any_of(assets, [](const auto & asset) {
+        return std::ranges::any_of(asset.entrypoints(), [](const auto & entry) { return entry.role == "expert_layer"; });
+    });
+    if (experts) {
+        if (routes.is_null()) throw std::invalid_argument("MoE targets require an EP topology and matching workload routes");
+        routing_.emplace(assets, requests, routes);
+    }
+    else if (!routes.is_null()) throw std::invalid_argument("EP routes require native expert-layer sources");
+
     for (std::size_t rank = 0; rank < assets_.size(); ++rank) {
         const auto offset = graph_.execution_resources.size();
         const auto & asset = *assets_[rank];
         const auto & resources = asset.execution_resources();
         graph_.execution_resources.insert(graph_.execution_resources.end(), resources.begin(), resources.end());
-        ranks_.push_back(std::make_unique<RankStructure>(asset, settings, graph_, offset, rank, topology_.stage_count()));
+        ranks_.push_back(std::make_unique<RankStructure>(asset, settings, graph_, offset, rank, topology_.stage_count(), routing_ ? &*routing_ : nullptr));
     }
 }
 
@@ -227,6 +236,7 @@ nlohmann::json ServingStructure::summary() const {
         { "attention_backend", implementation.at("attention_backend") },
         {        "logical_tp",       topology_.tensor_parallel_size() },
         {        "logical_pp",                topology_.stage_count() },
+        {        "logical_ep",           environment.at("logical_ep") },
         {          "topology",        topology_.parallel().document() },
         {            "counts",
          { { "batches", batch_count_ },
@@ -250,6 +260,7 @@ nlohmann::json ServingStructure::summary() const {
         {   "resource_execution", "observed_relations_and_collective_interfaces" },
         {            "workspace",             "prewarmed_native_attention_bound" }
     };
+    if (routing_) result["qualification"]["expert_routes"] = "given_workload_condition";
     return result;
 }
 

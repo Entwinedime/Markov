@@ -16,6 +16,7 @@ add_library(markov_core
     src/markov/execution/durations.cpp
     src/markov/execution/executor.cpp
     src/markov/contracts/expression.cpp
+    src/markov/contracts/expert_routes.cpp
     src/markov/contracts/input_group.cpp
     src/markov/contracts/serving.cpp
     src/markov/contracts/topology.cpp
@@ -39,6 +40,7 @@ target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion
 add_executable(markov src/markov/cli/main.cpp)
 add_library(markov_application
     src/markov/adapters/frameworks/sglang/batches.cpp
+    src/markov/adapters/frameworks/sglang/expert_routing.cpp
     src/markov/adapters/frameworks/sglang/disaggregated.cpp
     src/markov/adapters/frameworks/sglang/topology.cpp
     src/markov/adapters/frameworks/sglang/structure.cpp

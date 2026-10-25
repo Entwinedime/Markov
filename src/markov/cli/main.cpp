@@ -98,14 +98,15 @@ void check_fields(const nlohmann::json & source, std::initializer_list<std::stri
 }
 
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
-    check_fields(input, { "configuration", "requests", "node_durations_ns" }, "serving input");
+    check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
     const bool disaggregated = configuration.contains("pd");
     if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
     else
         check_fields(configuration,
-                     { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement" },
+                     { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement", "ep" },
                      "configuration");
+    if (input.contains("ep_routes") && !configuration.contains("ep")) throw std::invalid_argument("workload routes require a configured EP topology");
 
     std::vector<markov::Request> requests;
     if (!input.at("requests").is_array() || input.at("requests").empty()) throw std::invalid_argument("serving needs a nonempty request array");
@@ -163,7 +164,19 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
     const markov::sglang::ServingTopology topology(assets, static_cast<std::size_t>(stages), devices);
     const auto control_group = topology.parallel().groups().front().id;
-    markov::sglang::ServingStructure expansion(assets, settings, requests, topology);
+    nlohmann::json routes;
+    if (configuration.contains("ep")) {
+        const auto & ep = configuration.at("ep");
+        check_fields(ep, { "id", "size" }, "ep");
+        const auto id = ep.at("id").get<std::string>();
+        const auto size = integer(ep.at("size"));
+        if (id.empty() || size <= 0 || size != assets.front().environment().at("logical_ep").get<std::int64_t>())
+            throw std::invalid_argument("EP topology does not match the native source");
+        const auto & conditions = input.at("ep_routes");
+        if (!conditions.is_object() || !conditions.contains(id)) throw std::invalid_argument("workload has no route condition for EP topology: " + id);
+        routes = conditions.at(id);
+    }
+    markov::sglang::ServingStructure expansion(assets, settings, requests, topology, routes);
     markov::ServingController controller(settings, std::move(requests), control_group, static_cast<std::size_t>(stages), static_cast<std::size_t>(batch_limit));
     markov::ServingWorkflow workflow(controller, expansion, durations);
     auto result = workflow.run(details);

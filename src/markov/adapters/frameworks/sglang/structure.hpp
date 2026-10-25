@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "markov/adapters/frameworks/sglang/expert_routing.hpp"
 #include "markov/adapters/frameworks/sglang/rank_structure.hpp"
 #include "markov/adapters/frameworks/sglang/topology.hpp"
 #include "markov/templates/batch_expansion.hpp"
@@ -20,7 +22,8 @@ namespace markov::sglang {
 // Controller actions select rank groups; each rank retains only its local graph ports.
 class ServingStructure final : public BatchExpansion {
 public:
-    ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests, const ServingTopology & topology);
+    ServingStructure(std::span<const TemplateAsset> assets, ServingSettings settings, std::span<const Request> requests, const ServingTopology & topology,
+                     const nlohmann::json & routes);
     ServingStructure(const ServingStructure &) = delete;
     ServingStructure & operator=(const ServingStructure &) = delete;
 
@@ -48,6 +51,9 @@ private:
     ParallelComposition parallel_;
     std::int64_t prefill_token_granularity_;
     std::vector<const TemplateAsset *> assets_;
+
+    // Rank builders borrow this immutable routing condition for the lifetime of the expansion.
+    std::optional<ExpertRouting> routing_;
 
     // Views borrow their rank's builder, so rank objects retain stable addresses.
     std::vector<std::unique_ptr<RankStructure>> ranks_;

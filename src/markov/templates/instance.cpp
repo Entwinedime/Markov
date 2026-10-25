@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -22,6 +23,22 @@ Parameters read_parameters(const nlohmann::json & source) {
     }
 
     return result;
+}
+
+Parameters bind_parameters(Parameters inherited, const Parameters & fixed, const Invocation & invocation, const ScopedParameters & scopes) {
+    for (const auto & [name, value] : fixed) inherited.insert_or_assign(name, value);
+
+    for (const auto & [name, choices] : scopes) {
+        const auto original = fixed.find(name);
+        const auto target = invocation.bindings.find(name);
+        if (original == fixed.end() && target == invocation.bindings.end()) continue;
+        const auto identity = target == invocation.bindings.end() ? original->second : target->second;
+        for (const auto & [parameter, value] : choices.at(identity)) inherited.insert_or_assign(parameter, value);
+    }
+    for (const auto * target : { &invocation.parameters, &invocation.bindings }) {
+        for (const auto & [name, value] : *target) inherited.insert_or_assign(name, value);
+    }
+    return inherited;
 }
 
 } // namespace
@@ -56,7 +73,7 @@ Invocation Invocation::read(const nlohmann::json & source) {
 
 TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation,
                                           const TargetInputs * inputs) {
-    std::string mismatch = "no source for role " + role + " and phase " + phase;
+    std::set<std::string> mismatches;
     for (const auto & selection : asset.entrypoints()) {
         if (selection.role != role || (selection.phase && *selection.phase != phase)) continue;
 
@@ -69,14 +86,16 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
             return instance;
         }
         catch (const LayoutMismatch & error) {
-            mismatch = error.what();
+            mismatches.emplace(error.what());
         }
         catch (const std::invalid_argument & error) {
             throw std::invalid_argument("cannot expand " + role + ": " + error.what());
         }
     }
 
-    throw LayoutMismatch("no region layout matches target: " + mismatch);
+    std::string message = "no region layout matches " + role + "/" + phase;
+    for (const auto & mismatch : mismatches) message += "\n  " + mismatch;
+    throw LayoutMismatch(message);
 }
 
 void TemplateInstance::bind_inputs(const TargetInputs & inputs) {
@@ -134,28 +153,59 @@ TemplateInstance::TemplateInstance(const TemplateAsset & asset, std::size_t layo
            resources,
            std::vector<std::optional<std::size_t>>(asset.layout(layout).storages.size()),
            {},
-           invocation.sequences);
+           invocation.sequences,
+           invocation.parameter_scopes);
 }
 
 std::size_t TemplateInstance::expand_call(const std::string & role, const Invocation & invocation, const Parameters & parameters, std::size_t parent,
-                                          const ValuePorts & ports, const ParameterGroups & sequences) {
+                                          const ValuePorts & ports, const ParameterGroups & sequences, const ScopedParameters & scopes) {
     for (const auto & selection : asset_.entrypoints()) {
         if (selection.role != role || (selection.phase && *selection.phase != phase_)) continue;
         const auto frame = asset_.frame(selection);
         const auto & layout = asset_.layout(frame.layout);
         const auto & definition = asset_.definition(layout.definition);
 
-        auto arguments = parameters;
-        for (const auto * binding : { &frame.bindings.values, &invocation.parameters, &invocation.bindings }) {
-            for (const auto & [name, value] : *binding) arguments.insert_or_assign(name, value);
-        }
-        if (!std::ranges::all_of(definition.guards, [&](const auto & guard) { return (guard.condition.evaluate(arguments) != 0) == guard.expected; })) continue;
+        auto arguments = bind_parameters(parameters, frame.bindings.values, invocation, scopes);
 
         // A call family may expose different signatures, such as extend and decode allocation.
         if (layout.ports.inputs.size() != ports.inputs.size()
             || !std::ranges::all_of(ports.inputs, [&](const auto & port) { return layout.ports.inputs.contains(port.first); })
             || !std::ranges::all_of(ports.outputs, [&](const auto & port) { return layout.ports.outputs.contains(port.first); }))
             continue;
+
+        // Direct named axes bind local API parameters; compound dimensions are checked without fitting equations.
+        bool compatible = true;
+        for (const auto & contract : layout.input_shapes) {
+            const auto named = std::ranges::find_if(layout.ports.inputs, [&](const auto & port) { return port.second == contract.value; });
+            if (named == layout.ports.inputs.end()) continue;
+            const auto & type = graph_.types.at(ports.inputs.at(named->first));
+            if ((type.contains("dtype") && type.at("dtype") != contract.dtype) || (type.contains("device") && type.at("device") != contract.device)) {
+                compatible = false;
+                break;
+            }
+            if (!type.contains("shape")) continue;
+            const auto shape = type.at("shape").get<std::vector<std::int64_t>>();
+            if (shape.size() != contract.shape.size()) {
+                compatible = false;
+                break;
+            }
+            bool known = true;
+            for (std::size_t axis = 0; axis < shape.size(); ++axis) {
+                const auto expression = contract.shape[axis].document();
+                if (expression.is_string()) {
+                    const auto name = expression.get<std::string>();
+                    if (!arguments.contains(name) && std::ranges::find(definition.parameters, name) != definition.parameters.end())
+                        arguments.emplace(name, shape[axis]);
+                }
+                for (const auto & name : contract.shape[axis].variables()) known = known && arguments.contains(name);
+            }
+            if (known && evaluate_shape(contract.shape, arguments) != shape) {
+                compatible = false;
+                break;
+            }
+        }
+        if (!compatible) continue;
+        if (!std::ranges::all_of(definition.guards, [&](const auto & guard) { return (guard.condition.evaluate(arguments) != 0) == guard.expected; })) continue;
 
         // Named boundaries permit a different implementation without inheriting its source's private slots.
         std::vector<std::optional<std::size_t>> slots(layout.storages.size());
@@ -175,6 +225,7 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
                 resource = storage;
             }
         }
+
         for (const auto input : layout.inputs) {
             if (!slots[input])
                 throw LayoutMismatch("selected call has an unbound input: " + role + " layout " + std::to_string(frame.layout) + " value "
@@ -183,7 +234,7 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
 
         std::vector<std::size_t> resources;
         for (const auto bound : bound_resources) resources.push_back(bound ? *bound : graph_.resource_count++);
-        return expand(frame.layout, frame.bindings, invocation, parameters, parent, resources, std::move(slots), {}, sequences);
+        return expand(frame.layout, frame.bindings, invocation, std::move(arguments), parent, resources, std::move(slots), {}, sequences, scopes);
     }
 
     throw LayoutMismatch("no call implementation matches target: " + role);
@@ -204,7 +255,8 @@ void TemplateInstance::require_value(std::size_t identity, const nlohmann::json 
 
 std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings & bindings, Invocation invocation, Parameters parameters,
                                      std::optional<std::size_t> parent, const std::vector<std::size_t> & resources,
-                                     std::vector<std::optional<std::size_t>> slots, GroupValues input_groups, const ParameterGroups & inherited_sequences) {
+                                     std::vector<std::optional<std::size_t>> slots, GroupValues input_groups, const ParameterGroups & inherited_sequences,
+                                     const ScopedParameters & scopes) {
     const auto & layout = asset_.layout(identity);
     const auto & definition = asset_.definition(layout.definition);
     const auto & sequences = invocation.sequences.empty() ? inherited_sequences : invocation.sequences;
@@ -223,9 +275,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
     }
 
     // Target arguments override inherited and session bindings; derived values are computed below.
-    for (const auto & [key, value] : bindings.values) parameters.insert_or_assign(key, value);
-    for (const auto & [key, value] : invocation.parameters) parameters.insert_or_assign(key, value);
-    for (const auto & [key, value] : invocation.bindings) parameters.insert_or_assign(key, value);
+    parameters = bind_parameters(std::move(parameters), bindings.values, invocation, scopes);
 
     for (const auto & [name, _] : invocation.input_groups) {
         if (!definition.input_groups.contains(name)) throw std::invalid_argument("region has no input group " + name);
@@ -385,7 +435,8 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                                            parameters,
                                            region,
                                            { current, last ? named_ports.outputs : std::map<std::string, std::size_t>{} },
-                                           sequences);
+                                           sequences,
+                                           scopes);
             for (const auto & [name, value] : graph_.regions.at(child).at("ports").at("outputs").items())
                 current.insert_or_assign(name, value.get<std::size_t>());
         }
@@ -458,6 +509,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
             auto work = prototype.properties;
             work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
             work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
+            if (prototype.communication) work["communication"] = prototype.communication->instantiate(own_values, parameters, input_groups, bindings.literals);
             if (const auto found = bindings.execution.find(own->operation); found != bindings.execution.end()) {
                 const auto & execution = asset_.execution_binding(found->second, parameters);
                 const auto & pattern = asset_.execution_pattern(execution.pattern);
@@ -525,7 +577,8 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                                                      producer_resources,
                                                      std::vector<std::optional<std::size_t>>(prototype.storages.size()),
                                                      {},
-                                                     sequences);
+                                                     sequences,
+                                                     scopes);
                         members.push_back(graph_.regions.at(produced).at("outputs").at(0).get<std::size_t>());
                     }
                 }
@@ -533,10 +586,31 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
         }
 
         if (call.family) {
+
+            // A reusable implementation keeps the caller's role identity, such as its layer and expert shard.
+            for (const auto & [name, value] : bindings.children.at(child_index).values) child_invocation.bindings.try_emplace(name, value);
+
+            for (const auto & contract : child.input_shapes) {
+                if (!child_values.at(contract.value)) continue;
+                bool known = true;
+                for (const auto & dimension : contract.shape) {
+                    for (const auto & name : dimension.variables()) known = known && parameters.contains(name);
+                }
+                if (!known) continue;
+
+                // The caller supplies fixed geometry even when the callee uses its own local axis names.
+                require_value(*child_values[contract.value],
+                              {
+                                  { "kind", "tensor" },
+                                  { "dtype", contract.dtype },
+                                  { "device", contract.device },
+                                  { "shape", evaluate_shape(contract.shape, parameters) }
+                });
+            }
             ValuePorts bound;
             for (const auto & [name, value] : child.ports.inputs) bound.inputs.emplace(name, child_values.at(value).value());
             for (const auto & [name, value] : child.ports.outputs) bound.outputs.emplace(name, child_values.at(value).value());
-            expand_call(*call.family, child_invocation, parameters, region, bound, sequences);
+            expand_call(*call.family, child_invocation, parameters, region, bound, sequences, scopes);
         }
         else
             expand(call.layout,
@@ -547,7 +621,8 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                    remap(call.resources, resources),
                    std::move(child_values),
                    std::move(child_groups),
-                   sequences);
+                   sequences,
+                   scopes);
         ++child_index;
     }
 

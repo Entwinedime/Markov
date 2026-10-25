@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -19,6 +20,64 @@ void ParallelComposition::require_geometry(std::span<const std::size_t> referenc
                 throw std::invalid_argument("communication tensor geometry differs between endpoints");
         }
     }
+}
+
+nlohmann::json ParallelComposition::exchange(std::span<const std::size_t> operations) const {
+    auto signature = graph_.work[operations.front()].at("communication");
+    signature.erase("input_splits");
+    signature.erase("output_splits");
+    const auto dimension = signature.at("dimension").get<std::size_t>();
+    const auto & reference = graph_.types[graph_.operations[operations.front()].inputs.at(0)];
+    const auto reference_shape = reference.at("shape").get<std::vector<std::int64_t>>();
+    auto splits = nlohmann::json::array();
+
+    for (const auto operation : operations) {
+        const auto & access = graph_.operations[operation];
+        const auto & specification = graph_.work[operation].at("communication");
+        auto header = specification;
+        header.erase("input_splits");
+        header.erase("output_splits");
+        if (header != signature || access.inputs.size() != 1 || access.outputs.size() != 1)
+            throw std::invalid_argument("all-to-all participants need one matching tensor exchange signature");
+
+        for (const auto & [field, value] : {
+                 std::pair{  "input_splits",  access.inputs.front() },
+                 { "output_splits", access.outputs.front() }
+        }) {
+            const auto & type = graph_.types[value];
+            const auto shape = type.at("shape").get<std::vector<std::int64_t>>();
+            if (type.at("dtype") != reference.at("dtype") || type.at("device") != reference.at("device") || shape.size() != reference_shape.size()
+                || dimension >= shape.size())
+                throw std::invalid_argument("all-to-all payload types differ between participants");
+            for (std::size_t axis = 0; axis < shape.size(); ++axis) {
+                if (axis != dimension && shape[axis] != reference_shape[axis])
+                    throw std::invalid_argument("all-to-all payload dimensions differ outside their split axis");
+            }
+
+            const auto counts = specification.at(field).get<std::vector<std::int64_t>>();
+            if (counts.size() != operations.size()) throw std::invalid_argument("all-to-all needs one split per participant");
+            std::int64_t total = 0;
+            for (const auto count : counts) {
+                if (count < 0 || count > shape[dimension] - total) throw std::invalid_argument("all-to-all splits exceed their tensor extent");
+                total += count;
+            }
+            if (total != shape[dimension]) throw std::invalid_argument("all-to-all splits do not cover their tensor extent");
+        }
+        splits.push_back({
+            {  "input",  specification.at("input_splits") },
+            { "output", specification.at("output_splits") }
+        });
+    }
+
+    // Each directed payload must have the same row count at its receiving peer, including zero-sized edges.
+    for (std::size_t source = 0; source < splits.size(); ++source) {
+        for (std::size_t target = 0; target < splits.size(); ++target) {
+            if (splits[source].at("input")[target] != splits[target].at("output")[source])
+                throw std::invalid_argument("all-to-all sender and receiver splits disagree");
+        }
+    }
+    signature["rank_splits"] = std::move(splits);
+    return signature;
 }
 
 void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task) {
@@ -64,10 +123,11 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
             std::vector<std::size_t> operations;
             const auto first = calls.front()[index];
             const auto & specification = graph_.work[first].at("communication");
+            const bool variable_exchange = specification.at("primitive") == "all_to_all";
             for (const auto & rank : calls) {
                 const auto operation = rank[index];
                 const auto & access = graph_.operations[operation];
-                if (operation != first) {
+                if (operation != first && !variable_exchange) {
                     if (graph_.work[operation].at("communication") != specification)
                         throw std::invalid_argument("ranks disagree on collective operation order");
                     require_geometry(graph_.operations[first].inputs, access.inputs);
@@ -76,7 +136,7 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
                 operations.push_back(operation);
             }
 
-            auto bound = specification;
+            auto bound = variable_exchange ? exchange(operations) : specification;
             bound["group"] = group;
             connect_calls(operations, task, std::move(bound), index, "collective", {});
         }

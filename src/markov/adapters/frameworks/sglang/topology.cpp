@@ -17,6 +17,9 @@ ParallelTopology ServingTopology::build(std::span<const TemplateAsset> assets, s
     if (assets.empty() || stages == 0 || assets.size() % stages != 0) throw std::invalid_argument("PP stages must divide the source rank count");
     if (!devices.empty() && devices.size() != assets.size()) throw std::invalid_argument("placement needs one device per logical rank");
     const auto tp = assets.size() / stages;
+    const auto & first = assets.front().environment();
+    const auto ep = first.at("logical_ep").get<std::size_t>();
+    if (ep == 0 || (ep > 1 && ep != tp)) throw std::invalid_argument("this SGLang expert implementation requires EP to equal TP");
     std::set<std::size_t> source_ranks;
     for (const auto & asset : assets) {
         const auto & environment = asset.environment();
@@ -30,6 +33,9 @@ ParallelTopology ServingTopology::build(std::span<const TemplateAsset> assets, s
             throw std::invalid_argument("source pipeline coordinates differ from the target topology");
         if (stages == 1 && environment.contains("logical_pp") && environment.at("logical_pp") != 1)
             throw std::invalid_argument("pipeline sources require their recorded PP topology");
+        const auto source_ep = environment.at("logical_ep").get<std::size_t>();
+        if (source_ep != ep || (ep > 1 && environment.at("ep_rank").get<std::size_t>() != rank % tp))
+            throw std::invalid_argument("source expert coordinates differ from the target group");
     }
 
     std::vector<RankPlacement> ranks;
@@ -49,6 +55,7 @@ ParallelTopology ServingTopology::build(std::span<const TemplateAsset> assets, s
     for (std::size_t stage = 0; stage < stages; ++stage) {
         std::vector<std::size_t> local(tp);
         std::iota(local.begin(), local.end(), stage * tp);
+        if (ep > 1) groups.push_back({ "ep-" + std::to_string(stage), "ep", local });
         groups.push_back({ "tp-" + std::to_string(stage), "tp", std::move(local) });
     }
     if (stages > 1) {

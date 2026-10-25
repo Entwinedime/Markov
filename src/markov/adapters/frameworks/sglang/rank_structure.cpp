@@ -1,5 +1,7 @@
 #include "markov/adapters/frameworks/sglang/rank_structure.hpp"
 
+#include "markov/adapters/frameworks/sglang/expert_routing.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
@@ -80,13 +82,15 @@ void RankStructure::check_target(const TemplateAsset & asset, ServingSettings se
 }
 
 RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settings, RegionGraph & graph, std::size_t execution_offset, std::size_t rank,
-                             std::size_t lanes)
+                             std::size_t lanes, const ExpertRouting * routing)
     : settings_(settings),
       asset_(asset),
       shared_(graph),
       graph_(asset, graph, execution_offset),
       rank_(rank),
+      routing_(routing),
       publishes_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "request_output"; })),
+      coordinates_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "batch_coordination"; })),
       page_reuse_(PageReuse::Immediate) {
     const auto allocation = std::ranges::find(asset.entrypoints(), "kv_allocate", &RegionSelection::role);
     if (allocation == asset.entrypoints().end()) throw std::invalid_argument("serving source requires an allocation interface");
@@ -173,6 +177,7 @@ std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, s
         graph_.integers(prepared.inputs.at("free_pages")).slice(batch.allocated_pages, invocation.parameters.at("free_pages_before") - batch.allocated_pages));
     free_pages_ = prepared.outputs.at("free_pages");
     request_map_ = prepared.outputs.at("request_map");
+    if (coordinates_) graph_.append("batch_coordination", phase, {});
     graph_.end_composition(prepared.outputs);
 
     // These are the actual prepared values, including the CPU length vector and prompt staging buffer.
@@ -188,7 +193,9 @@ TargetRegion RankStructure::model(const Batch & batch, const std::map<std::strin
     auto bound = inputs;
     if (token_relay_) bound.emplace("token_relay", *token_relay_);
     const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
-    auto result = graph_.append(batch.phase == Phase::Prefill ? "Prefill" : "Decode", phase, invocation(batch), bound);
+    auto call = invocation(batch);
+    if (routing_) routing_->bind(call, batch, rank_);
+    auto result = graph_.append(batch.phase == Phase::Prefill ? "Prefill" : "Decode", phase, call, bound);
     token_relay_ = result.ports.outputs.at("token_relay");
     stamp(begin);
     return result;

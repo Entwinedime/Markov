@@ -15,6 +15,8 @@
 
 namespace markov::sglang {
 
+class ExpertRouting;
+
 struct RankProgram {
     std::optional<std::size_t> publication;
     std::size_t completion;
@@ -30,8 +32,8 @@ struct RankMessage {
 class RankStructure {
 public:
     static void check_target(const TemplateAsset & asset, ServingSettings settings, std::span<const Request> requests, bool output_lengths);
-    RankStructure(const TemplateAsset & asset, ServingSettings settings, RegionGraph & graph, std::size_t execution_offset, std::size_t rank,
-                  std::size_t lanes);
+    RankStructure(const TemplateAsset & asset, ServingSettings settings, RegionGraph & graph, std::size_t execution_offset, std::size_t rank, std::size_t lanes,
+                  const ExpertRouting * routing = nullptr);
     RankStructure(const RankStructure &) = delete;
     RankStructure & operator=(const RankStructure &) = delete;
 
@@ -71,7 +73,9 @@ private:
     TargetGraph graph_;
     std::vector<BatchViews> views_;
     std::size_t rank_;
+    const ExpertRouting * routing_;
     bool publishes_;
+    bool coordinates_;
     PageReuse page_reuse_;
 
     std::optional<std::size_t> free_pages_;

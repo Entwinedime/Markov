@@ -523,7 +523,7 @@ void SourceTemplates::compile(std::size_t identity) {
     grouped_values.insert(produced_values.begin(), produced_values.end());
 
     LocalValues local(values_, external_declarations, grouped_values);
-    LocalValues own(values_, external_declarations, grouped_values);
+    LocalValues own(values_, region.declarations, grouped_values);
     nlohmann::json definition{
         { "role",       record.at("role") },
         { "body", nlohmann::json::array() }
@@ -654,7 +654,7 @@ void SourceTemplates::compile(std::size_t identity) {
                 }
             }
 
-            for (const auto & key : { "kind", "name", "attributes", "communication" }) {
+            for (const auto & key : { "kind", "name", "attributes" }) {
                 if (operation.contains(key)) work[key] = operation.at(key);
             }
 
@@ -667,6 +667,7 @@ void SourceTemplates::compile(std::size_t identity) {
                 for (const auto & [name, _] : operation.at("input_groups").items()) work["input_groups"].push_back(name);
             }
             for (const auto & key : { "arguments", "keywords" }) work[key] = own.arguments(operation.at(key));
+            if (operation.contains("communication")) work["communication"] = own.arguments(operation.at("communication"));
             work["writes"] = nlohmann::json::array();
             for (const auto & storage : operation.at("writes")) work["writes"].push_back(own.resource(storage.get<std::size_t>()));
 

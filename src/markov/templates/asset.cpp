@@ -137,9 +137,15 @@ TemplateCatalog::TemplateCatalog(nlohmann::json document) {
 
             ArgumentTree arguments(std::move(work.at("arguments")));
             ArgumentTree keywords(std::move(work.at("keywords")));
+            std::optional<ArgumentTree> communication;
+            if (work.contains("communication")) {
+                communication.emplace(std::move(work.at("communication")));
+                work.erase("communication");
+            }
             const auto groups = work.value("input_groups", std::vector<std::string>{});
             for (const auto & key : { "name", "inputs", "outputs", "writes", "arguments", "keywords", "input_groups" }) work.erase(key);
-            definition.operations.push_back({ std::move(access), std::move(arguments), std::move(keywords), std::move(work), groups });
+            definition.operations.push_back(
+                { std::move(access), std::move(arguments), std::move(keywords), std::move(work), groups, std::move(communication) });
         }
 
         if (source.contains("input_groups")) {
