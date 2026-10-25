@@ -179,6 +179,13 @@ class Exploration:
             raise ValueError("model configuration or execution images changed; start a new run")
         write_json(path, observed, indent=2)
 
+        self.state["failures"].update(
+            self.acquisition.check_workloads(observed["model_configuration"], self.specification)
+        )
+        expected = len(self.specification["configurations"]) * len(self.specification["workloads"])
+        if len(self.state["failures"]) == expected:
+            return
+
         self.build_tool()
         for command in self.acquisition.observer_commands(
             self.environment.native_path(self.environment.observer_build)
@@ -244,14 +251,13 @@ class Exploration:
             capture = self.directory / self.state["sources"][key]
             capture.resolve().relative_to(self.directory)
             physical_paths = [capture / self.acquisition.physical_name(domain, rank) for rank in roles]
-            if not all(path.exists() for path in physical_paths):
-                command = self.acquisition.command("interpret", self.environment.native_path(capture / "capture.json"))
-                self.step(
-                    self.environment.native_command(
-                        command, capture, self.acquisition.observer_library, self.available("processing")
-                    ),
-                    "processing",
-                )
+            command = self.acquisition.command("interpret", self.environment.native_path(capture / "capture.json"))
+            self.step(
+                self.environment.native_command(
+                    command, capture, self.acquisition.observer_library, self.available("processing")
+                ),
+                "processing",
+            )
             for rank, physical in zip(roles, physical_paths, strict=True):
                 source = capture / self.acquisition.source_name(domain, rank)
                 arguments += ["--source", str(source), "--physical", str(physical)]
@@ -276,6 +282,8 @@ class Exploration:
             asset = assets / "templates.json"
             for workload in self.specification["workloads"]:
                 key = f"{configuration['id']}/{workload['id']}"
+                if key in self.state["failures"]:
+                    continue
                 if key in self.state["results"] and (self.directory / self.state["results"][key]).exists():
                     continue
                 target = self.directory / "inputs/targets" / (key + ".json")
@@ -288,19 +296,20 @@ class Exploration:
                         "max_prefill_tokens",
                         "pd",
                         "pp",
+                        "ep",
                         "microbatch_requests",
                         "placement",
                     )
                     if name in configuration
                 }
-                write_json(
-                    target,
-                    {
-                        "configuration": settings,
-                        "requests": workload["requests"],
-                        "node_durations_ns": self.specification["node_durations_ns"],
-                    },
-                )
+                inputs = {
+                    "configuration": settings,
+                    "requests": workload["requests"],
+                    "node_durations_ns": self.specification["node_durations_ns"],
+                }
+                if "ep" in configuration:
+                    inputs["ep_routes"] = workload["ep_routes"]
+                write_json(target, inputs)
                 base = "diagnostics" if self.details else "results"
                 result = self.directory / base / (key + ".json")
                 arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(result)]
@@ -327,12 +336,14 @@ class Exploration:
             "",
             "节点耗时为显式假设；任务完成不表示结构独立验收或性能精度通过。",
             "",
+            "请求完成仅指控制流程结束；仿真结果仍保守标为 partial，来源覆盖和适用条件由 structure 单独说明。",
+            "",
             f"模型：{self.specification['model']['path']}，{self.specification['model']['dtype']}。",
             "",
             f"来源实现域 {len(self.domain_settings)} 个，已保存来源会话 {len(self.state['sources'])} 份。",
             "",
-            "| 配置 / 请求集 | 结果 | 模式 | TP | PP | 输入请求 |",
-            "| --- | --- | --- | ---: | ---: | ---: |",
+            "| 配置 / 请求集 | 结果 | 模式 | TP | PP | EP | 输入请求 |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: |",
         ]
         for key, path in self.state["results"].items():
             configuration, workload = key.split("/")
@@ -341,6 +352,7 @@ class Exploration:
             lines.append(
                 f"| {key} | [请求完成]({link}) | {mode} | {configurations[configuration]['tp']} | "
                 f"{configurations[configuration].get('pp', 1)} | "
+                f"{configurations[configuration].get('ep', {}).get('size', '—')} | "
                 f"{len(workloads[workload]['requests'])} |"
             )
         if self.state["failures"]:
@@ -369,6 +381,7 @@ class Exploration:
         self.state["status"] = "running"
         self.state["failures"] = {}
         self.save()
+        domains = self.domain_settings
 
         # The run lock is held; reclaim only this task's interrupted workers before doing new work.
         try:
@@ -377,13 +390,25 @@ class Exploration:
             if needs_sources:
                 self.prepare()
             else:
-                self.build_tool()
-            for name, domain in self.domain_settings.items():
+                observed = json.loads((self.directory / "inputs/environment.json").read_text())
+                self.state["failures"].update(
+                    self.acquisition.check_workloads(observed["model_configuration"], self.specification)
+                )
+                if len(self.state["failures"]) != expected:
+                    self.build_tool()
+            needed = {
+                self.configurations[configuration["id"]]
+                for configuration in self.specification["configurations"]
+                for workload in self.specification["workloads"]
+                if f"{configuration['id']}/{workload['id']}" not in self.state["failures"]
+            }
+            domains = {name: domain for name, domain in self.domain_settings.items() if name in needed}
+            for name, domain in domains.items():
                 self.acquire(name, domain)
 
             # Publication may precede interruption; reclaim consumed exports on recovery as well.
             if not self.details:
-                for name, domain in self.domain_settings.items():
+                for name, domain in domains.items():
                     for representative, roles in enumerate(self.acquisition.source_groups(domain)):
                         capture = self.directory / self.state["sources"][f"{name}-source-{representative}"]
                         parents = {(capture / self.acquisition.source_name(domain, rank)).parent for rank in roles}
@@ -405,7 +430,7 @@ class Exploration:
             work = self.directory / "work"
 
             # Published sources no longer need the SDK or observer build, including a partial target result.
-            if work.exists() and all((self.directory / "assets" / name).exists() for name in self.domain_settings):
+            if work.exists() and all((self.directory / "assets" / name).exists() for name in domains):
                 shutil.rmtree(work)
             self.save()
             self.report()
@@ -448,6 +473,7 @@ def read_specification(path: Path) -> dict[str, Any]:
         ):
             raise ValueError(f"{category} need nonempty, unique path-safe IDs")
     maximum = (1 << 63) - 1
+    topologies = {}
     for configuration in document["configurations"]:
         pd = "pd" in configuration
         check_fields(
@@ -456,7 +482,14 @@ def read_specification(path: Path) -> dict[str, Any]:
             | (
                 {"pd"}
                 if pd
-                else {"pp", "microbatch_requests", "max_running_requests", "max_total_tokens", "max_prefill_tokens"}
+                else {
+                    "pp",
+                    "ep",
+                    "microbatch_requests",
+                    "max_running_requests",
+                    "max_total_tokens",
+                    "max_prefill_tokens",
+                }
             ),
             "configuration",
         )
@@ -487,6 +520,20 @@ def read_specification(path: Path) -> dict[str, Any]:
         pp = configuration.get("pp", 1)
         if type(pp) is not int or not 0 < pp <= maximum:
             raise ValueError("configuration pp is outside its positive integer range")
+        if "ep" in configuration:
+            ep = configuration["ep"]
+            check_fields(ep, {"id", "size"}, "ep")
+            if (
+                not isinstance(ep["id"], str)
+                or not ep["id"]
+                or type(ep["size"]) is not int
+                or not 0 < ep["size"] <= maximum
+            ):
+                raise ValueError("EP topology needs a nonempty ID and positive integer size")
+            geometry = configuration["tp"], pp, ep["size"]
+            if ep["id"] in topologies and topologies[ep["id"]] != geometry:
+                raise ValueError("one EP topology ID cannot refer to different parallel layouts")
+            topologies[ep["id"]] = geometry
         if not pd:
             microbatch = configuration.get("microbatch_requests", (configuration["max_running_requests"] - 1) // pp + 1)
             if type(microbatch) is not int or not 0 < microbatch <= configuration["max_running_requests"]:
@@ -509,7 +556,10 @@ def read_specification(path: Path) -> dict[str, Any]:
 
     # Reject malformed workloads before paying for a native source; per-configuration capacity remains a result.
     for workload in document["workloads"]:
-        check_fields(workload, {"id", "requests"}, "workload")
+        check_fields(workload, {"id", "requests", "ep_routes"}, "workload")
+        routes = workload.get("ep_routes", {})
+        if not isinstance(routes, dict) or routes.keys() - topologies.keys():
+            raise ValueError("workload routes must be keyed by declared EP topology IDs")
         requests = workload["requests"]
         identities = [request["id"] for request in requests]
         if (

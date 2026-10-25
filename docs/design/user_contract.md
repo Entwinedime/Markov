@@ -2,7 +2,7 @@
 
 一次任务是**一个固定模型 × 非空配置集合 × 非空请求集合**。用户提供探索范围、采集部署及预算，系统为缺少来源的实现域选择代表配方；用户不指定 base，也不维护原生请求、KV 或 worker 状态。
 
-本文描述正式入口的输入和产物，并单独列出已确定、尚待实现的调度、前缀缓存与 EP 输入扩展。执行结构使用给定耗时完成条件模拟；实测性能属于后续独立能力，不能从条件结果推定精度。
+本文描述正式入口的输入和产物，以及尚待实现的调度与前缀缓存扩展。EP 路由按拓扑组织，项目统一不自动获取真实权重下的补齐元数据。执行结构使用给定耗时完成条件模拟；实测性能属于后续独立能力，不能从条件结果推定精度。
 
 ## 输入
 
@@ -20,9 +20,11 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | `budget` | `native_seconds`、`processing_seconds`、`temporary_bytes`、`retained_bytes` 四项累计额度，非负整数 |
 | `configurations[]` | 候选配置；共同字段为唯一 `id`、`tp`、`attention_backend`、`page_size`；同一实例另有 `max_running_requests`、`max_total_tokens`、`max_prefill_tokens` |
 | `configurations[].pp / microbatch_requests` | 可选的 PP stage 数和每批成员上限；默认 PP=1，上限为总请求容量除以 PP 后向上取整 |
+| `configurations[].ep` | MoE 并行部署，含非空拓扑 `id` 和正整数 `size`；EP1 参考同样显式声明 |
 | `configurations[].pd` | P/D 分离时替代单实例容量字段：`prefill` 包含请求容量、token 容量及 Prefill 预算，`decode` 包含请求容量和 token 容量 |
 | `configurations[].placement.devices` | 可选的单机目标设备列表；同实例按 stage 内 TP rank 排列，数量为 TP×PP；PD 为 P、D 两个位置；元素互异且非负 |
 | `workloads[]` | 请求集合；每项有唯一 `id` 和非空 `requests` |
+| `workloads[].ep_routes` | 按 EP 拓扑 ID 提供请求/层/token 的全局专家选择及 padding 路由条件 |
 | `node_durations_ns` | 执行节点种类到非负整数纳秒的映射，明确给定模拟假设 |
 
 配置和 workload 的 ID 使用字母、数字、下划线或连字符，供结果路径使用。正计数参数在有符号 64 位整数范围内，KV 容量至少容纳一页。未知字段拒绝，不静默忽略未实现的 chunk、overlap、缓存或其他选项；不保留旧字段兼容。
@@ -42,7 +44,7 @@ PD 的字段示例为 [disaggregated.json](../../example/automatic_graph/disaggr
 | 变化 | 正式流程的处理 |
 | --- | --- |
 | 请求数量、输入/输出长度、到达、并发上限、KV 总容量、非 chunked Prefill 预算 | 在同一来源域内按目标参数与状态变换、重组模板；仍须满足来源规则、模型上下文和原生资源约束 |
-| TP、PP、dtype、attention backend、page_size | 分别建立来源域，每域采集全部必要逻辑 rank；目前没有跨这些域的模板迁移 |
+| TP、PP、EP、dtype、attention backend、page_size | 分别建立来源域，每域采集全部必要逻辑 rank；目前没有跨这些域的模板迁移 |
 | 模型 | 每次任务固定一个模型；换模型建立相应来源，已接入家族通过同一采集流程处理，不要求用户手改模板 |
 | chunk、overlap、缓存命中、speculative 等 | 需要扩展控制、状态和相应模板能力；现有合同不接受未实现的选项 |
 
@@ -74,21 +76,33 @@ Decode 优先从已就绪成员中先分配 token 预算，再处理 Prefill chu
 
 结果区分实际计算 token、缓存命中/驻留及容量占用。请求结束释放其引用与槽位，缓存持有的页可以保留，不要求全部页返回空闲池。跨布局、拓扑或服务实例不自动共享物理 KV；EP 的给定路由也须与声明的共享前缀一致，否则不能授予该复用资格。
 
-## EP 路由输入扩展（已确定，尚未实现）
+## EP 路由条件
 
-workload 增加可选字段 `ep_routes`，按目标 **EP 拓扑 ID** 提供路由分配。配置启用某个 EP 拓扑时，与其组合的 workload 必须包含该拓扑的对应路由项；未启用 EP 时不因本条约束强制提供该字段。当前正式解析器尚未接入此扩展，不能把这里的约定当作已可运行的输入。
+**现行合同继续有效。** 配置通过 `"ep": {"id": "experts", "size": 2}` 声明拓扑，workload 通过 `ep_routes["experts"]` 提供该拓扑的路由条件，示例见 [expert.json](../../example/automatic_graph/expert.json)。一个 workload 面向多个拓扑时分别提供对应项；同一拓扑 ID 不能指向不同并行布局，不隐式套用其他拓扑的路由。
 
-拓扑 ID 对应配置声明的通信组、专家分片及 expert 到逻辑 rank 的映射，不仅是 EP 数量或物理卡号。多个配置明确使用同一 EP 拓扑时可以选用同一路由项；拓扑不同则分别提供，不隐式迁移路由。配置集包含 EP 拓扑 A、B 时，同一 workload 需同时提供 A、B 两项，才能覆盖这两个预测组合。
+每个拓扑项包含 `assignments`。其中用 `request` 指定请求，`layers` 和 `tokens` 均为左闭右开区间，`experts` 是互异全局专家 ID，数量等于模型 top-k。请求位置覆盖 `[0, prompt_tokens + output_tokens - 1)`；连续范围可合并。EP1 同样需要 MoE 路由条件，dense 模型不接收专家路由。
 
-路由以请求 ID、模型层和逻辑 token 位置定位，覆盖 Prefill token 与实际 Decode 步，并提供 token 选择的 expert（包括合法多选）。不以采集时的 batch 序号、chunk 序号或墙钟定位；控制器重新组批、切块时按实际成员取得相应路由，目的 rank 和各 expert 工作量由拓扑与路由共同推导。
+`padding` 使用相同的层/token 区间及专家字段，但不含 `request`，位置相对于补齐尾部，覆盖 `[0, EP size - 1)` 的可能位置；EP1 可省略。用户按拓扑提供这些位置的专家选择，adapter 根据每个目标批次自动算实际补几行、分配到哪个 worker、增加多少专家工作量和通信，不要求用户维护逐 batch 状态。当前 SGLang DeepEP normal / all-to-all 将 token 向量补齐到 TP 倍数后连续切分，EP>1 要求 EP=TP；不凭“补零”默认专家、不均匀补齐路由、不忽略真实附加工作。
 
-在配置 × workload 装配边界一次校验拓扑匹配、必要范围覆盖及 expert 选择是否合法。缺少或不匹配时，该组合报告明确输入缺口；其他合法组合可以继续，不使用默认均匀路由、邻近拓扑或自动内容推断补齐。
+按拓扑分组是输入组织方式，不表示真实 token 的逻辑专家选择必须随 EP 改变。例如相同专家 `[0,15,30,45]` 在连续分片的 EP2 中对应 rank `[0,0,1,1]`，EP4 中对应 `[0,1,2,3]`；映射仍由 adapter 解释。比较部署本身的影响时，各拓扑项可填相同真实路由，分别提供 padding 条件。
+
+**当前统一选择。** 项目保留按 EP 拓扑提供路由的合同，统一不增加真实权重补齐元数据的自动获取，也不增加单份路由格式、模式选项或运行时 fallback。补齐专家选择来自 workload 的给定条件，普通来源中的 dummy 路由观察不冒充真实权重元数据。没有补齐时不产生附加工作。
+
+真实 token 的专家选择与部署映射仍有不同职责；本轮未找到简单、可泛化的自动补齐方法，采用按拓扑输入来控制实现规模。未来若改变此取舍，应统一调整正式合同和采集流程，不按模型或拓扑混用获取方式。
+
+路由描述 backend 重排、复制或容量截断之前的专家选择；这些处理若存在，由 adapter 解释有效工作量，缺少规则就保留能力缺口。按请求、层、token 核对覆盖、专家范围和 top-k，按配置核对部署及补齐条件。各公开入口校验自己的外部输入，非法组合不拖累其他合法组合。
 
 结果表示**给定路由分配下的条件预测**，不声称从请求长度推导了真实文本路由。路由是工作量与连接的输入条件，不指定原生批次或完成时间，也不免除 MoE 子图和通信来源。若后端还存在 batch 相关截断或重排，需要独立的实现规则；不能把来源批次的最终分配直接外推到所有目标批次。
+
+比较真实路由时需固定模型、权重和实际 token；相同 prompt 不能单独保证 Decode 输入相同，不同数值实现也未必产生相同 top-k。条件展开则明确固定同一份逻辑路由，再比较不同部署；重新组批、切块和 P/D 交接继续用请求的逻辑 token 位置，不用来源 batch 序号。
+
+同域也仍受实际原型限制；例如仅观察到 Decode 的零接收分支时，不能直接授予 Prefill 零接收资格。目标无法匹配原型时报告具体原因，来源的设备或运行时覆盖为 partial 时结果保留该资格。
 
 ## 原生来源与统一起点
 
 框架维护真实请求、组批、KV、槽位及 worker 生命周期。系统按实现域在单卡上顺序运行各逻辑 TP 角色，保留本地分片、角色职责和 collective 接口；请求长度不除以 TP。辅助数据与传输替代只服务结构观察，不提供真实通信数值或成本资格。
+
+EP>1 使用实际原生进程组，部署须提供足够设备，每个 worker 发布独立来源；不能把单卡 TP 分片方法当作已验证的单卡 EP 通信。all-to-all 与 direct/fused 后端属于不同来源，当前运行资格不互相转授。
 
 来源使用完整模型的 dummy 权重。统一预热后，逻辑 KV 清空，保留协议声明的编译、分配和 workspace 状态；模型加载、初始化和预热不计入目标服务时延，但计入采集费用。实际窗口中的分配、等待和搬运仍是业务工作。来源已热不证明任意新路径已热，不直接把小池 workspace 快照用于任意目标容量。
 
@@ -105,7 +119,7 @@ workload 增加可选字段 `ep_routes`，按目标 **EP 拓扑 ID** 提供路�
 目标结果分别报告：
 
 - `control_status=complete`：请求在给定耗时下结束。
-- `status` 和 `structure.qualification`：结构适用性及仍未证明的边界；请求完成时仍可为 `partial`。
+- `status`：当前仿真结果统一保守标为 `partial`，不根据来源未归属事件数自动升级或降级。`structure.qualification` 及各角色的来源覆盖分别说明适用条件与证据边界。
 - `first_output_ns / last_output_ns`：scheduler 向下游交出 token 的可见时刻，不包括 detokenizer、HTTP 或客户端接收。
 - `state_committed_ns`：请求结束及槽位/页效果提交；不同于输出可见。
 - PD 的 `pool_free_pages`：两池可回收的页总量，包括尚待原生合并的空闲页，不表示它们已在同一直接分配列表中。`structure.rank_sources` 保留每角色的来源覆盖和原生页复用方式。

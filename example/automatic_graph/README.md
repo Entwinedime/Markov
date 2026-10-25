@@ -29,11 +29,13 @@ PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_dev
 
 P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；一对原生服务取得两个角色，目标分别声明 P/D 容量。首期各 TP1、PP1，P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；目标 placement 的两个位置依次属于 P、D。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `pool_free_pages` 报告两池可回收总量。
 
+MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --input example/automatic_graph/expert.json`。示例为完整 Qwen1.5 MoE、TP2/EP2，需两张实际采集卡；请求路由按层和逻辑 token 区间给出，padding 路由单独声明。它是给定路由的条件结构，仍执行 gate/top-k 等工作，不能从长度推断真实内容路由；缺少原型或来源覆盖为 partial 时如实报告。
+
 示例预算是有限上限，不保证任意模型或配置都能在其中完成。初始化、统一预热、观察、导出、处理和失败均计入累计额度；额度不足时保留状态并停止，不隐式扩大预算或循环补采。
 
 ## 来源复用与结果含义
 
-每次任务固定一个模型。dtype、TP、PP、attention backend 和 page_size 相同的配置共享来源；每个域按实际逻辑 rank 取得本地分片。不同模型或域分别建立来源，不以普通 rank 的相似 shape 自动替代所有角色，也不声明同库跨 TP 或跨页大小变换。
+每次任务固定一个模型。dtype、TP、PP、EP、attention backend 和 page_size 相同的配置共享来源；每个域按实际逻辑 rank 取得本地分片。不同模型或域分别建立来源，不以普通 rank 的相似 shape 自动替代所有角色，也不声明同库跨 TP 或跨页大小变换。
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 
