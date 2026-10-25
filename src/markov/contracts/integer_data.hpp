@@ -20,6 +20,7 @@ public:
     void append(std::int64_t begin, std::int64_t count = 1);
     void append(IntegerData other);
     IntegerData slice(std::int64_t offset, std::int64_t count) const;
+    IntegerData sorted_unique() const;
 
     std::int64_t size() const;
     nlohmann::json document() const;

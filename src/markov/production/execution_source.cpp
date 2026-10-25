@@ -13,6 +13,23 @@ public:
     explicit Builder(ExecutionSource & owner) : owner_(owner) {}
 
     ExecutionPrototype compile(const nlohmann::json & observation) {
+        if (observation.contains("native_work")) {
+            const auto & work = observation.at("native_work");
+            const auto lane = resource(work.at("resource").get<std::string>(), 0);
+            const auto node = add("native", 0, 0, work.at("kind").get<std::string>(), lane, work.at("name").get<std::string>());
+
+            // A synchronous native API is one opaque service, including its blocking completion.
+            return {
+                { { "nodes", std::move(nodes_) },
+                 { "links", nlohmann::json::array() },
+                 { "sequences", { { node } } },
+                 { "requirements", nlohmann::json::array() },
+                 { "signals", nlohmann::json::array() },
+                 { "communication", nullptr },
+                 { "host_call", { { "entry", node }, { "return", node } } } },
+                std::move(bindings_)
+            };
+        }
         const auto & host = observation.at("host_scope");
         if (!host.is_null()) {
             const auto lane = resource("thread", host.at("thread").get<std::int64_t>());

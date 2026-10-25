@@ -27,7 +27,7 @@ class AllocationExample:
         self.recording = Recording(TorchMarkers())
         self.observer = OperatorObservation(self.recording)
         self.synchronization = SynchronizationObservation(self.recording.markers)
-        self.allocation = SGLangAllocation(self.observer, self.page_size, device)
+        self.allocation = SGLangAllocation(self.observer, self.page_size, device, False)
 
     def run(self) -> None:
         (self.output / "runtime").mkdir(parents=True)

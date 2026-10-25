@@ -151,6 +151,12 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
         }
         if (!std::ranges::all_of(definition.guards, [&](const auto & guard) { return (guard.condition.evaluate(arguments) != 0) == guard.expected; })) continue;
 
+        // A call family may expose different signatures, such as extend and decode allocation.
+        if (layout.ports.inputs.size() != ports.inputs.size()
+            || !std::ranges::all_of(ports.inputs, [&](const auto & port) { return layout.ports.inputs.contains(port.first); })
+            || !std::ranges::all_of(ports.outputs, [&](const auto & port) { return layout.ports.outputs.contains(port.first); }))
+            continue;
+
         // Named boundaries permit a different implementation without inheriting its source's private slots.
         std::vector<std::optional<std::size_t>> slots(layout.storages.size());
         std::vector<std::optional<std::size_t>> bound_resources(layout.resources);
@@ -170,7 +176,9 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
             }
         }
         for (const auto input : layout.inputs) {
-            if (!slots[input]) throw LayoutMismatch("selected call has an unbound input: " + role);
+            if (!slots[input])
+                throw LayoutMismatch("selected call has an unbound input: " + role + " layout " + std::to_string(frame.layout) + " value "
+                                     + std::to_string(input));
         }
 
         std::vector<std::size_t> resources;

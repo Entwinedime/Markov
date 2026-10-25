@@ -76,6 +76,7 @@ void SourceProjection::select() {
         for (const auto & key : { "arguments",
                                   "keywords",
                                   "attributes",
+                                  "native_work",
                                   "communication",
                                   "execution_guards",
                                   "execution_reduction",
@@ -392,13 +393,14 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         auto record = operation.properties;
         const auto host =
             host_scopes.find(operation.source ? std::pair{ std::string("operation"), *operation.source } : std::pair{ std::string("region"), access.region });
-        if (!device.work[identity].empty() || !runtime.effects[identity].empty() || host != host_scopes.end()) {
+        if (!device.work[identity].empty() || !runtime.effects[identity].empty() || host != host_scopes.end() || record.contains("native_work")) {
             record["execution_observation"] = {
                 { "communication", record.value("communication", nlohmann::json(nullptr)) },
                 { "host_scope", host == host_scopes.end() ? nlohmann::json(nullptr) : *host->second },
                 { "device_work", std::move(device.work[identity]) },
                 { "runtime_actions", std::move(runtime.effects[identity]) }
             };
+            if (record.contains("native_work")) record["execution_observation"]["native_work"] = record.at("native_work");
         }
 
         record.update({

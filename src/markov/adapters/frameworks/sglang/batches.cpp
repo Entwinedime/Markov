@@ -42,6 +42,16 @@ void BatchViews::advance(Phase phase) {
     if (phase == Phase::Decode) filter(running_.value(), name);
 }
 
+void BatchViews::accept() {
+    advance(Phase::Prefill);
+
+    // Destination admission removes finished rows before attaching the next prebuilt batch.
+    if (running_) {
+        filter(*running_, "control");
+        if (running_->members == 0) running_.reset();
+    }
+}
+
 std::map<std::string, std::size_t> BatchViews::decode_inputs() const {
     auto inputs = running_.value().columns;
     inputs["prefix_lengths"] = inputs.at("sequence_lengths");

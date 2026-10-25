@@ -43,6 +43,7 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
     auto & resource_bindings = instance.bound_inputs_.resources;
     const auto & value_bindings = instance.bound_inputs_.values;
     const auto & bound_types = instance.bound_inputs_.types;
+    fragment.regions.front()["entrypoint"] = role;
 
     // External state is shared by source identity; all remaining resources belong to this invocation.
     auto resource_count = graph_.resource_count;
@@ -174,6 +175,7 @@ std::size_t TargetGraph::begin_composition(const std::string & role, const std::
             {          "id",                                                          identity },
             {      "parent",                                                            parent },
             {        "role",                                                   definition.role },
+            {  "entrypoint",                                                              role },
             {       "phase",                                                             phase },
             {  "definition",                                                     definition_id },
             { "composition",                                                    "target_calls" },

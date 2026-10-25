@@ -48,6 +48,23 @@ IntegerData IntegerData::slice(std::int64_t offset, std::int64_t count) const {
 
 std::int64_t IntegerData::size() const { return size_; }
 
+IntegerData IntegerData::sorted_unique() const {
+    auto ordered = runs_;
+    std::ranges::sort(ordered, {}, &IntegerRun::begin);
+    IntegerData result;
+    for (const auto & run : ordered) {
+        auto begin = run.begin;
+        const auto end = run.begin + (run.count - 1);
+        if (!result.runs_.empty()) {
+            const auto previous = result.runs_.back().begin + (result.runs_.back().count - 1);
+            if (end <= previous) continue;
+            if (begin <= previous) begin = previous + 1;
+        }
+        result.append(begin, end - begin + 1);
+    }
+    return result;
+}
+
 nlohmann::json IntegerData::document() const {
     auto result = nlohmann::json::array();
     for (const auto & run : runs_) result.push_back({ run.begin, run.count });

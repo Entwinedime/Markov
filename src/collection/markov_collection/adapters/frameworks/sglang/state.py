@@ -19,12 +19,15 @@ class RequestCacheCall(NativeCall):
         self.request = request
         self.finished = finished
         self.immediate = finished and cache.token_to_kv_pool_allocator.is_not_in_free_group
+        self.pool_name = "release_pages" if cache.token_to_kv_pool_allocator.need_sort else "free_pages"
 
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
         self.input_ports = self.values.port_values({"request_map": self.cache.req_to_token_pool.req_to_token})
         if self.immediate:
             self.input_ports.update(
-                self.values.port_values({"free_pages": self.cache.token_to_kv_pool_allocator.free_pages})
+                self.values.port_values(
+                    {self.pool_name: getattr(self.cache.token_to_kv_pool_allocator, self.pool_name)}
+                )
             )
 
         return (self.cache.req_to_token_pool.req_to_token,), ()
@@ -73,7 +76,7 @@ class RequestCacheCall(NativeCall):
 
         self.output_ports = {"request_indices": self.view.result}
         if self.immediate:
-            self.output_ports["free_pages"] = self.cache.token_to_kv_pool_allocator.free_pages
+            self.output_ports[self.pool_name] = getattr(self.cache.token_to_kv_pool_allocator, self.pool_name)
         if not self.finished:
             self.output_ports["prefix_indices"] = self.request.prefix_indices
 
@@ -282,6 +285,54 @@ class PageReleaseCall(NativeCall):
 
     def outputs(self, result: Any) -> Any:
         return self.state_outputs
+
+
+class PageMergeCall(NativeCall):
+    def __init__(self, values: Any, original: Any, pool: Any) -> None:
+        super().__init__(values.recording, values, "sglang.KV.merge_and_sort_free", original, {})
+        self.pool = pool
+
+    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
+        tensors = {name: getattr(self.pool, name) for name in ("free_pages", "release_pages")}
+        for name, value in tensors.items():
+            self.values.bind_shape(value, (self.values.shapes.symbol(name + "_before"),))
+        self.input_ports = self.values.port_values(tensors)
+        return tuple(tensors.values()), ()
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        import torch
+
+        metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        metadata.update(
+            entrypoint="kv_merge_free",
+            entrypoint_phase=None,
+            parameters={
+                "free_pages_before": len(self.pool.free_pages),
+                "release_pages_before": len(self.pool.release_pages),
+            },
+            derived_parameters=[
+                {"name": "free_pages_after", "expression": ["add", "free_pages_before", "release_pages_before"]}
+            ],
+            guards=[{"condition": ["lt", 0, "release_pages_before"], "expected": True}],
+        )
+        with TensorGeometryObservation(self.values, factories={torch.empty: (0,)}):
+            return super().invoke(*args, **kwargs)
+
+    def outputs(self, result: Any) -> Any:
+        return self.pool.free_pages, self.pool.release_pages
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> str | None:
+        metadata["parameters"]["free_pages_after"] = len(self.pool.free_pages)
+        self.values.bind_shape(self.pool.free_pages, (self.values.shapes.symbol("free_pages_after"),))
+        metadata["ports"] = {
+            "inputs": self.input_ports,
+            "outputs": self.values.port_values(
+                {name: getattr(self.pool, name) for name in ("free_pages", "release_pages")}
+            ),
+        }
+        return None
 
 
 class PageReleaseGroupCall(NativeCall):

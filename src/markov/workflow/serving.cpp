@@ -54,12 +54,20 @@ nlohmann::json ServingWorkflow::run(bool details) {
                 decision["flow"] = action->flow;
                 decision["lane"] = action->lane;
                 decision["stage"] = action->stage ? nlohmann::json(*action->stage) : nlohmann::json(nullptr);
-                decision["step"] = action->step == ServingStep::Batch ? "batch" : action->step == ServingStep::Stage ? "stage" : "result";
+                decision["step"] = action->step_name();
                 decision["commits_requests"] = action->commits_requests();
                 decision["task"] = {
                     {    "group",    action->task.group },
                     { "sequence", action->task.sequence }
                 };
+                if (!action->work->transferred_pages.empty()) {
+                    decision["page_copies"] = nlohmann::json::array();
+                    for (const auto & page : action->work->transferred_pages)
+                        decision["page_copies"].push_back({
+                            {      "source",      page.source },
+                            { "destination", page.destination }
+                        });
+                }
             }
 
             // Construction and duration resolution succeed before request/page ownership changes.
@@ -108,6 +116,10 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
         // Publication does not release pages; result-processing completion commits those effects.
         controller_.finish(work.action, work.returned_pages, event.time_ns);
+        if (details) {
+            work.decision["completed_ns"] = event.time_ns;
+            work.decision["free_pages_after"] = controller_.free_pages();
+        }
         if (work.action.commits_requests()) record_completion(result, work.decision, work.action.work->effects, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));
         pending.erase(event.task);
@@ -125,13 +137,14 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
 nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
     nlohmann::json decision{
-        {             "phase", batch.phase == Phase::Prefill ? "prefill" : "decode" },
-        {                 "M",                                   batch.new_tokens() },
-        {                 "B",                                 batch.members.size() },
-        {                 "R",                               batch.request_capacity },
-        { "free_pages_before",                              batch.free_pages_before },
-        {   "allocated_pages",                                batch.allocated_pages },
-        {           "members",                              nlohmann::json::array() }
+        {                 "phase", batch.phase == Phase::Prefill ? "prefill" : "decode" },
+        {                     "M",                                   batch.new_tokens() },
+        {                     "B",                                 batch.members.size() },
+        {                     "R",                               batch.request_capacity },
+        {     "free_pages_before",                              batch.free_pages_before },
+        { "deferred_pages_before",                          batch.deferred_pages_before },
+        {       "allocated_pages",                                batch.allocated_pages },
+        {               "members",                              nlohmann::json::array() }
     };
     for (const auto & member : batch.members) {
         decision["members"].push_back({
@@ -177,11 +190,6 @@ void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json 
                 {         "finished",         member.finished },
                 {   "released_pages",   member.released_pages }
             });
-    }
-
-    if (details) {
-        decision["completed_ns"] = time_ns;
-        decision["free_pages_after"] = controller_.free_pages();
     }
 }
 

@@ -253,7 +253,7 @@ class Exploration:
                     "processing",
                 )
             for rank, physical in zip(roles, physical_paths, strict=True):
-                source = capture / f"rank-{rank}.json"
+                source = capture / self.acquisition.source_name(domain, rank)
                 arguments += ["--source", str(source), "--physical", str(physical)]
                 inputs += [source, physical]
 
@@ -281,11 +281,18 @@ class Exploration:
                 target = self.directory / "inputs/targets" / (key + ".json")
                 settings = {
                     name: configuration[name]
-                    for name in ("max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens")
+                    for name in (
+                        "max_running_requests",
+                        "max_total_tokens",
+                        "page_size",
+                        "max_prefill_tokens",
+                        "pd",
+                        "pp",
+                        "microbatch_requests",
+                        "placement",
+                    )
+                    if name in configuration
                 }
-                for name in ("pp", "microbatch_requests", "placement"):
-                    if name in configuration:
-                        settings[name] = configuration[name]
                 write_json(
                     target,
                     {
@@ -324,14 +331,15 @@ class Exploration:
             "",
             f"来源实现域 {len(self.domain_settings)} 个，已保存来源会话 {len(self.state['sources'])} 份。",
             "",
-            "| 配置 / 请求集 | 结果 | TP | PP | 输入请求 |",
-            "| --- | --- | ---: | ---: | ---: |",
+            "| 配置 / 请求集 | 结果 | 模式 | TP | PP | 输入请求 |",
+            "| --- | --- | --- | ---: | ---: | ---: |",
         ]
         for key, path in self.state["results"].items():
             configuration, workload = key.split("/")
             link = Path("..") / path
+            mode = "PD" if "pd" in configurations[configuration] else "共同实例"
             lines.append(
-                f"| {key} | [请求完成]({link}) | {configurations[configuration]['tp']} | "
+                f"| {key} | [请求完成]({link}) | {mode} | {configurations[configuration]['tp']} | "
                 f"{configurations[configuration].get('pp', 1)} | "
                 f"{len(workloads[workload]['requests'])} |"
             )
@@ -340,7 +348,7 @@ class Exploration:
             lines += [f"- {key}: {reason}" for key, reason in self.state["failures"].items()]
         lines += [
             "",
-            f"原生启动尝试 {self.state['native_attempts']} 次，返回成功 {len(self.state['sources'])} 次；"
+            f"原生启动尝试 {self.state['native_attempts']} 次，当前可复用来源会话 {len(self.state['sources'])} 份；"
             f"累计原生 {self.state['charged_ns']['native'] / 1e9:.3f} 秒，"
             f"处理 {self.state['charged_ns']['processing'] / 1e9:.3f} 秒。",
             "",
@@ -375,11 +383,15 @@ class Exploration:
 
             # Publication may precede interruption; reclaim consumed exports on recovery as well.
             if not self.details:
-                for relative in self.state["sources"].values():
-                    for child in ("native", "runtime"):
-                        path = self.directory / relative / child
-                        if path.exists():
-                            shutil.rmtree(path)
+                for name, domain in self.domain_settings.items():
+                    for representative, roles in enumerate(self.acquisition.source_groups(domain)):
+                        capture = self.directory / self.state["sources"][f"{name}-source-{representative}"]
+                        parents = {(capture / self.acquisition.source_name(domain, rank)).parent for rank in roles}
+                        for parent in parents:
+                            for child in ("native", "runtime"):
+                                path = parent / child
+                                if path.exists():
+                                    shutil.rmtree(path)
             self.predict()
             self.state["status"] = "complete" if not self.state["failures"] else "partial"
             if self.storage_bytes(retained=True) > self.specification["budget"]["retained_bytes"]:
@@ -437,33 +449,48 @@ def read_specification(path: Path) -> dict[str, Any]:
             raise ValueError(f"{category} need nonempty, unique path-safe IDs")
     maximum = (1 << 63) - 1
     for configuration in document["configurations"]:
+        pd = "pd" in configuration
         check_fields(
             configuration,
-            {
-                "id",
-                "tp",
-                "pp",
-                "microbatch_requests",
-                "attention_backend",
-                "max_running_requests",
-                "max_total_tokens",
-                "page_size",
-                "max_prefill_tokens",
-                "placement",
-            },
+            {"id", "tp", "attention_backend", "page_size", "placement"}
+            | (
+                {"pd"}
+                if pd
+                else {"pp", "microbatch_requests", "max_running_requests", "max_total_tokens", "max_prefill_tokens"}
+            ),
             "configuration",
         )
-        for name in ("tp", "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens"):
+        for name in ("tp", "page_size"):
             if type(configuration[name]) is not int or not 0 < configuration[name] <= maximum:
                 raise ValueError(f"configuration {name} is outside its positive integer range")
-        if configuration["max_total_tokens"] < configuration["page_size"]:
-            raise ValueError("configuration KV capacity needs at least one page")
+
+        pools = [(configuration, {"max_running_requests", "max_total_tokens", "max_prefill_tokens"})]
+        if pd:
+            check_fields(configuration["pd"], {"prefill", "decode"}, "pd")
+            if configuration["tp"] != 1:
+                raise ValueError("PD currently requires TP1 on each instance")
+            pools = []
+            for role in ("prefill", "decode"):
+                fields = {"max_running_requests", "max_total_tokens"} | (
+                    {"max_prefill_tokens"} if role == "prefill" else set()
+                )
+                pool = configuration["pd"][role]
+                check_fields(pool, fields, "pd." + role)
+                pools.append((pool, fields))
+        for pool, fields in pools:
+            for name in fields:
+                if type(pool[name]) is not int or not 0 < pool[name] <= maximum:
+                    raise ValueError(f"configuration {name} is outside its positive integer range")
+            if pool["max_total_tokens"] < configuration["page_size"]:
+                raise ValueError("configuration KV capacity needs at least one page")
+
         pp = configuration.get("pp", 1)
         if type(pp) is not int or not 0 < pp <= maximum:
             raise ValueError("configuration pp is outside its positive integer range")
-        microbatch = configuration.get("microbatch_requests", (configuration["max_running_requests"] - 1) // pp + 1)
-        if type(microbatch) is not int or not 0 < microbatch <= configuration["max_running_requests"]:
-            raise ValueError("microbatch_requests must fit the request capacity")
+        if not pd:
+            microbatch = configuration.get("microbatch_requests", (configuration["max_running_requests"] - 1) // pp + 1)
+            if type(microbatch) is not int or not 0 < microbatch <= configuration["max_running_requests"]:
+                raise ValueError("microbatch_requests must fit the request capacity")
         domain = SGLangAcquisition.domain(document["model"], configuration)
         if SGLangAcquisition.required_devices(domain) > len(deployment):
             raise ValueError("declared collection devices cannot run the required native source participants")
@@ -474,7 +501,7 @@ def read_specification(path: Path) -> dict[str, Any]:
             devices = placement["devices"]
             if (
                 not isinstance(devices, list)
-                or len(devices) != configuration["tp"] * pp
+                or len(devices) != (2 if pd else configuration["tp"] * pp)
                 or any(type(device) is not int or not 0 <= device <= maximum for device in devices)
                 or len(set(devices)) != len(devices)
             ):

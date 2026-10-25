@@ -16,8 +16,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "markov/adapters/frameworks/sglang/disaggregated.hpp"
 #include "markov/adapters/frameworks/sglang/structure.hpp"
 #include "markov/adapters/frameworks/sglang/topology.hpp"
+#include "markov/controller/disaggregated.hpp"
 #include "markov/controller/serving.hpp"
 #include "markov/execution/durations.hpp"
 #include "markov/graph/source_graph.hpp"
@@ -98,13 +100,12 @@ void check_fields(const nlohmann::json & source, std::initializer_list<std::stri
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
     check_fields(input, { "configuration", "requests", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
-    check_fields(configuration,
-                 { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement" },
-                 "configuration");
-    const markov::ServingSettings settings{ integer(configuration.at("max_running_requests")),
-                                            integer(configuration.at("max_total_tokens")),
-                                            integer(configuration.at("page_size")),
-                                            integer(configuration.at("max_prefill_tokens")) };
+    const bool disaggregated = configuration.contains("pd");
+    if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
+    else
+        check_fields(configuration,
+                     { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement" },
+                     "configuration");
 
     std::vector<markov::Request> requests;
     if (!input.at("requests").is_array() || input.at("requests").empty()) throw std::invalid_argument("serving needs a nonempty request array");
@@ -117,11 +118,6 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     }
 
     const markov::GivenDurations durations(input.at("node_durations_ns"));
-    const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
-    if (stages <= 0) throw std::invalid_argument("pp must be positive");
-    const auto batch_limit =
-        configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
-    if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
     std::vector<std::int64_t> devices;
     if (configuration.contains("placement")) {
         const auto & placement = configuration.at("placement");
@@ -130,6 +126,41 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
             throw std::invalid_argument("placement needs one device per logical rank");
         for (const auto & device : placement.at("devices")) devices.push_back(integer(device));
     }
+    if (disaggregated) {
+        const auto & pd = configuration.at("pd");
+        check_fields(pd, { "prefill", "decode" }, "pd");
+        const auto & p = pd.at("prefill");
+        const auto & d = pd.at("decode");
+        check_fields(p, { "max_running_requests", "max_total_tokens", "max_prefill_tokens" }, "pd.prefill");
+        check_fields(d, { "max_running_requests", "max_total_tokens" }, "pd.decode");
+        const auto page_size = integer(configuration.at("page_size"));
+        const markov::ServingSettings prefill(integer(p.at("max_running_requests")),
+                                              integer(p.at("max_total_tokens")),
+                                              page_size,
+                                              integer(p.at("max_prefill_tokens")));
+        const markov::ServingSettings decode(integer(d.at("max_running_requests")), integer(d.at("max_total_tokens")), page_size, 1);
+        const markov::DisaggregatedGroups groups{ "prefill", "decode", "kv" };
+        markov::sglang::DisaggregatedStructure expansion(assets, prefill, decode, requests, groups, devices);
+        markov::DisaggregatedController controller(prefill, decode, std::move(requests), groups, expansion.page_reuse());
+        markov::ServingWorkflow workflow(controller, expansion, durations);
+        auto result = workflow.run(details);
+        result["configuration"] = configuration;
+        result["duration_source"] = "given_execution_kind_ns";
+        result["pool_free_pages"] = controller.pool_free_pages();
+        result["structure"] = expansion.summary();
+        if (details) result["graph"] = expansion.document();
+        return result;
+    }
+
+    const markov::ServingSettings settings{ integer(configuration.at("max_running_requests")),
+                                            integer(configuration.at("max_total_tokens")),
+                                            integer(configuration.at("page_size")),
+                                            integer(configuration.at("max_prefill_tokens")) };
+    const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
+    if (stages <= 0) throw std::invalid_argument("pp must be positive");
+    const auto batch_limit =
+        configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
+    if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
     const markov::sglang::ServingTopology topology(assets, static_cast<std::size_t>(stages), devices);
     const auto control_group = topology.parallel().groups().front().id;
     markov::sglang::ServingStructure expansion(assets, settings, requests, topology);

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -17,9 +16,7 @@ ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, Servin
       prefill_token_granularity_(settings.page_size),
       assets_(assets.size()) {
     if (assets.empty()) throw std::invalid_argument("serving requires rank assets");
-    const auto addressable_pages = (static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1) / settings.page_size;
-    if (settings.max_total_tokens / settings.page_size >= addressable_pages)
-        throw std::invalid_argument("target KV indices exceed the native int32 range including reserved page zero");
+    RankStructure::check_target(assets.front(), settings, requests, true);
 
     for (const auto & asset : assets) {
         const auto & environment = asset.environment();
@@ -30,20 +27,6 @@ ServingStructure::ServingStructure(std::span<const TemplateAsset> assets, Servin
             if (environment.at(key) != assets.front().environment().at(key)) throw std::invalid_argument("rank sources have different implementation domains");
         }
         assets_[rank] = &asset;
-    }
-
-    // Follow TpModelWorker.get_worker_info and Scheduler.init_req_max_new_tokens; fixed outputs must not be clamped.
-    const auto context = assets.front().environment().at("implementation").at("model_config").at("context_len").get<std::int64_t>();
-    const auto capacity = settings.max_total_tokens / settings.page_size * settings.page_size;
-    const auto request_limit = std::min(context, capacity) - 1;
-    for (const auto & request : requests) {
-        if (request.prompt_tokens > 0 && request.output_tokens > 0) {
-            if (request.prompt_tokens >= request_limit - 5) throw std::invalid_argument("request exceeds the native input length limit: " + request.id);
-
-            const auto paged_input = ((request.prompt_tokens - 1) / settings.page_size + 1) * settings.page_size;
-            const auto output_limit = std::min(request_limit - request.prompt_tokens - 1, capacity - paged_input - settings.page_size - 1);
-            if (request.output_tokens > output_limit) throw std::invalid_argument("request output would be truncated by native serving: " + request.id);
-        }
     }
 
     for (std::size_t rank = 0; rank < assets_.size(); ++rank) {
@@ -254,13 +237,7 @@ nlohmann::json ServingStructure::summary() const {
          { "execution_dependencies", dependency_count_ } }           },
         {      "rank_sources",                nlohmann::json::array() }
     };
-    for (std::size_t rank = 0; rank < assets_.size(); ++rank)
-        result["rank_sources"].push_back({
-            {                                 "rank",                                                                                 rank },
-            {                    "physical_coverage",                                      assets_[rank]->physical_coverage().at("status") },
-            {                     "runtime_coverage",                                       assets_[rank]->runtime_coverage().at("status") },
-            { "workspace_capacity_lower_bound_bytes", assets_[rank]->environment().at("workspace_policy").at("capacity_lower_bound_bytes") }
-        });
+    for (const auto & rank : ranks_) result["rank_sources"].push_back(rank->source_summary());
 
     // shortcut: rejected-candidate retries and wire progress need their own native protocol evidence.
     result["qualification"] = {

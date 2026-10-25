@@ -16,7 +16,7 @@ class SGLangObservation:
     def __init__(self, description: dict[str, Any]) -> None:
         from torch.utils.weak import WeakIdKeyDictionary
 
-        from markov_collection.adapters.frameworks.sglang.primitives import TokenRelayPrototypes
+        from markov_collection.adapters.frameworks.sglang.primitives import IndexedWritePrototypes
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
         from markov_collection.adapters.runtimes.ascend.observation import AscendOperatorObservation
@@ -37,7 +37,7 @@ class SGLangObservation:
         )
         self.allocation: Any = None
         self.materializations: Any = None
-        self.token_relay = TokenRelayPrototypes(self.operators, selection["limits"]["B"])
+        self.indexed_writes = IndexedWritePrototypes(self.operators, selection["limits"]["B"])
 
         self.requests = set(description["source_requests"])
         self.baseline_requests = set(description["baseline_requests"])
@@ -56,13 +56,19 @@ class SGLangObservation:
 
             self.pipeline = PipelineObservation(self)
 
+        self.disaggregation = None
+        if "disaggregation_role" in description:
+            from markov_collection.adapters.frameworks.sglang.disaggregation import DisaggregationObservation
+
+            self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
+
     def load_model(self, original: Any, runner: Any) -> Any:
         result = original(runner)
         self.model = runner.model
         tp_size = self.shard.size if self.shard is not None else runner.tp_size
         tp_rank = self.shard.rank if self.shard is not None else runner.tp_rank
         self.parallel = {
-            "rank": runner.pp_rank * tp_size + tp_rank,
+            "rank": self.disaggregation.rank if self.disaggregation is not None else runner.pp_rank * tp_size + tp_rank,
             "tp_rank": tp_rank,
             "pp_rank": runner.pp_rank,
             "logical_tp": tp_size,
@@ -78,6 +84,7 @@ class SGLangObservation:
             "dtype": str(runner.model_config.dtype),
             "attention_backend": runner.server_args.attention_backend,
             "load_format": runner.server_args.load_format,
+            "disaggregation_mode": runner.server_args.disaggregation_mode,
         }
 
         return result
@@ -121,6 +128,23 @@ class SGLangObservation:
             self.batch_ids[batch] = identity
         return identity
 
+    def observation(self, requests: Any) -> str | None:
+        identities = {request.rid for request in requests}
+        if identities and identities <= self.requests:
+            return "source"
+        if identities and identities <= self.baseline_requests:
+            return "baseline"
+        return None
+
+    def begin_batch(self, scheduler: Any) -> None:
+        self.operators.begin_batch()
+        with self.operators.values.metadata():
+            mapping = scheduler.req_to_token_pool.req_to_token
+            shapes = self.operators.values.shapes
+
+            # Pool capacity belongs to every value version, before preparation first reads or writes it.
+            shapes.bind_shape(mapping, (shapes.symbol("R") + 1, mapping.shape[1]))
+
     def schedule(self, original: Any, scheduler: Any) -> Any:
         pending = list(scheduler.waiting_queue)
         for batch in (scheduler.running_batch, scheduler.last_batch):
@@ -128,23 +152,13 @@ class SGLangObservation:
                 pending.extend(batch.reqs)
 
         # Finished members still participate in the native filter before the scheduler becomes idle.
-        request_ids = {request.rid for request in pending}
-        if request_ids and request_ids <= self.requests:
-            observation = "source"
-        elif request_ids and request_ids <= self.baseline_requests:
-            observation = "baseline"
-        else:
+        observation = self.observation(pending)
+        if observation is None:
             return original(scheduler)
 
         identity = len(self.recording.batches)
         if observation == "source":
-            self.operators.begin_batch()
-            with self.operators.values.metadata():
-                mapping = scheduler.req_to_token_pool.req_to_token
-                shapes = self.operators.values.shapes
-
-                # Pool capacity belongs to every value version, before preparation first reads or writes it.
-                shapes.bind_shape(mapping, (shapes.symbol("R") + 1, mapping.shape[1]))
+            self.begin_batch(scheduler)
         context = (
             self.recording.scope("Schedule")
             if observation == "source"
@@ -318,6 +332,17 @@ class SGLangObservation:
     def publish(self, original: Any, sender: Any, output: Any, *args: Any, **kwargs: Any) -> Any:
         from sglang.srt.managers.io_struct import BatchTokenIDOutput
 
+        # A prefill server acknowledges ownership transfer; only decode publishes user tokens.
+        if (
+            self.disaggregation is not None
+            and self.disaggregation.role == "prefill"
+            and isinstance(output, BatchTokenIDOutput)
+            and set(output.rids) <= self.requests
+            and output.rids
+        ):
+            with self.recording.scope("KvAcknowledged", requests=list(output.rids)):
+                return original(sender, output, *args, **kwargs)
+
         if (
             self.recording.current_scope.get() is None
             or not isinstance(output, BatchTokenIDOutput)
@@ -364,6 +389,8 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.state import RequestCacheCall
 
         if self.recording.current_scope.get() is None:
+            if self.disaggregation is not None and request.rid in self.requests:
+                return self.disaggregation.release(original, cache, request, *args, **kwargs)
             return original(cache, request, *args, **kwargs)
 
         call = RequestCacheCall(
@@ -410,7 +437,8 @@ class SGLangObservation:
 
             if self.allocation is None:
                 pool = scheduler.token_to_kv_pool_allocator
-                self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device))
+                self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device), pool.need_sort)
+                self.indexed_writes.request_map(scheduler.req_to_token_pool.req_to_token)
                 self.materializations = AscendMaterializations(
                     self.operators,
                     pool.page_size,
@@ -423,7 +451,7 @@ class SGLangObservation:
             self.concatenation.warmup()
             self.allocation.warmup()
             self.materializations.warmup()
-            self.token_relay.warmup()
+            self.indexed_writes.warmup()
 
             boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
             self.workspace_states[boundary] = self.workspaces.snapshot()
@@ -433,7 +461,7 @@ class SGLangObservation:
                 self.allocation.capture()
                 self.matrices.capture()
                 self.materializations.capture()
-                self.token_relay.capture()
+                self.indexed_writes.capture()
         if result and any(batch["observation"] == "source" for batch in self.recording.batches):
             import torch
             import torch_npu
@@ -455,7 +483,9 @@ class SGLangObservation:
                     "matrix_selection": self.matrices.description,
                     "observer": __file__,
                     **self.parallel,
-                    "source_transport": "native_process_groups"
+                    "source_transport": "native_disaggregation"
+                    if self.disaggregation is not None
+                    else "native_process_groups"
                     if self.pipeline is not None
                     else "physical_group_of_one",
                     "implementation": self.implementation,
@@ -501,6 +531,10 @@ class SGLangObservation:
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_unfinished_req": self.request_cache,
             functions.target: functions.split_qkv,
         }
+        if self.disaggregation is not None:
+            targets.pop("sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run")
+            target = f"sglang.srt.managers.scheduler.Scheduler.get_next_disagg_{self.disaggregation.role}_batch_to_run"
+            targets[target] = self.schedule
         for target, observer in targets.items():
             HookRegistry.register(target, observer, HookType.AROUND)
 
@@ -508,6 +542,8 @@ class SGLangObservation:
             self.shard.install()
         if self.pipeline is not None:
             self.pipeline.install()
+        if self.disaggregation is not None:
+            self.disaggregation.install()
 
 
 def install() -> None:

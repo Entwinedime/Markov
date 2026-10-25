@@ -103,7 +103,8 @@ ExecutionPattern ExecutionPattern::read(const nlohmann::json & source) {
         const ExecutionPorts ports{ call.at("entry").get<std::size_t>(), call.at("return").get<std::size_t>() };
         const auto & entry = result.steps.at(ports.entry);
         const auto & returned = result.steps.at(ports.returned);
-        if (entry.kind != ExecutionKind::Host || returned.kind != ExecutionKind::Host || entry.resource != returned.resource
+        const bool opaque_service = ports.entry == ports.returned && entry.kind == ExecutionKind::Transfer;
+        if ((!opaque_service && (entry.kind != ExecutionKind::Host || returned.kind != ExecutionKind::Host)) || entry.resource != returned.resource
             || result.sequences[entry.resource].front() != ports.entry || result.sequences[entry.resource].back() != ports.returned)
             throw std::invalid_argument("host call ports do not delimit its caller service sequence");
         result.host_call = ports;
@@ -124,6 +125,34 @@ void ExecutionGraph::sequence(std::size_t node, std::size_t resource) {
     tails_.insert_or_assign(resource, node);
 }
 
+void ExecutionGraph::depend(std::size_t source, std::size_t target, std::string kind) { dependencies_.push_back({ source, target, std::move(kind) }); }
+
+std::vector<std::size_t> ExecutionGraph::initial_nodes(std::size_t begin) const {
+    std::set<std::size_t> dependent;
+    for (const auto & edge : dependencies_) {
+        if (edge.source >= begin && edge.target >= begin) dependent.insert(edge.target);
+    }
+
+    std::vector<std::size_t> result;
+    for (auto node = begin; node < first_node_ + nodes_.size(); ++node) {
+        if (!dependent.contains(node)) result.push_back(node);
+    }
+    return result;
+}
+
+std::vector<std::size_t> ExecutionGraph::terminal_nodes(std::size_t begin) const {
+    std::set<std::size_t> continued;
+    for (const auto & edge : dependencies_) {
+        if (edge.source >= begin && edge.target >= begin) continued.insert(edge.source);
+    }
+
+    std::vector<std::size_t> result;
+    for (auto node = begin; node < first_node_ + nodes_.size(); ++node) {
+        if (!continued.contains(node)) result.push_back(node);
+    }
+    return result;
+}
+
 void ExecutionGraph::append_host(std::size_t region, std::size_t resource) {
     const auto node = first_node_ + nodes_.size();
     const ExecutionOwner owner{ ExecutionOwner::Kind::Region, region };
@@ -134,6 +163,8 @@ void ExecutionGraph::append_host(std::size_t region, std::size_t resource) {
     sequence(node, resource);
     call(owner, { node, node });
 }
+
+void ExecutionGraph::initially_idle(std::size_t resource) { initially_idle_.insert(resource); }
 
 void ExecutionGraph::append(const ExecutionPattern & pattern, std::span<const std::size_t> resources, std::size_t operation, std::size_t region) {
     const auto offset = first_node_ + nodes_.size();
@@ -193,7 +224,8 @@ void ExecutionGraph::append(ExecutionGraph fragment, std::size_t operation_offse
         required.resource += resource_offset;
         if (const auto source = tails_.find(required.resource); source != tails_.end())
             dependencies_.push_back({ source->second, required.target, required.kind });
-        else incoming_.push_back(std::move(required));
+        else if (!initially_idle_.contains(required.resource) || (required.kind != "wait_completion" && required.kind != "queue_drain"))
+            incoming_.push_back(std::move(required));
     }
 
     // Fragments from one asset share logical execution resources, unlike their private tensor storage.

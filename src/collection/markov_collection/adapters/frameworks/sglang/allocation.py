@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 import sys
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -181,13 +182,14 @@ class AllocationLoop:
 
 
 class SGLangAllocation:
-    def __init__(self, operators: Any, page_size: int, device: str) -> None:
+    def __init__(self, operators: Any, page_size: int, device: str, need_sort: bool) -> None:
         from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 
         self.operators = operators
         self.recording = operators.recording
         self.page_size = page_size
         self.device = device
+        self.need_sort = need_sort
         self.pool_type = NPUPagedTokenToKVPoolAllocator
         self.original = inspect.unwrap(self.pool_type.alloc_extend)
         self.warmed = False
@@ -204,15 +206,15 @@ class SGLangAllocation:
         )
 
     def execute(self, lengths: tuple[int, ...], observed: bool | None) -> torch.Tensor:
-        from contextlib import nullcontext
-
         from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall
         from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
         values = self.operators.values
         with values.auxiliary():
             pages = sum((tokens - 1) // self.page_size + 1 for tokens in lengths)
-            pool = self.pool_type(pages * self.page_size, self.page_size, torch.bfloat16, self.device, None, False)
+            pool = self.pool_type(
+                pages * self.page_size, self.page_size, torch.bfloat16, self.device, None, self.need_sort
+            )
 
             # SGLang alloc_for_extend supplies int64 length vectors; no model or request state is recreated.
             prefix_cpu = torch.zeros(len(lengths), dtype=torch.int64)
@@ -251,6 +253,8 @@ class SGLangAllocation:
             return
         for point in self.points():
             self.execute(point, None)
+        if self.need_sort:
+            self.merge(None)
         if torch.device(self.device).type == "npu":
             torch.npu.synchronize()
         self.warmed = True
@@ -264,7 +268,52 @@ class SGLangAllocation:
             with self.operators.values.auxiliary():
                 if not torch.equal(baseline, observed):
                     raise RuntimeError("allocator observation changed native output")
+        if self.need_sort:
+            baseline = self.merge(False)
+            observed = self.merge(True)
+            with self.operators.values.auxiliary():
+                if not all(torch.equal(left, right) for left, right in zip(baseline, observed, strict=True)):
+                    raise RuntimeError("allocator merge observation changed native output")
         self.captured = True
+
+    def merge(self, observed: bool | None) -> tuple[torch.Tensor, torch.Tensor]:
+        from markov_collection.adapters.frameworks.sglang.state import PageMergeCall
+        from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
+
+        values = self.operators.values
+        with values.auxiliary():
+            pool = self.pool_type(4 * self.page_size, self.page_size, torch.bfloat16, self.device, None, True)
+            allocated = pool.alloc(2 * self.page_size)
+            pool.free(allocated)
+        original = inspect.unwrap(type(pool).merge_and_sort_free)
+        if observed is None:
+            original(pool)
+            return pool.free_pages, pool.release_pages
+
+        identity = len(self.recording.batches)
+        self.recording.batches.append(
+            {
+                "id": identity,
+                "kind": "primitive",
+                "phase": "control",
+                "members": [],
+                "parameters": {},
+                "observation": "source" if observed else "baseline",
+            }
+        )
+        if observed:
+            self.operators.begin_batch()
+        scope = (
+            self.recording.scope("AllocationPrototype", batch=identity)
+            if observed
+            else TorchMarkers.scope(f"markov.baseline/{identity}")
+        )
+        with scope, self.operators if observed else nullcontext():
+            if observed:
+                PageMergeCall(values, original, pool)(pool)
+            else:
+                original(pool)
+        return pool.free_pages, pool.release_pages
 
     @staticmethod
     def declare(regions: list[dict], operations: list[dict], values: list[dict]) -> None:

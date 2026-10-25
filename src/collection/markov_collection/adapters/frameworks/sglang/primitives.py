@@ -9,8 +9,10 @@ from markov_collection.adapters.runtimes.pytorch.kernels import KernelObservatio
 from markov_collection.instrumentation.calls import NativeCall
 
 
-class TokenRelayPrototypes:
+class IndexedWritePrototypes:
     def __init__(self, operators: Any, max_members: int) -> None:
+        import torch
+
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
 
         self.operators = operators
@@ -18,29 +20,35 @@ class TokenRelayPrototypes:
         self.warmed = False
         self.captured = False
 
-        # Serving supplies the ordinary variants; acquire only the additional native AI_CPU branches.
-        self.points = []
+        # Ordinary serving may never form B>1, so its write variants cannot depend on scheduler timing.
+        self.points = [((3,), members, torch.int64) for members in (1, 2)]
         if max_members > AscendIndexedWrites.index_limit:
-            self.points.append((AscendIndexedWrites.index_limit + 1, AscendIndexedWrites.index_limit + 1))
+            self.points.append(
+                ((AscendIndexedWrites.index_limit + 2,), AscendIndexedWrites.index_limit + 1, torch.int64)
+            )
         if max_members >= AscendIndexedWrites.storage_limit:
-            self.points.append((AscendIndexedWrites.storage_limit, 1))
+            self.points.append(((AscendIndexedWrites.storage_limit + 1,), 1, torch.int64))
 
-    def tensors(self, capacity: int, members: int) -> tuple[Any, Any, Any]:
+    def request_map(self, mapping: Any) -> None:
+        self.points.extend(((3, mapping.shape[1]), members, mapping.dtype) for members in (1, 2))
+
+    def tensors(self, shape: tuple[int, ...], members: int, dtype: Any) -> tuple[Any, Any, Any]:
         import torch
 
+        indices = tuple(torch.arange(members, dtype=torch.int64, device="npu") for _ in shape)
         return (
-            torch.zeros(capacity + 1, dtype=torch.int64, device="npu"),
-            torch.arange(members, dtype=torch.int64, device="npu"),
-            torch.ones(members, dtype=torch.int64, device="npu"),
+            torch.zeros(shape, dtype=dtype, device="npu"),
+            indices[0] if len(indices) == 1 else indices,
+            torch.ones(members, dtype=dtype, device="npu"),
         )
 
     def warmup(self) -> None:
         import torch
 
-        if self.warmed or not self.points:
+        if self.warmed:
             return
-        for capacity, members in self.points:
-            target, indices, payload = self.tensors(capacity, members)
+        for point in self.points:
+            target, indices, payload = self.tensors(*point)
             target[indices] = payload
         torch.npu.synchronize()
         self.warmed = True
@@ -52,12 +60,12 @@ class TokenRelayPrototypes:
 
         from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
-        if self.captured or not self.points:
+        if self.captured:
             return
-        for capacity, members in self.points:
+        for shape, members, dtype in self.points:
             for observed in (False, True):
                 with self.operators.values.auxiliary():
-                    target, indices, payload = self.tensors(capacity, members)
+                    target, indices, payload = self.tensors(shape, members, dtype)
                 identity = len(self.recording.batches)
                 self.recording.batches.append(
                     {
@@ -65,7 +73,7 @@ class TokenRelayPrototypes:
                         "kind": "primitive",
                         "phase": "primitive",
                         "members": [],
-                        "parameters": {"R": capacity, "B": members},
+                        "parameters": {"R": shape[0] - 1, "B": members},
                         "observation": "source" if observed else "baseline",
                     }
                 )
@@ -76,8 +84,9 @@ class TokenRelayPrototypes:
                             values = self.operators.values
                             capacity_axis = values.bounded_parameter("R", 1, sys.maxsize)
                             member_axis = values.bounded_parameter("B", 1, sys.maxsize)
-                            values.shapes.bind_contiguous(target, (capacity_axis + 1,))
-                            values.shapes.bind_contiguous(indices, (member_axis,))
+                            values.shapes.bind_contiguous(target, (capacity_axis + 1, *shape[1:]))
+                            for tensor in values.tensor_leaves(indices):
+                                values.shapes.bind_contiguous(tensor, (member_axis,))
                             values.shapes.bind_contiguous(payload, (member_axis,))
                         target[indices] = payload
                 else:

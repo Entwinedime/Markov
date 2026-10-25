@@ -100,6 +100,10 @@ public:
     void append(const ExecutionPattern & pattern, std::span<const std::size_t> resources, std::size_t operation, std::size_t region);
     void append(ExecutionGraph fragment, std::size_t operation_offset, std::size_t region_offset, std::size_t resource_offset = 0);
     void append_host(std::size_t region, std::size_t resource);
+    void initially_idle(std::size_t resource);
+    void depend(std::size_t source, std::size_t target, std::string kind);
+    std::vector<std::size_t> initial_nodes(std::size_t begin) const;
+    std::vector<std::size_t> terminal_nodes(std::size_t begin) const;
     void connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region, const std::string & kind);
     void connect_accesses(std::span<const ValueAccess> values, std::span<const nlohmann::json> types, std::span<const Operation> operations);
 
@@ -131,6 +135,7 @@ private:
 
     std::map<std::size_t, std::size_t> heads_;
     std::map<std::size_t, std::size_t> tails_;
+    std::set<std::size_t> initially_idle_;
     std::vector<ExecutionRequirement> incoming_;
     std::map<ExecutionOwner, ExecutionPorts> host_calls_;
     std::map<std::size_t, std::map<std::size_t, ExecutionPorts>> data_ports_;

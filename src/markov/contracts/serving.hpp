@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace markov {
@@ -18,6 +19,8 @@ struct Request {
     std::int64_t arrival_ns;
     std::int64_t prompt_tokens;
     std::int64_t output_tokens;
+
+    static std::vector<Request> ordered(std::vector<Request> requests);
 };
 
 struct ServingSettings {
@@ -28,6 +31,8 @@ struct ServingSettings {
     std::int64_t page_size;
     std::int64_t max_prefill_tokens;
 };
+
+enum class PageReuse { Immediate, DeferredSorted };
 
 // Framework facts constrain admission; the controller retains request and page ownership.
 struct AdmissionConstraints {
@@ -63,6 +68,7 @@ struct Batch {
     std::int64_t free_pages_before;
     std::int64_t allocated_pages;
     std::vector<BatchMember> members;
+    std::int64_t deferred_pages_before = 0;
 
     std::int64_t new_tokens() const;
 };
@@ -83,13 +89,19 @@ struct BatchEffects {
     std::vector<RequestCompletion> members;
 };
 
+struct KvPageCopy {
+    std::size_t source;
+    std::size_t destination;
+};
+
 // One immutable model iteration can be shared by its stage decisions and unfinished feedback.
 struct BatchWork {
     Batch batch;
     BatchEffects effects;
+    std::vector<KvPageCopy> transferred_pages{};
 };
 
-enum class ServingStep { Batch, Stage, Result };
+enum class ServingStep { Batch, Stage, Result, Reserve, Model, Transfer, Accept, Release };
 
 // Task identifies one decision; flow identifies the model iteration crossing its stages.
 struct ServingAction {
@@ -101,7 +113,8 @@ struct ServingAction {
     std::optional<std::size_t> stage;
     ServingStep step;
 
-    bool commits_requests() const { return step != ServingStep::Stage; }
+    bool commits_requests() const { return step == ServingStep::Batch || step == ServingStep::Result || step == ServingStep::Accept; }
+    std::string_view step_name() const;
 };
 
 // Intermediate work can complete without publishing a user-visible token.

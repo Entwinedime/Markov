@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <optional>
 #include <span>
 #include <string>
@@ -10,6 +9,7 @@
 
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/control.hpp"
+#include "markov/controller/kv_pool.hpp"
 
 namespace markov {
 
@@ -35,10 +35,7 @@ private:
         Request input;
         std::int64_t peak_pages;
 
-        std::optional<std::size_t> slot;
-        std::int64_t resident_tokens = 0;
         std::int64_t generated_tokens = 0;
-        std::vector<std::size_t> pages;
     };
 
     struct Flow {
@@ -54,19 +51,17 @@ private:
         std::optional<Flow> flow;
     };
 
-    std::int64_t pages_for(std::int64_t tokens) const;
     BatchEffects effects(const Batch & batch) const;
     std::shared_ptr<const BatchWork> plan_batch(std::size_t lane, std::int64_t now_ns, const AdmissionConstraints & admission) const;
 
     ServingSettings settings_;
     std::string group_;
     std::vector<RequestState> requests_;
+    KvPool kv_;
 
     std::size_t stages_;
     std::size_t batch_limit_;
     std::vector<Lane> lanes_;
-    std::deque<std::size_t> free_slots_;
-    std::deque<std::size_t> free_pages_;
 
     std::size_t waiting_ = 0;
     std::int64_t last_event_ns_ = 0;

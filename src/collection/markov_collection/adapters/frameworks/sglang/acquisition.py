@@ -38,13 +38,16 @@ class SGLangAcquisition:
 
     @staticmethod
     def domain(model: dict[str, Any], configuration: dict[str, Any]) -> dict[str, Any]:
-        return {
+        domain = {
             "dtype": model["dtype"],
             "tp": configuration["tp"],
             "pp": configuration.get("pp", 1),
             "attention_backend": configuration["attention_backend"],
             "page_size": configuration["page_size"],
         }
+        if "pd" in configuration:
+            domain["pd"] = True
+        return domain
 
     @staticmethod
     def configuration(page_size: int, pp: int = 1) -> dict[str, int]:
@@ -60,7 +63,9 @@ class SGLangAcquisition:
 
     @staticmethod
     def source_groups(domain: dict[str, Any]) -> Iterator[range]:
-        if domain["pp"] > 1:
+        if domain.get("pd"):
+            yield range(2)
+        elif domain["pp"] > 1:
             yield NativeServingSession.source_roles(domain["tp"], domain["pp"], 0)
         else:
             for rank in range(domain["tp"]):
@@ -68,30 +73,46 @@ class SGLangAcquisition:
 
     @staticmethod
     def required_devices(domain: dict[str, Any]) -> int:
-        return len(NativeServingSession.source_roles(domain["tp"], domain["pp"], 0))
+        return 2 if domain.get("pd") else len(NativeServingSession.source_roles(domain["tp"], domain["pp"], 0))
+
+    @staticmethod
+    def source_name(domain: dict[str, Any], rank: int) -> str:
+        prefix = ("prefill", "decode")[rank] + "/" if domain.get("pd") else ""
+        return prefix + f"rank-{rank}.json"
 
     @staticmethod
     def physical_name(domain: dict[str, Any], rank: int) -> str:
+        if domain.get("pd"):
+            return ("prefill", "decode")[rank] + "/physical.json"
         return f"physical-rank-{rank}.json" if domain["pp"] > 1 else "physical.json"
 
     @staticmethod
     def row_limits(configurations: list[dict[str, Any]], max_prompt_tokens: int) -> dict[str, int]:
-        members = max(configuration["max_running_requests"] for configuration in configurations)
-        rows = max(max_prompt_tokens, members)
+        members = 0
+        rows = max_prompt_tokens
         for configuration in configurations:
-            budget = configuration["max_prefill_tokens"]
+            prefill = configuration["pd"]["prefill"] if "pd" in configuration else configuration
+            members = max(members, prefill["max_running_requests"])
+            if "pd" in configuration:
+                members = max(members, configuration["pd"]["decode"]["max_running_requests"])
+                continue
+            budget = prefill["max_prefill_tokens"]
             page_size = configuration["page_size"]
 
             # A final whole request can start while the page-aligned prefix still has positive budget.
             prefix = (budget - 1) // page_size * page_size
             rows = max(rows, budget, prefix + max_prompt_tokens)
-        return {"M": rows, "B": members}
+        return {"M": max(rows, members), "B": members}
 
     @staticmethod
     def request(
         specification: dict[str, Any], domain: dict[str, Any], rank: int, output: str, selector: str
     ) -> dict[str, Any]:
         requests = NativeServingSession.warmup_requests(domain["page_size"])
+        if domain.get("pd"):
+            from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
+
+            requests = NativeDisaggregatedSession.structure_requests(domain["page_size"])
         model = specification["model"]
         configurations = [
             configuration
@@ -99,10 +120,21 @@ class SGLangAcquisition:
             if SGLangAcquisition.domain(model, configuration) == domain
         ]
         representative = SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
-        configurations.append(representative)
+        configurations.append(
+            {"page_size": domain["page_size"], "pd": {"prefill": representative, "decode": representative}}
+            if domain.get("pd")
+            else representative
+        )
         maximum_prompt = max(
             request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
         )
+        limits = SGLangAcquisition.row_limits(configurations, maximum_prompt)
+        if domain.get("pd"):
+
+            # Target P runs one prompt; native representative acquisition can still batch its own requests.
+            limits["M"] = max(
+                limits["M"], representative["max_running_requests"] * max(prompt for prompt, _ in requests)
+            )
         return {
             "model": model["path"],
             **domain,
@@ -112,7 +144,7 @@ class SGLangAcquisition:
             "configuration": representative,
             "matrix_selection": {
                 "binary": selector,
-                "limits": SGLangAcquisition.row_limits(configurations, maximum_prompt),
+                "limits": limits,
             },
         }
 
@@ -129,6 +161,15 @@ class SGLangAcquisition:
 
     @staticmethod
     def capture(request: dict[str, Any]) -> None:
+        if request.get("pd"):
+            from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
+
+            request["native_library"] = str(
+                Path(request["matrix_selection"]["binary"]).resolve().with_name(SGLangAcquisition.observer_library)
+            )
+            NativeDisaggregatedSession(request).run()
+            return
+
         NativeServingSession(
             request["model"],
             tuple(tuple(pair) for pair in request["requests"]),
@@ -151,39 +192,52 @@ class SGLangAcquisition:
 
     @staticmethod
     def interpret(request: dict[str, Any]) -> None:
-        from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
-        from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
-        from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
-        from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
+        if request.get("pd"):
+            from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
+
+            NativeDisaggregatedSession.interpret(request)
+            return
 
         directory = Path(request["output"])
         summary = json.loads((directory / "session-summary.json").read_text())
-        parallel = summary["logical_pp"] > 1
         ranks = NativeServingSession.source_roles(summary["logical_tp"], summary["logical_pp"], request["rank"])
         for rank in ranks:
-            path = directory / f"rank-{rank}.json"
-            source = json.loads(path.read_text())
+            SGLangAcquisition.interpret_role(directory, rank, summary["logical_pp"], summary["profile"])
 
-            # Interpretation can be repeated from the captured facts without another native session.
-            SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
-            geometries = TensorAssignmentCall.input_geometries(source["regions"])
-            TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
-            AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
-            AscendLayouts.declare(source["regions"], source["operations"], source["values"])
-            if parallel:
-                from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
+    @staticmethod
+    def interpret_role(directory: Path, rank: int, pp: int, profile: bool) -> None:
+        from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
+        from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
+        from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
+        from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
+        from markov_collection.adapters.runtimes.pytorch.collectives import AllReduceGeometry
+        from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
 
-                PipelineObservation.declare_waits(source["regions"])
-            write_json(path, source)
-            if not summary["profile"]:
-                continue
+        path = directory / f"rank-{rank}.json"
+        source = json.loads(path.read_text())
 
-            traces = directory / "native" / f"rank-{rank}" if parallel else directory / "native"
-            (trace,) = traces.rglob("trace_view.json")
-            observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
-            physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
-            name = SGLangAcquisition.physical_name(request, rank)
-            write_json(directory / name, physical)
+        # Interpretation can be repeated from the captured facts without another native session.
+        SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
+        geometries = TensorAssignmentCall.input_geometries(source["regions"])
+        TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
+        AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
+        AscendLayouts.declare(source["regions"], source["operations"], source["values"])
+        AllReduceGeometry.declare(source["operations"], source["values"])
+        DisaggregatedTemplates.declare(source)
+        if pp > 1:
+            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
+
+            PipelineObservation.declare_waits(source["regions"])
+        write_json(path, source)
+        if not profile:
+            return
+
+        traces = directory / "native" / f"rank-{rank}" if pp > 1 else directory / "native"
+        (trace,) = traces.rglob("trace_view.json")
+        observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
+        physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
+        name = SGLangAcquisition.physical_name({"pp": pp}, rank)
+        write_json(directory / name, physical)
 
 
 if __name__ == "__main__":

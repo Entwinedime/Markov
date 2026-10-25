@@ -463,7 +463,38 @@ void SourceTemplates::compile(std::size_t identity) {
 
     std::vector<Item> items;
     for (const auto child : region.children) items.push_back({ source_.at("regions")[child].at("operation_begin").get<std::size_t>(), false, child });
-    for (const auto operation : region.operations) items.push_back({ source_.at("operations")[operation].at("position").get<std::size_t>(), true, operation });
+
+    const bool dynamic_calls = metadata.value("dynamic_calls", false);
+    std::set<std::size_t> exposed;
+    if (dynamic_calls && !region.operations.empty()) {
+        exposed.insert(region.outputs.begin(), region.outputs.end());
+        for (const auto child : region.children) {
+            exposed.insert(regions_[child].inputs.begin(), regions_[child].inputs.end());
+            for (const auto & [_, values] : regions_[child].input_groups) exposed.insert(values.begin(), values.end());
+        }
+    }
+
+    for (const auto operation_id : region.operations) {
+        const auto & operation = source_.at("operations")[operation_id];
+        if (!dynamic_calls) {
+            items.push_back({ operation.at("position").get<std::size_t>(), true, operation_id });
+            continue;
+        }
+
+        // Private control calculations belong to caller CPU service; crossing data and device work stay explicit.
+        const auto & observation = operation.at("execution_observation");
+        const auto cpu_values = [this](const nlohmann::json & values) {
+            return std::ranges::all_of(values, [this](const auto & value) { return values_.at(value.template get<std::size_t>())->at("device") == "cpu"; });
+        };
+        const auto escapes =
+            std::ranges::any_of(operation.at("outputs"), [&](const auto & value) { return exposed.contains(value.template get<std::size_t>()); });
+        const auto writes_state =
+            std::ranges::any_of(operation.at("writes"), [&](const auto & value) { return external_resources_.contains(value.template get<std::size_t>()); });
+        if (!cpu_values(operation.at("inputs")) || !cpu_values(operation.at("outputs")) || escapes || writes_state || !observation.at("device_work").empty()
+            || !observation.at("runtime_actions").empty() || !observation.at("communication").is_null())
+            throw std::invalid_argument("dynamic caller exposes operation data or execution effects: " + record.at("role").get<std::string>());
+    }
+
     std::ranges::sort(items, [](const auto & left, const auto & right) {
         return std::tie(left.position, left.operation, left.identity) < std::tie(right.position, right.operation, right.identity);
     });
@@ -874,7 +905,7 @@ nlohmann::json SourceTemplates::document() {
         std::string role;
         if (metadata.contains("entrypoint")) role = metadata.at("entrypoint").get<std::string>();
         else if (record.at("role") == "module" && metadata.at("path") == "") role = "model";
-        else if (record.at("parent").is_null() && metadata.contains("batch")) role = record.at("role").get<std::string>();
+        else if (record.at("parent").is_null()) role = record.at("role").get<std::string>();
         else continue;
 
         std::vector<std::size_t> path;
@@ -887,9 +918,12 @@ nlohmann::json SourceTemplates::document() {
 
         std::ranges::reverse(path);
         const auto entry = static_cast<std::size_t>(std::distance(roots_.begin(), std::ranges::find(roots_, root)));
-        const auto phase = metadata.contains("entrypoint_phase")
-                               ? metadata.at("entrypoint_phase")
-                               : source_.at("batches").at(source_.at("regions")[root].at("metadata").at("batch").get<std::size_t>()).at("phase");
+        nlohmann::json phase;
+        const auto & caller = source_.at("regions")[root].at("metadata");
+
+        // Reservation and transfer are independent work, so their roots need no model batch or phase.
+        if (metadata.contains("entrypoint_phase")) phase = metadata.at("entrypoint_phase");
+        else if (caller.contains("batch")) phase = source_.at("batches").at(caller.at("batch").get<std::size_t>()).at("phase");
         result["entrypoints"].push_back({
             {  "role",  role },
             { "entry", entry },
