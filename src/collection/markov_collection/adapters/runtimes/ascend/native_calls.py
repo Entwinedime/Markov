@@ -46,6 +46,7 @@ class NativeRuntimeCalls:
                     "device": "wait_device",
                     "record_event": "record_event",
                     "wait_event": "wait_event",
+                    "synchronize_event": "wait_event_complete",
                 }[call["kind"]]
                 self.callbacks[f"markov.runtime/{process}/{identity}"] = call
 

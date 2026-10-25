@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -198,7 +199,10 @@ void SourceProjection::bind() {
             const auto producer = values_.at(input).producer;
             if (!producer || *producer == consumer || operations_[*producer].source) continue;
             const auto & outputs = operations_[*producer].access.outputs;
-            if (std::ranges::find(outputs, input) == outputs.end()) throw std::invalid_argument("private value escapes its native interface");
+            if (std::ranges::find(outputs, input) == outputs.end())
+                throw std::invalid_argument("private value " + std::to_string(input) + " escapes interface region "
+                                            + std::to_string(operations_[*producer].access.region) + " into " + operations_[consumer].access.name
+                                            + " in region " + std::to_string(operations_[consumer].access.region));
         }
     }
 }

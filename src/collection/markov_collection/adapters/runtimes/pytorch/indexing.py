@@ -34,7 +34,17 @@ class ScalarReductionObservation(TorchFunctionMode):
 
 class TensorAssignmentCall(NativeCall):
     @staticmethod
-    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]]) -> None:
+    def input_geometries(regions: list[dict[str, Any]]) -> list[dict[int, Any]]:
+        geometries: list[dict[int, Any]] = []
+        for region in regions:
+            parent = region["parent"]
+            geometry = dict(geometries[parent]) if parent is not None else {}
+            geometry.update((item["value"], item["shape"]) for item in region["metadata"].get("shape_contracts", []))
+            geometries.append(geometry)
+        return geometries
+
+    @staticmethod
+    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: list[dict[int, Any]]) -> None:
         for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "tensor_assignment":
@@ -43,12 +53,13 @@ class TensorAssignmentCall(NativeCall):
             if not isinstance(payload, dict) or "value" not in payload:
                 continue
             tensor = values[payload["value"]]
-            if tensor["shape_relation"] is None:
+            shape = geometries[region["id"]].get(payload["value"], tensor["shape_relation"])
+            if shape is None:
                 continue
 
             # The native indexing binding removes leading unit axes before dispatching the assignment.
             guards = []
-            for size, expression in zip(tensor["shape"], tensor["shape_relation"], strict=True):
+            for size, expression in zip(tensor["shape"], shape, strict=True):
                 if not isinstance(expression, int):
                     guards.append(
                         {"condition": ["eq", expression, 1], "expected": size == 1, "basis": "assignment_value_rank"}

@@ -36,7 +36,7 @@ class PhysicalComparison:
             region = record["parent"]
 
     @staticmethod
-    def event_protocol(actions: list[dict[str, Any]]) -> list[tuple[str, int, int]] | None:
+    def event_protocol(actions: list[dict[str, Any]]) -> list[tuple[str, int, int | None]] | None:
         events: dict[int, int] = {}
         streams: dict[int, int] = {}
         result = []
@@ -50,13 +50,14 @@ class PhysicalComparison:
         )
         for action in ordered:
             call = action["native_call"]
-            if call is None or "event" not in call or call["stream_status"] != 0:
+            host_wait = action["kind"] == "wait_event_complete"
+            if call is None or "event" not in call or (not host_wait and call["stream_status"] != 0):
                 return None
             result.append(
                 (
                     action["kind"],
                     events.setdefault(call["event"], len(events)),
-                    streams.setdefault(call["stream"], len(streams)),
+                    None if host_wait else streams.setdefault(call["stream"], len(streams)),
                 )
             )
         return result
@@ -100,7 +101,7 @@ class PhysicalComparison:
             else:
                 continue
             runtime[batch][action["native_api"]] += 1
-            if action["kind"] in ("record_event", "wait_event"):
+            if action["kind"] in ("record_event", "wait_event", "wait_event_complete"):
                 event_actions[batch].append(action)
 
         groups: dict[tuple[Any, ...], dict[str, list[int]]] = {}
@@ -198,7 +199,7 @@ class PhysicalComparison:
         return report
 
     def write(self, output: Path) -> dict[str, Any]:
-        physical = self.trace.physical_work()
+        physical = self.trace.physical_work(len(self.source["regions"]), len(self.source["operations"]))
         report = self.compare(physical)
         write_json(output / "physical.json", physical)
         write_json(output / "physical-summary.json", report, indent=2)

@@ -8,12 +8,6 @@
 namespace markov {
 namespace {
 
-void bind_resource(std::vector<std::optional<std::size_t>> & bindings, std::size_t local, std::size_t target) {
-    auto & bound = bindings.at(local);
-    if (bound && *bound != target) throw std::invalid_argument("input ports bind one alias to different target resources");
-    bound = target;
-}
-
 void remap_arguments(nlohmann::json & arguments, const std::vector<std::size_t> & values) {
     if (arguments.is_object() && arguments.size() == 1 && arguments.contains("value")) {
         arguments["value"] = values.at(arguments.at("value").get<std::size_t>());
@@ -43,40 +37,12 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
                                  const std::map<std::string, std::size_t> & inputs, const GroupValues & groups) {
 
     // Candidate selection and port validation finish before the shared graph changes.
-    auto instance = TemplateInstance::select(asset_, role, phase, invocation);
+    const TargetInputs bindings{ graph_, inputs, groups };
+    auto instance = TemplateInstance::select(asset_, role, phase, invocation, &bindings);
     auto & fragment = instance.graph_;
-    std::vector<std::optional<std::size_t>> resource_bindings(fragment.resource_count);
-    std::map<std::size_t, std::size_t> value_bindings;
-    std::map<std::size_t, nlohmann::json> bound_types;
-
-    std::vector<std::pair<std::size_t, std::size_t>> port_bindings;
-    for (const auto & [name, target] : inputs) port_bindings.emplace_back(instance.ports_.inputs.at(name), target);
-    for (const auto & [name, members] : groups) {
-        const auto & local = instance.group_inputs_.at(name);
-        if (members.size() != local.size()) throw std::invalid_argument("input group size differs from its target declaration: " + name);
-        for (std::size_t index = 0; index < members.size(); ++index) port_bindings.emplace_back(local[index], members[index]);
-    }
-
-    // Individual and collection ports use the same alias, type and producer checks.
-    for (const auto & [local, target] : port_bindings) {
-        const auto & value = fragment.values.at(local);
-        if (value.producer) throw std::invalid_argument("bound input port is produced inside its region");
-        const auto [position, added] = value_bindings.emplace(local, target);
-        if (!added && position->second != target) throw std::invalid_argument("one input port has conflicting target values");
-        bind_resource(resource_bindings, value.storage, graph_.values.at(target).storage);
-
-        auto & type = bound_types.try_emplace(target, graph_.types.at(target)).first->second;
-        const auto & required = fragment.types.at(local);
-        for (const auto & key : { "dtype", "device", "shape" }) {
-            if (type.contains(key) && required.contains(key) && type.at(key) != required.at(key))
-                throw LayoutMismatch(role + " input port " + std::to_string(local) + " has conflicting " + key + ": " + type.at(key).dump() + " versus "
-                                     + required.at(key).dump());
-        }
-
-        const auto kind = type.at("kind");
-        type.update(required);
-        if (kind == "tensor") type["kind"] = kind;
-    }
+    auto & resource_bindings = instance.bound_inputs_.resources;
+    const auto & value_bindings = instance.bound_inputs_.values;
+    const auto & bound_types = instance.bound_inputs_.types;
 
     // External state is shared by source identity; all remaining resources belong to this invocation.
     auto resource_count = graph_.resource_count;
@@ -116,6 +82,11 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
         operation.writes = remap(operation.writes, resources);
     }
 
+    for (auto & edge : fragment.dependencies) {
+        edge.source += operation_offset;
+        edge.target += operation_offset;
+    }
+
     for (auto & work : fragment.work) {
         remap_arguments(work["arguments"], values);
         remap_arguments(work["keywords"], values);
@@ -153,6 +124,9 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
     }
 
     graph_.operations.insert(graph_.operations.end(), std::make_move_iterator(fragment.operations.begin()), std::make_move_iterator(fragment.operations.end()));
+    graph_.dependencies.insert(graph_.dependencies.end(),
+                               std::make_move_iterator(fragment.dependencies.begin()),
+                               std::make_move_iterator(fragment.dependencies.end()));
     graph_.work.insert(graph_.work.end(), std::make_move_iterator(fragment.work.begin()), std::make_move_iterator(fragment.work.end()));
     graph_.regions.insert(graph_.regions.end(), std::make_move_iterator(fragment.regions.begin()), std::make_move_iterator(fragment.regions.end()));
     graph_.state_changes.insert(graph_.state_changes.end(),

@@ -49,7 +49,13 @@ nlohmann::json ServingWorkflow::run(bool details) {
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
             nlohmann::json decision;
             if (details) {
-                decision = describe_batch(action->batch);
+                decision = describe_batch(action->work->batch);
+                decision["scheduled_ns"] = action->scheduled_ns;
+                decision["flow"] = action->flow;
+                decision["lane"] = action->lane;
+                decision["stage"] = action->stage ? nlohmann::json(*action->stage) : nlohmann::json(nullptr);
+                decision["step"] = action->step == ServingStep::Batch ? "batch" : action->step == ServingStep::Stage ? "stage" : "result";
+                decision["commits_requests"] = action->commits_requests();
                 decision["task"] = {
                     {    "group",    action->task.group },
                     { "sequence", action->task.sequence }
@@ -58,8 +64,8 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
             // Construction and duration resolution succeed before request/page ownership changes.
             auto program = expansion_.expand(*action);
-            if (!program.publication && std::ranges::any_of(action->effects.members, &RequestCompletion::emits_output))
-                throw std::invalid_argument("declared request output has no publication port");
+            const bool publishes = action->commits_requests() && std::ranges::any_of(action->work->effects.members, &RequestCompletion::emits_output);
+            if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");
             executor_.submit(expansion_.graph(), action->task, program);
             controller_.start(*action);
 
@@ -95,14 +101,14 @@ nlohmann::json ServingWorkflow::run(bool details) {
         const auto & event = *next;
         auto & work = pending.at(event.task);
         if (event.kind == ExecutionEvent::Kind::Published) {
-            record_publication(result, work.action.effects, event.time_ns, details);
+            record_publication(result, work.action.work->effects, event.time_ns, details);
             if (details) work.decision["published_ns"] = event.time_ns;
             continue;
         }
 
         // Publication does not release pages; result-processing completion commits those effects.
         controller_.finish(work.action, work.returned_pages, event.time_ns);
-        record_completion(result, work.decision, work.action.effects, event.time_ns, details);
+        if (work.action.commits_requests()) record_completion(result, work.decision, work.action.work->effects, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));
         pending.erase(event.task);
 
@@ -120,7 +126,6 @@ nlohmann::json ServingWorkflow::run(bool details) {
 nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
     nlohmann::json decision{
         {             "phase", batch.phase == Phase::Prefill ? "prefill" : "decode" },
-        {      "scheduled_ns",                                   batch.scheduled_ns },
         {                 "M",                                   batch.new_tokens() },
         {                 "B",                                 batch.members.size() },
         {                 "R",                               batch.request_capacity },

@@ -79,6 +79,12 @@ class ShapeArguments:
                 self.bindings[frame.f_code, id(frame), name] = value
 
     def binding(self, name: str, frame: Any) -> Any:
+        origin = self.values.tensor_geometry
+        if origin is not None:
+            declared = origin.local_geometry(frame.f_code, name)
+            if declared is not None:
+                return declared
+
         _, _, assignments, writes = self.source(frame)
         key = (frame.f_code, id(frame), name)
         if name in assignments and key in self.bindings:

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -15,9 +16,9 @@ namespace markov::sglang {
 // Views own graph references and supplied row selections, never request or KV state.
 class BatchViews {
 public:
-    explicit BatchViews(TargetGraph & graph);
+    BatchViews(TargetGraph & graph, const TemplateAsset & asset);
 
-    static std::map<std::string, std::size_t> columns(const std::map<std::string, std::size_t> & ports);
+    std::map<std::string, std::size_t> columns(const std::map<std::string, std::size_t> & ports) const;
     std::size_t admission_members() const;
     void advance(Phase phase);
     std::optional<std::size_t> idle();
@@ -36,6 +37,7 @@ private:
     void merge(View & left, const View & right, const std::string & phase);
 
     TargetGraph & graph_;
+    std::set<std::string> fields_;
     std::optional<View> running_;
     std::optional<View> prefill_;
 };

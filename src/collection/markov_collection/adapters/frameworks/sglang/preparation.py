@@ -59,16 +59,19 @@ class ForwardBatchCall(NativeCall):
 
 
 class BatchPreparationCall(TensorGeometryCall):
-    def __init__(self, values: Any, original: Any, batch: Any, decode: bool) -> None:
-        inputs = {f"self.{path}": {0: "B"} for path in BatchTensors.fields.values()} if decode else {}
+    def __init__(
+        self, values: Any, original: Any, batch: Any, decode: bool, fields: dict[str, str] = BatchTensors.fields
+    ) -> None:
+        self.fields = fields if decode else BatchTensors.fields
+        inputs = {f"self.{path}": {0: "B"} for path in self.fields.values()} if decode else {}
         super().__init__(values.recording, values, original.__qualname__, original, inputs, data_shape=("B",))
         self.batch = batch
         self.decode = decode
 
     @staticmethod
-    def model_inputs(batch: Any) -> dict[str, Any]:
+    def model_inputs(batch: Any, fields: dict[str, str] = BatchTensors.fields) -> dict[str, Any]:
         inputs = {
-            **BatchTensors.read(batch),
+            **BatchTensors.read(batch, fields),
             "kv_locations": batch.out_cache_loc,
         }
         if batch.forward_mode.is_extend():
@@ -84,7 +87,7 @@ class BatchPreparationCall(TensorGeometryCall):
         }
         prefixes = []
         if self.decode:
-            inputs.update(BatchTensors.read(batch))
+            inputs.update(BatchTensors.read(batch, self.fields))
             inputs["prefix_lengths"] = inputs.pop("sequence_lengths")
             inputs["prefix_lengths_cpu"] = inputs.pop("sequence_lengths_cpu")
         else:
@@ -105,7 +108,7 @@ class BatchPreparationCall(TensorGeometryCall):
     ) -> str | None:
         batch = self.batch
         self.output_ports = {
-            **self.model_inputs(batch),
+            **self.model_inputs(batch, self.fields),
             "request_map": batch.req_to_token_pool.req_to_token,
             "free_pages": batch.token_to_kv_pool_allocator.free_pages,
         }
@@ -137,8 +140,9 @@ class InputStagingCall(NativeCall):
 
 
 class SGLangPreparation:
-    def __init__(self, values: Any) -> None:
+    def __init__(self, values: Any, fields: dict[str, str] = BatchTensors.fields) -> None:
         self.values = values
+        self.fields = fields
 
     def grouped_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return ExtendAllocationCall(
@@ -184,19 +188,19 @@ class SGLangPreparation:
         return PrefixMatchCall(self.values.recording, self.values, original.__qualname__, original, {})(*args, **kwargs)
 
     def prepare_decode(self, original: Any, batch: Any) -> Any:
-        return BatchPreparationCall(self.values, original, batch, decode=True)(batch)
+        return BatchPreparationCall(self.values, original, batch, decode=True, fields=self.fields)(batch)
 
     def filter_batch(self, original: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         if self.values.recording.current_scope.get() is None or not batch.reqs:
             return original(batch, *args, **kwargs)
 
-        return BatchTransitionCall(self.values, original, batch)(batch, *args, **kwargs)
+        return BatchTransitionCall(self.values, original, batch, fields=self.fields)(batch, *args, **kwargs)
 
     def merge_batch(self, original: Any, batch: Any, other: Any) -> Any:
         if self.values.recording.current_scope.get() is None:
             return original(batch, other)
 
-        return BatchTransitionCall(self.values, original, batch, other)(batch, other)
+        return BatchTransitionCall(self.values, original, batch, other, fields=self.fields)(batch, other)
 
     def allocate_extend(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
         return PageAllocationCall(self.values, original, pool, decode=False)(pool, *args, **kwargs)

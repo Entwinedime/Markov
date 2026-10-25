@@ -32,6 +32,7 @@ struct RegionGraph {
     std::vector<nlohmann::json> types;
 
     std::vector<Operation> operations;
+    std::vector<Dependency> dependencies;
     std::vector<nlohmann::json> work;
     std::vector<nlohmann::json> regions;
     std::vector<StateChange> state_changes;

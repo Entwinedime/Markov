@@ -50,10 +50,28 @@ class SGLangObservation:
 
         self.model: Any = None
         self.batch_ids: Any = WeakIdKeyDictionary()
+        self.pipeline = None
+        if description["pp_size"] > 1:
+            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
+
+            self.pipeline = PipelineObservation(self)
 
     def load_model(self, original: Any, runner: Any) -> Any:
         result = original(runner)
         self.model = runner.model
+        tp_size = self.shard.size if self.shard is not None else runner.tp_size
+        tp_rank = self.shard.rank if self.shard is not None else runner.tp_rank
+        self.parallel = {
+            "rank": runner.pp_rank * tp_size + tp_rank,
+            "tp_rank": tp_rank,
+            "pp_rank": runner.pp_rank,
+            "logical_tp": tp_size,
+            "logical_pp": runner.pp_size,
+            "layer_range": [
+                getattr(self.model, "start_layer", 0),
+                getattr(self.model, "end_layer", runner.model_config.num_hidden_layers),
+            ],
+        }
         self.implementation = {
             "model_path": runner.server_args.model_path,
             "model_config": runner.model_config.hf_config.to_dict(),
@@ -86,7 +104,7 @@ class SGLangObservation:
             {
                 "id": identity,
                 "phase": phase,
-                "rank": scheduler.ps.tp_rank,
+                "rank": self.parallel["rank"],
                 "members": members,
                 "parameters": {
                     "M": sum(item["new_tokens"] for item in members),
@@ -177,7 +195,10 @@ class SGLangObservation:
         phase = self.recording.batches[identity]["phase"]
         if self.recording.batches[identity]["observation"] == "baseline":
             with self.recording.markers.scope(f"markov.baseline/{identity}"):
-                return original(scheduler, batch, *args, **kwargs)
+                result = original(scheduler, batch, *args, **kwargs)
+            if self.pipeline is not None:
+                self.pipeline.remember(identity, result)
+            return result
 
         # Decode gathers relayed tokens before the model wrapper binds its inputs.
         with self.recording.scope(phase.capitalize(), batch=identity) as scope, self.operators:
@@ -191,10 +212,11 @@ class SGLangObservation:
                     scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("R") + 1,)
                 )
 
+            fields = self.pipeline.fields if self.pipeline is not None and phase == "decode" else BatchTensors.fields
             scope.metadata["ports"] = {
                 "inputs": self.operators.values.port_values(
                     {
-                        **BatchPreparationCall.model_inputs(batch),
+                        **BatchPreparationCall.model_inputs(batch, fields),
                         "token_relay": scheduler.future_map.output_tokens_buf,
                     }
                 ),
@@ -202,8 +224,18 @@ class SGLangObservation:
             }
 
             # Bind actual model inputs after native staging, through SGLang's common model interface.
+
             # Decode contributes one token per member, so its token axis is B by definition.
             token_axis = "B" if phase == "decode" else "M"
+            proxy = args[0] if args else kwargs.get("pp_proxy_tensors")
+            if proxy is not None:
+                payload = self.pipeline.payload(proxy.tensors)
+                with self.operators.values.metadata():
+                    for tensor in payload.values():
+                        self.operators.values.bind(tensor, {0: token_axis})
+                    scope.metadata["ports"]["inputs"].update(
+                        self.operators.values.port_values({f"proxy.{name}": tensor for name, tensor in payload.items()})
+                    )
             inputs = {
                 "input_ids": {0: token_axis},
                 "positions": {0: token_axis},
@@ -220,10 +252,24 @@ class SGLangObservation:
             scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
                 {
                     **BatchTensors.read(batch),
-                    "sampled_tokens": result.next_token_ids,
                     "token_relay": scheduler.future_map.output_tokens_buf,
                 }
             )
+            if result.next_token_ids is not None:
+                scope.metadata["ports"]["outputs"].update(
+                    self.operators.values.port_values({"sampled_tokens": result.next_token_ids})
+                )
+            if self.pipeline is not None:
+                self.pipeline.remember(identity, result)
+                if result.pp_hidden_states_proxy_tensors is not None:
+                    scope.metadata["ports"]["outputs"].update(
+                        self.operators.values.port_values(
+                            {
+                                f"proxy.{name}": tensor
+                                for name, tensor in result.pp_hidden_states_proxy_tensors.tensors.items()
+                            }
+                        )
+                    )
             return result
 
     def forward(self, original: Any, *args: Any, **kwargs: Any) -> Any:
@@ -251,6 +297,9 @@ class SGLangObservation:
                 ),
                 "outputs": {},
             }
+            scope.metadata["shape_contracts"] = [
+                {"value": scope.metadata["ports"]["inputs"]["sampled_tokens"], "shape": ["B"]}
+            ]
 
             returned = original(scheduler, batch, result)
             scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
@@ -385,20 +434,19 @@ class SGLangObservation:
                 self.matrices.capture()
                 self.materializations.capture()
                 self.token_relay.capture()
-        if result and self.recording.batches:
+        if result and any(batch["observation"] == "source" for batch in self.recording.batches):
             import torch
             import torch_npu
 
             self.result_interfaces(self.recording.regions)
             self.concatenation.declare()
             self.matrices.declare()
-            if self.shard is not None:
-                from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
+            from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
 
-                CollectiveCall.bind_transports(self.recording.regions, self.recording.operations, self.recording.values)
+            CollectiveCall.bind_transports(self.recording.regions, self.recording.operations, self.recording.values)
 
             self.recording.write(
-                self.directory / f"rank-{scheduler.ps.tp_rank}.json",
+                self.directory / f"rank-{self.parallel['rank']}.json",
                 {
                     "framework": "sglang",
                     "torch": torch.__version__,
@@ -406,9 +454,10 @@ class SGLangObservation:
                     "cann": self.concatenation.version,
                     "matrix_selection": self.matrices.description,
                     "observer": __file__,
-                    "rank": scheduler.ps.tp_rank,
-                    "logical_tp": self.shard.size if self.shard is not None else 1,
-                    "source_transport": "physical_group_of_one",
+                    **self.parallel,
+                    "source_transport": "native_process_groups"
+                    if self.pipeline is not None
+                    else "physical_group_of_one",
                     "implementation": self.implementation,
                     "device": torch.npu.get_device_name(),
                     "device_index": torch.npu.current_device(),
@@ -423,13 +472,19 @@ class SGLangObservation:
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
         from markov_collection.adapters.frameworks.sglang.preparation import SGLangPreparation
         from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
         from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
 
         functions = AscendFunctionObservation(self.operators.values)
         SGLangPrimitives(self.operators.values).install()
-        SGLangPreparation(self.operators.values).install()
+        fields = BatchTensors.fields
+        if self.pipeline is not None:
+
+            # PP keeps returned tokens in the batch until its next model invocation.
+            fields = self.pipeline.fields
+        SGLangPreparation(self.operators.values, fields).install()
 
         # Framework-specific hook paths stay at this installation boundary.
         targets = {
@@ -451,6 +506,8 @@ class SGLangObservation:
 
         if self.shard is not None:
             self.shard.install()
+        if self.pipeline is not None:
+            self.pipeline.install()
 
 
 def install() -> None:

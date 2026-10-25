@@ -23,6 +23,7 @@
     "queue_return": 0,
     "record_event": 1,
     "wait_event": 1,
+    "wait_event_complete": 0,
     "barrier": 0,
     "communication": 100
   }

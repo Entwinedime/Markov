@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,7 +31,7 @@ struct ServingSettings {
 
 // Framework facts constrain admission; the controller retains request and page ownership.
 struct AdmissionConstraints {
-    std::size_t occupied_members;
+    std::vector<std::size_t> occupied_members;
     std::int64_t prefill_token_granularity;
 };
 
@@ -58,7 +59,6 @@ struct BatchMember {
 // A batch is a decision snapshot; committing it remains the controller's responsibility.
 struct Batch {
     Phase phase;
-    std::int64_t scheduled_ns;
     std::int64_t request_capacity;
     std::int64_t free_pages_before;
     std::int64_t allocated_pages;
@@ -83,11 +83,25 @@ struct BatchEffects {
     std::vector<RequestCompletion> members;
 };
 
-// Decisions and effects travel together; only execution feedback commits mutable control state.
-struct ServingAction {
-    TaskIdentity task;
+// One immutable model iteration can be shared by its stage decisions and unfinished feedback.
+struct BatchWork {
     Batch batch;
     BatchEffects effects;
+};
+
+enum class ServingStep { Batch, Stage, Result };
+
+// Task identifies one decision; flow identifies the model iteration crossing its stages.
+struct ServingAction {
+    TaskIdentity task;
+    std::shared_ptr<const BatchWork> work;
+    std::int64_t scheduled_ns;
+    std::size_t flow;
+    std::size_t lane;
+    std::optional<std::size_t> stage;
+    ServingStep step;
+
+    bool commits_requests() const { return step != ServingStep::Stage; }
 };
 
 // Intermediate work can complete without publishing a user-visible token.

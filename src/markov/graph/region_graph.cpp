@@ -27,6 +27,7 @@ std::vector<std::size_t> RegionGraph::retire(std::span<std::size_t *> roots, std
     types = std::move(kept_types);
     integer_data = std::move(kept_integers);
     operations.clear();
+    dependencies.clear();
     work.clear();
     regions.clear();
     state_changes.clear();
@@ -82,7 +83,9 @@ nlohmann::json RegionGraph::document() const {
     }
 
     // Derive exported dependencies from the same values and operations that were serialized above.
-    for (const auto & edge : connect_accesses(values, operations)) {
+    auto edges = connect_accesses(values, operations);
+    edges.insert(edges.end(), dependencies.begin(), dependencies.end());
+    for (const auto & edge : edges) {
         result["dependencies"].push_back({
             { "source", edge.source },
             { "target", edge.target },

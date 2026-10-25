@@ -7,7 +7,16 @@ from typing import Any
 
 
 class ExecutionComparison:
-    api_kinds = {"copy", "copy_async", "wait_stream", "wait_device", "record_event", "wait_event", "unclassified"}
+    api_kinds = {
+        "copy",
+        "copy_async",
+        "wait_stream",
+        "wait_device",
+        "record_event",
+        "wait_event",
+        "wait_event_complete",
+        "unclassified",
+    }
 
     def __init__(self, native: list[dict[str, Any]], target: list[dict[str, Any]], execution: dict[str, Any]) -> None:
         self.native = native
@@ -201,7 +210,9 @@ class ExecutionComparison:
                 return {"same": None, "reason": "stream target or wait frontier was not observed"}
 
             event_submissions = {
-                item["submission"]["source_event"] for item in actions if item["kind"] in ("record_event", "wait_event")
+                item["submission"]["source_event"]
+                for item in actions
+                if item["kind"] in ("record_event", "wait_event", "wait_event_complete")
             }
             observed_submissions = {item["submission"]["source_event"] for item in observation["device_work"]}
             transport = []
@@ -350,7 +361,7 @@ class ExecutionComparison:
         for position, operation in enumerate(self.native):
             for action in operation["execution_observation"]["runtime_actions"]:
                 expected[position, action["kind"], action["native_api"]] += 1
-                if action["kind"] in ("record_event", "wait_event"):
+                if action["kind"] in ("record_event", "wait_event", "wait_event_complete"):
                     events.append((position, action))
 
         nodes = self.nodes
@@ -375,14 +386,14 @@ class ExecutionComparison:
             action["submission"] is None
             or "event" not in (action["native_call"] or {})
             or action["target"] is None
-            or action["target"]["kind"] != "stream"
+            or action["target"]["kind"] != ("event" if action["kind"] == "wait_event_complete" else "stream")
             for _, action in events
         ):
             return {
                 **report,
                 "same": None,
                 "status": "partial",
-                "reason": "event submission, identity or stream missing",
+                "reason": "event submission, identity or target missing",
             }
         if len({self.issue(action)[0] for _, action in events}) > 1:
             return {
@@ -396,7 +407,7 @@ class ExecutionComparison:
         ordinals: Counter[tuple[int, str]] = Counter()
         barriers = {}
         for node in nodes:
-            if node["kind"] == "barrier" and node["name"] in event_names:
+            if node["kind"] in ("barrier", "wait_event_complete") and node["name"] in event_names:
                 signature = self.positions[node["operation"]], node["name"]
                 barriers[(*signature, ordinals[signature])] = node
                 ordinals[signature] += 1
@@ -430,9 +441,10 @@ class ExecutionComparison:
                     "event": key,
                 }
             barrier = barriers[key]
-            stream = action["target"]["identity"]
-            stream_bindings[stream].add(barrier["resource"])
-            target_streams[barrier["resource"]].add(stream)
+            if action["kind"] != "wait_event_complete":
+                stream = action["target"]["identity"]
+                stream_bindings[stream].add(barrier["resource"])
+                target_streams[barrier["resource"]].add(stream)
             event = action["native_call"]["event"]
             if action["kind"] == "record_event":
                 records[event] = barrier["id"]

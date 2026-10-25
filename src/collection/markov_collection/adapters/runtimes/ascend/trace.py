@@ -100,6 +100,8 @@ class AscendTrace:
         "aclrtSynchronizeDeviceWithTimeout": "wait_device",
         "aclrtRecordEvent": "record_event",
         "aclrtStreamWaitEvent": "wait_event",
+        "aclrtSynchronizeEvent": "wait_event_complete",
+        "aclrtSynchronizeEventWithTimeout": "wait_event_complete",
     }
 
     def __init__(self, path: Path, runtime_directory: Path | None = None, *, device: int) -> None:
@@ -268,7 +270,7 @@ class AscendTrace:
 
         return result
 
-    def physical_work(self) -> dict[str, Any]:
+    def physical_work(self, region_count: int, operation_count: int) -> dict[str, Any]:
         tasks: dict[tuple[Any, Any, int], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         records = {}
         starts = {}
@@ -369,6 +371,8 @@ class AscendTrace:
                     target = {"kind": "stream", "identity": parameters["stream"]}
                 elif action["kind"] in ("copy", "wait_device") and parameters["device_status"] == 0:
                     target = {"kind": "device", "identity": parameters["device"]}
+                elif action["kind"] == "wait_event_complete" and "event" in parameters:
+                    target = {"kind": "event", "identity": parameters["event"]}
             if action["kind"] == "wait_device":
 
                 # Each source worker is restricted to its declared single physical device.
@@ -377,6 +381,20 @@ class AscendTrace:
                 target = {"kind": "device", "identity": self.device}
             action["target"] = target
 
+        limits = {"region": region_count, "operation": operation_count}
+        observed = {
+            identity
+            for identity, owner in owners.items()
+            if all(owner[kind] is None or owner[kind] < count for kind, count in limits.items())
+        }
+
+        # The profiler can stop after the source flush; later scopes belong to the next observation window.
+        outside = {
+            "device_tasks": sum(task["source_event"] not in observed for task in result),
+            "runtime_actions": sum(action["source_event"] not in observed for action in actions),
+        }
+        result = [task for task in result if task["source_event"] in observed]
+        actions = [action for action in actions if action["source_event"] in observed]
         self.bind_transfers(result, actions)
 
         # Queue-drain dependencies need both the API's stream and the worker serving that stream.
@@ -441,21 +459,30 @@ class AscendTrace:
             {"source_event": index, "name": task["name"]} for index, task in records.items() if index not in claims
         ]
 
-        return {
-            "work": result,
-            "runtime_actions": actions,
-            "host_scopes": [
+        host_scopes = []
+        for identity, event in enumerate(self.events):
+            if event.get("ph") != "X" or not event.get("name", "").startswith(("markov.operation/", "markov.region/")):
+                continue
+            kind, scope = event["name"].split("/", 1)
+            kind, scope = kind.removeprefix("markov."), int(scope)
+            if scope >= limits[kind]:
+                continue
+            host_scopes.append(
                 {
-                    "kind": event["name"].split("/", 1)[0].removeprefix("markov."),
-                    "identity": int(event["name"].split("/", 1)[1]),
+                    "kind": kind,
+                    "identity": scope,
                     "thread": event["tid"],
                     "source_event": identity,
                     "order": self.queues.order[identity],
                     "completion_order": self.queues.completion_order[identity],
                 }
-                for identity, event in enumerate(self.events)
-                if event.get("ph") == "X" and event.get("name", "").startswith(("markov.operation/", "markov.region/"))
-            ],
+            )
+
+        return {
+            "snapshot": {**limits, "outside": outside},
+            "work": result,
+            "runtime_actions": actions,
+            "host_scopes": host_scopes,
             "unassociated_runtime_actions": unassociated_runtime,
             "unassociated_tasks": unmatched,
             "observer_controls": observer_controls,

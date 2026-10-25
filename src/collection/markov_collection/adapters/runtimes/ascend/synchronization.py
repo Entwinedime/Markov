@@ -41,6 +41,7 @@ class SynchronizationObservation:
         _npu_trace.register_callback_for_npu_event_deletion(self.delete_event, "markov.event.delete")
         _npu_trace.register_callback_for_npu_event_record(self.record_event, "markov.event.record")
         _npu_trace.register_callback_for_npu_event_wait(self.wait_event, "markov.event.wait")
+        _npu_trace.register_callback_for_npu_event_synchronization(self.synchronize_event, "markov.event.synchronize")
 
         # Trace activation is process-wide; the native worker owns this observer.
         torch_npu._C._activate_npu_trace(0)
@@ -65,6 +66,9 @@ class SynchronizationObservation:
 
     def wait_event(self, event: int, stream: int) -> None:
         self.observe("wait_event", stream, event)
+
+    def synchronize_event(self, event: int) -> None:
+        self.observe("synchronize_event", None, event)
 
     def observe(self, kind: str, stream: int | None, event: int | None = None) -> None:
         record: dict[str, Any] = {"kind": kind, "queue_scope": self.queue_scope}

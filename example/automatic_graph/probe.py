@@ -154,7 +154,8 @@ class MechanismProbe:
             "device": "npu",
             "device_index": torch.npu.current_device(),
         }
-        TensorAssignmentCall.declare(self.recording.regions, self.recording.values)
+        geometries = TensorAssignmentCall.input_geometries(self.recording.regions)
+        TensorAssignmentCall.declare(self.recording.regions, self.recording.values, geometries)
         AscendLayouts.declare(self.recording.regions, self.recording.operations, self.recording.values)
         self.recording.write(self.output / "observations.json", environment)
         self.synchronization.write(self.output / "runtime")

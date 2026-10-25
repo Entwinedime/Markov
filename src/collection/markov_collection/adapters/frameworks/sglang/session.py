@@ -23,20 +23,32 @@ class NativeServingSession:
         configuration: dict[str, int],
         matrix_selection: dict[str, object],
         native_library: str,
+        pp_size: int = 1,
         dtype: str = "bfloat16",
         attention_backend: str = "ascend",
     ) -> None:
+
+        self.roles = self.source_roles(tp_size, pp_size, rank)
         self.model = model
         self.requests = requests
         self.output = output.resolve()
         self.profile = profile
         self.tp_size = tp_size
         self.rank = rank
+        self.pp_size = pp_size
         self.dtype = dtype
         self.attention_backend = attention_backend
         self.configuration = configuration
         self.matrix_selection = matrix_selection
         self.native_library = native_library
+
+    @staticmethod
+    def source_roles(tp: int, pp: int, rank: int) -> range:
+
+        # The pinned upstream Ascend capability table explicitly excludes PP2.
+        if pp == 2:
+            raise ValueError("this SGLang Ascend implementation does not support PP2")
+        return range(tp * pp) if pp > 1 else range(rank, rank + 1)
 
     @staticmethod
     def warmup_requests(page_size: int) -> tuple[tuple[int, int], ...]:
@@ -51,6 +63,7 @@ class NativeServingSession:
         )
 
     def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
+        print(f"markov: native {prefix}begin", flush=True)
         response = engine.generate(
             input_ids=[[1] * prompt for prompt, _ in requests],
             sampling_params=[
@@ -63,12 +76,23 @@ class NativeServingSession:
         # Consume native streaming to completion; publication then contains actual token-visible ports.
         for _ in response:
             pass
+        print(f"markov: native {prefix}complete", flush=True)
 
     @staticmethod
     def reset(engine: object) -> None:
+        print("markov: native pool reset begin", flush=True)
         response = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
         if not response.success:
             raise RuntimeError(f"native idle/cache reset failed: {response.message}")
+        print("markov: native pool reset complete", flush=True)
+
+    def wait_for_sources(self) -> None:
+        sources = [self.output / f"rank-{rank}.json" for rank in self.roles]
+
+        # PP forwards control requests after replying locally; every role must publish before shutdown.
+        while not all(path.is_file() for path in sources):
+            time.sleep(0.05)
+        print("markov: all native role sources complete", flush=True)
 
     def run(self) -> None:
         warmup = self.warmup_requests(self.configuration["page_size"])
@@ -81,8 +105,9 @@ class NativeServingSession:
             "baseline_requests": [f"baseline/{index}" for index in range(len(self.requests))],
             "matrix_selection": self.matrix_selection,
             "native_library": self.native_library,
+            "pp_size": self.pp_size,
         }
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.pp_size == 1:
             session["shard"] = {"size": self.tp_size, "rank": self.rank}
         if description.exists():
             raise FileExistsError(f"native session already exists: {description}")
@@ -98,7 +123,8 @@ class NativeServingSession:
             skip_tokenizer_init=True,
             device="npu",
             dtype=self.dtype,
-            tp_size=1,
+            tp_size=self.tp_size if self.pp_size > 1 else 1,
+            pp_size=self.pp_size,
             load_format="dummy",
             attention_backend=self.attention_backend,
             **self.configuration,
@@ -110,6 +136,7 @@ class NativeServingSession:
             log_level="warning",
         )
         initialized = time.perf_counter_ns()
+        print("markov: native initialization complete", flush=True)
         try:
             self.generate(engine, "warmup/", warmup)
             self.reset(engine)
@@ -126,9 +153,14 @@ class NativeServingSession:
                 self.reset(engine)
                 self.generate(engine, "capture/", self.requests)
                 self.reset(engine)
+                self.wait_for_sources()
             finally:
                 if self.profile:
                     engine.stop_profile()
+                    if self.pp_size > 1:
+                        directories = [self.output / "native" / f"rank-{rank}" for rank in self.roles]
+                        while not all(directory.is_dir() for directory in directories):
+                            time.sleep(0.05)
             captured = time.perf_counter_ns()
         finally:
             engine.shutdown()
@@ -142,6 +174,7 @@ class NativeServingSession:
             "model": self.model,
             "weight_source": "native_dummy_loader_full_model",
             "logical_tp": self.tp_size,
+            "logical_pp": self.pp_size,
             "rank": self.rank,
             "configuration": self.configuration,
             "matrix_selection": self.matrix_selection,

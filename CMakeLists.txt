@@ -37,6 +37,7 @@ target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion
 add_executable(markov src/markov/cli/main.cpp)
 add_library(markov_application
     src/markov/adapters/frameworks/sglang/batches.cpp
+    src/markov/adapters/frameworks/sglang/topology.cpp
     src/markov/adapters/frameworks/sglang/structure.cpp
     src/markov/adapters/frameworks/sglang/rank_structure.cpp
     src/markov/workflow/serving.cpp

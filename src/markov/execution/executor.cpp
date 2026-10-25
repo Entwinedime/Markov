@@ -25,7 +25,20 @@ void Executor::submit(const RegionGraph & graph, const TaskIdentity & task, cons
 
 void Executor::ingest(const RegionGraph & graph) {
     const auto & execution = graph.execution;
-    if (execution.has_unbound_waits()) throw std::invalid_argument("execution has unresolved incoming waits");
+    if (!execution.incoming_waits().empty()) {
+        const auto & wait = execution.incoming_waits().front();
+        const auto & owner = execution.nodes()[wait.target - execution.first_node()].owner;
+        const auto region = owner.kind == ExecutionOwner::Kind::Region ? owner.identity : graph.operations.at(owner.identity).region;
+        const auto & scope = graph.regions.at(region);
+        auto root = region;
+        while (!graph.regions[root].at("parent").is_null()) root = graph.regions[root].at("parent").get<std::size_t>();
+        throw std::invalid_argument("execution has unresolved wait: "
+                                    + nlohmann::json{ { "kind", wait.kind }, { "resource", wait.resource }, { "target", wait.target },
+                                                      { "role", graph.regions[root].at("role") },
+                                                      { "operation", owner.kind == ExecutionOwner::Kind::Operation ? nlohmann::json(graph.operations.at(owner.identity).name) : nlohmann::json(nullptr) },
+                                                      { "rank", scope.value("rank", nlohmann::json(nullptr)) },
+                                                      { "batch", scope.value("batch", nlohmann::json(nullptr)) } }.dump());
+    }
     if (execution.has_unbound_accesses(graph.operations.size())) throw std::invalid_argument("execution has unresolved data access ports");
     if (execution.has_unbound_communications()) throw std::invalid_argument("execution has unresolved collective participants");
 

@@ -17,6 +17,9 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--dtype", default="bfloat16", help="native model dtype; must match the prediction assets")
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument(
+        "--pp-size", type=int, default=1, help="observe actual pipeline ranks together on visible devices"
+    )
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--input", type=Path, help="serving input with simultaneous requests and native pool limits")
     parser.add_argument(
@@ -49,6 +52,7 @@ if __name__ == "__main__":
             "limits": SGLangAcquisition.row_limits([configuration], max(prompt for prompt, _ in requests)),
         },
         native_library=str(Path(arguments.matrix_selector).resolve().with_name(SGLangAcquisition.observer_library)),
+        pp_size=arguments.pp_size,
         dtype=arguments.dtype,
     ).run()
     SGLangAcquisition.interpret({"output": str(arguments.output), "rank": arguments.rank})

@@ -31,6 +31,7 @@ enum class ExecutionKind {
     WaitEntry,
     RecordEvent,
     WaitEvent,
+    WaitEventComplete,
     Barrier,
     Communication
 };
@@ -99,7 +100,7 @@ public:
     void append(const ExecutionPattern & pattern, std::span<const std::size_t> resources, std::size_t operation, std::size_t region);
     void append(ExecutionGraph fragment, std::size_t operation_offset, std::size_t region_offset, std::size_t resource_offset = 0);
     void append_host(std::size_t region, std::size_t resource);
-    void connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region);
+    void connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region, const std::string & kind);
     void connect_accesses(std::span<const ValueAccess> values, std::span<const nlohmann::json> types, std::span<const Operation> operations);
 
     // Release historical IR, retaining state readiness and possibly unfinished execution frontiers.
@@ -110,7 +111,7 @@ public:
     std::span<const ExecutionNode> nodes() const;
     std::span<const Dependency> dependencies() const;
     ExecutionPorts region_call(std::size_t region) const;
-    bool has_unbound_waits() const;
+    std::span<const ExecutionRequirement> incoming_waits() const;
     bool has_unbound_accesses(std::size_t operation_count) const;
     bool has_unbound_communications() const;
     nlohmann::json document() const;

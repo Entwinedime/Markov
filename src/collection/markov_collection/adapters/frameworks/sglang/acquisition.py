@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -40,18 +41,38 @@ class SGLangAcquisition:
         return {
             "dtype": model["dtype"],
             "tp": configuration["tp"],
+            "pp": configuration.get("pp", 1),
             "attention_backend": configuration["attention_backend"],
             "page_size": configuration["page_size"],
         }
 
     @staticmethod
-    def configuration(page_size: int) -> dict[str, int]:
-        return {
+    def configuration(page_size: int, pp: int = 1) -> dict[str, int]:
+        configuration = {
             "page_size": page_size,
             "max_running_requests": 2,
             "max_total_tokens": 32 * page_size,
             "max_prefill_tokens": 32 * page_size,
         }
+        if pp > 1:
+            configuration.update(max_running_requests=4, pp_max_micro_batch_size=2, pp_async_batch_depth=0)
+        return configuration
+
+    @staticmethod
+    def source_groups(domain: dict[str, Any]) -> Iterator[range]:
+        if domain["pp"] > 1:
+            yield NativeServingSession.source_roles(domain["tp"], domain["pp"], 0)
+        else:
+            for rank in range(domain["tp"]):
+                yield range(rank, rank + 1)
+
+    @staticmethod
+    def required_devices(domain: dict[str, Any]) -> int:
+        return len(NativeServingSession.source_roles(domain["tp"], domain["pp"], 0))
+
+    @staticmethod
+    def physical_name(domain: dict[str, Any], rank: int) -> str:
+        return f"physical-rank-{rank}.json" if domain["pp"] > 1 else "physical.json"
 
     @staticmethod
     def row_limits(configurations: list[dict[str, Any]], max_prompt_tokens: int) -> dict[str, int]:
@@ -77,7 +98,8 @@ class SGLangAcquisition:
             for configuration in specification["configurations"]
             if SGLangAcquisition.domain(model, configuration) == domain
         ]
-        configurations.append(SGLangAcquisition.configuration(domain["page_size"]))
+        representative = SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
+        configurations.append(representative)
         maximum_prompt = max(
             request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
         )
@@ -87,6 +109,7 @@ class SGLangAcquisition:
             "rank": rank,
             "output": output,
             "requests": requests,
+            "configuration": representative,
             "matrix_selection": {
                 "binary": selector,
                 "limits": SGLangAcquisition.row_limits(configurations, maximum_prompt),
@@ -113,13 +136,18 @@ class SGLangAcquisition:
             True,
             request["tp"],
             request["rank"],
-            configuration=SGLangAcquisition.configuration(request["page_size"]),
+            configuration=request["configuration"],
             matrix_selection=request["matrix_selection"],
-            native_library=str(Path(request["matrix_selection"]["binary"]).resolve().with_name(SGLangAcquisition.observer_library)),
+            native_library=str(
+                Path(request["matrix_selection"]["binary"]).resolve().with_name(SGLangAcquisition.observer_library)
+            ),
+            pp_size=request["pp"],
             dtype=request["dtype"],
             attention_backend=request["attention_backend"],
         ).run()
-        (Path(request["output"]) / f"rank-{request['rank']}.json").stat()
+        ranks = NativeServingSession.source_roles(request["tp"], request["pp"], request["rank"])
+        for rank in ranks:
+            (Path(request["output"]) / f"rank-{rank}.json").stat()
 
     @staticmethod
     def interpret(request: dict[str, Any]) -> None:
@@ -129,22 +157,33 @@ class SGLangAcquisition:
         from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
 
         directory = Path(request["output"])
-        path = directory / f"rank-{request['rank']}.json"
-        source = json.loads(path.read_text())
+        summary = json.loads((directory / "session-summary.json").read_text())
+        parallel = summary["logical_pp"] > 1
+        ranks = NativeServingSession.source_roles(summary["logical_tp"], summary["logical_pp"], request["rank"])
+        for rank in ranks:
+            path = directory / f"rank-{rank}.json"
+            source = json.loads(path.read_text())
 
-        # Interpretation can be repeated from the captured facts without another native session.
-        SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
-        TensorAssignmentCall.declare(source["regions"], source["values"])
-        AscendIndexedWrites.declare(source["regions"], source["values"])
-        AscendLayouts.declare(source["regions"], source["operations"], source["values"])
-        write_json(path, source)
-        if not json.loads((directory / "session-summary.json").read_text())["profile"]:
-            return
+            # Interpretation can be repeated from the captured facts without another native session.
+            SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
+            geometries = TensorAssignmentCall.input_geometries(source["regions"])
+            TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
+            AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
+            AscendLayouts.declare(source["regions"], source["operations"], source["values"])
+            if parallel:
+                from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
 
-        (trace,) = (directory / "native").rglob("trace_view.json")
-        observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
-        physical = observer.physical_work()
-        write_json(directory / "physical.json", physical)
+                PipelineObservation.declare_waits(source["regions"])
+            write_json(path, source)
+            if not summary["profile"]:
+                continue
+
+            traces = directory / "native" / f"rank-{rank}" if parallel else directory / "native"
+            (trace,) = traces.rglob("trace_view.json")
+            observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
+            physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
+            name = SGLangAcquisition.physical_name(request, rank)
+            write_json(directory / name, physical)
 
 
 if __name__ == "__main__":

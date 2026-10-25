@@ -54,7 +54,8 @@ Invocation Invocation::read(const nlohmann::json & source) {
     return result;
 }
 
-TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation) {
+TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation,
+                                          const TargetInputs * inputs) {
     std::string mismatch = "no source for role " + role + " and phase " + phase;
     for (const auto & selection : asset.entrypoints()) {
         if (selection.role != role || (selection.phase && *selection.phase != phase)) continue;
@@ -63,14 +64,57 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
         const auto frame = asset.frame(selection);
 
         try {
-            return TemplateInstance(asset, frame.layout, frame.bindings, invocation, role, phase);
+            auto instance = TemplateInstance(asset, frame.layout, frame.bindings, invocation, role, phase);
+            if (inputs != nullptr) instance.bind_inputs(*inputs);
+            return instance;
         }
         catch (const LayoutMismatch & error) {
             mismatch = error.what();
         }
+        catch (const std::invalid_argument & error) {
+            throw std::invalid_argument("cannot expand " + role + ": " + error.what());
+        }
     }
 
     throw LayoutMismatch("no region layout matches target: " + mismatch);
+}
+
+void TemplateInstance::bind_inputs(const TargetInputs & inputs) {
+    bound_inputs_.resources.resize(graph_.resource_count);
+    std::vector<std::pair<std::size_t, std::size_t>> ports;
+    for (const auto & [name, target] : inputs.ports) {
+        const auto local = ports_.inputs.find(name);
+        if (local == ports_.inputs.end()) throw LayoutMismatch(role_ + " has no input port: " + name);
+        ports.emplace_back(local->second, target);
+    }
+    for (const auto & [name, members] : inputs.groups) {
+        const auto local = group_inputs_.find(name);
+        if (local == group_inputs_.end() || local->second.size() != members.size()) throw LayoutMismatch(role_ + " has a different input group: " + name);
+        for (std::size_t index = 0; index < members.size(); ++index) ports.emplace_back(local->second[index], members[index]);
+    }
+
+    // Geometry and aliases select an implementation before any target state changes.
+    for (const auto & [local, target] : ports) {
+        const auto & value = graph_.values.at(local);
+        if (value.producer) throw std::invalid_argument("bound input port is produced inside its region");
+        const auto [position, added] = bound_inputs_.values.emplace(local, target);
+        if (!added && position->second != target) throw LayoutMismatch(role_ + " binds one input to different target values");
+        auto & resource = bound_inputs_.resources.at(value.storage);
+        const auto storage = inputs.graph.values.at(target).storage;
+        if (resource && *resource != storage) throw LayoutMismatch(role_ + " input aliases differ from the target");
+        resource = storage;
+
+        auto & type = bound_inputs_.types.try_emplace(target, inputs.graph.types.at(target)).first->second;
+        const auto & required = graph_.types.at(local);
+        for (const auto & key : { "dtype", "device", "shape" }) {
+            if (type.contains(key) && required.contains(key) && type.at(key) != required.at(key))
+                throw LayoutMismatch(role_ + " input " + std::to_string(local) + " has conflicting " + key + ": " + type.at(key).dump() + " versus "
+                                     + required.at(key).dump());
+        }
+        const auto kind = type.at("kind");
+        type.update(required);
+        if (kind == "tensor") type["kind"] = kind;
+    }
 }
 
 TemplateInstance::TemplateInstance(const TemplateAsset & asset, std::size_t layout, const FixedBindings & bindings, const Invocation & invocation,

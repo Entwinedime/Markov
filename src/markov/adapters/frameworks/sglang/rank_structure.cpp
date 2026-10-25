@@ -57,23 +57,26 @@ void bind_columns(TargetGraph & graph, const std::map<std::string, std::size_t> 
 
 } // namespace
 
-RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settings, RegionGraph & graph, std::size_t execution_offset, std::size_t rank)
+RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settings, RegionGraph & graph, std::size_t execution_offset, std::size_t rank,
+                             std::size_t lanes)
     : settings_(settings),
+      asset_(asset),
       shared_(graph),
       graph_(asset, graph, execution_offset),
-      views_(graph_),
       rank_(rank),
-      publishes_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "request_output"; })) {}
-
-RankProgram RankStructure::expand(const Batch & batch, const BatchEffects & effects) {
-    const auto begin = graph_.graph().regions.size();
-    const auto sampled_tokens = prepare(batch, effects);
-    auto result = complete(batch, effects, sampled_tokens);
-    for (std::size_t region = begin; region < shared_.regions.size(); ++region) shared_.regions[region]["rank"] = rank_;
-    return result;
+      publishes_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "request_output"; })) {
+    views_.reserve(lanes);
+    for (std::size_t lane = 0; lane < lanes; ++lane) views_.emplace_back(graph_, asset);
 }
 
-std::size_t RankStructure::prepare(const Batch & batch, const BatchEffects & effects) {
+RankProgram RankStructure::expand(const Batch & batch, const BatchEffects & effects) {
+    const auto inputs = prepare(batch, 0);
+    const auto output = model(batch, inputs);
+    return complete(batch, effects, 0, output.ports.outputs, output.ports.outputs.at("sampled_tokens"));
+}
+
+std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, std::size_t lane) {
+    const auto begin = shared_.regions.size();
     const auto columns = batch_operands(batch, settings_.page_size);
     const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
     std::map<std::string, std::size_t> state;
@@ -85,23 +88,9 @@ std::size_t RankStructure::prepare(const Batch & batch, const BatchEffects & eff
                                  { "scheduled_members", static_cast<std::int64_t>(batch.members.size()) }
     },
                              state);
-    views_.advance(batch.phase);
-
-    std::int64_t max_sequence_tokens = 0;
-    for (const auto & member : batch.members) max_sequence_tokens = std::max(max_sequence_tokens, member.context_tokens + member.new_tokens);
-
-    Invocation invocation;
-    invocation.parameters = {
-        {                   "M",                              batch.new_tokens() },
-        {                   "B", static_cast<std::int64_t>(batch.members.size()) },
-        {                   "R",                  settings_.max_running_requests },
-        {   "free_pages_before",                         batch.free_pages_before },
-        {     "allocated_pages",                           batch.allocated_pages },
-        { "max_sequence_tokens",                             max_sequence_tokens }
-    };
-    invocation.bindings = {
-        { "page_size", settings_.page_size }
-    };
+    auto & views = views_.at(lane);
+    views.advance(batch.phase);
+    auto invocation = this->invocation(batch);
 
     GroupValues groups;
 
@@ -134,7 +123,7 @@ std::size_t RankStructure::prepare(const Batch & batch, const BatchEffects & eff
     }
 
     std::map<std::string, std::size_t> inputs;
-    if (batch.phase == Phase::Decode) inputs = views_.decode_inputs();
+    if (batch.phase == Phase::Decode) inputs = views.decode_inputs();
     if (free_pages_) inputs.emplace("free_pages", *free_pages_);
     if (request_map_) inputs.emplace("request_map", *request_map_);
     const auto preparation = graph_.append("batch_preparation", phase, invocation, inputs, groups);
@@ -159,20 +148,30 @@ std::size_t RankStructure::prepare(const Batch & batch, const BatchEffects & eff
     graph_.end_composition(prepared.outputs);
 
     // These are the actual prepared values, including the CPU length vector and prompt staging buffer.
-    inputs = BatchViews::columns(prepared.outputs);
+    inputs = views.columns(prepared.outputs);
     inputs.emplace("kv_locations", prepared.outputs.at("kv_locations"));
     if (batch.phase == Phase::Prefill) inputs.emplace("prompt_tokens", prepared.outputs.at("prompt_tokens"));
-    if (token_relay_) inputs.emplace("token_relay", *token_relay_);
-
-    invocation.input_groups.clear();
-    invocation.sequences.clear();
-    const auto model = graph_.append(batch.phase == Phase::Prefill ? "Prefill" : "Decode", phase, invocation, inputs);
-    token_relay_ = model.ports.outputs.at("token_relay");
-    views_.remember(batch.phase, model.ports.outputs, effects);
-    return model.ports.outputs.at("sampled_tokens");
+    stamp(begin);
+    return inputs;
 }
 
-RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t sampled_tokens) {
+TargetRegion RankStructure::model(const Batch & batch, const std::map<std::string, std::size_t> & inputs) {
+    const auto begin = shared_.regions.size();
+    auto bound = inputs;
+    if (token_relay_) bound.emplace("token_relay", *token_relay_);
+    const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
+    auto result = graph_.append(batch.phase == Phase::Prefill ? "Prefill" : "Decode", phase, invocation(batch), bound);
+    token_relay_ = result.ports.outputs.at("token_relay");
+    stamp(begin);
+    return result;
+}
+
+RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
+                                    const std::map<std::string, std::size_t> & model_columns, std::size_t sampled_tokens) {
+    const auto begin = shared_.regions.size();
+    auto columns = model_columns;
+    columns["model_tokens"] = sampled_tokens;
+    views_.at(lane).remember(batch.phase, columns, effects);
     const bool immediate = batch.phase == Phase::Prefill;
     const auto phase = immediate ? "prefill" : "decode";
     Invocation group;
@@ -273,10 +272,101 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     graph_.end_composition({
         { "free_pages", free_pages_.value() }
     });
+    stamp(begin);
     return { publication, graph_.graph().execution.region_call(result_region).returned, std::move(returned_pages) };
 }
 
-std::size_t RankStructure::admission_members() const { return views_.admission_members(); }
+std::size_t RankStructure::admission_members(std::size_t lane) const { return views_.at(lane).admission_members(); }
+
+Invocation RankStructure::invocation(const Batch & batch) const {
+    std::int64_t max_sequence_tokens = 0;
+    for (const auto & member : batch.members) max_sequence_tokens = std::max(max_sequence_tokens, member.context_tokens + member.new_tokens);
+    Invocation result;
+    result.parameters = {
+        {                   "M",                              batch.new_tokens() },
+        {                   "B", static_cast<std::int64_t>(batch.members.size()) },
+        {                   "R",                  settings_.max_running_requests },
+        {   "free_pages_before",                         batch.free_pages_before },
+        {     "allocated_pages",                           batch.allocated_pages },
+        { "max_sequence_tokens",                             max_sequence_tokens }
+    };
+    result.bindings = {
+        { "page_size", settings_.page_size }
+    };
+    return result;
+}
+
+void RankStructure::stamp(std::size_t region_begin) {
+    for (std::size_t region = region_begin; region < shared_.regions.size(); ++region) shared_.regions[region]["rank"] = rank_;
+}
+
+RankMessage RankStructure::message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending) {
+    const auto begin = shared_.regions.size();
+    const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
+    auto arguments = invocation(batch);
+    const TemplateLayout * contract = nullptr;
+    for (const auto & entry : asset_.entrypoints()) {
+        if (entry.role == role && (!entry.phase || *entry.phase == phase)) {
+            const auto frame = asset_.frame(entry);
+            contract = &asset_.layout(frame.layout);
+            arguments.bindings.insert(frame.bindings.values.begin(), frame.bindings.values.end());
+            break;
+        }
+    }
+    if (contract == nullptr) throw LayoutMismatch("no source for pipeline message: " + role);
+    const auto & ports = sending ? contract->ports.inputs : contract->ports.outputs;
+    for (const auto & [name, value] : payload) {
+        const auto local = ports.at(name);
+        const auto shape = std::ranges::find(contract->input_shapes, local, &ShapeContract::value);
+        if (shape == contract->input_shapes.end()) throw std::invalid_argument("pipeline payload lacks a declared shape: " + name);
+        const auto & actual = shared_.types.at(value).at("shape");
+        if (actual.size() != shape->shape.size()) throw LayoutMismatch("pipeline payload dimensionality differs: " + name);
+        for (std::size_t axis = 0; axis < shape->shape.size(); ++axis) {
+            const auto expression = shape->shape[axis].document();
+            if (expression.is_string()) arguments.parameters.insert_or_assign(expression.get<std::string>(), actual[axis].get<std::int64_t>());
+        }
+    }
+
+    auto result = graph_.append(role, phase, arguments, sending ? payload : std::map<std::string, std::size_t>{});
+    stamp(begin);
+    return { std::move(result), std::move(arguments) };
+}
+
+void RankStructure::wait_message(const std::string & channel, const Batch & batch, const RankMessage & message) {
+    const auto begin = shared_.regions.size();
+    const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
+    for (const auto & [name, value] : message.region.ports.outputs) {
+        if (!name.starts_with("wire.")) continue;
+
+        // Work.wait observes the actual transmitted slice, while its invocation retains full payload dimensions.
+        graph_.append("pipeline_wait_" + channel + "_" + name.substr(5),
+                      phase,
+                      message.invocation,
+                      {
+                          { "tensor", value }
+        });
+    }
+    stamp(begin);
+}
+
+std::size_t RankStructure::receive_result(const Batch & batch, std::size_t sampled_tokens) {
+    const auto begin = shared_.regions.size();
+    const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
+    const auto arguments = invocation(batch);
+    graph_.append("pipeline_event_record", phase, arguments);
+    const auto result = graph_.append("pipeline_result_tokens",
+                                      phase,
+                                      arguments,
+                                      {
+                                          { "sampled_tokens",       sampled_tokens },
+                                          {    "token_relay", token_relay_.value() }
+    });
+    token_relay_ = result.ports.outputs.at("token_relay");
+    graph_.append("pipeline_ready_record", phase, arguments);
+    graph_.append("pipeline_ready_synchronize", phase, arguments);
+    stamp(begin);
+    return result.ports.outputs.at("sampled_tokens");
+}
 
 void RankStructure::return_pages(std::size_t output, std::span<const std::size_t> pages) {
     IntegerData returned;
@@ -292,16 +382,18 @@ void RankStructure::live_state(std::vector<std::size_t *> & values, std::set<std
     for (auto * value : { &free_pages_, &request_map_, &token_relay_ }) {
         if (*value) values.push_back(&value->value());
     }
-    views_.live_values(values);
+    for (auto & view : views_) view.live_values(values);
     graph_.live_resources(storage);
 }
 
 std::optional<std::size_t> RankStructure::idle() {
     const auto begin = shared_.regions.size();
-    const auto control = views_.idle();
-    for (std::size_t region = begin; region < shared_.regions.size(); ++region) shared_.regions[region]["rank"] = rank_;
-    if (!control) return std::nullopt;
-    return shared_.execution.region_call(*control).returned;
+    std::optional<std::size_t> control;
+    for (auto & view : views_) {
+        if (const auto completion = view.idle()) control = completion;
+    }
+    stamp(begin);
+    return control ? std::optional(shared_.execution.region_call(*control).returned) : std::nullopt;
 }
 
 } // namespace markov::sglang

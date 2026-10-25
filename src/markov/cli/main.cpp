@@ -17,7 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/adapters/frameworks/sglang/structure.hpp"
-#include "markov/contracts/topology.hpp"
+#include "markov/adapters/frameworks/sglang/topology.hpp"
 #include "markov/controller/serving.hpp"
 #include "markov/execution/durations.hpp"
 #include "markov/graph/source_graph.hpp"
@@ -95,33 +95,12 @@ void check_fields(const nlohmann::json & source, std::initializer_list<std::stri
     }
 }
 
-markov::ParallelTopology tensor_parallel_topology(const nlohmann::json & configuration, std::size_t rank_count) {
-    const nlohmann::json * devices = nullptr;
-    if (configuration.contains("placement")) {
-        const auto & placement = configuration.at("placement");
-        check_fields(placement, { "devices" }, "placement");
-        devices = &placement.at("devices");
-        if (!devices->is_array() || devices->size() != rank_count) throw std::invalid_argument("placement needs one device per TP rank");
-    }
-
-    std::vector<markov::RankPlacement> ranks;
-    std::vector<std::size_t> members;
-    std::set<std::size_t> used;
-    for (std::size_t rank = 0; rank < rank_count; ++rank) {
-        const auto device = devices == nullptr ? static_cast<std::int64_t>(rank) : integer(devices->at(rank));
-        if (device < 0 || !used.insert(static_cast<std::size_t>(device)).second)
-            throw std::invalid_argument("TP placement needs distinct nonnegative devices on one host");
-
-        ranks.push_back({ "local", static_cast<std::size_t>(device) });
-        members.push_back(rank);
-    }
-    return { std::move(ranks), { { "model", "tp", std::move(members) } } };
-}
-
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
     check_fields(input, { "configuration", "requests", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
-    check_fields(configuration, { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "placement" }, "configuration");
+    check_fields(configuration,
+                 { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement" },
+                 "configuration");
     const markov::ServingSettings settings{ integer(configuration.at("max_running_requests")),
                                             integer(configuration.at("max_total_tokens")),
                                             integer(configuration.at("page_size")),
@@ -138,10 +117,23 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     }
 
     const markov::GivenDurations durations(input.at("node_durations_ns"));
-    const auto topology = tensor_parallel_topology(configuration, assets.size());
-    const auto control_group = topology.groups().front().id;
+    const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
+    if (stages <= 0) throw std::invalid_argument("pp must be positive");
+    const auto batch_limit =
+        configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
+    if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
+    std::vector<std::int64_t> devices;
+    if (configuration.contains("placement")) {
+        const auto & placement = configuration.at("placement");
+        check_fields(placement, { "devices" }, "placement");
+        if (!placement.at("devices").is_array() || placement.at("devices").size() != assets.size())
+            throw std::invalid_argument("placement needs one device per logical rank");
+        for (const auto & device : placement.at("devices")) devices.push_back(integer(device));
+    }
+    const markov::sglang::ServingTopology topology(assets, static_cast<std::size_t>(stages), devices);
+    const auto control_group = topology.parallel().groups().front().id;
     markov::sglang::ServingStructure expansion(assets, settings, requests, topology);
-    markov::ServingController controller(settings, std::move(requests), control_group);
+    markov::ServingController controller(settings, std::move(requests), control_group, static_cast<std::size_t>(stages), static_cast<std::size_t>(batch_limit));
     markov::ServingWorkflow workflow(controller, expansion, durations);
     auto result = workflow.run(details);
     result["configuration"] = configuration;
@@ -193,6 +185,7 @@ int main(int argc, char ** argv) {
                 {         "status",                               result.at("status") },
                 { "control_status",                       result.at("control_status") },
                 {        "batches", result.at("structure").at("counts").at("batches") },
+                {        "actions", result.at("structure").at("counts").at("actions") },
                 {       "requests",                      result.at("requests").size() },
                 {     "free_pages",                           result.at("free_pages") }
             }.dump(2) << '\n';

@@ -31,7 +31,7 @@ class Exploration:
         self.specification = specification
         self.acquisition = SGLangAcquisition()
         self.environment = DockerEnvironment(
-            root, directory, self.acquisition.service, specification["deployment"]["physical_device"]
+            root, directory, self.acquisition.service, specification["deployment"]["physical_devices"]
         )
         state = directory / "state.json"
         self.state = (
@@ -217,8 +217,8 @@ class Exploration:
         draft.mkdir(parents=True, exist_ok=True)
         arguments = ["templates"]
         inputs = []
-        for rank in range(domain["tp"]):
-            key = f"{name}-rank-{rank}"
+        for representative, roles in enumerate(self.acquisition.source_groups(domain)):
+            key = f"{name}-source-{representative}"
             if key not in self.state["sources"]:
                 self.available("native")
                 capture = self.directory / "captures" / f"{key}-attempt-{self.state['native_attempts'] + 1}"
@@ -226,7 +226,7 @@ class Exploration:
                 request = self.acquisition.request(
                     self.specification,
                     domain,
-                    rank,
+                    roles[0],
                     self.environment.native_path(capture),
                     self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
                 )
@@ -243,8 +243,8 @@ class Exploration:
 
             capture = self.directory / self.state["sources"][key]
             capture.resolve().relative_to(self.directory)
-            physical = capture / "physical.json"
-            if not physical.exists():
+            physical_paths = [capture / self.acquisition.physical_name(domain, rank) for rank in roles]
+            if not all(path.exists() for path in physical_paths):
                 command = self.acquisition.command("interpret", self.environment.native_path(capture / "capture.json"))
                 self.step(
                     self.environment.native_command(
@@ -252,9 +252,10 @@ class Exploration:
                     ),
                     "processing",
                 )
-            source = capture / f"rank-{rank}.json"
-            arguments += ["--source", str(source), "--physical", str(physical)]
-            inputs += [source, physical]
+            for rank, physical in zip(roles, physical_paths, strict=True):
+                source = capture / f"rank-{rank}.json"
+                arguments += ["--source", str(source), "--physical", str(physical)]
+                inputs += [source, physical]
 
         # Compile all roles against one catalog, keeping each role's resource and execution bindings independent.
         asset = draft / "templates.json"
@@ -282,8 +283,9 @@ class Exploration:
                     name: configuration[name]
                     for name in ("max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens")
                 }
-                if "placement" in configuration:
-                    settings["placement"] = configuration["placement"]
+                for name in ("pp", "microbatch_requests", "placement"):
+                    if name in configuration:
+                        settings[name] = configuration[name]
                 write_json(
                     target,
                     {
@@ -299,9 +301,7 @@ class Exploration:
                     arguments.append("--details")
                 try:
                     self.step(
-                        self.environment.tool_command(
-                            arguments, [asset, target], result, self.available("processing")
-                        ),
+                        self.environment.tool_command(arguments, [asset, target], result, self.available("processing")),
                         "processing",
                     )
                     self.state["results"][key] = str(result.relative_to(self.directory))
@@ -322,16 +322,17 @@ class Exploration:
             "",
             f"模型：{self.specification['model']['path']}，{self.specification['model']['dtype']}。",
             "",
-            f"来源实现域 {len(self.domain_settings)} 个，已取得角色来源 {len(self.state['sources'])} 份。",
+            f"来源实现域 {len(self.domain_settings)} 个，已保存来源会话 {len(self.state['sources'])} 份。",
             "",
-            "| 配置 / 请求集 | 结果 | TP | 输入请求 |",
-            "| --- | --- | ---: | ---: |",
+            "| 配置 / 请求集 | 结果 | TP | PP | 输入请求 |",
+            "| --- | --- | ---: | ---: | ---: |",
         ]
         for key, path in self.state["results"].items():
             configuration, workload = key.split("/")
             link = Path("..") / path
             lines.append(
                 f"| {key} | [请求完成]({link}) | {configurations[configuration]['tp']} | "
+                f"{configurations[configuration].get('pp', 1)} | "
                 f"{len(workloads[workload]['requests'])} |"
             )
         if self.state["failures"]:
@@ -412,15 +413,20 @@ def read_specification(path: Path) -> dict[str, Any]:
         "task",
     )
     check_fields(document["model"], {"path", "dtype"}, "model")
-    check_fields(document["deployment"], {"physical_device"}, "deployment")
+    check_fields(document["deployment"], {"physical_devices"}, "deployment")
     check_fields(
         document["budget"], {"native_seconds", "processing_seconds", "temporary_bytes", "retained_bytes"}, "budget"
     )
     if document["framework"] != "sglang":
         raise ValueError("this acquisition entrypoint currently provides SGLang/Ascend")
-    device = document["deployment"]["physical_device"]
-    if type(device) is not int or device < 0:
-        raise ValueError("physical_device must be a nonnegative integer")
+    deployment = document["deployment"]["physical_devices"]
+    if (
+        not isinstance(deployment, list)
+        or not deployment
+        or any(type(device) is not int or device < 0 for device in deployment)
+        or len(set(deployment)) != len(deployment)
+    ):
+        raise ValueError("physical_devices must contain distinct nonnegative integers")
     for category in ("configurations", "workloads"):
         identities = [item["id"] for item in document[category]]
         if (
@@ -436,6 +442,8 @@ def read_specification(path: Path) -> dict[str, Any]:
             {
                 "id",
                 "tp",
+                "pp",
+                "microbatch_requests",
                 "attention_backend",
                 "max_running_requests",
                 "max_total_tokens",
@@ -450,6 +458,15 @@ def read_specification(path: Path) -> dict[str, Any]:
                 raise ValueError(f"configuration {name} is outside its positive integer range")
         if configuration["max_total_tokens"] < configuration["page_size"]:
             raise ValueError("configuration KV capacity needs at least one page")
+        pp = configuration.get("pp", 1)
+        if type(pp) is not int or not 0 < pp <= maximum:
+            raise ValueError("configuration pp is outside its positive integer range")
+        microbatch = configuration.get("microbatch_requests", (configuration["max_running_requests"] - 1) // pp + 1)
+        if type(microbatch) is not int or not 0 < microbatch <= configuration["max_running_requests"]:
+            raise ValueError("microbatch_requests must fit the request capacity")
+        domain = SGLangAcquisition.domain(document["model"], configuration)
+        if SGLangAcquisition.required_devices(domain) > len(deployment):
+            raise ValueError("declared collection devices cannot run the required native source participants")
 
         if "placement" in configuration:
             placement = configuration["placement"]
@@ -457,11 +474,11 @@ def read_specification(path: Path) -> dict[str, Any]:
             devices = placement["devices"]
             if (
                 not isinstance(devices, list)
-                or len(devices) != configuration["tp"]
+                or len(devices) != configuration["tp"] * pp
                 or any(type(device) is not int or not 0 <= device <= maximum for device in devices)
                 or len(set(devices)) != len(devices)
             ):
-                raise ValueError("TP placement needs one distinct nonnegative device per logical rank")
+                raise ValueError("placement needs one distinct nonnegative device per logical rank")
 
     # Reject malformed workloads before paying for a native source; per-configuration capacity remains a result.
     for workload in document["workloads"]:

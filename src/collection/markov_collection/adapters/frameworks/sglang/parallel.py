@@ -59,17 +59,17 @@ class CollectiveCall(NativeCall):
                     }
                 ]
 
-    def __init__(self, shard: SingleDeviceShard, kind: str, original: Any) -> None:
+    def __init__(self, values: Any, size: int, kind: str, original: Any) -> None:
         super().__init__(
-            shard.values.recording,
-            shard.values,
+            values.recording,
+            values,
             f"sglang.NpuCommunicator.{kind}",
             original,
             {},
             interface="collective",
             mutations=(0,) if kind == "all_reduce" else (),
         )
-        self.shard = shard
+        self.size = size
         self.kind = kind
 
     def completed(
@@ -78,7 +78,7 @@ class CollectiveCall(NativeCall):
         metadata["communication"] = {
             "primitive": self.kind,
             "group": "tp",
-            "size": self.shard.size,
+            "size": self.size,
             "dimension": args[1] if self.kind == "all_gather" else None,
         }
         shapes = self.values.shapes
@@ -89,7 +89,7 @@ class CollectiveCall(NativeCall):
 
         shape = list(shapes.tensor(args[0]).shape)
         if self.kind == "all_gather":
-            shape[args[1]] *= self.shard.size
+            shape[args[1]] *= self.size
         self.values.bind_shape(result, shape)
 
         return None
@@ -146,7 +146,7 @@ class SingleDeviceShard:
         if not self.depth or group.world_size != 1:
             return original(group, input_)
 
-        call = CollectiveCall(self, "all_reduce", self.communicator(group).all_reduce)
+        call = CollectiveCall(self.values, self.size, "all_reduce", self.communicator(group).all_reduce)
         return call(input_)
 
     def all_gather(self, original: Any, group: Any, input_: Any, dim: int = -1, output_tensor_list: Any = None) -> Any:
@@ -155,7 +155,7 @@ class SingleDeviceShard:
         if output_tensor_list is not None:
             raise NotImplementedError("single-device shard supports tensor-result all-gather")
 
-        call = CollectiveCall(self, "all_gather", self.communicator(group).all_gather)
+        call = CollectiveCall(self.values, self.size, "all_gather", self.communicator(group).all_gather)
         return call(input_, dim)
 
     def gather_into_tensor(

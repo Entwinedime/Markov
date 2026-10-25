@@ -21,10 +21,10 @@ class BatchTensors:
         "sampling_min_ps": "sampling_info.min_ps",
     }
 
-    @classmethod
-    def read(cls, batch: Any) -> dict[str, Any]:
+    @staticmethod
+    def read(batch: Any, fields: dict[str, str] = fields) -> dict[str, Any]:
         result = {}
-        for name, path in cls.fields.items():
+        for name, path in fields.items():
             value = batch
             for attribute in path.split("."):
                 value = getattr(value, attribute)
@@ -34,10 +34,12 @@ class BatchTensors:
 
 
 class BatchTransitionCall(NativeCall):
-    def __init__(self, values: Any, original: Any, batch: Any, other: Any = None) -> None:
-        inputs = {f"self.{path}": {0: "before_members"} for path in BatchTensors.fields.values()}
+    def __init__(
+        self, values: Any, original: Any, batch: Any, other: Any = None, *, fields: dict[str, str] = BatchTensors.fields
+    ) -> None:
+        inputs = {f"self.{path}": {0: "before_members"} for path in fields.values()}
         if other is not None:
-            inputs.update({f"other.{path}": {0: "added_members"} for path in BatchTensors.fields.values()})
+            inputs.update({f"other.{path}": {0: "added_members"} for path in fields.values()})
 
         super().__init__(
             values.recording,
@@ -50,14 +52,15 @@ class BatchTransitionCall(NativeCall):
         self.batch = batch
         self.other = other
         self.before_members = len(batch.reqs)
+        self.fields = fields
 
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
         self.value_begin = len(self.recording.values)
-        inputs = BatchTensors.read(self.batch)
+        inputs = BatchTensors.read(self.batch, self.fields)
         if self.other is not None:
             inputs = {
                 **{f"left.{name}": tensor for name, tensor in inputs.items()},
-                **{f"right.{name}": tensor for name, tensor in BatchTensors.read(self.other).items()},
+                **{f"right.{name}": tensor for name, tensor in BatchTensors.read(self.other, self.fields).items()},
             }
 
         self.input_ports = self.values.port_values(inputs)
@@ -100,7 +103,7 @@ class BatchTransitionCall(NativeCall):
             ]
 
         # An empty native batch leaves stale tensors behind; none are outputs of that transition.
-        self.output_tensors = BatchTensors.read(self.batch) if after_members else {}
+        self.output_tensors = BatchTensors.read(self.batch, self.fields) if after_members else {}
         for tensor in self.output_tensors.values():
             self.values.bind(tensor, {0: "after_members"})
         outputs = self.values.port_values(self.output_tensors)

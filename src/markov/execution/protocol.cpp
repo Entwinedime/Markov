@@ -12,9 +12,10 @@
 namespace markov {
 namespace {
 
-constexpr std::array<std::string_view, 16> kind_names{ "enqueue",      "submit",     "device",       "copy",         "copy_async", "wait_stream",
-                                                       "wait_device",  "transfer",   "queue_return", "unclassified", "host",       "wait_entry",
-                                                       "record_event", "wait_event", "barrier",      "communication" };
+constexpr std::array<std::string_view, 17> kind_names{ "enqueue",     "submit",       "device",       "copy",         "copy_async",
+                                                       "wait_stream", "wait_device",  "transfer",     "queue_return", "unclassified",
+                                                       "host",        "wait_entry",   "record_event", "wait_event",   "wait_event_complete",
+                                                       "barrier",     "communication" };
 
 } // namespace
 
@@ -68,10 +69,10 @@ ExecutionPattern ExecutionPattern::read(const nlohmann::json & source) {
             throw std::invalid_argument("invalid execution frontier requirement");
 
         const auto kind = result.steps[requirement.target].kind;
-        const bool valid =
-            (requirement.kind == "queue_drain" && kind == ExecutionKind::WaitEntry)
-            || (requirement.kind == "wait_completion" && (kind == ExecutionKind::WaitStream || kind == ExecutionKind::WaitDevice))
-            || (requirement.kind == "event_wait" && !requirement.source && result.sequences[requirement.resource].empty() && kind == ExecutionKind::Barrier);
+        const bool valid = (requirement.kind == "queue_drain" && kind == ExecutionKind::WaitEntry)
+                           || (requirement.kind == "wait_completion" && (kind == ExecutionKind::WaitStream || kind == ExecutionKind::WaitDevice))
+                           || (requirement.kind == "event_wait" && !requirement.source && result.sequences[requirement.resource].empty()
+                               && (kind == ExecutionKind::Barrier || kind == ExecutionKind::WaitEventComplete));
         if (!valid) throw std::invalid_argument("execution frontier kind conflicts with its target or resource");
         result.requirements.push_back(std::move(requirement));
     }
@@ -235,18 +236,18 @@ void ExecutionGraph::append(ExecutionGraph fragment, std::size_t operation_offse
     dependencies_.insert(dependencies_.end(), std::make_move_iterator(fragment.dependencies_.begin()), std::make_move_iterator(fragment.dependencies_.end()));
 }
 
-void ExecutionGraph::connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region) {
+void ExecutionGraph::connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region, const std::string & kind) {
     const auto node = first_node_ + nodes_.size();
     nodes_.push_back({
-        { ExecutionKind::Communication, resource, std::nullopt, "collective" },
+        { ExecutionKind::Communication, resource, std::nullopt, kind },
         { ExecutionOwner::Kind::Region, region }
     });
 
-    // One collective consumes every participant's readiness and releases every participant's stream.
+    // A shared transfer waits for its actual endpoints and releases their local transport streams.
     for (const auto operation : operations) {
         const auto ports = communications_.at(operation);
-        dependencies_.push_back({ ports.entry, node, "collective_ready" });
-        dependencies_.push_back({ node, ports.returned, "collective_complete" });
+        dependencies_.push_back({ ports.entry, node, kind + "_ready" });
+        dependencies_.push_back({ node, ports.returned, kind + "_complete" });
         communications_.erase(operation);
     }
 }
@@ -358,7 +359,7 @@ std::size_t ExecutionGraph::first_node() const { return first_node_; }
 std::span<const ExecutionNode> ExecutionGraph::nodes() const { return nodes_; }
 std::span<const Dependency> ExecutionGraph::dependencies() const { return dependencies_; }
 ExecutionPorts ExecutionGraph::region_call(std::size_t region) const { return host_calls_.at({ ExecutionOwner::Kind::Region, region }); }
-bool ExecutionGraph::has_unbound_waits() const { return !incoming_.empty(); }
+std::span<const ExecutionRequirement> ExecutionGraph::incoming_waits() const { return incoming_; }
 bool ExecutionGraph::has_unbound_accesses(std::size_t operation_count) const { return missing_call_ports_ || bound_operations_ != operation_count; }
 bool ExecutionGraph::has_unbound_communications() const { return !communications_.empty(); }
 

@@ -1,24 +1,21 @@
 #include "markov/adapters/frameworks/sglang/batches.hpp"
 
-#include <initializer_list>
 #include <utility>
 
 namespace markov::sglang {
 
-BatchViews::BatchViews(TargetGraph & graph) : graph_(graph) {}
+BatchViews::BatchViews(TargetGraph & graph, const TemplateAsset & asset) : graph_(graph) {
+    for (const auto & entry : asset.entrypoints()) {
+        if (entry.role != "batch_filter") continue;
+        for (const auto & [name, _] : asset.layout(asset.frame(entry).layout).ports.inputs) fields_.insert(name);
+    }
+}
 
-std::map<std::string, std::size_t> BatchViews::columns(const std::map<std::string, std::size_t> & ports) {
+std::map<std::string, std::size_t> BatchViews::columns(const std::map<std::string, std::size_t> & ports) const {
     std::map<std::string, std::size_t> result;
-    for (const auto * name : { "request_slots",
-                               "request_slots_cpu",
-                               "sequence_lengths",
-                               "sequence_lengths_cpu",
-                               "original_lengths",
-                               "sampling_temperatures",
-                               "sampling_top_ps",
-                               "sampling_top_ks",
-                               "sampling_min_ps" })
-        result.emplace(name, ports.at(name));
+    for (const auto & name : fields_) {
+        if (const auto found = ports.find(name); found != ports.end()) result.emplace(*found);
+    }
 
     return result;
 }
@@ -73,7 +70,8 @@ std::optional<std::size_t> BatchViews::idle() {
 }
 
 void BatchViews::remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects) {
-    View view{ columns(ports), static_cast<std::int64_t>(effects.members.size()), {} };
+    View view{ {}, static_cast<std::int64_t>(effects.members.size()), {} };
+    for (const auto & name : fields_) view.columns.emplace(name, ports.at(name));
     for (std::size_t row = 0; row < effects.members.size(); ++row) {
         if (!effects.members[row].finished) view.kept_rows.push_back(static_cast<std::int64_t>(row));
     }

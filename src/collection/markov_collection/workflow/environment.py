@@ -9,13 +9,13 @@ from pathlib import Path
 
 
 class DockerEnvironment:
-    def __init__(self, root: Path, run: Path, service: str, device: int) -> None:
+    def __init__(self, root: Path, run: Path, service: str, devices: list[int]) -> None:
         self.root = root
         self.build = root / "build/automatic-graph"
         self.observer_build = run / "work/observer-build"
         self.label = f"markov.run={run}"
         self.service = service
-        self.device = device
+        self.devices = devices
         self.native: str | None = None
         self.compose = ["docker", "compose", "-f", str(root / "docker/compose/inference.yml")]
         prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
@@ -30,7 +30,7 @@ class DockerEnvironment:
         self.native = None
 
     def start(self) -> None:
-        environment = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(self.device))
+        environment = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=",".join(map(str, self.devices)))
         command = self.compose + ["run", "--no-deps", "-d", "--label", self.label, self.service, "sleep", "infinity"]
         self.native = subprocess.check_output(command, env=environment, text=True, timeout=30).strip()
 
@@ -54,6 +54,8 @@ class DockerEnvironment:
             f"LD_PRELOAD={self.native_path(self.observer_build / library)}",
             "-e",
             f"MARKOV_NATIVE_RUNTIME_DIR={self.native_path(output / 'runtime')}",
+            "-e",
+            f"TRITON_CACHE_DIR={self.native_path(self.observer_build.parent / 'triton-cache')}",
             str(self.native),
             *self.limited(arguments, remaining_ns),
         ]

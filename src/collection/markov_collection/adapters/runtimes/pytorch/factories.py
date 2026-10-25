@@ -52,6 +52,9 @@ class TensorGeometryObservation:
             return self.factories.get(function)
         return None
 
+    def local_geometry(self, code: Any, name: str) -> int | None:
+        return None
+
 
 class TensorGeometryCall(NativeCall):
     def __init__(

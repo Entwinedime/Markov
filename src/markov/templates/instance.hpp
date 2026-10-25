@@ -24,10 +24,17 @@ struct Invocation {
     static Invocation read(const nlohmann::json & source);
 };
 
+struct TargetInputs {
+    const RegionGraph & graph;
+    const std::map<std::string, std::size_t> & ports;
+    const GroupValues & groups;
+};
+
 // Target values and calls are private to an expansion; shared asset definitions stay immutable.
 class TemplateInstance {
 public:
-    static TemplateInstance select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation);
+    static TemplateInstance select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation,
+                                   const TargetInputs * inputs = nullptr);
 
     const std::vector<StateChange> & state_changes() const;
     const ValuePorts & ports() const;
@@ -44,6 +51,13 @@ private:
     std::size_t expand_call(const std::string & role, const Invocation & invocation, const Parameters & parameters, std::size_t parent,
                             const ValuePorts & ports, const ParameterGroups & sequences);
     void require_value(std::size_t value, const nlohmann::json & specification);
+    void bind_inputs(const TargetInputs & inputs);
+
+    struct BoundInputs {
+        std::map<std::size_t, std::size_t> values;
+        std::vector<std::optional<std::size_t>> resources;
+        std::map<std::size_t, nlohmann::json> types;
+    };
 
     // The task owns the compiled asset; instances own only their target values, calls and operations.
     const TemplateAsset & asset_;
@@ -53,6 +67,7 @@ private:
     std::vector<std::size_t> outputs_;
     ValuePorts ports_;
     GroupValues group_inputs_;
+    BoundInputs bound_inputs_;
 
     std::size_t layout_;
     std::string role_;

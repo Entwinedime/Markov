@@ -32,7 +32,7 @@ public:
             if (submission.is_null()) continue;
 
             const auto node = submit(submission, action.at("kind").get<std::string>(), action.at("native_api").get<std::string>());
-            if (action.at("kind") == "record_event" || action.at("kind") == "wait_event")
+            if (action.at("kind") == "record_event" || action.at("kind") == "wait_event" || action.at("kind") == "wait_event_complete")
                 event_submissions.insert(submission.at("source_event").get<std::size_t>());
             const auto & target = action.at("target");
             if (!target.is_null()) nodes_[node]["target"] = resource(target.at("kind").get<std::string>(), target.at("identity").get<std::int64_t>());
@@ -162,7 +162,8 @@ private:
     void bind_events(const nlohmann::json & actions) {
         std::vector<const nlohmann::json *> events;
         for (const auto & action : actions) {
-            if (action.at("kind") == "record_event" || action.at("kind") == "wait_event") events.push_back(&action);
+            if (action.at("kind") == "record_event" || action.at("kind") == "wait_event" || action.at("kind") == "wait_event_complete")
+                events.push_back(&action);
         }
         std::ranges::sort(events,
                           [](const auto * left, const auto * right) { return left->at("submission").at("order") < right->at("submission").at("order"); });
@@ -171,28 +172,33 @@ private:
         for (const auto * action : events) {
             const auto & arguments = action->at("native_call");
             const auto & target = action->at("target");
-            if (arguments.is_null() || !arguments.contains("event") || target.is_null() || target.at("kind") != "stream")
-                throw std::invalid_argument("stream event has no observed identity or stream");
+            const bool host_wait = action->at("kind") == "wait_event_complete";
+            if (arguments.is_null() || !arguments.contains("event") || target.is_null() || target.at("kind") != (host_wait ? "event" : "stream"))
+                throw std::invalid_argument("event action has no observed identity or target");
 
-            const auto stream = resource("stream", target.at("identity").get<std::int64_t>());
             const auto source = action->at("source_event").get<std::size_t>();
             const auto origin = identities_.at({ "thread", source });
-
-            // Event APIs define stream barriers even when the profiler omits their device tasks.
-            const auto order = action->at("submission").at("order").get<std::size_t>();
-            const auto barrier = add("event", source, order, "barrier", stream, action->at("native_api").get<std::string>());
-            issues_[barrier] = issues_.at(origin);
-            link(origin, barrier, "submission");
             const auto event = resource("event", arguments.at("event").get<std::int64_t>());
+            auto completion = origin;
+
+            if (!host_wait) {
+
+                // Stream waits queue a barrier; host synchronization waits at the actual API return.
+                const auto stream = resource("stream", target.at("identity").get<std::int64_t>());
+                const auto order = action->at("submission").at("order").get<std::size_t>();
+                completion = add("event", source, order, "barrier", stream, action->at("native_api").get<std::string>());
+                issues_[completion] = issues_.at(origin);
+                link(origin, completion, "submission");
+            }
 
             // Bind the event's device completion, never its CPU enqueue or API return.
-            if (action->at("kind") == "record_event") recorded.insert_or_assign(event, barrier);
-            else if (const auto signal = recorded.find(event); signal != recorded.end()) link(signal->second, barrier, "event_wait");
+            if (action->at("kind") == "record_event") recorded.insert_or_assign(event, completion);
+            else if (const auto signal = recorded.find(event); signal != recorded.end()) link(signal->second, completion, "event_wait");
             else
                 event_requirements_.push_back({
                     { "resource",        event },
                     {   "source",      nullptr },
-                    {   "target",      barrier },
+                    {   "target",   completion },
                     {     "kind", "event_wait" }
                 });
         }
@@ -251,7 +257,7 @@ private:
         if (const auto known = identities_.find({ "thread", source }); known != identities_.end()) return known->second;
 
         const auto begin = submission.at("order").get<std::size_t>();
-        const bool waiting = kind == "wait_stream" || kind == "wait_device";
+        const bool waiting = kind == "wait_stream" || kind == "wait_device" || kind == "wait_event_complete";
         const auto end = waiting || kind == "copy" ? submission.at("completion_order").get<std::size_t>() : begin;
         const auto lane = resource("thread", submission.at("thread").get<std::int64_t>());
         const auto identity = add("thread", source, end, kind, lane, name);
