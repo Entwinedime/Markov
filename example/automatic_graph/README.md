@@ -27,6 +27,8 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话发布全部角色，目标使用同一控制器维护多微批次和唯一 KV 状态。
 
+P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；一对原生服务取得两个角色，目标分别声明 P/D 容量。首期各 TP1、PP1，P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；目标 placement 的两个位置依次属于 P、D。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `pool_free_pages` 报告两池可回收总量。
+
 示例预算是有限上限，不保证任意模型或配置都能在其中完成。初始化、统一预热、观察、导出、处理和失败均计入累计额度；额度不足时保留状态并停止，不隐式扩大预算或循环补采。
 
 ## 来源复用与结果含义

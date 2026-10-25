@@ -16,11 +16,12 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | --- | --- |
 | `framework` | 采集框架；正式入口提供 `sglang` / Ascend |
 | `model.path / dtype` | 固定模型在推理容器中的路径及原生 dtype |
-| `deployment.physical_devices` | 互异非负整数构成的采集设备列表；TP 本地分片使用一张卡，PP 需要实际原生参与者 |
+| `deployment.physical_devices` | 互异非负整数构成的采集设备列表；TP 本地分片使用一张卡，PP 需要实际原生参与者，PD 使用两张卡 |
 | `budget` | `native_seconds`、`processing_seconds`、`temporary_bytes`、`retained_bytes` 四项累计额度，非负整数 |
-| `configurations[]` | 候选配置；每项有唯一 `id`、`tp`、`attention_backend`、`max_running_requests`、`max_total_tokens`、`page_size`、`max_prefill_tokens` |
+| `configurations[]` | 候选配置；共同字段为唯一 `id`、`tp`、`attention_backend`、`page_size`；同一实例另有 `max_running_requests`、`max_total_tokens`、`max_prefill_tokens` |
 | `configurations[].pp / microbatch_requests` | 可选的 PP stage 数和每批成员上限；默认 PP=1，上限为总请求容量除以 PP 后向上取整 |
-| `configurations[].placement.devices` | 可选的单机目标设备列表；按 stage 内 TP rank 排列，数量等于 TP×PP，元素是互异的非负整数 |
+| `configurations[].pd` | P/D 分离时替代单实例容量字段：`prefill` 包含请求容量、token 容量及 Prefill 预算，`decode` 包含请求容量和 token 容量 |
+| `configurations[].placement.devices` | 可选的单机目标设备列表；同实例按 stage 内 TP rank 排列，数量为 TP×PP；PD 为 P、D 两个位置；元素互异且非负 |
 | `workloads[]` | 请求集合；每项有唯一 `id` 和非空 `requests` |
 | `node_durations_ns` | 执行节点种类到非负整数纳秒的映射，明确给定模拟假设 |
 
@@ -28,9 +29,11 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 模型路径须在部署的原生容器中可访问，镜像及模型文件由部署准备。任务保存实际模型配置和镜像身份，恢复不重新解释镜像标签。
 
-`placement` 声明目标绑定，和采集用的 `deployment.physical_devices` 分开；省略时按逻辑 rank 依次绑定目标设备 `0..TP×PP-1`。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个逻辑参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
+`placement` 声明目标绑定，和采集用的 `deployment.physical_devices` 分开；省略时同实例按逻辑 rank 绑定目标设备 `0..TP×PP-1`，PD 的 P/D 分别绑定 0/1。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个逻辑参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
 
 PP 的全局 rank 为 `stage×TP + TP rank`。当前 Ascend 版本不支持 PP2；PP 来源使用实际 TP×PP 参与进程取得，不能仅凭目标模板展开声称单卡可采任意流水线。微批次上限须为正且不超过总请求容量；采集配方和目标上限分别维护。
+
+PD 的字段示例为 [disaggregated.json](../../example/automatic_graph/disaggregated.json)。当前各实例 TP1、PP1，不接收 `pp` 或 `microbatch_requests`；两者模型、dtype、backend 和 KV 页布局相同，容量和槽位独立。一次原生会话对取得两个角色，不把两个副本视为 TP2；PD 与同实例 serving 分别建立来源域，不能直接交换整套模板。
 
 只改变这些设备绑定不会重采本地计算模板；若实际传输或局部实现改变，仍需相应来源。当前给定耗时不随设备标签变化自动产生带宽、争用或异构设备模型。
 
@@ -54,6 +57,8 @@ PP 的全局 rank 为 `stage×TP + TP rank`。当前 Ascend 版本不支持 PP2�
 请求不用按到达排序，同刻按声明顺序处理。输入描述 token 长度和固定输出长度，不提供文本、真实 token 内容、原生 batch 或外部完成时刻。Prefill 产生第一个 token，输出 N 个 token 需要 N−1 次 Decode。内容相关路由、EOS 和缓存命中不由长度虚构。
 
 控制基线是 FCFS、Prefill/Decode 分开。单 stage 保留一个在途批次；PP 以固定 lane 维护微批次，可在不同 stage 并发，结果回传后才提交该批请求效果。控制器为请求预留完成前的峰值页预算，实际页随驻留量分配；模型上下文上限独立于 KV 总容量。框架适配器同时检查原生单请求长度和页预留约束，原生会拒绝或缩短的请求不能作为固定输出预测。某配置无法容纳请求属于该组合的结果，不让其他合法组合因此失去来源。
+
+PD 采用单请求 Prefill、逐请求接入及正常 Decode 组批的轻量规则。D 先预约完整生命周期的容量预算，P 只驻留 prompt 的 KV；传输完成后，D 的 prebuilt 接入发布首 token，不再执行一次模型，输出长度 1 同样经历交接。P 的应答不计作用户输出，确认传输后即可释放源页；两实例和传输分别由完成事件推进，目的容量不足时背压。
 
 `max_prefill_tokens` 是当前非分块路径的软合批预算。预算为正时接纳完整请求，再按框架给出的粒度扣除；SGLang 的固定输出、cold-cache 路径按页取整计量，实际 M 仍按原始 token 长度求和。最后一个完整请求可以超过剩余预算。采集规划据此为实际 M 确定行数上界，已有模板仍受其已发布参数域约束。
 
@@ -103,7 +108,8 @@ workload 增加可选字段 `ep_routes`，按目标 **EP 拓扑 ID** 提供路�
 - `status` 和 `structure.qualification`：结构适用性及仍未证明的边界；请求完成时仍可为 `partial`。
 - `first_output_ns / last_output_ns`：scheduler 向下游交出 token 的可见时刻，不包括 detokenizer、HTTP 或客户端接收。
 - `state_committed_ns`：请求结束及槽位/页效果提交；不同于输出可见。
-- `completed_ns`：最后一个批次的内部结果处理完成，不表示所有异步资源工作已耗尽。
+- PD 的 `pool_free_pages`：两池可回收的页总量，包括尚待原生合并的空闲页，不表示它们已在同一直接分配列表中。`structure.rank_sources` 保留每角色的来源覆盖和原生页复用方式。
+- `completed_ns`：最后一个控制任务完成，PD 包含必要交接和源释放；不表示流程外的异步资源工作已耗尽。
 
 ResultProcessed 推进生成进度和控制状态，RequestOutput 只记录实际输出。所有参与 rank 的内部完成与实际发送角色的输出分别连接，不能以客户端响应或单个 rank 返回替代全体控制就绪。
 

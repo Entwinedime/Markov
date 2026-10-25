@@ -32,6 +32,7 @@ python -m pip install --no-deps --no-build-isolation -e .
 
 ```bash
 example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
+example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json
 example/automatic_graph/run.sh --resume data/YOUR_RUN
 ```
 
@@ -64,6 +65,8 @@ C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架
 
 ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求/KV 状态，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
 
+PD 由 DisaggregatedController 维护一份请求进度和两个 KvPool；页组件同时支持即时归还与待合并后排序，决策不复制页所有权。SGLang 的 DisaggregatedStructure 组合两个 RankStructure，绑定预约、无模型接入、搬运和释放；原生 sorted allocator 的两个缓冲区保持独立，只有分配需要时展开合并模板。框架观察、声明和双服务生命周期分开维护，memfabric 接口事实留在 Ascend runtime adapter。详细结果保留动作完成时刻、页复制对应和展开入口名；默认结果保留请求、两池终态和来源资格。
+
 TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
 
 本地 deprecated 源码只供查阅，由 Git 忽略，不作为远端交付内容，也不进入 build、import 或 fallback。验证矩阵、批量编排和窗口判据留在 example，正式业务不导入示例。
@@ -91,7 +94,7 @@ python example/automatic_graph/serving.py \
 
 多 stage 来源通过一键任务的 pp 和采集设备列表选择原生 TP×PP 会话；每次会话发布全部 rank 来源和对应 physical-rank 文件。TP 本地角色与 PP 来源组共享采集/解释接口，任务环境在 work 中保留 launcher 缓存；不能把缺少 peer 的单卡运行当作完整流水线来源。
 
-固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，代表采集与单步示例共用它。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际声明的预热请求，不预先跑完整目标序列。
+固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，各采集入口共用。代表观察请求另由 adapter 选择；PD 保留较长输出以观察多成员 Decode，原语辅助观察覆盖固定实现分支，两者不代替实际模型来源。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际预热请求。PD 的 capture.json 保存采集输入，responses 目录保存各轮响应，二者职责分开，不预先跑完整目标序列。
 
 宿主调用 modeling 消费来源：
 
