@@ -89,6 +89,8 @@ python example/automatic_graph/serving.py \
 
 示例通过原生 Engine 加载完整模型的 dummy 权重，统一预热后分别执行未插桩和观察路径，关闭会话后调用共同解释入口。未启用 `--profile` 时只解释语义关系；启用时同时生成 `physical.json`。`--tp-size N --rank R` 用于物理单卡执行一个逻辑角色；每个角色使用独立输出目录。单卡辅助传输提供结构来源，不提供真实多卡数值、通信时延或争用样本。
 
+多 stage 来源通过一键任务的 pp 和采集设备列表选择原生 TP×PP 会话；每次会话发布全部 rank 来源和对应 physical-rank 文件。TP 本地角色与 PP 来源组共享采集/解释接口，任务环境在 work 中保留 launcher 缓存；不能把缺少 peer 的单卡运行当作完整流水线来源。
+
 固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，代表采集与单步示例共用它。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际声明的预热请求，不预先跑完整目标序列。
 
 宿主调用 modeling 消费来源：

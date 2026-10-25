@@ -21,15 +21,17 @@ docker compose -p markov-next-redesign -f docker/compose/inference.yml build sgl
 example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 ```
 
-`MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，目标 TP 不要求现场拥有同样数量的卡。
+`MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，TP 本地分片不要求现场拥有目标数量的卡；PP 采集使用实际 TP×PP 参与进程。
 
-配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_device` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
+配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP×PP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_devices` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
+
+PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话发布全部角色，目标使用同一控制器维护多微批次和唯一 KV 状态。
 
 示例预算是有限上限，不保证任意模型或配置都能在其中完成。初始化、统一预热、观察、导出、处理和失败均计入累计额度；额度不足时保留状态并停止，不隐式扩大预算或循环补采。
 
 ## 来源复用与结果含义
 
-每次任务固定一个模型。dtype、TP、attention backend 和 page_size 相同的配置共享来源；每个域按实际逻辑 rank 取得本地分片。不同模型或域分别建立来源，不以普通 rank 的相似 shape 自动替代所有角色，也不声明同库跨 TP 或跨页大小变换。
+每次任务固定一个模型。dtype、TP、PP、attention backend 和 page_size 相同的配置共享来源；每个域按实际逻辑 rank 取得本地分片。不同模型或域分别建立来源，不以普通 rank 的相似 shape 自动替代所有角色，也不声明同库跨 TP 或跨页大小变换。
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 

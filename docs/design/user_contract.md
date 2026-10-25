@@ -16,10 +16,11 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | --- | --- |
 | `framework` | 采集框架；正式入口提供 `sglang` / Ascend |
 | `model.path / dtype` | 固定模型在推理容器中的路径及原生 dtype |
-| `deployment.physical_device` | 执行采集的单张物理设备，非负整数；不代表目标 TP |
+| `deployment.physical_devices` | 互异非负整数构成的采集设备列表；TP 本地分片使用一张卡，PP 需要实际原生参与者 |
 | `budget` | `native_seconds`、`processing_seconds`、`temporary_bytes`、`retained_bytes` 四项累计额度，非负整数 |
 | `configurations[]` | 候选配置；每项有唯一 `id`、`tp`、`attention_backend`、`max_running_requests`、`max_total_tokens`、`page_size`、`max_prefill_tokens` |
-| `configurations[].placement.devices` | 可选的单机目标设备列表；按逻辑 TP rank 排列，数量等于 TP，元素是互异的非负整数 |
+| `configurations[].pp / microbatch_requests` | 可选的 PP stage 数和每批成员上限；默认 PP=1，上限为总请求容量除以 PP 后向上取整 |
+| `configurations[].placement.devices` | 可选的单机目标设备列表；按 stage 内 TP rank 排列，数量等于 TP×PP，元素是互异的非负整数 |
 | `workloads[]` | 请求集合；每项有唯一 `id` 和非空 `requests` |
 | `node_durations_ns` | 执行节点种类到非负整数纳秒的映射，明确给定模拟假设 |
 
@@ -27,7 +28,9 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 模型路径须在部署的原生容器中可访问，镜像及模型文件由部署准备。任务保存实际模型配置和镜像身份，恢复不重新解释镜像标签。
 
-`placement` 声明目标绑定，和采集用的 `deployment.physical_device` 分开；省略时按逻辑 rank 依次绑定目标设备 `0..TP-1`。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个 TP 参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
+`placement` 声明目标绑定，和采集用的 `deployment.physical_devices` 分开；省略时按逻辑 rank 依次绑定目标设备 `0..TP×PP-1`。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个逻辑参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
+
+PP 的全局 rank 为 `stage×TP + TP rank`。当前 Ascend 版本不支持 PP2；PP 来源使用实际 TP×PP 参与进程取得，不能仅凭目标模板展开声称单卡可采任意流水线。微批次上限须为正且不超过总请求容量；采集配方和目标上限分别维护。
 
 只改变这些设备绑定不会重采本地计算模板；若实际传输或局部实现改变，仍需相应来源。当前给定耗时不随设备标签变化自动产生带宽、争用或异构设备模型。
 
@@ -36,7 +39,7 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | 变化 | 正式流程的处理 |
 | --- | --- |
 | 请求数量、输入/输出长度、到达、并发上限、KV 总容量、非 chunked Prefill 预算 | 在同一来源域内按目标参数与状态变换、重组模板；仍须满足来源规则、模型上下文和原生资源约束 |
-| TP、dtype、attention backend、page_size | 分别建立来源域，每域采集全部必要逻辑 rank；目前没有跨这些域的模板迁移 |
+| TP、PP、dtype、attention backend、page_size | 分别建立来源域，每域采集全部必要逻辑 rank；目前没有跨这些域的模板迁移 |
 | 模型 | 每次任务固定一个模型；换模型建立相应来源，已接入家族通过同一采集流程处理，不要求用户手改模板 |
 | chunk、overlap、缓存命中、speculative 等 | 需要扩展控制、状态和相应模板能力；现有合同不接受未实现的选项 |
 
@@ -50,7 +53,7 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 请求不用按到达排序，同刻按声明顺序处理。输入描述 token 长度和固定输出长度，不提供文本、真实 token 内容、原生 batch 或外部完成时刻。Prefill 产生第一个 token，输出 N 个 token 需要 N−1 次 Decode。内容相关路由、EOS 和缓存命中不由长度虚构。
 
-控制基线是 FCFS、Prefill/Decode 分开、每副本一个在途模型批次。控制器为请求预留完成前的峰值页预算，实际页随驻留量分配；模型上下文上限独立于 KV 总容量。框架适配器同时检查原生单请求长度和页预留约束，原生会拒绝或缩短的请求不能作为固定输出预测。某配置无法容纳请求属于该组合的结果，不让其他合法组合因此失去来源。
+控制基线是 FCFS、Prefill/Decode 分开。单 stage 保留一个在途批次；PP 以固定 lane 维护微批次，可在不同 stage 并发，结果回传后才提交该批请求效果。控制器为请求预留完成前的峰值页预算，实际页随驻留量分配；模型上下文上限独立于 KV 总容量。框架适配器同时检查原生单请求长度和页预留约束，原生会拒绝或缩短的请求不能作为固定输出预测。某配置无法容纳请求属于该组合的结果，不让其他合法组合因此失去来源。
 
 `max_prefill_tokens` 是当前非分块路径的软合批预算。预算为正时接纳完整请求，再按框架给出的粒度扣除；SGLang 的固定输出、cold-cache 路径按页取整计量，实际 M 仍按原始 token 长度求和。最后一个完整请求可以超过剩余预算。采集规划据此为实际 M 确定行数上界，已有模板仍受其已发布参数域约束。
 
@@ -120,6 +123,8 @@ data/<UTC时间>_automatic-graph/
 ├── state.json              唯一任务状态、来源引用及累计额度
 └── work/                   SDK、观察库及尚未发布的角色草稿
 ```
+
+结果计数中的 `batches` 表示模型迭代，`actions` 表示阶段或结果动作；PP 的一次迭代包含多个动作。明细区域按同一 batch 身份连接各 stage，动作和 lane 单独标记。
 
 默认结果不保留完整历史图。首次运行的 `--details` 在同一业务执行中保留目标图、逐批/逐 token 记录及原始 profiler/runtime 导出；原始导出仍位于对应 capture，不复制到另一份诊断目录。正式来源和模板是机器资产，不因精简展示而裁剪。
 
