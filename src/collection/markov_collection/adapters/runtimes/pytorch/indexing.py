@@ -103,6 +103,34 @@ class TensorViewCall(NativeCall):
         return None
 
 
+class TensorPartitionCall(NativeCall):
+    def __init__(self, values: Any, original: Any) -> None:
+        super().__init__(values.recording, values, original.__qualname__, original, {}, interface="tensor_partition")
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> None:
+        tensor = args[0] if args else kwargs["input"]
+        sections = args[1] if len(args) > 1 else kwargs["indices_or_sections"]
+        dimension = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+        source = self.values.shapes.tensor(tensor)
+        dimension %= source.ndim
+        extent = source.shape[dimension]
+        quotient, remainder = extent // sections, extent % sections
+
+        # Native tensor_split keeps the original storage; only each slice's symbolic bounds change.
+        for index, output in enumerate(result):
+            shape = list(source.shape)
+            shape[dimension] = (extent + sections - index - 1) // sections
+            start = index * quotient + torch.sym_min(index, remainder)
+            with self.values.shapes.mode:
+                offset = source.storage_offset() + start * source.stride(dimension)
+                fake = source.as_strided(shape, source.stride(), offset)
+            self.values.shapes.tensors[output] = fake
+            self.values.shapes.unavailable.pop(output, None)
+            self.values.publish_shape(output)
+
+
 class TensorViewObservation(TorchFunctionMode):
     def __init__(
         self, values: Any, buffers: list[tuple[Any, tuple[Any, ...]]], start: Any = None, index: Any = None

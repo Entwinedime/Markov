@@ -24,11 +24,12 @@ class NativeServingSession:
         matrix_selection: dict[str, object],
         native_library: str,
         pp_size: int = 1,
+        ep_size: int = 1,
         dtype: str = "bfloat16",
         attention_backend: str = "ascend",
     ) -> None:
 
-        self.roles = self.source_roles(tp_size, pp_size, rank)
+        self.roles = self.source_roles(tp_size, pp_size, rank, ep_size)
         self.model = model
         self.requests = requests
         self.output = output.resolve()
@@ -36,6 +37,8 @@ class NativeServingSession:
         self.tp_size = tp_size
         self.rank = rank
         self.pp_size = pp_size
+        self.ep_size = ep_size
+        self.native_group = pp_size > 1 or ep_size > 1
         self.dtype = dtype
         self.attention_backend = attention_backend
         self.configuration = configuration
@@ -43,12 +46,14 @@ class NativeServingSession:
         self.native_library = native_library
 
     @staticmethod
-    def source_roles(tp: int, pp: int, rank: int) -> range:
+    def source_roles(tp: int, pp: int, rank: int, ep: int = 1) -> range:
 
         # The pinned upstream Ascend capability table explicitly excludes PP2.
         if pp == 2:
             raise ValueError("this SGLang Ascend implementation does not support PP2")
-        return range(tp * pp) if pp > 1 else range(rank, rank + 1)
+        if ep > 1 and ep != tp:
+            raise ValueError("this SGLang DeepEP implementation requires EP to equal TP")
+        return range(tp * pp) if pp > 1 or ep > 1 else range(rank, rank + 1)
 
     @staticmethod
     def warmup_requests(page_size: int) -> tuple[tuple[int, int], ...]:
@@ -106,14 +111,22 @@ class NativeServingSession:
             "matrix_selection": self.matrix_selection,
             "native_library": self.native_library,
             "pp_size": self.pp_size,
+            "ep_size": self.ep_size,
         }
-        if self.tp_size > 1 and self.pp_size == 1:
+        if self.tp_size > 1 and not self.native_group:
             session["shard"] = {"size": self.tp_size, "rank": self.rank}
         if description.exists():
             raise FileExistsError(f"native session already exists: {description}")
         write_json(description, session)
         os.environ["MARKOV_GRAPH_SESSION"] = str(description)
         os.environ["SGLANG_PLUGINS"] = "markov"
+
+        expert_options = {}
+        if self.ep_size > 1:
+
+            # Select the qualified native all-to-all implementation before workers start.
+            os.environ.update(DEEP_USE_ALLTOALL_MODE="1", DEEPEP_HCCL_BUFFSIZE="1024", HCCL_BUFFSIZE="1024")
+            expert_options = {"ep_size": self.ep_size, "moe_a2a_backend": "deepep", "deepep_mode": "normal"}
 
         from sglang.srt.entrypoints.engine import Engine
 
@@ -123,8 +136,9 @@ class NativeServingSession:
             skip_tokenizer_init=True,
             device="npu",
             dtype=self.dtype,
-            tp_size=self.tp_size if self.pp_size > 1 else 1,
+            tp_size=self.tp_size if self.native_group else 1,
             pp_size=self.pp_size,
+            **expert_options,
             load_format="dummy",
             attention_backend=self.attention_backend,
             **self.configuration,
@@ -157,7 +171,7 @@ class NativeServingSession:
             finally:
                 if self.profile:
                     engine.stop_profile()
-                    if self.pp_size > 1:
+                    if self.native_group:
                         directories = [self.output / "native" / f"rank-{rank}" for rank in self.roles]
                         while not all(directory.is_dir() for directory in directories):
                             time.sleep(0.05)
@@ -175,6 +189,7 @@ class NativeServingSession:
             "weight_source": "native_dummy_loader_full_model",
             "logical_tp": self.tp_size,
             "logical_pp": self.pp_size,
+            "logical_ep": self.ep_size,
             "rank": self.rank,
             "configuration": self.configuration,
             "matrix_selection": self.matrix_selection,

@@ -212,11 +212,14 @@ class SGLangPrimitives:
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from torch.nn import Linear
 
         weights = []
         attention = set()
         for module in model.modules():
-            if isinstance(module, LinearBase) and isinstance(module.quant_method, UnquantizedLinearMethod):
+            if isinstance(module, Linear) or (
+                isinstance(module, LinearBase) and isinstance(module.quant_method, UnquantizedLinearMethod)
+            ):
 
                 # Both Prefill token rows and Decode member rows use the actual loaded local shard.
                 weights.extend((module.weight, axis) for axis in ("M", "B"))

@@ -22,13 +22,13 @@ class AscendMatrices:
         self.binary = binary
         self.limits = limits
         self.version = version
-        self.sources: dict[tuple[int, int, str, str], torch.Tensor] = {}
-        self.selections: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+        self.sources: dict[tuple[int, int, str], torch.Tensor] = {}
+        self.selections: dict[tuple[int, int, str], dict[str, Any]] = {}
         self.captured = False
 
     @staticmethod
-    def key(inner: int, columns: int, dtype: str, axis: str) -> tuple[int, int, str, str]:
-        return inner, columns, dtype, axis
+    def key(inner: int, columns: int, dtype: str) -> tuple[int, int, str]:
+        return inner, columns, dtype
 
     def prepare(self, weights: list[tuple[torch.Tensor, str]]) -> None:
         soc = torch.npu.get_device_name()
@@ -43,21 +43,20 @@ class AscendMatrices:
             root / f"opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/{platform.machine()}/libophost_comm_legacy.so"
         )
 
-        requests = []
+        requests = {}
         for weight, axis in weights:
             columns, inner = weight.shape
-            key = self.key(inner, columns, str(weight.dtype), axis)
+            key = self.key(inner, columns, str(weight.dtype))
             if key in self.sources:
+                requests[key]["max_rows"] = max(requests[key]["max_rows"], self.limits[axis])
                 continue
             self.sources[key] = weight
-            requests.append(
-                {"K": inner, "N": columns, "dtype": str(weight.dtype), "axis": axis, "max_rows": self.limits[axis]}
-            )
+            requests[key] = {"K": inner, "N": columns, "dtype": str(weight.dtype), "max_rows": self.limits[axis]}
 
         descriptions = []
 
         # The native query exhausts each declared row domain; only compressed conditions are retained.
-        for request in requests:
+        for request in requests.values():
             response = subprocess.check_output(
                 [
                     self.binary,
@@ -72,7 +71,7 @@ class AscendMatrices:
                 text=True,
             )
             descriptions.append({**request, **json.loads(response)})
-        self.selections = {self.key(item["K"], item["N"], item["dtype"], item["axis"]): item for item in descriptions}
+        self.selections = {self.key(item["K"], item["N"], item["dtype"]): item for item in descriptions}
         self.description = {
             "provider": "LegacyMmCheckHitV3Shape",
             "cann": self.version,
@@ -86,7 +85,7 @@ class AscendMatrices:
             torch.matmul(torch.ones((rows, key[0]), device=weight.device, dtype=weight.dtype), weight.T)
         torch.npu.synchronize()
 
-    def points(self) -> list[tuple[tuple[int, int, str, str], int]]:
+    def points(self) -> list[tuple[tuple[int, int, str], int]]:
         points = []
         for key, selection in self.selections.items():
             intervals = selection["v3_intervals"]
@@ -117,7 +116,7 @@ class AscendMatrices:
                         "kind": "primitive",
                         "phase": "primitive",
                         "members": [],
-                        "parameters": {key[3]: rows},
+                        "parameters": {"matrix_rows": rows},
                         "observation": "source" if observed else "baseline",
                     }
                 )
@@ -125,8 +124,8 @@ class AscendMatrices:
                     self.operators.begin_batch()
                     with self.recording.scope("RuntimePrototype", batch=identity), self.operators:
                         with self.operators.values.metadata():
-                            self.operators.values.bounded_parameter(key[3], 1, self.limits[key[3]])
-                            self.operators.values.bind(left, {0: key[3]})
+                            self.operators.values.bounded_parameter("matrix_rows", 1, self.selections[key]["max_rows"])
+                            self.operators.values.bind(left, {0: "matrix_rows"})
                         torch.matmul(left, right)
                 else:
                     with TorchMarkers.scope(f"markov.baseline/{identity}"):
@@ -134,16 +133,37 @@ class AscendMatrices:
                 torch.npu.synchronize()
         self.captured = True
 
-    def declare(self) -> None:
-        for operation in self.recording.operations:
+    @staticmethod
+    def declare(
+        regions: list[dict[str, Any]],
+        operations: list[dict[str, Any]],
+        values: list[dict[str, Any]],
+        description: dict[str, Any],
+    ) -> None:
+        selections = {
+            AscendMatrices.key(item["K"], item["N"], item["dtype"]): item for item in description["matrices"]
+        }
+        for operation in operations:
             geometry = operation.get("matrix_selection")
             if geometry is None:
                 continue
+
+            scope = regions[operation["region"]]
+            output = scope["metadata"]["ports"]["outputs"]["result"]
+            parent = regions[scope["parent"]]
+            for contract in parent["metadata"].get("shape_contracts", []):
+                if contract["value"] == output:
+
+                    # The caller's recorded return relation leaves the local matrix axis inside its own API.
+                    values[output]["shape_relation"] = contract["shape"]
+            declarations = scope["metadata"].get("shape_contracts", [])
+            scope["metadata"]["shape_contracts"] = [
+                declaration for declaration in declarations if declaration["value"] != output
+            ] + [{"value": output, "shape": ["matrix_rows", geometry["N"]]}]
+
             axis = geometry["axis"]
-            if not isinstance(axis, str) or axis not in self.limits:
-                raise NotImplementedError(f"dense matrix row relation needs a bounded input axis: {axis}")
-            key = self.key(geometry["K"], geometry["N"], geometry["dtype"], axis)
-            selection = self.selections[key]
+            key = AscendMatrices.key(geometry["K"], geometry["N"], geometry["dtype"])
+            selection = selections[key]
             intervals = selection["v3_intervals"]
             selected = any(first <= geometry["rows"] <= last for first, last in intervals)
 

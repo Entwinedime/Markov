@@ -48,8 +48,8 @@ class DockerEnvironment:
         return [
             "docker",
             "exec",
-            "-e",
-            "PYTHONPATH=/workspace/trace-sim/src/collection:/workspace/trace-sim/third_party/sglang/python",
+            "--workdir",
+            self.native_path(output),
             "-e",
             f"LD_PRELOAD={self.native_path(self.observer_build / library)}",
             "-e",

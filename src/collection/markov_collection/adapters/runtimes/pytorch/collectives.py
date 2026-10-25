@@ -4,6 +4,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from markov_collection.instrumentation.calls import NativeCall
+
+
+class CommunicationWork(NativeCall):
+    def __init__(self, values: Any, work: Any, tensors: tuple[Any, ...]) -> None:
+        super().__init__(
+            values.recording, values, "torch.distributed.Work.wait", work.wait, {}, interface="communication_wait"
+        )
+        self.tensors = tensors
+
+    def wait(self, *args: Any, **kwargs: Any) -> Any:
+        return self(*args, **kwargs)
+
+    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
+        return self.tensors, ()
+
 
 class AllReduceGeometry:
     @staticmethod

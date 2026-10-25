@@ -32,6 +32,23 @@ class BatchTensors:
 
         return result
 
+    @staticmethod
+    def declare_model_inputs(regions: list[dict[str, Any]], values: list[dict[str, Any]]) -> None:
+        for region in regions:
+            if region["role"] not in {"Prefill", "Decode"}:
+                continue
+            metadata = region["metadata"]
+            columns = {
+                value: ["B", *values[value]["shape"][1:]]
+                for name, value in metadata["ports"]["inputs"].items()
+                if name in BatchTensors.fields
+            }
+
+            # Prepared columns belong to this batch even when the native filter returned the same tensor object.
+            metadata["shape_contracts"] = [
+                contract for contract in metadata.get("shape_contracts", []) if contract["value"] not in columns
+            ] + [{"value": value, "shape": shape} for value, shape in columns.items()]
+
 
 class BatchTransitionCall(NativeCall):
     def __init__(

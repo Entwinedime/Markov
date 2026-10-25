@@ -17,8 +17,9 @@ from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils.weak import WeakIdKeyDictionary
 
 from markov_collection.adapters.runtimes.pytorch.factories import TensorCreationCall
-from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
+from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall, TensorPartitionCall
 from markov_collection.adapters.runtimes.pytorch.shape_arguments import ShapeArguments
+from markov_collection.instrumentation.calls import ShapeUnavailable
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,11 @@ class ShapeFunctions(TorchFunctionMode):
 
         if self.values.interface is not None:
             return function(*args, **kwargs)
+
+        if function in (torch.Tensor.tensor_split, torch.tensor_split):
+            sections = args[1] if len(args) > 1 else kwargs.get("indices_or_sections")
+            if type(sections) is int:
+                return TensorPartitionCall(self.values, function)(*args, **kwargs)
 
         if function is torch.Tensor.__getitem__:
             indices = args[1] if isinstance(args[1], tuple) else (args[1],)
@@ -288,7 +294,7 @@ class ShapeRelations:
 
     def tensor(self, tensor: torch.Tensor) -> Any:
         if tensor in self.unavailable:
-            raise RuntimeError(f"input shape relation unavailable: {self.unavailable[tensor]}")
+            raise ShapeUnavailable(f"input shape relation unavailable: {self.unavailable[tensor]}")
         if tensor not in self.tensors:
             with torch._C.DisableTorchFunction(), _disable_current_modes():
                 self.tensors[tensor] = self.mode.from_tensor(tensor, static_shapes=True)

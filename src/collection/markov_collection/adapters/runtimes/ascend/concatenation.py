@@ -81,17 +81,18 @@ class AscendConcatenation:
                 torch.npu.synchronize()
         self.captured = True
 
-    def declare(self) -> None:
-        for region in self.recording.regions:
+    @classmethod
+    def declare(cls, regions: list[dict[str, Any]], source_values: list[dict[str, Any]]) -> None:
+        for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "concatenate":
                 continue
             group = metadata["input_groups"]["segments"]
             members = group["members"]
-            values = [self.recording.values[member["value"]] for member in members]
+            values = [source_values[member["value"]] for member in members]
             if (
                 group["device"] != "npu"
-                or group["dtype"] not in self.dtype_bytes
+                or group["dtype"] not in cls.dtype_bytes
                 or metadata["attributes"]["axis"] != 0
                 or any(
                     len(value["shape"]) != 1 or value["stride"] != [1] or value["dtype"] != group["dtype"]
@@ -102,29 +103,29 @@ class AscendConcatenation:
 
             # Filtering and alignment are functions of actual members, including a completely full KV pool.
             lengths = [member["parameters"]["extent"] for member in members]
-            width = self.dtype_bytes[group["dtype"]]
+            width = cls.dtype_bytes[group["dtype"]]
             nonempty = sum(length > 0 for length in lengths)
-            aligned = sum(length > 0 and length * width % self.alignment_bytes == 0 for length in lengths)
+            aligned = sum(length > 0 and length * width % cls.alignment_bytes == 0 for length in lengths)
             group["sums"].update(
                 {
                     "nonempty_segments": ["lt", 0, "extent"],
                     "aligned_segments": [
                         "and",
                         ["lt", 0, "extent"],
-                        ["eq", ["mod", ["mul", width, "extent"], self.alignment_bytes], 0],
+                        ["eq", ["mod", ["mul", width, "extent"], cls.alignment_bytes], 0],
                     ],
                 }
             )
             metadata["parameters"].update(nonempty_segments=nonempty, aligned_segments=aligned)
-            vectorized = self.fan_in < nonempty <= self.aligned_fan_in and aligned == nonempty
+            vectorized = cls.fan_in < nonempty <= cls.aligned_fan_in and aligned == nonempty
             metadata["execution_guards"] = [
                 {"condition": ["eq", "nonempty_segments", 0], "expected": nonempty == 0},
                 {"condition": ["eq", "nonempty_segments", 1], "expected": nonempty == 1},
                 {
                     "condition": [
                         "and",
-                        ["lt", self.fan_in, "nonempty_segments"],
-                        ["le", "nonempty_segments", self.aligned_fan_in],
+                        ["lt", cls.fan_in, "nonempty_segments"],
+                        ["le", "nonempty_segments", cls.aligned_fan_in],
                         ["eq", "aligned_segments", "nonempty_segments"],
                     ],
                     "expected": vectorized,
@@ -135,5 +136,5 @@ class AscendConcatenation:
                 metadata["execution_reduction"] = {
                     "group": "segments",
                     "field": "extent",
-                    "fan_in": self.aligned_fan_in if vectorized else self.fan_in,
+                    "fan_in": cls.aligned_fan_in if vectorized else cls.fan_in,
                 }

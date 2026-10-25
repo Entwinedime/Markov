@@ -58,6 +58,7 @@ class NativeDisaggregatedSession:
                 "matrix_selection": self.request["matrix_selection"],
                 "native_library": self.request["native_library"],
                 "pp_size": 1,
+                "ep_size": 1,
                 "disaggregation_role": role,
             },
         )

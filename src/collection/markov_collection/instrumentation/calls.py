@@ -9,6 +9,10 @@ from typing import Any
 from markov_collection.instrumentation.recording import Recording
 
 
+class ShapeUnavailable(RuntimeError):
+    """The native result exists, but its reusable shape relation is not established."""
+
+
 class NativeCall:
     def __init__(
         self,
@@ -83,7 +87,15 @@ class NativeCall:
                     if self.values.versions[storage] == version:
                         self.values.versions[storage] += 1
 
-                scope.metadata["shape_error"] = self.completed(args, kwargs, result, scope.metadata)
+                try:
+                    scope.metadata["shape_error"] = self.completed(args, kwargs, result, scope.metadata)
+                except ShapeUnavailable as error:
+
+                    # Preserve complete native evidence; template construction still rejects this unresolved relation.
+                    scope.metadata["shape_error"] = str(error)
+                    for tensor in self.values.tensor_leaves(self.outputs(result)):
+                        self.values.shapes.unavailable[tensor] = self.path
+                        self.values.shapes.tensors.pop(tensor, None)
                 scope.metadata["result"] = self.values.encode(result)
                 scope.metadata["outputs"] = self.values.references(self.outputs(result))
                 if modified:

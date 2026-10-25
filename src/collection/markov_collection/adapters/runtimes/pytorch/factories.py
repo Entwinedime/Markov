@@ -17,10 +17,12 @@ class TensorGeometryObservation:
         data_shape: tuple[str | int, ...] | None = None,
         sources: tuple[Any, ...] | None = None,
         factories: dict[Any, tuple[str | int, ...]] | None = None,
+        scalars: dict[tuple[Any, str], int] | None = None,
     ) -> None:
         self.values = values
         self.data_shape = data_shape
         self.factories = {inspect.unwrap(function): shape for function, shape in (factories or {}).items()}
+        self.scalars = scalars or {}
 
         self.sources = None if sources is None else list(sources)
         self.scope = values.recording.current_scope.get()
@@ -53,7 +55,7 @@ class TensorGeometryObservation:
         return None
 
     def local_geometry(self, code: Any, name: str) -> int | None:
-        return None
+        return self.scalars.get((code, name))
 
 
 class TensorGeometryCall(NativeCall):

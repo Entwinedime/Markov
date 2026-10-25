@@ -44,14 +44,26 @@ class ShapeArguments:
                 node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
             )
             statements = tree.body[0].body if isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)) else []
-            assignments = {
-                statement.targets[0].id: statement.value
-                for statement in statements
-                if isinstance(statement, ast.Assign)
-                and len(statement.targets) == 1
-                and isinstance(statement.targets[0], ast.Name)
-                and writes[statement.targets[0].id] == 1
-            }
+            assignments = {}
+            for statement in statements:
+                if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+                    continue
+
+                pending = [(statement.targets[0], statement.value)]
+                while pending:
+                    target, expression = pending.pop()
+                    if isinstance(target, ast.Name) and writes[target.id] == 1:
+                        assignments[target.id] = expression
+                    elif isinstance(target, (ast.Tuple, ast.List)) and not any(
+                        isinstance(item, ast.Starred) for item in target.elts
+                    ):
+
+                        # Fixed unpacking preserves each dimension's source instead of matching its observed integer.
+                        for index, item in enumerate(target.elts):
+                            value = ast.copy_location(
+                                ast.Subscript(value=expression, slice=ast.Constant(index), ctx=ast.Load()), expression
+                            )
+                            pending.append((item, value))
             self.calls[frame.f_code] = (
                 first,
                 [node for node in ast.walk(tree) if isinstance(node, ast.Call)],
@@ -187,6 +199,11 @@ class ShapeArguments:
                 raise NotImplementedError("mutable Python shape lists need an explicit geometry declaration")
             return value
         if isinstance(node, ast.Attribute):
+            origin = self.values.tensor_geometry
+            if origin is not None:
+                declared = origin.local_geometry(frame.f_code, ast.unparse(node))
+                if declared is not None:
+                    return declared
             value = self.expression(node.value, frame)
             if isinstance(value, torch.Tensor):
                 tensor = self.values.shapes.tensor(value)

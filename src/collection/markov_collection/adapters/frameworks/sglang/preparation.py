@@ -118,10 +118,15 @@ class BatchPreparationCall(TensorGeometryCall):
 
 
 class InputStagingCall(NativeCall):
+    def __init__(self, *args: Any, native_padding: bool, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.native_padding = native_padding
+
     def invoke(self, runner: Any, forward_batch: Any, *args: Any, **kwargs: Any) -> Any:
         with self.values.metadata():
             symbols = self.values.shapes
-            members, tokens = symbols.symbol("B"), symbols.symbol("M")
+            members = symbols.symbol("model_members" if self.native_padding else "B")
+            tokens = symbols.symbol("model_tokens" if self.native_padding else "M")
             buffers = []
 
             # The native registry owns slot axes and geometry, including non-leading token axes.
@@ -140,9 +145,10 @@ class InputStagingCall(NativeCall):
 
 
 class SGLangPreparation:
-    def __init__(self, values: Any, fields: dict[str, str] = BatchTensors.fields) -> None:
+    def __init__(self, values: Any, fields: dict[str, str] = BatchTensors.fields, native_padding: bool = False) -> None:
         self.values = values
         self.fields = fields
+        self.native_padding = native_padding
 
     def grouped_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return ExtendAllocationCall(
@@ -221,7 +227,9 @@ class SGLangPreparation:
         )(*args, **kwargs)
 
     def stage_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
-        return InputStagingCall(self.values.recording, self.values, original.__qualname__, original, {})(
+        return InputStagingCall(
+            self.values.recording, self.values, original.__qualname__, original, {}, native_padding=self.native_padding
+        )(
             *args, **kwargs
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import torch
@@ -60,14 +61,35 @@ class AscendOperatorObservation(OperatorObservation):
                     "K": left.shape[1],
                     "N": right.shape[1],
                     "dtype": str(left.dtype),
-                    "axis": relation[0] if relation is not None else None,
+                    "axis": "matrix_rows",
                 }
         if geometry is None:
             return super().record_operation(operation, args, kwargs)
 
         # Isolate the actual operator, so a local prototype can serve any enclosing model module.
-        with self.recording.scope("call", path=str(operation)):
-            identity = len(self.recording.operations)
-            result = super().record_operation(operation, args, kwargs)
-            self.recording.operations[identity]["matrix_selection"] = geometry
-            return result
+        outer = self.values.shapes.tensors.get(left) if relation is not None else None
+        with self.recording.scope("call", path=str(operation)) as scope:
+            scope.metadata.update(
+                entrypoint="dense_matrix", call_family="dense_matrix", parameters={"matrix_rows": left.shape[0]}
+            )
+            with self.values.metadata():
+                self.values.bounded_parameter("matrix_rows", 1, sys.maxsize)
+            with self.values.bind_input(left, {0: "matrix_rows"}):
+                with self.values.metadata():
+                    scope.metadata["ports"] = {
+                        "inputs": self.values.port_values({"left": left, "right": right}), "outputs": {}
+                    }
+                    scope.metadata["inputs"] = list(scope.metadata["ports"]["inputs"].values())
+                    identity = len(self.recording.operations)
+                result = super().record_operation(operation, args, kwargs)
+                with self.values.metadata():
+                    self.recording.operations[identity]["matrix_selection"] = geometry
+                    scope.metadata["ports"]["outputs"] = self.values.port_values({"result": result})
+
+        with self.values.metadata():
+            if outer is None:
+                self.values.shapes.unavailable[result] = "dense matrix input relation unavailable"
+                self.values.shapes.tensors.pop(result, None)
+            else:
+                self.values.bind_shape(result, (outer.shape[0], geometry["N"]))
+        return result

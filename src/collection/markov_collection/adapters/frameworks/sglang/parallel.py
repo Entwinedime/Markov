@@ -1,9 +1,13 @@
-"""Observe native logical TP shards using one physical worker and explicit collective ports."""
+"""Observe native process groups and isolated logical TP shards through explicit ports."""
 
 from __future__ import annotations
 
+import inspect
+from functools import partial
+from pathlib import Path
 from typing import Any
 
+from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
@@ -28,7 +32,11 @@ class CollectiveCall(NativeCall):
         regions: list[dict[str, Any]], operations: list[dict[str, Any]], values: list[dict[str, Any]]
     ) -> None:
         calls: dict[int, list[dict[str, Any]]] = {}
-        native = {"all_reduce": "c10d.allreduce_.default", "all_gather": "c10d._allgather_base_.default"}
+        native = {
+            "all_reduce": "c10d.allreduce_.default",
+            "all_gather": "c10d._allgather_base_.default",
+            "reduce_scatter": "c10d._reduce_scatter_base_.default",
+        }
         for operation in operations:
             if operation["name"] in native.values():
                 calls.setdefault(operation["region"], []).append(operation)
@@ -43,7 +51,7 @@ class CollectiveCall(NativeCall):
 
             # Mark the actual backend call; all-gather's later layout work remains local device work.
             transport["communication"] = True
-            if primitive == "all_gather":
+            if primitive == "all_gather" and not metadata["communication"].get("buffered_output"):
                 source = values[metadata["inputs"][0]]
                 shape = source["shape_relation"]
                 if shape is None:
@@ -60,6 +68,7 @@ class CollectiveCall(NativeCall):
                 ]
 
     def __init__(self, values: Any, size: int, kind: str, original: Any) -> None:
+        self.buffered = kind in {"all_gather_into_tensor", "reduce_scatter_tensor"}
         super().__init__(
             values.recording,
             values,
@@ -67,10 +76,18 @@ class CollectiveCall(NativeCall):
             original,
             {},
             interface="collective",
-            mutations=(0,) if kind == "all_reduce" else (),
+            mutations=(0,) if self.buffered or kind == "all_reduce" else (),
         )
         self.size = size
-        self.kind = kind
+        self.kind = {"all_gather_into_tensor": "all_gather", "reduce_scatter_tensor": "reduce_scatter"}.get(kind, kind)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        if self.buffered:
+            self.output = args[0]
+        return super().invoke(*args, **kwargs)
+
+    def outputs(self, result: Any) -> Any:
+        return self.output if self.buffered else result
 
     def completed(
         self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
@@ -79,20 +96,122 @@ class CollectiveCall(NativeCall):
             "primitive": self.kind,
             "group": "tp",
             "size": self.size,
-            "dimension": args[1] if self.kind == "all_gather" else None,
+            "dimension": 0 if self.buffered else args[1] if self.kind == "all_gather" else None,
         }
+        if self.buffered:
+            metadata["communication"]["buffered_output"] = True
+        source = args[1] if self.buffered else args[0]
+        output = self.outputs(result)
         shapes = self.values.shapes
-        if args[0] in shapes.unavailable:
-            shapes.unavailable[result] = self.path
-            shapes.tensors.pop(result, None)
-            return f"collective input relation unavailable: {shapes.unavailable[args[0]]}"
+        if source in shapes.unavailable:
+            shapes.unavailable[output] = self.path
+            shapes.tensors.pop(output, None)
+            return f"collective input relation unavailable: {shapes.unavailable[source]}"
 
-        shape = list(shapes.tensor(args[0]).shape)
+        shape = list(shapes.tensor(source).shape)
         if self.kind == "all_gather":
-            shape[args[1]] *= self.size
-        self.values.bind_shape(result, shape)
+            shape[0 if self.buffered else args[1]] *= self.size
+        elif self.kind == "reduce_scatter":
+            metadata["guards"] = [
+                {"condition": ["eq", ["mod", shapes.expression(shape[0]), self.size], 0], "expected": True}
+            ]
+            shape[0] //= self.size
+        self.values.bind_shape(output, shape)
 
         return None
+
+
+class BatchCoordinationCall(NativeCall):
+    def __init__(self, values: Any, original: Any) -> None:
+        super().__init__(values.recording, values, original.__qualname__, original, {})
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> None:
+        if result is None or not result.reqs:
+            return
+        metadata.update(
+            entrypoint="batch_coordination",
+            entrypoint_phase=None,
+            ports={"inputs": {}, "outputs": {}},
+        )
+
+
+class ProcessGroupObservation:
+    def __init__(self, observation: Any) -> None:
+        self.observation = observation
+        self.recording = observation.recording
+        self.values = observation.operators.values
+
+    def profile(self, original: Any, manager: Any, output_dir: str, *args: Any, **kwargs: Any) -> Any:
+        rank = self.observation.parallel["rank"]
+        self.profile_output = Path(output_dir) / f"rank-{rank}"
+        return original(manager, str(self.profile_output.with_name(f".rank-{rank}")), *args, **kwargs)
+
+    def stop_profile(self, original: Any, manager: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(manager, *args, **kwargs)
+        if result.success:
+
+            # A role becomes visible only after its native exporter has returned.
+            manager.torch_profiler_output_dir.rename(self.profile_output)
+        return result
+
+    def collective(self, original: Any, group: Any, tensor: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.recording.current_scope.get() is None or group.world_size == 1:
+            return original(group, tensor, *args, **kwargs)
+
+        call = CollectiveCall(self.values, group.world_size, original.__name__, partial(original, group))
+        if original.__name__ == "all_gather" and not args:
+            return call(tensor, kwargs.pop("dim", -1), **kwargs)
+        return call(tensor, *args, **kwargs)
+
+    def coordinate(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.recording.current_scope.get() is None:
+            return original(*args, **kwargs)
+        return BatchCoordinationCall(self.values, original)(*args, **kwargs)
+
+    def coordination_geometry(self, original: Any, info: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.recording.current_scope.get() is None:
+            return original(info, *args, **kwargs)
+        code = inspect.unwrap(original).__code__
+        dimensions = {(code, f"self.{field}"): getattr(info, field) for field in ("dp_size", "tp_size", "cp_size")}
+        with TensorGeometryObservation(self.values, scalars=dimensions):
+            return original(info, *args, **kwargs)
+
+    def gather_into_tensor(
+        self, original: Any, output: Any, source: Any, group: Any = None, async_op: bool = False
+    ) -> Any:
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        if self.recording.current_scope.get() is None or self.values.interface is not None:
+            return original(output, source, group=group, async_op=async_op)
+        parallel = get_tp_group()
+        if group not in (parallel.device_group, parallel.cpu_group):
+            return original(output, source, group=group, async_op=async_op)
+
+        call = CollectiveCall(self.values, parallel.world_size, "all_gather_into_tensor", original)
+        return call(output, source, group=group, async_op=async_op)
+
+    def install(self) -> None:
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        targets = {
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.collective,
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.collective,
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor": self.collective,
+            "sglang.srt.distributed.parallel_state.GroupCoordinator.reduce_scatter_tensor": self.collective,
+            "sglang.srt.managers.scheduler_components.dp_attn.prepare_mlp_sync_batch_raw": self.coordinate,
+            "sglang.srt.managers.scheduler_components.dp_attn.MLPSyncBatchInfo.all_gather": self.coordination_geometry,
+            "torch.distributed.all_gather_into_tensor": self.gather_into_tensor,
+            (
+                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._init_profile"
+            ): self.profile,
+            (
+                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._stop_profile"
+            ): self.stop_profile,
+        }
+        for target, hook in targets.items():
+            HookRegistry.register(target, hook, HookType.AROUND)
 
 
 class SingleDeviceShard:

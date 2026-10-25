@@ -16,6 +16,7 @@ class SGLangObservation:
     def __init__(self, description: dict[str, Any]) -> None:
         from torch.utils.weak import WeakIdKeyDictionary
 
+        from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.primitives import IndexedWritePrototypes
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
@@ -38,6 +39,8 @@ class SGLangObservation:
         self.allocation: Any = None
         self.materializations: Any = None
         self.indexed_writes = IndexedWritePrototypes(self.operators, selection["limits"]["B"])
+        self.experts = ExpertObservation(self)
+        self.ep_size = description["ep_size"]
 
         self.requests = set(description["source_requests"])
         self.baseline_requests = set(description["baseline_requests"])
@@ -50,6 +53,12 @@ class SGLangObservation:
 
         self.model: Any = None
         self.batch_ids: Any = WeakIdKeyDictionary()
+        self.process_groups = None
+        if description["pp_size"] > 1 or description["ep_size"] > 1:
+            from markov_collection.adapters.frameworks.sglang.parallel import ProcessGroupObservation
+
+            self.process_groups = ProcessGroupObservation(self)
+
         self.pipeline = None
         if description["pp_size"] > 1:
             from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
@@ -63,6 +72,8 @@ class SGLangObservation:
             self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
 
     def load_model(self, original: Any, runner: Any) -> Any:
+        from sglang.srt.runtime_context import get_parallel
+
         result = original(runner)
         self.model = runner.model
         tp_size = self.shard.size if self.shard is not None else runner.tp_size
@@ -73,6 +84,8 @@ class SGLangObservation:
             "pp_rank": runner.pp_rank,
             "logical_tp": tp_size,
             "logical_pp": runner.pp_size,
+            "logical_ep": get_parallel().moe_ep_size,
+            "ep_rank": get_parallel().moe_ep_rank,
             "layer_range": [
                 getattr(self.model, "start_layer", 0),
                 getattr(self.model, "end_layer", runner.model_config.num_hidden_layers),
@@ -85,6 +98,9 @@ class SGLangObservation:
             "attention_backend": runner.server_args.attention_backend,
             "load_format": runner.server_args.load_format,
             "disaggregation_mode": runner.server_args.disaggregation_mode,
+            "moe_a2a_backend": runner.server_args.moe_a2a_backend,
+            "deepep_mode": runner.server_args.deepep_mode,
+            "expert_transport": os.environ.get("DEEP_USE_ALLTOALL_MODE", "0"),
         }
 
         return result
@@ -221,7 +237,8 @@ class SGLangObservation:
                 # The serving model runs only nonempty batches; this is an input contract, not a source length hint.
                 for name in ("M", "B"):
                     self.operators.values.bounded_parameter(name, 1, sys.maxsize)
-                self.operators.values.bind(batch.req_pool_indices, {0: "B"})
+                for tensor in BatchTensors.read(batch).values():
+                    self.operators.values.bind(tensor, {0: "B"})
                 self.operators.values.bind_shape(
                     scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("R") + 1,)
                 )
@@ -241,6 +258,13 @@ class SGLangObservation:
 
             # Decode contributes one token per member, so its token axis is B by definition.
             token_axis = "B" if phase == "decode" else "M"
+            member_axis = "B"
+            if self.ep_size > 1:
+                from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
+
+                with self.operators.values.metadata():
+                    ExpertModelGeometry.bind_batch(self.operators.values, token_axis, member_axis, self.ep_size)
+                token_axis, member_axis = "model_tokens", "model_members"
             proxy = args[0] if args else kwargs.get("pp_proxy_tensors")
             if proxy is not None:
                 payload = self.pipeline.payload(proxy.tensors)
@@ -254,12 +278,16 @@ class SGLangObservation:
                 "input_ids": {0: token_axis},
                 "positions": {0: token_axis},
                 "forward_batch.out_cache_loc": {0: token_axis},
-                "forward_batch.seq_lens": {0: "B"},
-                "forward_batch.req_pool_indices": {0: "B"},
-                "forward_batch.extend_seq_lens": {0: "B"},
+                "forward_batch.seq_lens": {0: member_axis},
+                "forward_batch.req_pool_indices": {0: member_axis},
+                "forward_batch.extend_seq_lens": {0: member_axis},
             }
             with ModuleObservation(
-                self.recording, self.model, self.operators.values, inputs, {RadixAttention: AttentionCall}
+                self.recording,
+                self.model,
+                self.operators.values,
+                inputs,
+                {RadixAttention: AttentionCall, **self.experts.module_calls(self.model)},
             ):
                 result = original(scheduler, batch, *args, **kwargs)
 
@@ -466,13 +494,6 @@ class SGLangObservation:
             import torch
             import torch_npu
 
-            self.result_interfaces(self.recording.regions)
-            self.concatenation.declare()
-            self.matrices.declare()
-            from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
-
-            CollectiveCall.bind_transports(self.recording.regions, self.recording.operations, self.recording.values)
-
             self.recording.write(
                 self.directory / f"rank-{self.parallel['rank']}.json",
                 {
@@ -486,7 +507,7 @@ class SGLangObservation:
                     "source_transport": "native_disaggregation"
                     if self.disaggregation is not None
                     else "native_process_groups"
-                    if self.pipeline is not None
+                    if self.process_groups is not None
                     else "physical_group_of_one",
                     "implementation": self.implementation,
                     "device": torch.npu.get_device_name(),
@@ -509,12 +530,17 @@ class SGLangObservation:
 
         functions = AscendFunctionObservation(self.operators.values)
         SGLangPrimitives(self.operators.values).install()
+        self.experts.install()
         fields = BatchTensors.fields
         if self.pipeline is not None:
 
             # PP keeps returned tokens in the batch until its next model invocation.
             fields = self.pipeline.fields
-        SGLangPreparation(self.operators.values, fields).install()
+        SGLangPreparation(self.operators.values, fields, self.ep_size > 1).install()
+        if self.ep_size > 1:
+            from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
+
+            ExpertModelGeometry(self.operators.values).install()
 
         # Framework-specific hook paths stay at this installation boundary.
         targets = {
@@ -540,6 +566,8 @@ class SGLangObservation:
 
         if self.shard is not None:
             self.shard.install()
+        if self.process_groups is not None:
+            self.process_groups.install()
         if self.pipeline is not None:
             self.pipeline.install()
         if self.disaggregation is not None:

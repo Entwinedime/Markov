@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -17,7 +18,7 @@ class ModuleObservation:
         model: Any,
         values: Any,
         inputs: dict[str, dict[int, str]],
-        calls: dict[type, type[NativeCall]] | None = None,
+        calls: dict[type, Callable[..., NativeCall]] | None = None,
     ) -> None:
         self.recording = recording
         self.model = model

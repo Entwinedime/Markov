@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
-from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
+from markov_collection.adapters.runtimes.pytorch.collectives import CommunicationWork
 from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
 from markov_collection.instrumentation.calls import NativeCall
 
@@ -26,15 +26,11 @@ class MessageGeometry(TensorGeometryObservation):
         self.transfers = 0
         self.header = False
         self.group_size = 1
-        self.group_geometry: dict[tuple[Any, str], int] = {}
 
     def bind_group(self, original: Any, all_gather_group: Any) -> None:
         self.group_size = 1 if all_gather_group is None else all_gather_group.world_size
-        self.group_geometry[inspect.unwrap(original).__code__, "all_gather_size"] = self.group_size
+        self.scalars[inspect.unwrap(original).__code__, "all_gather_size"] = self.group_size
         self.metadata["bindings"] = {"payload_parts": self.group_size}
-
-    def local_geometry(self, code: Any, name: str) -> int | None:
-        return self.group_geometry.get((code, name))
 
     def describe(self, fields: list[tuple[str, Any]]) -> None:
         from sglang.srt.distributed.parallel_state import TensorMetadata
@@ -121,16 +117,9 @@ class TransferCall(NativeCall):
                 operation["communication"] = True
 
 
-class ObservedWork(NativeCall):
+class ObservedWork(CommunicationWork):
     def __init__(self, observation: Any, work: Any, tensor: Any, identity: int, channel: str, field: str) -> None:
-        super().__init__(
-            observation.recording,
-            observation.values,
-            "torch.distributed.Work.wait",
-            work.wait,
-            {},
-            interface="communication_wait",
-        )
+        super().__init__(observation.values, work, (tensor,))
         self.operators = observation.operators
         self.tensor = tensor
         self.identity = identity
@@ -147,9 +136,6 @@ class ObservedWork(NativeCall):
                 ports={"inputs": self.values.port_values({"tensor": self.tensor}), "outputs": {}},
             )
             return self(*args, **kwargs)
-
-    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
-        return (self.tensor,), ()
 
 
 class PipelineObservation:
@@ -423,30 +409,6 @@ class PipelineObservation:
             else work
         )
 
-    def profile(self, original: Any, manager: Any, output_dir: str, *args: Any, **kwargs: Any) -> Any:
-        from pathlib import Path
-
-        rank = self.observation.parallel["rank"]
-        self.profile_output = Path(output_dir) / f"rank-{rank}"
-        return original(manager, str(self.profile_output.with_name(f".rank-{rank}")), *args, **kwargs)
-
-    def stop_profile(self, original: Any, manager: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original(manager, *args, **kwargs)
-        if result.success:
-
-            # Publish the directory only after the native exporter has returned for this role.
-            manager.torch_profiler_output_dir.rename(self.profile_output)
-        return result
-
-    def collective(self, original: Any, group: Any, tensor: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.recording.current_scope.get() is None or group.world_size == 1:
-            return original(group, tensor, *args, **kwargs)
-
-        call = CollectiveCall(self.values, group.world_size, original.__name__, partial(original, group))
-        if original.__name__ == "all_gather" and not args:
-            return call(tensor, kwargs.pop("dim", -1), **kwargs)
-        return call(tensor, *args, **kwargs)
-
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -459,19 +421,11 @@ class PipelineObservation:
             "sglang.srt.distributed.parallel_state.GroupCoordinator.recv_object": self.header,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.recv_tensor_dict": self.receive_message,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.send_tensor_dict": self.send_message,
-            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.collective,
-            "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.collective,
             "torch.distributed.isend": self.transfer,
             "torch.distributed.send": self.transfer,
             "torch.distributed.irecv": self.transfer,
             "torch_npu.npu.streams.Event.record": self.record_event,
             "torch_npu.npu.streams.Event.synchronize": self.synchronize_event,
-            (
-                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._init_profile"
-            ): self.profile,
-            (
-                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._stop_profile"
-            ): self.stop_profile,
         }
         for target, hook in targets.items():
             HookRegistry.register(target, hook, HookType.AROUND)
