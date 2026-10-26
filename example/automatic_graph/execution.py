@@ -142,6 +142,7 @@ class ExecutionComparison:
         ordinals = Counter()
         required = set()
         external_waits = 0
+        external_entries = set()
         for position, action in waits:
             signature = position, action["native_api"]
             ordinal = ordinals[signature]
@@ -157,6 +158,7 @@ class ExecutionComparison:
                 ]
                 if not visible:
                     external_waits += 1
+                    external_entries.add(entries[signature][ordinal])
                     continue
 
                 # A drain waits for the item's CPU return, not merely its last device submission.
@@ -169,15 +171,26 @@ class ExecutionComparison:
             for edge in self.execution["dependencies"]
             if edge["kind"] == "queue_drain" and edge["target"] in entry_ids
         }
-        same = required == actual
+        local_ids = {node["id"] for node in self.nodes}
+        internal = {edge for edge in actual if edge[0] in local_ids}
+        external = actual - internal
+        incoming = {
+            item["target"]
+            for item in self.execution["incoming"]
+            if item["kind"] == "queue_drain" and item["target"] in entry_ids
+        }
+        unexpected = ({target for _, target in external} | incoming) - external_entries
+        same = required == internal and not unexpected
         return {
             "same": None if same and external_waits else same,
             "native_queue_items": len(items),
             "draining_waits": len(waits),
             "queue_completion_links": len(required),
-            "missing_queue_links": len(required - actual),
-            "extra_queue_links": len(actual - required),
+            "missing_queue_links": len(required - internal),
+            "extra_queue_links": len(internal - required),
             "external_queue_waits": external_waits,
+            "external_queue_links": len(external),
+            "unexpected_boundary_entries": sorted(unexpected)[:3],
         }
 
     def stream_item(
@@ -343,16 +356,28 @@ class ExecutionComparison:
             for item in self.execution["incoming"]
             if item["kind"] == "wait_completion" and item["target"] in wait_ids
         }
+        local_ids = {node["id"] for node in self.nodes}
+        internal = {edge for edge in actual if edge[0] in local_ids}
+        external = actual - internal
+        external_ids = {source for source, _ in external}
+        resources = {node["id"]: node["resource"] for node in self.execution["nodes"] if node["id"] in external_ids}
+        boundary = incoming | {(resources[source], target) for source, target in external}
+        unexpected = boundary - initial
+        same = required == internal and not unexpected
+
+        # A cropped flow cannot certify earlier work or the drained initial state of its streams.
         return {
-            "same": required == actual and initial == incoming,
+            "same": None if same and initial else same,
             "streams": len(bindings),
             "native_waits": native_waits,
             "kinds": dict(kinds),
             "completion_links": len(required),
-            "missing": list(sorted(required - actual))[:3],
-            "extra": list(sorted(actual - required))[:3],
+            "missing": list(sorted(required - internal))[:3],
+            "extra": list(sorted(internal - required))[:3],
             "initial_frontiers": len(initial),
-            "same_initial_frontiers": initial == incoming,
+            "external_completion_links": len(external),
+            "unresolved_initial_frontiers": len(incoming),
+            "unexpected_boundary_frontiers": list(sorted(unexpected))[:3],
         }
 
     def events(self) -> dict[str, Any]:

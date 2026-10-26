@@ -23,6 +23,8 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 `MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，TP 本地分片不要求现场拥有目标数量的卡；PP 采集使用实际 TP×PP 参与进程。
 
+原生入口加载镜像中安装的Python采集包；修改采集源码后也要重建`sglang-profile`，仓库挂载不会自动替换已安装的包。使用本机代理且构建网络不可达时，可通过已有的`MARKOV_BUILD_NETWORK=host`选择构建网络；运行镜像和依赖仍由同一Dockerfile制作。
+
 配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP×PP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_devices` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
 
 PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话启动全部必要参与者，代表发布观察，其余角色使用独立绑定；目标使用同一控制器维护多微批次和唯一 KV 状态。
@@ -122,6 +124,30 @@ scripts/markov.sh simulate \
 
 ## 辅助入口
 
+已有探索任务可以继续对指定目标做原生结构对照：
+
+```bash
+example/automatic_graph/run.sh validate \
+  --run data/YOUR_RUN --configuration larger --workload together \
+  --capture captures/target-larger-together
+```
+
+配置和请求集ID来自该任务的输入。入口先用已发布模板计算默认/明细结果，再观察全部真实worker，逐rank比较；目标观察不参与建库。原生入口要求请求同时到达，所需物理卡由原任务deployment提供，预算继续使用该任务的累计额度，必须事先覆盖来源与目标运行。已有capture仅在模型、拓扑、请求、规定的池参数及路由一致时复用，已有案例报告拒绝覆盖；不自动重试。
+
+案例汇总保存在`results/validation/<配置>/<请求集>/<capture名>.json`，逐rank明细及执行/路由证据在旁边同名目录，原生事实保存在指定capture目录。原生证据逐行核对workload专家ID与实际通信split、专家计数；批次人数取实际Prefill/Decode执行区域。预测证据检查节点完成、依赖就绪、资源独占、动作排空、交接边及输出序列。普通失败保留错误并继续其他rank；预算耗尽与中断单独记录，保留尚需处理的临时材料。完成对照后删除消费过的大图，结构差异或partial均不代表性能精度结论。
+
+`matrix.py`维护当前S8调查的具名输入配方。已有模型来源元数据的准备目录可用`run.sh matrix --run data/YOUR_MATRIX`生成任务与边界输入；它只写输入，未运行模型，且拒绝改写已冻结清单。每个来源域的正式输入位于`runs/<域名>/inputs/task.json`，后续通过同一正式workflow启动，批量调查编排和汇总继续留在example。
+
+审查完成后在清单中记录`frozen_revision`、两个执行镜像的ID并将`status`设为`frozen`，再执行：
+
+```bash
+example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
+```
+
+批量入口核对冻结代码与镜像，先运行全部正式来源/预测任务，再执行预选原生对照、边界输入和生命周期案例；不根据目标结果补模板。整轮与各任务分别保留时间、尝试及存储上限，原生启动前检查声明卡的实际进程，已有占用或无法确认空闲时不启动Engine。独立案例出错后继续无依赖案例，缺来源的案例记blocked；预算停止/中断保留历史与费用，原命令可继续未完成案例，完成的结果不覆盖。
+
+`results/summary.md`为整轮入口，`results/outcomes.json`保留逐次结果，`runs/<域>/`仍采用正式目录结构，额外边界及生命周期证据在`cases/`。来源SDK/runtime原始导出消费后移到原capture的`evidence/`中，避免默认清理且不复制；规范事实保留采集时路径，需检查原始文件时使用该归档位置。完整临时图消费后删除，只保留精简证据。整轮结束不自动判为结构全部通过，也不自动生成窗口审查结论。
+
 | 文件 | 用途 |
 | --- | --- |
 | [probe.py](probe.py)、[state.py](state.py)、[allocator.py](allocator.py) | 观察公共操作、页池与分配机制 |
@@ -129,5 +155,9 @@ scripts/markov.sh simulate \
 | [physical.py](physical.py) | 从保留的 trace/runtime 事实形成物理归属清单 |
 | [structure.py](structure.py) | 比较独立观察与预测的批次、工作、几何、状态及端口 |
 | [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿 |
+| [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
+| [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |
 
 这些入口读取公共结果和原生事实，不回流修改被验预测。物理工作有归属不等于全部依赖已恢复；不完整参数或关联保留 partial，不能按最近时间强配。结构来源 profiler 耗时不直接成为 CPU、设备、通信成本，dummy 权重也不提供数值或内容相关行为的正确性结论。
+
+单个flow的完成关系比较只证明所选操作范围内的边。等待若涉及起点之前或上一flow的工作，会分别报告外部完成边及未绑定前沿，保持partial；完整窗口及控制交接另行核对。范围内缺边、多余边或外部资源连接错误仍判为差异。

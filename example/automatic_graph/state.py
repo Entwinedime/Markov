@@ -11,7 +11,7 @@ from types import MethodType
 
 import torch
 import torch_npu
-from markov_collection.adapters.frameworks.sglang.state import PageReleaseCall, PageReleaseGroupCall
+from markov_collection.adapters.frameworks.sglang.state import PageMergeCall, PageReleaseCall, PageReleaseGroupCall
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation, TorchMarkers
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.instrumentation.recording import Recording
@@ -77,8 +77,12 @@ class PageStateExample:
                         self.recording, self.observer.values, NPUPagedTokenToKVPoolAllocator.free, pool
                     )
                 call(pool, indices)
+                if need_sort:
+                    PageMergeCall(self.observer.values, pool.merge_and_sort_free, pool)()
             else:
                 pool.free(indices)
+                if need_sort:
+                    pool.merge_and_sort_free()
         torch.npu.synchronize()
 
     def execute_group(self, tokens: tuple[int, ...], observed: bool) -> None:
