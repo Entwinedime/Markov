@@ -7,6 +7,8 @@ import sys
 from functools import partial
 from typing import Any
 
+import torch
+
 from markov_collection.adapters.runtimes.ascend.moe import ExpertPermutationCall
 from markov_collection.adapters.runtimes.pytorch.collectives import CommunicationWork
 from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
@@ -166,6 +168,17 @@ class ExpertObservation:
         self.values = serving.operators.values
         self.current: ExpertCall | None = None
 
+    @staticmethod
+    def declare(source: dict[str, Any]) -> None:
+        if source["environment"]["implementation"]["deepep_mode"] != "normal":
+            return
+
+        # Fixed normal dispatch selects by tensor geometry and routes, independently of the serving phase.
+        for region in source["regions"]:
+            metadata = region["metadata"]
+            if metadata.get("entrypoint") == "expert_layer":
+                metadata["entrypoint_phase"] = None
+
     def module_calls(self, model: Any) -> dict[type, Any]:
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopK
@@ -189,7 +202,13 @@ class ExpertObservation:
             (code, "num_experts"): experts,
             (code, "num_local_experts"): experts // buffer.group_size,
         }
-        with TensorGeometryObservation(self.values, scalars=dimensions):
+        with self.values.metadata():
+            rows = self.values.shapes.tensor(args[0]).shape[0]
+
+        # DeepEP's token-membership buffer follows the local routing rows, not the acquisition batch length.
+        with TensorGeometryObservation(
+            self.values, factories={torch.zeros: (rows, buffer.group_size)}, scalars=dimensions
+        ):
             result = original(buffer, *args, **kwargs)
         layout = buffer._alltoall_layout
         with self.values.metadata():

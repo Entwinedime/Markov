@@ -17,7 +17,7 @@ DisaggregatedController::DisaggregatedController(ServingSettings prefill, Servin
     if (prefill.page_size != decode.page_size) throw std::invalid_argument("PD page transfer requires matching page sizes");
     for (auto & request : Request::ordered(std::move(requests))) {
         if (prefill_.pages_for(request.prompt_tokens) > prefill_settings_.max_total_tokens / prefill_settings_.page_size
-            || decode_.pages_for(request.prompt_tokens + request.output_tokens - 1) > decode_settings_.max_total_tokens / decode_settings_.page_size)
+            || decode_.pages_for(request.prompt_tokens + (request.output_tokens - 1)) > decode_settings_.max_total_tokens / decode_settings_.page_size)
             throw std::invalid_argument("request cannot fit its P/D KV capacity: " + request.id);
         requests_.push_back({ std::move(request) });
     }
@@ -122,10 +122,10 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         auto remaining = decode_settings_.max_total_tokens / decode_settings_.page_size;
         for (const auto request : active_) {
             const auto & input = requests_[request].input;
-            remaining -= decode_.pages_for(input.prompt_tokens + input.output_tokens - 1);
+            remaining -= decode_.pages_for(input.prompt_tokens + (input.output_tokens - 1));
         }
         const auto & next = requests_[waiting_].input;
-        if (next.arrival_ns <= now_ns && decode_.pages_for(next.prompt_tokens + next.output_tokens - 1) <= remaining) {
+        if (next.arrival_ns <= now_ns && decode_.pages_for(next.prompt_tokens + (next.output_tokens - 1)) <= remaining) {
             auto batch = new_batch(decode_, decode_settings_, Phase::Prefill);
             append_member(batch, decode_, waiting_, next.prompt_tokens);
             return action(ServingStep::Reserve, std::move(batch), {}, now_ns, next_task_);

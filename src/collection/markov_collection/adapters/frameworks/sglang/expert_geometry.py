@@ -23,10 +23,25 @@ class ModelPaddingCall(NativeCall):
                 continue
             source = metadata["ports"]["inputs"]["tensor"]
             output = metadata["ports"]["outputs"]["tensor"]
-            shape = geometries[region["id"]].get(source, values[source]["shape_relation"])
+            parent = regions[region["parent"]]["metadata"]
+            shape = geometries[region["parent"]].get(source, values[source]["shape_relation"])
+            caller_contracts = parent.setdefault("shape_contracts", [])
+            if not any(contract["value"] == source for contract in caller_contracts):
+                caller_contracts.append({"value": source, "shape": shape})
+
+            metadata.setdefault("parameters", {})["input_extent"] = values[source]["shape"][0]
+            contracts = metadata.setdefault("shape_contracts", [])
+            contracts[:] = [contract for contract in contracts if contract["value"] not in (source, output)]
+            contracts.append({"value": source, "shape": ["input_extent", *shape[1:]]})
+            if output != source:
+                contracts.append(
+                    {"value": output, "shape": [metadata["argument_relations"][1]["scalar"], *shape[1:]]}
+                )
+
+            # Padding has the same local input contract in Prefill and Decode.
             metadata["guards"] = [
                 {
-                    "condition": ["eq", shape[0], metadata["argument_relations"][1]["scalar"]],
+                    "condition": ["eq", "input_extent", metadata["argument_relations"][1]["scalar"]],
                     "expected": values[source]["shape"][0] == values[output]["shape"][0],
                 }
             ]

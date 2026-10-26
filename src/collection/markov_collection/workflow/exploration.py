@@ -25,6 +25,13 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
+class CommandFailed(RuntimeError):
+    def __init__(self, returncode: int, stderr: str) -> None:
+        super().__init__(f"command failed ({returncode}): {stderr}")
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 class Exploration:
     def __init__(self, root: Path, directory: Path, specification: dict[str, Any], details: bool) -> None:
         self.root = root
@@ -127,7 +134,7 @@ class Exploration:
             if process.returncode:
                 with log_path.open() as log:
                     message = "".join(deque(log, maxlen=1)).strip()
-                raise RuntimeError(f"command failed ({process.returncode}): {message[:1000]}")
+                raise CommandFailed(process.returncode, message[:1000])
         finally:
             elapsed = time.monotonic_ns() - started
             self.state["charged_ns"][category] += elapsed - reserved
@@ -179,6 +186,7 @@ class Exploration:
         if path.exists() and json.loads(path.read_text()) != observed:
             raise ValueError("model configuration or execution images changed; start a new run")
         write_json(path, observed, indent=2)
+        self.model_configuration = observed["model_configuration"]
 
         self.state["failures"].update(
             self.acquisition.check_workloads(observed["model_configuration"], self.specification)
@@ -229,6 +237,7 @@ class Exploration:
                 roles[0],
                 self.environment.native_path(capture),
                 self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
+                self.model_configuration,
             )
             write_json(capture / "capture.json", request, indent=2)
             command = self.acquisition.command("capture", self.environment.native_path(capture / "capture.json"))

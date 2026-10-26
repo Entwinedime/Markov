@@ -16,7 +16,7 @@ class TensorGeometryObservation:
         values: Any,
         data_shape: tuple[str | int, ...] | None = None,
         sources: tuple[Any, ...] | None = None,
-        factories: dict[Any, tuple[str | int, ...]] | None = None,
+        factories: dict[Any, tuple[str | int | torch.SymInt, ...]] | None = None,
         scalars: dict[tuple[Any, str], int] | None = None,
     ) -> None:
         self.values = values
@@ -49,7 +49,7 @@ class TensorGeometryObservation:
 
         return None
 
-    def factory_geometry(self, function: Any) -> tuple[str | int, ...] | None:
+    def factory_geometry(self, function: Any) -> tuple[str | int | torch.SymInt, ...] | None:
         if self.values.recording.current_scope.get() == self.scope:
             return self.factories.get(function)
         return None
@@ -63,7 +63,7 @@ class TensorGeometryCall(NativeCall):
         self,
         *args: Any,
         data_shape: tuple[str | int, ...] | None = None,
-        factories: dict[Any, tuple[str | int, ...]] | None = None,
+        factories: dict[Any, tuple[str | int | torch.SymInt, ...]] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)

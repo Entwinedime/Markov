@@ -45,8 +45,8 @@ void BatchViews::advance(Phase phase) {
 void BatchViews::accept() {
     advance(Phase::Prefill);
 
-    // Destination admission removes finished rows before attaching the next prebuilt batch.
-    if (running_) {
+    // Only changed membership needs selection before attaching the next prebuilt batch.
+    if (running_ && running_->kept_rows.size() != static_cast<std::size_t>(running_->members)) {
         filter(*running_, "control");
         if (running_->members == 0) running_.reset();
     }

@@ -44,10 +44,24 @@ class ConcatenationCall(NativeCall):
         metadata["argument_relations"] = [{"input_group": "segments"}, *metadata["arguments"][1:]]
         metadata["attributes"] = {"axis": axis}
 
-        # Native cat already checks compatible types and non-concatenated dimensions.
-        shape = list(result.shape)
-        shape[axis] = self.values.shapes.symbol("concat_extent")
-        self.values.bind_shape(result, shape)
+        # The caller keeps its operand expressions; concat_extent belongs only to this interface.
+        shapes = self.values.shapes
+        caller_shape = list(shapes.tensor(tensors[0]).shape)
+        if self.parent_group is not None:
+            region = self.recording.regions[self.recording.current_scope.get()]
+            parent = self.recording.regions[region["parent"]]["metadata"]
+            sums = parent["input_groups"][self.parent_group]["sums"]
+            total_parameter = next(name for name, expression in sums.items() if expression == "extent")
+            caller_shape[axis] = shapes.symbol(total_parameter)
+        elif self.repetition is not None:
+            caller_shape[axis] *= shapes.symbol(self.repetition.count)
+        else:
+            caller_shape[axis] = sum(shapes.tensor(tensor).shape[axis] for tensor in tensors)
+        self.values.bind_shape(result, caller_shape)
+
+        local_shape = shapes.shape(result)
+        local_shape[axis] = "concat_extent"
+        metadata.setdefault("shape_contracts", []).append({"value": self.values.value(result), "shape": local_shape})
         return None
 
 

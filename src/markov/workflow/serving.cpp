@@ -120,7 +120,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
             work.decision["completed_ns"] = event.time_ns;
             work.decision["free_pages_after"] = controller_.free_pages();
         }
-        if (work.action.commits_requests()) record_completion(result, work.decision, work.action.work->effects, event.time_ns, details);
+        if (details || work.action.commits_requests()) record_completion(result, work.decision, work.action, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));
         pending.erase(event.task);
 
@@ -178,11 +178,14 @@ void ServingWorkflow::record_publication(nlohmann::json & result, const BatchEff
     }
 }
 
-void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json & decision, const BatchEffects & effects, std::int64_t time_ns,
+void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json & decision, const ServingAction & action, std::int64_t time_ns,
                                         bool details) const {
+    const auto & effects = action.work->effects;
     for (std::size_t index = 0; index < effects.members.size(); ++index) {
         const auto & member = effects.members[index];
-        if (member.finished) result["requests"][member.request]["state_committed_ns"] = time_ns;
+
+        // Intermediate actions expose their planned effects without committing the external request state.
+        if (action.commits_requests() && member.finished) result["requests"][member.request]["state_committed_ns"] = time_ns;
         if (details)
             decision["members"][index].update({
                 { "generated_tokens", member.generated_tokens },

@@ -55,9 +55,16 @@ class SGLangObservation:
 
         self.model: Any = None
         self.selected = True
+        self.derived_role = False
+        self.observe_all_workers = description.get("observe_all_workers", False)
         self.batch_ids: Any = WeakIdKeyDictionary()
         self.process_groups = None
-        if description["pp_size"] > 1 or description["ep_size"] > 1 or "disaggregation_role" in description:
+        if (
+            description["pp_size"] > 1
+            or description["ep_size"] > 1
+            or "disaggregation_role" in description
+            or self.observe_all_workers
+        ):
             from markov_collection.adapters.frameworks.sglang.parallel import ProcessGroupObservation
 
             self.process_groups = ProcessGroupObservation(self)
@@ -74,12 +81,22 @@ class SGLangObservation:
 
             self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
 
+        self.routing = None
+        if description.get("serving_input") is not None:
+            from markov_collection.adapters.frameworks.sglang.native_routes import NativeExpertRoutes
+
+            self.routing = NativeExpertRoutes(self.operators.values, description)
+
     def load_model(self, original: Any, runner: Any) -> Any:
         from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.runtime_context import get_parallel
 
         result = original(runner)
         self.model = runner.model
+
+        if self.routing is not None:
+            self.routing.configure(self.model, runner.model_config.hf_config.num_hidden_layers)
+
         tp_size = self.shard.size if self.shard is not None else runner.tp_size
         tp_rank = self.shard.rank if self.shard is not None else runner.tp_rank
 
@@ -99,7 +116,13 @@ class SGLangObservation:
             from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
 
             plan = WorkerRolePlan.from_group(self.model, self.parallel)
-            self.selected = self.parallel["rank"] in plan["representatives"]
+            self.derived_role = self.parallel["rank"] not in plan["representatives"]
+            self.selected = self.observe_all_workers or not self.derived_role
+            plan["observed_roles"] = (
+                list(range(self.rank_offset, self.rank_offset + plan["participants"]))
+                if self.observe_all_workers
+                else plan["representatives"]
+            )
             self.synchronization.set_enabled(self.selected)
             if runner.pp_rank == 0 and tp_rank == 0:
                 write_json(self.directory / "role-plan.json", plan, indent=2)
@@ -122,21 +145,13 @@ class SGLangObservation:
         return result
 
     def record_batch(self, scheduler: Any, batch: Any, observation: str) -> int:
+        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
+
         phase = "control"
         members = []
         if batch is not None:
             phase = "prefill" if batch.forward_mode.is_extend() else "decode"
-            members = [
-                {
-                    "id": request.rid,
-                    "new_tokens": request.extend_input_len if phase == "prefill" else 1,
-                    "context_tokens": len(request.prefix_indices)
-                    if phase == "prefill"
-                    else len(request.origin_input_ids) + len(request.output_ids) - 1,
-                    "slot": int(request.req_pool_idx),
-                }
-                for request in batch.reqs
-            ]
+            members = BatchTensors.members(batch)
 
         identity = len(self.recording.batches)
         self.recording.batches.append(
@@ -509,37 +524,43 @@ class SGLangObservation:
                 self.matrices.capture()
                 self.materializations.capture()
                 self.indexed_writes.capture()
-        if result and self.disaggregation is not None and not self.selected:
+        if result and self.disaggregation is not None and self.derived_role:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
         if result and any(batch["observation"] == "source" for batch in self.recording.batches):
-            import torch
-            import torch_npu
-
-            self.recording.write(
-                self.directory / f"rank-{self.parallel['rank']}.json",
-                {
-                    "framework": "sglang",
-                    "torch": torch.__version__,
-                    "torch_npu": torch_npu.__version__,
-                    "cann": self.concatenation.version,
-                    "matrix_selection": self.matrices.description,
-                    "observer": __file__,
-                    **self.parallel,
-                    "source_transport": "native_disaggregation"
-                    if self.disaggregation is not None
-                    else "native_process_groups"
-                    if self.process_groups is not None
-                    else "physical_group_of_one",
-                    "implementation": self.implementation,
-                    "device": torch.npu.get_device_name(),
-                    "device_index": torch.npu.current_device(),
-                    "workspace_boundaries": self.workspace_states,
-                    "workspace_policy": self.workspace_policy,
-                },
-            )
-            self.synchronization.write(self.directory / "runtime")
+            if self.pipeline is None:
+                self.write()
+            else:
+                self.pipeline.export(scheduler)
 
         return result
+
+    def write(self) -> None:
+        import torch
+        import torch_npu
+
+        self.recording.write(
+            self.directory / f"rank-{self.parallel['rank']}.json",
+            {
+                "framework": "sglang",
+                "torch": torch.__version__,
+                "torch_npu": torch_npu.__version__,
+                "cann": self.concatenation.version,
+                "matrix_selection": self.matrices.description,
+                "observer": __file__,
+                **self.parallel,
+                "source_transport": "native_disaggregation"
+                if self.disaggregation is not None
+                else "native_process_groups"
+                if self.process_groups is not None
+                else "physical_group_of_one",
+                "implementation": self.implementation,
+                "device": torch.npu.get_device_name(),
+                "device_index": torch.npu.current_device(),
+                "workspace_boundaries": self.workspace_states,
+                "workspace_policy": self.workspace_policy,
+            },
+        )
+        self.synchronization.write(self.directory / "runtime")
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -594,6 +615,9 @@ class SGLangObservation:
             targets[target] = self.schedule
         for target, observer in targets.items():
             HookRegistry.register(target, observer, HookType.AROUND)
+
+        if self.routing is not None:
+            self.routing.install()
 
         if self.shard is not None:
             self.shard.install()

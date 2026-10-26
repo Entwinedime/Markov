@@ -234,7 +234,8 @@ class PageReleaseCall(NativeCall):
                 getattr(pool, self.pool_name), (self.values.shapes.symbol(f"{self.pool_name}_before"),)
             )
 
-        with UniqueObservation(self.values, "released_pages"):
+        # Empty pool operands select a different native concat path; reuse the common grouped interface.
+        with UniqueObservation(self.values, "released_pages"), ConcatenationObservation(self.values):
             return super().invoke(*args, **kwargs)
 
     def completed(
@@ -315,7 +316,10 @@ class PageMergeCall(NativeCall):
             ],
             guards=[{"condition": ["lt", 0, "release_pages_before"], "expected": True}],
         )
-        with TensorGeometryObservation(self.values, factories={torch.empty: (0,)}):
+        with (
+            TensorGeometryObservation(self.values, factories={torch.empty: (0,)}),
+            ConcatenationObservation(self.values),
+        ):
             return super().invoke(*args, **kwargs)
 
     def outputs(self, result: Any) -> Any:

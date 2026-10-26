@@ -1,4 +1,4 @@
-"""Check conditional routes against model metadata before native acquisition."""
+"""Validate and query logical expert choices independently of native batching."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class ExpertRouteConditions:
             self.insert(assignment, segments[name], tokens[name], True)
         for name, length in tokens.items():
             self.coverage(segments[name], length, name)
+        self.assignments = segments
 
         padding = source.get("padding", [])
         if not isinstance(padding, list):
@@ -38,9 +39,10 @@ class ExpertRouteConditions:
             self.insert(assignment, segments, self.padding, False)
         if self.padding:
             self.coverage(segments, self.padding, "padding")
+        self.padding_routes = segments
 
     def insert(
-        self, source: dict[str, Any], segments: dict[int, list[tuple[int, int]]], tokens: int, request: bool
+        self, source: dict[str, Any], segments: dict[int, list[tuple[int, int, list[int]]]], tokens: int, request: bool
     ) -> None:
         fields = {"layers", "tokens", "experts"} | ({"request"} if request else set())
         if not isinstance(source, dict) or source.keys() - fields:
@@ -56,19 +58,64 @@ class ExpertRouteConditions:
         ):
             raise ValueError("route experts must be distinct model expert IDs matching top-k")
         for layer in range(*layers):
-            segments.setdefault(layer, []).append(interval)
+            segments.setdefault(layer, []).append((*interval, experts))
 
-    def coverage(self, segments: dict[int, list[tuple[int, int]]], tokens: int, context: str) -> None:
+    def coverage(self, segments: dict[int, list[tuple[int, int, list[int]]]], tokens: int, context: str) -> None:
 
         # Preflight covers the model range; native module bindings later select the actual expert layers.
         for layer in range(self.layers):
             covered = 0
-            for begin, end in sorted(segments.get(layer, [])):
+            ranges = segments.get(layer, [])
+            ranges.sort(key=lambda item: item[0])
+            for begin, end, _ in ranges:
                 if begin != covered:
                     raise ValueError(f"route gap or overlap for {context}, layer {layer}")
                 covered = end
             if covered != tokens:
                 raise ValueError(f"incomplete route for {context}, layer {layer}")
+
+    def rows(self, request: str | None, layer: int, begin: int, end: int) -> list[list[int]]:
+        if begin == end:
+            return []
+
+        layers = self.padding_routes if request is None else self.assignments[request]
+        result = []
+        for first, last, experts in layers[layer]:
+            count = max(0, min(end, last) - max(begin, first))
+            result.extend([experts] * count)
+
+        return result
+
+    def representative(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
+        assignments = []
+        padding = []
+        width = self.experts // (self.padding + 1)
+        for layer in range(self.layers):
+            balanced = [
+                (expert * self.experts // self.top_k + layer * width) % self.experts for expert in range(self.top_k)
+            ]
+            choices = (balanced, list(range(self.top_k)), list(range(self.experts - self.top_k, self.experts)))
+            for index, request in enumerate(requests):
+                assignments.append(
+                    {
+                        "request": request["id"],
+                        "layers": [layer, layer + 1],
+                        "tokens": [0, request["prompt_tokens"] + request["output_tokens"] - 1],
+                        "experts": choices[(layer + index) % len(choices)],
+                    }
+                )
+
+            # Match the live tail's routes so its padding does not hide a zero-receiver branch.
+            if self.padding:
+                padding.append(
+                    {
+                        "layers": [layer, layer + 1],
+                        "tokens": [0, self.padding],
+                        "experts": choices[(layer + len(requests) - 1) % len(choices)],
+                    }
+                )
+
+        return {"assignments": assignments, "padding": padding}
 
     @staticmethod
     def interval(source: list[int], limit: int, field: str) -> tuple[int, int]:

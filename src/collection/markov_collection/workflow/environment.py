@@ -80,6 +80,12 @@ class DockerEnvironment:
 
     def tool_command(self, arguments: list[str], inputs: list[Path], output: Path, remaining_ns: int) -> list[str]:
         binary = self.build / "markov"
+
+        # Docker otherwise creates directories for missing file bind sources.
+        for source in (binary, *inputs):
+            if not source.is_file():
+                raise FileNotFoundError(f"tool input is not a file: {source}")
+
         command = [
             "docker",
             "run",

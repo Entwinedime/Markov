@@ -18,6 +18,10 @@ class MemfabricObservation:
                 continue
 
             metadata = region["metadata"]
+            if metadata["status"] != 0:
+                raise ValueError("a failed native transfer cannot provide a completed-copy template")
+
+            # The synchronous API owns native segment coalescing and stream completion as one service.
             metadata.update(
                 interface="remote_copy",
                 entrypoint="remote_copy",
@@ -36,7 +40,7 @@ class MemfabricObservation:
         if self.recording.current_scope.get() is None:
             return original(engine, session, buffers, destinations, lengths)
 
-        # Lengths come from the registered buffers and actual contiguous transfer segments.
+        # Lengths describe submitted buffers; the native transport may coalesce adjacent ranges.
         with self.recording.scope(
             "RemoteCopy", transport="ascend_sdma", bytes=sum(lengths), segments=list(lengths)
         ) as scope:

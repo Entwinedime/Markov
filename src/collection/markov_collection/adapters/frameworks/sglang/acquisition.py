@@ -156,23 +156,33 @@ class SGLangAcquisition:
         rows = max_prompt_tokens
         for configuration in configurations:
             prefill = configuration["pd"]["prefill"] if "pd" in configuration else configuration
-            members = max(members, prefill["max_running_requests"])
-            if "pd" in configuration:
-                members = max(members, configuration["pd"]["decode"]["max_running_requests"])
-                continue
-            budget = prefill["max_prefill_tokens"]
-            page_size = configuration["page_size"]
+            if "pd" not in configuration:
+                budget = prefill["max_prefill_tokens"]
+                page_size = configuration["page_size"]
 
-            # A final whole request can start while the page-aligned prefix still has positive budget.
-            prefix = (budget - 1) // page_size * page_size
-            rows = max(rows, budget, prefix + max_prompt_tokens)
+                # A final whole request can start while the page-aligned prefix still has positive budget.
+                prefix = (budget - 1) // page_size * page_size
+                rows = max(rows, budget, prefix + max_prompt_tokens)
+
+            pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
+            for pool in pools:
+                size = pool.get("ep", {}).get("size", 1)
+
+                # Native MLP synchronization pads Decode members as well as Prefill tokens.
+                members = max(members, (pool["max_running_requests"] + size - 1) // size * size)
+                rows = (rows + size - 1) // size * size
         return {"M": max(rows, members), "B": members}
 
     @staticmethod
     def request(
-        specification: dict[str, Any], domain: dict[str, Any], rank: int, output: str, selector: str
+        specification: dict[str, Any],
+        domain: dict[str, Any],
+        rank: int,
+        output: str,
+        selector: str,
+        model_configuration: dict[str, Any],
     ) -> dict[str, Any]:
-        requests = NativeServingSession.warmup_requests(domain["page_size"])
+        requests = NativeServingSession.structure_requests(domain["page_size"])
         if domain.get("pd"):
             from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
 
@@ -194,16 +204,15 @@ class SGLangAcquisition:
         maximum_prompt = max(
             request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
         )
-        limits = SGLangAcquisition.row_limits(configurations, maximum_prompt)
-        for size in [ep for _, _, _, ep in domain["pd"]] if domain.get("pd") else [domain["ep"]]:
-            limits["M"] = (limits["M"] + size - 1) // size * size
 
         # Target P runs one prompt; native representative acquisition can still batch its own requests.
         if domain.get("pd"):
-            limits["M"] = max(
-                limits["M"], representative["prefill"]["max_running_requests"] * max(prompt for prompt, _ in requests)
+            maximum_prompt = max(
+                maximum_prompt,
+                representative["prefill"]["max_running_requests"] * max(prompt for prompt, _ in requests),
             )
-        return {
+        limits = SGLangAcquisition.row_limits(configurations, maximum_prompt)
+        result = {
             "model": model["path"],
             **domain,
             "rank": rank,
@@ -214,6 +223,46 @@ class SGLangAcquisition:
                 "binary": selector,
                 "limits": limits,
             },
+        }
+        if model_configuration.get("num_experts", 0):
+            result["serving_input"] = SGLangAcquisition.source_input(
+                result, model_configuration, specification["node_durations_ns"]
+            )
+        return result
+
+    @staticmethod
+    def source_input(request: dict[str, Any], model: dict[str, Any], durations: dict[str, int]) -> dict[str, Any]:
+        requests = [
+            {"id": f"representative-{index}", "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
+            for index, (prompt, output) in enumerate(request["requests"])
+        ]
+        roles = request["pd"] if "pd" in request else (("model", request["tp"], request["pp"], request["ep"]),)
+        pools = {}
+        routes = {}
+        for role, tp, pp, ep in roles:
+            settings = request["configuration"][role] if "pd" in request else request["configuration"]
+            pool = {name: settings[name] for name in ("max_running_requests", "max_total_tokens", "max_prefill_tokens")}
+            topology = {"id": f"representative-{role}", "size": ep}
+            pool["ep"] = topology
+            if "pd" in request:
+                pool["tp"] = tp
+                if role == "decode":
+                    del pool["max_prefill_tokens"]
+            if pp > 1:
+                pool.update(pp=pp, microbatch_requests=settings["pp_max_micro_batch_size"])
+            pools[role] = pool
+            routes[topology["id"]] = ExpertRouteConditions(model, ep).representative(requests)
+
+        configuration = {"page_size": request["page_size"]}
+        if "pd" in request:
+            configuration["pd"] = pools
+        else:
+            configuration.update(pools["model"])
+        return {
+            "configuration": configuration,
+            "requests": requests,
+            "ep_routes": routes,
+            "node_durations_ns": durations,
         }
 
     @staticmethod
@@ -254,6 +303,8 @@ class SGLangAcquisition:
             ep_size=request["ep"],
             dtype=request["dtype"],
             attention_backend=request["attention_backend"],
+            observe_all_workers=request.get("observe_all_workers", False),
+            serving_input=request.get("serving_input"),
         ).run()
         summary = json.loads((Path(request["output"]) / "session-summary.json").read_text())
         for rank in summary["observed_roles"]:
@@ -270,17 +321,14 @@ class SGLangAcquisition:
         directory = Path(request["output"])
         summary = json.loads((directory / "session-summary.json").read_text())
         for rank in summary["observed_roles"]:
-            SGLangAcquisition.interpret_role(
-                directory, rank, summary["logical_pp"], summary["profile"], summary["logical_ep"]
-            )
+            SGLangAcquisition.interpret_role(directory, rank, summary["logical_pp"], summary["profile"])
 
     @staticmethod
-    def interpret_role(
-        directory: Path, rank: int, pp: int, profile: bool, ep: int = 1, *, disaggregated: bool = False
-    ) -> None:
+    def interpret_role(directory: Path, rank: int, pp: int, profile: bool) -> None:
         from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
         from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
         from markov_collection.adapters.frameworks.sglang.expert_geometry import ModelPaddingCall
+        from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.hooks import SGLangObservation
         from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
         from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
@@ -296,6 +344,7 @@ class SGLangAcquisition:
 
         # Interpretation can be repeated from the captured facts without another native session.
         SGLangObservation.result_interfaces(source["regions"])
+        ExpertObservation.declare(source)
         BatchTensors.declare_model_inputs(source["regions"], source["values"])
         AscendConcatenation.declare(source["regions"], source["values"])
         AscendMatrices.declare(
@@ -318,7 +367,7 @@ class SGLangAcquisition:
         if not profile:
             return
 
-        grouped = disaggregated or pp > 1 or ep > 1
+        grouped = source["environment"]["source_transport"] != "physical_group_of_one"
         name = f"physical-rank-{rank}.json" if grouped else "physical.json"
 
         # Physical mapping belongs to immutable trace identities; declaration fixes can reuse the completed export.

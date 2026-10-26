@@ -90,18 +90,23 @@ class AscendConcatenation:
             group = metadata["input_groups"]["segments"]
             members = group["members"]
             values = [source_values[member["value"]] for member in members]
+            dtype = source_values[metadata["outputs"][0]]["dtype"]
             if (
                 group["device"] != "npu"
-                or group["dtype"] not in cls.dtype_bytes
+                or dtype not in cls.dtype_bytes
                 or metadata["attributes"]["axis"] != 0
                 or any(
-                    len(value["shape"]) != 1 or value["stride"] != [1] or value["dtype"] != group["dtype"]
+                    len(value["shape"]) != 1 or value["stride"] != [1] or value["dtype"] not in cls.dtype_bytes
                     for value in values
                 )
             ):
                 continue
 
             # Filtering and alignment are functions of actual members, including a completely full KV pool.
+            group["dtype"] = dtype
+            types = [value["dtype"] for value in values]
+            if any(member != dtype for member in types):
+                group["member_dtypes"] = types
             lengths = [member["parameters"]["extent"] for member in members]
             width = cls.dtype_bytes[group["dtype"]]
             nonempty = sum(length > 0 for length in lengths)
@@ -132,7 +137,9 @@ class AscendConcatenation:
                 },
             ]
             metadata["entrypoint_phase"] = None
-            if nonempty > 1:
+
+            # Mixed operands keep their native casts; homogeneous reduction prototypes cannot replace them.
+            if nonempty > 1 and "member_dtypes" not in group:
                 metadata["execution_reduction"] = {
                     "group": "segments",
                     "field": "extent",

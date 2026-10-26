@@ -38,15 +38,21 @@ class NativeDisaggregatedSession:
 
     @staticmethod
     def structure_requests(page_size: int) -> tuple[tuple[int, int], ...]:
+        requests = list(NativeServingSession.structure_requests(page_size))
 
-        # Retain two requests long enough to observe both single- and multi-member Decode semantics.
-        return tuple(
-            (prompt, 16 if index < 2 else output)
-            for index, (prompt, output) in enumerate(NativeServingSession.warmup_requests(page_size))
-        )
+        # Keep multi-member Decode and a request that finishes immediately after KV acceptance.
+        for index in range(2):
+            requests[index] = (requests[index][0], 16)
+        requests[-1] = (requests[-1][0], 1)
+        return tuple(requests)
 
     def __init__(self, request: dict[str, Any]) -> None:
         self.request = request
+        source = request.get("serving_input")
+        if source is not None and [[item["prompt_tokens"], item["output_tokens"]] for item in source["requests"]] != [
+            list(pair) for pair in request["requests"]
+        ]:
+            raise ValueError("injected workload must describe the submitted native requests")
         self.output = Path(request["output"])
         self.services = self.instances(request)
         self.children: list[subprocess.Popen[bytes]] = []
@@ -79,6 +85,8 @@ class NativeDisaggregatedSession:
                 "ep_size": instance["ep"],
                 "rank_offset": instance["offset"],
                 "disaggregation_role": role,
+                "observe_all_workers": self.request.get("observe_all_workers", False),
+                "serving_input": self.request.get("serving_input"),
             },
         )
 
@@ -178,7 +186,7 @@ class NativeDisaggregatedSession:
         for device in devices:
             directory = self.output / self.services[device]["role"]
             plan = json.loads((directory / "role-plan.json").read_text())
-            directories.extend(directory / "native" / f"rank-{rank}" for rank in plan["representatives"])
+            directories.extend(directory / "native" / f"rank-{rank}" for rank in plan["observed_roles"])
 
         # PP forwards control requests after replying locally; every selected recording must close before shutdown.
         while not all(directory.is_dir() for directory in directories):
@@ -254,18 +262,20 @@ class NativeDisaggregatedSession:
                 "basis": "native_disaggregated_instance_roles",
                 "participants": sum(len(instance["ranks"]) for instance in self.services),
                 "representatives": [],
+                "observed_roles": [],
                 "instances": [],
             }
             for instance in self.services:
                 directory = self.output / instance["role"]
                 observed = json.loads((directory / "role-plan.json").read_text())
                 plan["representatives"].extend(observed["representatives"])
+                plan["observed_roles"].extend(observed["observed_roles"])
                 for derived in observed["instances"]:
                     layout = directory / f"rank-{derived['environment']['rank']}-layout.json"
                     derived["environment"]["kv_layout"] = json.loads(layout.read_text())
                     layout.unlink()
                     plan["instances"].append(derived)
-                for rank in observed["representatives"]:
+                for rank in observed["observed_roles"]:
                     (directory / f"rank-{rank}.json").stat()
             write_json(self.output / "role-plan.json", plan, indent=2)
             write_json(
@@ -281,7 +291,8 @@ class NativeDisaggregatedSession:
                     "configuration": self.request["configuration"],
                     "transport": "ascend_sdma",
                     "native_participants": [rank for instance in self.services for rank in instance["ranks"]],
-                    "observed_roles": plan["representatives"],
+                    "observed_roles": plan["observed_roles"],
+                    "routing_source": "workload" if self.request.get("serving_input") is not None else "native",
                     "instances": [
                         {key: value for key, value in instance.items() if key != "ranks"} for instance in self.services
                     ],
@@ -303,10 +314,8 @@ class NativeDisaggregatedSession:
         from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
 
         directory = Path(request["output"])
-        plan = json.loads((directory / "role-plan.json").read_text())
+        summary = json.loads((directory / "session-summary.json").read_text())
         for instance in NativeDisaggregatedSession.instances(request):
-            for rank in plan["representatives"]:
+            for rank in summary["observed_roles"]:
                 if rank in instance["ranks"]:
-                    SGLangAcquisition.interpret_role(
-                        directory / instance["role"], rank, instance["pp"], True, instance["ep"], disaggregated=True
-                    )
+                    SGLangAcquisition.interpret_role(directory / instance["role"], rank, instance["pp"], True)

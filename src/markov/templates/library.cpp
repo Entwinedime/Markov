@@ -560,6 +560,7 @@ void SourceTemplates::compile(std::size_t identity) {
         const auto value = metadata.at("source").get<std::size_t>();
         port_shapes.emplace(value, local.values.at(local.value(value)).at("shape"));
     }
+
     if (metadata.contains("shape_contracts")) {
         for (const auto & contract : metadata.at("shape_contracts"))
             port_shapes.insert_or_assign(contract.at("value").get<std::size_t>(), contract.at("shape"));

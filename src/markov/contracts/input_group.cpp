@@ -13,6 +13,7 @@ InputGroup InputGroup::read(const nlohmann::json & source) {
     InputGroup group;
     group.dtype = source.at("dtype").get<std::string>();
     group.device = source.at("device").get<std::string>();
+    group.member_dtypes = source.value("member_dtypes", std::vector<std::string>{});
     group.count = source.at("count").get<std::string>();
     for (const auto & [name, expression] : source.at("sums").items()) group.sums.emplace(name, Expression::read(expression));
 
@@ -21,7 +22,11 @@ InputGroup InputGroup::read(const nlohmann::json & source) {
     return group;
 }
 
+const std::string & InputGroup::member_dtype(std::size_t index) const { return member_dtypes.empty() ? dtype : member_dtypes.at(index); }
+
 void InputGroup::derive(Parameters & parameters, std::span<const Parameters> members) const {
+    if (!member_dtypes.empty() && member_dtypes.size() != members.size()) throw std::invalid_argument("typed input group member count differs");
+
     Parameters derived;
     if (members.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
         throw std::overflow_error("input group exceeds the parameter range");

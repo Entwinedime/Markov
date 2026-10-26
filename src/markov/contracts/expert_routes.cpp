@@ -36,7 +36,7 @@ ExpertRoutes::ExpertRoutes(const nlohmann::json & source, std::span<const Reques
     // Match the controller's stable arrival order without retaining a second request-progress state.
     std::map<std::string, std::pair<std::size_t, std::int64_t>> identities;
     for (const auto & request : Request::ordered(std::vector<Request>(requests.begin(), requests.end()))) {
-        identities.emplace(request.id, std::pair{ requests_.size(), request.prompt_tokens + request.output_tokens - 1 });
+        identities.emplace(request.id, std::pair{ requests_.size(), request.prompt_tokens + (request.output_tokens - 1) });
         requests_.emplace_back();
     }
     for (const auto & assignment : assignments) {

@@ -48,9 +48,9 @@ class MessageGeometry(TensorGeometryObservation):
                 declaration = {"value": self.metadata["ports"]["inputs"][name], "shape": axes}
                 if declaration not in self.metadata.setdefault("shape_contracts", []):
                     self.metadata["shape_contracts"].append(declaration)
-            if self.group_size > 1:
 
-                # The native send-allgather branch slices only tensors divisible by the actual TP group.
+            # The native send-allgather branch slices only tensors divisible by the actual TP group.
+            if self.group_size > 1:
                 elements = axes[0] if axes else 1
                 if len(axes) > 1:
                     elements = ["mul", *axes]
@@ -157,6 +157,25 @@ class PipelineObservation:
         self.receive_channel = ""
         self.message: MessageGeometry | None = None
         self.channel = ""
+        self.export_pending = False
+
+    def export(self, scheduler: Any) -> None:
+        self.export_pending = True
+        self.write_if_ready(scheduler)
+
+    def write_if_ready(self, scheduler: Any) -> None:
+        if scheduler.send_proxy_work or scheduler.send_output_work or self.recording.current_scope.get() is not None:
+            return
+
+        # The native loop owns submission and waits; publication only follows its completed queues.
+        self.observation.write()
+        self.export_pending = False
+
+    def commit(self, original: Any, scheduler: Any, work: Any) -> Any:
+        result = original(scheduler, work)
+        if self.export_pending:
+            self.write_if_ready(scheduler)
+        return result
 
     @staticmethod
     def payload(tensors: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -366,9 +385,9 @@ class PipelineObservation:
             return original(group, *args, **kwargs)
 
         self.message.header = True
-        try:
 
-            # Python metadata selects allocations; its tensors are outside the declared device payload flow.
+        # Python metadata selects allocations; its tensors are outside the declared device payload flow.
+        try:
             with self.values.auxiliary():
                 result = original(group, *args, **kwargs)
             fields = result if original.__name__ == "recv_object" else args[0]
@@ -397,9 +416,9 @@ class PipelineObservation:
             "field": self.message.next_field(),
         }
         work = TransferCall(self.values, original, tensor, communication)(tensor, *args, **kwargs)
-        if primitive == "send":
 
-            # The deferred native Work.wait consumes the actual wire view, which can be a TP slice.
+        # The deferred native Work.wait consumes the actual wire view, which can be a TP slice.
+        if primitive == "send":
             self.message.metadata["ports"]["outputs"].update(
                 self.values.port_values({f"wire.{communication['field']}": tensor})
             )
@@ -413,6 +432,7 @@ class PipelineObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
+            "sglang.srt.managers.scheduler.Scheduler._pp_commit_comm_work": self.commit,
             "sglang.srt.managers.scheduler.Scheduler._pp_send_recv_and_preprocess_output_tensors": self.receive_outputs,
             "sglang.srt.managers.scheduler.Scheduler._pp_send_dict_to_next_stage": self.send,
             "sglang.srt.managers.scheduler.Scheduler._pp_recv_typed_dict": self.receive,

@@ -22,6 +22,21 @@ class BatchTensors:
     }
 
     @staticmethod
+    def members(batch: Any) -> list[dict[str, Any]]:
+        prefill = batch.forward_mode.is_extend()
+        return [
+            {
+                "id": request.rid,
+                "new_tokens": request.extend_input_len if prefill else 1,
+                "context_tokens": len(request.prefix_indices)
+                if prefill
+                else len(request.origin_input_ids) + len(request.output_ids) - 1,
+                "slot": int(request.req_pool_idx),
+            }
+            for request in batch.reqs
+        ]
+
+    @staticmethod
     def read(batch: Any, fields: dict[str, str] = fields) -> dict[str, Any]:
         result = {}
         for name, path in fields.items():

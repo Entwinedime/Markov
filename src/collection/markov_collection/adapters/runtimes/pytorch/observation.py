@@ -131,7 +131,7 @@ class TensorValues:
         shape: list[Any] = list(first.shape)
         shape[axis] = "extent"
 
-        return {
+        group = {
             "dtype": str(first.dtype),
             "device": first.device.type,
             "shape": shape,
@@ -141,6 +141,10 @@ class TensorValues:
                 {"value": self.value(tensor), "parameters": {"extent": tensor.shape[axis]}} for tensor in tensors
             ],
         }
+        types = [str(tensor.dtype) for tensor in tensors]
+        if any(dtype != group["dtype"] for dtype in types):
+            group["member_dtypes"] = types
+        return group
 
     def bounded_parameter(self, name: str, minimum: int, maximum: int) -> Any:
         symbol = self.shapes.symbol(name)

@@ -285,6 +285,12 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
         if (!added && position->second != source) throw std::invalid_argument("conflicting external resource origins");
     }
 
+    // Collection aggregates belong to this call, even when its caller uses the same parameter names.
+    for (const auto & [_, group] : definition.input_groups) {
+        parameters.erase(group.count);
+        for (const auto & [name, _] : group.sums) parameters.erase(name);
+    }
+
     // Target arguments override inherited and session bindings; derived values are computed below.
     parameters = bind_parameters(std::move(parameters), bindings.values, invocation, scopes);
 
@@ -381,7 +387,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
             require_value(identities[index],
                           {
                               { "kind", "tensor" },
-                              { "dtype", group.dtype },
+                              { "dtype", group.member_dtype(index) },
                               { "device", group.device },
                               { "shape", group.dimensions(parameters, members[index]) }
             });

@@ -144,7 +144,14 @@ class DisaggregationObservation:
             return original(processor, batch)
 
         with self.recording.scope("PrebuiltResult", batch=identity) as scope:
+            scope.metadata["ports"] = {
+                "inputs": self.values.port_values({"free_pages": processor.token_to_kv_pool_allocator.free_pages}),
+                "outputs": {},
+            }
             result = original(processor, batch)
+            scope.metadata["ports"]["outputs"] = self.values.port_values(
+                {"free_pages": processor.token_to_kv_pool_allocator.free_pages}
+            )
             scope.metadata["effects"] = [
                 {"id": request.rid, "generated_tokens": len(request.output_ids), "finished": request.finished()}
                 for request in batch.reqs

@@ -29,9 +29,14 @@ class NativeServingSession:
         ep_size: int = 1,
         dtype: str = "bfloat16",
         attention_backend: str = "ascend",
+        observe_all_workers: bool = False,
+        serving_input: dict[str, Any] | None = None,
     ) -> None:
 
+        self.native_group = pp_size > 1 or ep_size > 1 or observe_all_workers
         self.roles = self.source_roles(tp_size, pp_size, rank, ep_size)
+        if self.native_group:
+            self.roles = range(tp_size * pp_size)
         self.observed_roles = tuple(self.roles)
         self.model = model
         self.requests = requests
@@ -41,12 +46,19 @@ class NativeServingSession:
         self.rank = rank
         self.pp_size = pp_size
         self.ep_size = ep_size
-        self.native_group = pp_size > 1 or ep_size > 1
         self.dtype = dtype
         self.attention_backend = attention_backend
         self.configuration = configuration
         self.matrix_selection = matrix_selection
         self.native_library = native_library
+        self.observe_all_workers = observe_all_workers
+        self.serving_input = serving_input
+        if (
+            serving_input is not None
+            and tuple((request["prompt_tokens"], request["output_tokens"]) for request in serving_input["requests"])
+            != requests
+        ):
+            raise ValueError("injected workload must describe the submitted native requests")
 
     @staticmethod
     def source_roles(tp: int, pp: int, rank: int, ep: int = 1) -> range:
@@ -69,6 +81,14 @@ class NativeServingSession:
             (page_size // 4 + 1, 2),
             (1, 1),
         )
+
+    @classmethod
+    def structure_requests(cls, page_size: int) -> tuple[tuple[int, int], ...]:
+        *initial, tail = cls.warmup_requests(page_size)
+
+        # Page-aligned input and a live tail cover identity padding and native batch merge.
+        initial[2] = (page_size, initial[2][1])
+        return (*initial, (tail[0], 3))
 
     @staticmethod
     def check_responses(responses: Iterable[dict[str, Any]], expected: dict[str, int]) -> None:
@@ -132,6 +152,8 @@ class NativeServingSession:
             "rank_offset": 0,
             "pp_size": self.pp_size,
             "ep_size": self.ep_size,
+            "observe_all_workers": self.observe_all_workers,
+            "serving_input": self.serving_input,
         }
         if self.tp_size > 1 and not self.native_group:
             session["shard"] = {"size": self.tp_size, "rank": self.rank}
@@ -172,7 +194,7 @@ class NativeServingSession:
         initialized = time.perf_counter_ns()
         if self.native_group:
             plan = json.loads((self.output / "role-plan.json").read_text())
-            self.observed_roles = tuple(plan["representatives"])
+            self.observed_roles = tuple(plan["observed_roles"])
         print("markov: native initialization complete", flush=True)
         try:
             self.generate(engine, "warmup/", warmup)
@@ -219,6 +241,7 @@ class NativeServingSession:
             "configuration": self.configuration,
             "matrix_selection": self.matrix_selection,
             "worker_limits": engine._scheduler_init_result.scheduler_infos,
+            "routing_source": "workload" if self.serving_input is not None else "native",
         }
         write_json(self.output / "session-summary.json", summary, indent=2)
         print(json.dumps(summary))
