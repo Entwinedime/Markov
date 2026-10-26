@@ -97,6 +97,19 @@ void check_fields(const nlohmann::json & source, std::initializer_list<std::stri
     }
 }
 
+nlohmann::json expert_condition(const nlohmann::json & settings, const nlohmann::json & input, const markov::TemplateAsset & source) {
+    if (!settings.contains("ep")) return nullptr;
+    const auto & ep = settings.at("ep");
+    check_fields(ep, { "id", "size" }, "ep");
+    const auto id = ep.at("id").get<std::string>();
+    const auto size = integer(ep.at("size"));
+    if (id.empty() || size <= 0 || size != source.environment().at("logical_ep").get<std::int64_t>())
+        throw std::invalid_argument("EP topology does not match the native source");
+    const auto & conditions = input.at("ep_routes");
+    if (!conditions.is_object() || !conditions.contains(id)) throw std::invalid_argument("workload has no route condition for EP topology: " + id);
+    return conditions.at(id);
+}
+
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
     check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
@@ -106,7 +119,8 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
         check_fields(configuration,
                      { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement", "ep" },
                      "configuration");
-    if (input.contains("ep_routes") && !configuration.contains("ep")) throw std::invalid_argument("workload routes require a configured EP topology");
+    if (input.contains("ep_routes") && !configuration.contains("ep") && !disaggregated)
+        throw std::invalid_argument("workload routes require a configured EP topology");
 
     std::vector<markov::Request> requests;
     if (!input.at("requests").is_array() || input.at("requests").empty()) throw std::invalid_argument("serving needs a nonempty request array");
@@ -132,8 +146,27 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
         check_fields(pd, { "prefill", "decode" }, "pd");
         const auto & p = pd.at("prefill");
         const auto & d = pd.at("decode");
-        check_fields(p, { "max_running_requests", "max_total_tokens", "max_prefill_tokens" }, "pd.prefill");
-        check_fields(d, { "max_running_requests", "max_total_tokens" }, "pd.decode");
+        check_fields(p, { "tp", "pp", "ep", "max_running_requests", "max_total_tokens", "max_prefill_tokens" }, "pd.prefill");
+        check_fields(d, { "tp", "pp", "ep", "max_running_requests", "max_total_tokens" }, "pd.decode");
+        if (input.contains("ep_routes") && !p.contains("ep") && !d.contains("ep"))
+            throw std::invalid_argument("workload routes require a configured EP topology");
+        const markov::TemplateAsset * prefill_source = nullptr;
+        const markov::TemplateAsset * decode_source = nullptr;
+        for (const auto & asset : assets) {
+            const auto & mode = asset.environment().at("implementation").at("disaggregation_mode");
+            if (mode == "prefill") prefill_source = &asset;
+            if (mode == "decode") decode_source = &asset;
+        }
+        if (prefill_source == nullptr || decode_source == nullptr) throw std::invalid_argument("PD requires prefill and decode sources");
+        for (const auto & [pool, source] : {
+                 std::pair{ &p, prefill_source },
+                 { &d,  decode_source }
+        }) {
+            const auto tp = integer(pool->at("tp"));
+            const auto pp = pool->contains("pp") ? integer(pool->at("pp")) : 1;
+            if (tp <= 0 || pp <= 0 || tp != source->environment().at("logical_tp") || pp != source->environment().at("logical_pp"))
+                throw std::invalid_argument("PD target topology differs from its native instance source");
+        }
         const auto page_size = integer(configuration.at("page_size"));
         const markov::ServingSettings prefill(integer(p.at("max_running_requests")),
                                               integer(p.at("max_total_tokens")),
@@ -141,7 +174,14 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                               integer(p.at("max_prefill_tokens")));
         const markov::ServingSettings decode(integer(d.at("max_running_requests")), integer(d.at("max_total_tokens")), page_size, 1);
         const markov::DisaggregatedGroups groups{ "prefill", "decode", "kv" };
-        markov::sglang::DisaggregatedStructure expansion(assets, prefill, decode, requests, groups, devices);
+        markov::sglang::DisaggregatedStructure expansion(assets,
+                                                         prefill,
+                                                         decode,
+                                                         requests,
+                                                         groups,
+                                                         devices,
+                                                         expert_condition(p, input, *prefill_source),
+                                                         expert_condition(d, input, *decode_source));
         markov::DisaggregatedController controller(prefill, decode, std::move(requests), groups, expansion.page_reuse());
         markov::ServingWorkflow workflow(controller, expansion, durations);
         auto result = workflow.run(details);
@@ -162,21 +202,12 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     const auto batch_limit =
         configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
     if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
-    const markov::sglang::ServingTopology topology(assets, static_cast<std::size_t>(stages), devices);
+    const markov::sglang::ServingTopology topology(assets, devices);
+    if (static_cast<std::size_t>(stages) != topology.stage_count("model")) throw std::invalid_argument("target PP differs from its source topology");
     const auto control_group = topology.parallel().groups().front().id;
-    nlohmann::json routes;
-    if (configuration.contains("ep")) {
-        const auto & ep = configuration.at("ep");
-        check_fields(ep, { "id", "size" }, "ep");
-        const auto id = ep.at("id").get<std::string>();
-        const auto size = integer(ep.at("size"));
-        if (id.empty() || size <= 0 || size != assets.front().environment().at("logical_ep").get<std::int64_t>())
-            throw std::invalid_argument("EP topology does not match the native source");
-        const auto & conditions = input.at("ep_routes");
-        if (!conditions.is_object() || !conditions.contains(id)) throw std::invalid_argument("workload has no route condition for EP topology: " + id);
-        routes = conditions.at(id);
-    }
-    markov::sglang::ServingStructure expansion(assets, settings, requests, topology, routes);
+    const auto routes = expert_condition(configuration, input, assets.front());
+    markov::RegionGraph graph;
+    markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
     markov::ServingController controller(settings, std::move(requests), control_group, static_cast<std::size_t>(stages), static_cast<std::size_t>(batch_limit));
     markov::ServingWorkflow workflow(controller, expansion, durations);
     auto result = workflow.run(details);
@@ -187,12 +218,11 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     return result;
 }
 
-markov::TemplateAsset select_role(const markov::TemplateCatalog & catalog, nlohmann::json & document, const nlohmann::json & target) {
+const markov::TemplateAsset & select_role(std::span<const markov::TemplateAsset> roles, const nlohmann::json & target) {
     const auto rank = target.contains("source_rank") ? integer(target.at("source_rank")) : 0;
-    auto & roles = document.at("roles");
-    const auto selected = std::ranges::find_if(roles, [rank](const auto & role) { return role.at("environment").at("rank") == rank; });
+    const auto selected = std::ranges::find_if(roles, [rank](const auto & role) { return role.environment().at("rank") == rank; });
     if (selected == roles.end()) throw std::invalid_argument("template catalog has no selected source rank");
-    return { catalog, std::move(*selected) };
+    return *selected;
 }
 
 } // namespace
@@ -220,8 +250,7 @@ int main(int argc, char ** argv) {
             if (template_path.empty() || input.empty() || output.empty()) throw std::invalid_argument("simulate requires templates, input and output");
             auto document = read_json(template_path);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
-            std::vector<markov::TemplateAsset> assets;
-            for (auto & role : document.at("roles")) assets.emplace_back(catalog, std::move(role));
+            const auto assets = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
             const auto result = simulate(assets, read_json(input), details);
             write_json(output, result, { template_path, input }, !details);
             std::cout << nlohmann::json{
@@ -239,6 +268,7 @@ int main(int argc, char ** argv) {
         if (argc >= 2 && std::string(argv[1]) == "templates") {
             std::vector<std::pair<std::filesystem::path, std::filesystem::path>> sources;
             std::filesystem::path output;
+            std::filesystem::path instances;
             for (int index = 2; index < argc; ++index) {
                 const std::string option = argv[index];
                 if (index + 1 == argc) throw std::invalid_argument("templates option has no value");
@@ -246,6 +276,7 @@ int main(int argc, char ** argv) {
                 if (option == "--source") sources.emplace_back(value, std::filesystem::path{});
                 else if (option == "--physical" && !sources.empty() && sources.back().second.empty()) sources.back().second = value;
                 else if (option == "--output" && output.empty()) output = value;
+                else if (option == "--instances" && instances.empty()) instances = value;
                 else throw std::invalid_argument("unknown or repeated templates option: " + option);
             }
             if (sources.empty() || output.empty()) throw std::invalid_argument("templates requires sources and output");
@@ -262,7 +293,13 @@ int main(int argc, char ** argv) {
                 library.add(markov::SourceProjection(graph).document(physical_path.empty() ? nullptr : &physical));
                 if (!physical_path.empty()) inputs.push_back(physical_path);
             }
+            if (!instances.empty()) {
+                library.add_instances(read_json(instances).at("instances"));
+                inputs.push_back(instances);
+            }
             const auto result = std::move(library).document();
+            const markov::TemplateCatalog catalog(result.at("catalog"));
+            markov::TemplateAsset::read_roles(catalog, result.at("roles"));
             write_json(output, result, inputs);
             std::cout << nlohmann::json{
                 {        "definitions",        result.at("catalog").at("definitions").size() },
@@ -284,7 +321,8 @@ int main(int argc, char ** argv) {
         if (!inspect && !produce && !expand && !composition) {
             std::cerr << "Usage: markov inspect --source observations.json\n"
                          "       markov produce --source observations.json [--physical physical.json] --output source-graph.json\n"
-                         "       markov templates --source observations.json [--physical physical.json] [--source ...] --output templates.json\n"
+                         "       markov templates --source observations.json [--physical physical.json] [--source ...] [--instances roles.json] --output "
+                         "templates.json\n"
                          "       markov expand --templates templates.json --target target.json --output region.json\n"
                          "       markov compose --templates templates.json --target calls.json --output graph.json\n"
                          "       markov simulate --templates templates.json --input serving.json --output result.json [--details]\n";
@@ -294,8 +332,9 @@ int main(int argc, char ** argv) {
         if (composition) {
             auto document = read_json(argv[3]);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
+            const auto roles = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
             const auto target = read_json(argv[5]);
-            const auto asset = select_role(catalog, document, target);
+            const auto & asset = select_role(roles, target);
             const auto result = compose(asset, target);
             write_json(argv[7], result, { argv[3], argv[5] });
             std::cout << nlohmann::json{
@@ -313,8 +352,9 @@ int main(int argc, char ** argv) {
         if (expand) {
             auto document = read_json(argv[3]);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
+            const auto roles = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
             const auto target = read_json(argv[5]);
-            const auto asset = select_role(catalog, document, target);
+            const auto & asset = select_role(roles, target);
             auto instance = markov::TemplateInstance::select(asset,
                                                              target.at("role").get<std::string>(),
                                                              target.at("phase").get<std::string>(),

@@ -2,11 +2,28 @@
 
 #include <algorithm>
 #include <charconv>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
 
 namespace markov {
+namespace {
+
+void bind_role_values(FixedBindings & frame, const std::map<std::string, Expression> & rules, std::set<std::string> & unused) {
+    const auto original = frame.values;
+    for (auto & [name, value] : frame.values) {
+        if (const auto rule = rules.find(name); rule != rules.end()) {
+            value = rule->second.evaluate(original);
+            unused.erase(name);
+        }
+    }
+
+    for (auto & child : frame.children) bind_role_values(child, rules, unused);
+    for (auto & [_, producer] : frame.producers) bind_role_values(producer, rules, unused);
+}
+
+} // namespace
 
 std::vector<std::int64_t> evaluate_shape(const std::vector<Expression> & shape, const Parameters & parameters) {
     std::vector<std::int64_t> dimensions;
@@ -268,6 +285,43 @@ TemplateAsset::TemplateAsset(const TemplateCatalog & catalog, nlohmann::json doc
     std::vector<CallVisit> visiting(catalog_.layout_count());
     for (const auto & entry : entries_) validate_calls(entry.layout, visiting);
     for (const auto & selection : entrypoints_) validate_calls(frame(selection).layout, visiting);
+}
+
+std::vector<TemplateAsset> TemplateAsset::read_roles(const TemplateCatalog & catalog, const nlohmann::json & roles) {
+    std::vector<TemplateAsset> result;
+    std::map<std::int64_t, std::size_t> ranks;
+    for (const auto & role : roles) {
+        if (role.contains("representative")) {
+            const auto source = ranks.at(role.at("representative").get<std::int64_t>());
+            if (result[source].environment().contains("role_source")) throw std::invalid_argument("a role representative must be an observed source");
+            result.push_back(result[source].bind_role(role));
+        }
+        else result.emplace_back(catalog, role);
+
+        const auto rank = result.back().environment().at("rank").get<std::int64_t>();
+        if (rank < 0 || !ranks.emplace(rank, result.size() - 1).second) throw std::invalid_argument("template roles need distinct nonnegative ranks");
+    }
+    return result;
+}
+
+TemplateAsset TemplateAsset::bind_role(const nlohmann::json & instance) const {
+    auto result = *this;
+    std::map<std::string, Expression> rules;
+    std::set<std::string> unused;
+    for (const auto & [name, expression] : instance.at("bindings").items()) {
+        rules.emplace(name, Expression::read(expression));
+        unused.emplace(name);
+    }
+
+    // Rewrite declared bindings atomically in a private instance; observed calls and the catalog stay intact.
+    for (auto & entry : result.entries_) bind_role_values(entry.bindings, rules, unused);
+    if (!unused.empty()) throw std::invalid_argument("role mapping has no declared binding: " + *unused.begin());
+    result.environment_.update(instance.at("environment"));
+    result.environment_["role_source"] = {
+        { "representative", instance.at("representative") },
+        {       "bindings",       instance.at("bindings") }
+    };
+    return result;
 }
 
 BoundExecution TemplateAsset::bound_execution(const nlohmann::json & source) const {

@@ -80,8 +80,7 @@ std::optional<std::size_t> BatchViews::idle() {
 }
 
 void BatchViews::remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects) {
-    View view{ {}, static_cast<std::int64_t>(effects.members.size()), {} };
-    for (const auto & name : fields_) view.columns.emplace(name, ports.at(name));
+    View view{ columns(ports), static_cast<std::int64_t>(effects.members.size()), {} };
     for (std::size_t row = 0; row < effects.members.size(); ++row) {
         if (!effects.members[row].finished) view.kept_rows.push_back(static_cast<std::int64_t>(row));
     }

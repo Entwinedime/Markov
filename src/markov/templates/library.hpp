@@ -11,6 +11,7 @@ namespace markov {
 class TemplateLibrary {
 public:
     void add(const nlohmann::json & source);
+    void add_instances(const nlohmann::json & instances);
     nlohmann::json document() &&;
 
 private:

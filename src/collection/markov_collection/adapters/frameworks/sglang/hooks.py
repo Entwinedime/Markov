@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+from markov_collection.artifacts.json_file import write_json
 from markov_collection.instrumentation.recording import Recording
 
 
@@ -26,6 +27,7 @@ class SGLangObservation:
         from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
         self.directory = Path(description["output"])
+        self.rank_offset = description["rank_offset"]
         self.recording = Recording(TorchMarkers())
         self.synchronization = SynchronizationObservation(self.recording.markers)
         self.workspaces = AscendWorkspaces(self.synchronization, Path(description["native_library"]))
@@ -52,9 +54,10 @@ class SGLangObservation:
             self.shard = SingleDeviceShard(shard["size"], shard["rank"], self.operators.values)
 
         self.model: Any = None
+        self.selected = True
         self.batch_ids: Any = WeakIdKeyDictionary()
         self.process_groups = None
-        if description["pp_size"] > 1 or description["ep_size"] > 1:
+        if description["pp_size"] > 1 or description["ep_size"] > 1 or "disaggregation_role" in description:
             from markov_collection.adapters.frameworks.sglang.parallel import ProcessGroupObservation
 
             self.process_groups = ProcessGroupObservation(self)
@@ -72,25 +75,38 @@ class SGLangObservation:
             self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
 
     def load_model(self, original: Any, runner: Any) -> Any:
+        from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.runtime_context import get_parallel
 
         result = original(runner)
         self.model = runner.model
         tp_size = self.shard.size if self.shard is not None else runner.tp_size
         tp_rank = self.shard.rank if self.shard is not None else runner.tp_rank
+
+        # Wrapper properties vary by model; the loaded attention modules identify the actual local layer interval.
+        layers = [module.layer_id for module in self.model.modules() if isinstance(module, RadixAttention)]
         self.parallel = {
-            "rank": self.disaggregation.rank if self.disaggregation is not None else runner.pp_rank * tp_size + tp_rank,
+            "rank": self.rank_offset + runner.pp_rank * tp_size + tp_rank,
             "tp_rank": tp_rank,
             "pp_rank": runner.pp_rank,
             "logical_tp": tp_size,
             "logical_pp": runner.pp_size,
             "logical_ep": get_parallel().moe_ep_size,
             "ep_rank": get_parallel().moe_ep_rank,
-            "layer_range": [
-                getattr(self.model, "start_layer", 0),
-                getattr(self.model, "end_layer", runner.model_config.num_hidden_layers),
-            ],
+            "layer_range": [min(layers), max(layers) + 1],
         }
+        if self.process_groups is not None:
+            from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
+
+            plan = WorkerRolePlan.from_group(self.model, self.parallel)
+            self.selected = self.parallel["rank"] in plan["representatives"]
+            self.synchronization.set_enabled(self.selected)
+            if runner.pp_rank == 0 and tp_rank == 0:
+                write_json(self.directory / "role-plan.json", plan, indent=2)
+        elif self.shard is not None and tp_rank == 0:
+            from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
+
+            self.parallel["worker_roles"] = WorkerRolePlan.from_model(self.model, tp_size)
         self.implementation = {
             "model_path": runner.server_args.model_path,
             "model_config": runner.model_config.hf_config.to_dict(),
@@ -145,6 +161,8 @@ class SGLangObservation:
         return identity
 
     def observation(self, requests: Any) -> str | None:
+        if not self.selected:
+            return None
         identities = {request.rid for request in requests}
         if identities and identities <= self.requests:
             return "source"
@@ -230,11 +248,9 @@ class SGLangObservation:
                 self.pipeline.remember(identity, result)
             return result
 
-        # Decode gathers relayed tokens before the model wrapper binds its inputs.
+        # Decode relays tokens before the model wrapper binds inputs; serving batches are nonempty by contract.
         with self.recording.scope(phase.capitalize(), batch=identity) as scope, self.operators:
             with self.operators.values.metadata():
-
-                # The serving model runs only nonempty batches; this is an input contract, not a source length hint.
                 for name in ("M", "B"):
                     self.operators.values.bounded_parameter(name, 1, sys.maxsize)
                 for tensor in BatchTensors.read(batch).values():
@@ -254,8 +270,6 @@ class SGLangObservation:
                 "outputs": {},
             }
 
-            # Bind actual model inputs after native staging, through SGLang's common model interface.
-
             # Decode contributes one token per member, so its token axis is B by definition.
             token_axis = "B" if phase == "decode" else "M"
             member_axis = "B"
@@ -269,8 +283,13 @@ class SGLangObservation:
             if proxy is not None:
                 payload = self.pipeline.payload(proxy.tensors)
                 with self.operators.values.metadata():
-                    for tensor in payload.values():
-                        self.operators.values.bind(tensor, {0: token_axis})
+                    for name, tensor in payload.items():
+                        axis = f"proxy_{name}_tokens"
+                        scope.metadata.setdefault("parameters", {})[axis] = tensor.shape[0]
+                        self.operators.values.bounded_parameter(axis, 1, sys.maxsize)
+
+                        # The previous stage supplies this geometry; EP can forward a local token shard.
+                        self.operators.values.bind(tensor, {0: axis})
                     scope.metadata["ports"]["inputs"].update(
                         self.operators.values.port_values({f"proxy.{name}": tensor for name, tensor in payload.items()})
                     )
@@ -490,6 +509,8 @@ class SGLangObservation:
                 self.matrices.capture()
                 self.materializations.capture()
                 self.indexed_writes.capture()
+        if result and self.disaggregation is not None and not self.selected:
+            write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
         if result and any(batch["observation"] == "source" for batch in self.recording.batches):
             import torch
             import torch_npu
@@ -527,14 +548,15 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.preparation import SGLangPreparation
         from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
         from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
+        from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
 
         functions = AscendFunctionObservation(self.operators.values)
         SGLangPrimitives(self.operators.values).install()
         self.experts.install()
         fields = BatchTensors.fields
-        if self.pipeline is not None:
 
-            # PP keeps returned tokens in the batch until its next model invocation.
+        # PP keeps returned tokens in the batch until its next model invocation.
+        if self.pipeline is not None:
             fields = self.pipeline.fields
         SGLangPreparation(self.operators.values, fields, self.ep_size > 1).install()
         if self.ep_size > 1:
@@ -555,11 +577,20 @@ class SGLangObservation:
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free": self.release_pages,
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_finished_req": self.request_cache,
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_unfinished_req": self.request_cache,
+            "torch_npu.profiler.tensorboard_trace_handler": AscendTrace.capture_handler,
             functions.target: functions.split_qkv,
         }
         if self.disaggregation is not None:
             targets.pop("sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run")
-            target = f"sglang.srt.managers.scheduler.Scheduler.get_next_disagg_{self.disaggregation.role}_batch_to_run"
+            role = self.disaggregation.role
+
+            # Native PP Prefill calls admission directly; the non-PP loop owns an outer PD scheduling method.
+            method = (
+                "get_new_batch_prefill"
+                if self.pipeline is not None and role == "prefill"
+                else f"get_next_disagg_{role}_batch_to_run"
+            )
+            target = f"sglang.srt.managers.scheduler.Scheduler.{method}"
             targets[target] = self.schedule
         for target, observer in targets.items():
             HookRegistry.register(target, observer, HookType.AROUND)

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from bisect import bisect_right
 from collections import defaultdict
 from decimal import Decimal
-from itertools import pairwise
+from itertools import accumulate, pairwise
+from operator import itemgetter
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,11 @@ class NativeRuntimeCalls:
                     raise ValueError("native runtime call ends before it begins")
                 call["source"] = {"process": int(path.stem), "record": index}
                 self.calls[(call["thread"], call["api"])].append(call)
+
+        self.prefix_ends = {}
+        for key, calls in self.calls.items():
+            calls.sort(key=itemgetter("begin_raw_ns"))
+            self.prefix_ends[key] = list(accumulate((call["end_raw_ns"] for call in calls), max))
 
         self.callbacks: dict[str, dict[str, Any]] = {}
         for path in directory.glob("*-callbacks.json"):
@@ -90,18 +97,21 @@ class NativeRuntimeCalls:
     def arguments(self, event: dict[str, Any], timestamp_ns: int) -> dict[str, Any] | None:
         arguments = event["args"]
         instant = timestamp_ns - self.offset_ns
-        matches = [
-            call
-            for call in self.calls.get((arguments["Thread Id"], arguments["id"]), ())
-            if call["begin_raw_ns"] <= instant < call["end_raw_ns"]
-        ]
-        if len(matches) != 1:
-            return None
+        key = arguments["Thread Id"], arguments["id"]
+        calls = self.calls.get(key, ())
+        position = bisect_right(calls, instant, key=itemgetter("begin_raw_ns"))
+        match = None
 
-        call = matches[0]
+        # Prefix ends retain nested/ambiguous calls while skipping intervals that have already ended.
+        while position and self.prefix_ends[key][position - 1] > instant:
+            position -= 1
+            call = calls[position]
+            if instant < call["end_raw_ns"]:
+                if match is not None:
+                    return None
+                match = call
 
-        # The API entry identifies the invocation; profiler closing timestamps are not service costs.
-        return self.parameters(call)
+        return None if match is None else self.parameters(match)
 
     @staticmethod
     def parameters(call: dict[str, Any]) -> dict[str, Any]:

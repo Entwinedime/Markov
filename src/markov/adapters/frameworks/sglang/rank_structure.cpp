@@ -99,10 +99,30 @@ RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settin
     for (std::size_t lane = 0; lane < lanes; ++lane) views_.emplace_back(graph_, asset);
 }
 
-RankProgram RankStructure::expand(const Batch & batch, const BatchEffects & effects) {
-    const auto inputs = prepare(batch, 0);
-    const auto output = model(batch, inputs);
-    return complete(batch, effects, 0, output.ports.outputs, output.ports.outputs.at("sampled_tokens"));
+RankProgram RankStructure::expand(const ServingAction & action) {
+    const auto & batch = action.work->batch;
+    const auto & effects = action.work->effects;
+    switch (action.step) {
+    case ServingStep::Batch:
+    case ServingStep::Model: {
+        const auto inputs = prepare(batch, action.lane);
+        const auto output = model(batch, inputs);
+        return complete(batch,
+                        effects,
+                        action.lane,
+                        output.ports.outputs,
+                        output.ports.outputs.at("sampled_tokens"),
+                        action.step == ServingStep::Model ? std::optional(action.flow) : std::nullopt);
+    }
+    case ServingStep::Reserve:
+        return reserve(batch);
+    case ServingStep::Accept:
+        return accept(batch, effects, action.flow);
+    case ServingStep::Release:
+        return release(effects);
+    default:
+        throw std::invalid_argument("rank cannot execute this serving action");
+    }
 }
 
 std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, std::size_t lane) {
@@ -202,13 +222,8 @@ TargetRegion RankStructure::model(const Batch & batch, const std::map<std::strin
 }
 
 RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
-                                    const std::map<std::string, std::size_t> & model_columns, std::size_t sampled_tokens) {
-    return finish_result(batch, effects, lane, model_columns, sampled_tokens, std::nullopt);
-}
-
-RankProgram RankStructure::finish_result(const Batch & batch, const BatchEffects & effects, std::size_t lane,
-                                         const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens,
-                                         std::optional<std::size_t> handoff) {
+                                    const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens,
+                                    std::optional<std::size_t> handoff) {
     const auto begin = shared_.regions.size();
     auto columns = model_columns;
     if (sampled_tokens) columns["model_tokens"] = *sampled_tokens;
@@ -349,12 +364,6 @@ TargetRegion RankStructure::cache_member(const RequestCompletion & member, bool 
     return result;
 }
 
-RankProgram RankStructure::prefill_handoff(const Batch & batch, const BatchEffects & effects, std::size_t handoff) {
-    const auto inputs = prepare(batch, 0);
-    const auto output = model(batch, inputs);
-    return finish_result(batch, effects, 0, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), handoff);
-}
-
 RankProgram RankStructure::reserve(const Batch & batch) {
     const auto begin = shared_.regions.size();
     merge_pages(batch);
@@ -406,7 +415,7 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     token_relay_ = accepted.ports.outputs.at("token_relay");
     graph_.end_composition(accepted.ports.outputs);
     stamp(begin);
-    return finish_result(batch, effects, 0, accepted.ports.outputs, std::nullopt, std::nullopt);
+    return complete(batch, effects, 0, accepted.ports.outputs, std::nullopt);
 }
 
 RankProgram RankStructure::release(const BatchEffects & effects) {
@@ -437,13 +446,20 @@ std::size_t RankStructure::admission_members(std::size_t lane) const { return vi
 PageReuse RankStructure::page_reuse() const { return page_reuse_; }
 
 nlohmann::json RankStructure::source_summary() const {
-    return {
+    auto result = nlohmann::json{
         {                                 "rank",                                                                        rank_ },
         {                    "physical_coverage",                                      asset_.physical_coverage().at("status") },
         {                     "runtime_coverage",                                       asset_.runtime_coverage().at("status") },
         { "workspace_capacity_lower_bound_bytes", asset_.environment().at("workspace_policy").at("capacity_lower_bound_bytes") },
         {                           "page_reuse",   page_reuse_ == PageReuse::DeferredSorted ? "deferred_sorted" : "immediate" }
     };
+    const auto & environment = asset_.environment();
+    if (environment.contains("role_source")) result["role_source"] = environment.at("role_source");
+    else
+        result["role_source"] = {
+            { "observed_rank", environment.at("rank") }
+        };
+    return result;
 }
 
 const char * RankStructure::released_pool() const { return page_reuse_ == PageReuse::DeferredSorted ? "release_pages" : "free_pages"; }

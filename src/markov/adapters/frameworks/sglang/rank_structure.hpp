@@ -40,16 +40,12 @@ public:
     std::size_t admission_members(std::size_t lane) const;
     PageReuse page_reuse() const;
     nlohmann::json source_summary() const;
-    RankProgram expand(const Batch & batch, const BatchEffects & effects);
-    RankProgram prefill_handoff(const Batch & batch, const BatchEffects & effects, std::size_t handoff);
-    RankProgram reserve(const Batch & batch);
-    RankProgram accept(const Batch & batch, const BatchEffects & effects, std::size_t handoff);
-    RankProgram release(const BatchEffects & effects);
+    RankProgram expand(const ServingAction & action);
     TargetRegion transfer(std::int64_t bytes, std::int64_t segments);
     std::map<std::string, std::size_t> prepare(const Batch & batch, std::size_t lane);
     TargetRegion model(const Batch & batch, const std::map<std::string, std::size_t> & inputs);
     RankProgram complete(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & model_columns,
-                         std::size_t sampled_tokens);
+                         std::optional<std::size_t> sampled_tokens, std::optional<std::size_t> handoff = std::nullopt);
     RankMessage message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending);
     void wait_message(const std::string & channel, const Batch & batch, const RankMessage & message);
     std::size_t receive_result(const Batch & batch, std::size_t sampled_tokens);
@@ -58,8 +54,9 @@ public:
     void live_state(std::vector<std::size_t *> & values, std::set<std::size_t> & storage);
 
 private:
-    RankProgram finish_result(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & columns,
-                              std::optional<std::size_t> sampled_tokens, std::optional<std::size_t> handoff);
+    RankProgram reserve(const Batch & batch);
+    RankProgram accept(const Batch & batch, const BatchEffects & effects, std::size_t handoff);
+    RankProgram release(const BatchEffects & effects);
     TargetRegion cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase);
     Invocation invocation(const Batch & batch) const;
     void stamp(std::size_t region_begin);

@@ -216,6 +216,7 @@ private:
 class TemplateAsset {
 public:
     TemplateAsset(const TemplateCatalog & catalog, nlohmann::json document);
+    static std::vector<TemplateAsset> read_roles(const TemplateCatalog & catalog, const nlohmann::json & roles);
 
     const TemplateDefinition & definition(std::size_t identity) const;
     const TemplateLayout & layout(std::size_t identity) const;
@@ -234,6 +235,7 @@ public:
 private:
     enum class CallVisit { Unseen, Active, Complete };
 
+    TemplateAsset bind_role(const nlohmann::json & instance) const;
     FixedBindings fixed_bindings(const nlohmann::json & source) const;
     BoundExecution bound_execution(const nlohmann::json & source) const;
     void validate_bindings(std::size_t layout, const FixedBindings & bindings) const;

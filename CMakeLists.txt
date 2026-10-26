@@ -42,6 +42,7 @@ add_library(markov_application
     src/markov/adapters/frameworks/sglang/batches.cpp
     src/markov/adapters/frameworks/sglang/expert_routing.cpp
     src/markov/adapters/frameworks/sglang/disaggregated.cpp
+    src/markov/adapters/frameworks/sglang/kv_transfer.cpp
     src/markov/adapters/frameworks/sglang/topology.cpp
     src/markov/adapters/frameworks/sglang/structure.cpp
     src/markov/adapters/frameworks/sglang/rank_structure.cpp

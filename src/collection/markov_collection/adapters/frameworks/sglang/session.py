@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from markov_collection.artifacts.json_file import write_json
 
@@ -30,6 +32,7 @@ class NativeServingSession:
     ) -> None:
 
         self.roles = self.source_roles(tp_size, pp_size, rank, ep_size)
+        self.observed_roles = tuple(self.roles)
         self.model = model
         self.requests = requests
         self.output = output.resolve()
@@ -67,6 +70,23 @@ class NativeServingSession:
             (1, 1),
         )
 
+    @staticmethod
+    def check_responses(responses: Iterable[dict[str, Any]], expected: dict[str, int]) -> None:
+        completed = set()
+        for response in responses:
+            metadata = response["meta_info"]
+            reason = metadata["finish_reason"]
+            if reason is None:
+                continue
+
+            identity = metadata["id"]
+            if reason["type"] != "length" or metadata["completion_tokens"] != expected[identity]:
+                raise RuntimeError(f"native request {identity} did not finish its fixed output: {reason}")
+            completed.add(identity)
+
+        if completed != expected.keys():
+            raise RuntimeError(f"native stream ended before requests completed: {sorted(expected.keys() - completed)}")
+
     def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
         print(f"markov: native {prefix}begin", flush=True)
         response = engine.generate(
@@ -78,9 +98,8 @@ class NativeServingSession:
             stream=True,
         )
 
-        # Consume native streaming to completion; publication then contains actual token-visible ports.
-        for _ in response:
-            pass
+        # HTTP success and a closed stream can still contain aborted native requests.
+        self.check_responses(response, {f"{prefix}{index}": output for index, (_, output) in enumerate(requests)})
         print(f"markov: native {prefix}complete", flush=True)
 
     @staticmethod
@@ -92,7 +111,7 @@ class NativeServingSession:
         print("markov: native pool reset complete", flush=True)
 
     def wait_for_sources(self) -> None:
-        sources = [self.output / f"rank-{rank}.json" for rank in self.roles]
+        sources = [self.output / f"rank-{rank}.json" for rank in self.observed_roles]
 
         # PP forwards control requests after replying locally; every role must publish before shutdown.
         while not all(path.is_file() for path in sources):
@@ -110,6 +129,7 @@ class NativeServingSession:
             "baseline_requests": [f"baseline/{index}" for index in range(len(self.requests))],
             "matrix_selection": self.matrix_selection,
             "native_library": self.native_library,
+            "rank_offset": 0,
             "pp_size": self.pp_size,
             "ep_size": self.ep_size,
         }
@@ -122,9 +142,9 @@ class NativeServingSession:
         os.environ["SGLANG_PLUGINS"] = "markov"
 
         expert_options = {}
-        if self.ep_size > 1:
 
-            # Select the qualified native all-to-all implementation before workers start.
+        # Select the qualified native all-to-all implementation before workers start.
+        if self.ep_size > 1:
             os.environ.update(DEEP_USE_ALLTOALL_MODE="1", DEEPEP_HCCL_BUFFSIZE="1024", HCCL_BUFFSIZE="1024")
             expert_options = {"ep_size": self.ep_size, "moe_a2a_backend": "deepep", "deepep_mode": "normal"}
 
@@ -150,6 +170,9 @@ class NativeServingSession:
             log_level="warning",
         )
         initialized = time.perf_counter_ns()
+        if self.native_group:
+            plan = json.loads((self.output / "role-plan.json").read_text())
+            self.observed_roles = tuple(plan["representatives"])
         print("markov: native initialization complete", flush=True)
         try:
             self.generate(engine, "warmup/", warmup)
@@ -172,7 +195,7 @@ class NativeServingSession:
                 if self.profile:
                     engine.stop_profile()
                     if self.native_group:
-                        directories = [self.output / "native" / f"rank-{rank}" for rank in self.roles]
+                        directories = [self.output / "native" / f"rank-{rank}" for rank in self.observed_roles]
                         while not all(directory.is_dir() for directory in directories):
                             time.sleep(0.05)
             captured = time.perf_counter_ns()
@@ -183,7 +206,7 @@ class NativeServingSession:
             "initialization_ns": initialized - started,
             "warmup_ns": warmed - initialized,
             "warmup_requests": warmup,
-            "capture_and_export_ns": captured - warmed,
+            "capture_and_flush_ns": captured - warmed,
             "profile": self.profile,
             "model": self.model,
             "weight_source": "native_dummy_loader_full_model",
@@ -191,6 +214,8 @@ class NativeServingSession:
             "logical_pp": self.pp_size,
             "logical_ep": self.ep_size,
             "rank": self.rank,
+            "native_participants": list(self.roles),
+            "observed_roles": list(self.observed_roles),
             "configuration": self.configuration,
             "matrix_selection": self.matrix_selection,
             "worker_limits": engine._scheduler_init_result.scheduler_infos,

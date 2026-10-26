@@ -1,6 +1,7 @@
 #include <ATen/core/TensorBody.h>
 #include <acl/acl_rt.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,8 @@
 #include <unistd.h>
 
 namespace {
+
+std::atomic_bool runtime_enabled{ true };
 
 template <class Function> Function original(const char * name) {
     auto * symbol = dlsym(RTLD_NEXT, name);
@@ -33,7 +36,7 @@ std::int64_t raw_time_ns() {
 class RuntimeCall {
 public:
     RuntimeCall(const char * name, aclrtStream stream, bool has_stream, std::size_t bytes = 0, int direction = -1)
-        : directory_(std::getenv("MARKOV_NATIVE_RUNTIME_DIR")),
+        : directory_(runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
           bytes_(bytes),
           direction_(direction) {
@@ -98,6 +101,8 @@ private:
 };
 
 } // namespace
+
+extern "C" void markov_set_runtime_enabled(int enabled) { runtime_enabled.store(enabled != 0, std::memory_order_relaxed); }
 
 extern "C" aclError aclrtMemcpy(void * destination, std::size_t capacity, const void * source, std::size_t bytes, aclrtMemcpyKind direction) {
     static const auto call = original<decltype(&aclrtMemcpy)>("aclrtMemcpy");

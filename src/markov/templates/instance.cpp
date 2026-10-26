@@ -41,6 +41,37 @@ Parameters bind_parameters(Parameters inherited, const Parameters & fixed, const
     return inherited;
 }
 
+bool bind_input_parameters(const TemplateLayout & layout, const TemplateDefinition & definition, const std::map<std::string, std::size_t> & ports,
+                           const RegionGraph & graph, Parameters & arguments) {
+
+    // Direct named axes come from actual ports; compound dimensions remain constraints, never fitted equations.
+    for (const auto & contract : layout.input_shapes) {
+        const auto named = std::ranges::find_if(layout.ports.inputs, [&](const auto & port) { return port.second == contract.value; });
+        if (named == layout.ports.inputs.end()) continue;
+        const auto target = ports.find(named->first);
+        if (target == ports.end()) continue;
+
+        const auto & type = graph.types.at(target->second);
+        if ((type.contains("dtype") && type.at("dtype") != contract.dtype) || (type.contains("device") && type.at("device") != contract.device)) return false;
+        if (!type.contains("shape")) continue;
+        const auto shape = type.at("shape").get<std::vector<std::int64_t>>();
+        if (shape.size() != contract.shape.size()) return false;
+
+        bool known = true;
+        for (std::size_t axis = 0; axis < shape.size(); ++axis) {
+            const auto expression = contract.shape[axis].document();
+            if (expression.is_string()) {
+                const auto name = expression.get<std::string>();
+                if (!arguments.contains(name) && std::ranges::find(definition.parameters, name) != definition.parameters.end())
+                    arguments.emplace(name, shape[axis]);
+            }
+            for (const auto & name : contract.shape[axis].variables()) known = known && arguments.contains(name);
+        }
+        if (known && evaluate_shape(contract.shape, arguments) != shape) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 Invocation Invocation::read(const nlohmann::json & source) {
@@ -81,7 +112,18 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
         const auto frame = asset.frame(selection);
 
         try {
-            auto instance = TemplateInstance(asset, frame.layout, frame.bindings, invocation, role, phase);
+            auto bound = invocation;
+            if (inputs != nullptr) {
+                const auto & layout = asset.layout(frame.layout);
+                const auto & definition = asset.definition(layout.definition);
+                auto parameters = bind_parameters({}, frame.bindings.values, bound, bound.parameter_scopes);
+                if (!bind_input_parameters(layout, definition, inputs->ports, inputs->graph, parameters))
+                    throw LayoutMismatch(role + " input geometry differs");
+                for (const auto & name : definition.parameters) {
+                    if (parameters.contains(name)) bound.parameters.emplace(name, parameters.at(name));
+                }
+            }
+            auto instance = TemplateInstance(asset, frame.layout, frame.bindings, bound, role, phase);
             if (inputs != nullptr) instance.bind_inputs(*inputs);
             return instance;
         }
@@ -173,38 +215,7 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
             || !std::ranges::all_of(ports.outputs, [&](const auto & port) { return layout.ports.outputs.contains(port.first); }))
             continue;
 
-        // Direct named axes bind local API parameters; compound dimensions are checked without fitting equations.
-        bool compatible = true;
-        for (const auto & contract : layout.input_shapes) {
-            const auto named = std::ranges::find_if(layout.ports.inputs, [&](const auto & port) { return port.second == contract.value; });
-            if (named == layout.ports.inputs.end()) continue;
-            const auto & type = graph_.types.at(ports.inputs.at(named->first));
-            if ((type.contains("dtype") && type.at("dtype") != contract.dtype) || (type.contains("device") && type.at("device") != contract.device)) {
-                compatible = false;
-                break;
-            }
-            if (!type.contains("shape")) continue;
-            const auto shape = type.at("shape").get<std::vector<std::int64_t>>();
-            if (shape.size() != contract.shape.size()) {
-                compatible = false;
-                break;
-            }
-            bool known = true;
-            for (std::size_t axis = 0; axis < shape.size(); ++axis) {
-                const auto expression = contract.shape[axis].document();
-                if (expression.is_string()) {
-                    const auto name = expression.get<std::string>();
-                    if (!arguments.contains(name) && std::ranges::find(definition.parameters, name) != definition.parameters.end())
-                        arguments.emplace(name, shape[axis]);
-                }
-                for (const auto & name : contract.shape[axis].variables()) known = known && arguments.contains(name);
-            }
-            if (known && evaluate_shape(contract.shape, arguments) != shape) {
-                compatible = false;
-                break;
-            }
-        }
-        if (!compatible) continue;
+        if (!bind_input_parameters(layout, definition, ports.inputs, graph_, arguments)) continue;
         if (!std::ranges::all_of(definition.guards, [&](const auto & guard) { return (guard.condition.evaluate(arguments) != 0) == guard.expected; })) continue;
 
         // Named boundaries permit a different implementation without inheriting its source's private slots.

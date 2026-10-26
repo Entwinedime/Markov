@@ -92,6 +92,21 @@ class NativeQueues:
 
 
 class AscendTrace:
+    @staticmethod
+    def capture_handler(original: Any, directory: str) -> Any:
+
+        # Close every native recording window before spending time on CPU-side analysis.
+        return original(directory, analyse_flag=False)
+
+    @staticmethod
+    def exported_trace(directory: Path) -> Path:
+        from torch_npu.profiler.profiler import analyse
+
+        # SDK output is not atomic; an existing trace can belong to an interrupted analysis.
+        analyse(str(directory))
+        (trace,) = directory.rglob("trace_view.json")
+        return trace
+
     runtime_kinds = {
         "aclrtMemcpy": "copy",
         "aclrtMemcpyAsync": "copy_async",
@@ -207,8 +222,6 @@ class AscendTrace:
 
                 yield event
                 first = False
-                buffer = buffer[position:]
-                position = 0
 
     def launch_sources(self) -> dict[int, int]:
         launches = defaultdict(list)
@@ -373,9 +386,9 @@ class AscendTrace:
                     target = {"kind": "device", "identity": parameters["device"]}
                 elif action["kind"] == "wait_event_complete" and "event" in parameters:
                     target = {"kind": "event", "identity": parameters["event"]}
-            if action["kind"] == "wait_device":
 
-                # Each source worker is restricted to its declared single physical device.
+            # Each source worker is restricted to its declared single physical device.
+            if action["kind"] == "wait_device":
                 if target is not None and target["identity"] != self.device:
                     raise ValueError("device wait disagrees with the source device declaration")
                 target = {"kind": "device", "identity": self.device}

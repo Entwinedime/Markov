@@ -125,9 +125,7 @@ class BatchCoordinationCall(NativeCall):
     def __init__(self, values: Any, original: Any) -> None:
         super().__init__(values.recording, values, original.__qualname__, original, {})
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         if result is None or not result.reqs:
             return
         metadata.update(
@@ -143,6 +141,19 @@ class ProcessGroupObservation:
         self.recording = observation.recording
         self.values = observation.operators.values
 
+    def profile_request(self, original: Any, manager: Any, request: Any) -> Any:
+        if not self.observation.selected:
+            import torch.distributed as distributed
+            from sglang.srt.managers.io_struct import ProfileReqOutput, ProfileReqType
+
+            # The native Torch profiler stops with a TP/DP barrier, including peers without an exporter.
+            if request.type == ProfileReqType.STOP_PROFILE:
+                distributed.barrier(manager.dp_tp_cpu_group)
+
+            # This worker still serves the group; only observation and export are skipped.
+            return ProfileReqOutput(success=True, message="Participant has no assigned observation")
+        return original(manager, request)
+
     def profile(self, original: Any, manager: Any, output_dir: str, *args: Any, **kwargs: Any) -> Any:
         rank = self.observation.parallel["rank"]
         self.profile_output = Path(output_dir) / f"rank-{rank}"
@@ -150,9 +161,9 @@ class ProcessGroupObservation:
 
     def stop_profile(self, original: Any, manager: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(manager, *args, **kwargs)
-        if result.success:
 
-            # A role becomes visible only after its native exporter has returned.
+        # Publish only after the native recording is closed and its raw buffers are flushed.
+        if result.success:
             manager.torch_profiler_output_dir.rename(self.profile_output)
         return result
 
@@ -196,6 +207,9 @@ class ProcessGroupObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
+            (
+                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile"
+            ): self.profile_request,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.collective,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.collective,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor": self.collective,

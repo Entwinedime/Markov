@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextvars import copy_context
+from functools import partial
 from typing import Any
 
 
@@ -11,13 +13,47 @@ class DisaggregationObservation:
 
         self.serving = serving
         self.role = role
-        self.rank = {"prefill": 0, "decode": 1}[role]
         self.recording = serving.recording
         self.operators = serving.operators
         self.values = self.operators.values
         self.rooms: dict[int, dict[str, Any]] = {}
         self.pages: dict[tuple[int, ...], dict[str, Any]] = {}
         self.transport = MemfabricObservation(self.recording)
+
+    def registration(self, original: Any, queue: Any) -> Any:
+        manager = original(queue)
+
+        # Bind after native transport creation; installing hooks must not import its SDK early.
+        if self.role == "prefill":
+            manager.send_kvcache = partial(self.transfer, manager.send_kvcache, grouping="buffers")
+            manager.send_kvcache_slice = partial(self.transfer, manager.send_kvcache_slice, grouping="buffer_tokens")
+
+        pool = queue.token_to_kv_pool
+        heads = queue.scheduler.model_config.get_total_num_kv_heads()
+        first = manager.attn_tp_rank // max(1, manager.attn_tp_size // heads) * pool.head_num
+        tensors = {}
+        for layer in range(pool.start_layer, pool.start_layer + pool.layer_num):
+            for kind, tensor in (("key", pool._get_key_buffer(layer)), ("value", pool._get_value_buffer(layer))):
+                tensors[tensor.data_ptr()] = kind, layer, tensor
+
+        buffers = []
+        for address in manager.kv_args.kv_data_ptrs:
+            kind, layer, tensor = tensors[address]
+            buffers.append(
+                {
+                    "kind": kind,
+                    "layer": layer,
+                    "head_begin": first,
+                    "head_end": first + pool.head_num,
+                    "head_bytes": tensor.stride(-2) * tensor.element_size(),
+                }
+            )
+        self.serving.parallel["kv_layout"] = {
+            "page_size": manager.kv_args.page_size,
+            "buffers": buffers,
+            "metadata_item_bytes": list(manager.kv_args.aux_item_lens),
+        }
+        return manager
 
     @staticmethod
     def request_metadata(request: Any, capacity: int) -> dict[str, Any]:
@@ -29,7 +65,7 @@ class DisaggregationObservation:
         }
 
     def reserve(self, original: Any, queue: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        if request.rid not in self.serving.requests:
+        if not self.serving.selected or request.rid not in self.serving.requests:
             return original(queue, request, *args, **kwargs)
 
         self.serving.begin_batch(queue.scheduler)
@@ -59,7 +95,7 @@ class DisaggregationObservation:
 
     def receive(self, original: Any, queue: Any, transfer: Any) -> Any:
         request = transfer.req
-        if request.rid not in self.serving.requests:
+        if not self.serving.selected or request.rid not in self.serving.requests:
             return original(queue, transfer)
 
         with (
@@ -116,7 +152,7 @@ class DisaggregationObservation:
             return result
 
     def send(self, original: Any, scheduler: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        if request.rid not in self.serving.requests:
+        if not self.serving.selected or request.rid not in self.serving.requests:
             return original(scheduler, request, *args, **kwargs)
 
         metadata = self.request_metadata(request, scheduler.req_to_token_pool.size)
@@ -130,9 +166,9 @@ class DisaggregationObservation:
 
         with self.values.metadata():
             tensors = {name: value for name, value in vars(buffers).items() if isinstance(value, torch.Tensor)}
-            for tensor in tensors.values():
 
-                # The native scheduler reserves two metadata slots per request slot on both instances.
+            # The native scheduler reserves two metadata slots per request slot on both instances.
+            for tensor in tensors.values():
                 self.values.bind_shape(tensor, (2 * self.values.shapes.symbol("R"), *tensor.shape[1:]))
             metadata["metadata_buffers"] = self.values.port_values(tensors)
 
@@ -142,28 +178,27 @@ class DisaggregationObservation:
             self.pages[tuple(map(int, indices))] = metadata
             scope = self.recording.regions[self.recording.current_scope.get()]["metadata"]
             scope["source_pages"] = indices.tolist()
-            scope["kv_item_bytes"] = list(sender.kv_mgr.kv_args.kv_item_lens)
-            scope["page_size"] = sender.kv_mgr.kv_args.page_size
         return original(sender, indices, *args, **kwargs)
 
     def transfer(
         self,
         original: Any,
-        manager: Any,
         session: str,
         source: Any,
         destination_buffers: Any,
         destination: Any,
-        executor: Any,
+        *args: Any,
+        grouping: str,
     ) -> Any:
+        self.serving.parallel["kv_layout"]["copy_grouping"] = grouping
         metadata = self.pages.get(tuple(map(int, source)))
         if metadata is None:
-            return original(manager, session, source, destination_buffers, destination, executor)
+            return original(session, source, destination_buffers, destination, *args)
 
         with self.recording.scope(
             "KvTransfer", **metadata, source_pages=source.tolist(), destination_pages=destination.tolist()
         ) as scope:
-            result = original(manager, session, source, destination_buffers, destination, executor)
+            result = original(session, source, destination_buffers, destination, *args)
             scope.metadata["status"] = result
             return result
 
@@ -176,16 +211,29 @@ class DisaggregationObservation:
             return original(manager, request, *args, **kwargs)
 
     def release(self, original: Any, cache: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.serving.selected:
+            return original(cache, request, *args, **kwargs)
         with (
             self.recording.scope("KvReleased", **self.request_metadata(request, cache.req_to_token_pool.size)),
             self.operators,
         ):
             return self.serving.request_cache(original, cache, request, *args, **kwargs)
 
+    def submit(self, original: Any, executor: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
+        scope = self.recording.current_scope.get()
+        if scope is None or self.recording.regions[scope]["role"] != "KvTransfer":
+            return original(executor, function, *args, **kwargs)
+
+        # Carry observation ownership into native copy workers without changing their lifecycle.
+        return original(executor, copy_context().run, function, *args, **kwargs)
+
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
+            "concurrent.futures.ThreadPoolExecutor.submit": self.submit,
+            "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager": self.registration,
+            "sglang.srt.disaggregation.decode.DecodePreallocQueue._init_kv_manager": self.registration,
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc": self.reserve,
             "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": self.receive,
             "sglang.srt.managers.scheduler.Scheduler.get_new_prebuilt_batch": self.prebuilt,
@@ -195,7 +243,6 @@ class DisaggregationObservation:
             ): self.prebuilt_result,
             "sglang.srt.managers.scheduler.Scheduler.send_kv_chunk": self.send,
             "sglang.srt.disaggregation.mooncake.conn.MooncakeKVSender.send": self.enqueue,
-            "sglang.srt.disaggregation.ascend.conn.AscendKVManager.send_kvcache": self.transfer,
             "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_aux": self.metadata_transfer,
             (
                 "sglang.srt.distributed.device_communicators.mooncake_transfer_engine."

@@ -11,6 +11,7 @@ import stat
 import subprocess
 import time
 from collections import deque
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -216,6 +217,34 @@ class Exploration:
             "processing",
         )
 
+    def capture_source(self, name: str, domain: dict[str, Any], representative: int, roles: Sequence[int]) -> Path:
+        key = f"{name}-source-{representative}"
+        if key not in self.state["sources"]:
+            self.available("native")
+            capture = self.directory / "captures" / f"{key}-attempt-{self.state['native_attempts'] + 1}"
+            capture.mkdir(parents=True)
+            request = self.acquisition.request(
+                self.specification,
+                domain,
+                roles[0],
+                self.environment.native_path(capture),
+                self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
+            )
+            write_json(capture / "capture.json", request, indent=2)
+            command = self.acquisition.command("capture", self.environment.native_path(capture / "capture.json"))
+            self.step(
+                self.environment.native_command(
+                    command, capture, self.acquisition.observer_library, self.available("native")
+                ),
+                "native",
+            )
+            self.state["sources"][key] = str(capture.relative_to(self.directory))
+            self.save()
+
+        capture = self.directory / self.state["sources"][key]
+        capture.resolve().relative_to(self.directory)
+        return capture
+
     def acquire(self, name: str, domain: dict[str, Any]) -> None:
         assets = self.directory / "assets" / name
         if assets.exists():
@@ -224,32 +253,16 @@ class Exploration:
         draft.mkdir(parents=True, exist_ok=True)
         arguments = ["templates"]
         inputs = []
-        for representative, roles in enumerate(self.acquisition.source_groups(domain)):
-            key = f"{name}-source-{representative}"
-            if key not in self.state["sources"]:
-                self.available("native")
-                capture = self.directory / "captures" / f"{key}-attempt-{self.state['native_attempts'] + 1}"
-                capture.mkdir(parents=True)
-                request = self.acquisition.request(
-                    self.specification,
-                    domain,
-                    roles[0],
-                    self.environment.native_path(capture),
-                    self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
-                )
-                write_json(capture / "capture.json", request, indent=2)
-                command = self.acquisition.command("capture", self.environment.native_path(capture / "capture.json"))
-                self.step(
-                    self.environment.native_command(
-                        command, capture, self.acquisition.observer_library, self.available("native")
-                    ),
-                    "native",
-                )
-                self.state["sources"][key] = str(capture.relative_to(self.directory))
-                self.save()
 
-            capture = self.directory / self.state["sources"][key]
-            capture.resolve().relative_to(self.directory)
+        # The mandatory first representative supplies native module partitions before choosing remaining sessions.
+        bootstrap = self.capture_source(name, domain, 0, next(self.acquisition.source_groups(domain)))
+        plan = self.acquisition.role_plan(domain, bootstrap)
+        instances = self.directory / "inputs/role-plans" / (name + ".json")
+        write_json(instances, plan, indent=2)
+        arguments += ["--instances", str(instances)]
+        inputs.append(instances)
+        for representative, roles in enumerate(self.acquisition.source_groups(domain, plan)):
+            capture = self.capture_source(name, domain, representative, roles)
             physical_paths = [capture / self.acquisition.physical_name(domain, rank) for rank in roles]
             command = self.acquisition.command("interpret", self.environment.native_path(capture / "capture.json"))
             self.step(
@@ -307,7 +320,8 @@ class Exploration:
                     "requests": workload["requests"],
                     "node_durations_ns": self.specification["node_durations_ns"],
                 }
-                if "ep" in configuration:
+                pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
+                if any("ep" in pool for pool in pools):
                     inputs["ep_routes"] = workload["ep_routes"]
                 write_json(target, inputs)
                 base = "diagnostics" if self.details else "results"
@@ -349,11 +363,16 @@ class Exploration:
             configuration, workload = key.split("/")
             link = Path("..") / path
             mode = "PD" if "pd" in configurations[configuration] else "共同实例"
+            pools = (
+                [configurations[configuration]["pd"][role] for role in ("prefill", "decode")]
+                if mode == "PD"
+                else [configurations[configuration]]
+            )
+            tp = "/".join(str(pool["tp"]) for pool in pools)
+            pp = "/".join(str(pool.get("pp", 1)) for pool in pools)
+            ep = "/".join(str(pool.get("ep", {}).get("size", "—")) for pool in pools)
             lines.append(
-                f"| {key} | [请求完成]({link}) | {mode} | {configurations[configuration]['tp']} | "
-                f"{configurations[configuration].get('pp', 1)} | "
-                f"{configurations[configuration].get('ep', {}).get('size', '—')} | "
-                f"{len(workloads[workload]['requests'])} |"
+                f"| {key} | [请求完成]({link}) | {mode} | {tp} | {pp} | {ep} | {len(workloads[workload]['requests'])} |"
             )
         if self.state["failures"]:
             lines += ["", "未完成项：", ""]
@@ -409,10 +428,12 @@ class Exploration:
             # Publication may precede interruption; reclaim consumed exports on recovery as well.
             if not self.details:
                 for name, domain in domains.items():
-                    for representative, roles in enumerate(self.acquisition.source_groups(domain)):
-                        capture = self.directory / self.state["sources"][f"{name}-source-{representative}"]
-                        parents = {(capture / self.acquisition.source_name(domain, rank)).parent for rank in roles}
-                        for parent in parents:
+                    for key, relative in self.state["sources"].items():
+                        if not key.startswith(name + "-source-"):
+                            continue
+                        for parent in self.acquisition.observation_directories(domain, self.directory / relative):
+                            parent = parent.resolve()
+                            parent.relative_to(self.directory)
                             for child in ("native", "runtime"):
                                 path = parent / child
                                 if path.exists():
@@ -476,64 +497,54 @@ def read_specification(path: Path) -> dict[str, Any]:
     topologies = {}
     for configuration in document["configurations"]:
         pd = "pd" in configuration
+        capacity = {"max_running_requests", "max_total_tokens", "max_prefill_tokens"}
+        geometry = {"tp", "pp", "ep"}
         check_fields(
             configuration,
-            {"id", "tp", "attention_backend", "page_size", "placement"}
-            | (
-                {"pd"}
-                if pd
-                else {
-                    "pp",
-                    "ep",
-                    "microbatch_requests",
-                    "max_running_requests",
-                    "max_total_tokens",
-                    "max_prefill_tokens",
-                }
-            ),
+            {"id", "attention_backend", "page_size", "placement"}
+            | ({"pd"} if pd else geometry | capacity | {"microbatch_requests"}),
             "configuration",
         )
-        for name in ("tp", "page_size"):
-            if type(configuration[name]) is not int or not 0 < configuration[name] <= maximum:
-                raise ValueError(f"configuration {name} is outside its positive integer range")
+        if type(configuration["page_size"]) is not int or not 0 < configuration["page_size"] <= maximum:
+            raise ValueError("configuration page_size is outside its positive integer range")
 
-        pools = [(configuration, {"max_running_requests", "max_total_tokens", "max_prefill_tokens"})]
+        pools = [(configuration, capacity)]
         if pd:
             check_fields(configuration["pd"], {"prefill", "decode"}, "pd")
-            if configuration["tp"] != 1:
-                raise ValueError("PD currently requires TP1 on each instance")
             pools = []
             for role in ("prefill", "decode"):
-                fields = {"max_running_requests", "max_total_tokens"} | (
-                    {"max_prefill_tokens"} if role == "prefill" else set()
-                )
+                fields = capacity if role == "prefill" else capacity - {"max_prefill_tokens"}
                 pool = configuration["pd"][role]
-                check_fields(pool, fields, "pd." + role)
+                check_fields(pool, fields | geometry, "pd." + role)
                 pools.append((pool, fields))
+
+        ranks = 0
         for pool, fields in pools:
-            for name in fields:
+            for name in fields | {"tp"}:
                 if type(pool[name]) is not int or not 0 < pool[name] <= maximum:
                     raise ValueError(f"configuration {name} is outside its positive integer range")
             if pool["max_total_tokens"] < configuration["page_size"]:
                 raise ValueError("configuration KV capacity needs at least one page")
+            pp = pool.get("pp", 1)
+            if type(pp) is not int or not 0 < pp <= maximum:
+                raise ValueError("configuration pp is outside its positive integer range")
+            ranks += pool["tp"] * pp
 
-        pp = configuration.get("pp", 1)
-        if type(pp) is not int or not 0 < pp <= maximum:
-            raise ValueError("configuration pp is outside its positive integer range")
-        if "ep" in configuration:
-            ep = configuration["ep"]
-            check_fields(ep, {"id", "size"}, "ep")
-            if (
-                not isinstance(ep["id"], str)
-                or not ep["id"]
-                or type(ep["size"]) is not int
-                or not 0 < ep["size"] <= maximum
-            ):
-                raise ValueError("EP topology needs a nonempty ID and positive integer size")
-            geometry = configuration["tp"], pp, ep["size"]
-            if ep["id"] in topologies and topologies[ep["id"]] != geometry:
-                raise ValueError("one EP topology ID cannot refer to different parallel layouts")
-            topologies[ep["id"]] = geometry
+            if "ep" in pool:
+                ep = pool["ep"]
+                check_fields(ep, {"id", "size"}, "ep")
+                if (
+                    not isinstance(ep["id"], str)
+                    or not ep["id"]
+                    or type(ep["size"]) is not int
+                    or not 0 < ep["size"] <= maximum
+                ):
+                    raise ValueError("EP topology needs a nonempty ID and positive integer size")
+                layout = pool["tp"], pp, ep["size"]
+                if ep["id"] in topologies and topologies[ep["id"]] != layout:
+                    raise ValueError("one EP topology ID cannot refer to different parallel layouts")
+                topologies[ep["id"]] = layout
+
         if not pd:
             microbatch = configuration.get("microbatch_requests", (configuration["max_running_requests"] - 1) // pp + 1)
             if type(microbatch) is not int or not 0 < microbatch <= configuration["max_running_requests"]:
@@ -548,7 +559,7 @@ def read_specification(path: Path) -> dict[str, Any]:
             devices = placement["devices"]
             if (
                 not isinstance(devices, list)
-                or len(devices) != (2 if pd else configuration["tp"] * pp)
+                or len(devices) != ranks
                 or any(type(device) is not int or not 0 <= device <= maximum for device in devices)
                 or len(set(devices)) != len(devices)
             ):

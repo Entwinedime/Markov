@@ -80,21 +80,6 @@ class DisaggregatedTemplates:
             ):
                 value["shape_relation"] = [["mul", 2, "R"], *value["shape"][1:]]
 
-        sends = [region for region in self.regions if region["role"] == "KvSend"]
-        if sends:
-            sent = sends[0]["metadata"]
-            auxiliary = next(region for region in self.regions if region["role"] == "KvMetadataTransfer")
-            copied = next(
-                region
-                for region in self.regions
-                if region["parent"] == auxiliary["id"] and region["role"] == "RemoteCopy"
-            )
-            self.source["environment"]["kv_layout"] = {
-                "page_size": sent["page_size"],
-                "buffer_item_bytes": sent["kv_item_bytes"],
-                "metadata_item_bytes": copied["metadata"]["segments"],
-            }
-
     def reserve(self, region: dict[str, Any]) -> None:
         metadata = region["metadata"]
         metadata["parameters"]["request_slot"] = metadata["slot"]

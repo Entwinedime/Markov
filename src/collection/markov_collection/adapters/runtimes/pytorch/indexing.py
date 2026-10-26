@@ -22,9 +22,9 @@ class ScalarReductionObservation(TorchFunctionMode):
     def __torch_function__(self, function: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
         kwargs = kwargs or {}
         result = function(*args, **kwargs)
-        if function is torch.Tensor.max and len(args) == 1 and args[0] is self.tensor and not kwargs:
 
-            # The caller declares the reduction's meaning; scalar identity preserves it across device readback.
+        # The caller declares the reduction's meaning; scalar identity preserves it across device readback.
+        if function is torch.Tensor.max and len(args) == 1 and args[0] is self.tensor and not kwargs:
             with self.values.metadata():
                 self.values.shapes.scalars[result] = self.values.bounded_parameter(
                     self.parameter, self.minimum, self.maximum
@@ -107,9 +107,7 @@ class TensorPartitionCall(NativeCall):
     def __init__(self, values: Any, original: Any) -> None:
         super().__init__(values.recording, values, original.__qualname__, original, {}, interface="tensor_partition")
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         tensor = args[0] if args else kwargs["input"]
         sections = args[1] if len(args) > 1 else kwargs["indices_or_sections"]
         dimension = args[2] if len(args) > 2 else kwargs.get("dim", 0)
@@ -132,6 +130,19 @@ class TensorPartitionCall(NativeCall):
 
 
 class TensorViewObservation(TorchFunctionMode):
+    @staticmethod
+    def declare_slice(values: Any, view: Any, begin: Any, end: Any) -> None:
+        identity = values.value(view)
+        producer = values.recording.values[identity]["producer"]
+        operation = values.recording.operations[producer]
+        if operation["name"] != "aten.slice.Tensor":
+            raise ValueError("declared slice bounds require their actual native slice producer")
+
+        # The published view identifies this operation; the caller supplies the slice's semantic range.
+        arguments = list(operation["arguments"])
+        arguments[2:4] = [{"scalar": begin}, {"scalar": end}]
+        operation["argument_relations"] = arguments
+
     def __init__(
         self, values: Any, buffers: list[tuple[Any, tuple[Any, ...]]], start: Any = None, index: Any = None
     ) -> None:

@@ -20,6 +20,7 @@ from markov_collection.artifacts.json_file import write_json
 class SynchronizationObservation:
     def __init__(self, markers: Any) -> None:
         self.markers = markers
+        self.enabled = True
         self.records: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         self.events: dict[int, int] = {}
@@ -46,6 +47,13 @@ class SynchronizationObservation:
         # Trace activation is process-wide; the native worker owns this observer.
         torch_npu._C._activate_npu_trace(0)
 
+    def set_enabled(self, enabled: bool) -> None:
+        native = ctypes.CDLL(None).markov_set_runtime_enabled
+        native.argtypes = [ctypes.c_int]
+        native.restype = None
+        native(int(enabled))
+        self.enabled = enabled
+
     def stream(self, stream: int) -> None:
         self.observe("stream", stream)
 
@@ -71,6 +79,8 @@ class SynchronizationObservation:
         self.observe("synchronize_event", None, event)
 
     def observe(self, kind: str, stream: int | None, event: int | None = None) -> None:
+        if not self.enabled:
+            return
         record: dict[str, Any] = {"kind": kind, "queue_scope": self.queue_scope}
 
         # Native callbacks may arrive on different threads; reserve the identity before ctypes releases the GIL.

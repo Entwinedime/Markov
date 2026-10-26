@@ -28,7 +28,10 @@ class BatchTensors:
             value = batch
             for attribute in path.split("."):
                 value = getattr(value, attribute)
-            result[name] = value
+
+            # Prebuilt/relay-staged batches can omit columns that native filtering also leaves absent.
+            if value is not None:
+                result[name] = value
 
         return result
 
@@ -43,6 +46,12 @@ class BatchTensors:
                 for name, value in metadata["ports"]["inputs"].items()
                 if name in BatchTensors.fields
             }
+            if "model_tokens" in metadata["ports"]["inputs"]:
+                value = metadata["ports"]["inputs"]["model_tokens"]
+
+                # Relayed PP tokens become this batch's input before EP padding reads their geometry.
+                axis = "B" if region["role"] == "Decode" else "M"
+                columns[value] = [axis, *values[value]["shape"][1:]]
 
             # Prepared columns belong to this batch even when the native filter returned the same tensor object.
             metadata["shape_contracts"] = [

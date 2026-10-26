@@ -941,6 +941,11 @@ void TemplateLibrary::add(const nlohmann::json & source) {
     roles_.push_back(compiled.document());
 }
 
+void TemplateLibrary::add_instances(const nlohmann::json & instances) {
+    if (!instances.is_array()) throw std::invalid_argument("role instances must be an array");
+    for (const auto & instance : instances) roles_.push_back(instance);
+}
+
 nlohmann::json TemplateLibrary::document() && {
     nlohmann::json catalog{
         {        "definitions",        std::vector<nlohmann::json>(definitions_.size()) },

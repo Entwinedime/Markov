@@ -202,6 +202,27 @@ class PositionCall(NativeCall):
         return None
 
 
+class VocabularyMaskCall(NativeCall):
+    def __init__(self, values: Any, original: Any) -> None:
+        super().__init__(values.recording, values, original.__qualname__, original, {}, interface="vocabulary_mask")
+        self.mask_signature = inspect.signature(original)
+
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
+        arguments = self.mask_signature.bind(*args, **kwargs).arguments
+        tensor, *fields = arguments
+        source = arguments[tensor]
+        metadata["bindings"] = {"vocab_" + field: arguments[field] for field in fields}
+
+        # API argument names identify shard offsets; observed integer equality never identifies a binding.
+        metadata["argument_relations"] = [{"value": self.values.value(source)}] + [
+            {"scalar": "vocab_" + field} for field in fields
+        ]
+        metadata["keywords"] = {"mapping": []}
+        shape = self.values.shapes.tensor(source).shape
+        for output in result:
+            self.values.bind_shape(output, shape)
+
+
 class SGLangPrimitives:
     def __init__(self, values: Any) -> None:
         self.values = values
@@ -216,12 +237,12 @@ class SGLangPrimitives:
 
         weights = []
         attention = set()
+
+        # Loaded local shards anchor the token/member geometry instead of reconstructed model shapes.
         for module in model.modules():
             if isinstance(module, Linear) or (
                 isinstance(module, LinearBase) and isinstance(module.quant_method, UnquantizedLinearMethod)
             ):
-
-                # Both Prefill token rows and Decode member rows use the actual loaded local shard.
                 weights.extend((module.weight, axis) for axis in ("M", "B"))
             elif isinstance(module, VocabParallelEmbedding):
                 weights.append((module.weight, "B"))
@@ -280,6 +301,9 @@ class SGLangPrimitives:
             return original(pool)
         return PageReleaseGroupCall(self.values.recording, self.values, original, pool)(pool)
 
+    def vocabulary_mask(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+        return VocabularyMaskCall(self.values, original)(*args, **kwargs)
+
     def install(self) -> None:
         from sgl_kernel_npu.mem_cache import allocator
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -289,6 +313,7 @@ class SGLangPrimitives:
         )
 
         targets = {
+            "sglang.srt.layers.vocab_parallel_embedding.get_masked_input_and_mask": self.vocabulary_mask,
             "sglang.srt.mem_cache.common.write_cache_indices": self.write_request_tokens,
             "sglang.srt.model_executor.triton_ops.position.compute_position_triton": self.positions,
             "sglang.srt.mem_cache.allocator.base.BaseTokenToKVPoolAllocator.free_group_end": self.release_group,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,15 +27,17 @@ class SGLangAcquisition:
         for configuration in specification["configurations"]:
             for workload in specification["workloads"]:
                 try:
-                    if "ep" not in configuration:
-                        if experts:
-                            raise ValueError("MoE configurations require an EP topology and routes, including EP1")
-                        continue
-                    if not experts:
-                        raise ValueError("EP topology requires a model with routed experts")
-                    topology = configuration["ep"]
-                    source = workload.get("ep_routes", {}).get(topology["id"])
-                    ExpertRouteConditions(model, topology["size"]).check(source, workload["requests"])
+                    pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
+                    for pool in pools:
+                        if "ep" not in pool:
+                            if experts:
+                                raise ValueError("MoE instances require an EP topology and routes, including EP1")
+                            continue
+                        if not experts:
+                            raise ValueError("EP topology requires a model with routed experts")
+                        topology = pool["ep"]
+                        source = workload.get("ep_routes", {}).get(topology["id"])
+                        ExpertRouteConditions(model, topology["size"]).check(source, workload["requests"])
                 except (KeyError, TypeError, ValueError) as error:
                     failures[f"{configuration['id']}/{workload['id']}"] = f"route input: {error}"
         return failures
@@ -61,14 +63,23 @@ class SGLangAcquisition:
     def domain(model: dict[str, Any], configuration: dict[str, Any]) -> dict[str, Any]:
         domain = {
             "dtype": model["dtype"],
-            "tp": configuration["tp"],
-            "pp": configuration.get("pp", 1),
-            "ep": configuration["ep"]["size"] if "ep" in configuration else 1,
             "attention_backend": configuration["attention_backend"],
             "page_size": configuration["page_size"],
         }
         if "pd" in configuration:
-            domain["pd"] = True
+            domain["pd"] = tuple(
+                (
+                    role,
+                    configuration["pd"][role]["tp"],
+                    configuration["pd"][role].get("pp", 1),
+                    configuration["pd"][role].get("ep", {}).get("size", 1),
+                )
+                for role in ("prefill", "decode")
+            )
+        else:
+            domain.update(
+                tp=configuration["tp"], pp=configuration.get("pp", 1), ep=configuration.get("ep", {}).get("size", 1)
+            )
         return domain
 
     @staticmethod
@@ -84,33 +95,60 @@ class SGLangAcquisition:
         return configuration
 
     @staticmethod
-    def source_groups(domain: dict[str, Any]) -> Iterator[range]:
+    def source_groups(domain: dict[str, Any], plan: dict[str, Any] | None = None) -> Iterator[Sequence[int]]:
         if domain.get("pd"):
-            yield range(2)
+            yield range(SGLangAcquisition.required_devices(domain)) if plan is None else tuple(plan["representatives"])
         elif domain["pp"] > 1 or domain["ep"] > 1:
-            yield NativeServingSession.source_roles(domain["tp"], domain["pp"], 0, domain["ep"])
+            yield (
+                NativeServingSession.source_roles(domain["tp"], domain["pp"], 0, domain["ep"])
+                if plan is None
+                else tuple(plan["representatives"])
+            )
         else:
-            for rank in range(domain["tp"]):
+            ranks = range(domain["tp"]) if plan is None else plan["representatives"]
+            for rank in ranks:
                 yield range(rank, rank + 1)
 
     @staticmethod
+    def role_plan(domain: dict[str, Any], bootstrap: Path) -> dict[str, Any]:
+        if domain.get("pd") or domain["pp"] > 1 or domain["ep"] > 1:
+            return json.loads((bootstrap / "role-plan.json").read_text())
+        if not domain.get("pd") and domain["pp"] == 1 and domain["ep"] == 1 and domain["tp"] > 1:
+            source = json.loads((bootstrap / "rank-0.json").read_text())
+            return source["environment"]["worker_roles"]
+        return {
+            "representatives": [rank for group in SGLangAcquisition.source_groups(domain) for rank in group],
+            "instances": [],
+        }
+
+    @staticmethod
+    def observation_directories(domain: dict[str, Any], capture: Path) -> tuple[Path, ...]:
+        return (capture / "prefill", capture / "decode") if domain.get("pd") else (capture,)
+
+    @staticmethod
     def required_devices(domain: dict[str, Any]) -> int:
-        return (
-            2
-            if domain.get("pd")
-            else len(NativeServingSession.source_roles(domain["tp"], domain["pp"], 0, domain["ep"]))
-        )
+        if domain.get("pd"):
+            from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
+
+            return sum(len(instance["ranks"]) for instance in NativeDisaggregatedSession.instances(domain))
+        return len(NativeServingSession.source_roles(domain["tp"], domain["pp"], 0, domain["ep"]))
 
     @staticmethod
     def source_name(domain: dict[str, Any], rank: int) -> str:
-        prefix = ("prefill", "decode")[rank] + "/" if domain.get("pd") else ""
+        prefix = SGLangAcquisition.instance(domain, rank)["role"] + "/" if domain.get("pd") else ""
         return prefix + f"rank-{rank}.json"
 
     @staticmethod
     def physical_name(domain: dict[str, Any], rank: int) -> str:
         if domain.get("pd"):
-            return ("prefill", "decode")[rank] + "/physical.json"
+            return SGLangAcquisition.instance(domain, rank)["role"] + f"/physical-rank-{rank}.json"
         return f"physical-rank-{rank}.json" if domain["pp"] > 1 or domain["ep"] > 1 else "physical.json"
+
+    @staticmethod
+    def instance(domain: dict[str, Any], rank: int) -> dict[str, Any]:
+        from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
+
+        return next(instance for instance in NativeDisaggregatedSession.instances(domain) if rank in instance["ranks"])
 
     @staticmethod
     def row_limits(configurations: list[dict[str, Any]], max_prompt_tokens: int) -> dict[str, int]:
@@ -145,23 +183,25 @@ class SGLangAcquisition:
             for configuration in specification["configurations"]
             if SGLangAcquisition.domain(model, configuration) == domain
         ]
-        representative = SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
-        configurations.append(
-            {"page_size": domain["page_size"], "pd": {"prefill": representative, "decode": representative}}
+        representative = (
+            {role: SGLangAcquisition.configuration(domain["page_size"], pp) for role, _, pp, _ in domain["pd"]}
             if domain.get("pd")
-            else representative
+            else SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
+        )
+        configurations.append(
+            {"page_size": domain["page_size"], "pd": representative} if domain.get("pd") else representative
         )
         maximum_prompt = max(
             request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
         )
         limits = SGLangAcquisition.row_limits(configurations, maximum_prompt)
-        if domain["ep"] > 1:
-            size = domain["ep"]
+        for size in [ep for _, _, _, ep in domain["pd"]] if domain.get("pd") else [domain["ep"]]:
             limits["M"] = (limits["M"] + size - 1) // size * size
+
+        # Target P runs one prompt; native representative acquisition can still batch its own requests.
         if domain.get("pd"):
-            # Target P runs one prompt; native representative acquisition can still batch its own requests.
             limits["M"] = max(
-                limits["M"], representative["max_running_requests"] * max(prompt for prompt, _ in requests)
+                limits["M"], representative["prefill"]["max_running_requests"] * max(prompt for prompt, _ in requests)
             )
         return {
             "model": model["path"],
@@ -215,8 +255,8 @@ class SGLangAcquisition:
             dtype=request["dtype"],
             attention_backend=request["attention_backend"],
         ).run()
-        ranks = NativeServingSession.source_roles(request["tp"], request["pp"], request["rank"], request["ep"])
-        for rank in ranks:
+        summary = json.loads((Path(request["output"]) / "session-summary.json").read_text())
+        for rank in summary["observed_roles"]:
             (Path(request["output"]) / f"rank-{rank}.json").stat()
 
     @staticmethod
@@ -229,16 +269,15 @@ class SGLangAcquisition:
 
         directory = Path(request["output"])
         summary = json.loads((directory / "session-summary.json").read_text())
-        ranks = NativeServingSession.source_roles(
-            summary["logical_tp"], summary["logical_pp"], request["rank"], summary["logical_ep"]
-        )
-        for rank in ranks:
+        for rank in summary["observed_roles"]:
             SGLangAcquisition.interpret_role(
                 directory, rank, summary["logical_pp"], summary["profile"], summary["logical_ep"]
             )
 
     @staticmethod
-    def interpret_role(directory: Path, rank: int, pp: int, profile: bool, ep: int = 1) -> None:
+    def interpret_role(
+        directory: Path, rank: int, pp: int, profile: bool, ep: int = 1, *, disaggregated: bool = False
+    ) -> None:
         from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
         from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
         from markov_collection.adapters.frameworks.sglang.expert_geometry import ModelPaddingCall
@@ -279,13 +318,14 @@ class SGLangAcquisition:
         if not profile:
             return
 
-        name = SGLangAcquisition.physical_name({"pp": pp, "ep": ep}, rank)
+        grouped = disaggregated or pp > 1 or ep > 1
+        name = f"physical-rank-{rank}.json" if grouped else "physical.json"
 
         # Physical mapping belongs to immutable trace identities; declaration fixes can reuse the completed export.
         if (directory / name).exists():
             return
-        traces = directory / "native" / f"rank-{rank}" if pp > 1 or ep > 1 else directory / "native"
-        (trace,) = traces.rglob("trace_view.json")
+        traces = directory / "native" / f"rank-{rank}" if grouped else directory / "native"
+        trace = AscendTrace.exported_trace(traces)
         observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
         physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
         write_json(directory / name, physical)

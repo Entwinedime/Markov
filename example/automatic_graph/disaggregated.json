@@ -11,22 +11,20 @@
   "configurations": [
     {
       "id": "pd",
-      "tp": 1,
       "attention_backend": "ascend",
       "page_size": 128,
       "pd": {
-        "prefill": {"max_running_requests": 2, "max_total_tokens": 2048, "max_prefill_tokens": 2048},
-        "decode": {"max_running_requests": 2, "max_total_tokens": 2048}
+        "prefill": {"tp": 1, "max_running_requests": 2, "max_total_tokens": 2048, "max_prefill_tokens": 2048},
+        "decode": {"tp": 1, "max_running_requests": 2, "max_total_tokens": 2048}
       }
     },
     {
       "id": "small-pool",
-      "tp": 1,
       "attention_backend": "ascend",
       "page_size": 128,
       "pd": {
-        "prefill": {"max_running_requests": 1, "max_total_tokens": 256, "max_prefill_tokens": 256},
-        "decode": {"max_running_requests": 2, "max_total_tokens": 512}
+        "prefill": {"tp": 1, "max_running_requests": 1, "max_total_tokens": 256, "max_prefill_tokens": 256},
+        "decode": {"tp": 1, "max_running_requests": 2, "max_total_tokens": 512}
       }
     }
   ],

@@ -3,14 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <span>
 #include <vector>
 
-#include "markov/adapters/frameworks/sglang/rank_structure.hpp"
+#include "markov/adapters/frameworks/sglang/kv_transfer.hpp"
+#include "markov/adapters/frameworks/sglang/structure.hpp"
 #include "markov/controller/disaggregated.hpp"
 #include "markov/templates/batch_expansion.hpp"
-#include "markov/templates/parallel_composition.hpp"
 
 namespace markov::sglang {
 
@@ -18,7 +17,8 @@ namespace markov::sglang {
 class DisaggregatedStructure final : public BatchExpansion {
 public:
     DisaggregatedStructure(std::span<const TemplateAsset> assets, ServingSettings prefill, ServingSettings decode, std::span<const Request> requests,
-                           const DisaggregatedGroups & groups, std::span<const std::int64_t> devices);
+                           const DisaggregatedGroups & groups, std::span<const std::int64_t> devices, const nlohmann::json & prefill_routes,
+                           const nlohmann::json & decode_routes);
 
     GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
@@ -30,23 +30,29 @@ public:
     PageReuse page_reuse() const;
 
 private:
+    using RankPorts = std::map<std::size_t, std::vector<std::size_t>>;
+
     struct Handoff {
-        std::vector<std::size_t> reserved;
-        std::vector<std::size_t> prepared;
-        std::vector<std::size_t> transferred;
+        RankPorts reserved;
+        RankPorts prepared;
+        RankPorts transferred;
         bool accepted = false;
         bool released = false;
     };
 
     void require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind);
-    std::vector<std::size_t> transfer(const ServingAction & action, const Handoff & handoff);
+    void transfer(const ServingAction & action, Handoff & handoff);
+    void bind_readiness(const ServingAction & action, const BatchProgram & program, std::span<const std::size_t> drained, RankPorts & ports);
+    std::size_t append_transfer(const KvTransfer & route, std::int64_t bytes, std::int64_t segments, std::span<const std::size_t> prerequisites,
+                                const std::string & kind, std::span<const KvSlice> slices);
     void count(std::size_t operation_begin, std::size_t node_begin, std::size_t dependency_begin);
 
     RegionGraph graph_;
-    ParallelTopology topology_;
-    ParallelComposition parallel_;
-    std::vector<const TemplateAsset *> assets_;
-    std::vector<std::unique_ptr<RankStructure>> ranks_;
+    ServingTopology topology_;
+    DisaggregatedGroups groups_;
+    ServingStructure prefill_;
+    ServingStructure decode_;
+    KvTransfers transfers_;
     std::map<std::size_t, Handoff> handoffs_;
     std::size_t batches_ = 0;
     std::size_t actions_ = 0;

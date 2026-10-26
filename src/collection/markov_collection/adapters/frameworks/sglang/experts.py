@@ -10,6 +10,7 @@ from typing import Any
 from markov_collection.adapters.runtimes.ascend.moe import ExpertPermutationCall
 from markov_collection.adapters.runtimes.pytorch.collectives import CommunicationWork
 from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
+from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
@@ -18,9 +19,7 @@ class ExpertRoutingCall(NativeCall):
         super().__init__(*args, **kwargs, interface="expert_routing")
         self.layer = self.original.__self__
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         hidden = args[0] if args else kwargs["hidden_states"]
         rows = self.values.shapes.tensor(hidden).shape[0]
         count = self.layer.topk_config.top_k
@@ -83,14 +82,12 @@ class ExpertCall(NativeCall):
         finally:
             self.observation.current = previous
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         metadata.update(entrypoint="expert_layer", call_family="expert_layer")
         metadata["ports"]["outputs"] = self.values.port_values({"hidden": result})
-        if self.layer.moe_ep_size > 1:
 
-            # Empty receivers select their own local branch, without duplicating whole model layouts.
+        # Empty receivers select their own local branch, without duplicating whole model layouts.
+        if self.layer.moe_ep_size > 1:
             metadata.setdefault("guards", []).append(
                 {"condition": ["eq", "expert_received", 0], "expected": metadata["parameters"]["expert_received"] == 0}
             )
@@ -110,9 +107,7 @@ class ExpertComputeCall(NativeCall):
         self.dispatch = dispatch_output
         return super().invoke(method, layer, dispatch_output)
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         dispatch = self.dispatch
         self.values.bind_shape(result.hidden_states, self.values.shapes.tensor(dispatch.hidden_states).shape)
         metadata["attributes"] = self.observation.current.metadata["attributes"]
@@ -136,9 +131,7 @@ class ExpertCollectiveCall(NativeCall):
     def outputs(self, result: Any) -> Any:
         return result if self.gather else result[1]
 
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> None:
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         frame = self.observation.current
         size = frame.layer.moe_ep_size
         source = self.values.shapes.tensor(args[0])
@@ -199,6 +192,13 @@ class ExpertObservation:
         with TensorGeometryObservation(self.values, scalars=dimensions):
             result = original(buffer, *args, **kwargs)
         layout = buffer._alltoall_layout
+        with self.values.metadata():
+            TensorViewObservation.declare_slice(
+                self.values,
+                layout["num_global_tokens_per_local_expert"],
+                "expert_begin",
+                ["add", "expert_begin", "local_expert_count"],
+            )
         parameters = self.current.metadata["parameters"]
         for prefix, field in (("send", "input_splits"), ("receive", "output_splits")):
             parameters.update({f"expert_{prefix}_{index}": int(count) for index, count in enumerate(layout[field])})

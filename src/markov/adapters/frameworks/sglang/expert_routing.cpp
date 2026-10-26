@@ -10,23 +10,23 @@
 
 namespace markov::sglang {
 
-ExpertRouting::Geometry ExpertRouting::discover(std::span<const TemplateAsset> assets) {
-    const auto & first = assets.front().environment();
+ExpertRouting::Geometry ExpertRouting::discover(std::span<const TemplateAsset * const> assets) {
+    const auto & first = assets.front()->environment();
     Geometry result{ first.at("logical_ep").get<std::int64_t>(),
                      first.at("implementation").at("model_config").at("num_hidden_layers").get<std::int64_t>(),
                      {},
                      {} };
     std::map<std::int64_t, ExpertLayer> layers;
 
-    for (const auto & asset : assets) {
-        const auto & environment = asset.environment();
+    for (const auto * asset : assets) {
+        const auto & environment = asset->environment();
         const auto rank = environment.at("rank").get<std::size_t>();
         if (result.size > 1 && environment.at("implementation").at("expert_transport") != "1")
             throw std::invalid_argument("expert routing requires the observed DeepEP all-to-all implementation");
 
-        for (const auto & entry : asset.entrypoints()) {
+        for (const auto & entry : asset->entrypoints()) {
             if (entry.role != "expert_layer") continue;
-            const auto & bindings = asset.frame(entry).bindings.values;
+            const auto & bindings = asset->frame(entry).bindings.values;
             const ExpertLayer layer{ bindings.at("expert_layer"), bindings.at("expert_count"), bindings.at("expert_top_k") };
             const Partition partition{ bindings.at("expert_rank"), bindings.at("expert_begin"), bindings.at("local_expert_count"), layer.experts };
             if (layer.id < 0 || layer.id >= result.model_layers || layer.experts <= 0 || layer.top_k <= 0 || layer.top_k > layer.experts || result.size <= 0
@@ -44,7 +44,7 @@ ExpertRouting::Geometry ExpertRouting::discover(std::span<const TemplateAsset> a
     return result;
 }
 
-ExpertRouting::ExpertRouting(std::span<const TemplateAsset> assets, std::span<const Request> requests, const nlohmann::json & source)
+ExpertRouting::ExpertRouting(std::span<const TemplateAsset * const> assets, std::span<const Request> requests, const nlohmann::json & source)
     : geometry_(discover(assets)),
       routes_(source, requests, geometry_.layers, geometry_.model_layers, geometry_.size - 1) {}
 
