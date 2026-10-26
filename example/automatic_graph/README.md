@@ -1,6 +1,6 @@
 # 自动取图与条件 Serving 示例
 
-输入一个固定模型、配置集合和请求集合，流程自动选择代表来源、单卡采集逻辑角色、建立参数化模板，再按目标状态动态展开。模型使用完整结构的 dummy 权重，节点耗时来自显式假设；输出用于检查执行结构，不构成真实性能预测或精度结论。
+输入一个固定模型、配置集合和请求集合，流程自动选择代表来源、观察必要逻辑角色、建立参数化模板，再按目标状态动态展开。模型使用完整结构的 dummy 权重，节点耗时来自显式假设；输出用于检查执行结构，不构成真实性能预测或精度结论。
 
 ## 准备与一键运行
 
@@ -25,9 +25,9 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP×PP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_devices` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
 
-PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话发布全部角色，目标使用同一控制器维护多微批次和唯一 KV 状态。
+PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话启动全部必要参与者，代表发布观察，其余角色使用独立绑定；目标使用同一控制器维护多微批次和唯一 KV 状态。
 
-P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；一对原生服务取得两个角色，目标分别声明 P/D 容量。首期各 TP1、PP1，P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；目标 placement 的两个位置依次属于 P、D。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `pool_free_pages` 报告两池可回收总量。
+P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；目标在两池内分别声明 `tp` 与容量，示例仍为双方 TP1、PP1。P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；placement 先列 P 的全部 rank，再列 D 的全部 rank。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `pool_free_pages` 报告两池可回收总量。对称/非对称 TP、双方 PP4 和 MoE 双方 TP=EP2 已有有限开发核对；原生要求 Decode PP 等于 Prefill PP 或1，来源限制和独立验证边界继续保留。
 
 MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --input example/automatic_graph/expert.json`。示例为完整 Qwen1.5 MoE、TP2/EP2，需两张实际采集卡；请求路由按层和逻辑 token 区间给出，padding 路由单独声明。它是给定路由的条件结构，仍执行 gate/top-k 等工作，不能从长度推断真实内容路由；缺少原型或来源覆盖为 partial 时如实报告。
 
@@ -35,7 +35,7 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 ## 来源复用与结果含义
 
-每次任务固定一个模型。dtype、TP、PP、EP、attention backend 和 page_size 相同的配置共享来源；每个域按实际逻辑 rank 取得本地分片。不同模型或域分别建立来源，不以普通 rank 的相似 shape 自动替代所有角色，也不声明同库跨 TP 或跨页大小变换。
+每次任务固定一个模型。dtype、TP、PP、EP、attention backend 和 page_size 相同的配置共享来源；每个域保留实际逻辑 rank 的本地分片。可隔离 TP 先取得必要根角色，由实际模块和原生词表分片 API 规划其余代表，再为等价 peer 生成独立绑定。原生组仍启动协议所需的参与者，模型加载后比较模块布局和角色职责，仅选代表观察与导出；PP4、EP4 复用、TP2×PP3×EP2 及限定多 rank PD 组合已有开发核对。`inputs/role-plans` 和结果的 `role_source` 区分观察与派生。不同模型或域分别建立来源，不以相似 shape 自动替代所有职责，也不声明同库跨 TP 或跨页大小变换。
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 
@@ -49,7 +49,7 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 ```text
 data/<UTC时间>_automatic-graph/
-  inputs/                       原任务、环境身份及逐组合输入
+  inputs/                       原任务、环境身份、角色规划及逐组合输入
   captures/<角色-尝试>/         会话摘要、操作来源及规范物理事实
   assets/<实现域>/templates.json  共享定义/布局/执行模式与独立角色绑定
   results/summary.md             人读入口、失败与累计费用

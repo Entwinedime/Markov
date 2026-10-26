@@ -92,7 +92,9 @@ python example/automatic_graph/serving.py \
 
 示例通过原生 Engine 加载完整模型的 dummy 权重，统一预热后分别执行未插桩和观察路径，关闭会话后调用共同解释入口。未启用 `--profile` 时只解释语义关系；启用时同时生成 `physical.json`。`--tp-size N --rank R` 用于物理单卡执行一个逻辑角色；每个角色使用独立输出目录。单卡辅助传输提供结构来源，不提供真实多卡数值、通信时延或争用样本。
 
-多 stage 来源通过一键任务的 pp 和采集设备列表选择原生 TP×PP 会话；每次会话发布全部 rank 来源和对应 physical-rank 文件。TP 本地角色与 PP 来源组共享采集/解释接口，任务环境在 work 中保留 launcher 缓存；不能把缺少 peer 的单卡运行当作完整流水线来源。
+启用 profiler 时，原生阶段只记录、停止并落盘原始缓冲；解释阶段调用 Torch NPU 的官方 analyse 生成 trace，再建立物理归属。这样 PP 不会因前一个 stage 解析导出而使后续 stage 持续记录。原始落盘计入 native 额度，解析与建库计入 processing；恢复复用原始记录及已完整发布的物理归属，未发布的角色从原始记录重新解析，不能以 SDK 输出文件存在推定其已完成。阶段分离不减少必需观察，也不保证任意采集都能在给定额度内完成。
+
+多 stage 来源通过一键任务的 pp 和采集设备列表选择原生 TP×PP 会话；实际启动全部必要参与者，只为规划的代表发布观察及对应 physical-rank 文件，其余角色保留代表引用和独立绑定。TP 本地角色与 PP 来源组共享采集/解释接口，任务环境在 work 中保留 launcher 缓存；不能把缺少 peer 的单卡运行当作完整流水线来源。
 
 固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，各采集入口共用。代表观察请求另由 adapter 选择；PD 保留较长输出以观察多成员 Decode，原语辅助观察覆盖固定实现分支，两者不代替实际模型来源。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际预热请求。PD 的 capture.json 保存采集输入，responses 目录保存各轮响应，二者职责分开，不预先跑完整目标序列。
 

@@ -16,13 +16,13 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 | --- | --- |
 | `framework` | 采集框架；正式入口提供 `sglang` / Ascend |
 | `model.path / dtype` | 固定模型在推理容器中的路径及原生 dtype |
-| `deployment.physical_devices` | 互异非负整数构成的采集设备列表；TP 本地分片使用一张卡，PP 需要实际原生参与者，PD 使用两张卡 |
+| `deployment.physical_devices` | 互异非负整数构成的采集设备列表；可隔离 TP 本地分片使用一张卡，PP/EP/PD 原生组需要实际协议参与者；PD 数量为两侧 TP×PP 之和，代表观察不减少必要协议进程 |
 | `budget` | `native_seconds`、`processing_seconds`、`temporary_bytes`、`retained_bytes` 四项累计额度，非负整数 |
-| `configurations[]` | 候选配置；共同字段为唯一 `id`、`tp`、`attention_backend`、`page_size`；同一实例另有 `max_running_requests`、`max_total_tokens`、`max_prefill_tokens` |
+| `configurations[]` | 候选配置；共同字段为唯一 `id`、`attention_backend`、`page_size`；同一实例另有 `tp`、`max_running_requests`、`max_total_tokens`、`max_prefill_tokens` |
 | `configurations[].pp / microbatch_requests` | 可选的 PP stage 数和每批成员上限；默认 PP=1，上限为总请求容量除以 PP 后向上取整 |
 | `configurations[].ep` | MoE 并行部署，含非空拓扑 `id` 和正整数 `size`；EP1 参考同样显式声明 |
-| `configurations[].pd` | P/D 分离时替代单实例容量字段：`prefill` 包含请求容量、token 容量及 Prefill 预算，`decode` 包含请求容量和 token 容量 |
-| `configurations[].placement.devices` | 可选的单机目标设备列表；同实例按 stage 内 TP rank 排列，数量为 TP×PP；PD 为 P、D 两个位置；元素互异且非负 |
+| `configurations[].pd` | P/D 分离时替代顶层 TP 和容量字段：两池各有 `tp`、可选 `pp/ep` 和独立容量；`prefill` 另有 Prefill 预算；新增组合的可用范围取决于原生协议和结构闭环 |
+| `configurations[].placement.devices` | 可选的单机目标设备列表；同实例按 stage 内 TP rank 排列，数量为 TP×PP；PD 先列全部 P rank，再列全部 D rank；元素互异且非负 |
 | `workloads[]` | 请求集合；每项有唯一 `id` 和非空 `requests` |
 | `workloads[].ep_routes` | 按 EP 拓扑 ID 提供请求/层/token 的全局专家选择及 padding 路由条件 |
 | `node_durations_ns` | 执行节点种类到非负整数纳秒的映射，明确给定模拟假设 |
@@ -31,11 +31,11 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 模型路径须在部署的原生容器中可访问，镜像及模型文件由部署准备。任务保存实际模型配置和镜像身份，恢复不重新解释镜像标签。
 
-`placement` 声明目标绑定，和采集用的 `deployment.physical_devices` 分开；省略时同实例按逻辑 rank 绑定目标设备 `0..TP×PP-1`，PD 的 P/D 分别绑定 0/1。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个逻辑参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
+`placement` 声明目标绑定，和采集用的 `deployment.physical_devices` 分开；省略时按全局逻辑 rank 连续绑定目标设备，PD 中 D 的编号从 P 的 rank 总数开始。纯预测不据此检查现场卡数。当前正式入口采用同构单机、每个逻辑参与者独占一个设备的范围，不接收 host 列表或同卡多 rank；结果中的 topology 明确列出逻辑 rank、目标位置及参与组。
 
 PP 的全局 rank 为 `stage×TP + TP rank`。当前 Ascend 版本不支持 PP2；PP 来源使用实际 TP×PP 参与进程取得，不能仅凭目标模板展开声称单卡可采任意流水线。微批次上限须为正且不超过总请求容量；采集配方和目标上限分别维护。
 
-PD 的字段示例为 [disaggregated.json](../../example/automatic_graph/disaggregated.json)。当前各实例 TP1、PP1，不接收 `pp` 或 `microbatch_requests`；两者模型、dtype、backend 和 KV 页布局相同，容量和槽位独立。一次原生会话对取得两个角色，不把两个副本视为 TP2；PD 与同实例 serving 分别建立来源域，不能直接交换整套模板。
+PD 的字段示例为 [disaggregated.json](../../example/automatic_graph/disaggregated.json)，示例在两池内分别声明 TP1。两者模型、dtype、backend 和 KV 页布局相同，容量和槽位独立；一次原生会话对运行两侧全部必要参与者，只观察规划的代表。PD 与同实例 serving 分别建立来源域，不能直接交换整套模板；两侧拓扑也是 PD 来源域的一部分。双方 TP1/PP1、对称 TP2/TP2、非对称 TP1/TP2、双方 PP4 及 MoE 双方 TP=EP2 已有有限开发核对；接受拓扑字段不代表任意组合已通过独立验证，来源覆盖限制仍保留。当前原生 PD 要求 Decode PP 等于 Prefill PP 或1。本轮 PD 不接收独立微批次策略参数。
 
 只改变这些设备绑定不会重采本地计算模板；若实际传输或局部实现改变，仍需相应来源。当前给定耗时不随设备标签变化自动产生带宽、争用或异构设备模型。
 
@@ -133,7 +133,7 @@ ResultProcessed 推进生成进度和控制状态，RequestOutput 只记录实�
 
 ```text
 data/<UTC时间>_automatic-graph/
-├── inputs/                  任务、环境身份及逐组合输入
+├── inputs/                  任务、环境身份、角色规划及逐组合输入
 ├── captures/<角色-尝试>/    会话摘要、操作来源及规范物理事实
 ├── assets/<实现域>/templates.json  共享模板目录与各逻辑 rank 的独立绑定
 ├── results/summary.md       人读入口、组合结果与累计费用
