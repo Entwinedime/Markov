@@ -94,9 +94,17 @@ python example/automatic_graph/serving.py \
 
 启用 profiler 时，原生阶段只记录、停止并落盘原始缓冲；解释阶段调用 Torch NPU 的官方 analyse 生成 trace，再建立物理归属。这样 PP 不会因前一个 stage 解析导出而使后续 stage 持续记录。原始落盘计入 native 额度，解析与建库计入 processing；恢复复用原始记录及已完整发布的物理归属，未发布的角色从原始记录重新解析，不能以 SDK 输出文件存在推定其已完成。阶段分离不减少必需观察，也不保证任意采集都能在给定额度内完成。
 
+PP语义观察在原生循环提交完已有proxy/output发送句柄后发布，保留延后发生但仍属于原批次的等待。采集结束以完整观察文件为边界；发送、接收和等待仍由框架执行。
+
 多 stage 来源通过一键任务的 pp 和采集设备列表选择原生 TP×PP 会话；实际启动全部必要参与者，只为规划的代表发布观察及对应 physical-rank 文件，其余角色保留代表引用和独立绑定。TP 本地角色与 PP 来源组共享采集/解释接口，任务环境在 work 中保留 launcher 缓存；不能把缺少 peer 的单卡运行当作完整流水线来源。
 
-固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，各采集入口共用。代表观察请求另由 adapter 选择；PD 保留较长输出以观察多成员 Decode，原语辅助观察覆盖固定实现分支，两者不代替实际模型来源。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际预热请求。PD 的 capture.json 保存采集输入，responses 目录保存各轮响应，二者职责分开，不预先跑完整目标序列。
+独立角色对照可在 adapter 内部采集请求中设置 `observe_all_workers`，启动真实参与组并观察所有 worker；它不改变代表分类或派生绑定，实际记录名单另由 `observed_roles` 交出。此选项不进入探索输入合同；正常采集仍只观察必要代表。
+
+`serving.py --observe-all-workers`提供相同的示例入口。共同实例的`--input`读取正式serving输入，当前要求请求同时到达；TP数量仍用`--tp-size`指定。输入包含EP拓扑时，adapter按请求、层及逻辑token将同一份`ep_routes`注入原生TopK结果，包含padding，保留原生组批、gate计算和真实dispatch/combine。baseline和观察路径使用相同条件，统一预热不变；辅助注入不进入待预测工作，其时长不能作为性能样本。这种对照检验给定路由下的结构，不验证自然专家选择或文本数值。
+
+仿真明细记录每个动作完成时已有的成员效果；`commits_requests` 表明该动作是否提交外部请求状态。中间stage、Prefill计算或资源交接可以有计划效果而不提交请求，不能把这些明细字段本身当作状态已提交；默认精简输出不保留动作历史。
+
+固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，各采集入口共用。结构观察使用独立的 `structure_requests(page_size)` 五请求配方，覆盖页前/页边界/页后及对齐和非对齐输入，保留槽位复用后仍需Decode的尾请求；PD沿用相同prompt，保留较长输出和接入即结束的请求。原语辅助观察覆盖固定实现分支，不代替实际模型来源。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际预热请求。PD 的 capture.json 保存采集输入，responses 目录保存各轮响应，二者职责分开，不预先跑完整目标序列。
 
 宿主调用 modeling 消费来源：
 
