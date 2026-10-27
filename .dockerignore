@@ -1,0 +1,10 @@
+.git
+.cache
+.env
+.env.*
+deprecated
+third_party
+data
+build
+ppts
+**/__pycache__
