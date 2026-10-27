@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,12 +14,15 @@ struct ProfileFile {
     Channel channel;
     std::filesystem::path path;
     std::uintmax_t bytes;
+    std::int64_t clock_offset_ns = 0;
+    bool clock_recorded = true;
 };
 
 struct ProfileManifest {
     std::filesystem::path path;
     std::string framework;
     std::vector<ProfileFile> files;
+    std::optional<std::filesystem::path> capture_origin_manifest = std::nullopt;
 };
 
 // Resolve files relative to their capture after moving a complete profile.

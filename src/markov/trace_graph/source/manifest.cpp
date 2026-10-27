@@ -24,7 +24,13 @@ void append_files(ProfileManifest & result, const nlohmann::json & entries, cons
     for (const auto & entry : entries) {
         auto path = captured_path(result.path, origin, entry.at("path").get<std::string>()).lexically_normal();
         const auto bytes = std::filesystem::file_size(path);
-        result.files.push_back({ channel, std::move(path), bytes });
+        std::int64_t offset_ns = 0;
+        const bool recorded = channel != Channel::Torch || entry.contains("host_clock");
+        if (entry.contains("host_clock")) {
+            const auto & clock = entry.at("host_clock");
+            offset_ns = clock.at("unix_origin_ns").get<std::int64_t>() - clock.at("origin_ns").get<std::int64_t>();
+        }
+        result.files.push_back({ channel, std::move(path), bytes, offset_ns, recorded });
     }
 }
 
@@ -39,6 +45,7 @@ ProfileManifest inspect_manifest(const std::filesystem::path & path) {
         throw std::runtime_error("Profile is not a completed real capture: " + path.string());
 
     ProfileManifest result{ std::filesystem::absolute(path).lexically_normal(), raw.at("framework").get<std::string>(), {} };
+    if (raw.contains("capture_origin_manifest")) result.capture_origin_manifest = raw.at("capture_origin_manifest").get<std::string>();
     const std::filesystem::path origin = raw.at("run_dir").get<std::string>();
     const auto & trace = raw.at("trace");
     append_files(result, trace.at("torch_trace_files"), origin, Channel::Torch);
