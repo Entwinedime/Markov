@@ -11,6 +11,12 @@
 
 业务流程不能要求用户串联内部 bundle builder、score runner 或多套模型入口。
 
+Python 的 `modeling/` 负责已准备输入的统一预测，`preparation/` 负责采集与性能维护，
+`applications/` 在上层组织直接使用、准确性实验和配置搜索。预测核心不导入应用、准备、评分或训练执行路径；
+应用可以调用准备与预测，实验和搜索的主流程不依赖彼此。C++ 继续负责图、执行状态和同一仿真时钟。
+搜索只在声明的有限空间和预算内选择 target；不改变模型公式或仿真粒度。
+一次比较只使用同一成本依据，正常确认在预测排名和确认集合形成后独立进行，不回写本次模型。
+
 正式使用从平台/框架、model、base config、workload 和 target config 集合开始；
 流程负责采集 base、接收 manifest、构建原始 DAG 和推演目标结构。已有 manifest 是复用方式，不是唯一入口。
 独立性能采集、数据库和成本模型是长期维护的另一条主线，在成本填充与仿真阶段汇合；
@@ -80,6 +86,10 @@ component 由 mutation 的语义 ownership 声明。核心层只要求 owner 明
 - 异步状态推进与 DAG duration 使用同一个 service cost 接口；timeout deadline 是配置派生的等待门，不是另一套 I/O 成本；
 - 不按 config、workload 或 cell 写业务分支；
 - 不用 oracle cost 反向修改预测结构。
+
+原生事件名、模型角色和设备 API 在适配层解释，共同构图与索引消费解释后的观测。
+目标规则、数值估计、执行和报告分别承担职责，CMake 与实际 include 依赖均保持这一方向；
+报告不能成为算法依赖，源观测也不能经由 HiCache patch 取得通用图能力。
 
 oracle-cost replay 只诊断预测 operation/effect 的 cost binding 和 sensitivity，不证明完整 target 时序结构，也不获得泛化成绩。
 

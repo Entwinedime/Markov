@@ -14,7 +14,9 @@
 | 路径 | 职责与修改边界 |
 | --- | --- |
 | `scripts/{profile,model,run,build}.sh` | 用户入口、容器调度与构建；保持薄封装 |
-| `scripts/internal/markov_internal/` | 配置、采集编排、校准、预测和评分工作流 |
+| `scripts/internal/markov_internal/modeling/` | 已准备输入的统一预测接口、同源执行和成本表示 |
+| `scripts/internal/markov_internal/preparation/` | Base/CPU 准备、独立性能采集与数据库维护 |
+| `scripts/internal/markov_internal/applications/` | 直接使用、准确性实验和配置搜索的上层编排 |
 | `src/profiling/` | 采集配置、manifest、时钟、Python probe 与 LD_PRELOAD hook |
 | `src/modeling/trace_graph/` | C++ DAG、图变换、运行时建模和仿真 |
 | `configs/` | 声明式实验、workload、profiling 与 modeling 配置 |

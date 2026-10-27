@@ -124,14 +124,19 @@ scripts/profile.sh configs/experiments/hicache_manual_workload/profiling_full_da
 ```
 
 capture 只在全部请求及正式窗口成功后写计划，不覆盖已有计划。
-真实输出必须达到 max_new_tokens；HTTP 成功但被容量裁短不是合法 bundle。
-replay 核对 workload、request order 和完整 token 数组。单次 workload 可直接指定
+`max_new_tokens` 是输出上限，不再一律当作实际输出长度；`ignore_eos=false` 可以记录自然 EOS，
+每条请求保存实际 token、原输出上限和结束原因。长度结束必须达到上限，EOS 必须匹配最后一枚 token，
+无法辨识的结束或容量裁短不是合法 bundle。模板可在 request_defs 的 sampling 中覆盖单条请求的上限/EOS 策略。
+replay 核对 workload、request order、完整 token 数组和结束原因，保留原上限，不能把 EOS 改成长短一致但语义不同的长度结束。
+旧固定长度计划按其已知长度结束合同读取，不假装包含自然 EOS 证据。单次 workload 可直接指定
 `--forced-token-plan`，不要求 suite 或额外 bundle；占位符 `{forced_token_plan}` 才需要 bundle，
 bundle 与显式 plan 同时提供时报错。
 
 模板的请求、重复请求、barrier、checkpoint 共用展开和预算逻辑。
 正式边界对应展开后的第一、最后正式请求。响应 token 在 HTTP 边界解析一次；
 capture bundle 的计划路径来自 manifest 所声明的 workload 报告，不存重复响应和校验副本。
+服务器响应若含 `cached_tokens` 或 `cached_tokens_details`，也保留在请求报告中；命中量以 token 计，details 保留层级和后端信息。
+缺失字段不补零。这些是服务自身返回的缓存计数，不需要开启 profiler，也不等同于内部预取队列观测。
 自定义普通请求可使用 prompt_token_ids，不要求人工 anchor/tail 或状态 checkpoint。
 
 有状态模板默认 `--checkpoint-mode verify`。
@@ -149,6 +154,10 @@ ShareGPT 本地语料通过同一 workload 入口转化：
 按实际 tokenizer 选样、不裁文本。语料与 token 数组留在 data，选样规则在 configs；
 预热、正式、独立校准及确认会话分别声明。预热不计正式窗口，但缓存不会隐式清空。
 旧 trace 不因新增语料或探针自动获得缺失字段。
+
+新选样可通过 `exclude_selection_reports` 排除之前的开发、确认、校准及暖机会话；
+多轮历史仍来自语料给定的 assistant 消息，不假装来自本次生成。
+自然记录后按同一工作量回放，不等于预测尚未生成的内容、任意 EOS 或并发用户流量。
 
 ## 5. 共享校准的采集语义
 
@@ -178,10 +187,32 @@ DMA 的 `runtime-dma` 入口需要 base-report 提供模型几何、设备和 NU
 SGLang 的 Torch 记录设备及框架工作，LD_PRELOAD 记录 CPU/API/I/O 时序，
 Python probe 补充执行语义。后者不是额外一份可叠加的执行成本。
 
+SGLang/Ascend 的 Torch 采集使用 `profiling.torch.npu_profiler_level`，默认 2。
+当前实际 Level0/1 导出都缺少 DMA 方向与字节数，不能满足现行 HiCache I/O 图变换的源观测要求；
+补回显示导出裁掉的 API 也不能生成未采集的载荷字段。不按传输时长猜方向、均分字节或用成本校准补这些结构信息。
+Level2 额外包含 runtime API 与 AICPU 观测，不只是硬件利用率档位；等级和 AI Core 指标是不同开关。
+默认关闭 PipeUtilization，`profiling.debug=true` 或显式 `SGLANG_NPU_PROFILER_AIC_METRICS=1` 才启用硬件指标。
+这是 torch-npu 的采集精细度，不是项目版本号。默认保留所需运行时信息，不额外采 AI Core 利用率指标；
+等级与运行日志保留为采集条件，不作为成本变量或部署资源身份。原始 vendor 数据不由这项设置主动删除。
+长输出的最小设置仍在本轮验证中；不能仅凭设置变轻或 trace 变小，宣称 DAG 覆盖及正常性能精度已通过。
+
+当前 torch-npu 的 Level0 会在 `trace_view.json` 中裁掉原生 AscendCL API 等记录，但同次采集的 CANN 导出仍保留它们。
+因此 manifest 的每个 Torch 条目可声明 `cann_runtime_trace_files`，列出该 rank 的原始 CANN 导出路径。
+构图只从这些明确路径补回被裁掉的事件，与 Torch 使用同一个时钟变换；设备工作不重复加入，也不另生成合并 trace。
+Level1/2 不需要补回被裁掉的 API，但这不代表 Level1 具备载荷几何。使用 Level0 的资产须保留 manifest 引用的 CANN 导出，不能只保留显示时间线。
+这解决的是采集交接的信息遗漏，不表示原始 DAG 的依赖或预测精度已经通过验证。
+
 Python probe 默认 snapshot-free，只读现有 Python 标量、容器长度与 tensor 元数据，
 不读取 tensor 内容、不复制缓存、不增加设备同步。DAG consumer 即使 diagnostics=off，
 也需要请求响应、CPU 通信、层等待、分配及 phase 边界；只做 state/input-contract 时不安装这些 DAG 观测。
 manifest 的 python_runtime_probes 记录选择，实际覆盖仍由建模检查。
+
+实现位于 `src/profiling/python_probe/trace_sim_probe`：`bootstrap.py` 装配选中的探针，
+`probes/` 保留通用 callable、标量取值与线程计时，SGLang 的原生插桩和 HiCache 字段读取归
+`adapters/frameworks/sglang/`。框架读取器在启动时注入，通用取值模块不自行导入 HiCache；
+manifest 中的观测族名称及事件字段不因目录变化而改变。这是代码分工，不扩张 KTransformers 的探针能力。
+10-13 重构后已在 SGLang 容器核对八个选中探针模块的导入，并通过普通入口完成新的 token 记录、
+base profile 与目标预测。该证据覆盖这次移动及实际入口，不证明所有探针分支或额外扰动都已量化。
 
 缓存查询同时记录缓存树与控制器的对象关系，不需要 snapshot 或实际写回/回载来建立身份。
 建模只接受这类直接关系或明确的调用/请求对应，不按最近时间或“只有一棵树”猜测。
@@ -212,7 +243,7 @@ Qwen3 角色由实际模块登记，其他模型可提供测量几何，但不�
 Attention/metadata/dense 共用 `thread_timing.invoke_runtime_call`：
 先记录结束墙钟与线程 CPU，再提取返回元数据、写事件；异常原样传递并记录 raised。
 其他探针有不同边界时保留独立实现，不为统一代码改变测量口径。
-当前这轮计时重构尚未重新实采，不能宣称探针扰动已经重新验证。
+10-13 已有新的普通采集，但没有新增同源 full/light 的扰动对照，不能宣称探针开销已重新量化。
 
 ### 所有者、返回值和通信
 
@@ -277,6 +308,7 @@ bench-serving JSONL 的总时长没有 trace 时钟起点，不能构造 [0,dura
 已经声明但不完整的窗口不能退回整个请求包络。
 
 窗口内执行进入 DAG；窗口前 token 字典只解释路径，前序事实只初始化状态。
+暖机的成功 Decode 分配也用于初始化窗口开始时的 KV 状态，不增加正式窗口耗时；不能只留下跨界结束操作而丢弃其已有分配。
 与已准入 async 操作精确对应的尾部 ACK/release 闭合生命周期，不独立延长 E2E。
 不按配置、cell、事件白名单或固定微秒范围硬编码窗口。
 固定校准可在准备阶段用 barrier/checkpoint 建状态，正式窗口中只放请求。
@@ -294,6 +326,13 @@ manifest 每份 Torch trace 的 host_clock 分别保留 vendor 的 origin_tick/o
 导出不与重型 DAG 建模并发。宽松停止可能把 API 超时只写为 warning，
 manifest completed 和文件存在不能替代完整性检查。
 不完整导出优先从保留原始数据离线恢复，不能当作成本误差拟合。
+
+当前 torch-npu 默认拒绝读取超过 10 GiB 的单个 CANN JSON，却可能继续输出只含框架工作的时间线。
+因此停止 API 成功不够；采集入口会拒绝已知超过读取上限的导出，保留原始数据，不将其发布为成功采集。
+确需长 trace 时，可在采集配置的 `env` 中设置 `SGLANG_NPU_PROFILER_MAX_FILE_BYTES`，单位为字节，必须为正整数。
+例如 `"34359738368"` 为 32 GiB，仅提高离线解析的文件上限，不增加采样事件，也不改变模型的执行条件。
+提高上限前须留足主机内存，并保持 rank 导出串行；它不是内存使用上限，更不保证任意大文件都能完成解析。
+对已出现上限丢失的采集，需要从同次原始数据重新导出；只修改输入设置不能修复旧文件，也不能据此复用旧 CPU 绑定。
 
 ## 8. 产物与开发位置
 
@@ -321,8 +360,8 @@ manifest 只声明实际配置、文件、采集状态与窗口，不存内部�
 | profiling/executor、runtime、environments | 单次生命周期、命令、目录与环境 |
 | `src/profiling/config.py`、manifest.py、profiler_clock.py | 配置规整、交接文件与时钟证据 |
 | Python probe bootstrap/patching/schema | 安装、重复包装与事实路由 |
-| probes/values 与 probes/hicache | 参数/返回值读取与 HiCache 语义字段，不负责安装或写事件 |
-| probes/ 与 hicache_probe_targets.json | 实际框架边界、必要元数据和调用时钟 |
+| probes/values 与 adapters/frameworks/sglang/hicache | 通用参数读取与 HiCache 原生字段，不负责安装或写事件 |
+| adapters/frameworks/sglang 与 hicache_probe_targets.json | 实际框架边界、必要元数据和调用时钟 |
 | LD_PRELOAD targets/framework | 原生 hook 与轻量计时 |
 
 增加观测前确认下游真正消费的字段。安装时解析签名、同次开始/结束各绑定一次，
@@ -332,7 +371,8 @@ manifest 只声明实际配置、文件、采集状态与窗口，不存内部�
 catalog 选择与运行时安装共用 `schema.parse_target`，字段、条件和 fact 规则只维护一份；
 字段或条件格式错误在采集预检查时报错，不必等服务器启动。安装输入按模块和 callable 一次分组，
 仍保留同一函数上的 target 顺序及每次导入后的重查。
-`probes/values.extract_value` 处理参数、返回值、路径和组合表达式，HiCache 前缀由固定分派处理。
+`probes/values.extract_value` 处理参数、返回值、路径和组合表达式，HiCache 读取器由 bootstrap 注入，
+通用取值模块不自行导入框架实现。
 token 提取器不再依赖 callable 安装器；摘要 list 与完整 token 字典仍分别取值，缺失不填零。
 probe 导入不得初始化设备或启动运行；新增包装不得读 tensor、snapshot 或额外同步。
 真实覆盖、额外扰动及支持范围须通过正式采集验证，不能以字段存在或构建通过代替。

@@ -17,8 +17,9 @@ base 配置 + model + workload → base 采集 → 原始 DAG → 目标工作�
 10-10 已清理不再使用的历史实验资产。本页旧证据路径仅描述当时验证，不保证仍可运行；
 现存采集、校准、静态回放输入及最新稳定对照以工作进展的[数据资产](work_progress.md#数据资产)为准。
 
-10-10 的稳定对照已完成完整 HTTP、源回放及代表目标的结构比较。本轮职责精简已完成 60 格回归、普通首次采集
-及结构报告修正后的代表验证；具体范围和限制以[工作进展](work_progress.md)为准，不用旧成绩代替新验证。
+10-10 的稳定对照及 10-12 的上一轮整理已完成完整 HTTP、源回放与相关代表验证；具体范围和限制以
+[工作进展](work_progress.md)为准。10-13—10-14 代码分层重构已完成 clean 构建及 186 格预测和独立评分，
+完整 HTTP 与重构前逐项保持；结构及静态诊断的范围另列，不以旧成绩代替新验证。
 
 ## 1. 当前能做什么
 
@@ -70,6 +71,80 @@ base 配置 + model + workload → base 采集 → 原始 DAG → 目标工作�
 
 输入、阶段衔接及仿真粒度的原则见第 9 节；具体文件只在修改相应职责时阅读。
 
+### 源观测代码的阅读顺序
+
+以下 C++ 路径相对 `src/modeling/trace_graph`，头文件在 `include/markov/trace_graph` 对应层级。
+这些职责已通过本轮统一构建与完整数值回归。阅读说明并入本主文档，不恢复已经不在工作区中的单独代码指南。
+
+1. 从 `src/source_dag/build.cpp` 看 manifest 输入如何按原顺序构图和合并。`io/trace_manifest_input.cpp`
+   负责通道、时钟和正式窗口；Ascend 事件角色在窗口裁剪前解释，SGLang 观测在构图前分流。
+   Level0 的原生事件补充由 manifest 的 `cann_runtime_trace_files` 明确登记；建模不搜索目录，也不把整份 CANN 设备时间线重复入图。
+2. `adapters/runtimes/ascend/event_semantics` 与 `adapters/frameworks/sglang/trace_semantics` 解释原生名称。
+   `TraceEvent` 保存有限的路由、调用和同步角色；这些是内部源解释结果，不是成本、新的采集字段或版本凭据。
+   构图器据此分别保存执行节点与只读观测，归一化同线程嵌套区间，并建立提交和同步依赖。
+3. `source_dag/index`、`stream_order`、`call_regions` 解释共同邻接、CPU 区间、设备提交与调用归属。
+   `SourceDagIndex` 借用不可变图，不读取缓存事实或成本；CPU 区间与邻接索引分别在首次查询时构建，
+   不为只查 CPU 区间的观察提前物化全部依赖。缓存属于当前索引实例，图被修改后必须重建索引。
+4. `adapters/frameworks/sglang/source_calls` 产出注意力、分配和通信等源工作，`models/qwen3_calls`
+   与 `qwen3_layout` 解释模型角色和布局。Ascend 算子对应及同步读回在 `operator_bindings`，
+   HiCache 事实和控制包络在 `hicache_observations`；不再把这些能力藏在 DAG patch 的通用索引里。
+5. 目标规划消费这些已解释的工作；独立测量导出读取服务区间。源墙钟、CPU 服务、队列等待、
+   设备完成和缓存发布不能合并成一个耗时，也不能由 target 实测补全缺失语义。
+   Prefill/Decode 的节点归属按 logical input 与原始半开时间区间查询索引；
+   重叠区间仍视为归属冲突，不用“取最近阶段”代替原有因果与线程条件。
+
+### 目标执行与工作流的阅读顺序
+
+从 `modules/hicache/runtime/window.cpp` 的 `HiCacheExecution::run` 看本次执行：准备源依据、
+原子替换源片段，再由一个仿真时钟驱动准入、展开、成本绑定与完成。这个对象拥有本 target 的状态，
+源图和配置只借用；各组件按明确顺序完成绑定，所有源替换结束后共用最终保留的资源依据。
+计算调用只持有尚未展开的模板和工作计划；展开后，节点与依赖由 DAG 持有，局部副本立即释放。
+准备总数仍包含待展开与已展开调用，报告在生成工作时累计动作数量，不为计数另存全量计划。
+
+目标工作在 `structure/hicache` 与 HiCache model 中决定；具体 SGLang/Ascend 张量程序在适配层。
+`runtime/host_program` 生成共同 host/worker/device 工作，`host_cost_binding` 只绑定数值。
+`cost/source_migration` 迁移已证明未变的成本，`cost/operator_model` 查询独立响应，
+`cost/io_service` 估计相对服务时间，`runtime/io_completion` 才将其放入执行时钟。
+`adapters/frameworks/sglang/allocator_preparation` 只观察源分配工作；源中位数的静态推算留在
+`modules/hicache/diagnostics`。结构报告由 `reporting/hicache_structure` 消费结果，不参与规则或成本选择。
+
+Python 从 `applications/prediction.py` 看直接应用，从 `applications/accuracy/cli.py` 看矩阵实验，
+从 `preparation/performance.py` 看独立性能维护。`modeling/predictor.py` 是统一数值接口，
+只消费已经准备的输入；`modeling/invoke.py` 负责经公开命令调用 modeling 容器。
+`ScenarioRequest` 与 `PerformanceRequest` 在边界解析 JSON，内部读明确字段；准备选定的新成本包路径
+作为结果传递，不改原输入文件。两条主线共用 `CpuServiceInputs`、采集生命周期及
+`cost_preparation` 的入库、离线训练能力。数据库事实和模型选择规则保持原样，默认预测不加载采集器。
+这些职责属于 10-13—10-14 重构，clean 构建及 186 格行为回归已通过；不能据此宣称完成新的平台或模型验证。
+
+当前 Python 入口有三种用法：`predict` 直接使用已准备输入，`prepare-hicache` 先准备再预测，
+`experiment --request <experiment.json>` 在上层组织矩阵。示例见 `configs/modeling/accuracy_example.json`：
+`groups` 引用已有组声明，`execution` 控制并行及报告，`evaluation` 单独引用正常对照与可选结构证据。
+全部选中预测结束后才进入正常采集和评分；`--predict-only` 停在预测，`--score-only` 只评分已有结果。
+独立评分也可用 `prediction_dirs` 直接引用任意已有预测目录，此时不需要 `groups`，不执行输入准备或预测。
+正常对照也可通过 `evaluation.normal_suites` 显式声明，使用关闭 profiling、指定 `run_root/run_id` 的正式采集 suite。
+重复次数在 suite 中声明，不由模型自行追加；所有采集仍串行，失败保留，不按耗时筛样本。
+
+Base 与 CPU 准备由 `preparation/base.py` 的 `prepare_inputs` 完成，不需要 target。
+公开的 `prepare-hicache --calibration-only` 因此可省略 `target_configs`，不再填虚假 self。
+准备过程写入 `input_summary.json`；应用的 `group_summary.json` 引用它并记录最终预测状态。
+`modeling/invoke.py` 返回本次退出状态、结构化报告与实际墙钟；数值接口 `predict` 不负责排名或评分。
+
+### 常见修改从哪里入手
+
+先判断变化的是输入解释、执行规则、数值还是报告，再沿该职责修改提供者和实际调用方。
+不要为了对齐模块，让后面的阶段重新判断同一个原生字段。
+
+| 要修改的内容 | 主要位置 | 为什么不需要改其余阶段 |
+| --- | --- | --- |
+| 一个原生 trace 字段或调用名 | `adapters/frameworks/sglang`、`adapters/runtimes/ascend`；模型角色在 `models/qwen3_*`，探针在同级 framework 适配包 | 对外仍提供事件角色、调用观测和工作描述；通用 DAG 不识别新的原生名字 |
+| 一个合法 HiCache 分支 | `modules/hicache/model` 与 `structure/hicache`，执行衔接在 `runtime` | 先生成工作与依赖，再查询既有成本接口；不能为了缺模型改成另一分支 |
+| 一种成本形式 | Python `modeling/cost/models` 的离线训练与包输出、C++ `cost/operator_model` 的查询 | 消费已有 `OperationWork` 的变量，不改缓存状态或节点生成；I/O 服务另由 `cost/io_service` 估计 |
+| 一份实验报告 | C++ `reporting/hicache_structure` 或 Python `applications/accuracy` | 消费已完成的领域结果；不修改工作、系数或准备状态，不触发采集 |
+
+CMake 同样按实际职责装配：共同图、源索引、工作和数值向内独立；HiCache rules 决定策略，
+SGLang observations 解释源依据，HiCache execution 将二者与成本、仿真连接，reporting 在外层消费结果。
+静态推算及 oracle 回放只在 validation 构建中装配，Release 的正确性不依赖这些诊断。
+
 源样本与独立测量仍有不同的读取方式，但得到的 host 操作计划通过同一个落图入口执行。
 资源顺序由操作计划统一给出：先是执行的 stream，再是等待的 stream；同一资源重复出现时不能去重，
 显式 event completion 则另外绑定。main、worker、设备服务与 residual gap 也不能合并为一个成本。
@@ -80,6 +155,8 @@ base 配置 + model + workload → base 采集 → 原始 DAG → 目标工作�
 共用入口规划，先通过完整 mutation 应用改边及成本替换，再登记执行回调。
 非活跃层等待也先规划整组插入再应用；allocator preparation 的源坐标在创建时提供，不再事后修补。
 候选分支的资源不足仍在目标实际需要时报告；已确定执行的调用则立即要求可用资源。
+未启用的层等待仍按源提交顺序定位设备流；查找后续层界限时只访问同一 logical input、同一 forward 的调用，
+保留原来的层号与精确时间条件，不为每个调用遍历整份 workload，也不改变目标分支或成本。
 当前验证范围及尚未解决的问题见[工作进展](work_progress.md)。
 
 ### 输入来源
@@ -93,6 +170,7 @@ profiling 与 modeling 只通过 `profile_manifest.json` 交接，不扫描目�
 
 环境比较区分运行资源与采集控制：`HOOK_EMISSION_TIMING` 和
 `SGLANG_NPU_PROFILER_SERIAL_EXPORT`、`SGLANG_HICACHE_IO_TIMING` 不作为资源匹配维度，原采集配置仍保留这些开关。
+成本适用性也不比较诊断接口的访问凭据值；原部署来源不改写，模型、TP、执行参数和资源仍须匹配。
 这不放宽模型、TP、设备或线程资源匹配，也不表示观测开销已全部消除；CPU 校正仍须绑定实际源采集。
 
 target 文件只含 `{name?, hicache}`，示例见
@@ -106,6 +184,14 @@ target 不得携带成本、观测或评分字段。页大小及策略在输入�
 完整 HTTP 评分需要 workload 报告声明正式窗口。只有 bench-serving 总时长、没有 trace 起止坐标时，
 不能据此裁剪 trace。普通 build-dag 可保留完整 trace；需要正式窗口的构模或评分会报告缺失。
 
+HiCache 预测和结构观察会保留最后一次显式 idle barrier 之后的准备请求，
+它们与正式请求共用执行时钟，但不计入正式 HTTP。无需用户手工拼接图；范围来自同一 manifest 的 workload 报告，
+原始 trace 必须包含相应准备工作。源回放和 HTTP 摘要单列 `preparation_request_count` 与执行时钟上的 `formal_start_us`，
+结构报告的 `request_context` 区分准备/正式数量，`observed_request_start_us` 是首个选中请求的原始观测起点，
+不是预测执行时间。I/O 效果和计算操作使用同一准备范围，不能一边保留暖机、一边从正式窗口重新编号。
+普通构图、成本导出和历史静态回放不因此隐式扩大各自的选择范围。
+当前验证及未覆盖范围见工作进展；局部执行成功不证明目标结构完整或正常 HTTP 精度达标。
+
 ## 3. 选择命令
 
 所有命令从仓库根目录运行：
@@ -118,12 +204,21 @@ target 不得携带成本、观测或评分字段。页大小及策略在输入�
 | 已完成预测的独立评分 | `scripts/model.sh evaluate` |
 | 导入独立测量并离线训练 | `scripts/model.sh cost-db import/train` |
 | 已有成本包直接预测 | `scripts/model.sh predict` |
+| 声明矩阵并独立评分 | `scripts/model.sh experiment --request <experiment.json>` |
+| 有限 HiCache 配置搜索 | `scripts/model.sh search --request <search.json>` |
 
 `prepare-cpu-service`、`export-hicache-operation-costs` 和 `calibrate-hicache` 是同一流程的可独立排查阶段，
 不是用户必须手工串联的另一套流程。具体参数用对应命令的 `--help` 查询。
 
 `prepare-hicache` 在宿主机协调容器；设备采集进入框架容器，构模与预测进入 modeling 容器。
 一次批量预测共用一个 modeling 容器，但整个 prepare 不保证只启动一次容器。
+`prepare-hicache` 与 `predict` 均支持 `--trace-threads`（源读取/构图）和 `--trace-file-threads`（文件解析），默认各为 1。
+它们与 `--model-run-jobs` 的目标并发数独立；增加线程前须考虑大图内存，不会因此并行设备采集。
+modeling 容器默认限制为 320 GiB（内存与内存加交换区上限相同），可通过
+`TRACE_SIM_MODELING_MEMORY_LIMIT` 按平台设置；这不能替代并发控制。每个目标有独立可变图，
+峰值会随执行增长，不能用源图大小或早期采样估计整批峰值。当前研究首项恢复使用 4 个目标工作进程，后续常规使用 8；仅下一高复用/roomy 根据已完成同源八并发任务的 141.34 GiB 全程峰值安排 12，实际峰值仍需观察。超时补全及有限参照使用 8，一次一个预测批次。
+本轮外部 watchdog 在容器达到 280 GiB 或主机可用内存低于 96 GiB 时停止本轮预测容器，
+保留中断与计费；320 GiB 容器硬限继续生效。
 
 同一 manifest 和 CPU 校正的目标在一次调用内共用源准备：trace 读取、原始 DAG、客户端锚点、
 可选的原始回放，以及 CPU 校正只准备一次。源组顺序执行；`--model-run-jobs` 限制该组的并发目标数，
@@ -188,17 +283,23 @@ scripts/model.sh build-dag --config <runner_config.json>
 只有一个 base 时可直接采用所声明的 workloads；多个 base 的实验文件仍须用 `base_config` 明确选择，
 按需用 `workload_ids` 缩小范围。显式空列表不是“全部 workloads”。
 
-例如使用已有独立性能库、尚未采集 base：
+普通预测优先引用平台维护者已准备的成本包，不要求应用用户先维护数据库或编写逐操作训练声明。
+例如尚未采集 base，但已有适用成本包：
 
 ~~~json
 {
   "profile_suite": "<base-experiment.json>",
   "target_configs": ["configs/modeling/hicache_target_example.json"],
-  "cost_database": "<platform-cost-database.sqlite>",
-  "cost_training": "<deployment-model-definitions.json>",
+  "cost_model": "<platform-cost-package.json>",
   "base_capture_budget": {
     "wall_seconds": 1200,
     "server_starts": 2,
+    "requests": 100,
+    "tokens": 100000
+  },
+  "cpu_service_capture_budget": {
+    "wall_seconds": 600,
+    "server_starts": 1,
     "requests": 100,
     "tokens": 100000
   },
@@ -206,12 +307,24 @@ scripts/model.sh build-dag --config <runner_config.json>
 }
 ~~~
 
-预算数字只是例子，应按实际允许的采集规模填写。已有成本包时可用 `cost_model` 代替数据库与训练声明。
-CPU 配对和新的独立成本补采另行声明，不从 base 预算借用。运行方式与下面的复用例子相同。
+预算数字只是例子，应按实际允许的采集规模填写；CPU 预算使入口能自动安排同源轻量回放，已有校正可显式复用。
+资源声明方式见下面的复用例子；实际资源必须与成本包匹配，不能照抄其他平台的标签。
+仅有数据库时，按后文用 `cost_database` 和 `cost_training` 替代成本包。新的独立成本补采另行声明，
+不从 base 或 CPU 预算借用。运行方式与下面的复用例子相同。
 模板 workload 不必预写 token 回放参数；没有已有计划时，入口先记录 tokens，再采集受控 base trace。
 显式 replay 计划或组的 token bundle 可跳过记录。两次运行使用各自的新报告目录，不覆盖原 workload 输出；
 不需要 HiCache 状态检查的普通 token 模板也不要求配置矩阵文件。
-当前仍要求固定输出长度与串行模板请求，不等于已经支持任意自然结束或并发请求的自动准备。
+当前仍使用串行模板请求；可记录逐请求的自然 EOS 或长度上限输出，再按实际序列和原结束条件回放。
+输出 token 数不是 Decode 执行次数：重叠调度可能在处理结束结果前已启动下一轮，连单 token 输出也可能有 Decode 分配。
+分配、计算与释放必须依据实际执行观测和框架规则。生命周期需要的新页若缺少对应分配边界，报告结构缺口及请求、页宽、
+已扩展/已 Decode/已提交 token 数；增加成本样本不能补齐这种结构信息，也不能把缺失分配当成零成本。
+已在原始 trace 中观测到的窗口前成功分配作为状态上下文保留；它初始化尚未结束的暖机请求，不生成正式窗口的成本节点。
+目标策略在该请求的结束阶段新增写入时，由 scheduler 的计算流与 worker 角色绑定资源，不要求源中存在同类写入模板。
+输出上限用于预留预算，实际 token 用于完成后的耗用和回放；单条请求可覆盖输出上限。
+正式采集前，先在 workload 配置中控制请求数量和逐请求输出上限，并保留本次需要验证的执行路径。
+这两个量直接影响 trace 和 base DAG 的规模；程序不按实验名强制限额，也不在构图时悄悄裁掉请求或节点。
+若改变工作量，重新准备匹配的记录、profile 和 CPU 校正；实验中的 target 预测和正常测量使用同一实际序列，不能沿用原负载真值。
+这不是对尚未生成内容或任意在线 EOS 的预测，也不表示并发请求或较长 Decode 的完整建模已通过本轮验收。
 
 性能数据库独立于这一组长期维护；训练声明负责选择适用部署和各类模型，整组共用一个结果包。
 空库、新后端或不适用的模型仍需独立性能采集，现行入口不能仅凭空库自动采齐全部计算、I/O 和控制成本。
@@ -386,6 +499,13 @@ CPU 成本校正比较同一个 base 的完整采集与轻量回放，不拿 tar
 新采集的 base 轻量回放与共享控制校准的轻量回放使用同一验收规则：manifest/workload 完成、
 没有采集错误、forced-token replay 验证通过，且仅含 LD_PRELOAD 通道。命令成功不能替代这些条件；
 CPU 配对所需计时文件继续由对应采集路径检查，失败尝试仍计入预算。
+绑定 forward 校正时，先按原线程和时间范围选出节点与跨界 gap，再按原节点顺序分摊整数预算；
+校正区间按线程批量写入。这样避免长 Decode 对每轮重复扫描整图或逐条搬动区间数组，不改变校正公式。
+层调用按线程、请求、阶段和 batch 一次分组，再按 forward 顺序查找；不为每份测量重新扫描全部层调用。
+输入归属、区间重叠和整数预算检查在正式构建中保留；逐节点/整段 gap 的成本表示恒等复核只在
+`TRACE_GRAPH_DEBUG=ON` 的显式诊断构建中运行，不能把这项复核当作目标预测精度。
+Python 配对也按原 PID/TID 对同步区间一次建索引，forward、layer 和主机片段共用范围查询；
+查询保留跨界和重叠候选，由原有语义校验拒绝，不因索引而静默裁掉异常观测。
 两份输入必须有可对应的 token、请求、rank、forward 和层调用；没有配对依据的成本保留原值。
 正式窗口的 CPU 配对同时按正式请求身份选取 scheduler 工作。预热的结果处理可能延伸到正式 HTTP
 窗口内，但不能因此要求它对应一个正式 forward；这些未选中的工作仍保留在 source DAG 中，不删耗时。
@@ -437,6 +557,8 @@ retained 报告说明不能安全扣除的 recorder 成本；缺报告不能解�
 Release 默认只保存保留条数、保留 CPU 时间与 recorder 校正汇总；逐条 `rows` 明细仅在
 `TRACE_GRAPH_DEBUG=ON` 构建中输出。两种构建生成同一份正式 CPU 成本，Python 准备流程不依赖明细。
 正式 cpu_service.json 按区间逐条写出，每条记录一行，避免为序列化再拼一份完整区间表；字段与读取合同不变。
+元数据在大区间数组之前。Python 编排只读取源、配对与窗口等头部信息，不为核对来源展开几千万个区间；
+实际成本仍由 C++ 完整读取并验证，按线程批量合并。写出时复用线程身份与字段结构，不改变区间数值。
 校正只处理已测量区间，不清零 residual gap，也不是逐条指令的开销归因。
 host、scheduler、输入处理和层等待配对直接生成统一的 CPU 测量记录；source 在配对入口绑定一次，
 合并及追加 recorder 修正时共用线程区间重叠检查，避免重复扣费，不再经过字段转换中间层。
@@ -449,6 +571,14 @@ HiCache CPU 节点索引按紧凑的时间、空点标记和节点 ID 排序，�
 原始 DAG 仍保留窗口内的实际执行，未配对的预热成本不扣除。跨起点的 batch 包络标为 `causal_head` 上下文，
 不要求窗口外的层等待具有完整节点，也不将整次预热 forward 纳入目标计算变换。
 独立校准显式使用 `--include-setup-requests` 时，准备请求仍在其测量范围内。
+窗口结束处，两个 rank 可能在 HTTP 端点前后分别进入同一次非阻塞 load/write 确认。
+裁剪前先按 group、members 和 collective_index 闭合同轮同伴，保留所需外层调用、原生 worker 和返回边界。
+这只是已启动检查的因果上下文，不延长 HTTP 端点，也不纳入后续轮询；缺失同伴或不完整调用仍由正常观察器拒绝。
+窗口外的新轮询不会仅因其原生事件等待与后台事实重叠而被纳入图。HTTP 之后的事件同步须属于已开始的语义调用或已证明的同伴，
+否则不保留其原生等待，避免把未纳入的下一轮检查变成窗口内写入的悬空消费者。被明确保留的写确认则仍需先替换其等待尾部、再替换写入。
+起点也可能截在同一次加载 MIN 的两个 rank 入口之间。若同伴和签名完整、两侧外层调用前后均为空队列，
+且每个 rank 都在其首个建模缓存输入前返回，则保留源图中的检查尾部，不重建窗口外的前缀，也不重复发布状态。
+这类未变化工作单列为 `retained_empty_opening_rounds`；不满足上述条件的半轮检查仍报告不完整。
 每份采集的同步事件在输入处统一转换为纳秒区间，由 forward、host、输入、scheduler 和 layer 观察共用；
 各观察器不再重复解析 Chrome trace 或反复换算时间单位，仍分别检查自己的区间归属和成本扣除。
 原始写入保存在 cpu_measurements.json 的 recorder_writes 中；C++ 输出扣除及保留统计，Python 不再读回成本后第二次构图。
@@ -539,8 +669,10 @@ I/O 补采要求显式 `physical_capture.page_token_sizes`，不从 target 列�
 | 状态 | 含义与下一步 |
 | --- | --- |
 | `predicted` | 本次组预测全部执行；成本覆盖与独立精度验收仍需另外检查 |
+| `preparing` / `capturing_base` / `preparing_cpu_service` / `preparing_costs` / `predicting` | 本次输入准备、base 采集、CPU 校正、独立成本准备或预测；不把上一轮成功时间当成本轮结果 |
 | `planned` / `source_inputs_prepared` | dry-run 或 calibration-only 已结束，没有执行 target，也没有训练 |
-| `needs_independent_cost_model` | 缺成本输入；提供成本包，或已有数据库和训练请求 |
+| `interrupted` | 本次准备被中断，已完成采集保留；先核对本次进程已收尾，再重跑同一命令，未完成目标不作为有效预测 |
+| `needs_independent_cost_model` | 采集前已发现未声明成本依据；引用成本包，或提供数据库与训练请求；首次建设走 `prepare-costs` |
 | `structure_corrections_required` | 目标工作或依赖规则不完整，不能用补采代替结构实现 |
 | `cost_model_definitions_required` / `cost_corrections_required` | 缺训练定义、工作变量或存在不适用的数值响应；先查看修正说明 |
 | `acquisition_requires_database_and_training_request` | 已开启自动补采，但未声明数据库或离线训练请求 |
@@ -552,9 +684,13 @@ I/O 补采要求显式 `physical_capture.page_token_sizes`，不从 target 列�
 `captures` 按顺序记录本次共享补采，`operation` 标明需求；它不是第二份预算账本。
 base、CPU、物理及共享 workload 的各自账本记录跨次累计用量，失败、重试和无效输出均计费，不重置历史。
 预算只约束新采集：已有匹配测量可复用；某项预算被拒绝时，其他不同需求仍核对自己的限额。
+只增加 profiler API 的启动/停止等待时限，不改变工作量或通道，已完成的 base/独立采集仍可复用；
+旧输入及实际时限保留在账本。执行、结束条件和采集通道等变化仍需要匹配，失败采集不因此变成可用输入。
 中途已经完成的测量保留并可入库，不能把整个批次宣称为全部完成。
 
 未收尾记录需要先核对其声明的进程、容器、产物和日志，不能因记录旧就删除账本重启。
+阶段状态在进入长任务前发布，但不是进程存活证明；中断后仍按下述账本和容器核对，不能只看 `preparing` 等字段。
+正式准备新预测时先撤下旧预测的完成摘要，避免采集尚未完成就评分旧结果；dry-run 和 calibration-only 不撤下已有预测。
 入口查询具体容器，但 running 字段不是活进程证据；容器不存在或查询失败也不能证明清理、用量结算和产物有效。
 当前不承诺完全自动的中断恢复。命令失败保留原停止原因，损坏产物作为附加错误；缺少可读用量时按预留预算计费。
 
@@ -569,6 +705,10 @@ dry-run 不启动采集和预测；calibration-only 只准备源输入。两者�
 ## 7. 独立成本库、预测与结果
 
 ### 独立性能准备
+
+这是平台维护入口，不是每次应用预测的前置步骤。应用用户通常只引用维护者交付的适用成本包及资源声明；
+已有依据可以跨任务复用，新增测量和模型定义由维护者在这条独立流程内处理。
+当前仍需显式声明采样方案与训练规则，不支持只填平台名就从空库自动建齐全部成本；缺规则不能靠补采替代。
 
 平台维护者用一个入口组织独立性能主线，不需要构造 base/target 预测组：
 
@@ -653,6 +793,8 @@ scripts/model.sh cost-db train \
 物理采集报告只发布来源和条件，离线成本层才从库内测量拟合服务响应。训练不回读外部测量文件。
 导入和训练不启动设备采集，不读取评分结果；所选部署和来源必须独立于本轮 base 及评分采集。
 部署比较排除纯观测开关，但 CPU 亲和性、设备及实际执行开关仍参与适用性判断。
+性能库的只读选样与预测共用部署语义：诊断接口的访问凭据不区分性能平台，不要求复制到新的训练声明。
+原始部署记录仍保留，模型、TP、后端及资源条件不因此放宽；没有匹配事实时依旧报告缺测。
 
 重复导入按原采集与测量位置去重，不合并不同真实采集中的同一工作点。
 新 runtime/control 采集默认以原 manifest 路径建立身份，重导入沿用库中已登记的身份；
@@ -809,9 +951,151 @@ scripts/model.sh predict \
 `source_observations_status=not_requested` 仅表示没有额外导出报告，不表示没有使用源依据。
 
 终端逐 target 显示预测秒数；无结果显示 `not predicted` 和原因。来源、外推和保留等待仍需查看摘要。
+结果中的 `next_action` 区分结构规则、独立成本及普通执行失败，`failure_log` 指向本次失败日志。
+`configuration_comparison` 按同一 source/workload 排列已执行目标；目标未全部完成时不声称找到了最快配置。
+相对 base 的收益仅在有 self 预测时提供，并注明是预测参照；没有它时为 null，不拿带 profiler 的 source 墙钟冒充正常实测。
+该排序不是已验证推荐或置信区间，完整限制仍由 cells 和独立评分说明。
+直接预测只比较用户给定的候选；下述搜索入口可从有限参数列表生成候选，不实现连续或在线优化。
+更换模型、TP、后端或资源环境前，要重新核对执行规则和独立性能依据；同一模型的成本外推也不等于已测工作点。
+是否适合扩大搜索，还取决于可区分收益、预测本身的耗时和首次准备成本，不能只看 E2E 误差。
 默认 `--diagnostics off` 使用 Release，只保留 compact summary、失败日志和复现输入；
 `--diagnostics full` 使用 validation，增加明细和成功日志，不改变模型。
 当前执行式结果没有完整组件归属及 target 操作映射，不能用历史静态 oracle 回放证明其整图正确。
+
+### 用结果选择配置，以及何时扩大搜索
+
+先确认候选都执行成功，并查看成本外推、保留等待和不支持分支；再比较完整 HTTP 秒数。
+应用输出的排序只是预测，不带已验证的置信度。很小的时间差不能直接当成可靠收益，
+更不能为得到一个“最优配置”忽略失败项或缺成本的候选。
+
+实验中的 `configuration_selection` 按预先约定的正常重复测量判断：
+
+| 状态 | 应怎样使用 |
+| --- | --- |
+| `INSUFFICIENT_SEPARATION` | 当前样本不能区分快慢；保留 base 或给出候选组，不强排第一名 |
+| `SUPPORTED_ON_MEASURED_PAIRS` | 只支持已可区分配置对的顺序；重叠组内部仍不能下结论 |
+| `INCORRECT_ORDER` / `UNRESOLVED_ORDER` | 暂不扩大搜索，先查工作/依赖、成本范围与剩余近似，不根据分数自动调参 |
+
+后续搜索先限于已支持的 HiCache 页大小、容量、写入和预取策略等显式候选，
+模型、TP、后端、资源和给定工作量不变；配置合法也不意味着每个工作点都有适用成本。
+当前目标是完整 HTTP 正式窗口时间，不是并发吞吐、任意在线输出或其他延迟指标。
+有限候选生成与预算搜索由下述入口完成；它不等于已经找到真实运行的全局最优配置。
+
+扩大候选集合前还应比较采集、CPU 准备、预测墙钟和少量正常实测的成本。
+本次准备时间与累计账本有重叠，不能相加；性能库首次建设成本未知时也不能记零。
+部署前可独立确认少量代表或优选候选，确认结果只用于评价，不回写本次模型；
+若修改了规则或参数，再用新的未见输入验证，不把原验证集继续称为首次泛化。
+
+### 配置搜索
+
+搜索与准确性实验是同一预测模型的两个调用方。用户给出固定场景、完整 target 模板、有限取值和预算，
+搜索层负责选点和排序；模型仍只负责根据准备好的输入计算目标操作、成本和完整 HTTP 时间。
+
+正式例子为 [search_example.json](../configs/modeling/search_example.json)。把 `scenario` 换成本次 Base 准备声明，
+可以引用已有 manifest，也可以通过 `profile_suite` 和原有预算首次采集；无需填写 `target_configs`。
+再选定其中一个 workload，修改模板、变量列表及输出位置：
+
+~~~bash
+scripts/model.sh search --request <search.json> --dry-run
+scripts/model.sh search --request <search.json>
+scripts/model.sh search --request <search.json> --resume
+~~~
+
+`--dry-run` 仅写 `search_plan.json`：不采集、不训练、不构图、不预测，也不覆盖已完成的搜索摘要。
+计划能说明已知缺口，不能预先保证所有目标操作都具有成本。当前首轮 HiCache 搜索使用 SGLang，
+保持模型、TP、后端、资源放置和请求/token 序列不变，不把 KTransformers 当作支持 HiCache。
+
+**输入怎么写。** `space` 接受 `page_size`、`l1_capacity_pages`、`l2_capacity_pages`、`write_policy`、
+`prefetch_policy` 和 `prefetch_threshold_pages` 的有限列表。页大小单位为 tokens/page，其余三个容量/门槛值用页。
+也可分别使用 `l1_capacity_tokens`、`l2_capacity_tokens`、`prefetch_threshold_tokens`，与对应 pages 字段互斥；
+token 值须能被每个所选页宽整除，入口逐页宽转换，使变更页大小时保持 token 容量和准入门槛。
+不同时把 host 比率作为独立变量。host 页数必须大于设备页数，这是当前支持合同，
+不是对实际内存足够的保证。预取容量上限由真实的 host/device 容量差派生，不是自由参数。
+所有未搜索值来自完整模板；Base 参照也需有可解释的实际页容量与门槛。
+资源额度与源 Base 不同时，可用 `reference_config` 引用空间内的同资源参照 target。
+它与 self 一样在搜索预算内先行预测；摘要的 `same_resource_reference` 和对应缩短率与 source Base 单列，
+避免把增加资源的收益全算成策略收益。
+
+`search.initial_indices` 可预先指定空间内的固定策略索引：在 Base 和同资源参照之后优先预测，
+计入同一预测预算，不读取既有目标评分。成功预测的指定项也进入自动正常筛选；
+空间外的源 Base 另做一次正常采集作为评分基准，不参与部署候选选择，仍保留其 self 预测。研究实验用这一项纳入开发阶段已选定的固定策略。
+
+timeout 的三个秒单位参数只在 `prefetch_policy=timeout` 分支展开。例如：
+
+~~~json
+{
+  "prefetch_policy": ["wait_complete", "timeout"],
+  "timeout": {
+    "prefetch_timeout_base_sec": [0.1, 1.0],
+    "prefetch_timeout_per_ki_token_sec": [0.0],
+    "prefetch_timeout_max_sec": [2.0]
+  }
+}
+~~~
+
+在当前建模的 HiRadixCache 中，这个字段组不会为 wait-complete 生成两个相同执行点。
+需要保留参数的联合关系时，可将 `timeout` 写为 `{"profiles":[{...},{...}]}`，每项显式给出上例的三个字段，
+不与独立参数列表混用。恒定等待及达到上限后完全等价的超时函数只生成一个点；实际启动值仍使用所声明的一组参数。
+重复取值按实际配置去重，不按名称、文件或预测时间去重；同一语义也用于未变成本迁移和正常配置核对。
+设备/host 启动参数经同一个 SGLang 配置解释器换算和取整，结果同时保存完整 `hicache` 值、`server_flags`，
+以及提供其余固定运行参数的 `unchanged_runtime_from`；不要把它当作脱离原场景的部署保证。
+
+`objective` 默认形态为 `{"metric":"http_e2e_sec","workload":"..."}`。需要组合负载时，
+改为 `{"metric":"http_e2e_sec","weights":{"workload_a":1,"workload_b":2}}`；权重在入口归一，
+每个正权重 workload 必须有对应 Base，全部完成后才能给配置总分。失败负载不从权重中删掉。
+完整 HTTP 包括 gap、未归属成本和 Prefill/Decode，但保留源等待等现行近似，不是这些部分都已准确建模。
+
+**怎样选点。** 空间能在预算内算完时用 `enumerate`；否则用 `stratified_random` 并声明整数 `seed`。
+它先按写策略、预取策略与页大小分层，每层抽一点，再按剩余组合数分配；预算不够覆盖分支时明确列出未覆盖项。
+`random` 只作为同口径的均匀随机比较参照。
+`local` 先分层覆盖，再根据已有模型预测，选至多四种不同机制的较优配置，各提出至多六个合法邻域点，
+同时保留随机探索；页宽/门槛、写入/停止策略可以联合改变。它不读取正常实测或重新拟合成本。
+`coordinate` 使用相同的初始覆盖、预算和随机探索，只关闭邻域中的联合改变，作为单变量改进对照。
+自适应批次默认覆盖至少 32 个配置，分支更多时扩大到分支数；多负载按实际配置×负载次数计费。
+每个批次仍使用现有预测入口，源图准备及失败均累计，不能宣称复用了常驻源图。
+静态随机流的前缀保持稳定；自适应流受实际批次边界影响，恢复会保留已有结果，但不承诺与一次更大预算调用的后续序列相同。
+这些方法共用一套空间和预测路径，不引入代理模型、网络服务或另一份缓存仿真。
+候选按需生成，不为抽少量点先物化整个笛卡尔积。
+
+**预算和恢复。** `search.max_predictions` 计算配置×workload 的实际尝试数，包括失败和重试；
+self 参照另计，并在空间包含相同执行点时复用一次。每个多负载候选先预留其全部必需名额。
+`max_wall_sec` 是累计搜索墙钟，包含源图构建和结果整理；到期停止实际调用并回收其专属容器，清理会有少量额外墙钟。
+准备采集/训练、搜索、正常确认分别计时，完整等待时间另记，不把已有性能库的历史取得成本记成零。
+没有当前报告的启动失败保守计费；有正式开始记录时，未启动项不当作已完成或耗时为零。
+
+`--resume` 是用户明确确认“输入、代码和成本仍是同一依据”的动作，不是文件摘要证明。
+只补未完成单元，保留失败目录与累计消耗；预算可提高，不清空历史。
+改过规则、workload、成本包或训练依据后用新输出目录，不能沿用旧成功值。
+上次进程突然消失且记录未结算时，先核对进程与容器，不凭旧状态文件自动重启。
+搜索不在运行中逐候选补库或换参数；缺口留给独立性能维护，新依据对应一次新比较。
+
+默认产物为 `search_summary.json`、输入及逐批正式预测报告。摘要包含合法空间与拒绝原因、完整候选、
+已算/缺成本/结构缺口、未选择点和未覆盖分支，以及预测排名和全部并列最优。
+`global_model_optimum_proven` 仅在整个合法空间都有完整预测时成立，它仍不是实际运行的全局最优。
+`completed_source_preparations` 和对应墙钟只累计已完成源准备；中断部分包含在总搜索墙钟内，不伪造精确分项。
+
+**可选正常确认。** 默认 `confirmation.enabled=false`，不读取 target 实测。
+只声明 `confirmation.enabled=true` 和独立 `budget`（wall_seconds/server_starts/requests/tokens）时，
+流程从 Base 配置自动生成正常采集输入，不要求用户逐候选编写 suite。
+先按模型选出同资源参照、排名代表及机制不同的候选；源 Base 在空间外时只作为评分锚点，不参与候选胜者选择。
+`screening_repetitions` 默认 1，试跑后确定候选，再用 `repetitions`（默认 5）次新样本独立确认候选和同资源参照。
+两阶段共用累计预算，筛选样本不混入最终均值，预测排名不因实测而改写；观察范围仍重叠时不确认收益。
+样本范围不是置信区间，没有收益时不强制推荐新配置。未配置同资源参照且 source 不在空间内时报告 `REFERENCE_REQUIRED`。
+失败候选不赋零耗时；自动确认保留失败、停止该配置剩余试跑，并继续其余配置。最终候选失败时仍完成参照的新样本，不推荐该候选；参照或源评分基准失败则报告测量未完成。已记录的同阶段失败不会因 resume 静默重试，筛选样本仍不混入目标最终均值。
+Ascend 自动确认在每次实际启动采集前等待其他 NPU 应用退出；已完成的相同采集直接复用，不等待设备。等待单列到 `resource_wait.json`，不消耗采集运行预算。
+这是启动前的占用检查，不能保证整批期间独占设备；需要持续独占时仍应由外部调度器预留资源。
+
+也可显式提供 `profile_suites` 和独立 `budget` 采集声明的对照，或用已有正常测量的 `target_profile_manifests` 只评分。
+正常 suite 仍是公开 profiling 输入，须关闭 profiling、通道及计时开关，
+标签和实际参数与生成的候选对应；重复次数在 suite 中预先声明。确认使用选定 Base 的实际 token 回放，不重新记录目标 tokens。
+显式输入时，搜索结束后先写选择集合：Base、同资源参照、`top_count` 个排名代表及一个竞争候选，再打开正常输入或采集。
+优先选一个预测分数不同的竞争候选；并列预测仍保留，确认某个代表不等于确认整个并列组。
+只采声明集合、保留失败和慢样本，评分走公开 `evaluate`，不回写成本或改变预测排名。
+正常资源/模型条件不同会拒绝比较，实测排序不符也如实保留，不据此偷偷重新搜索或拟合。
+单次观测可以检查流程，不能据此确认稳定收益；样本数、范围和精度 gate 仍须单独阅读。
+
+代码从 `applications/search/request.py`、`space.py`、`algorithms.py`、`workflow.py` 顺序阅读；
+结果整理在 `results.py`。只有显式正常确认时，CLI 才进入独立的 `confirmation.py`；搜索引擎不导入 evaluator。
 
 ## 8. 独立评分与历史回放
 
@@ -842,11 +1126,20 @@ scripts/model.sh evaluate \
 对执行式预测评估正常运行耗时，追加 `--normal-http`，用重复的 `--target-profile-manifest`
 传入关闭 profiling、channels 和 TIMING 探针的正常运行。需同时提供各 base/workload 的正常测量，
 作为“不改变 base 耗时”的比较基线；不能用带采集的 base 墙钟代替。
+计时开关显式设为 `"0"` 属于关闭，不因字段名包含 `TIMING` 被拒绝；计时输出路径和启用的开关仍不能用于正常真值。
 同一配置与 workload 的重复运行按正式窗口耗时取算术平均，结果保留报告路径、样本数和最小/最大值。
 评分核对请求顺序、失败请求及已报告的 token 回放失败，不排除 gap、未归属成本或计算阶段。
 不加该参数时仍使用单份 target profile，重复身份会报歧义；历史静态 oracle 诊断保持此路径。
 所有选中预测完成后才读取 target；输出必须与预测目录分离。
 评分不采集、不重预测、不改模型，也不触发 refit。
+可重复使用 `--target-config <label>` 显式选择确认子集；默认仍评分目录中的全部格，
+选中格未完成就拒绝读真值，不因其他配置失败而把它们混作性能较差的候选。
+
+独立评分增加 `configuration_selection`：按 source/workload 比较候选排序和选择损失。
+只有正常样本范围不重叠的配置对才计为可区分；重叠表示样本尚不能分辨，不代表等效或统计置信区间。
+报告分别列出可区分和无法区分的配置对，后者不强行判断预测顺序正确或错误。
+报告倒序、预测并列与推荐候选相对实测最低均值的损失，预测并列时保留全部候选，不事后选择最好的一项。
+不同 base 可以复用相同真值，排序对的数量不是独立实验数量；排序结论不修改原有完整 HTTP 门槛。
 
 完整 E2E 对比预测 HTTP 时间与 target 正式 HTTP 窗口，不排除任何成本，
 不以 target DAG 回放或预测图后台终点为真值。报告总面板、逐 base、self 和 base-wall 参照；
@@ -858,6 +1151,12 @@ scripts/model.sh evaluate \
 同一格同时出现后两种情况时归入域外组；未记录查询与明确没有查询分别列出，不当作已有覆盖。
 这只分类该查询报告，不包含 I/O 载荷模型、成本迁移或保留 gap；“各变量在范围内”不等于联合工作点已测，
 任何分组都不是全图成本覆盖率或可信度证明。分组只帮助说明结果范围，不改变精度门槛。
+
+`gate_summary.json.costs` 分开记录运行开销：`recorded.current_invocation` 是本次准备和最后一次预测尝试的墙钟，
+`recorded.cumulative_acquisitions` 直接引用原有采集账本的累计用量，包括已记账的失败与重试。
+本次准备可能已经包含其中的采集时间，不能把两部分相加；没有账本或值为 null 表示未记录，不表示零成本。
+早期 CPU 离线处理、复用 profile 和性能库的首次取得成本未齐时，仍为 `INCOMPLETE_COST_EVIDENCE`，不声称首次使用更便宜。
+这里不创建另一份用量账本，也不影响性能评分或触发新采集。
 
 普通评分不再生成历史逐组件结构、phase 成本、delta 和去 gap 汇总，也不为这些报告构建 target DAG。
 `gate_summary.json` 的 `acceptance_scope=full_http_formal_window`；PASS 只表示完整 HTTP 与 base-wall
@@ -997,6 +1296,7 @@ Attention 的两次逐层缓存检查也只在 K/V 主机提交之后发生：�
 | logits 与采样 | Prefill 末行选择、单行输出投影、TP 收集、输出整理和 argmax 分开 | 普通单请求、末 token、贪心路径；输入 logprob、随机采样、LoRA 和自定义处理不套用普通规则 |
 | eager 输入准备 | 根据实际注册 buffer 和目标 token 行数分组复制，入口、组间推进、末尾整理各自计费 | 单请求、连续一维注册布局；无 pipeline 代理输入，多张量转换及自定义回调不自动支持 |
 | allocator | 每请求 sequence/prefix 长度、目标页几何及 free/release 状态；准备、分配、索引写入分别生成 | 只使用已声明的后端 ABI；naive/JIT、首次准备、排序、失败重试均有独立规则与成本需求 |
+| Prefill 接纳 | 声明的生成预留、未命中输入和目标可用页共同决定是否等待；待完成写入经非阻塞确认后重试 | 当前串行、非分块路径；失败匹配的缓存拆分保留，新增接纳 CPU 复用粗粒度独立调度区间并单列近似 |
 | 通信 | 参与者、载荷、输入事件、传输、完成事件及等待规则 | 普通 HCCL all-reduce 和末 token 单行 all-gather；就绪后的完成区间不是通信带宽，也不包括源侧 peer 等待 |
 
 布局相同不等于成本必然不变，名称相同更不能证明几何相同。未被模块接管的阶段节点只有在工作不变时
