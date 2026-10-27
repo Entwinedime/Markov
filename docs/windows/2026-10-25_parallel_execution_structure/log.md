@@ -1930,3 +1930,58 @@
 **验证：** data/20261027T223827.749481Z_s8-a-followup保留输入、原始日志及results/qualification.json、results/lifecycle.json。page256原生1次/143.284458140s，processing 0.665571420s，在SelfAttentionOperation报ERR00100并退出137；未生成成功结果，不能将137解释为OOM。中断回归复用真实来源、从全新状态走公开入口：中断后status=interrupted、pending=null、processing 1.269246540s；恢复complete、pending=null、processing累计75.301674570s、native_attempts=0，所属容器均清理。modeling Docker内4份相关Python编译语法通过，未新增test或重跑无关矩阵。
 
 **结论与限制：** 探针修复及该限定输入的中断恢复取得开发回归资格，不回写旧独立案例为通过。无Markov观察仍原生失败，说明此page256配置当前不具备原生资格；尚未证明所有page256配置均不可运行，也未证明失败具体根因。后续转入来源与结构修复，旧B下游受阻记录继续保留。
+
+
+## 2026-10-28 — S8-A：分配入口与辅助原型上下文收口
+
+**范围：** 起点29d8bc24d4b0119cf80627c61ebddf355c4774de已推送并确认；本批处理page1与Dense PP来源事实，暂不改MoE、控制器或评价规则。
+
+**改动：** 原始page1来源的第二次准备读取free_pages时，shape仍为上次释放的released_pages+free_pages_before，且服务分配没有kv_allocate边界。按原生alloc入口新增轻量观察，共享池状态/端口和前后容量公式，分别保留token与paged接口的参数语义；不为released_pages填默认值。PP辅助materialization的预热及观察移入实际model_stream，与矩阵辅助原型采用相同上下文；不放宽执行资源隔离。
+
+**验证：** 修改前已联查NativeCall、TensorViewObservation、原生分配实现、HookRegistry及全部调用方；3份修改Python在modeling Docker内语法通过，git diff检查通过，运行资格待取得。登记两个新来源任务qwen3-page1、qwen3-tp1-pp3，各最多1次native/600s、processing 900s，复用原有六项目标输入作开发回归；镜像重建processing最多600s。当前开发根目录总额度改为native 3次/1800s、processing 2700s、临时128GiB/保留96GiB，原1次取证和费用保留，变更记在results/mechanism-budget-amendment.json。适配Python随镜像安装，本批须重建同名稳定镜像后运行，不以旧镜像验证新源码。
+
+**结论与限制：** 代码已改但尚无新来源/展开通过资格。上述任务只检验两个明确机制，不补采目标或扩张为新独立矩阵；若仍失败先保存事实，不能按目标加规则。
+
+
+## 2026-10-28 — S8-A：首批来源回归结果与参数入口修正
+
+**范围：** 两组来源回归已结束，保留全部失败；仅修正本批token入口的调用合同，不修改PP判断或追加来源点。
+
+**改动：** page1新入口错误依赖NativeCall.signature；该缓存只在声明tensor形参时建立，纯标量need_size入口没有它。改为原生明确的(pool, need_size)方法签名，不加空值回退。完整镜像构建缺缓存而触发上游依赖重装，已中止；随后以原bc4f镜像为底，仅重打包采集器得到534fa918，未重装推理栈。进一步联查发现正式prepare会在容器内editable安装工作区采集器，本轮有效代码因此也记录工作区文件hash，后续仅Python改动不需为采集重建原生框架。
+
+**验证：** 镜像构建中止及重打包共计processing 76.107583070s，失败和日志均保留。page1尝试1以signature=None错误终止，native 164.906233820s、processing 18.438677090s、未发布来源；PP3来源正常完成，native 182.536308420s、processing 83.896171040s，六项目标仍3成功/3 selection 1拒绝。role0新增了一个辅助执行分支，role1/2的该选择仍只有原三分支，不能认为PP缺口已关闭。登记page1再尝试一次，job cap改2、开发轮累计cap改4次/native 2400s，其余总额度不变，旧计费和失败不清除；记录在results/token-retry-amendment.json。
+
+**结论与限制：** 先保存完整本批结果，再作明确调用合同修正；只重做page1公开来源流程。PP保持partial，后续先沿实际调用上下文继续静态定位，不立刻循环采集或增加shape样本。
+
+
+## 2026-10-28 — S8-A：执行条件身份与批次端口几何
+
+**范围：** page1重试已完成原生采集但模板构建失败；本批不再新增native，处理共享归一化与适配端口语义。
+
+**改动：** 新PP来源role1/2中，相同定义、操作、caller、资源上下文和常量128的selection 1与辅助selection 22/24仅因乘法操作数次序不同而分离。核心在选择身份及重复候选签名处规范交换律表达式，保留原可执行guard的求值顺序、条件真值、常量和资源隔离；不做通用代数求解或放宽匹配。page1原生输出将allocator局部allocated_pages轴带到准备/模型边界，适配中的统一批次几何声明补齐准备输出及模型输入kv_locations的new-token语义，维护者仍只有BatchTensors。
+
+**验证：** page1重试未再发生调用签名异常，保留真实session-summary、rank和physical；累计该任务native 277.332392950s、processing 73.536156720s、2次尝试，当前失败是构建时missing parameter: allocated_pages。本批使用已完成来源重新解释/编译/展开：新建两个native额度为0、processing各最多900s的开发任务，硬链接保留输入及物理记录，原始文件靠原子发布隔离；继续计入当前轮processing 2700s总上限，旧失败、费用和原来源不覆盖。
+
+**结论与限制：** 确认PP既有适配上下文问题，也有共享身份归一化缺陷；不能把它们归为单一adapter问题。模板端口及核心改动待必要编译和正式入口回归，不授予新独立证据；不新增采样点或原生重采。
+
+
+## 2026-10-28 — S8-A：PP条件修复通过与token局部符号定位
+
+**范围：** 两项CPU重处理结束；针对page1剩余错误只修实际符号生产者，删除无效的后处理尝试。
+
+**改动：** page1的真实模板编译入口用gdb定位到SourceGraph::inspect_guards；原始assignment 1425仍引用已离开allocator作用域的allocated_pages。仅给批次端口补几何不能改写采集时已生成的下游guard，因此撤回BatchTensors与acquisition的本批修改，不保留补丁路径。在TokenAllocationCall返回处将结果绑定为批次M，新建下游view/assignment自然沿用该token轴；与已有paged输出的M语义一致。
+
+**验证：** 核心C++构建、clang-format dry-run及相关Python语法检查通过。PP3用已采数据重解释/归一化/展开，6/6正式预测完成、native_attempts=0、processing 43.079368210s。page1同样重处理仍失败，说明问题早于后处理；原始来源、失败和gdb堆栈保留在开发根目录。因修正的是活体观察时的符号，登记一个新的token-output-geometry来源任务，最多1次native/600s、processing 900s；开发轮累计最多5次/native 3000s，processing及存储总上限不变，不回收旧费用或增加shape点。
+
+**结论与限制：** PP修复取得该域六项开发展开资格，仍不代替原生逐rank独立对照。page1只重采原定代表输入以验证已定位的生产端修正，不把旧符号改写成新原生证据，也不在核心增加默认参数或旁路。
+
+
+## 2026-10-28 — S8-A：两个来源机制的开发回归与维护收尾
+
+**范围：** 本批分配语义、PP辅助上下文和核心条件身份；S8整体及其他PP/MoE/P/D问题保持未完成，不进入调度优化或性能层。
+
+**改动：** 最终保留共享池分配端口/状态、原生token与paged参数特化、token返回M轴及交换律条件身份键；不保留失败的批次端口后处理，也未新增test、CLI、采样点、默认参数或框架patch。联查NativeCall生命周期、分配原生入口、view/assignment几何、辅助上下文、候选分组/去重、发布绑定及目标选择，保留错误处理、常量/资源隔离和原guard求值顺序。
+
+**验证：** token-output-geometry新来源及6/6正式展开complete，本任务native 156.109391000s、processing 67.610753520s；PP重处理6/6 complete、native为0。最终本开发轮5次native/759.262550510s、processing 481.075479820s，失败和中止费用计入，所有pending为空。最终稳定镜像markov-next-sglang:ubuntu22.04为7c86173ea040，原生栈继承bc4f未重新安装，包内三份修改Python hash与工作区一致，四项主要依赖版本不变；最终Python语法、C++构建/格式、Git diff检查通过。数据检查确认12份结果存在、原冻结报告哈希不变、原始记录及失败保留；简明结果在开发根目录results/source-adaptation.md，机器审查摘要在results/batch-review.json。
+
+**结论与限制：** 两个来源机制取得限定开发资格；原B错误和未执行项仍按当时事实保留，其他域及逐rank独立对照不能据此算通过。核心有实质修改，后续A继续收口后须重新完整B。本批代码、文档和数据完成关联审查；7134755、7398dd3、fd37c8d三个代码提交已推送并核对远端fd37c8d4ccd5aab4eb42db2672a725bca9f658be，文档随本提交交付。用户reference暂存与deprecated/data均不纳入提交。
