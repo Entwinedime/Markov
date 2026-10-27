@@ -1,0 +1,15 @@
+**
+!third_party/
+!third_party/ktransformers/
+!third_party/ktransformers/archive/
+!third_party/ktransformers/archive/**
+!python/
+!python/markov/
+!python/markov/adapters/
+!python/markov/adapters/ktransformers/
+!python/markov/adapters/ktransformers/ascend/
+!python/markov/adapters/ktransformers/ascend/build.patch
+**/.git
+**/__pycache__
+**/build
+**/*.egg-info
