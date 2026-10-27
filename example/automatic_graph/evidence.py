@@ -16,46 +16,95 @@ class ExecutionEvidence:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
 
+    @staticmethod
+    def valid_interval(item: dict[str, Any], now_ns: int) -> bool:
+        match item["status"]:
+            case "completed":
+                return 0 <= item["started_ns"] <= item["completed_ns"] <= now_ns
+            case "running":
+                return 0 <= item["started_ns"] <= now_ns <= item["expected_ns"]
+            case "waiting":
+                return "started_ns" not in item
+        return False
+
+    @staticmethod
+    def ports_complete(boundary: dict[str, Any], timeline: dict[int, dict[str, Any]]) -> bool:
+        ports = boundary["execution_ports"]["completions"]
+        return (
+            bool(ports)
+            and all(timeline[node]["status"] == "completed" for node in ports)
+            and max(boundary["scheduled_ns"], *(timeline[node]["completed_ns"] for node in ports))
+            == boundary["completed_ns"]
+        )
+
     def check(self) -> dict[str, Any]:
         graph = self.result["graph"]
         execution = graph["execution"]
         timeline = {item["node"]: item for item in self.result["execution_timeline"]}
         identities = {node["id"] for node in execution["nodes"]}
         checks = {
-            "all_nodes_completed_once": len(timeline) == len(self.result["execution_timeline"])
-            and set(timeline) == identities
-            and all(item["status"] == "completed" for item in timeline.values()),
-            "nonnegative_intervals": all(
-                0 <= item["started_ns"] <= item["completed_ns"] <= self.result["completed_ns"]
-                for item in timeline.values()
-            ),
+            "timeline_identity": len(timeline) == len(self.result["execution_timeline"])
+            and len(identities) == len(execution["nodes"])
+            and set(timeline) == identities,
         }
-        if not checks["all_nodes_completed_once"]:
+        if not checks["timeline_identity"]:
             return {"status": "differences", "checks": checks}
+
+        # A serving window ends at its visible ports; unrelated asynchronous tails can still be in flight.
+        checks["nonnegative_intervals"] = all(
+            self.valid_interval(item, self.result["completed_ns"]) for item in timeline.values()
+        )
         checks["dependency_readiness"] = all(
-            timeline[edge["source"]]["completed_ns"] <= timeline[edge["target"]]["started_ns"]
+            timeline[edge["target"]]["status"] == "waiting"
+            or (
+                timeline[edge["source"]]["status"] == "completed"
+                and timeline[edge["source"]]["completed_ns"] <= timeline[edge["target"]]["started_ns"]
+            )
             for edge in execution["dependencies"]
         )
         resources = defaultdict(list)
-        actions = defaultdict(list)
+        owned = defaultdict(list)
         owner = {}
         for node in execution["nodes"]:
             item = timeline[node["id"]]
-            resources[node["resource"]].append((item["started_ns"], item["completed_ns"]))
+            if item["status"] != "waiting":
+                end = item["completed_ns"] if item["status"] == "completed" else item["expected_ns"]
+                resources[node["resource"]].append((item["started_ns"], end))
             region = node.get("region")
             if region is None:
                 region = graph["operations"][node["operation"]]["region"]
-            action = graph["regions"][region]["action"]
-            actions[action].append(item)
-            owner[node["id"]] = action
+            scope = graph["regions"][region]
+            identity = ("action", scope["action"]) if "action" in scope else ("control", scope["control"])
+            owned[identity].append(item)
+            owner[node["id"]] = identity
         checks["exclusive_resources"] = all(
             left[1] <= right[0] for intervals in resources.values() for left, right in pairwise(sorted(intervals))
         )
         decisions = self.result["decisions"]
-        checks["all_actions_drained"] = set(actions) == {item["task"]["sequence"] for item in decisions} and all(
-            item["scheduled_ns"] <= node["started_ns"] <= node["completed_ns"] <= item["completed_ns"]
+        boundaries = {("action", item["task"]["sequence"]): item for item in decisions}
+        boundaries.update((("control", index), item) for index, item in enumerate(self.result["controls"]))
+        checks["work_ownership"] = len(boundaries) == len(decisions) + len(self.result["controls"]) and set(
+            owned
+        ) == set(boundaries)
+        if not checks["work_ownership"]:
+            return {"status": "differences", "checks": checks}
+
+        checks["scheduled_work"] = all(
+            item["status"] == "waiting" or boundaries[identity]["scheduled_ns"] <= item["started_ns"]
+            for identity, items in owned.items()
+            for item in items
+        )
+        checks["completion_ports"] = all(self.ports_complete(item, timeline) for item in boundaries.values())
+        checks["publication_ports"] = all(
+            "published_ns" not in item
+            if item["execution_ports"]["publication"] is None
+            else (
+                timeline[item["execution_ports"]["publication"]]["status"] == "completed"
+                and max(item["scheduled_ns"], timeline[item["execution_ports"]["publication"]]["completed_ns"])
+                == item["published_ns"]
+                <= item["completed_ns"]
+            )
             for item in decisions
-            for node in actions[item["task"]["sequence"]]
         )
         outputs = defaultdict(list)
         for item in self.result["outputs"]:
@@ -79,7 +128,7 @@ class ExecutionEvidence:
         )
         checks["handoff_readiness"] = all(
             steps[first]["completed_ns"] <= steps[last]["scheduled_ns"]
-            and (steps[first]["task"]["sequence"], steps[last]["task"]["sequence"]) in cross
+            and (("action", steps[first]["task"]["sequence"]), ("action", steps[last]["task"]["sequence"])) in cross
             for steps in flows.values()
             if set(steps) == {"reserve", "model", "transfer", "accept", "release"}
             for first, last in (
@@ -93,7 +142,9 @@ class ExecutionEvidence:
             "status": "matched" if all(checks.values()) else "differences",
             "checks": checks,
             "execution_nodes": len(timeline),
+            "node_states": dict(Counter(item["status"] for item in timeline.values())),
             "actions": len(decisions),
+            "controls": len(self.result["controls"]),
             "handoffs": len(flows),
         }
 

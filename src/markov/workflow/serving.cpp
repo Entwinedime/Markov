@@ -74,6 +74,11 @@ nlohmann::json ServingWorkflow::run(bool details) {
             auto program = expansion_.expand(*action);
             const bool publishes = action->commits_requests() && std::ranges::any_of(action->work->effects.members, &RequestCompletion::emits_output);
             if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");
+            if (details)
+                decision["execution_ports"] = {
+                    { "publication", program.publication ? nlohmann::json(*program.publication) : nlohmann::json(nullptr) },
+                    { "completions",                                                                  program.completions }
+                };
             executor_.submit(expansion_.graph(), action->task, program);
             controller_.start(*action);
 
@@ -93,8 +98,9 @@ nlohmann::json ServingWorkflow::run(bool details) {
             if (!completions.empty()) {
                 if (details)
                     result["controls"].push_back({
-                        { "scheduled_ns", scheduled_ns },
-                        { "completed_ns",     ready_ns }
+                        {    "scheduled_ns",                       scheduled_ns },
+                        {    "completed_ns",                           ready_ns },
+                        { "execution_ports", { { "completions", completions } } }
                     });
                 if (!details) executor_.retain(expansion_.retire());
             }
