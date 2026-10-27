@@ -40,6 +40,24 @@ performance.models 可省略，表示独立模型尚未选定；execution 必须
 首次用户可以声明模型、base 和 workload，由准备流程安排受控采集及必要的 CPU 开销校正。
 已有数据满足条件时直接使用，不为每组目标重建性能数据库。
 
+### 来源与页几何诊断
+
+```bash
+MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
+  build/modeling/Release/markov_core page-work /path/to/page_work_request.json /path/to/page_work_report.json
+```
+
+诊断请求只有 manifest 和 page_sizes_tokens，例如 `{"manifest":"capture/profile_manifest.json","page_sizes_tokens":[64,128]}`。
+manifest 的相对路径以请求文件所在目录为起点；页大小必须为正整数。这项诊断读取真实来源，共享一次准备后生成各页几何。
+同一 token 前缀在这次来源准备中只有一个身份，不能将该数字当作跨采集的地址。
+
+报告保留准备请求和正式请求，区分查询输入、完整 prompt 与实际提交路径；查询输入长度不是命中长度。
+可复用上限与最少 Prefill token 只描述页对齐的边界，实际值还取决于容量、缓存所在层及发布时机。
+prior_committed_prefix_tokens 给出此前提交过的最长匹配前缀；它假设没有淘汰，不能当作实际命中。
+radix_segments 按目标页大小表示压缩前缀树，匹配时会在共同前缀处分裂。报告同时保留客户端屏障的位置及控制含义，
+不将源屏障的等待时间写入目标工作；观察用 checkpoint 不参与目标调度。
+它不运行目标配置，也不验证目标 DAG 相似度或性能；源回放使用观测成本，不能当作目标预测精度。
+
 ## 统一任务入口的职责
 
 用户入口将结构化请求交给正式 Python 包，不要求手动串联内部 bundle、CPU 导出、模型训练和 C++ 二进制。
@@ -69,8 +87,10 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cos
 deployment 沿用预测请求的六项条件。每项工作为 operation、implementation、timing_scope 和数值 features；
 正式目标规划器接入后生成这些描述，应用用户不需要手工逐节点填写。
 
-选定模型文件只有 deployment 和 models 两项。每个模型给出相同的操作/实现/计时口径、intercept_ns、coefficients_ns、
+选定模型文件只有 deployment 和 models 两项。每个模型给出相同的操作/实现/计时口径、response、
 特征 ranges、完整 measured_points、extrapolation_features、allow_new_combinations 及 sources。
+response.form 为 affine 时包含 intercept_ns 和 coefficients_ns；为 coefficient_curve 时包含 feature 与 points，
+每个测点含 coordinate、intercept_ns 和 coefficients_ns。测点严格递增，曲线坐标的适用范围不得超出测点区间。
 这些是离线维护结果，不在查询过程中拟合；旧成本资产需显式转换单位和合同，程序不猜格式或长期兼容两套字段。
 
 报告逐项返回状态、可用时的整数 duration_ns、覆盖类别和模型来源引用。缺失或不支持的耗时为 null。

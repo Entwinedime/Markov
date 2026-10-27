@@ -37,6 +37,17 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 目前只验证过一份 SGLang 来源；报告保留源等待与 gap，分别列出请求回放和设备时间差异，不能当作正常运行预测精度。
 设备依赖与 KTransformers 尚未完成验收。此命令严格读取 manifest 声明的文件，不自动修复不完整采集。
 
+HiCache 页几何的实验诊断入口：
+
+```bash
+MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
+  build/modeling/Release/markov_core page-work /path/to/page_work_request.json /path/to/page_work_report.json
+```
+
+请求文件包含 manifest 路径与 page_sizes_tokens 数组。它共享一次来源准备，按各页大小重新划分请求前缀，
+同时给出压缩前缀树、先前提交的前缀交集及源回放；报告中的可复用上限没有考虑缓存容量和可见性，
+不能当作实际命中或目标 DAG 预测。
+
 独立成本查询已有单独入口，供模型维护时检查工作覆盖与响应：
 
 ```bash
