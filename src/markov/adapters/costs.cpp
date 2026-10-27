@@ -46,13 +46,39 @@ planning::Features features(const Json & raw) {
     return result;
 }
 
+cost::Affine affine(const Json & raw) {
+    const auto intercept = raw.at("intercept_ns").get<double>();
+    if (!std::isfinite(intercept)) throw std::runtime_error("Cost intercept must be finite");
+    return { intercept, features(raw.at("coefficients_ns")) };
+}
+
+cost::Formula formula(const Json & raw) {
+    const auto form = raw.at("form").get<std::string>();
+    if (form == "affine") {
+        fields(raw, { "form", "intercept_ns", "coefficients_ns" });
+        return affine(raw);
+    }
+    if (form != "coefficient_curve") throw std::runtime_error("Unsupported cost response form: " + form);
+    fields(raw, { "form", "feature", "points" });
+    cost::CoefficientCurve result{ raw.at("feature").get<std::string>(), {} };
+    const auto & points = raw.at("points");
+    if (!points.is_array() || points.size() < 2) throw std::runtime_error("Cost coefficient curve requires at least two anchors");
+    for (const auto & point : points) {
+        fields(point, { "coordinate", "intercept_ns", "coefficients_ns" });
+        const auto coordinate = point.at("coordinate").get<double>();
+        if (!std::isfinite(coordinate) || (!result.points.empty() && coordinate <= result.points.back().coordinate))
+            throw std::runtime_error("Cost curve coordinates must be finite and strictly increasing");
+        result.points.push_back({ coordinate, affine(point) });
+    }
+    return result;
+}
+
 cost::Model model(const Json & raw) {
     fields(raw,
            { "operation",
              "implementation",
              "timing_scope",
-             "intercept_ns",
-             "coefficients_ns",
+             "response",
              "ranges",
              "measured_points",
              "extrapolation_features",
@@ -60,22 +86,33 @@ cost::Model model(const Json & raw) {
              "sources" });
     cost::Model result{
         { raw.at("operation").get<std::string>(), raw.at("implementation").get<std::string>(), raw.at("timing_scope").get<std::string>() },
-        raw.at("intercept_ns").get<double>(),
-        features(raw.at("coefficients_ns")),
+        formula(raw.at("response")),
         {},
         {},
         raw.at("extrapolation_features").get<std::set<std::string>>(),
         raw.at("allow_new_combinations").get<bool>(),
         raw.at("sources").get<std::vector<std::string>>()
     };
-    if (!std::isfinite(result.intercept_ns) || result.sources.empty()) throw std::runtime_error("Cost model needs finite coefficients and measurement sources");
+    if (result.sources.empty()) throw std::runtime_error("Cost model needs measurement sources");
 
     for (const auto & [name, values] : raw.at("ranges").get<std::map<std::string, std::vector<double>>>()) {
         if (values.size() != 2 || !std::isfinite(values[0]) || !std::isfinite(values[1]) || values[0] > values[1])
             throw std::runtime_error("Invalid cost domain range: " + name);
         result.ranges.emplace(name, cost::Range{ values[0], values[1] });
     }
-    for (const auto & [name, coefficient] : result.coefficients_ns) result.ranges.at(name);
+    if (const auto * response = std::get_if<cost::Affine>(&result.response)) {
+        for (const auto & [name, coefficient] : response->coefficients_ns) result.ranges.at(name);
+    }
+    else {
+        const auto & curve = std::get<cost::CoefficientCurve>(result.response);
+        const auto domain = result.ranges.at(curve.feature);
+        if (domain.lower < curve.points.front().coordinate || domain.upper > curve.points.back().coordinate
+            || result.extrapolation_features.contains(curve.feature))
+            throw std::runtime_error("Cost curve domain must remain within its anchors: " + curve.feature);
+        for (const auto & point : curve.points) {
+            for (const auto & [name, coefficient] : point.response.coefficients_ns) result.ranges.at(name);
+        }
+    }
     for (const auto & name : result.extrapolation_features) result.ranges.at(name);
 
     if (!raw.at("measured_points").is_array()) throw std::runtime_error("Cost measured_points must be an array");

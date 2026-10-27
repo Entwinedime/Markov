@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace markov::trace_graph::cost {
@@ -16,10 +17,26 @@ struct Range {
     double upper;
 };
 
-struct Model {
-    planning::WorkKind kind;
+struct Affine {
     double intercept_ns;
     planning::Features coefficients_ns;
+};
+
+struct CoefficientPoint {
+    double coordinate;
+    Affine response;
+};
+
+struct CoefficientCurve {
+    std::string feature;
+    std::vector<CoefficientPoint> points;
+};
+
+using Formula = std::variant<Affine, CoefficientCurve>;
+
+struct Model {
+    planning::WorkKind kind;
+    Formula response;
     std::map<std::string, Range> ranges;
     std::set<std::vector<double>> measured_points;
     std::set<std::string> extrapolation_features;

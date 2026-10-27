@@ -1,11 +1,37 @@
 #include "markov/trace_graph/cost/models.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::cost {
+namespace {
+
+long double evaluate(const Affine & response, const planning::Features & features) {
+    long double result = response.intercept_ns;
+    for (const auto & [name, coefficient] : response.coefficients_ns) result += static_cast<long double>(coefficient) * features.at(name);
+    return result;
+}
+
+long double evaluate(const Formula & response, const planning::Features & features) {
+    if (const auto * affine = std::get_if<Affine>(&response)) return evaluate(*affine, features);
+
+    const auto & curve = std::get<CoefficientCurve>(response);
+    const auto coordinate = features.at(curve.feature);
+    const auto right = std::ranges::upper_bound(curve.points, coordinate, {}, &CoefficientPoint::coordinate);
+    if (right == curve.points.end()) return evaluate(curve.points.back().response, features);
+
+    // Intake requires the coordinate domain to lie within the measured curve.
+    // Interpolate response coefficients, never clamp an unsupported work point.
+    const auto & left = *(right - 1);
+    const auto position = (coordinate - left.coordinate) / (right->coordinate - left.coordinate);
+    const auto lower = evaluate(left.response, features);
+    return lower + position * (evaluate(right->response, features) - lower);
+}
+
+} // namespace
 
 Models::Models(std::vector<Model> models) : models_(std::move(models)) {
     for (std::size_t id = 0; id < models_.size(); ++id) {
@@ -43,8 +69,7 @@ Response Models::query(const planning::Work & work) const {
     const auto coverage = !outside.empty() ? Coverage::Extrapolated : measured ? Coverage::Measured : Coverage::NewCombination;
     if (coverage == Coverage::NewCombination && !model.allow_new_combinations) return { Status::UnmeasuredCombination, std::nullopt, coverage, {}, id };
 
-    long double duration = model.intercept_ns;
-    for (const auto & [name, coefficient] : model.coefficients_ns) duration += static_cast<long double>(coefficient) * work.features.at(name);
+    const auto duration = evaluate(model.response, work.features);
 
     // A regression may have a negative intercept; its physical response still
     // must fit the nonnegative integer-ns contract. Never clamp it to zero.
