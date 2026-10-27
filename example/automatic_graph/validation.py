@@ -15,6 +15,10 @@ from markov_collection.workflow.exploration import BudgetExceeded, Exploration, 
 from serving import native_configuration
 
 
+class NativeDeviceUnavailable(RuntimeError):
+    pass
+
+
 def analyze(task: Exploration, script: str, arguments: list[str]) -> None:
     command = ["python3", str(task.root / "example/automatic_graph" / script), *arguments]
     task.step(
@@ -72,6 +76,8 @@ def completion_checks(target: dict[str, Any], result: dict[str, Any]) -> dict[st
 
 
 class NativeValidation:
+    resumable = {"interrupted", "budget_exhausted", "resource_blocked"}
+
     def __init__(
         self, task: Exploration, configuration: str, workload: str, capture: Path, minimum_members: int = 1
     ) -> None:
@@ -128,7 +134,7 @@ class NativeValidation:
             else native_configuration(settings)
         )
         pairs = [[item["prompt_tokens"], item["output_tokens"]] for item in target["requests"]]
-        if self.capture.exists():
+        if self.capture.exists() and (self.outcome.get("native_complete", False) or self.interpreted()):
             observed = json.loads((self.capture / "capture.json").read_text())
             expected = {**self.domain, "model": self.task.specification["model"]["path"], "requests": pairs}
             if "pd" in expected:
@@ -153,7 +159,9 @@ class NativeValidation:
         environment = task.environment
         if environment.native is None:
             task.prepare()
-        self.capture.mkdir(parents=True)
+
+        # An explicit resume may reuse a request directory left by an unstarted device preflight.
+        self.capture.mkdir(parents=True, exist_ok=self.resuming)
         request = task.acquisition.request(
             task.specification,
             self.domain,
@@ -254,7 +262,7 @@ class NativeValidation:
     def run(self, resume: bool = False) -> dict[str, Any]:
         if self.report.exists():
             previous = json.loads(self.report.read_text())
-            if not resume or previous["status"] not in ("interrupted", "budget_exhausted"):
+            if not resume or previous["status"] not in self.resumable:
                 raise FileExistsError(f"validation report already exists: {self.report}")
             history = previous.pop("history", [])
             self.outcome = {
@@ -348,17 +356,19 @@ class NativeValidation:
                 status = "interrupted"
             elif isinstance(error, BudgetExceeded):
                 status = "budget_exhausted"
+            elif isinstance(error, NativeDeviceUnavailable):
+                status = "resource_blocked"
             outcome.update(
                 status=status,
                 error_type=type(error).__name__,
                 error=str(error),
             )
             self.task.environment.cleanup()
-            if isinstance(error, (KeyboardInterrupt, BudgetExceeded)):
+            if isinstance(error, (KeyboardInterrupt, BudgetExceeded, NativeDeviceUnavailable)):
                 raise
         finally:
             write_json(self.report, outcome, indent=2)
-            if self.work.exists() and outcome["status"] not in ("interrupted", "budget_exhausted"):
+            if self.work.exists() and outcome["status"] not in self.resumable:
                 shutil.rmtree(self.work)
         return outcome
 

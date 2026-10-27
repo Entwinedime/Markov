@@ -1,4 +1,4 @@
-"""Run the frozen S8 investigation sequentially, retaining errors and shared task budgets."""
+"""Run the S8 investigation with a frozen core and reviewed adapter scopes."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any
 
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.workflow.exploration import BudgetExceeded, CommandFailed, Exploration, read_specification
-from validation import NativeValidation, analyze, completion_checks
+from validation import NativeDeviceUnavailable, NativeValidation, analyze, completion_checks
 
 
 class InvestigationTask(Exploration):
@@ -52,15 +52,18 @@ for device in sys.argv[1:]:
 print('Selected native devices are idle')
 """
         command = ["python3", "-c", script, *map(str, self.environment.devices)]
-        self.step(
-            [
-                "docker",
-                "exec",
-                str(self.environment.native),
-                *self.environment.limited(command, self.available("processing")),
-            ],
-            "processing",
-        )
+        try:
+            self.step(
+                [
+                    "docker",
+                    "exec",
+                    str(self.environment.native),
+                    *self.environment.limited(command, self.available("processing")),
+                ],
+                "processing",
+            )
+        except CommandFailed as error:
+            raise NativeDeviceUnavailable(str(error)) from error
 
     def storage_bytes(self, retained: bool = False) -> int:
         self.investigation.check_storage(retained)
@@ -88,6 +91,21 @@ class Investigation:
         self.directory = directory
         self.manifest = json.loads((directory / "inputs/matrix.json").read_text())
         self.jobs = {job["id"]: job for job in self.manifest["jobs"]}
+        self.case_tasks = {"workflow/" + job["id"]: job["task"] for job in self.jobs.values()}
+        self.case_tasks.update(
+            {
+                f"native/{job['id']}/{case['configuration']}/{case['workload']}": job["task"]
+                for job in self.jobs.values()
+                for case in job["native_cases"]
+            }
+        )
+        for kind in ("conditional", "lifecycle"):
+            self.case_tasks.update(
+                {
+                    kind + "/" + case["id"]: self.jobs[case["job"]]["task"] if "job" in case else case.get("task")
+                    for case in self.manifest[kind + "_cases"]
+                }
+            )
         self.output = directory / "results/outcomes.json"
         self.outcomes = json.loads(self.output.read_text()) if self.output.exists() else []
 
@@ -129,16 +147,31 @@ class Investigation:
             "docker",
             "scripts",
             "third_party",
+            "docs/design",
             "CMakeLists.txt",
             "pyproject.toml",
             ".clang-format",
         ]
-        subprocess.run(
-            ["git", "diff", "--exit-code", self.manifest["frozen_revision"], "--", *paths],
-            cwd=self.root,
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
+        adapters = [
+            "src/markov/adapters",
+            "src/collection/markov_collection/adapters",
+            "src/collection/adapters",
+            "docker/images/base/sglang",
+            "docker/images/sglang",
+        ]
+
+        # An adapter revision must already be reviewed; changing folders cannot waive core semantics.
+        frozen = paths + [":(exclude)" + path for path in adapters]
+        for revision, scope in (
+            (self.manifest["frozen_revision"], frozen),
+            (self.manifest["adapter_revision"], adapters),
+        ):
+            subprocess.run(
+                ["git", "diff", "--exit-code", revision, "--", *scope],
+                cwd=self.root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
         if subprocess.check_output(
             ["git", "ls-files", "--others", "--exclude-standard", "--", *paths], cwd=self.root, text=True
         ).strip():
@@ -151,17 +184,15 @@ class Investigation:
 
     def done(self, case: str) -> bool:
         previous = next((item for item in reversed(self.outcomes) if item["case"] == case), None)
-        if previous is None or previous["status"] in ("interrupted", "budget_exhausted"):
+        if previous is None or previous["status"] in NativeValidation.resumable | {"blocked"}:
             return False
-        if previous["status"] == "blocked" and "depends_on" in previous:
-            return previous["dependency_status"] not in ("interrupted", "budget_exhausted")
-        return True
+        return previous["source_task"] == self.case_tasks[case]
 
     def record(self, case: str, outcome: dict[str, Any]) -> None:
         if outcome["status"] == "blocked" and "depends_on" in outcome:
             dependency = next(item for item in reversed(self.outcomes) if item["case"] == outcome["depends_on"])
             outcome["dependency_status"] = dependency["status"]
-        self.outcomes.append({**outcome, "case": case})
+        self.outcomes.append({**outcome, "case": case, "source_task": self.case_tasks[case]})
         write_json(self.output, self.outcomes, indent=2)
         latest = {item["case"]: item for item in self.outcomes}
         counts: dict[str, int] = {}
@@ -169,7 +200,7 @@ class Investigation:
             counts[item["status"]] = counts.get(item["status"], 0) + 1
         states = self.states()
         lines = [
-            "# 独立调查运行结果",
+            "# 执行结构检查结果",
             "",
             "本页记录执行结果；调查完成不等于结构资格全部通过。",
             "",
@@ -205,6 +236,8 @@ class Investigation:
             raise
         except BudgetExceeded as error:
             self.record(case, {"status": "budget_exhausted", "error": str(error)})
+        except NativeDeviceUnavailable as error:
+            self.record(case, {"status": "resource_blocked", "error": str(error)})
         except Exception as error:
             self.record(case, {"status": "error", "error_type": type(error).__name__, "error": str(error)})
         else:
@@ -252,7 +285,7 @@ class Investigation:
                 previous = json.loads(validation.report.read_text()) if validation.report.exists() else None
                 outcome = (
                     previous
-                    if previous and previous["status"] not in ("interrupted", "budget_exhausted")
+                    if previous and previous["status"] not in NativeValidation.resumable
                     else validation.run(resume=True)
                 )
                 outcome["report"] = str(validation.report.relative_to(self.directory))
@@ -494,15 +527,7 @@ class Investigation:
             self.execute("conditional/" + case["id"], self.conditional, case)
         for case in self.manifest["lifecycle_cases"]:
             self.execute("lifecycle/" + case["id"], self.lifecycle, case)
-        expected = ["workflow/" + job["id"] for job in self.manifest["jobs"]]
-        expected += [
-            f"native/{job['id']}/{case['configuration']}/{case['workload']}"
-            for job in self.manifest["jobs"]
-            for case in job["native_cases"]
-        ]
-        expected += ["conditional/" + case["id"] for case in self.manifest["conditional_cases"]]
-        expected += ["lifecycle/" + case["id"] for case in self.manifest["lifecycle_cases"]]
-        pending = [case for case in expected if not self.done(case)]
+        pending = [case for case in self.case_tasks if not self.done(case)]
         print(json.dumps({"investigation_complete": not pending, "pending": pending}), flush=True)
         if pending:
             raise SystemExit(2)

@@ -24,9 +24,22 @@ class MatrixInputs:
         return name
 
     def requests(self, page, count=8, seed=None):
-        generator = random.Random(seed)
-        prompts = [5, max(1, page - 3), page + 5, max(1, 2 * page - 3), 3 * page + 1, 19, 41, 83]
+        generator = random.Random(self.manifest["request_seed"] + (seed or 0))
+        prompts = [
+            1,
+            max(1, page - 1),
+            page,
+            page + 1,
+            2 * page - 1,
+            2 * page,
+            2 * page + 1,
+            3 * page + generator.randint(1, max(1, page // 2)),
+        ]
         outputs = [2, 1, 6, 3, 2, 4, 1, 3]
+
+        # Freeze fresh request combinations while retaining the named page boundaries.
+        generator.shuffle(prompts)
+        generator.shuffle(outputs)
         result = []
         for index in range(count):
             prompt = (
@@ -152,10 +165,10 @@ class MatrixInputs:
             self.job(f"qwen3-pd{prefill}-{decode}", "qwen3-8b", pd=((prefill, 1, 1), (decode, 1, 1)), groups=["J", "K"])
         self.job("qwen3-moe-pd-pp3", "qwen3-moe", pd=((2, 3, 2), (2, 1, 2)), groups=["H", "I", "J", "K"])
         for tp in (1, 2):
-            self.job(f"phi3-tp{tp}", "phi3-mini", tp=tp, groups=["B", "F", "H"])
-        for ep in (2, 4):
-            self.job(f"olmoe-ep{ep}", "olmoe", tp=ep, ep=ep, groups=["B", "I"])
-        self.job("olmoe-ep2-pp3", "olmoe", tp=2, pp=3, ep=2, groups=["B", "H", "I"])
+            self.job(f"llama31-tp{tp}", "llama31-8b", tp=tp, groups=["B", "F", "H"])
+
+        # Native OLMoE TP/PP failures remain in the first investigation report.
+        self.job("olmoe-ep1", "olmoe", groups=["B", "I"])
         self.job("qwen3-fp16", "qwen3-8b", dtype="float16", groups=["B"])
         for page in (1, 16, 64, 256):
             self.job(f"qwen3-page{page}", "qwen3-8b", page=page, groups=["C", "F"])
@@ -264,7 +277,7 @@ class MatrixInputs:
                 for length in (2047, 2048, 2049, 2305)
             ],
         }
-        for identifier in ("qwen3-tp2", "phi3-tp1", "phi3-tp2"):
+        for identifier in ("qwen3-tp2", "llama31-tp1", "llama31-tp2"):
             self.tasks[identifier]["workloads"].append(copy.deepcopy(long_context))
         for tokens in (16384, 262144):
             configuration = copy.deepcopy(self.tasks["qwen3-tp2"]["configurations"][1])

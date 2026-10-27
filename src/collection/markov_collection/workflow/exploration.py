@@ -26,8 +26,8 @@ class BudgetExceeded(RuntimeError):
 
 
 class CommandFailed(RuntimeError):
-    def __init__(self, returncode: int, stderr: str) -> None:
-        super().__init__(f"command failed ({returncode}): {stderr}")
+    def __init__(self, returncode: int, stderr: str, log: Path) -> None:
+        super().__init__(f"command failed ({returncode}): {stderr}\nlog: {log}")
         self.returncode = returncode
         self.stderr = stderr
 
@@ -111,6 +111,7 @@ class Exploration:
             with log_path.open("a") as log:
                 log.write(json.dumps({"category": category, "command": command}) + "\n")
                 log.flush()
+                output_begin = log.tell()
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
                 try:
                     while process.poll() is None:
@@ -129,19 +130,26 @@ class Exploration:
                     process.terminate()
                     process.wait()
                     raise
-            if process.returncode == 124:
-                raise BudgetExceeded(f"{category} time budget exhausted")
-            if process.returncode:
-                with log_path.open() as log:
-                    message = "".join(deque(log, maxlen=1)).strip()
-                raise CommandFailed(process.returncode, message[:1000])
         finally:
             elapsed = time.monotonic_ns() - started
             self.state["charged_ns"][category] += elapsed - reserved
             self.state["pending"] = None
             self.save()
-        if elapsed > reserved:
+        if elapsed > reserved or process.returncode == 124:
             raise BudgetExceeded(f"{category} time budget exhausted")
+
+        # A timeout's forced kill also exits 137; use the refunded balance to distinguish budget exhaustion.
+        if process.returncode == 137:
+            self.available(category)
+        if process.returncode:
+            with log_path.open() as log:
+                log.seek(output_begin)
+                lines = (line.strip() for line in log)
+                lines = (line for line in lines if line)
+                first = next(lines, "")
+                tail = deque(lines, maxlen=12)
+            message = "\n".join(line[:600] for line in (first, *tail))
+            raise CommandFailed(process.returncode, message, log_path)
 
     def build_tool(self) -> None:
 
@@ -188,11 +196,10 @@ class Exploration:
         write_json(path, observed, indent=2)
         self.model_configuration = observed["model_configuration"]
 
-        self.state["failures"].update(
-            self.acquisition.check_workloads(observed["model_configuration"], self.specification)
-        )
+        invalid = self.acquisition.check_workloads(observed["model_configuration"], self.specification)
+        self.state["failures"].update(invalid)
         expected = len(self.specification["configurations"]) * len(self.specification["workloads"])
-        if len(self.state["failures"]) == expected:
+        if len(invalid) == expected:
             return
 
         self.build_tool()
@@ -230,7 +237,9 @@ class Exploration:
         if key not in self.state["sources"]:
             self.available("native")
             capture = self.directory / "captures" / f"{key}-attempt-{self.state['native_attempts'] + 1}"
-            capture.mkdir(parents=True)
+
+            # A device preflight can stop before spending an Engine attempt, leaving only its request file.
+            capture.mkdir(parents=True, exist_ok=True)
             request = self.acquisition.request(
                 self.specification,
                 domain,
