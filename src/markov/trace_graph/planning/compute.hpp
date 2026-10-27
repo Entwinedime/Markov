@@ -4,8 +4,10 @@
 
 #include <array>
 #include <compare>
+#include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace markov::trace_graph::planning {
 
@@ -48,7 +50,14 @@ struct AttentionGeometry {
     auto operator<=>(const AttentionGeometry &) const = default;
 };
 
-using ComputeGeometry = std::variant<LinearGeometry, NormalizationGeometry, ActivationGeometry, AdditionGeometry, AttentionGeometry>;
+struct CacheWriteGeometry {
+    std::string operation;
+    double width, source_row_stride;
+    std::string materialize_implementation, materialized_write_implementation;
+    auto operator<=>(const CacheWriteGeometry &) const = default;
+};
+
+using ComputeGeometry = std::variant<LinearGeometry, NormalizationGeometry, ActivationGeometry, AdditionGeometry, AttentionGeometry, CacheWriteGeometry>;
 
 struct RowInput {
     double rows;
@@ -69,8 +78,14 @@ struct ComputeOperation {
     std::string implementation;
     ComputeGeometry geometry;
 
-    Work describe(Phase phase, const ComputeInput & input) const;
+    std::vector<Work> describe(Phase phase, const ComputeInput & input) const;
     auto operator<=>(const ComputeOperation &) const = default;
+};
+
+struct ComputePart {
+    ComputeOperation operation;
+    std::optional<RowBinding> rows;
+    auto operator<=>(const ComputePart &) const = default;
 };
 
 } // namespace markov::trace_graph::planning

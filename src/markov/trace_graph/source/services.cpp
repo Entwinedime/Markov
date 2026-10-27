@@ -10,12 +10,6 @@
 namespace markov::trace_graph::source {
 namespace {
 
-struct Envelope {
-    Time begin_ns, end_ns;
-    RecordRef record;
-    std::vector<Index> work;
-};
-
 struct Lane {
     std::vector<Index> work;
     std::vector<Index> device_spans;
@@ -54,14 +48,6 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
             const auto & call = observations.work_observations[id];
             return std::tuple(call.begin_ns, call.end_ns, call.record.file, call.record.position);
         });
-        std::vector<Envelope> envelopes;
-        for (const auto id : lane.work) {
-            const auto & call = observations.work_observations[id];
-            if (!envelopes.empty() && envelopes.back().record.file == call.record.file && envelopes.back().record.position == call.record.position) {
-                envelopes.back().work.push_back(id);
-            }
-            else envelopes.push_back({ call.begin_ns, call.end_ns, call.record, { id } });
-        }
         std::ranges::sort(lane.submissions, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
 
         // Sweep the CPU envelopes once; nesting and shared primitive probes
@@ -71,20 +57,19 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
         for (const auto submission : lane.submissions) {
             const auto & link = observations.dependencies[submission];
             const auto time = observations.points[link.before].time_ns;
-            while (next < envelopes.size() && envelopes[next].begin_ns <= time) {
-                active.emplace(envelopes[next].end_ns, next);
+            while (next < lane.work.size() && observations.work_observations[lane.work[next]].begin_ns <= time) {
+                const auto id = lane.work[next];
+                active.emplace(observations.work_observations[id].end_ns, id);
                 ++next;
             }
             while (!active.empty() && active.begin()->first <= time) active.erase(active.begin());
             if (active.empty()) continue;
-            if (active.size() != 1 || envelopes[active.begin()->second].work.size() != 1) {
-                for (const auto & [end, envelope] : active) {
-                    for (const auto work : envelopes[envelope].work) result[work].issue = ServiceIssue::SharedProbe;
-                }
+            const auto work = active.begin()->second;
+            if (active.size() != 1 || observations.work_descriptions[observations.work_observations[work].description].observed.size() != 1) {
+                for (const auto & [end, id] : active) result[id].issue = ServiceIssue::SharedProbe;
                 continue;
             }
 
-            const auto work = envelopes[active.begin()->second].work.front();
             const auto & port = observations.points[link.after];
             const auto & candidates = lanes[port.resource].device_spans;
             const auto at = std::ranges::lower_bound(candidates, port.time_ns, {}, [&](Index id) { return observations.spans[id].begin_ns; });

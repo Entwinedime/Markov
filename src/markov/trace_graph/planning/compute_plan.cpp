@@ -1,42 +1,48 @@
 #include "markov/trace_graph/planning/compute_plan.hpp"
 
-#include <compare>
+#include <algorithm>
+#include <functional>
 #include <map>
-#include <optional>
 #include <utility>
 
 namespace markov::trace_graph::planning {
 
 ComputePlan project_compute(const source::SourceContext & source, source::Index frame, const AttentionInput & variables) {
-    struct Binding {
-        source::Index description;
-        std::optional<RowBinding> rows;
-        auto operator<=>(const Binding &) const = default;
-    };
     const auto & observed = source.observations();
     const auto phase = observed.compute_frames[frame].phase;
     ComputePlan result;
-    std::map<Binding, std::size_t> bindings;
+    std::map<source::Index, std::vector<std::size_t>> bindings;
     for (const auto operation : source.frame_operations(frame)) {
         const auto & call = observed.work_observations[operation];
-        const auto & definition = observed.work_descriptions[call.description].operation;
-        const bool attention = std::holds_alternative<AttentionGeometry>(definition.geometry);
-        if (!attention && !call.rows) {
+        const auto & description = observed.work_descriptions[call.description];
+        if (std::ranges::any_of(description.recipe,
+                                [](const ComputePart & part) { return !std::holds_alternative<AttentionGeometry>(part.operation.geometry) && !part.rows; })) {
             result.missing_row_bindings.push_back(operation);
             continue;
         }
-        const Binding key{ call.description, call.rows };
-        const auto [binding, inserted] = bindings.try_emplace(key, result.work.size());
+        const auto [binding, inserted] = bindings.try_emplace(call.description);
         if (inserted) {
-            ComputeInput input = variables;
-            if (!attention) {
-                const auto items = call.rows->basis == RowBasis::QueryTokens ? variables.query_tokens : variables.batch_size;
-                input = RowInput{ items * call.rows->rows_per_item };
+            for (const auto & part : description.recipe) {
+                ComputeInput input = variables;
+                if (!std::holds_alternative<AttentionGeometry>(part.operation.geometry)) {
+                    const auto items = part.rows->basis == RowBasis::QueryTokens ? variables.query_tokens : variables.batch_size;
+                    input = RowInput{ items * part.rows->rows_per_item };
+                }
+                for (auto & work : part.operation.describe(phase, input)) {
+                    binding->second.push_back(result.work.size());
+                    result.work.push_back(std::move(work));
+                }
             }
-            result.work.push_back(definition.describe(phase, input));
         }
-        const auto unchanged = result.work[binding->second] == observed.work_descriptions[call.description].observed;
-        result.operations.push_back({ binding->second, operation, unchanged });
+        const auto & original = description.observed;
+        const auto unchanged =
+            std::ranges::equal(original, binding->second, {}, std::identity{}, [&](std::size_t id) -> const Work & { return result.work[id]; });
+        const auto begin = result.operations.size();
+        for (const auto work : binding->second) {
+            const auto id = result.operations.size();
+            result.operations.push_back({ work, operation, unchanged });
+            if (id != begin) result.dependencies.push_back({ id - 1, id, graph::EdgeKind::DataDependency });
+        }
     }
     return result;
 }

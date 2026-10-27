@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/trace_graph/graph/graph.hpp"
 #include "markov/trace_graph/planning/compute.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
@@ -19,6 +20,9 @@ struct ComputeInstance {
 struct ComputePlan {
     std::vector<Work> work;
     std::vector<ComputeInstance> operations;
+
+    // Local operation indices; enclosing frame/layer dependencies are separate.
+    std::vector<graph::Edge> dependencies;
     std::vector<source::Index> missing_row_bindings;
 };
 

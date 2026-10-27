@@ -23,12 +23,18 @@ std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const Com
     const auto & args = event.args;
     if (event.name == "runtime.phase.attention") {
         if (!descriptor->operation || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) return {};
-        return {
-            ComputeObservation{
-                               *descriptor->operation,
-                               AttentionInput{ frame.query_tokens->front(), descriptor->tensor_query_tokens, frame.sequence_tokens.front(), 1, descriptor->page_tokens },
-                               std::nullopt }
-        };
+        std::vector<ComputeObservation> result;
+        for (const auto & write : descriptor->cache_writes) {
+            const auto rows =
+                descriptor->tensor_query_tokens == frame.query_tokens->front() ? std::optional(RowBinding{ RowBasis::QueryTokens, 1 }) : std::nullopt;
+            result.push_back({ write, RowInput{ descriptor->tensor_query_tokens }, rows });
+        }
+        result.push_back({
+            *descriptor->operation,
+            AttentionInput{ frame.query_tokens->front(), descriptor->tensor_query_tokens, frame.sequence_tokens.front(), 1, descriptor->page_tokens },
+            std::nullopt
+        });
+        return result;
     }
 
     const auto input = args.at("input_shape").get<std::vector<double>>();
@@ -45,7 +51,8 @@ std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const Com
         const auto weight_stride = args.at("weight_stride").get<std::vector<double>>();
         if (weight.size() != 2 || weight_stride.size() != 2) return {};
 
-        auto implementation = "torch.linear:" + args.at("input_dtype").get<std::string>();
+        const auto method = event.name == "runtime.phase.logits_projection" ? "torch.matmul.logits:" : "torch.linear:";
+        auto implementation = method + args.at("input_dtype").get<std::string>();
         implementation += args.at("bias_shape").is_null() ? ":no_bias" : ":bias";
         if (args.at("input_dtype") != args.at("weight_dtype")) implementation += ":weight=" + args.at("weight_dtype").get<std::string>();
         return {
@@ -87,6 +94,35 @@ std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const Com
         };
     }
     return {};
+}
+
+std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::json & args) {
+    if (!args.at("save_kv_cache").get<bool>() || !args.at("key_present").get<bool>() || !args.at("value_present").get<bool>())
+        return std::vector<ComputeOperation>{};
+
+    const auto & cache = args.at("cache_write");
+    if (cache.at("pool_implementation") != "sglang.srt.hardware_backend.npu.memory_pool_npu.NPUMHATokenToKVPool" || cache.at("use_fia") != true
+        || cache.at("cache_dtype") != "torch.bfloat16" || cache.at("key_dtype") != cache.at("cache_dtype") || cache.at("value_dtype") != cache.at("cache_dtype")
+        || cache.at("location_dtype") != "torch.int64")
+        return std::nullopt;
+
+    std::vector<ComputeOperation> result;
+    for (const auto * tensor : { "key", "value" }) {
+        const auto shape = cache.at(std::string(tensor) + "_shape").get<std::vector<double>>();
+        const auto stride = cache.at(std::string(tensor) + "_stride").get<std::vector<double>>();
+        if (shape.size() != 3 || stride.size() != 3 || stride[2] != 1 || stride[1] != shape[2] || shape[0] != args.at("query_shape").at(0).get<double>()
+            || cache.at("locations").get<double>() != shape[0])
+            return std::nullopt;
+
+        result.push_back({
+            "ascend.scatter_nd_update_",
+            CacheWriteGeometry{ "attention." + std::string(tensor) + "_write",
+                               shape[1] * shape[2],
+                               stride[0],
+                               "ascend.slice.bfloat16.aicore", "ascend.scatter_nd_update.bfloat16.aicore" }
+        });
+    }
+    return result;
 }
 
 } // namespace
@@ -148,11 +184,9 @@ const AttentionDescriptor & ProbeReader::attention_descriptor(const ProbeEvent &
     const auto key = std::tuple(event.process, phase, args.at("descriptor_id").get<Index>());
     if (!args.at("descriptor_present").get<bool>()) return attention_descriptors_.at(key);
 
-    AttentionDescriptor result{ std::nullopt,
-                                args.at("page_size_tokens").get<double>(),
-                                args.at("query_shape").at(0).get<double>(),
-                                std::nullopt,
-                                args.at("layer_id").get<Index>() };
+    AttentionDescriptor result{
+        std::nullopt, {}, args.at("page_size_tokens").get<double>(), args.at("query_shape").at(0).get<double>(), std::nullopt, args.at("layer_id").get<Index>()
+    };
     if (!args.at("extend_query_lengths").is_null()) result.query_tokens = args.at("extend_query_lengths").get<std::vector<double>>();
     const auto d = args.at("query_key_head_dim").get<double>(), v = args.at("value_head_dim").get<double>();
     // These are the eager Ascend FIA branches; graph, sliding-window and
@@ -164,12 +198,14 @@ const AttentionDescriptor & ProbeReader::attention_descriptor(const ProbeEvent &
         && args.at("attention_cp_size").get<int>() == 1 && args.at("batch_size").get<int>() == 1 && args.at("value_heads") == args.at("key_heads")
         && (phase == Phase::Prefill ? ((d == v && (d == 128 || d == 192 || d == 256)) || (d == 192 && v == 128))
                                     : args.at("fia_torch_ops_dispatch") == "batch_invariant");
-    if (supported) {
+    const auto writes = attention_writes(args);
+    if (supported && writes) {
         const auto implementation = phase == Phase::Prefill ? "ascend.fia.TND" : "ascend.fia.batch_invariant.BSND";
         result.operation = ComputeOperation{
             implementation,
             AttentionGeometry{ args.at("query_heads").get<double>(), args.at("key_heads").get<double>(), d, v, args.at("causal_attention").get<bool>() }
         };
+        result.cache_writes = *writes;
     }
     const auto [stored, inserted] = attention_descriptors_.try_emplace(key, result);
     if (!inserted && stored->second != result) throw std::runtime_error("Attention descriptor ID is redefined with different work");
@@ -210,11 +246,14 @@ void ProbeReader::observe_compute(const ProbeEvent & event) {
     if (descriptor) layer = descriptor->layer;
     else if (args.contains("model_layer_index") && !args.at("model_layer_index").is_null()) layer = args.at("model_layer_index").get<Index>();
     else if (args.contains("layer_id") && !args.at("layer_id").is_null()) layer = args.at("layer_id").get<Index>();
-    for (auto & primitive : observed) {
-        auto work = primitive.operation.describe(frame.phase, primitive.input);
-        const auto description = output_.describe_work(std::move(work), std::move(primitive.operation));
-        output_.work_observations.push_back({ description, resource, event.begin_ns, event.end_ns, event.record, context->second, layer, primitive.rows });
+    std::vector<trace_graph::planning::Work> work;
+    std::vector<trace_graph::planning::ComputePart> recipe;
+    for (auto & part : observed) {
+        for (auto & operation : part.operation.describe(frame.phase, part.input)) work.push_back(std::move(operation));
+        recipe.push_back({ std::move(part.operation), part.rows });
     }
+    const auto description = output_.describe_work(std::move(work), std::move(recipe));
+    output_.work_observations.push_back({ description, resource, event.begin_ns, event.end_ns, event.record, context->second, layer });
 }
 
 } // namespace markov::adapters::sglang

@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::source {
@@ -95,13 +96,13 @@ struct ObservedWork {
     RecordRef record;
     Index frame;
     std::optional<Index> layer;
-    std::optional<planning::RowBinding> rows;
 };
 
 struct WorkDescription {
-    // Derive the captured query once; keep geometry for later variable binding.
-    planning::Work observed;
-    planning::ComputeOperation operation;
+    // One native call owns an ordered recipe, not one cost per CPU envelope.
+    // Keep its captured expansion and fixed geometry for later variable binding.
+    std::vector<planning::Work> observed;
+    std::vector<planning::ComputePart> recipe;
 };
 
 struct ComputeFrame {
@@ -139,7 +140,7 @@ public:
     void normalize_resources();
     void resolve_flows();
     void release_intake_indexes();
-    Index describe_work(planning::Work work, planning::ComputeOperation operation);
+    Index describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe);
     void observe_tokens(const std::string & request, TokenRole role, planning::PrefixId path, RecordRef record);
 
     std::vector<std::string> names;
@@ -163,7 +164,7 @@ private:
     std::unordered_map<std::string, Index> name_ids_;
     std::unordered_map<std::string, Index> resource_ids_;
     std::unordered_map<Index, Index> resource_aliases_;
-    std::map<planning::Work, Index> work_ids_;
+    std::map<std::pair<std::vector<planning::ComputePart>, std::vector<planning::Work>>, Index> work_ids_;
 };
 
 } // namespace markov::trace_graph::source

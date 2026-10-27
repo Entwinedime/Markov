@@ -12,6 +12,7 @@ namespace markov::adapters::sglang {
 
 struct AttentionDescriptor {
     std::optional<trace_graph::planning::ComputeOperation> operation;
+    std::vector<trace_graph::planning::ComputeOperation> cache_writes;
     double page_tokens;
     double tensor_query_tokens;
     std::optional<std::vector<double>> query_tokens;

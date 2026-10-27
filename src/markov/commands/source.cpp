@@ -107,7 +107,7 @@ Json device_service_summary(const source::SourceContext & source) {
 
 Json source_compute_alignment(const source::SourceContext & source) {
     const auto & captured = source.observations();
-    std::size_t unavailable = 0, missing_bindings = 0, compared = 0, mismatched = 0;
+    std::size_t unavailable = 0, missing_bindings = 0, compared = 0, mismatched = 0, recipes = 0, dependencies = 0;
     auto examples = Json::array();
     for (source::Index frame_id = 0; frame_id < captured.compute_frames.size(); ++frame_id) {
         const auto & frame = captured.compute_frames[frame_id];
@@ -118,26 +118,39 @@ Json source_compute_alignment(const source::SourceContext & source) {
         const auto query = frame.query_tokens->front();
         const auto plan = planning::project_compute(source, frame_id, { query, query, frame.sequence_tokens.front(), 1, *frame.page_tokens });
         missing_bindings += plan.missing_row_bindings.size();
-        for (const auto & operation : plan.operations) {
-            ++compared;
-            const auto & observed = captured.work_observations[operation.source_operation];
-            if (plan.work[operation.work] == captured.work_descriptions[observed.description].observed) continue;
+        dependencies += plan.dependencies.size();
+        std::size_t at = 0;
+        for (const auto operation : source.frame_operations(frame_id)) {
+            ++recipes;
+            const auto & call = captured.work_observations[operation];
+            const auto & original = captured.work_descriptions[call.description].observed;
+            const auto begin = at;
+            while (at < plan.operations.size() && plan.operations[at].source_operation == operation) ++at;
+            const auto actual_count = at - begin;
+            bool different = false;
+            for (std::size_t i = 0; i < std::max(actual_count, original.size()); ++i) {
+                ++compared;
+                if (i < actual_count && i < original.size() && plan.work[plan.operations[begin + i].work] == original[i]) continue;
 
-            ++mismatched;
+                ++mismatched;
+                different = true;
+            }
             constexpr std::size_t example_limit = 5;
-            if (examples.size() < example_limit)
+            if (different && examples.size() < example_limit)
                 examples.push_back({
-                    {            "frame",                   frame_id },
-                    { "source_operation", operation.source_operation }
+                    {            "frame",  frame_id },
+                    { "source_operation", operation }
                 });
         }
     }
     return {
-        {   "compared_operations",            compared },
-        { "mismatched_operations",          mismatched },
-        {  "missing_row_bindings",    missing_bindings },
-        {    "unavailable_frames",         unavailable },
-        {              "examples", std::move(examples) }
+        {       "compared_operations",            compared },
+        {          "compared_recipes",             recipes },
+        { "intra_recipe_dependencies",        dependencies },
+        {     "mismatched_operations",          mismatched },
+        {      "missing_row_bindings",    missing_bindings },
+        {        "unavailable_frames",         unavailable },
+        {                  "examples", std::move(examples) }
     };
 }
 
@@ -312,7 +325,13 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
     auto work_descriptions = Json::array();
     std::vector<std::size_t> work_counts(captured.work_descriptions.size(), 0);
     for (const auto & work : captured.work_observations) ++work_counts[work.description];
-    for (const auto & description : captured.work_descriptions) { work_descriptions.push_back(work_json(description.observed)); }
+    for (const auto & description : captured.work_descriptions) {
+        auto operations = Json::array();
+        for (const auto & work : description.observed) operations.push_back(work_json(work));
+        work_descriptions.push_back({
+            { "operations", std::move(operations) }
+        });
+    }
     auto frames = Json::array();
     for (const auto & frame : captured.compute_frames) {
         auto requests = Json::array();
@@ -368,7 +387,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {                    "graph_edges",                                                                                        built_source.graph.edges().size() },
         {       "native_observation_roles",                                                                                                      source.native_roles },
         {              "work_descriptions",                                                                                             std::move(work_descriptions) },
-        {         "work_description_scope",                                                                                       "observed_compute_geometry_subset" },
+        {         "work_description_scope",                                                                                         "observed_compute_recipe_subset" },
         {                 "compute_frames",                                                                                                        std::move(frames) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
         {         "device_service_binding",                                                                                          device_service_summary(context) },
@@ -376,6 +395,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
         {        "work_observation_counts",                                                                                                   std::move(work_counts) },
         {              "work_observations",                                                                                        captured.work_observations.size() },
+        {          "work_observation_unit",                                                                                              "native_compute_probe_call" },
         {                  "record_counts",                                                                                                          captured.counts },
         {               "dependency_audit",                                                                                              std::move(dependency_audit) },
         {       "unresolved_flow_examples",                                                                                                 std::move(flow_examples) },
@@ -409,7 +429,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         // Its capacity follows the input; it is not a target hardware setting.
         planning::Cache prefixes({ corpus_pages, 0, 1, std::nullopt });
         std::map<planning::Work, WorkCounts> projected_work;
-        std::size_t missing_projection_inputs = 0, missing_row_bindings = 0;
+        std::size_t missing_projection_inputs = 0, missing_row_bindings = 0, dependencies = 0;
         auto requests = Json::array();
         for (const auto & request : observations.requests) {
             const auto found = observations.request_tokens.find(request.identity);
@@ -447,6 +467,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
                 const auto plan = planning::project_compute(source.context, frame_id, { query, query, context, 1, static_cast<double>(size) });
                 missing_row_bindings += plan.missing_row_bindings.size();
+                dependencies += plan.dependencies.size();
                 for (const auto & operation : plan.operations) {
                     auto & counts = projected_work[plan.work[operation.work]];
                     ++counts.instances;
@@ -485,13 +506,14 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             });
         }
         targets.push_back({
-            {          "page_size_tokens",                                        size },
-            {                  "requests",                         std::move(requests) },
-            {       "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
-            {    "projected_compute_work",                          std::move(compute) },
-            { "missing_projection_inputs",                   missing_projection_inputs },
-            {      "missing_row_bindings",                        missing_row_bindings },
-            {            "radix_segments",                         std::move(segments) }
+            {               "page_size_tokens",                                        size },
+            {                       "requests",                         std::move(requests) },
+            {            "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
+            {         "projected_compute_work",                          std::move(compute) },
+            { "projected_compute_dependencies",                                dependencies },
+            {      "missing_projection_inputs",                   missing_projection_inputs },
+            {           "missing_row_bindings",                        missing_row_bindings },
+            {                 "radix_segments",                         std::move(segments) }
         });
     }
     auto barriers = Json::array();
