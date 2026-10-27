@@ -1,5 +1,7 @@
 #include "markov/adapters/sglang/observations.hpp"
 
+#include <array>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -7,13 +9,100 @@
 namespace markov::adapters::sglang {
 
 using namespace trace_graph::source;
+namespace {
+
+using namespace trace_graph::planning;
+
+struct ComputeObservation {
+    ComputeOperation operation;
+    ComputeInput input;
+    std::optional<RowBinding> rows;
+};
+
+std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const ComputeFrame & frame, const AttentionDescriptor * descriptor) {
+    const auto & args = event.args;
+    if (event.name == "runtime.phase.attention") {
+        if (!descriptor->operation || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) return {};
+        return {
+            ComputeObservation{
+                               *descriptor->operation,
+                               AttentionInput{ frame.query_tokens->front(), descriptor->tensor_query_tokens, frame.sequence_tokens.front(), 1, descriptor->page_tokens },
+                               std::nullopt }
+        };
+    }
+
+    const auto input = args.at("input_shape").get<std::vector<double>>();
+    const auto stride = args.at("input_stride").get<std::vector<double>>();
+    if (input.size() != 2 || stride.size() != 2) return {};
+    const std::array<double, 2> input_stride{ stride[0], stride[1] };
+    const auto basis =
+        event.name == "runtime.phase.logits_projection" && args.at("last_token_projection").get<bool>() ? RowBasis::BatchSize : RowBasis::QueryTokens;
+    std::optional<RowBinding> rows;
+    if (args.contains("rows_per_token") && !args.at("rows_per_token").is_null()) rows = RowBinding{ basis, args.at("rows_per_token").get<double>() };
+
+    if (event.name == "runtime.phase.linear" || event.name == "runtime.phase.logits_projection") {
+        const auto weight = args.at("weight_shape").get<std::vector<double>>();
+        const auto weight_stride = args.at("weight_stride").get<std::vector<double>>();
+        if (weight.size() != 2 || weight_stride.size() != 2) return {};
+
+        auto implementation = "torch.linear:" + args.at("input_dtype").get<std::string>();
+        implementation += args.at("bias_shape").is_null() ? ":no_bias" : ":bias";
+        if (args.at("input_dtype") != args.at("weight_dtype")) implementation += ":weight=" + args.at("weight_dtype").get<std::string>();
+        return {
+            ComputeObservation{ { std::move(implementation), LinearGeometry{ weight[0], input[1], input_stride, { weight_stride[0], weight_stride[1] } } },
+                               RowInput{ input[0] },
+                               rows }
+        };
+    }
+    if (event.name == "runtime.phase.normalization") {
+        const auto implementation = "torch_npu.rms_norm:" + args.at("input_dtype").get<std::string>() + ":weight=" + args.at("weight_dtype").get<std::string>();
+        const ComputeObservation normalization{
+            { implementation, NormalizationGeometry{ input[1], args.at("epsilon").get<double>(), input_stride } },
+            RowInput{ input[0] },
+            rows
+        };
+        if (args.at("implementation") == "torch_npu.npu_rms_norm") return { normalization };
+        if (args.at("implementation") != "torch_npu.npu_add_rms_norm" || !args.at("split_residual_norm").get<bool>()
+            || args.at("post_residual_addition").get<bool>() || args.at("input_shape") != args.at("residual_shape")
+            || args.at("input_stride") != args.at("residual_stride") || args.at("input_dtype") != args.at("residual_dtype") || stride[0] != input[1]
+            || stride[1] != 1)
+            return {};
+
+        // The installed batch-invariant backend executes an add then RMSNorm.
+        // Preserve both operations; the enclosing probe wall is not charged.
+        return {
+            ComputeObservation{ { "aten.add:" + args.at("input_dtype").get<std::string>(), AdditionGeometry{ input[1], input_stride } },
+                               RowInput{ input[0] },
+                               rows },
+            normalization
+        };
+    }
+    if (event.name == "runtime.phase.gated_activation" && args.at("implementation") == "torch_npu.npu_swiglu") {
+        const auto output = args.at("output_shape").get<std::vector<double>>();
+        if (output.size() != 2) return {};
+        return {
+            ComputeObservation{ { "torch_npu.swiglu:" + args.at("input_dtype").get<std::string>(), ActivationGeometry{ output[1], input_stride } },
+                               RowInput{ input[0] },
+                               rows }
+        };
+    }
+    return {};
+}
+
+} // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
-    if (name == "hicache_cache_extend_input_start") forward_phases_[process] = "prefill";
-    if (name == "runtime.hicache.decode_allocation") forward_phases_[process] = "decode";
+    if (name == "runtime.hicache.decode_allocation") {
+        ComputeFrame frame{ trace_graph::planning::Phase::Decode,      {},          args.at("sequence_lens_tokens").get<std::vector<double>>(), {},
+                            args.at("page_size_tokens").get<double>(), event.record };
+        for (const auto & identity : args.at("request_ids")) frame.requests.push_back(output_.name(identity.get<std::string>()));
+        frame.query_tokens = std::vector<double>(frame.requests.size(), args.at("token_per_req").get<double>());
+        forward_frames_[process] = output_.compute_frames.size();
+        output_.compute_frames.push_back(std::move(frame));
+    }
 
     if (name == "hicache_cache_lookup_input_end" || name == "hicache_cache_finished_req_lifecycle_commit_end") {
         const auto path = token_path(args.at("token_dictionary"));
@@ -23,16 +112,21 @@ void ProbeReader::observe(const ProbeEvent & event) {
     if (name == "hicache_cache_extend_input_start") {
         const auto & dictionaries = args.at("token_dictionaries");
         const auto & identities = args.at("request_ids");
+        ComputeFrame frame{ trace_graph::planning::Phase::Prefill, {}, {}, std::nullopt, std::nullopt, event.record };
         for (std::size_t i = 0; i < identities.size(); ++i) {
             const auto path = token_path(dictionaries.at(i));
-            output_.observe_tokens(identities[i].get<std::string>(), TokenRole::Prompt, path, event.record);
+            const auto request = identities[i].get<std::string>();
+            output_.observe_tokens(request, TokenRole::Prompt, path, event.record);
+            frame.requests.push_back(output_.name(request));
+            frame.sequence_tokens.push_back(output_.token_paths.length(path));
         }
+        forward_frames_[process] = output_.compute_frames.size();
+        output_.compute_frames.push_back(std::move(frame));
     }
 
-    if (name == "runtime.phase.linear") {
-        const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
-        observe_linear(args, process, resource, event.begin_ns, event.end_ns, event.record);
-    }
+    if (name == "runtime.phase.linear" || name == "runtime.phase.logits_projection" || name == "runtime.phase.normalization"
+        || name == "runtime.phase.gated_activation" || name == "runtime.phase.attention")
+        observe_compute(event);
 }
 
 trace_graph::planning::PrefixId ProbeReader::token_path(const nlohmann::json & dictionary) {
@@ -48,45 +142,79 @@ trace_graph::planning::PrefixId ProbeReader::token_path(const nlohmann::json & d
     return path;
 }
 
-void ProbeReader::observe_linear(const nlohmann::json & args, const std::string & process, Index resource, Time begin, Time end, RecordRef record) {
+const AttentionDescriptor & ProbeReader::attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase) {
+    using namespace trace_graph::planning;
+    const auto & args = event.args;
+    const auto key = std::tuple(event.process, phase, args.at("descriptor_id").get<Index>());
+    if (!args.at("descriptor_present").get<bool>()) return attention_descriptors_.at(key);
+
+    AttentionDescriptor result{ std::nullopt,
+                                args.at("page_size_tokens").get<double>(),
+                                args.at("query_shape").at(0).get<double>(),
+                                std::nullopt,
+                                args.at("layer_id").get<Index>() };
+    if (!args.at("extend_query_lengths").is_null()) result.query_tokens = args.at("extend_query_lengths").get<std::vector<double>>();
+    const auto d = args.at("query_key_head_dim").get<double>(), v = args.at("value_head_dim").get<double>();
+    // These are the eager Ascend FIA branches; graph, sliding-window and
+    // grouped requests need their own execution and work descriptions.
+    const bool supported =
+        args.at("use_fia").get<bool>() && !args.at("use_mla").get<bool>() && args.at("use_alibi") != true && !args.at("graph_mode").get<bool>()
+        && !args.at("cross_attention").get<bool>() && !args.at("encoder_present").get<bool>() && !args.at("sinks_present").get<bool>()
+        && !args.at("mode_is_target_verify").get<bool>() && !args.at("mode_is_draft_extend").get<bool>() && args.at("sliding_window_size").get<int>() == -1
+        && args.at("attention_cp_size").get<int>() == 1 && args.at("batch_size").get<int>() == 1 && args.at("value_heads") == args.at("key_heads")
+        && (phase == Phase::Prefill ? ((d == v && (d == 128 || d == 192 || d == 256)) || (d == 192 && v == 128))
+                                    : args.at("fia_torch_ops_dispatch") == "batch_invariant");
+    if (supported) {
+        const auto implementation = phase == Phase::Prefill ? "ascend.fia.TND" : "ascend.fia.batch_invariant.BSND";
+        result.operation = ComputeOperation{
+            implementation,
+            AttentionGeometry{ args.at("query_heads").get<double>(), args.at("key_heads").get<double>(), d, v, args.at("causal_attention").get<bool>() }
+        };
+    }
+    const auto [stored, inserted] = attention_descriptors_.try_emplace(key, result);
+    if (!inserted && stored->second != result) throw std::runtime_error("Attention descriptor ID is redefined with different work");
+    return stored->second;
+}
+
+void ProbeReader::observe_compute(const ProbeEvent & event) {
+    const auto & args = event.args;
     if (args.at("status") != "returned") return;
-    const auto phase = forward_phases_.find(process);
-    if (phase == forward_phases_.end()) {
-        ++output_.counts["linear_work_without_forward_context"];
+    const auto context = forward_frames_.find(event.process);
+    if (context == forward_frames_.end()) {
+        ++output_.counts["compute_work_without_forward_context"];
         return;
+    }
+    auto & frame = output_.compute_frames[context->second];
+    const AttentionDescriptor * descriptor = nullptr;
+    if (event.name == "runtime.phase.attention") {
+        const auto phase = frame.phase == trace_graph::planning::Phase::Prefill ? "prefill" : "decode";
+        if (args.at("phase") != phase) {
+            ++output_.counts["compute_frame_phase_mismatch"];
+            return;
+        }
+        descriptor = &attention_descriptor(event, frame.phase);
+        frame.page_tokens = descriptor->page_tokens;
+        if (frame.phase == trace_graph::planning::Phase::Prefill) frame.query_tokens = descriptor->query_tokens;
     }
 
-    const auto input = args.at("input_shape").get<std::vector<double>>();
-    const auto weight = args.at("weight_shape").get<std::vector<double>>();
-    const auto input_stride = args.at("input_stride").get<std::vector<double>>();
-    const auto weight_stride = args.at("weight_stride").get<std::vector<double>>();
-    if (input.size() != 2 || weight.size() != 2 || input_stride.size() != 2 || weight_stride.size() != 2) {
-        ++output_.counts["linear_work_unsupported_geometry"];
+    auto observed = read_compute(event, frame, descriptor);
+    if (observed.empty()) {
+        ++output_.counts["compute_work_unsupported_geometry." + event.name];
         return;
     }
-    const auto m = input[0], k = input[1], n = weight[0];
-    auto implementation = "torch.linear:" + args.at("input_dtype").get<std::string>();
-    implementation += args.at("bias_shape").is_null() ? ":no_bias" : ":bias";
-    if (args.at("input_dtype") != args.at("weight_dtype")) implementation += ":weight=" + args.at("weight_dtype").get<std::string>();
 
     // The probe supplies geometry and provenance, not a device measurement.
     // The independent provider estimates service; this CPU envelope is not charged.
-    trace_graph::planning::Work work{
-        { phase->second + ".linear", std::move(implementation), "device_service" },
-        { { "m", m },
-         { "n", n },
-         { "k", k },
-         { "multiply_accumulate_count", m * n * k },
-         { "input_elements", m * k },
-         { "output_elements", m * n },
-         { "weight_elements", n * k },
-         { "input_stride_0", input_stride[0] },
-         { "input_stride_1", input_stride[1] },
-         { "weight_stride_0", weight_stride[0] },
-         { "weight_stride_1", weight_stride[1] } }
-    };
-    const auto description = output_.describe_work(std::move(work));
-    output_.work_observations.push_back({ description, resource, begin, end, record });
+    const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    std::optional<Index> layer;
+    if (descriptor) layer = descriptor->layer;
+    else if (args.contains("model_layer_index") && !args.at("model_layer_index").is_null()) layer = args.at("model_layer_index").get<Index>();
+    else if (args.contains("layer_id") && !args.at("layer_id").is_null()) layer = args.at("layer_id").get<Index>();
+    for (auto & primitive : observed) {
+        auto work = primitive.operation.describe(frame.phase, primitive.input);
+        const auto description = output_.describe_work(std::move(work), std::move(primitive.operation));
+        output_.work_observations.push_back({ description, resource, event.begin_ns, event.end_ns, event.record, context->second, layer, primitive.rows });
+    }
 }
 
 } // namespace markov::adapters::sglang

@@ -45,9 +45,9 @@ void Observations::normalize_resources() {
     for (auto & work : work_observations) work.resource = canonical_resource(work.resource);
 }
 
-Index Observations::describe_work(planning::Work work) {
+Index Observations::describe_work(planning::Work work, planning::ComputeOperation operation) {
     const auto [entry, inserted] = work_ids_.try_emplace(work, work_descriptions.size());
-    if (inserted) work_descriptions.push_back(std::move(work));
+    if (inserted) work_descriptions.push_back({ std::move(work), std::move(operation) });
     return entry->second;
 }
 

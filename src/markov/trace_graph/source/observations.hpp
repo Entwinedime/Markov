@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/trace_graph/planning/compute.hpp"
 #include "markov/trace_graph/planning/token_paths.hpp"
 #include "markov/trace_graph/planning/work.hpp"
 
@@ -92,6 +93,24 @@ struct ObservedWork {
     Time begin_ns;
     Time end_ns;
     RecordRef record;
+    Index frame;
+    std::optional<Index> layer;
+    std::optional<planning::RowBinding> rows;
+};
+
+struct WorkDescription {
+    // Derive the captured query once; keep geometry for later variable binding.
+    planning::Work observed;
+    planning::ComputeOperation operation;
+};
+
+struct ComputeFrame {
+    planning::Phase phase;
+    std::vector<Index> requests; // Indices into Observations::names, not requests.
+    std::vector<double> sequence_tokens;
+    std::optional<std::vector<double>> query_tokens;
+    std::optional<double> page_tokens;
+    RecordRef record;
 };
 
 enum class TokenRole { LookupInput, Prompt, Committed };
@@ -120,7 +139,7 @@ public:
     void normalize_resources();
     void resolve_flows();
     void release_intake_indexes();
-    Index describe_work(planning::Work work);
+    Index describe_work(planning::Work work, planning::ComputeOperation operation);
     void observe_tokens(const std::string & request, TokenRole role, planning::PrefixId path, RecordRef record);
 
     std::vector<std::string> names;
@@ -133,8 +152,9 @@ public:
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;
     std::vector<WorkloadBarrier> workload_barriers;
-    std::vector<planning::Work> work_descriptions;
+    std::vector<WorkDescription> work_descriptions;
     std::vector<ObservedWork> work_observations;
+    std::vector<ComputeFrame> compute_frames;
     planning::TokenPaths token_paths;
     std::map<std::string, RequestTokens> request_tokens;
     std::map<std::string, std::size_t> counts;

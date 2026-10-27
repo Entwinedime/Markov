@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,6 +21,7 @@ struct RadixNode {
 struct RadixMatch {
     RadixId node;
     std::size_t pages;
+    std::optional<RadixId> split_child = std::nullopt;
 };
 
 // Keys are complete page-end token prefixes from one shared TokenPaths index.
@@ -28,7 +30,10 @@ class RadixTree {
 public:
     // Matching may split an existing segment at the query's common prefix.
     RadixMatch match(std::span<const PrefixId> pages);
-    RadixId insert(std::span<const PrefixId> pages);
+    // Insertion returns the leaf and the number of pages that already existed.
+    // A split child lets the cache owner divide residency and held references.
+    RadixMatch insert(std::span<const PrefixId> pages);
+    void erase_leaf(RadixId node);
     std::span<const RadixNode> nodes() const { return nodes_; }
 
 private:

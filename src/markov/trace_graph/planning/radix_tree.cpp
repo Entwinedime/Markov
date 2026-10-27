@@ -15,20 +15,21 @@ RadixMatch RadixTree::match(std::span<const PrefixId> pages) {
         const auto child = found->second;
         const auto & segment = nodes_[child].pages;
         const auto remaining = pages.subspan(matched);
-        const auto common = std::ranges::mismatch(segment, remaining).in1 - segment.begin();
+        const auto common = static_cast<std::size_t>(std::ranges::mismatch(segment, remaining).in1 - segment.begin());
+
         matched += common;
         node = child;
-        if (static_cast<std::size_t>(common) < segment.size()) {
+        if (common < segment.size()) {
             node = split(child, common);
-            break;
+            return { node, matched, child };
         }
     }
     return { node, matched };
 }
 
-RadixId RadixTree::insert(std::span<const PrefixId> pages) {
+RadixMatch RadixTree::insert(std::span<const PrefixId> pages) {
     const auto matched = match(pages);
-    if (matched.pages == pages.size()) return matched.node;
+    if (matched.pages == pages.size()) return matched;
 
     const auto id = nodes_.size();
     nodes_.push_back({
@@ -37,8 +38,10 @@ RadixId RadixTree::insert(std::span<const PrefixId> pages) {
         {}
     });
     nodes_[matched.node].children.emplace(pages[matched.pages], id);
-    return id;
+    return { id, matched.pages, matched.split_child };
 }
+
+void RadixTree::erase_leaf(RadixId node) { nodes_[nodes_[node].parent].children.erase(nodes_[node].pages.front()); }
 
 RadixId RadixTree::split(RadixId child, std::size_t prefix_pages) {
     const auto parent = nodes_[child].parent;

@@ -1,7 +1,8 @@
 #include "markov/commands/source.hpp"
 
 #include "markov/adapters/source.hpp"
-#include "markov/trace_graph/planning/radix_tree.hpp"
+#include "markov/trace_graph/planning/cache.hpp"
+#include "markov/trace_graph/planning/compute_plan.hpp"
 #include "markov/trace_graph/source/build.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
@@ -20,6 +21,51 @@ namespace {
 using namespace trace_graph;
 using Clock = std::chrono::steady_clock;
 using Json = nlohmann::json;
+
+Json work_json(const planning::Work & work) {
+    return {
+        {      "operation",      work.kind.operation },
+        { "implementation", work.kind.implementation },
+        {   "timing_scope",   work.kind.timing_scope },
+        {       "features",            work.features }
+    };
+}
+
+Json source_compute_alignment(const source::SourceContext & source) {
+    const auto & captured = source.observations();
+    std::size_t unavailable = 0, missing_bindings = 0, compared = 0, mismatched = 0;
+    auto examples = Json::array();
+    for (source::Index frame_id = 0; frame_id < captured.compute_frames.size(); ++frame_id) {
+        const auto & frame = captured.compute_frames[frame_id];
+        if (!frame.query_tokens || frame.query_tokens->size() != 1 || frame.sequence_tokens.size() != 1 || !frame.page_tokens) {
+            ++unavailable;
+            continue;
+        }
+        const auto query = frame.query_tokens->front();
+        const auto plan = planning::project_compute(source, frame_id, { query, query, frame.sequence_tokens.front(), 1, *frame.page_tokens });
+        missing_bindings += plan.missing_row_bindings.size();
+        for (const auto & operation : plan.operations) {
+            ++compared;
+            const auto & observed = captured.work_observations[operation.source_operation];
+            if (plan.work[operation.work] == captured.work_descriptions[observed.description].observed) continue;
+
+            ++mismatched;
+            constexpr std::size_t example_limit = 5;
+            if (examples.size() < example_limit)
+                examples.push_back({
+                    {            "frame",                   frame_id },
+                    { "source_operation", operation.source_operation }
+                });
+        }
+    }
+    return {
+        {   "compared_operations",            compared },
+        { "mismatched_operations",          mismatched },
+        {  "missing_row_bindings",    missing_bindings },
+        {    "unavailable_frames",         unavailable },
+        {              "examples", std::move(examples) }
+    };
+}
 
 Json timing_alignment(const source::Observations & observations, const source::SourceGraph & source, const simulation::ExecutionResult & replay,
                       graph::Time origin) {
@@ -192,12 +238,17 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
     auto work_descriptions = Json::array();
     std::vector<std::size_t> work_counts(captured.work_descriptions.size(), 0);
     for (const auto & work : captured.work_observations) ++work_counts[work.description];
-    for (const auto & work : captured.work_descriptions) {
-        work_descriptions.push_back({
-            {      "operation",      work.kind.operation },
-            { "implementation", work.kind.implementation },
-            {   "timing_scope",   work.kind.timing_scope },
-            {       "features",            work.features }
+    for (const auto & description : captured.work_descriptions) { work_descriptions.push_back(work_json(description.observed)); }
+    auto frames = Json::array();
+    for (const auto & frame : captured.compute_frames) {
+        auto requests = Json::array();
+        for (const auto request : frame.requests) requests.push_back(captured.names[request]);
+        frames.push_back({
+            {           "phase", frame.phase == planning::Phase::Prefill ? "prefill" : "decode" },
+            {        "requests",                                            std::move(requests) },
+            { "sequence_tokens",                                          frame.sequence_tokens },
+            {    "query_tokens", frame.query_tokens ? Json(*frame.query_tokens) : Json(nullptr) },
+            {     "page_tokens",   frame.page_tokens ? Json(*frame.page_tokens) : Json(nullptr) }
         });
     }
     auto replay_report = replay_summary(captured, built_source, replay, context.origin_ns());
@@ -243,7 +294,9 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {                    "graph_edges",                                                                                        built_source.graph.edges().size() },
         {       "native_observation_roles",                                                                                                      source.native_roles },
         {              "work_descriptions",                                                                                             std::move(work_descriptions) },
-        {         "work_description_scope",                                                                                          "observed_linear_geometry_only" },
+        {         "work_description_scope",                                                                                       "observed_compute_geometry_subset" },
+        {                 "compute_frames",                                                                                                        std::move(frames) },
+        {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
         {                 "request_tokens",                                                                                          request_token_summary(captured) },
         {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
         {        "work_observation_counts",                                                                                                   std::move(work_counts) },
@@ -269,7 +322,16 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     const auto & paths = observations.token_paths;
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
-        planning::RadixTree prefixes;
+        std::size_t corpus_pages = 0;
+        for (const auto & [identity, tokens] : observations.request_tokens) {
+            if (tokens.committed) corpus_pages += paths.length(tokens.committed->path) / size;
+        }
+
+        // This diagnostic retains the complete corpus as one logical layer.
+        // Its capacity follows the input; it is not a target hardware setting.
+        planning::Cache prefixes({ corpus_pages, 0, 1, std::nullopt });
+        std::map<planning::Work, std::size_t> projected_work;
+        std::size_t missing_projection_inputs = 0, missing_row_bindings = 0;
         auto requests = Json::array();
         for (const auto & request : observations.requests) {
             const auto found = observations.request_tokens.find(request.identity);
@@ -286,7 +348,29 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             const auto lookup_pages = paths.pages(lookup_input, size);
             const auto committed_pages = paths.pages(committed, size);
             const auto prior_commit = prefixes.match(lookup_pages);
-            prefixes.insert(committed_pages);
+            const auto prior_pages = prefixes.page_count(prior_commit.device);
+            prefixes.pin_device(prior_commit.device);
+
+            const auto existing = prefixes.match(committed_pages);
+            const auto buffer = prefixes.reserve(planning::Tier::Device, committed_pages.size() - prefixes.page_count(existing.device)).value();
+            prefixes.commit_device(committed_pages, buffer);
+            prefixes.release(buffer);
+            prefixes.unpin_device(prior_commit.device);
+
+            const auto frames = source.context.request_frames(request.identity);
+            missing_projection_inputs += frames.empty();
+            for (const auto frame_id : frames) {
+                const auto & frame = observations.compute_frames[frame_id];
+                if (frame.requests.size() != 1 || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) {
+                    ++missing_projection_inputs;
+                    continue;
+                }
+                const auto query = frame.phase == planning::Phase::Prefill ? paths.length(prompt) - prior_pages * size : frame.query_tokens->front();
+                const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
+                const auto plan = planning::project_compute(source.context, frame_id, { query, query, context, 1, static_cast<double>(size) });
+                missing_row_bindings += plan.missing_row_bindings.size();
+                for (const auto & operation : plan.operations) ++projected_work[plan.work[operation.work]];
+            }
             requests.push_back({
                 {                        "request",                                  request.identity },
                 {                         "formal",                                    request.formal },
@@ -294,14 +378,20 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 {     "lookup_input_page_prefixes",                                      lookup_pages },
                 {        "committed_page_prefixes",                                   committed_pages },
                 {        "maximum_reusable_tokens",                        lookup_pages.size() * size },
-                {  "prior_committed_prefix_tokens",                         prior_commit.pages * size },
+                {  "prior_committed_prefix_tokens",                                prior_pages * size },
                 {         "minimum_prefill_tokens", paths.length(prompt) - lookup_pages.size() * size },
                 { "uncached_committed_tail_tokens",                    paths.length(committed) % size }
             });
         }
+        auto compute = Json::array();
+        for (const auto & [work, count] : projected_work) {
+            auto value = work_json(work);
+            value["instances"] = count;
+            compute.push_back(std::move(value));
+        }
         auto segments = Json::array();
-        for (std::size_t id = 1; id < prefixes.nodes().size(); ++id) {
-            const auto & node = prefixes.nodes()[id];
+        for (std::size_t id = 1; id < prefixes.tree().nodes().size(); ++id) {
+            const auto & node = prefixes.tree().nodes()[id];
             segments.push_back({
                 {       "node",                id },
                 {     "parent",       node.parent },
@@ -310,9 +400,13 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             });
         }
         targets.push_back({
-            { "page_size_tokens",                size },
-            {         "requests", std::move(requests) },
-            {   "radix_segments", std::move(segments) }
+            {          "page_size_tokens",                                        size },
+            {                  "requests",                         std::move(requests) },
+            {       "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
+            {    "projected_compute_work",                          std::move(compute) },
+            { "missing_projection_inputs",                   missing_projection_inputs },
+            {      "missing_row_bindings",                        missing_row_bindings },
+            {            "radix_segments",                         std::move(segments) }
         });
     }
     auto barriers = Json::array();
@@ -325,18 +419,19 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         });
 
     auto report = Json{
-        {                 "status",                                                "target_page_workload_compiled"                                   },
-        {               "manifest",                                                                                     source.manifest.path.string() },
-        {                  "scope",                                                                       "request_ancestry_and_target_page_geometry" },
-        {                "targets",                                                                                                std::move(targets) },
-        {      "workload_barriers",                                                                                               std::move(barriers) },
-        {    "source_preparations",                                                                                                                 1 },
-        {     "source_graph_nodes",                                                                       source.context.graph().graph.nodes().size() },
-        { "logical_token_prefixes",                                                                                                      paths.size() },
-        {       "target_dag_built",                                                                                                             false },
-        {        "costs_evaluated",                                                                                                             false },
+        {                 "status","target_page_workload_compiled"                                   },
+        {               "manifest",               source.manifest.path.string() },
+        {                  "scope", "request_ancestry_and_target_page_geometry" },
+        {                "targets",                          std::move(targets) },
+        {      "workload_barriers",                         std::move(barriers) },
+        {    "source_preparations",                                           1 },
+        {     "source_graph_nodes", source.context.graph().graph.nodes().size() },
+        { "logical_token_prefixes",                                paths.size() },
+        {       "target_dag_built",                                       false },
+        {        "costs_evaluated",                                       false },
         {          "qualification",
-         "Prior commits describe an unbounded prefix corpus, not a resident cache. Capacity, visibility and runtime branches are not evaluated here." }
+         "Unbounded corpus, unpadded compute subset only. Actual capacity, I/O visibility and runtime branches are not evaluated; this is not a target DAG or "
+         "E2E prediction."                                                     }
     };
     report["source_replay"] = source_report(source);
     return report;

@@ -1,0 +1,268 @@
+#include "markov/trace_graph/planning/cache.hpp"
+
+#include <algorithm>
+#include <functional>
+#include <queue>
+#include <stdexcept>
+#include <utility>
+
+namespace markov::trace_graph::planning {
+
+std::optional<CacheSlot> & Cache::slot(RadixId node, Tier tier) { return tier == Tier::Device ? nodes_[node].device : nodes_[node].host; }
+
+const std::optional<CacheSlot> & Cache::slot(RadixId node, Tier tier) const { return tier == Tier::Device ? nodes_[node].device : nodes_[node].host; }
+
+std::vector<RadixId> Cache::path(RadixId node) const {
+    std::vector<RadixId> result;
+    while (node != 0) {
+        result.push_back(node);
+        node = tree_.nodes()[node].parent;
+    }
+    std::ranges::reverse(result);
+    return result;
+}
+
+void Cache::apply_split(const RadixMatch & change) {
+    nodes_.resize(tree_.nodes().size());
+    if (!change.split_child) return;
+
+    const auto child = *change.split_child;
+    const auto prefix = tree_.nodes()[child].parent;
+    nodes_[prefix] = nodes_[child];
+    nodes_[prefix].host_refs = 0;
+    for (const auto tier : { Tier::Device, Tier::Host }) {
+        const auto & allocation = slot(prefix, tier);
+        if (allocation && allocation->producer) copies_.at(*allocation->producer).nodes.push_back(prefix);
+    }
+}
+
+void Cache::touch(const RadixMatch & change) {
+    const auto visited = path(change.node);
+    for (const auto id : visited) {
+        if (id == change.node && change.split_child) nodes_[*change.split_child].access_sequence = ++access_sequence_;
+        nodes_[id].access_sequence = ++access_sequence_;
+    }
+}
+
+CacheMatch Cache::match(std::span<const PrefixId> pages) {
+    const auto result = tree_.match(pages);
+    apply_split(result);
+    touch(result);
+
+    auto device = result.node, host = result.node;
+    while (device != 0 && !nodes_[device].device) device = tree_.nodes()[device].parent;
+    while (host != 0 && !nodes_[host].host) host = tree_.nodes()[host].parent;
+    return { result.node, device, host, result.pages };
+}
+
+std::size_t Cache::page_count(RadixId node) const {
+    std::size_t result = 0;
+    while (node != 0) {
+        result += tree_.nodes()[node].pages.size();
+        node = tree_.nodes()[node].parent;
+    }
+    return result;
+}
+
+std::size_t Cache::used_pages(Tier tier) const { return tier == Tier::Device ? used_device_pages_ : used_host_pages_; }
+
+std::size_t Cache::available_pages(Tier tier) const { return (tier == Tier::Device ? config_.device_pages : config_.host_pages) - used_pages(tier); }
+
+std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
+    const auto & allocation = slot(node, tier);
+    if (!allocation) return 0;
+    return allocation->producer ? copies_.at(*allocation->producer).published_layers : config_.layers;
+}
+
+bool Cache::take_pages(Tier tier, std::size_t pages) {
+    if (pages > available_pages(tier)) return false;
+    (tier == Tier::Device ? used_device_pages_ : used_host_pages_) += pages;
+    return true;
+}
+
+void Cache::return_pages(Tier tier, std::size_t pages) { (tier == Tier::Device ? used_device_pages_ : used_host_pages_) -= pages; }
+
+std::optional<BufferId> Cache::reserve(Tier tier, std::size_t pages) {
+    if (!take_pages(tier, pages)) return std::nullopt;
+
+    const auto id = next_identity_++;
+    buffers_.emplace(id, Buffer{ tier, pages });
+    return id;
+}
+
+RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer) {
+    const auto matched = match(pages);
+    auto & allocation = buffers_.at(buffer);
+    std::size_t needed = pages.size() - matched.pages;
+    for (const auto id : path(matched.node)) {
+        if (!nodes_[id].device) needed += tree_.nodes()[id].pages.size();
+    }
+    if (allocation.tier != Tier::Device || allocation.pages < needed) throw std::runtime_error("Device commit exceeds its reserved buffer");
+
+    const auto inserted = tree_.insert(pages);
+    apply_split(inserted);
+    for (const auto id : path(inserted.node)) {
+        const bool present = nodes_[id].device.has_value();
+        if (!present) {
+            nodes_[id].device = CacheSlot{};
+            allocation.pages -= tree_.nodes()[id].pages.size();
+        }
+        const bool new_suffix = id == inserted.node && inserted.pages < pages.size();
+        if (config_.backup_after_hits && (present || new_suffix)) ++nodes_[id].hits;
+    }
+    touch(inserted);
+    return inserted.node;
+}
+
+RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
+    const auto matched = match(pages);
+    auto & allocation = buffers_.at(buffer);
+    const auto needed = pages.size() - matched.pages;
+    if (allocation.tier != Tier::Host || allocation.pages < needed) throw std::runtime_error("Host commit exceeds its reserved buffer");
+
+    const auto inserted = tree_.insert(pages);
+    apply_split(inserted);
+    if (needed != 0) {
+        nodes_[inserted.node].host = CacheSlot{};
+        allocation.pages -= needed;
+    }
+    touch(inserted);
+    return inserted.node;
+}
+
+void Cache::release(BufferId buffer) {
+    const auto allocation = buffers_.at(buffer);
+    return_pages(allocation.tier, allocation.pages);
+    buffers_.erase(buffer);
+}
+
+void Cache::pin_device(RadixId node) {
+    while (node != 0) {
+        ++nodes_[node].device_refs;
+        node = tree_.nodes()[node].parent;
+    }
+}
+
+void Cache::unpin_device(RadixId node) {
+    while (node != 0) {
+        --nodes_[node].device_refs;
+        node = tree_.nodes()[node].parent;
+    }
+}
+
+void Cache::pin_host(RadixId node) { ++nodes_[node].host_refs; }
+void Cache::unpin_host(RadixId node) { --nodes_[node].host_refs; }
+
+bool Cache::backup_required(RadixId node) const {
+    const auto & state = nodes_[node];
+    const auto parent = tree_.nodes()[node].parent;
+    return config_.backup_after_hits && state.device && !state.host && state.hits >= *config_.backup_after_hits && (parent == 0 || nodes_[parent].host);
+}
+
+CopyStart Cache::begin_backup(RadixId node) {
+    const auto pages = tree_.nodes()[node].pages.size();
+    if (nodes_[node].host) return { CopyStatus::AlreadyPresent, std::nullopt, 0 };
+    if (ready_layers(node, Tier::Device) != config_.layers) return { CopyStatus::SourceNotReady, std::nullopt, pages };
+    if (!take_pages(Tier::Host, pages)) return { CopyStatus::InsufficientCapacity, std::nullopt, pages };
+
+    const auto id = next_identity_++;
+    copies_.emplace(id, Copy{ CopyKind::Backup, node, { node }, 0 });
+    nodes_[node].host = CacheSlot{ id };
+    pin_device(node);
+    return { CopyStatus::Started, id, pages };
+}
+
+CopyStart Cache::begin_load(RadixId node) {
+    if (nodes_[node].device) return { CopyStatus::AlreadyPresent, std::nullopt, 0 };
+
+    std::vector<RadixId> loading;
+    std::size_t pages = 0;
+    bool sources_ready = true;
+    for (auto id = node; id != 0 && !nodes_[id].device; id = tree_.nodes()[id].parent) {
+        sources_ready &= ready_layers(id, Tier::Host) == config_.layers;
+        loading.push_back(id);
+        pages += tree_.nodes()[id].pages.size();
+    }
+    if (!sources_ready) return { CopyStatus::SourceNotReady, std::nullopt, pages };
+    if (!take_pages(Tier::Device, pages)) return { CopyStatus::InsufficientCapacity, std::nullopt, pages };
+
+    const auto id = next_identity_++;
+    copies_.emplace(id, Copy{ CopyKind::Load, node, loading, 0 });
+    for (const auto destination : loading) nodes_[destination].device = CacheSlot{ id };
+    pin_host(node);
+    pin_device(node);
+    return { CopyStatus::Started, id, pages };
+}
+
+void Cache::publish_layer(TransferId transfer) { ++copies_.at(transfer).published_layers; }
+void Cache::publish_all(TransferId transfer) { copies_.at(transfer).published_layers = config_.layers; }
+
+void Cache::acknowledge(TransferId transfer) {
+    const auto & copy = copies_.at(transfer);
+    if (copy.published_layers != config_.layers) throw std::runtime_error("Cannot acknowledge an unpublished cache transfer");
+
+    const auto destination = copy.kind == CopyKind::Backup ? Tier::Host : Tier::Device;
+    for (const auto node : copy.nodes) slot(node, destination)->producer.reset();
+    unpin_device(copy.source_pin);
+    if (copy.kind == CopyKind::Load) unpin_host(copy.source_pin);
+    copies_.erase(transfer);
+}
+
+std::vector<RadixId> Cache::eviction_order(Tier tier) const {
+    using Candidate = std::pair<std::size_t, RadixId>;
+    std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> eligible;
+    std::vector<std::size_t> resident_children(nodes_.size(), 0);
+    for (RadixId id = 1; id < nodes_.size(); ++id) {
+        if (slot(id, tier)) ++resident_children[tree_.nodes()[id].parent];
+    }
+    const auto selectable = [&](RadixId id) {
+        const auto & state = nodes_[id];
+        return id != 0 && slot(id, tier) && state.device_refs == 0 && (tier == Tier::Device || (!state.device && state.host_refs == 0));
+    };
+    for (RadixId id = 1; id < nodes_.size(); ++id) {
+        if (resident_children[id] == 0 && selectable(id)) eligible.emplace(nodes_[id].access_sequence, id);
+    }
+
+    std::vector<RadixId> result;
+    while (!eligible.empty()) {
+        const auto id = eligible.top().second;
+        eligible.pop();
+        result.push_back(id);
+
+        const auto parent = tree_.nodes()[id].parent;
+        if (--resident_children[parent] == 0 && selectable(parent)) eligible.emplace(nodes_[parent].access_sequence, parent);
+    }
+    return result;
+}
+
+void Cache::detach_empty_leaf(RadixId node) {
+    if (!nodes_[node].device && !nodes_[node].host && tree_.nodes()[node].children.empty()) tree_.erase_leaf(node);
+}
+
+Eviction Cache::evict_device(RadixId node) {
+    if (node == 0 || !nodes_[node].device || nodes_[node].device_refs != 0) return Eviction::Blocked;
+    for (const auto & [key, child] : tree_.nodes()[node].children) {
+        if (nodes_[child].device) return Eviction::Blocked;
+    }
+    if (!nodes_[node].host && !config_.backup_after_hits) return Eviction::BackupRequired;
+    if (!nodes_[node].host && !tree_.nodes()[node].children.empty()) return Eviction::Blocked;
+
+    return_pages(Tier::Device, tree_.nodes()[node].pages.size());
+    nodes_[node].device.reset();
+    detach_empty_leaf(node);
+    return Eviction::Removed;
+}
+
+bool Cache::evict_host(RadixId node) {
+    if (!nodes_[node].host || nodes_[node].device || nodes_[node].device_refs != 0 || nodes_[node].host_refs != 0) return false;
+    for (const auto & [key, child] : tree_.nodes()[node].children) {
+        if (nodes_[child].host) return false;
+    }
+
+    return_pages(Tier::Host, tree_.nodes()[node].pages.size());
+    nodes_[node].host.reset();
+    detach_empty_leaf(node);
+    return true;
+}
+
+} // namespace markov::trace_graph::planning

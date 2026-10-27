@@ -3,10 +3,21 @@
 #include "markov/adapters/probes.hpp"
 
 #include <map>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace markov::adapters::sglang {
+
+struct AttentionDescriptor {
+    std::optional<trace_graph::planning::ComputeOperation> operation;
+    double page_tokens;
+    double tensor_query_tokens;
+    std::optional<std::vector<double>> query_tokens;
+    trace_graph::source::Index layer;
+    auto operator<=>(const AttentionDescriptor &) const = default;
+};
 
 // Probe observations stay at the framework boundary. They describe work and
 // state; their enclosing wall duration is not a second CPU service charge.
@@ -17,10 +28,11 @@ public:
 private:
     void observe(const ProbeEvent & event) override;
     trace_graph::planning::PrefixId token_path(const nlohmann::json & dictionary);
-    void observe_linear(const nlohmann::json & args, const std::string & process, trace_graph::source::Index resource, trace_graph::source::Time begin,
-                        trace_graph::source::Time end, trace_graph::source::RecordRef record);
-    std::map<std::string, std::string> forward_phases_;
+    void observe_compute(const ProbeEvent & event);
+    const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
+    std::map<std::string, trace_graph::source::Index> forward_frames_;
     std::map<std::string, trace_graph::planning::PrefixId> token_descriptors_;
+    std::map<std::tuple<std::string, trace_graph::planning::Phase, trace_graph::source::Index>, AttentionDescriptor> attention_descriptors_;
 };
 
 } // namespace markov::adapters::sglang

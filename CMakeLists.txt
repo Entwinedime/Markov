@@ -25,6 +25,9 @@ add_library(markov_source
     src/markov/trace_graph/source/context.cpp
     src/markov/trace_graph/planning/token_paths.cpp
     src/markov/trace_graph/planning/radix_tree.cpp
+    src/markov/trace_graph/planning/cache.cpp
+    src/markov/trace_graph/planning/compute.cpp
+    src/markov/trace_graph/planning/compute_plan.cpp
 )
 target_link_libraries(markov_source PUBLIC markov_graph nlohmann_json::nlohmann_json)
 target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)

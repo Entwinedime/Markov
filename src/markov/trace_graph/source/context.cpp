@@ -13,8 +13,22 @@ SourceContext::SourceContext(Observations && observations)
       origin_ns_(std::numeric_limits<Time>::max()) {
     for (const auto & node : graph_.node_origins) origin_ns_ = std::min(origin_ns_, node.begin_ns);
 
+    frame_operations_.resize(observations_.compute_frames.size());
+    for (Index id = 0; id < observations_.work_observations.size(); ++id) frame_operations_[observations_.work_observations[id].frame].push_back(id);
+    for (auto & operations : frame_operations_) {
+        std::ranges::stable_sort(operations, {}, [&](Index id) { return observations_.work_observations[id].begin_ns; });
+    }
+    for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
+        for (const auto request : observations_.compute_frames[frame].requests) request_frames_[observations_.names[request]].push_back(frame);
+    }
+
     // The context is read-only now; keep semantic tables, not parser interning.
     observations_.release_intake_indexes();
+}
+
+std::span<const Index> SourceContext::request_frames(std::string_view request) const {
+    const auto found = request_frames_.find(request);
+    return found == request_frames_.end() ? std::span<const Index>{} : found->second;
 }
 
 simulation::ExecutionResult SourceContext::replay() const {
