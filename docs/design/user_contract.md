@@ -58,6 +58,7 @@ radix_segments 按目标页大小表示压缩前缀树，匹配时会在共同�
 不将源屏障的等待时间写入目标工作；观察用 checkpoint 不参与目标调度。
 corpus_device_pages 统计完整保留此前前缀所需的逻辑页，不是目标硬件的峰值分配量；请求临时页与在途 I/O 不在此假设内。
 projected_compute_work 只列已解释计算原语的工作量及次数，假设 query 没有 padding；缺绑定信息单独报告。
+其中 source_work_unchanged 统计完整工作描述与源一致的实例，source_service_bound 进一步要求存在无歧义的源设备服务；两者都是迁移候选，不是已完成成本绑定。
 source_compute_projection 用源变量核对这些原语是否保持原工作描述，不评价成本或完整 DAG。
 它不运行目标配置，也不验证目标 DAG 相似度或性能；源回放使用观测成本，不能当作目标预测精度。
 
