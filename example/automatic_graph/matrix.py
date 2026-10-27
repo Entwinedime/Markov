@@ -164,8 +164,9 @@ class MatrixInputs:
         for prefill, decode in ((4, 2), (2, 4)):
             self.job(f"qwen3-pd{prefill}-{decode}", "qwen3-8b", pd=((prefill, 1, 1), (decode, 1, 1)), groups=["J", "K"])
         self.job("qwen3-moe-pd-pp3", "qwen3-moe", pd=((2, 3, 2), (2, 1, 2)), groups=["H", "I", "J", "K"])
-        for tp in (1, 2):
-            self.job(f"llama31-tp{tp}", "llama31-8b", tp=tp, groups=["B", "F", "H"])
+        for prefix, model in (("llama31", "llama31-8b"), ("glm4", "glm4-9b-chat")):
+            for tp in (1, 2):
+                self.job(f"{prefix}-tp{tp}", model, tp=tp, groups=["B", "F", "H"])
 
         # Native OLMoE TP/PP failures remain in the first investigation report.
         self.job("olmoe-ep1", "olmoe", groups=["B", "I"])
@@ -277,7 +278,7 @@ class MatrixInputs:
                 for length in (2047, 2048, 2049, 2305)
             ],
         }
-        for identifier in ("qwen3-tp2", "llama31-tp1", "llama31-tp2"):
+        for identifier in ("qwen3-tp2", "llama31-tp1", "llama31-tp2", "glm4-tp1", "glm4-tp2"):
             self.tasks[identifier]["workloads"].append(copy.deepcopy(long_context))
         for tokens in (16384, 262144):
             configuration = copy.deepcopy(self.tasks["qwen3-tp2"]["configurations"][1])
