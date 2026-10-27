@@ -1,9 +1,6 @@
 --- a/setup.py
 +++ b/setup.py
-@@ -42,11 +42,12 @@
- KTRANSFORMERS_BUILD_XPU = torch.xpu.is_available()
- 
- 
+@@ -45,5 +45,6 @@
 -try:
 -    import torch_npu
 -    KTRANSFORMERS_BUILD_NPU = torch_npu.npu.is_available()
@@ -15,15 +12,9 @@
 +
 +torch_npu = SimpleNamespace(__version__=version("torch-npu"))
 +KTRANSFORMERS_BUILD_NPU = True
- 
- # 检测 DEV_BACKEND 环境变量
- dev_backend = os.environ.get("DEV_BACKEND", "").lower()
 --- a/csrc/balance_serve/CMakeLists.txt
 +++ b/csrc/balance_serve/CMakeLists.txt
-@@ -10,11 +10,9 @@
-     
-     link_directories(${TORCH_INSTALL_PREFIX}/../torch.libs)
-     # find torch_npu
+@@ -13,5 +13,3 @@
 -    execute_process(
 -            COMMAND python -c "import torch; import torch_npu; print(torch_npu.__path__[0])"
 -            OUTPUT_VARIABLE TORCH_NPU_PATH
@@ -32,6 +23,3 @@
 +    set(TORCH_NPU_PATH "$ENV{TORCH_NPU_PATH}")
 +    # Use one ACL header family instead of mixing SDK and wheel declarations.
 +    include_directories(BEFORE "${TORCH_NPU_PATH}/include/third_party/acl/inc")
-     message(STATUS "Found PTA at: ${TORCH_NPU_PATH}")
-     find_library(PTA_LIBRARY torch_npu PATH "${TORCH_NPU_PATH}/lib")
- endif()
