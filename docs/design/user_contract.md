@@ -1,6 +1,28 @@
 # 用户输入与正式流程
 
-本文定义用户输入、准备行为和结果合同；命令仅在实际交付后写入操作说明。
+本文定义用户输入、准备行为和结果合同；下方操作说明仅列已实现入口，完整预测合同仍作为后续接入边界。
+
+## 输入预览和采集检查
+
+```bash
+scripts/markov.sh plan --request configs/prediction.json
+docker build -t markov-modeling:ubuntu24.04 -f docker/modeling/Dockerfile .
+scripts/build.sh Release
+scripts/run.sh modeling -- build/modeling/Release/markov_core inspect-manifest /path/to/profile_manifest.json
+```
+
+plan 读取请求、核对 workload/manifest/模型包的声明路径并列出已知准备动作，不构图、启动设备或创建结果目录。
+输出 not_evaluated 列出尚未分析的源语义、目标工作和成本覆盖，不能据此认定模型可用。
+manifest 检查只读取 manifest 和文件元数据；输出 inputs_accessible 不代表通道内容、源 DAG 或正常性能已通过。
+
+请求路径以声明它的文件目录为起点。base 二选一：manifest 复用真实来源，configuration 声明需要采集的配置。
+每个 target 只有 name 和 configuration；name 用于定位结果，不作为结构或成本特征。
+deployment 包含 platform、framework、runtime、model、dtype、tensor_parallel；工作配置由相应适配器解释。
+performance.models 可省略，表示独立模型尚未选定；execution 必须给 output，jobs 默认为 1，memory_limit_gib 可显式声明。
+示例在 configs 中，不预置本机模型路径、设备编号、评分文件或实验身份。
+
+采集文件可以相对 manifest 所在目录声明；完整采集移动后，原 run_dir 内的绝对引用按同一采集的相对位置解析。
+这不扫描目录、猜测相似文件或自动兼容历史字段。采集外的独立绝对来源仍使用其明确路径。
 
 ## 用户提供什么
 
