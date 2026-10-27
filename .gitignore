@@ -40,3 +40,6 @@ kernel_meta/
 cpu_trace*.json
 raw_parsed_*.json
 output_graph.json
+
+# Local reference implementation; preserved in Git history
+/deprecated/
