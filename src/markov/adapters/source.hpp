@@ -4,6 +4,7 @@
 #include "markov/trace_graph/source/manifest.hpp"
 
 #include <cstddef>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -21,6 +22,12 @@ struct PreparedSource {
     double build_sec;
 };
 
+struct PageWorkRequest {
+    trace_graph::source::ProfileManifest manifest;
+    std::vector<std::size_t> page_sizes_tokens;
+};
+
 PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest);
+PageWorkRequest read_page_work_request(const std::filesystem::path & path);
 
 } // namespace markov::adapters

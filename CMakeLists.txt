@@ -11,7 +11,7 @@ find_package(nlohmann_json REQUIRED)
 
 add_library(markov_graph
     src/markov/trace_graph/graph/graph.cpp
-    src/markov/trace_graph/simulation/replay.cpp
+    src/markov/trace_graph/simulation/execution.cpp
 )
 target_include_directories(markov_graph PUBLIC src)
 target_compile_options(markov_graph PRIVATE -Wall -Wextra -Wpedantic)
@@ -23,6 +23,8 @@ add_library(markov_source
     src/markov/trace_graph/source/clients.cpp
     src/markov/trace_graph/source/build.cpp
     src/markov/trace_graph/source/context.cpp
+    src/markov/trace_graph/planning/token_paths.cpp
+    src/markov/trace_graph/planning/radix_tree.cpp
 )
 target_link_libraries(markov_source PUBLIC markov_graph nlohmann_json::nlohmann_json)
 target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)
@@ -32,6 +34,7 @@ target_include_directories(markov_cost PUBLIC src)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
+    src/markov/adapters/probes.cpp
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp
     src/markov/adapters/ascend/causality.cpp

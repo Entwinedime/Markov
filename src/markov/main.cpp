@@ -22,6 +22,7 @@ namespace {
 void usage(std::ostream & stream) {
     stream << "usage: markov_core inspect-manifest <profile_manifest.json> [report.json]\n"
               "       markov_core source <profile_manifest.json> [report.json]\n"
+              "       markov_core page-work <page_work_request.json> [report.json]\n"
               "       markov_core costs <cost_queries.json> [report.json]\n";
 }
 
@@ -85,7 +86,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string_view command(argv[1]);
-    if (command != "inspect-manifest" && command != "source" && command != "costs") {
+    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work") {
         usage(std::cerr);
         return 2;
     }
@@ -102,12 +103,15 @@ int main(int argc, char ** argv) {
             result = markov::commands::cost_report(queries, selected);
         }
         else {
-            const auto manifest = markov::trace_graph::source::inspect_manifest(argv[2]);
+            const auto page_request = command == "page-work" ? std::optional(markov::adapters::read_page_work_request(argv[2])) : std::nullopt;
+            const auto manifest = page_request ? page_request->manifest : markov::trace_graph::source::inspect_manifest(argv[2]);
             std::vector<std::filesystem::path> inputs{ manifest.path };
+            if (page_request) inputs.push_back(std::filesystem::absolute(argv[2]).lexically_normal());
             if (manifest.capture_origin_manifest) inputs.push_back(*manifest.capture_origin_manifest);
             for (const auto & file : manifest.files) inputs.push_back(file.path);
             prepare_output(output, inputs);
-            result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
+            if (page_request) result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest), page_request->page_sizes_tokens);
+            else result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
         }
         if (output) write_report(result, *output);
         else std::cout << result.dump(2) << '\n';

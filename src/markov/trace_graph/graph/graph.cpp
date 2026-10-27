@@ -14,11 +14,14 @@ NodeId Graph::append(Node node) {
 
 void Graph::connect(NodeId from, NodeId to, EdgeKind kind) { edges_.push_back({ from, to, kind }); }
 
-void Graph::finalize() {
-    std::ranges::sort(edges_, [](const Edge & a, const Edge & b) { return std::tie(a.from, a.to, a.kind) < std::tie(b.from, b.to, b.kind); });
-    const auto duplicates = std::ranges::unique(edges_, [](const Edge & a, const Edge & b) { return a.from == b.from && a.to == b.to && a.kind == b.kind; });
-    edges_.erase(duplicates.begin(), duplicates.end());
+void canonicalize_edges(std::vector<Edge> & edges) {
+    std::ranges::sort(edges, [](const Edge & a, const Edge & b) { return std::tie(a.from, a.to, a.kind) < std::tie(b.from, b.to, b.kind); });
+    const auto duplicates = std::ranges::unique(edges, [](const Edge & a, const Edge & b) { return a.from == b.from && a.to == b.to && a.kind == b.kind; });
+    edges.erase(duplicates.begin(), duplicates.end());
+}
 
+void Graph::finalize() {
+    canonicalize_edges(edges_);
     offsets_.assign(nodes_.size() + 1, 0);
     incoming_.assign(nodes_.size(), 0);
     for (const auto & edge : edges_) {

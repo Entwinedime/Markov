@@ -25,6 +25,8 @@ struct Edge {
     EdgeKind kind;
 };
 
+void canonicalize_edges(std::vector<Edge> & edges);
+
 // Concrete execution costs and resources only; source clocks and provenance
 // stay outside the core graph. Finalize before reading indexed dependencies.
 class Graph {

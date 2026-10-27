@@ -7,8 +7,14 @@
 
 namespace markov::trace_graph::source {
 
-// The client report belongs to the selected base capture, not target truth.
-// Keep preparation requests and formal membership in their original order.
-std::vector<RequestWindow> read_client_requests(const std::filesystem::path & path);
+struct ClientProgram {
+    std::vector<RequestWindow> requests;
+    std::vector<WorkloadBarrier> barriers;
+    std::size_t record_count;
+};
+
+// Keep declared control semantics, not observed barrier durations. Diagnostic
+// checkpoints are instrumentation, never target scheduling or cache assertions.
+ClientProgram read_client_program(const std::filesystem::path & path, Index file);
 
 } // namespace markov::trace_graph::source

@@ -17,12 +17,14 @@ SourceContext::SourceContext(Observations && observations)
     observations_.release_intake_indexes();
 }
 
-simulation::ReplayResult SourceContext::replay() const {
+simulation::ExecutionResult SourceContext::replay() const {
     std::vector<Time> available(graph_.graph.nodes().size(), 0);
     for (Index i = 0; i < available.size(); ++i) {
         if (graph_.graph.incoming_counts()[i] == 0) available[i] = graph_.node_origins[i].begin_ns - origin_ns_;
     }
-    return simulation::replay(graph_.graph, available);
+    simulation::Execution execution(graph_.graph, available);
+    execution.run();
+    return execution.take_result();
 }
 
 } // namespace markov::trace_graph::source

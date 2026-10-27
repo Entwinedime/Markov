@@ -1,11 +1,13 @@
 #pragma once
 
+#include "markov/trace_graph/planning/token_paths.hpp"
 #include "markov/trace_graph/planning/work.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -75,12 +77,34 @@ struct RequestWindow {
     std::optional<Index> sent = std::nullopt;
 };
 
+enum class BarrierKind { DrainHiCache };
+
+struct WorkloadBarrier {
+    // The control occurs before this request index; size() means after the last.
+    Index before_request;
+    BarrierKind kind;
+    RecordRef record;
+};
+
 struct ObservedWork {
     Index description;
     Index resource;
     Time begin_ns;
     Time end_ns;
     RecordRef record;
+};
+
+enum class TokenRole { LookupInput, Prompt, Committed };
+
+struct TokenObservation {
+    planning::PrefixId path;
+    RecordRef record;
+};
+
+struct RequestTokens {
+    std::optional<TokenObservation> lookup_input;
+    std::optional<TokenObservation> prompt;
+    std::optional<TokenObservation> committed;
 };
 
 // Source-only observations. No target policy, regression or mutable execution
@@ -97,6 +121,7 @@ public:
     void resolve_flows();
     void release_intake_indexes();
     Index describe_work(planning::Work work);
+    void observe_tokens(const std::string & request, TokenRole role, planning::PrefixId path, RecordRef record);
 
     std::vector<std::string> names;
     std::vector<Resource> resources;
@@ -107,8 +132,11 @@ public:
     std::map<std::string, std::size_t> flow_audit;
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;
+    std::vector<WorkloadBarrier> workload_barriers;
     std::vector<planning::Work> work_descriptions;
     std::vector<ObservedWork> work_observations;
+    planning::TokenPaths token_paths;
+    std::map<std::string, RequestTokens> request_tokens;
     std::map<std::string, std::size_t> counts;
 
 private:

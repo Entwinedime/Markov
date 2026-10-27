@@ -1,6 +1,6 @@
 #pragma once
 
-#include "markov/trace_graph/simulation/replay.hpp"
+#include "markov/trace_graph/simulation/execution.hpp"
 #include "markov/trace_graph/source/build.hpp"
 #include "markov/trace_graph/source/observations.hpp"
 
@@ -19,7 +19,7 @@ public:
     const Observations & observations() const { return observations_; }
     const SourceGraph & graph() const { return graph_; }
     Time origin_ns() const { return origin_ns_; }
-    simulation::ReplayResult replay() const;
+    simulation::ExecutionResult replay() const;
 
 private:
     Observations observations_;

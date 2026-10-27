@@ -51,6 +51,13 @@ Index Observations::describe_work(planning::Work work) {
     return entry->second;
 }
 
+void Observations::observe_tokens(const std::string & request, TokenRole role, planning::PrefixId path, RecordRef record) {
+    auto & observed = request_tokens[request];
+    auto & destination = role == TokenRole::LookupInput ? observed.lookup_input : role == TokenRole::Prompt ? observed.prompt : observed.committed;
+    if (destination && destination->path != path) throw std::runtime_error("Source ranks disagree about request token ancestry: " + request);
+    if (!destination) destination = TokenObservation{ path, record };
+}
+
 void Observations::resolve_flows() {
     struct FlowPair {
         const ObservedFlow * start = nullptr;
