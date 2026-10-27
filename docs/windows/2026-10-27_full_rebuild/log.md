@@ -135,3 +135,7 @@ B 先实现有界流式读取与适配，再形成共享 DAG/回放；资源搜�
 **环境与限制：** KTransformers 依赖镜像已构建，原生构建先后因 zlib 缺失与 ACL 头文件混用失败，修正仅在镜像内应用；完整构建仍在执行。
 核实 BuildKit 未落实 CLI 的资源限额后，仅对已确认属于本任务的构建 cgroup 设置并读回 16 GiB/2 CPU 上界，未操作他人资源。
 目标生成、条件执行、完整 HTTP、跨框架来源与 60/186 格均未完成；源查询可用不代表精度通过。
+
+**本批后续结果：** 6716ea8 与说明 afa0fd9 已推送并核对。KTransformers 完整镜像构建成功，Torch/torch-npu/cpuinfer_ext/sched_ext 无设备导入通过。
+无设备 local_chat 入口因设备探测转入 CUDA 扩展而未通过，不能授予推理资格；BLAS 默认线程数收紧为 2。
+上游 NPU loader 支持 safetensors，现有 Llama-2-7b-hf 是可核对的模型候选，不将缺历史 GGUF 当作无资产的结论。
