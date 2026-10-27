@@ -60,6 +60,8 @@ corpus_device_pages 统计完整保留此前前缀所需的逻辑页，不是目
 projected_compute_work 只列已解释计算原语的工作量及次数，假设 query 没有 padding；缺绑定信息单独报告。
 其中 source_work_unchanged 统计完整工作描述与源一致的实例，source_service_bound 进一步要求存在无歧义的源设备服务；两者都是迁移候选，不是已完成成本绑定。
 source_compute_projection 用源变量核对这些原语是否保持原工作描述，不评价成本或完整 DAG。
+源报告的 work_observations 计一次原生计算 probe 调用，work_descriptions 中每项的 operations 列出该配方展开的操作；操作数与调用数分别统计。
+projected_compute_dependencies 只计配方内部的数据依赖，尚不包含调用之间、跨层及 I/O 发布依赖，不能当作完整目标图的边数。
 它不运行目标配置，也不验证目标 DAG 相似度或性能；源回放使用观测成本，不能当作目标预测精度。
 
 ## 统一任务入口的职责
