@@ -84,7 +84,83 @@ class RequestCacheCall(NativeCall):
         return None
 
 
-class PageAllocationCall(NativeCall):
+class PoolAllocationCall(NativeCall):
+    def __init__(self, values: Any, original: Any, pool: Any, inputs: dict[str, dict[int, str]]) -> None:
+        super().__init__(values.recording, values, original.__qualname__, original, inputs)
+        self.pool = pool
+        self.before_count = len(pool.free_pages)
+
+    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
+        self.input_ports = self.values.port_values({"free_pages": self.pool.free_pages})
+
+        # The allocation boundary owns pool geometry; prior release parameters stay in their caller.
+        self.values.bind_shape(self.pool.free_pages, (self.values.shapes.symbol("free_pages_before"),))
+        return (self.pool.free_pages,), ()
+
+    def allocation_views(self, pages: int) -> TensorViewObservation:
+        metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        metadata["entrypoint"] = "kv_allocate"
+        metadata["call_family"] = "kv_allocate"
+        metadata["parameters"] = {"allocated_pages": pages, "free_pages_before": self.before_count}
+        metadata["bindings"] = {"page_size": self.pool.page_size, "need_sort": int(self.pool.need_sort)}
+        metadata["guards"] = [
+            {"condition": ["le", 0, "allocated_pages"], "expected": True},
+            {"condition": ["le", "allocated_pages", "free_pages_before"], "expected": True},
+            {"condition": ["eq", "page_size", self.pool.page_size], "expected": True},
+            {"condition": "need_sort", "expected": self.pool.need_sort},
+        ]
+        metadata["derived_parameters"] = [
+            {"name": "free_pages_after", "expression": ["add", "free_pages_before", ["mul", -1, "allocated_pages"]]}
+        ]
+        metadata["state_effects"] = {"free_pages": {"before": "free_pages_before", "after": "free_pages_after"}}
+
+        symbols = self.values.shapes
+        tail = [(self.pool.free_pages, (symbols.symbol("free_pages_after"),))]
+        return TensorViewObservation(self.values, tail, start=symbols.symbol("allocated_pages"))
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> str | None:
+        metadata["parameters"]["free_pages_after"] = len(self.pool.free_pages)
+        metadata["ports"] = {
+            "inputs": self.input_ports,
+            "outputs": self.values.port_values({"kv_locations": result, "free_pages": self.pool.free_pages}),
+        }
+        return None
+
+    def outputs(self, result: Any) -> Any:
+        return result, self.pool.free_pages
+
+
+class TokenAllocationCall(PoolAllocationCall):
+    def __init__(self, values: Any, original: Any, pool: Any) -> None:
+        super().__init__(values, original, pool, {})
+
+    def invoke(self, pool: Any, need_size: int) -> Any:
+        with self.values.metadata():
+
+            # The non-paged serving path calls alloc directly, with tokens as its unit.
+            pages = need_size // self.pool.page_size
+            views = self.allocation_views(pages)
+            allocated = TensorViewObservation(
+                self.values,
+                [(self.pool.free_pages, (self.values.shapes.symbol("allocated_pages"),))],
+                index=slice(None, pages),
+            )
+
+        with allocated, views:
+            return super().invoke(pool, need_size)
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> str | None:
+
+        # Downstream batch work consumes tokens, not the allocator's local page-count symbol.
+        self.values.bind_shape(result, (self.values.shapes.symbol("M"),))
+        return super().completed(args, kwargs, result, metadata)
+
+
+class PageAllocationCall(PoolAllocationCall):
 
     # NPUPagedTokenToKVPoolAllocator.alloc_extend dispatches at this native page-count boundary.
     parallel_page_limit = 200
@@ -94,19 +170,19 @@ class PageAllocationCall(NativeCall):
         if not decode:
             inputs.update({name: {0: "B"} for name in ("prefix_lens", "prefix_lens_cpu")})
 
-        super().__init__(values.recording, values, original.__qualname__, original, inputs)
-        self.pool = pool
+        super().__init__(values, original, pool, inputs)
         self.decode = decode
-        self.before_count = len(pool.free_pages)
 
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
-        self.input_ports = self.values.port_values(
-            {
-                "free_pages": self.pool.free_pages,
-                "sequence_lengths": arguments["seq_lens"],
-                "sequence_lengths_cpu": arguments["seq_lens_cpu"],
-                "last_locations": arguments["last_loc"],
-            }
+        resources = super().resources(arguments)
+        self.input_ports.update(
+            self.values.port_values(
+                {
+                    "sequence_lengths": arguments["seq_lens"],
+                    "sequence_lengths_cpu": arguments["seq_lens_cpu"],
+                    "last_locations": arguments["last_loc"],
+                }
+            )
         )
         if not self.decode:
             self.input_ports.update(
@@ -115,8 +191,7 @@ class PageAllocationCall(NativeCall):
                 )
             )
 
-        self.values.bind_shape(self.pool.free_pages, (self.values.shapes.symbol("free_pages_before"),))
-        return (self.pool.free_pages,), ()
+        return resources
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         import torch
@@ -137,17 +212,8 @@ class PageAllocationCall(NativeCall):
                 )
             )
 
+            views = self.allocation_views(pages)
             metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
-            metadata["entrypoint"] = "kv_allocate"
-            metadata["call_family"] = "kv_allocate"
-            metadata["parameters"] = {"allocated_pages": pages, "free_pages_before": self.before_count}
-            metadata["bindings"] = {"page_size": self.pool.page_size, "need_sort": int(self.pool.need_sort)}
-            metadata["guards"] = [
-                {"condition": ["le", 0, "allocated_pages"], "expected": True},
-                {"condition": ["le", "allocated_pages", "free_pages_before"], "expected": True},
-                {"condition": ["eq", "page_size", self.pool.page_size], "expected": True},
-                {"condition": "need_sort", "expected": self.pool.need_sort},
-            ]
 
             # Both implementations retain the same allocator ports and state transition.
             if self.decode:
@@ -162,14 +228,6 @@ class PageAllocationCall(NativeCall):
                 metadata["bindings"]["pages_provided"] = int(provided is not None)
                 metadata["guards"].append({"condition": "pages_provided", "expected": provided is not None})
 
-            metadata["derived_parameters"] = [
-                {"name": "free_pages_after", "expression": ["add", "free_pages_before", ["mul", -1, "allocated_pages"]]}
-            ]
-            metadata["state_effects"] = {"free_pages": {"before": "free_pages_before", "after": "free_pages_after"}}
-
-            symbols = self.values.shapes
-            tail = [(self.pool.free_pages, (symbols.symbol("free_pages_after"),))]
-            start = symbols.symbol("allocated_pages")
             members = nullcontext()
             if not self.decode and pages >= self.parallel_page_limit:
                 from markov_collection.adapters.frameworks.sglang.allocation import AllocationLoop
@@ -182,23 +240,10 @@ class PageAllocationCall(NativeCall):
 
         with (
             TensorGeometryObservation(self.values, factories={torch.empty: ("M",)}),
-            TensorViewObservation(self.values, tail, start=start),
+            views,
             members,
         ):
             return super().invoke(*args, **kwargs)
-
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> str | None:
-        metadata["parameters"]["free_pages_after"] = len(self.pool.free_pages)
-        metadata["ports"] = {
-            "inputs": self.input_ports,
-            "outputs": self.values.port_values({"kv_locations": result, "free_pages": self.pool.free_pages}),
-        }
-        return None
-
-    def outputs(self, result: Any) -> Any:
-        return result, self.pool.free_pages
 
 
 class PageReleaseCall(NativeCall):

@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from markov_collection.adapters.frameworks.sglang.batches import BatchTensors, BatchTransitionCall
-from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall
+from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall, TokenAllocationCall
 from markov_collection.adapters.runtimes.pytorch.concatenation import CollectionCall, GroupRepetition
 from markov_collection.adapters.runtimes.pytorch.factories import (
     TensorCreationCall,
@@ -211,6 +211,9 @@ class SGLangPreparation:
     def allocate_extend(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
         return PageAllocationCall(self.values, original, pool, decode=False)(pool, *args, **kwargs)
 
+    def allocate_tokens(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
+        return TokenAllocationCall(self.values, original, pool)(pool, *args, **kwargs)
+
     def allocate_decode(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
         return PageAllocationCall(self.values, original, pool, decode=True)(pool, *args, **kwargs)
 
@@ -260,6 +263,7 @@ class SGLangPreparation:
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new": self.forward_batch,
             "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch": self.request_arrays,
             "sglang.srt.utils.common.flatten_arrays_to_pinned_cpu": self.materialize_tokens,
+            "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc": self.allocate_tokens,
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_extend": (
                 self.allocate_extend
             ),
