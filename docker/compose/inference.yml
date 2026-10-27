@@ -42,6 +42,8 @@ services:
 
   modeling:
     working_dir: /workspace/trace-sim
+    mem_limit: ${TRACE_SIM_MODELING_MEMORY_LIMIT:-320g}
+    memswap_limit: ${TRACE_SIM_MODELING_MEMORY_LIMIT:-320g}
     build:
       context: ../..
       dockerfile: docker/images/modeling/Dockerfile

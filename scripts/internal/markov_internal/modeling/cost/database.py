@@ -12,6 +12,7 @@ import sqlite3
 from typing import Any
 
 from ...common.paths import require_repo_path
+from ..deployment import cost_environment_matches
 from .control import control_entries
 
 
@@ -53,6 +54,20 @@ def _json(value: Any) -> str:
     """Canonical semantic values for SQLite equality, not an integrity digest."""
 
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _deployment_ids(connection: sqlite3.Connection, deployment: dict[str, Any]) -> tuple[int, ...]:
+    """Select the performance domain without copying diagnostic credentials.
+
+    Stored descriptions remain provenance. Training uses the same resource and
+    implementation comparison as prediction, not equality of access credentials.
+    """
+
+    return tuple(
+        identity
+        for identity, description in connection.execute("SELECT id, description FROM deployments")
+        if cost_environment_matches(json.loads(description), deployment)
+    )
 
 
 def evidence_manifests(evidence: dict[str, Any]) -> set[str]:
@@ -418,11 +433,13 @@ class CostDatabase:
         """Select aggregate I/O facts, not whole operator export reports."""
 
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
+            deployments = _deployment_ids(connection, deployment)
+            placeholders = ",".join("?" for _ in deployments)
             rows = connection.execute(
                 "SELECT c.name, e.kind, s.manifest, e.payload FROM evidence e "
                 "JOIN captures c ON c.id=e.capture_id JOIN capture_sources s ON s.id=e.source_id "
-                "JOIN deployments d ON d.id=c.deployment_id WHERE d.description=? ORDER BY c.name, e.kind",
-                (_json(deployment),),
+                f"WHERE c.deployment_id IN ({placeholders}) ORDER BY c.name, e.kind",
+                deployments,
             ).fetchall()
 
         return [
@@ -445,18 +462,18 @@ class CostDatabase:
         Deployment and provenance descriptions are joined, not stored per row.
         """
 
-        environment_json = _json(deployment)
-        environment = json.loads(environment_json)
+        environment = json.loads(_json(deployment))
         placeholders = ",".join("?" for _ in operations)
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
+            deployments = _deployment_ids(connection, deployment)
+            domains = ",".join("?" for _ in deployments)
             stored = connection.execute(
                 "SELECT c.name, o.position, s.manifest, o.operation, o.implementation, "
                 "o.features, o.duration_us, o.timing_scope FROM observations o "
                 "JOIN captures c ON c.id=o.capture_id JOIN capture_sources s ON s.id=o.source_id "
-                "JOIN deployments d ON d.id=c.deployment_id WHERE d.description=? "
-                f"AND o.operation IN ({placeholders}) "
+                f"WHERE c.deployment_id IN ({domains}) AND o.operation IN ({placeholders}) "
                 "ORDER BY o.operation, o.implementation, o.timing_scope, c.name, o.position",
-                (environment_json, *operations),
+                (*deployments, *operations),
             )
 
             return [
@@ -479,10 +496,12 @@ class CostDatabase:
         """Count deployment candidates without loading their measured features."""
 
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
+            deployments = _deployment_ids(connection, deployment)
+            placeholders = ",".join("?" for _ in deployments)
             counts = connection.execute(
                 "SELECT c.name, COUNT(*) FROM observations o JOIN captures c ON c.id=o.capture_id "
-                "JOIN deployments d ON d.id=c.deployment_id WHERE d.description=? GROUP BY c.name",
-                (_json(deployment),),
+                f"WHERE c.deployment_id IN ({placeholders}) GROUP BY c.name",
+                deployments,
             )
             return sum(count for capture, count in counts if capture not in excluded_captures)
 
@@ -490,21 +509,23 @@ class CostDatabase:
         """Report stored deployment/operator coverage without creating a database."""
 
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
+            environments = dict(connection.execute("SELECT id, description FROM deployments"))
             groups = connection.execute(
-                "SELECT d.description, o.operation, o.implementation, o.timing_scope, COUNT(*), COUNT(DISTINCT o.capture_id) "
-                "FROM observations o JOIN captures c ON c.id=o.capture_id JOIN deployments d ON d.id=c.deployment_id "
-                "GROUP BY d.description, o.operation, o.implementation, o.timing_scope "
-                "ORDER BY d.description, o.operation, o.implementation, o.timing_scope"
+                "SELECT c.deployment_id, o.operation, o.implementation, o.timing_scope, COUNT(*), COUNT(DISTINCT o.capture_id) "
+                "FROM observations o JOIN captures c ON c.id=o.capture_id "
+                "GROUP BY c.deployment_id, o.operation, o.implementation, o.timing_scope"
             ).fetchall()
+            groups.sort(key=lambda row: (environments[row[0]], *row[1:4]))
 
             # Distinct work descriptions suffice for geometry coverage; do not
             # load every repeated layer measurement or infer identifiability
-            # from a large raw sample count.
-            coverage: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+            # from a large raw sample count. Sort by the deployment's integer
+            # identity, not its potentially large JSON description per record.
+            coverage: dict[tuple[int, str, str, str], dict[str, Any]] = {}
             for environment, operation, implementation, scope, raw_features, count in connection.execute(
-                "SELECT d.description, o.operation, o.implementation, o.timing_scope, o.features, COUNT(*) "
-                "FROM observations o JOIN captures c ON c.id=o.capture_id JOIN deployments d ON d.id=c.deployment_id "
-                "GROUP BY d.description, o.operation, o.implementation, o.timing_scope, o.features"
+                "SELECT c.deployment_id, o.operation, o.implementation, o.timing_scope, o.features, COUNT(*) "
+                "FROM observations o JOIN captures c ON c.id=o.capture_id "
+                "GROUP BY c.deployment_id, o.operation, o.implementation, o.timing_scope, o.features"
             ):
                 key = environment, operation, implementation, scope
                 group = coverage.setdefault(key, {"distinct_work_points": 0, "features": {}})
@@ -528,7 +549,7 @@ class CostDatabase:
             ),
             "groups": [
                 {
-                    "deployment": json.loads(environment),
+                    "deployment": json.loads(environments[environment]),
                     "operation": operation,
                     "implementation": implementation,
                     "timing_scope": scope,

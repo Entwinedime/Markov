@@ -45,13 +45,30 @@ class ProfileRunRef:
         return f"{self.input_id}/{self.config_id}"
 
 
+def cpu_service_metadata(path: Path) -> dict[str, Any]:
+    """Read the formal CPU file's header without materializing its interval array.
+
+    The backend writer places metadata before the top-level ``spans`` field.
+    This reads provenance only; the backend still reads and validates all costs.
+    """
+
+    header = []
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if line.startswith('  "spans":'):
+                return json.loads("".join(header).rstrip().removesuffix(",") + "\n}")
+
+            header.append(line)
+    return json.loads("".join(header))
+
+
 def cpu_service_inputs(paths: list[Path], sources: tuple[Path, ...]) -> dict[Path, Path]:
     """Bind explicit service files to their own selected captures, never targets."""
 
     inputs = {}
     for path in paths:
         path = require_repo_path(path)
-        source = require_repo_path(load_json(path)["source_manifest"]).resolve()
+        source = require_repo_path(cpu_service_metadata(path)["source_manifest"]).resolve()
         if source not in sources:
             raise ValueError(f"CPU service input does not belong to a selected source: {path}")
         if source in inputs:
@@ -196,9 +213,15 @@ def apply_sglang_capacity_from_flags(flags: dict[str, str], hicache_config: dict
     if hicache_size <= 0 and hicache_ratio is not None and hicache_ratio > 0.0:
         host_capacity_tokens = (int(max_total_tokens * hicache_ratio) // page_size + 1) * page_size
         result["l2_capacity_pages"] = host_capacity_tokens // page_size
-        prefetch_limit_tokens = max(0, int(0.8 * (host_capacity_tokens - max_total_tokens)))
+        prefetch_limit_tokens = sglang_prefetch_capacity_tokens(host_capacity_tokens, max_total_tokens)
         result["prefetch_capacity_limit_pages"] = prefetch_limit_tokens // page_size
     return result
+
+
+def sglang_prefetch_capacity_tokens(host_capacity_tokens: int, device_capacity_tokens: int) -> int:
+    """SGLang reserves 20% of the host/device difference; this is not an I/O fit."""
+
+    return max(0, int(0.8 * (host_capacity_tokens - device_capacity_tokens)))
 
 
 def parse_server_command_flags(path: Path) -> dict[str, str]:

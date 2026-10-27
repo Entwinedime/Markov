@@ -12,6 +12,8 @@ cd "$ROOT_DIR"
 usage() {
     cat >&2 <<'EOF'
 Main workflow:
+  scripts/model.sh search --request <search.json> [--dry-run | --resume]
+  scripts/model.sh experiment --request <experiment.json> [--dry-run | --predict-only | --score-only]
   scripts/model.sh prepare-costs --request <performance_request.json> [--dry-run]
   scripts/model.sh prepare-hicache --group <group_request.json> [--dry-run]
   scripts/model.sh build-dag (--profile-manifest <manifest> --output-dir <dir> | --config <runner_config.json>)
@@ -85,37 +87,43 @@ case "$action:$calibration_kind" in
         module=modeling.cost.cli
         ;;
     export-hicache-operation-costs:)
-        module=modeling_workflow.calibration.operation_costs
+        module=preparation.calibration.operation_costs
         ;;
     prepare-cpu-service:)
-        module=modeling_workflow.calibration.prepare_cpu_service
+        module=preparation.calibration.prepare_cpu_service
         ;;
     prepare-hicache:)
-        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.prepare "$@"
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.applications.prediction "$@"
         ;;
     prepare-costs:)
-        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.performance "$@"
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.preparation.performance "$@"
+        ;;
+    experiment:)
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.applications.accuracy.cli "$@"
+        ;;
+    search:)
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.applications.search.cli "$@"
         ;;
     build-dag:)
         module=modeling.source_dag.cli
         ;;
     calibrate-hicache:physical)
-        module=modeling_workflow.io_calibration
+        module=preparation.io_calibration
         ;;
     calibrate-hicache:runtime-dma)
-        module=modeling_workflow.runtime_dma_calibration
+        module=preparation.runtime_dma_calibration
         ;;
     calibrate-hicache:eviction-cpu)
-        module=modeling_workflow.calibration.eviction_cpu
+        module=preparation.calibration.eviction_cpu
         ;;
     calibrate-hicache:idle-sync)
-        module=modeling_workflow.calibration.idle_sync
+        module=preparation.calibration.idle_sync
         ;;
     predict:)
-        module=modeling_workflow.cli
+        module=applications.direct
         ;;
     evaluate:)
-        module=modeling_workflow.evaluation.existing
+        module=applications.accuracy.evaluate
         ;;
     *)
         echo "unknown modeling action: $action${calibration_kind:+/$calibration_kind}" >&2

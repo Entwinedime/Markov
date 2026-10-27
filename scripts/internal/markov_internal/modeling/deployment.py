@@ -8,6 +8,19 @@ from ..common.io import load_json
 from .source_dag.profiles import ProfileRunRef, parse_server_command_flags
 
 
+def cost_environment_matches(observed: dict[str, Any], declared: dict[str, Any]) -> bool:
+    """Compare performance domains, not credentials for the diagnostic API.
+
+    Keep recorded deployments intact for provenance and database selection.
+    Changing an access credential does not change an operation's implementation.
+    """
+
+    credential = "TRACE_SIM_HICACHE_DIAGNOSTIC_API_KEY"
+    observed_domain = {**observed, "env": {key: value for key, value in observed["env"].items() if key != credential}}
+    declared_domain = {**declared, "env": {key: value for key, value in declared["env"].items() if key != credential}}
+    return observed_domain == declared_domain
+
+
 def source_environment(source: ProfileRunRef, resources: dict[str, str] | None = None) -> dict[str, Any]:
     """Read declared runtime dimensions; unknown hardware remains unknown.
 
@@ -66,6 +79,9 @@ def source_environment(source: ProfileRunRef, resources: dict[str, str] | None =
         "HOOK_SYNC_THREAD_CPU",
         "HOOK_MEMCPY2D_TIMING",
         "SGLANG_NPU_PROFILER_SERIAL_EXPORT",
+        "SGLANG_NPU_PROFILER_LEVEL",
+        "SGLANG_NPU_PROFILER_AIC_METRICS",
+        "SGLANG_NPU_PROFILER_MAX_FILE_BYTES",
         "SGLANG_HICACHE_IO_TIMING",
         "SGLANG_STEP_TIMING_DIR",
         "SGLANG_SCHEDULER_TIMING",

@@ -18,3 +18,14 @@ def write_json(path: Path, value: Any) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+    """Publish a progress report without exposing a half-written JSON on interruption."""
+
+    pending = path.with_name(path.name + ".pending")
+    try:
+        write_json(pending, value)
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
