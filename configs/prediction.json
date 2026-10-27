@@ -1,0 +1,37 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B",
+    "framework": "sglang",
+    "runtime": "ascend",
+    "model": "Qwen/Qwen3-32B",
+    "dtype": "bfloat16",
+    "tensor_parallel": 2
+  },
+  "base": {
+    "configuration": {
+      "page_size": 64,
+      "device_pages": 64,
+      "host_pages": 128,
+      "write_policy": "write_back",
+      "prefetch_stop_policy": "wait_complete"
+    }
+  },
+  "workload": "workload.json",
+  "targets": [
+    {
+      "name": "smaller_pages",
+      "configuration": {
+        "page_size": 32,
+        "device_pages": 128,
+        "host_pages": 256,
+        "write_policy": "write_back",
+        "prefetch_stop_policy": "wait_complete"
+      }
+    }
+  ],
+  "execution": {
+    "output": "../data/prediction",
+    "jobs": 1,
+    "memory_limit_gib": 4
+  }
+}

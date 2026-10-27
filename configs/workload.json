@@ -1,0 +1,8 @@
+{
+  "requests": [
+    {"prompt": "Explain how a prefix cache avoids repeated computation.", "max_new_tokens": 16},
+    {"prompt": "Explain how a prefix cache avoids repeated computation. Give one example.", "max_new_tokens": 16}
+  ],
+  "arrival": "serial",
+  "formal_begin_index": 0
+}
