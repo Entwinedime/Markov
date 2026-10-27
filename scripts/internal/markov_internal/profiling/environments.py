@@ -48,6 +48,8 @@ def build_server_env(
     apply_framework_defaults(env, adapter)
     if adapter.profiler_api:
         env["SGLANG_TORCH_PROFILER_DIR"] = str(runtime.output_path(layout.run_dir, "torch"))
+        env["SGLANG_NPU_PROFILER_LEVEL"] = str(runtime.channel_options["torch"]["npu_profiler_level"])
+        env.setdefault("SGLANG_NPU_PROFILER_AIC_METRICS", "1" if runtime.debug else "0")
     env["TRACE_SIM_PROFILING_CHANNELS"] = ",".join(runtime.channels)
 
     if runtime.enabled and "python_probe" in runtime.channels:

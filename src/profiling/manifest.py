@@ -32,9 +32,21 @@ def build_profile_manifest(
     hook_prefix = runtime.output_path(run_dir, "ld_preload")
     torch_trace_files = _glob_files(torch_dir, "**/trace_view.json")
     for entry in torch_trace_files:
-        clock = read_host_clock(Path(entry["path"]))
+        trace_path = Path(entry["path"])
+        clock = read_host_clock(trace_path)
         if clock is not None:
             entry["host_clock"] = clock
+
+        # torch-npu Level0 records ACL APIs but prunes their display events.
+        # Declare the original CANN export so modeling can restore those host
+        # boundaries without another device capture or duplicate device work.
+        if (
+            cfg.get("framework", "sglang") == "sglang"
+            and runtime.channel_options["torch"].get("npu_profiler_level") == 0
+        ):
+            entry["cann_runtime_trace_files"] = _glob_files(
+                trace_path.parent.parent, "PROF*/mindstudio_profiler_output/msprof*.json"
+            )
     ld_preload_trace_files = _glob_files(hook_prefix.parent, escape(hook_prefix.name) + ".rank*.pid*.json")
     python_probe_files = _glob_files(python_probe_dir, "*.json")
     collection_errors = [error] if error else []

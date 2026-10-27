@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import Any, Callable
 
 
@@ -12,13 +11,14 @@ SourceExtractor = Callable[
 ]
 
 
-@functools.cache
-def hicache_source_extractor() -> SourceExtractor:
-    # HiCache expressions use this reader for their arguments. Resolve the
-    # domain handler after module loading, before any measured call begins.
-    from .hicache.sources import extract_source
+_SOURCE_EXTRACTOR: SourceExtractor | None = None
 
-    return extract_source
+
+def configure_source_extractor(extractor: SourceExtractor) -> None:
+    """Bind the selected framework reader at bootstrap, before measured calls."""
+
+    global _SOURCE_EXTRACTOR
+    _SOURCE_EXTRACTOR = extractor
 
 
 def extract_value(
@@ -44,9 +44,10 @@ def extract_value(
             return (False, None)
         return (True, _safe_len(value) if kind == "len" else _safe_list(value))
 
-    handled, found, value = hicache_source_extractor()(source, field_name, bound, args, result)
-    if handled:
-        return (found, value)
+    if _SOURCE_EXTRACTOR is not None:
+        handled, found, value = _SOURCE_EXTRACTOR(source, field_name, bound, args, result)
+        if handled:
+            return (found, value)
 
     if not source:
         return (field_name in bound, bound.get(field_name))

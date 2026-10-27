@@ -58,9 +58,19 @@ def start_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], runtime:
     write_json(layout.run_dir / "profile_start_response.json", response)
 
 
-def stop_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_cfg: dict[str, Any]) -> None:
-    """Invoke ``/stop_profile``, recording failures unless strict stop is enabled."""
+def stop_torch_profiler(
+    layout: RunLayout,
+    server_cfg: dict[str, Any],
+    runtime: ProfilingRuntimeConfig,
+    server_env: dict[str, str],
+) -> None:
+    """Stop capture; reject NPU exports known to exceed the vendor reader limit.
 
+    Non-strict API failures remain warnings. A completed but size-capped export
+    is unusable even when the vendor API reports success; its raw data is kept.
+    """
+
+    profile_cfg = runtime.channel_options["torch"]
     log("Stopping SGLang profiler via /stop_profile.")
     try:
         response = post_json(
@@ -74,3 +84,23 @@ def stop_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_c
             raise
         response = {"warning": str(exc)}
     write_json(layout.run_dir / "profile_stop_response.json", response)
+
+    cann_files = list(
+        runtime.output_path(layout.run_dir, "torch").glob("**/PROF*/mindstudio_profiler_output/msprof*.json")
+    )
+    if not cann_files:
+        return
+
+    # Optional backend import: GPU captures do not have Ascend CANN exports.
+    from torch_npu.profiler.analysis.prof_common_func._constant import Constant
+
+    configured_limit = server_env.get("SGLANG_NPU_PROFILER_MAX_FILE_BYTES")
+    limit_bytes = int(configured_limit) if configured_limit is not None else Constant.MAX_FILE_SIZE
+    for path in cann_files:
+        size_bytes = path.stat().st_size
+        if size_bytes > limit_bytes:
+            raise RuntimeError(
+                f"NPU CANN export {path} has {size_bytes} bytes, exceeding the torch-npu reader limit "
+                f"of {limit_bytes} bytes. Raw capture data is retained; re-export with a sufficient "
+                "SGLANG_NPU_PROFILER_MAX_FILE_BYTES before using this profile."
+            )

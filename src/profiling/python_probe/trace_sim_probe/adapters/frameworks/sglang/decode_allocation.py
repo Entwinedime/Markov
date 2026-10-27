@@ -7,7 +7,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 from trace_sim_probe.patching import install_wrapper
-from trace_sim_probe.probes.hicache.common import _cache_scope_key
+from trace_sim_probe.adapters.frameworks.sglang.hicache.common import _cache_scope_key
 from trace_sim_probe.writer import get_writer
 
 TARGET_MODULES = (

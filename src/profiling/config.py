@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from markov_internal.profiling.frameworks import DEFAULT_SGLANG_NPU_PROFILER_LEVEL
 from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS, runtime_probe_names
 
 
@@ -48,6 +49,9 @@ class ProfilingRuntimeConfig:
             if self.enabled and "python_probe" in self.channels
             else [],
             "debug": self.debug,
+            "torch_npu_profiler_level": self.channel_options["torch"].get("npu_profiler_level")
+            if self.enabled and "torch" in self.channels
+            else None,
             "capture_tail_contract": {
                 "post_workload_drain_sec": self.post_workload_drain_sec,
                 "python_probe_flush_interval_sec": self.python_probe_flush_interval_sec,
@@ -78,6 +82,15 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
         if not isinstance(options, dict):
             raise TypeError(f"profiling.{channel} must be an object")
         channel_options[channel] = options
+
+    if cfg.get("framework", "sglang") == "sglang":
+        torch_options = dict(channel_options["torch"])
+        # Levels 0/1 omit runtime DMA geometry required by current HiCache DAGs.
+        npu_level = torch_options.get("npu_profiler_level", DEFAULT_SGLANG_NPU_PROFILER_LEVEL)
+        if type(npu_level) is not int or npu_level not in (0, 1, 2):
+            raise ValueError("profiling.torch.npu_profiler_level must be 0, 1 or 2")
+        torch_options["npu_profiler_level"] = npu_level
+        channel_options["torch"] = torch_options
 
     channels = _normalize_channels(profiling.get("channels"), channel_options)
     python_probe_cfg = channel_options["python_probe"]

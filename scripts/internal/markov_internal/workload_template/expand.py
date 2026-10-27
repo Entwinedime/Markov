@@ -30,6 +30,7 @@ class RequestPlan:
     anchor_tokens: int | None
     tail_tokens: int | None
     max_new_tokens: int
+    ignore_eos: bool
 
 
 @dataclass(frozen=True)
@@ -137,11 +138,14 @@ def request_token_budget(template: Template) -> dict[str, int]:
     This estimate includes preparation requests, not only the formal window.
     """
     counts = []
-    output = template.data["defaults"]["sampling"]["max_new_tokens"]
+    output_limits = []
+    default_sampling = template.data["defaults"]["sampling"]
     for raw in template.data["steps"]:
         for step in _expand_step(raw):
             if step["kind"] == "request":
                 definition, _ = resolve_request_definition(template.data["request_defs"], step["request"])
+                sampling = {**default_sampling, **definition.get("sampling", {})}
+                output = sampling["max_new_tokens"]
                 contract = definition.get("token_contract")
                 input_count = (
                     contract["anchor_tokens"] + contract["tail_tokens"]
@@ -149,7 +153,11 @@ def request_token_budget(template: Template) -> dict[str, int]:
                     else len(definition["prompt_token_ids"])
                 )
                 counts.append(input_count + output)
-    return {"requests": len(counts), "tokens": sum(counts), "output_tokens_per_request": output}
+                output_limits.append(output)
+
+    # This scalar is only a conservative fallback for an old failed report
+    # without a per-request limit. Successful attempts charge actual work.
+    return {"requests": len(counts), "tokens": sum(counts), "output_tokens_per_request": max(output_limits)}
 
 
 def _expand_step(raw_step: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
@@ -195,6 +203,7 @@ def _build_request_plan(
 
     request_name = raw_step["request"]
     request_definition, request_index = resolve_request_definition(template.data["request_defs"], request_name)
+    sampling = {**template.data["defaults"]["sampling"], **request_definition.get("sampling", {})}
     if "prompt_token_ids" in request_definition:
         token_ids = tuple(request_definition["prompt_token_ids"])
     else:
@@ -225,7 +234,8 @@ def _build_request_plan(
         prompt_token_ids=token_ids,
         anchor_tokens=anchor_tokens,
         tail_tokens=actual_tail_tokens,
-        max_new_tokens=template.data["defaults"]["sampling"]["max_new_tokens"],
+        max_new_tokens=sampling["max_new_tokens"],
+        ignore_eos=sampling["ignore_eos"],
     )
 
 

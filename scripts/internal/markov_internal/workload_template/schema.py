@@ -135,8 +135,8 @@ def _validate_template_shape(data: Mapping[str, Any]) -> None:
         raise TemplateValidationError("template.defaults.sampling.temperature must be 0")
     if sampling.get("top_p") != 1.0:
         raise TemplateValidationError("template.defaults.sampling.top_p must be 1.0")
-    if sampling.get("ignore_eos") is not True:
-        raise TemplateValidationError("template.defaults.sampling.ignore_eos must be true")
+    if not isinstance(sampling.get("ignore_eos"), bool):
+        raise TemplateValidationError("template.defaults.sampling.ignore_eos must be a boolean")
 
     fragments = _required_object(data, "fragments", "template")
     for fragment_name, fragment in fragments.items():
@@ -157,6 +157,16 @@ def _validate_template_shape(data: Mapping[str, Any]) -> None:
             raise TemplateValidationError(f"request definition {request_name} may contain at most one {{i}}")
         if not isinstance(request_def, dict):
             raise TemplateValidationError(f"request definition {request_name} must be an object")
+
+        if "sampling" in request_def:
+            overrides = _required_object(request_def, "sampling", f"request definition {request_name}")
+            if set(overrides) - {"max_new_tokens", "ignore_eos"}:
+                raise TemplateValidationError(f"request {request_name}: only output limit/EOS overrides are supported")
+            if "max_new_tokens" in overrides:
+                _required_positive_int(overrides, "max_new_tokens", f"request definition {request_name}.sampling")
+            if "ignore_eos" in overrides and not isinstance(overrides["ignore_eos"], bool):
+                raise TemplateValidationError(f"request {request_name}.sampling.ignore_eos must be a boolean")
+
         # Generated calibration requests may reuse admitted input tokens without
         # a decode/encode round trip changing their length or shared prefix.
         tokens = request_def.get("prompt_token_ids")

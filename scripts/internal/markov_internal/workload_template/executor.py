@@ -13,6 +13,7 @@ from ..common.io import write_json
 from ..contracts.forced_token.plan import (
     int_list,
     load_forced_token_plan,
+    output_work_error,
     validate_plan_contract,
 )
 from .diagnostics import assertion_matches, evaluate_assertion
@@ -210,8 +211,21 @@ def _validate_replay_plan(plan: CanonicalPlan, plan_path: Path) -> dict[str, Map
         captured = indexed[request.logical_request_id]
         if tuple(captured["origin_input_ids"]) != request.prompt_token_ids:
             raise TemplateValidationError(f"forced plan origin input mismatch: {request.logical_request_id}")
-        if len(captured["forced_output_ids"]) != request.max_new_tokens:
-            raise TemplateValidationError(f"forced plan output length mismatch: {request.logical_request_id}")
+        # Existing fixed-length plans have no sampling/end fields. Their actual
+        # contract is length-limited, not a guessed natural-generation record.
+        recorded_limit = captured.get("max_new_tokens", request.max_new_tokens)
+        recorded_ignore_eos = captured.get("ignore_eos", True)
+        if (recorded_limit, recorded_ignore_eos) != (request.max_new_tokens, request.ignore_eos):
+            raise TemplateValidationError(f"forced plan sampling mismatch: {request.logical_request_id}")
+
+        if "finish_reason" not in captured and not request.ignore_eos:
+            raise TemplateValidationError(
+                f"natural output plan is missing its end condition: {request.logical_request_id}"
+            )
+        reason = captured.get("finish_reason", {"type": "length", "length": recorded_limit})
+        error = output_work_error(captured["forced_output_ids"], recorded_limit, recorded_ignore_eos, reason)
+        if error:
+            raise TemplateValidationError(f"forced plan {error}: {request.logical_request_id}")
     return indexed
 
 
@@ -225,8 +239,8 @@ def _execute_request(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Send a request; replay_request comes from the already validated replay plan."""
 
-    # Replay identities and lengths were checked before execution. The request
-    # carries the same prompt/sampling settings; only forced output is added.
+    # Keep the original limit and EOS policy: shortening the limit to the
+    # recorded length would turn an EOS end into a length end in SGLang.
     body = _request_body(request, return_tokens=mode != "none")
     if mode == "replay":
         body["trace_sim_forced_output_ids"] = replay_request["forced_output_ids"]
@@ -245,32 +259,44 @@ def _execute_request(
         "origin_input_count": len(request.prompt_token_ids),
         "anchor_tokens": request.anchor_tokens,
         "tail_tokens": request.tail_tokens,
+        "output_token_limit": request.max_new_tokens,
+        "ignore_eos": request.ignore_eos,
         **response,
     }
     captured: dict[str, Any] | None = None
     if mode == "capture" and row.get("status") == "ok":
         if output_ids is None or prompt_ids != list(request.prompt_token_ids):
             row.update(status="error", failure_reason="capture_response_missing_token_ids")
-        elif len(output_ids) != request.max_new_tokens:
-            row.update(status="error", failure_reason="capture_output_length_mismatch")
+        elif "finish_reason" not in row:
+            row.update(status="error", failure_reason="capture_response_missing_finish_reason")
         else:
-            captured = {
-                "logical_request_id": request.logical_request_id,
-                "origin_input_ids": prompt_ids,
-                "forced_output_ids": output_ids,
-            }
+            error = output_work_error(output_ids, request.max_new_tokens, request.ignore_eos, row["finish_reason"])
+            if error:
+                row.update(status="error", failure_reason=f"capture_{error}")
+            else:
+                captured = {
+                    "logical_request_id": request.logical_request_id,
+                    "origin_input_ids": prompt_ids,
+                    "forced_output_ids": output_ids,
+                    "max_new_tokens": request.max_new_tokens,
+                    "ignore_eos": request.ignore_eos,
+                    "finish_reason": row["finish_reason"],
+                }
 
     if mode == "replay":
         expected_output = replay_request["forced_output_ids"]
         output_matches = output_ids == expected_output
         prompt_matches = prompt_ids == replay_request["origin_input_ids"]
+        expected_reason = replay_request.get("finish_reason", {"type": "length", "length": request.max_new_tokens})
+        finish_matches = row.get("finish_reason") == expected_reason
         row.update(
             forced_output_count=len(expected_output),
             forced_token_output_checked=output_ids is not None,
             actual_output_matches_forced=output_matches,
             actual_prompt_matches_plan=prompt_matches,
+            actual_finish_matches_plan=finish_matches,
         )
-        if row.get("status") == "ok" and not (output_matches and prompt_matches):
+        if row.get("status") == "ok" and not (output_matches and prompt_matches and finish_matches):
             row.update(status="error", failure_reason="forced_token_replay_mismatch")
 
     if row.get("status") != "ok" and "failure_reason" not in row:
@@ -289,7 +315,7 @@ def _request_body(request: RequestPlan, *, return_tokens: bool) -> dict[str, Any
             "temperature": 0,
             "top_p": 1.0,
             "top_k": 1,
-            "ignore_eos": True,
+            "ignore_eos": request.ignore_eos,
             "sampling_seed": 20260729,
         },
     }
@@ -345,7 +371,7 @@ def _post_json(
 
 
 def _response_facts(payload: bytes) -> dict[str, Any]:
-    """Extract response token facts needed by capture/replay contracts."""
+    """Extract replay token facts and optional server-reported cache counts; missing metadata stays absent."""
 
     try:
         parsed = json.loads(payload.decode("utf-8"))
@@ -356,6 +382,13 @@ def _response_facts(payload: bytes) -> dict[str, Any]:
     output_ids = int_list(parsed.get("output_ids"))
     prompt_ids = int_list(parsed.get("prompt_token_ids"))
     result: dict[str, Any] = {"_output_ids": output_ids, "_prompt_ids": prompt_ids}
+    meta_info = parsed.get("meta_info")
+    if isinstance(meta_info, dict):
+        if isinstance(meta_info.get("finish_reason"), dict):
+            result["finish_reason"] = meta_info["finish_reason"]
+        for field in ("cached_tokens", "cached_tokens_details"):
+            if field in meta_info:
+                result[field] = meta_info[field]
     if output_ids is not None:
         result["actual_output_count"] = len(output_ids)
     if prompt_ids is not None:
@@ -584,8 +617,14 @@ def _forced_token_summary(
     unchecked = [row for row in replay_rows if not row.get("forced_token_output_checked")]
     output_mismatches = [row for row in replay_rows if row.get("actual_output_matches_forced") is False]
     prompt_mismatches = [row for row in replay_rows if row.get("actual_prompt_matches_plan") is False]
+    finish_mismatches = [row for row in replay_rows if row.get("actual_finish_matches_plan") is False]
     replay_ready = (
-        bool(replay_rows) and not unchecked and not output_mismatches and not prompt_mismatches and plan_exists
+        bool(replay_rows)
+        and not unchecked
+        and not output_mismatches
+        and not prompt_mismatches
+        and not finish_mismatches
+        and plan_exists
     )
     return {
         "enabled": mode != "none",
@@ -600,6 +639,7 @@ def _forced_token_summary(
         "mismatch_count": len(output_mismatches),
         "unchecked_count": len(unchecked),
         "prompt_mismatch_count": len(prompt_mismatches),
+        "finish_mismatch_count": len(finish_mismatches),
         "all_actual_outputs_match_plan": (not output_mismatches and not unchecked and not prompt_mismatches)
         if mode == "replay"
         else None,

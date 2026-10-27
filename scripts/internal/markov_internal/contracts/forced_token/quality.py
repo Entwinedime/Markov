@@ -8,6 +8,7 @@ from .constants import (
     FORCED_TOKEN_ERROR_MODE_UNKNOWN,
     FORCED_TOKEN_ERROR_ORIGIN_INPUT,
     FORCED_TOKEN_ERROR_OUTPUT_MISMATCH,
+    FORCED_TOKEN_ERROR_FINISH_REASON,
     FORCED_TOKEN_ERROR_OUTPUT_UNCHECKED,
     FORCED_TOKEN_ERROR_PLAN_MISSING,
     FORCED_TOKEN_ERROR_REQUEST_COUNT,
@@ -26,6 +27,7 @@ def empty_forced_token_quality() -> dict[str, Any]:
         "mismatch_count": 0,
         "unchecked_count": 0,
         "prompt_mismatch_count": 0,
+        "finish_mismatch_count": 0,
         "all_actual_outputs_match_plan": None,
         "plan_written": None,
     }
@@ -47,6 +49,7 @@ def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
             "mismatch_count": forced["mismatch_count"],
             "unchecked_count": forced["unchecked_count"],
             "prompt_mismatch_count": forced["prompt_mismatch_count"],
+            "finish_mismatch_count": forced.get("finish_mismatch_count", 0),
             "all_actual_outputs_match_plan": forced.get("all_actual_outputs_match_plan"),
             "plan_written": forced.get("plan_written"),
         }
@@ -64,6 +67,8 @@ def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
             errors.append(FORCED_TOKEN_ERROR_OUTPUT_UNCHECKED)
         if result["prompt_mismatch_count"]:
             errors.append(FORCED_TOKEN_ERROR_ORIGIN_INPUT)
+        if result["finish_mismatch_count"]:
+            errors.append(FORCED_TOKEN_ERROR_FINISH_REASON)
     else:
         errors.append(FORCED_TOKEN_ERROR_MODE_UNKNOWN)
     result["errors"] = sorted(set(errors))

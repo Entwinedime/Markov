@@ -12,6 +12,7 @@ from types import ModuleType
 
 from trace_sim_probe.writer import _truthy
 from trace_sim_probe.schema import runtime_probe_names
+from trace_sim_probe.probes.values import configure_source_extractor
 
 
 _INSTALLED = False
@@ -27,11 +28,17 @@ def _probes() -> tuple[ModuleType, ...]:
 
     global _PROBES
     if _PROBES is None:
+        # Bootstrap is the composition boundary. Common recording/value
+        # readers do not import SGLang; bind its scalar reader before wrapping.
+        framework_package = "trace_sim_probe.adapters.frameworks.sglang"
+        sources = importlib.import_module(framework_package + ".hicache.sources")
+        configure_source_extractor(sources.extract_source)
+
         probes = [importlib.import_module("trace_sim_probe.probes.generic_callable")]
         consumers = tuple(os.environ.get("TRACE_SIM_PYTHON_PROBE_CONSUMERS", "").split(","))
         diagnostics = os.environ.get("TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS", "off")
         probes.extend(
-            importlib.import_module("trace_sim_probe.probes." + name)
+            importlib.import_module(framework_package + "." + name)
             for name in runtime_probe_names(consumers, diagnostics)
         )
         _PROBES = tuple(probes)

@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+# Runtime API records supply the DMA direction and byte geometry HiCache needs.
+# Hardware-utilization counters are a separate, optional collection setting.
+DEFAULT_SGLANG_NPU_PROFILER_LEVEL = 2
+
+
 @dataclass(frozen=True)
 class FrameworkAdapter:
     """Framework-owned capture and cleanup capabilities."""

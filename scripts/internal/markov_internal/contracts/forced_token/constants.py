@@ -3,6 +3,7 @@
 FORCED_TOKEN_ERROR_PLAN_MISSING = "forced_token_plan_missing"
 FORCED_TOKEN_ERROR_REQUEST_COUNT = "forced_token_plan_request_count_mismatch"
 FORCED_TOKEN_ERROR_OUTPUT_MISMATCH = "forced_token_actual_output_mismatch"
+FORCED_TOKEN_ERROR_FINISH_REASON = "forced_token_finish_reason_mismatch"
 FORCED_TOKEN_ERROR_OUTPUT_UNCHECKED = "forced_token_actual_output_unchecked"
 FORCED_TOKEN_ERROR_ORIGIN_INPUT = "forced_token_origin_input_mismatch"
 FORCED_TOKEN_ERROR_MODE_UNKNOWN = "forced_token_mode_unknown"

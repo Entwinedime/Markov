@@ -137,7 +137,7 @@ class ProfileRun:
                         time.sleep(drain_sec)
 
                     if torch_enabled and should_stop_torch_profiler_after_workload(profile_cfg):
-                        stop_torch_profiler(self.layout, self.server_cfg, profile_cfg)
+                        stop_torch_profiler(self.layout, self.server_cfg, self.runtime, server_env)
                 finally:
                     stop_process(server_process)
                     shutdown_cooldown_sec = float(self.server_cfg.get("shutdown_cooldown_sec", 0))

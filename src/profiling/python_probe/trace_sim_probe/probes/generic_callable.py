@@ -22,7 +22,7 @@ from .thread_timing import (
     _thread_timing_delta,
     _thread_timing_snapshot,
 )
-from .values import extract_value, hicache_source_extractor
+from .values import extract_value
 
 
 @functools.cache
@@ -88,7 +88,6 @@ def _resolve_target(module: ModuleType, target: TargetSpec) -> tuple[Any, str, A
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
     """包装同步或异步 callable，并按 target phase 配置发事件。"""
 
-    hicache_source_extractor()
     # The installed callable is fixed; only its argument values change per call.
     try:
         argument_spec = inspect.signature(fn)

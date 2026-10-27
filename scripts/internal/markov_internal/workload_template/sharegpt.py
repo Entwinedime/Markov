@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json, write_json
+from ..common.paths import require_repo_path
 from .schema import TemplateValidationError
 
 
@@ -32,6 +33,7 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
     from transformers import AutoTokenizer
 
     policy = load_json(policy_path)
+    excluded = _excluded_conversations(policy.get("exclude_selection_reports", []))
     records = load_json(dataset)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     random.Random(policy["seed"]).shuffle(records)
@@ -47,6 +49,9 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
         # all chunks of one original conversation on the same side of holdout.
         prefix, separator, suffix = record_id.rpartition("_")
         identity = prefix if separator and suffix.isdigit() else record_id
+        if identity in excluded:
+            reasons["previously_selected_conversation"] += 1
+            continue
         if identity in seen_ids:
             reasons["duplicate_conversation_id"] += 1
             continue
@@ -89,7 +94,13 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
 
     turns = policy["multi_turn_turns"]
     multi = _take(
-        [c for c in conversations if len(c.prompts) >= turns and c.conversation_id not in used],
+        [
+            c
+            for c in conversations
+            if len(c.prompts) >= turns
+            and len(c.prompts[turns - 1]) >= policy.get("multi_turn_minimum_input_tokens", minimum)
+            and c.conversation_id not in used
+        ],
         policy["multi_turn_conversations"],
         "multi-turn conversations",
     )
@@ -107,7 +118,9 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
 
     workloads = {
         "independent": independent,
-        "multi_turn": [(c, turn) for turn in range(turns) for c in multi],
+        "multi_turn": [
+            (c, turn) for _ in range(policy.get("multi_turn_revisit_passes", 1)) for turn in range(turns) for c in multi
+        ],
         "revisit": [(c, len(c.prompts) - 1) for _ in range(policy["revisit_passes"]) for c in revisit],
     }
     # A disjoint real prompt warms the common eager/Decode path outside the
@@ -127,6 +140,7 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
     report = {
         "dataset": str(dataset),
         "selection_policy": policy,
+        "excluded_conversation_count": len(excluded),
         "corpus_conversation_count": len(records),
         "scanned_conversation_count": len(selected_records),
         "admitted_conversation_count": len(conversations),
@@ -147,7 +161,17 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
     for name, requests in workloads.items():
         workload_id = f"sharegpt_{name}"
         template_path = output_dir / f"{workload_id}.json"
-        document = _request_template(workload_id, requests, policy["output_tokens"][name], warmup)
+        request_limits = policy.get("request_output_limits", {})
+        ignore_eos = policy.get("ignore_eos", True)
+        document = _request_template(
+            workload_id,
+            requests,
+            policy["output_tokens"][name],
+            warmup,
+            ignore_eos=ignore_eos,
+            output_limits=request_limits.get(name, {}),
+            warmup_output_tokens=policy.get("warmup_output_tokens"),
+        )
         write_json(template_path, document)
         lengths = [len(c.prompts[turn]) for c, turn in requests]
         prefix_lengths = []
@@ -160,7 +184,11 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
         report["workloads"][workload_id] = {
             "template": str(template_path),
             "formal_request_count": len(requests),
-            "output_tokens_per_request": policy["output_tokens"][name],
+            "output_tokens_per_request": policy["output_tokens"][name]
+            if ignore_eos and not request_limits.get(name)
+            else None,
+            "output_token_limit": policy["output_tokens"][name],
+            "ignore_eos": ignore_eos,
             "input_tokens": {"minimum": min(lengths), "median": statistics.median(lengths), "maximum": max(lengths)},
             "shared_input_prefix_tokens": prefix_lengths,
             "requests": [
@@ -171,6 +199,29 @@ def prepare_sharegpt(dataset: Path, policy_path: Path, tokenizer_path: str, outp
 
     write_json(output_dir / "selection_report.json", report)
     return report
+
+
+def _excluded_conversations(selection_reports: list[str]) -> set[str]:
+    """Keep previous development, confirmation and calibration identities out.
+
+    Inputs are explicit selection reports, never predictions or target scores.
+    Exclusion uses original conversation identity, including split chunks.
+    """
+
+    excluded: set[str] = set()
+    for path in selection_reports:
+        report = load_json(require_repo_path(path))
+        for workload in report["workloads"].values():
+            excluded.update(request["conversation_id"] for request in workload["requests"])
+
+        excluded.update(report.get("confirmation_conversation_ids", []))
+        excluded.update(report.get("independent_calibration_conversation_ids", []))
+        if "warmup" in report:
+            excluded.add(report["warmup"]["conversation_id"])
+        if "warmup_conversation_id" in report:
+            excluded.add(report["warmup_conversation_id"])
+
+    return excluded
 
 
 def _take(values: list[Conversation], count: int, description: str) -> list[Conversation]:
@@ -191,13 +242,26 @@ def _common_prefix(left: tuple[int, ...], right: tuple[int, ...]) -> int:
 
 
 def _request_template(
-    workload_id: str, requests: list[tuple[Conversation, int]], output_tokens: int, warmup: Conversation
+    workload_id: str,
+    requests: list[tuple[Conversation, int]],
+    output_tokens: int,
+    warmup: Conversation,
+    *,
+    ignore_eos: bool = True,
+    output_limits: dict[str, int] | None = None,
+    warmup_output_tokens: int | None = None,
 ) -> dict[str, Any]:
     definitions = {"warmup": {"prompt_token_ids": list(warmup.prompts[0])}}
+    if warmup_output_tokens is not None:
+        definitions["warmup"]["sampling"] = {"max_new_tokens": warmup_output_tokens}
+
     steps = [{"id": "warmup", "kind": "request", "request": "warmup", "phase": "prepare", "measure": False}]
     for index, (conversation, turn) in enumerate(requests):
         name = f"request_{index:03d}"
         definitions[name] = {"prompt_token_ids": list(conversation.prompts[turn])}
+        if output_limits is not None and str(index) in output_limits:
+            definitions[name]["sampling"] = {"max_new_tokens": output_limits[str(index)]}
+
         steps.append({"id": name, "kind": "request", "request": name, "phase": "formal", "measure": True})
 
     return {
@@ -209,7 +273,7 @@ def _request_template(
                 "temperature": 0,
                 "top_p": 1.0,
                 "top_k": 1,
-                "ignore_eos": True,
+                "ignore_eos": ignore_eos,
             }
         },
         "fragments": {},
