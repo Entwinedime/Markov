@@ -24,6 +24,14 @@ void append_once(std::vector<std::size_t> & values, std::size_t value) {
     if (std::ranges::find(values, value) == values.end()) values.push_back(value);
 }
 
+void canonicalize_expression(nlohmann::json & expression) {
+    if (!expression.is_array()) return;
+    for (auto argument = std::next(expression.begin()); argument != expression.end(); ++argument) canonicalize_expression(*argument);
+
+    static const std::set<std::string> commutative{ "add", "mul", "min", "max", "eq", "and", "or" };
+    if (commutative.contains(expression.at(0).get<std::string>())) std::sort(std::next(expression.begin()), expression.end());
+}
+
 nlohmann::json execution_signature(const nlohmann::json & frame) {
     nlohmann::json result{
         { "host_resource", frame.at("host_resource") },
@@ -771,7 +779,7 @@ std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_s
     std::vector<const nlohmann::json *> patterns(library_.execution_patterns_.size());
     for (const auto & [pattern, identity] : library_.execution_patterns_) patterns[identity] = &pattern;
 
-    std::vector<std::pair<nlohmann::json, nlohmann::json>> signatures;
+    std::vector<std::tuple<nlohmann::json, nlohmann::json, nlohmann::json>> signatures;
     std::map<nlohmann::json, std::set<nlohmann::json>> contexts;
     for (const auto & candidate : execution_candidates_) {
         const auto & pattern = *patterns[candidate.at("pattern").get<std::size_t>()];
@@ -786,8 +794,14 @@ std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_s
             binding_signature.push_back(private_event ? nlohmann::json(nullptr) : value);
             if (!private_event) context.insert(resource);
         }
+        auto guards = candidate.at("guards");
         auto conditions = nlohmann::json::array();
-        for (const auto & guard : candidate.at("guards")) conditions.push_back(guard.at("condition"));
+
+        // Compare semantic keys after naming symbols; executable guards keep their original evaluation order.
+        for (auto & guard : guards) {
+            canonicalize_expression(guard.at("condition"));
+            conditions.push_back(guard.at("condition"));
+        }
         const auto & call = pattern.at("host_call");
         const auto caller = call.is_null() ? nlohmann::json(nullptr)
                                            : resources.at(pattern.at("nodes").at(call.at("entry").get<std::size_t>()).at("resource").get<std::size_t>());
@@ -800,13 +814,13 @@ std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_s
         };
         if (context.size() > 1) contexts[key].insert(context);
         key["context"] = context;
-        signatures.emplace_back(std::move(key), std::move(binding_signature));
+        signatures.emplace_back(std::move(key), std::move(binding_signature), std::move(guards));
     }
 
     for (std::size_t index = 0; index < execution_candidates_.size(); ++index) {
         const auto & candidate = execution_candidates_[index];
         const auto & resources = candidate.at("resources");
-        auto [key, binding_signature] = std::move(signatures[index]);
+        auto [key, binding_signature, guards] = std::move(signatures[index]);
 
         // An empty implementation has no device context; share it only with one observed calling context.
         if (key.at("context").size() == 1 && key.at("context").at(0) == key.at("caller")) {
@@ -827,7 +841,7 @@ std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_s
         }
         selected.push_back(identity);
         nlohmann::json signature{
-            {    "guards",  candidate.at("guards") },
+            {    "guards",       std::move(guards) },
             {   "pattern", candidate.at("pattern") },
             { "resources",       binding_signature }
         };
