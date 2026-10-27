@@ -59,6 +59,24 @@ performance.models 可省略，表示独立模型尚未选定；execution 必须
 结构或变量未知时先报告事实缺口，不能靠重复采样把它变成成本缺口。
 已授权执行的补采必须有累计预算和停止条件；不建立无界的“预测失败—补点—重跑”循环。
 
+### 已实现的独立成本查询
+
+```bash
+scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cost_queries.json /path/to/cost_report.json
+```
+
+这是模型维护与覆盖检查入口。查询文件给出 deployment、models 路径和 work 列表；相对模型路径以查询文件所在目录为起点。
+deployment 沿用预测请求的六项条件。每项工作为 operation、implementation、timing_scope 和数值 features；
+正式目标规划器接入后生成这些描述，应用用户不需要手工逐节点填写。
+
+选定模型文件只有 deployment 和 models 两项。每个模型给出相同的操作/实现/计时口径、intercept_ns、coefficients_ns、
+特征 ranges、完整 measured_points、extrapolation_features、allow_new_combinations 及 sources。
+这些是离线维护结果，不在查询过程中拟合；旧成本资产需显式转换单位和合同，程序不猜格式或长期兼容两套字段。
+
+报告逐项返回状态、可用时的整数 duration_ns、覆盖类别和模型来源引用。缺失或不支持的耗时为 null。
+模型的部署条件必须与请求一致；不同 scope 的耗时不会被自动求和。查询完成不代表目标结构、完整 HTTP 或精度验收通过。
+报告不能覆盖查询文件或选定模型文件，写入失败时不以不完整文件替代原报告。
+
 ## workload 规模与可复现性
 
 请求数量、每请求输入与生成上限由 workload 显式控制，不按实验名称硬编码，也不裁剪已采 trace 来缩小 DAG。

@@ -1,6 +1,6 @@
 # 项目主工作流
 
-更新时间：2026-10-27。
+更新时间：2026-10-28。
 
 ## 项目保留的主思路
 
@@ -29,7 +29,7 @@
 一个代表目标有约 1,223 万活跃节点和 3,343 万活跃边，同批还存在重复成本查询、无关回调与目标级源分析。
 这些是静态分析与旧资产统计，尚未取得新实现的效率成绩。
 
-全量重构已交付筹备基线并进入入口与构建阶段；目标是理顺三阶段职责、实现同输入批次显著提速和缩减规模，尚无新预测精度或效率结果。
+全量重构已交付入口与构建底座，已有原始 DAG 回放和来源工作描述的独立成本查询，正在联合接通目标结构与执行；正式目标预测、同输入批次提速和规模目标尚未验收。
 
 ## 资产仍在哪里
 
@@ -37,13 +37,14 @@
 
 | 资产 | 当前保留用途 |
 | --- | --- |
-| `data/reproductions/hicache/` | 186 格恢复的 base/CPU 配对、tokens、独立成本、正常对照、预测和评分 |
-| `data/modeling_runs/prediction-layers-20261022-hZDock/` | 旧分层、代表结构、应用与搜索验证输入和结果 |
-| `data/modeling_runs/e2e-outlier-20261022-3Nxfsq/` | 大误差归因、base/target 正常观测与诊断 |
-| `data/search_runs/hicache-demo-20261023/` | 已完成搜索展示、共享成本来源与机制证据 |
-| `data/search_runs/hicache-autotuning-20261025/` | 已终止研究的开发、部分正式结果、资源记录及失败证据 |
+| `data/archive/reproductions/hicache/` | 186 格恢复的 base/CPU 配对、tokens、独立成本、正常对照、预测和评分 |
+| `data/archive/modeling_runs/prediction-layers-20261022-hZDock/` | 旧分层、代表结构、应用与搜索验证输入和结果 |
+| `data/archive/modeling_runs/e2e-outlier-20261022-3Nxfsq/` | 大误差归因、base/target 正常观测与诊断 |
+| `data/archive/search_runs/hicache-demo-20261023/` | 已完成搜索展示、共享成本来源与机制证据 |
+| `data/archive/search_runs/hicache-autotuning-20261025/` | 已终止研究的开发、部分正式结果、资源记录及失败证据 |
 | `third_party/sglang`、`third_party/ktransformers` | 原位保留的框架依赖；SGLang 配套提交为 `99e8be732` |
 
 旧实现源码及说明位于 `deprecated/`，完整历史文档位于 `deprecated/docs/`。
 历史资产、原始观测、校正与正常真值各自保留原身份；新实现应显式接收必要来源，不能扫描目录猜输入。
-本轮没有设备采集、仿真、评分或数据清理；新的准确率、结构一致性和速度均待实现后验证。
+本轮已运行源回放，尚未进行设备采集、目标预测、独立评分或数据清理；源回放不授予正常预测精度资格。
+历史运行目录现位于 data/archive；本轮新输入与输出使用 data/rebuild，并通过显式 manifest 指向归档来源。

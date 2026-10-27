@@ -1,7 +1,7 @@
 # Markov
 
 项目正在全量重构。旧实现、配置、环境和文档在本地 deprecated 中保留，并已保存到历史提交。
-当前提供输入预览、采集 manifest 检查与 modeling 构建；原始 DAG、正式预测、采集和搜索正在按阶段恢复。
+当前提供输入预览、采集 manifest 检查与 modeling 构建，原始 DAG 回放已进入真实输入验证；正式预测、采集和搜索正在按阶段恢复。
 
 项目继续使用三阶段路线：base trace 构建原始 DAG，配置与执行规则生成目标工作和依赖，
 独立成本模型与未变工作的源成本填入后执行，预测完整 HTTP。实验与资源成本搜索在上层共用这一预测器。
@@ -27,10 +27,28 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core inspect-manifest /
 manifest 检查核对声明通道文件和访问路径，不加载 trace 内容或构建 DAG。
 modeling 开发容器无设备和网络，默认内存上限 4 GiB；通过 `MARKOV_MODELING_MEMORY` 显式调整。
 
+原始 DAG 的实验诊断入口：
+
+```bash
+MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
+  build/modeling/Release/markov_core source /path/to/profile_manifest.json /path/to/source_report.json
+```
+
+目前只验证过一份 SGLang 来源；报告保留源等待与 gap，分别列出请求回放和设备时间差异，不能当作正常运行预测精度。
+设备依赖与 KTransformers 尚未完成验收。此命令严格读取 manifest 声明的文件，不自动修复不完整采集。
+
+独立成本查询已有单独入口，供模型维护时检查工作覆盖与响应：
+
+```bash
+scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cost_queries.json /path/to/cost_report.json
+```
+
+它只读取选定模型和工作描述，不读取 base 或 target trace，不训练模型；结果是操作成本，尚未接入完整目标预测。
+
 ## 新文档从哪里读
 
 - [整体架构](docs/design/architecture.md)：三阶段、共同合同、粒度与建议源码职责。
-- [用户合同](docs/design/user_contract.md)：首次使用、性能维护、结果和错误；命令目前均为规划。
+- [用户合同](docs/design/user_contract.md)：输入、已交付入口及后续准备边界。
 - [成本与数据库](docs/design/cost_models.md)：源成本迁移、独立测量、离线模型和补采边界。
 - [验证方式](docs/design/validation.md)：三份报告、完整 HTTP、60/186 格和 10× 效率口径。
 - [工程与文档约束](docs/design/engineering_constraints.md)：代码表达、维护边界及三层文档规则。
