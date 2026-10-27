@@ -23,22 +23,26 @@ public:
         if (check_ == nullptr) throw std::runtime_error(dlerror());
     }
 
-    bool use_v3(std::int64_t rows, std::int64_t inner, std::int64_t columns, ge::DataType dtype, std::uint32_t cores, const std::string & soc) const {
+    bool use_v3(std::int64_t rows, std::int64_t inner, std::int64_t columns, ge::DataType dtype, bool with_bias, std::uint32_t cores,
+                const std::string & soc) const {
         gert::Tensor left;
         gert::Tensor right;
+        gert::Tensor bias;
         left.MutableOriginShape() = gert::Shape({ rows, inner });
         right.MutableOriginShape() = gert::Shape({ columns, inner });
+        bias.MutableOriginShape() = gert::Shape({ columns });
         left.MutableStorageShape() = left.GetOriginShape();
         right.MutableStorageShape() = right.GetOriginShape();
+        bias.MutableStorageShape() = bias.GetOriginShape();
 
         // Match the installed bridge's metadata conversion; no device data is allocated.
-        for (auto * tensor : { &left, &right }) {
+        for (auto * tensor : { &left, &right, &bias }) {
             tensor->SetOriginFormat(ge::FORMAT_ND);
             tensor->SetStorageFormat(ge::FORMAT_ND);
             tensor->SetDataType(dtype);
         }
 
-        return check_(&left, &right, nullptr, false, true, ge::FORMAT_ND, false, cores, soc);
+        return check_(&left, &right, with_bias ? &bias : nullptr, false, true, ge::FORMAT_ND, false, cores, soc);
     }
 
 private:
@@ -58,7 +62,7 @@ std::int64_t positive_integer(std::string_view text) {
 
 int main(int argc, char ** argv) {
     try {
-        if (argc != 8) throw std::invalid_argument("library, cube cores, SoC, K, N, dtype and maximum rows required");
+        if (argc != 9) throw std::invalid_argument("library, cube cores, SoC, K, N, dtype, maximum rows and bias mode required");
         const auto cores = positive_integer(argv[2]);
         if (cores > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("cube core count is too large");
         const auto inner = positive_integer(argv[4]);
@@ -66,6 +70,8 @@ int main(int argc, char ** argv) {
         const auto maximum = positive_integer(argv[7]);
         const std::string_view type(argv[6]);
         if (type != "torch.bfloat16" && type != "torch.float16") throw std::invalid_argument("BF16 or FP16 required");
+        const std::string_view bias(argv[8]);
+        if (bias != "bias" && bias != "none") throw std::invalid_argument("bias or none required");
 
         const MatrixSelector selector(argv[1]);
         const std::string soc(argv[3]);
@@ -75,7 +81,7 @@ int main(int argc, char ** argv) {
 
         // Exhaust the declared integer domain, then compress without fitting a threshold.
         for (std::int64_t row = 1;; ++row) {
-            if (selector.use_v3(row, inner, columns, dtype, static_cast<std::uint32_t>(cores), soc)) {
+            if (selector.use_v3(row, inner, columns, dtype, bias == "bias", static_cast<std::uint32_t>(cores), soc)) {
                 if (!first) first = row;
             }
             else if (first) {

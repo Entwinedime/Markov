@@ -228,28 +228,16 @@ class SGLangPrimitives:
         self.values = values
 
     @staticmethod
-    def model_resources(model: Any) -> tuple[list[tuple[Any, str]], list[tuple[int, int, int]]]:
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    def attention_geometries(model: Any) -> list[tuple[int, int, int]]:
         from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-        from torch.nn import Linear
 
-        weights = []
-        attention = set()
-
-        # Loaded local shards anchor the token/member geometry instead of reconstructed model shapes.
-        for module in model.modules():
-            if isinstance(module, Linear) or (
-                isinstance(module, LinearBase) and isinstance(module.quant_method, UnquantizedLinearMethod)
-            ):
-                weights.extend((module.weight, axis) for axis in ("M", "B"))
-            elif isinstance(module, VocabParallelEmbedding):
-                weights.append((module.weight, "B"))
-            elif isinstance(module, RadixAttention):
-                attention.add((module.tp_q_head_num, module.qk_head_dim, module.v_head_dim))
-
-        return weights, sorted(attention)
+        return sorted(
+            {
+                (module.tp_q_head_num, module.qk_head_dim, module.v_head_dim)
+                for module in model.modules()
+                if isinstance(module, RadixAttention)
+            }
+        )
 
     def positions(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         if self.values.recording.current_scope.get() is None:

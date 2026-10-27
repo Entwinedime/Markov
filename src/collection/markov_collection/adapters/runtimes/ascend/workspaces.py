@@ -33,7 +33,7 @@ class AscendWorkspaces:
         # ATB aligns the runner scratch buffer to 512 bytes before handing it to the allocator.
         return ((bound + 511) // 512) * 512
 
-    def reserve(self, cube_cores: int, geometries: list[tuple[int, int, int]]) -> dict[str, object]:
+    def reserve(self, cube_cores: int, geometries: list[tuple[int, int, int]], streams: list[int]) -> dict[str, object]:
         required = self.attention_bound(cube_cores, geometries)
         library = ctypes.CDLL(str(Path(torch_npu.__file__).parent / "lib/libtorch_npu.so"))
         allocator = library._ZN6at_npu6native18allocate_workspaceEmPv
@@ -41,19 +41,19 @@ class AscendWorkspaces:
         reserve.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p]
         reserve.restype = ctypes.c_int
 
-        stream = torch_npu.npu.current_stream().npu_stream
+        streams = list(dict.fromkeys(streams))
         torch_npu.npu.synchronize()
-        if reserve(ctypes.cast(allocator, ctypes.c_void_p), required, stream) != 0:
-            raise RuntimeError("native workspace bound reservation failed")
+        for stream in streams:
+            if reserve(ctypes.cast(allocator, ctypes.c_void_p), required, stream) != 0:
+                raise RuntimeError("native workspace bound reservation failed")
 
         minimum = ((required + 32 + 2097151) // 2097152) * 2097152
-        identity = self.stream_identity(stream)
-        established = any(
-            state["device"] == torch_npu.npu.current_device()
-            and state["stream"] == identity
-            and state["capacity_bytes"] >= minimum
+        retained = {
+            state["stream"]: state["capacity_bytes"]
             for state in self.snapshot()
-        )
+            if state["device"] == torch_npu.npu.current_device()
+        }
+        established = all(retained.get(self.stream_identity(stream), 0) >= minimum for stream in streams)
         if not established:
             raise RuntimeError("native allocator did not retain the declared workspace capacity")
         return {

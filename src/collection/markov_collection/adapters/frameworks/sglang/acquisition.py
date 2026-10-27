@@ -156,13 +156,12 @@ class SGLangAcquisition:
         rows = max_prompt_tokens
         for configuration in configurations:
             prefill = configuration["pd"]["prefill"] if "pd" in configuration else configuration
-            if "pd" not in configuration:
-                budget = prefill["max_prefill_tokens"]
-                page_size = configuration["page_size"]
+            budget = prefill["max_prefill_tokens"]
+            page_size = configuration["page_size"]
 
-                # A final whole request can start while the page-aligned prefix still has positive budget.
-                prefix = (budget - 1) // page_size * page_size
-                rows = max(rows, budget, prefix + max_prompt_tokens)
+            # Native Prefill can batch whole requests in both serving modes, independently of our controller.
+            prefix = (budget - 1) // page_size * page_size
+            rows = max(rows, budget, prefix + max_prompt_tokens)
 
             pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
             for pool in pools:
@@ -202,15 +201,11 @@ class SGLangAcquisition:
             {"page_size": domain["page_size"], "pd": representative} if domain.get("pd") else representative
         )
         maximum_prompt = max(
-            request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
+            max(prompt for prompt, _ in requests),
+            max(
+                request["prompt_tokens"] for workload in specification["workloads"] for request in workload["requests"]
+            ),
         )
-
-        # Target P runs one prompt; native representative acquisition can still batch its own requests.
-        if domain.get("pd"):
-            maximum_prompt = max(
-                maximum_prompt,
-                representative["prefill"]["max_running_requests"] * max(prompt for prompt, _ in requests),
-            )
         limits = SGLangAcquisition.row_limits(configurations, maximum_prompt)
         result = {
             "model": model["path"],

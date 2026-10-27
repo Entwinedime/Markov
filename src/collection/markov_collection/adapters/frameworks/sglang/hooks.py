@@ -54,6 +54,7 @@ class SGLangObservation:
             self.shard = SingleDeviceShard(shard["size"], shard["rank"], self.operators.values)
 
         self.model: Any = None
+        self.model_stream: Any = None
         self.selected = True
         self.derived_role = False
         self.observe_all_workers = description.get("observe_all_workers", False)
@@ -349,6 +350,13 @@ class SGLangObservation:
             return result
 
     def forward(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+        import torch
+
+        # Warmup discovers the context actually used by the model, including native PP's forward stream.
+        self.model_stream = torch.npu.current_stream()
+        if self.allocation is None:
+            with self.matrices:
+                return original(*args, **kwargs)
         if self.recording.current_scope.get() is None:
             return original(*args, **kwargs)
 
@@ -493,6 +501,8 @@ class SGLangObservation:
         # Reset logical pools without discarding the allocator state established by uniform warmup.
         result = original(scheduler, empty_cache=False)
         if result:
+            import torch
+
             from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
             from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
             from markov_collection.adapters.runtimes.ascend.materialization import AscendMaterializations
@@ -507,9 +517,13 @@ class SGLangObservation:
                     scheduler.req_to_token_pool.req_to_token.dtype,
                     ("B", "max_sequence_tokens"),
                 )
-                weights, attention = SGLangPrimitives.model_resources(self.model)
-                self.matrices.prepare(weights)
-                self.workspace_policy = self.workspaces.reserve(self.matrices.description["cube_cores"], attention)
+                with torch.npu.stream(self.model_stream):
+                    self.matrices.prepare()
+                self.workspace_policy = self.workspaces.reserve(
+                    self.matrices.description["cube_cores"],
+                    SGLangPrimitives.attention_geometries(self.model),
+                    [torch.npu.current_stream().npu_stream, self.model_stream.npu_stream],
+                )
             self.concatenation.warmup()
             self.allocation.warmup()
             self.materializations.warmup()
@@ -521,7 +535,8 @@ class SGLangObservation:
             if any(batch["observation"] == "source" for batch in self.recording.batches):
                 self.concatenation.capture()
                 self.allocation.capture()
-                self.matrices.capture()
+                with torch.npu.stream(self.model_stream):
+                    self.matrices.capture()
                 self.materializations.capture()
                 self.indexed_writes.capture()
         if result and self.disaggregation is not None and self.derived_role:

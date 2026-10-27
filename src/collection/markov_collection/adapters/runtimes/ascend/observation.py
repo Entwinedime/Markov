@@ -9,6 +9,7 @@ import torch
 import torch_npu
 
 from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
+from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation
 
 
@@ -39,32 +40,18 @@ class AscendOperatorObservation(OperatorObservation):
                 self.recording.operations[identity].update(execution_guards=guards, contiguous_storage=storage)
                 return result
 
-        if str(operation) not in {"aten.matmul.default", "aten.mm.default"}:
+        if str(operation) not in AscendMatrices.apis:
             return super().record_operation(operation, args, kwargs)
 
         with self.values.metadata():
-            left, right = args[:2]
-            eligible = (
-                left.device.type == right.device.type == "npu"
-                and left.ndim == right.ndim == 2
-                and left.dtype == right.dtype
-                and left.dtype in (torch.bfloat16, torch.float16)
-                and tuple(left.stride()) == (left.shape[1], 1)
-                and tuple(right.stride()) == (1, right.shape[0])
-                and torch_npu.get_npu_format(left) == torch_npu.get_npu_format(right) == 2
-            )
-            geometry = None
-            if eligible:
-                relation = self.values.shapes.shape(left)
-                geometry = {
-                    "rows": left.shape[0],
-                    "K": left.shape[1],
-                    "N": right.shape[1],
-                    "dtype": str(left.dtype),
-                    "axis": "matrix_rows",
-                }
+            geometry = AscendMatrices.geometry(operation, args, kwargs)
         if geometry is None:
             return super().record_operation(operation, args, kwargs)
+
+        biased = geometry["api"] == "aten.addmm.default"
+        left, right = args[1:3] if biased else args[:2]
+        with self.values.metadata():
+            relation = self.values.shapes.shape(left)
 
         # Isolate the actual operator, so a local prototype can serve any enclosing model module.
         outer = self.values.shapes.tensors.get(left) if relation is not None else None
@@ -77,7 +64,10 @@ class AscendOperatorObservation(OperatorObservation):
             with self.values.bind_input(left, {0: "matrix_rows"}):
                 with self.values.metadata():
                     scope.metadata["ports"] = {
-                        "inputs": self.values.port_values({"left": left, "right": right}), "outputs": {}
+                        "inputs": self.values.port_values(
+                            {"left": left, "right": right} | ({"bias": args[0]} if biased else {})
+                        ),
+                        "outputs": {},
                     }
                     scope.metadata["inputs"] = list(scope.metadata["ports"]["inputs"].values())
                     identity = len(self.recording.operations)

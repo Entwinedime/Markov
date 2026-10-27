@@ -24,7 +24,7 @@ class ExpertRoutingCall(NativeCall):
     def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
         hidden = args[0] if args else kwargs["hidden_states"]
         rows = self.values.shapes.tensor(hidden).shape[0]
-        count = self.layer.topk_config.top_k
+        count = result.topk_ids.shape[1]
         self.values.bind_shape(result.topk_ids, (rows, count))
         self.values.bind_shape(result.topk_weights, (rows, count))
         metadata["attributes"] = {"top_k": count, "renormalize": self.layer.topk_config.renormalize}
@@ -39,6 +39,7 @@ class ExpertCall(NativeCall):
     def invoke(self, hidden_states: Any, topk_output: Any) -> Any:
         self.metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
         layer = self.layer
+        self.top_k = topk_output.topk_ids.shape[1]
         with self.values.metadata():
             self.hidden = hidden_states
             self.values.bounded_parameter("expert_received", 0, sys.maxsize)
@@ -49,12 +50,12 @@ class ExpertCall(NativeCall):
                     "expert_begin": layer.moe_ep_rank * layer._num_local_routed,
                     "expert_count": layer._num_global_routed,
                     "local_expert_count": layer._num_local_routed,
-                    "expert_top_k": layer.top_k,
+                    "expert_top_k": self.top_k,
                 },
                 attributes={
                     "experts": layer.num_experts,
                     "local_experts": layer.num_local_experts,
-                    "top_k": layer.top_k,
+                    "top_k": self.top_k,
                     "ep_size": layer.moe_ep_size,
                 },
                 ports={
@@ -152,7 +153,7 @@ class ExpertCollectiveCall(NativeCall):
             )
             rows = self.values.shapes.symbol("expert_received")
             if frame.exchange == "combine":
-                rows = self.values.shapes.tensor(frame.hidden).shape[0] * frame.layer.top_k
+                rows = self.values.shapes.tensor(frame.hidden).shape[0] * frame.top_k
             self.values.bind_shape(result[1], (rows, *source.shape[1:]))
         metadata["communication"] = communication
 
