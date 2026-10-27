@@ -402,15 +402,24 @@ class Investigation:
             try:
                 deadline = time.monotonic() + 30
                 while process.poll() is None and time.monotonic() < deadline:
-                    identities = subprocess.check_output(
-                        ["docker", "ps", "-q", "--filter", f"label={task.environment.label}"], text=True
-                    ).split()
-                    if identities:
-                        containers = json.loads(subprocess.check_output(["docker", "inspect", *identities], text=True))
-                        if any("simulate" in container["Config"]["Cmd"] for container in containers):
-                            process.send_signal(signal.SIGINT)
-                            stopped = True
-                            break
+
+                    # Read commands in the same snapshot; transient containers may vanish before inspect.
+                    commands = subprocess.check_output(
+                        [
+                            "docker",
+                            "ps",
+                            "--no-trunc",
+                            "--format",
+                            "{{.Command}}",
+                            "--filter",
+                            f"label={task.environment.label}",
+                        ],
+                        text=True,
+                    ).splitlines()
+                    if any(" simulate " in command for command in commands):
+                        process.send_signal(signal.SIGINT)
+                        stopped = True
+                        break
                     time.sleep(0.05)
                 if process.poll() is None and not stopped:
                     process.send_signal(signal.SIGINT)
