@@ -11,6 +11,7 @@ line-length = 120
 extend-exclude = [
     "build",
     "data",
+    "deprecated",
     "docs/tmp",
     "third_party",
 ]

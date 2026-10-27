@@ -1,5 +1,20 @@
 # 当前工作进展
 
+## 10-27 旧实现归档，准备全量重构
+
+主仓库按采集、C++ 建模、Python 工作流、实验脚本、文档分成五个提交，已推送至 `origin/main`，
+迁移前基线为 `8668eec`；SGLang 的自然 token 回放和 NPU 导出配置改动单独提交并推送，子模块为 `99e8be732`。
+
+旧 `src/`、`scripts/`、`examples/`、`configs/`、`docker/`、根 CMake 和 Docker 上下文规则移至 `deprecated/`，
+保留源码内容、文件权限和目录层级。根目录尚无新的采集、预测、实验或搜索入口；归档代码用于对照，
+需要运行旧流程时使用迁移前提交的独立 checkout。此次搬移不计作代码瘦身或性能提升。
+`third_party/`、`data/`、`build/`、`ppts/` 与文档保留原位，未清理资产，未重启已终止的搜索。
+迁移核对为 574 个文件内容不变的 Git 重命名，其中自有源码 546 文件、88,814 行；归档目录之外没有遗留自有源码。
+
+迁移前 Python lint/格式、12 个 Shell 语法、14 个配置 JSON、SGLang 两文件语法，
+以及 modeling Docker 内 200 个变动 C/C++ 文件的格式检查通过。此次不重跑编译、设备采集或实验矩阵；
+历史结果仅描述归档实现，不作为新实现的验收。当前目录说明见[README](../README.md)。
+
 更新时间：2026-10-27。本文维护当前状态、待办和资产位置；用法见[建模说明](modeling_development.md)，
 公式见[成本模型](hicache_io_cost_model.md)，验收规则与历史实验见[验证说明](validation/hicache_validation.md)。
 

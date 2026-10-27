@@ -1,5 +1,8 @@
 # Profiling 开发与使用
 
+> 2026-10-27：本文描述的采集实现、脚本与环境定义已归档至 `deprecated/`。原命令属于迁移前布局，
+> 当前根目录不提供旧采集入口；旧运行基线与目录映射见[仓库说明](../README.md)。
+
 真实采集统一从 `scripts/profile.sh` 进入，由配置选择 SGLang 或 KTransformers 容器。
 采集结果通过 `profile_manifest.json` 交给建模，不需要手工寻找或拼接 trace。
 本文讲采集合同；预测和校准编排见[建模说明](modeling_development.md)，当前证据见[工作进展](work_progress.md)。

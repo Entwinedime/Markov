@@ -1,5 +1,8 @@
 # Modeling 开发与使用
 
+> 2026-10-27：本文描述的实现已归档至 `deprecated/`。原命令及源码路径属于迁移前布局，
+> 当前根目录不提供旧预测入口；旧运行基线与目录映射见[仓库说明](../README.md)。
+
 本项目从一个 base 的真实采集构建 source DAG，根据 target 配置推演缓存行为、工作量和耗时。
 用户提供平台/框架、model、base config、workload 和 target config 集合，流程负责采集、构图和预测；
 已有 profile 是复用方式，不是首次使用必须手工制作的输入。

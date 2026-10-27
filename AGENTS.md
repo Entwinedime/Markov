@@ -2,6 +2,15 @@
 
 本文件约束在本仓库中工作的代码代理，适用于根目录及其子目录；子目录存在更具体的 `AGENTS.md` 时，按其适用范围执行。用户明确指令优先。本文中的“必须”“不得”为硬性约束，“优先”为默认选择，偏离时应说明理由。
 
+## 当前仓库阶段（2026-10-27）
+
+旧自有实现已按用户要求移至 `deprecated/`，新的实现尚未开始。下文的 `src/`、`scripts/`、`examples/`、
+`configs/`、`docker/` 及原运行命令均描述迁移前布局，查阅源码时对应 `deprecated/` 下的同名目录；
+这些历史命令不得作为当前根目录的可用入口。归档前提交为 `8668eec`，需要运行旧流程时使用该提交的独立 checkout。
+`deprecated/` 默认用于对照，不继续迭代旧实现；新实现的目录和职责通过后续设计明确。
+本文件的编码规范、数据隔离、资源安全与数据保护要求继续适用；本次归档不代表完成瘦身或提速。
+`third_party/`、`data/`、`build/` 和 `ppts/` 留在原位，不因源码归档而清理或改写。
+
 ## 1. 开始工作前
 
 - 先阅读 `README.md`、`docs/project_constraints.md`，再根据任务阅读 `docs/profiling_development.md` 或 `docs/modeling_development.md`。成本模型、验收和数据资产分别查阅 `docs/hicache_io_cost_model.md`、`docs/validation/hicache_validation.md`、`docs/work_progress.md`。
