@@ -526,7 +526,8 @@ class SGLangObservation:
                 )
             self.concatenation.warmup()
             self.allocation.warmup()
-            self.materializations.warmup()
+            with torch.npu.stream(self.model_stream):
+                self.materializations.warmup()
             self.indexed_writes.warmup()
 
             boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
@@ -537,7 +538,7 @@ class SGLangObservation:
                 self.allocation.capture()
                 with torch.npu.stream(self.model_stream):
                     self.matrices.capture()
-                self.materializations.capture()
+                    self.materializations.capture()
                 self.indexed_writes.capture()
         if result and self.disaggregation is not None and self.derived_role:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
