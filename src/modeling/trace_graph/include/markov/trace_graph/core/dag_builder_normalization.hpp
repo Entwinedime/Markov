@@ -25,7 +25,7 @@ struct EventLaneIdentity {
 };
 
 [[nodiscard]] uint64_t node_end_ts(const TraceEvent & event);
-[[nodiscard]] bool is_hicache_control_event(const TraceEvent & event);
+[[nodiscard]] bool is_control_envelope(const TraceEvent & event);
 [[nodiscard]] bool is_submit_anchor_event(const TraceEvent & event);
 [[nodiscard]] EventLaneIdentity resolve_event_lane(const TraceEvent & event, bool collect_aliases);
 

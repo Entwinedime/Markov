@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include <algorithm>
 #include <set>
@@ -12,7 +13,7 @@ bool min_call(const core::TraceEvent & e, uint64_t numel) {
 }
 } // namespace
 
-PrefetchWorkerObservations observe_prefetch_workers(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives) {
+PrefetchWorkerObservations observe_prefetch_workers(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives) {
     PrefetchWorkerObservations out;
     const auto & events = source.graph().runtime_observations();
     using Lane = std::pair<std::string, std::string>;
@@ -125,7 +126,7 @@ PrefetchWorkerObservations observe_prefetch_workers(const patch::HiCacheSourceDa
         if (!drain_calls.empty()) ++out.issues["drain_min_without_return"];
     }
     std::map<size_t, size_t> worker_releases;
-    std::map<Lane, std::vector<const patch::HiCacheSourceFactNode *>> worker_frames;
+    std::map<Lane, std::vector<const adapters::sglang::HiCacheFactObservation *>> worker_frames;
     for (const auto & fact : source.fact_nodes())
         if (fact.fact_role == "prefetch_io_observed") worker_frames[{ fact.pid, fact.tid }].push_back(&fact);
     for (auto & [lane, frames] : worker_frames) std::ranges::sort(frames, {}, [](const auto * fact) { return fact->timestamp_us; });
@@ -139,7 +140,7 @@ PrefetchWorkerObservations observe_prefetch_workers(const patch::HiCacheSourceDa
             if (release.request_id.empty()) release.issue = "abort_request_not_observed";
             continue; // Explicit scope, not a guessed worker or successful completion.
         }
-        std::vector<const patch::HiCacheSourceFactNode *> parents;
+        std::vector<const adapters::sglang::HiCacheFactObservation *> parents;
         if (release.owner == "prefetch_completion") {
             for (const auto & fact : source.fact_nodes()) {
                 if (fact.pid != e.pid || fact.tid != e.tid) continue;
@@ -188,7 +189,7 @@ PrefetchWorkerObservations observe_prefetch_workers(const patch::HiCacheSourceDa
             query.issue = "query_allocation_or_release_geometry";
             continue;
         }
-        std::vector<const patch::HiCacheSourceFactNode *> workers;
+        std::vector<const adapters::sglang::HiCacheFactObservation *> workers;
         for (const auto & fact : source.fact_nodes())
             if (fact.fact_role == "prefetch_io_observed" && fact.pid == q.pid && fact.operation_id == q.arg("operation_id")) workers.push_back(&fact);
         const auto issued = *allocated - *released;

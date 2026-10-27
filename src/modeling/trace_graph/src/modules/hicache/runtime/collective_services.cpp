@@ -1,4 +1,6 @@
 #include "markov/trace_graph/modules/hicache/runtime/collective_services.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -16,7 +18,7 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::DeviceCollectiveCall> calls,
+void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls,
                                      uint64_t begin_us, uint64_t end_us) {
     using Ref = core::DagNodeRef;
     using Kind = core::DagEdgeKind;
@@ -35,7 +37,7 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGrap
         std::optional<size_t> device;
     };
     std::map<size_t, WorkerReplacement> worker_replacements;
-    const patch::HiCacheSourceDagIndex source(original);
+    const adapters::sglang::HiCacheSourceIndex source(original);
     const auto queues = simulation::detail::discover_cpu_task_queues(original);
     for (const auto & call : calls) {
         const auto & event = original.runtime_observations().at(call.region.observation);
@@ -81,13 +83,13 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGrap
         const auto task = std::ranges::find_if(*tasks, [&](const auto & candidate) { return candidate.devices.contains(node); });
         if (task == tasks->end() || task->devices.size() != 1)
             throw std::runtime_error("Collective CPU replacement needs one logical communication launch per reduction task");
-        if (source_dag::collective_task_kind(original.event_for_node(queues.tasks.at(task->task).submission).name) != call.transfer)
+        if (adapters::sglang::collective_task_kind(original.event_for_node(queues.tasks.at(task->task).submission).name) != call.transfer)
             throw std::runtime_error("Collective CPU submission does not match its declared HCCL transfer");
 
         for (const auto & observed : *tasks) {
             using TaskKind = structure::hicache::CollectiveTaskKind;
             const auto & queued = queues.tasks.at(observed.task);
-            const auto primitive = source_dag::collective_task_kind(original.event_for_node(queued.submission).name);
+            const auto primitive = adapters::sglang::collective_task_kind(original.event_for_node(queued.submission).name);
             if (!primitive) throw std::runtime_error("Collective call contains an unsupported queued CPU primitive");
             const bool cpu_only = *primitive == TaskKind::Destroy;
             if (observed.devices.size() != (cpu_only ? 0 : 1)) throw std::runtime_error("Collective queue primitive lacks its expected device-event ownership");

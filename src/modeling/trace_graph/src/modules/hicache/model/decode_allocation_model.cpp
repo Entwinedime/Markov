@@ -6,7 +6,7 @@
 namespace markov::trace_graph::modules::hicache::model {
 
 void HiCacheState::apply_cache_decode_allocation(const HiCacheFact & fact) {
-    if (!execution_prefetch_control_ || fact.batch_paths.empty() || fact.batch_paths.size() != fact.decode_iterations.size())
+    if ((formal_window_active_ && !execution_prefetch_control_) || fact.batch_paths.empty() || fact.batch_paths.size() != fact.decode_iterations.size())
         throw std::invalid_argument("Decode allocation requires a complete execution action");
     auto & scope = scope_state(fact);
     const auto page_size = pager_.page_size_for_fact(fact);

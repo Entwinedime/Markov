@@ -2,6 +2,7 @@
  * @file
  * @brief Commit D2H/H2S exact-ledger attribution and lifecycle identity.
  */
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
@@ -17,21 +18,21 @@ namespace markov::trace_graph::modules::hicache::patch::attribution_detail {
 using model::HiCacheEffectDecision;
 using model::HiCacheSourceCarrierState;
 
-bool role_contract_available(const HiCacheSourceDagIndex & source, std::string_view role) {
+bool role_contract_available(const adapters::sglang::HiCacheSourceIndex & source, std::string_view role) {
     return source.graph().has_input_contract("hicache_dag_patch") || !source.nodes_for_fact_role(role).empty();
 }
 
 namespace {
 
-bool nested_call(const HiCacheSourceFactNode & child, const HiCacheSourceFactNode & parent) {
+bool nested_call(const adapters::sglang::HiCacheFactObservation & child, const adapters::sglang::HiCacheFactObservation & parent) {
     return child.pid == parent.pid && child.tid == parent.tid && child.timestamp_us >= parent.timestamp_us && fact_end(child) <= fact_end(parent);
 }
 
-bool contains_object_node(const HiCacheSourceFactNode & fact, uint64_t node_id) {
+bool contains_object_node(const adapters::sglang::HiCacheFactObservation & fact, uint64_t node_id) {
     return std::ranges::find(fact.operation_node_ids, node_id) != fact.operation_node_ids.end();
 }
 
-template <typename Fn> void for_each_role_fact_including_tail(const HiCacheSourceDagIndex & source, std::string_view role, Fn fn) {
+template <typename Fn> void for_each_role_fact_including_tail(const adapters::sglang::HiCacheSourceIndex & source, std::string_view role, Fn fn) {
     for (size_t node_id : source.nodes_for_fact_role(role)) {
         const auto * fact = source.fact_node(node_id);
         if (fact != nullptr) fn(*fact);
@@ -41,8 +42,9 @@ template <typename Fn> void for_each_role_fact_including_tail(const HiCacheSourc
     }
 }
 
-const HiCacheSourceFactNode * paired_call_end(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & start) {
-    const HiCacheSourceFactNode * match = nullptr;
+const adapters::sglang::HiCacheFactObservation * paired_call_end(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                 const adapters::sglang::HiCacheFactObservation & start) {
+    const adapters::sglang::HiCacheFactObservation * match = nullptr;
     bool ambiguous = false;
     for_each_role_fact_including_tail(source, start.fact_role, [&](const auto & candidate) {
         if (candidate.phase != "end" || candidate.target_id != start.target_id || candidate.pid != start.pid || candidate.tid != start.tid
@@ -55,9 +57,9 @@ const HiCacheSourceFactNode * paired_call_end(const HiCacheSourceDagIndex & sour
     return match;
 }
 
-std::vector<const HiCacheSourceFactNode *> nested_role_facts(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor,
-                                                             std::string_view role) {
-    std::vector<const HiCacheSourceFactNode *> matches;
+std::vector<const adapters::sglang::HiCacheFactObservation *>
+    nested_role_facts(const adapters::sglang::HiCacheSourceIndex & source, const adapters::sglang::HiCacheFactObservation & anchor, std::string_view role) {
+    std::vector<const adapters::sglang::HiCacheFactObservation *> matches;
     for_each_role_fact_including_tail(source, role, [&](const auto & fact) {
         if (nested_call(fact, anchor)) matches.push_back(&fact);
     });
@@ -68,14 +70,14 @@ std::vector<const HiCacheSourceFactNode *> nested_role_facts(const HiCacheSource
     return matches;
 }
 
-bool complete_d2h_page_identity(const HiCacheSourceFactNode & enqueue) {
+bool complete_d2h_page_identity(const adapters::sglang::HiCacheFactObservation & enqueue) {
     if (enqueue.page_hashes.empty()) return false;
     const std::set<std::string_view> unique_hashes(enqueue.page_hashes.begin(), enqueue.page_hashes.end());
     return unique_hashes.size() == enqueue.page_hashes.size()
            && std::ranges::all_of(enqueue.page_hashes, [](const auto & page_hash) { return !page_hash.empty(); });
 }
 
-bool exact_capacity_release_closure(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & enqueue) {
+bool exact_capacity_release_closure(const adapters::sglang::HiCacheSourceIndex & source, const adapters::sglang::HiCacheFactObservation & enqueue) {
     if (!enqueue.object_node_id) return false;
     size_t match_count = 0;
     for_each_role_fact_including_tail(source, "commit_capacity_release_observed", [&](const auto & start) {
@@ -88,12 +90,13 @@ bool exact_capacity_release_closure(const HiCacheSourceDagIndex & source, const 
     return match_count == 1;
 }
 
-const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & enqueue) {
+const adapters::sglang::HiCacheFactObservation * delayed_write_back_owner(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                          const adapters::sglang::HiCacheFactObservation & enqueue) {
     if (enqueue.write_back != true || enqueue.phase != "end" || enqueue.effective_token_count == 0 || !enqueue.object_node_id
         || !complete_d2h_page_identity(enqueue) || !exact_capacity_release_closure(source, enqueue))
         return nullptr;
 
-    const HiCacheSourceFactNode * capacity_result = nullptr;
+    const adapters::sglang::HiCacheFactObservation * capacity_result = nullptr;
     bool ambiguous_capacity_result = false;
     for_each_role_fact_including_tail(source, "capacity_result_observed", [&](const auto & candidate) {
         if (candidate.phase != "end" || candidate.pid != enqueue.pid || candidate.cache_scope != enqueue.cache_scope || !nested_call(enqueue, candidate))
@@ -103,7 +106,7 @@ const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagInd
     });
     if (ambiguous_capacity_result || capacity_result == nullptr) return nullptr;
 
-    const HiCacheSourceFactNode * owner = nullptr;
+    const adapters::sglang::HiCacheFactObservation * owner = nullptr;
     for_each_role_fact_including_tail(source, "cache_lifecycle_commit", [&](const auto & candidate) {
         if (candidate.phase != "end" || candidate.pid != enqueue.pid || candidate.cache_scope != enqueue.cache_scope
             || fact_boundary(candidate) > capacity_result->timestamp_us || nested_call(enqueue, candidate))
@@ -119,7 +122,7 @@ const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagInd
     // it to the current allocation opportunity, without importing prelude cost.
     // A later canonical input closes that opportunity; proximity alone is not
     // enough to attach arbitrary asynchronous writes to an earlier extension.
-    const HiCacheSourceFactNode * latest_input = nullptr;
+    const adapters::sglang::HiCacheFactObservation * latest_input = nullptr;
     for (const auto & candidate : source.fact_nodes()) {
         if (candidate.fact_class != "workload_identity" || candidate.pid != enqueue.pid || candidate.tid != enqueue.tid
             || candidate.cache_scope != enqueue.cache_scope || fact_boundary(candidate) > capacity_result->timestamp_us)
@@ -131,8 +134,9 @@ const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagInd
     return latest_input != nullptr && latest_input->fact_role == "cache_extend_input" && latest_input->phase == "start" ? latest_input : nullptr;
 }
 
-const HiCacheSourceFactNode * paired_tail_call_end(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & start) {
-    const HiCacheSourceFactNode * match = nullptr;
+const adapters::sglang::HiCacheFactObservation * paired_tail_call_end(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                      const adapters::sglang::HiCacheFactObservation & start) {
+    const adapters::sglang::HiCacheFactObservation * match = nullptr;
     for (const auto & candidate : source.tail_context_facts()) {
         if (candidate.fact_role != start.fact_role || candidate.phase != "end" || candidate.target_id != start.target_id || candidate.pid != start.pid
             || candidate.tid != start.tid || candidate.timestamp_us != start.timestamp_us)
@@ -145,7 +149,8 @@ const HiCacheSourceFactNode * paired_tail_call_end(const HiCacheSourceDagIndex &
 
 } // namespace
 
-std::vector<const HiCacheSourceFactNode *> commit_d2h_enqueues(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor) {
+std::vector<const adapters::sglang::HiCacheFactObservation *> commit_d2h_enqueues(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                                  const adapters::sglang::HiCacheFactObservation & anchor) {
     auto matches = nested_role_facts(source, anchor, "commit_device_to_host_enqueue_observed");
     matches.erase(std::remove_if(matches.begin(), matches.end(), [](const auto * fact) { return fact->phase != "end"; }), matches.end());
     for_each_role_fact_including_tail(source, "commit_device_to_host_enqueue_observed", [&](const auto & enqueue) {
@@ -162,12 +167,13 @@ std::vector<const HiCacheSourceFactNode *> commit_d2h_enqueues(const HiCacheSour
     return matches;
 }
 
-std::vector<const HiCacheSourceFactNode *> capacity_release_calls(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor) {
+std::vector<const adapters::sglang::HiCacheFactObservation *> capacity_release_calls(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                                     const adapters::sglang::HiCacheFactObservation & anchor) {
     std::set<uint64_t> object_node_ids;
     for (const auto * enqueue : commit_d2h_enqueues(source, anchor)) {
         if (enqueue->effective_token_count > 0 && enqueue->object_node_id) object_node_ids.insert(*enqueue->object_node_id);
     }
-    std::vector<const HiCacheSourceFactNode *> releases;
+    std::vector<const adapters::sglang::HiCacheFactObservation *> releases;
     for_each_role_fact_including_tail(source, "commit_capacity_release_observed", [&](const auto & start) {
         if (start.phase != "start" || start.pid != anchor.pid) return;
         const bool owns_node = std::ranges::any_of(object_node_ids, [&](uint64_t object_node_id) { return contains_object_node(start, object_node_id); });
@@ -181,7 +187,7 @@ std::vector<const HiCacheSourceFactNode *> capacity_release_calls(const HiCacheS
     return releases;
 }
 
-bool all_capacity_releases_in_tail(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor) {
+bool all_capacity_releases_in_tail(const adapters::sglang::HiCacheSourceIndex & source, const adapters::sglang::HiCacheFactObservation & anchor) {
     std::set<uint64_t> expected;
     for (const auto * enqueue : commit_d2h_enqueues(source, anchor)) {
         if (enqueue->effective_token_count > 0 && enqueue->object_node_id) expected.insert(*enqueue->object_node_id);
@@ -202,8 +208,9 @@ bool all_capacity_releases_in_tail(const HiCacheSourceDagIndex & source, const H
 
 namespace {
 
-std::vector<const HiCacheIoOperationRecord *> d2h_records_for_commit(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations,
-                                                                     const HiCacheSourceFactNode & anchor) {
+std::vector<const HiCacheIoOperationRecord *> d2h_records_for_commit(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                     const HiCacheIoOperationLedger & operations,
+                                                                     const adapters::sglang::HiCacheFactObservation & anchor) {
     std::set<uint64_t> object_node_ids;
     for (const auto * enqueue : commit_d2h_enqueues(source, anchor)) {
         if (enqueue->effective_token_count > 0 && enqueue->object_node_id) object_node_ids.insert(*enqueue->object_node_id);
@@ -227,8 +234,9 @@ std::vector<const HiCacheIoOperationRecord *> d2h_records_for_commit(const HiCac
     return records;
 }
 
-std::vector<const HiCacheIoOperationRecord *> h2s_records_for_commit(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations,
-                                                                     const HiCacheSourceFactNode & anchor) {
+std::vector<const HiCacheIoOperationRecord *> h2s_records_for_commit(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                     const HiCacheIoOperationLedger & operations,
+                                                                     const adapters::sglang::HiCacheFactObservation & anchor) {
     std::set<std::string> operation_ids;
     for (const auto * release : capacity_release_calls(source, anchor)) {
         for (const auto * enqueue : nested_role_facts(source, *release, "writeback_enqueue_observed")) {
@@ -247,8 +255,9 @@ std::vector<const HiCacheIoOperationRecord *> h2s_records_for_commit(const HiCac
 
 } // namespace
 
-void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations, const HiCacheEffectDecision & decision,
-                                     const HiCacheSourceFactNode & anchor, HiCacheSourceAttribution & output) {
+void classify_commit_d2h_from_ledger(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheIoOperationLedger & operations,
+                                     const HiCacheEffectDecision & decision, const adapters::sglang::HiCacheFactObservation & anchor,
+                                     HiCacheSourceAttribution & output) {
     const auto records = d2h_records_for_commit(source, operations, anchor);
     std::set<uint64_t> expected_object_node_ids;
     for (const auto * enqueue : commit_d2h_enqueues(source, anchor)) {
@@ -347,8 +356,8 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
     (void)source;
 }
 
-void classify_commit_h2s_from_ledger(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations, const HiCacheSourceFactNode & anchor,
-                                     HiCacheSourceAttribution & output) {
+void classify_commit_h2s_from_ledger(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheIoOperationLedger & operations,
+                                     const adapters::sglang::HiCacheFactObservation & anchor, HiCacheSourceAttribution & output) {
     const auto records = h2s_records_for_commit(source, operations, anchor);
     if (records.empty()) {
         if (all_capacity_releases_in_tail(source, anchor)) {

@@ -6,14 +6,15 @@ namespace markov::trace_graph::modules::hicache::model {
 
 HiCachePrefetchWaitExecution::HiCachePrefetchWaitExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, SchedulerCosts scheduler_costs,
                                                            std::string policy, PrefetchCheckLocalCost local_cost, PrefetchCheckCollectiveCost collective_cost,
-                                                           SchedulerHandler scheduler)
+                                                           SchedulerHandler scheduler, AdmissionReady admission_ready)
     : state_(state),
       facts_(std::move(facts)),
       scheduler_costs_(std::move(scheduler_costs)),
       policy_(std::move(policy)),
       local_cost_(std::move(local_cost)),
       collective_cost_(std::move(collective_cost)),
-      scheduler_(std::move(scheduler)) {
+      scheduler_(std::move(scheduler)),
+      admission_ready_(std::move(admission_ready)) {
     if (facts_.empty() || !scheduler_) throw std::invalid_argument("Prefetch waiting requires ranks and explicit scheduler action handling");
 }
 
@@ -42,11 +43,11 @@ void HiCachePrefetchWaitExecution::retry(const CpuRankNodes & entries, simulatio
     issue_check(execution.returned, future);
 }
 
-void HiCachePrefetchWaitExecution::dispatch(const Action & action, uint64_t time, simulation::FutureDag & future) {
+void HiCachePrefetchWaitExecution::dispatch(const Action & action, uint64_t time, size_t node, simulation::FutureDag & future) {
     const auto & b = action.boundary;
     const auto kind = b.action;
     if (kind != PrefetchSchedulerAction::StorageDrain) {
-        scheduler_(b, time, future);
+        scheduler_(b, time, node, future);
         return;
     }
     auto fact = facts_.at(b.rank);
@@ -70,7 +71,7 @@ void HiCachePrefetchWaitExecution::advance(size_t node, uint64_t time, simulatio
     if (const auto at = actions_.find(node); at != actions_.end()) {
         const auto action = at->second;
         actions_.erase(at);
-        dispatch(action, time, future);
+        dispatch(action, time, node, future);
     }
     for (auto at = checks_.begin(); at != checks_.end();) {
         const auto ready = at->execution->advance(node, time, future);
@@ -79,10 +80,13 @@ void HiCachePrefetchWaitExecution::advance(size_t node, uint64_t time, simulatio
             continue;
         }
         ++at->finished;
-        if (!*ready && !at->retried) {
-            at->retried = true;
-            retry(at->returned, future);
+        const auto participant = std::ranges::find_if(at->returned, [&](const auto & item) { return item.second == node; })->first;
+        const bool admitted = *ready && admission_ready_(participant);
+        if (!at->admitted) {
+            at->admitted = admitted;
+            if (!admitted) retry(at->returned, future);
         }
+        else if (*at->admitted != admitted) throw std::runtime_error("Serial TP prefill admission disagrees across ranks");
         if (at->finished == facts_.size()) at = checks_.erase(at);
         else ++at;
     }

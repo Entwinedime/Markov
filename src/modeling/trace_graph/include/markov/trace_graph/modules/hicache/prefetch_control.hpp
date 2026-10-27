@@ -1,5 +1,7 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/prefetch.hpp"
 #include <set>
 
@@ -7,7 +9,7 @@ namespace markov::trace_graph::modules::hicache {
 
 struct PrefetchControlCpuInterval {
     std::string role;
-    patch::HiCacheTimingIntervalOwnership cpu;
+    source_dag::TimingIntervalOwnership cpu;
 };
 
 /** One source progress call. Observation/round ids refer to the original graph
@@ -27,14 +29,15 @@ struct PrefetchControlObservation {
     std::string issue;
 };
 
-[[nodiscard]] std::vector<PrefetchControlObservation> observe_prefetch_control(const patch::HiCacheSourceDagIndex & source,
+[[nodiscard]] std::vector<PrefetchControlObservation> observe_prefetch_control(const adapters::sglang::HiCacheSourceIndex & source,
                                                                                const CpuCollectiveObservation & collectives, std::string_view source_policy);
 
 using PrefetchRequestObservations = std::map<std::string, std::map<int, std::vector<PrefetchControlObservation>>>;
 /** Validate selected requests and order each rank's calls. A null filter means
  * all source requests; an empty filter means none. */
-[[nodiscard]] PrefetchRequestObservations observe_prefetch_requests(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives,
-                                                                    std::string_view policy, const std::set<std::string> * requests = nullptr);
+[[nodiscard]] PrefetchRequestObservations observe_prefetch_requests(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                    const CpuCollectiveObservation & collectives, std::string_view policy,
+                                                                    const std::set<std::string> * requests = nullptr);
 
 /** Source measurements, not a target service prediction. Increment return is
  * the publication upper bound; observation ids retain both endpoints. A full
@@ -52,6 +55,6 @@ struct PrefetchServiceObservation {
     std::string issue;
 };
 
-[[nodiscard]] std::vector<PrefetchServiceObservation> observe_prefetch_services(const patch::HiCacheSourceDagIndex & source);
+[[nodiscard]] std::vector<PrefetchServiceObservation> observe_prefetch_services(const adapters::sglang::HiCacheSourceIndex & source);
 
 } // namespace markov::trace_graph::modules::hicache

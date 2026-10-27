@@ -1,13 +1,15 @@
 #include "markov/trace_graph/modules/hicache/scope_observation.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 
 namespace markov::trace_graph::modules::hicache {
 
 HiCacheScopeObservation observe_hicache_scope(const core::DagGraph & graph) {
     HiCacheScopeObservation observed;
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto layer_waits = observe_hicache_layer_waits(source);
     observed.phases = observe_hicache_phases(graph, &layer_waits);
     const auto own_nodes = [&](const auto & nodes) { observed.nodes.insert(nodes.begin(), nodes.end()); };
@@ -21,7 +23,7 @@ HiCacheScopeObservation observe_hicache_scope(const core::DagGraph & graph) {
         own_nodes(phase.decode.submit_cpu_node_ids);
     }
     observed.operations = patch::build_hicache_io_operation_ledger(source);
-    const auto own_gaps = [&](const std::vector<patch::HiCacheCpuGapSlice> & slices) {
+    const auto own_gaps = [&](const std::vector<source_dag::CpuGapSlice> & slices) {
         for (const auto & slice : slices)
             if (slice.owned_end_us > slice.owned_start_us) observed.gap_intervals[slice.owner_node_id].emplace_back(slice.owned_start_us, slice.owned_end_us);
     };

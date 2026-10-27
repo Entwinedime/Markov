@@ -8,6 +8,7 @@
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 
+#include <memory>
 #include <nlohmann/json.hpp>
 
 namespace markov::trace_graph::core {
@@ -27,12 +28,13 @@ struct PreparedSource {
     io::ManifestClientInput client_input;
     core::ClientRequestChain client_chain;
     nlohmann::json replay_report;
+    std::unique_ptr<const core::DagGraph> migration_graph{};
 };
 
-[[nodiscard]] PreparedSource prepare_source(const CliOptions & options);
+[[nodiscard]] PreparedSource prepare_source(const CliOptions & options, bool include_preparation = false);
 
-/** Execute one target with private graph, modules, lazy caches and clock. */
-int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource source, core::Logger & logger);
+/** Mutate one private source in place; its caller owns both graph lifetimes. */
+int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource & source, core::Logger & logger);
 
 /** Linux container batch: prepare once, then fork bounded target executions.
  * Completion records go to stdout; each target retains its own log. */

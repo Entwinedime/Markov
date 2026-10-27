@@ -1,4 +1,5 @@
 #pragma once
+#include "markov/trace_graph/modules/hicache/model/input.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 
@@ -11,13 +12,6 @@
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::model {
-
-struct HiCacheReplayFact {
-    HiCacheFact fact;
-    HiCacheFactRole role = HiCacheFactRole::Unknown;
-    bool consumed = false;
-    bool started = false;
-};
 
 /** One state for an entire formal window. Parse source identities and capture
  * phase observations before simulation; apply formal/tail facts only when their

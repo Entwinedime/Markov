@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 
@@ -10,8 +11,8 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph, uint64_t begin_us) {
-    const patch::HiCacheSourceDagIndex initial(graph);
-    std::vector<std::pair<patch::HiCacheSourceFactNode, HiCacheEvictionRegion>> releases;
+    const adapters::sglang::HiCacheSourceIndex initial(graph);
+    std::vector<std::pair<adapters::sglang::HiCacheFactObservation, HiCacheEvictionRegion>> releases;
     std::vector<core::TraceEvent> points;
     for (const auto & fact : initial.fact_nodes()) {
         if (fact.fact_role != "capacity_result_observed" || fact.phase != "end") continue;
@@ -29,7 +30,7 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph, uint64_
         }
     }
     (void)bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     auto compute_roles = compute_resources_;
     const auto witness = [&](const std::string & pid, const std::string & tid, size_t node, std::string_view origin) {
@@ -71,7 +72,7 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph, uint64_
         if (generated_submissions_.contains(key) || !compute_roles.contains(key)) continue;
         const auto main = source.cpu_boundary_at_or_before(key.first, key.second, load.record.source_start_us);
         if (!main) continue;
-        const auto resources = observe_load_index_resources(source, queues, *main, compute_roles.at(key));
+        const auto resources = observe_host_device_resources(source, queues, *main, compute_roles.at(key));
         if (!resources) continue;
         const auto & model_layers = layers[key.first];
         if (model_layers.empty() || *model_layers.begin() != 0 || *model_layers.rbegin() + 1 != model_layers.size())

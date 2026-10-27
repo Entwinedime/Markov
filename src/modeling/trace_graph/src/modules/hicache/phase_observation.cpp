@@ -5,22 +5,23 @@
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 
+#include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
-#include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <charconv>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <ranges>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache {
 
@@ -137,22 +138,12 @@ std::string phase_family_name(std::string_view name) {
 
 } // namespace
 
-bool is_hicache_paged_attention(std::string_view name) {
-    std::string normalized;
-    normalized.reserve(name.size());
-    for (const auto character : name) {
-        if (character >= 'A' && character <= 'Z') normalized.push_back(static_cast<char>(character - 'A' + 'a'));
-        else if ((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')) normalized.push_back(character);
-    }
-    return normalized.contains("attention");
-}
-
 HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits) {
     HiCachePhaseObservationAudit audit;
     HiCacheLayerWaitObservation local_waits;
     if (!layer_waits) {
         if (std::ranges::any_of(graph.runtime_observations(), [](const auto & event) { return event.name == "runtime.hicache.layer_waits"; }))
-            local_waits = observe_hicache_layer_waits(patch::HiCacheSourceDagIndex(graph));
+            local_waits = observe_hicache_layer_waits(source_dag::SourceDagIndex(graph));
         layer_waits = &local_waits;
     }
     audit.layer_wait_status = layer_waits->status;
@@ -353,15 +344,42 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         else observation.decode_call_iterations.emplace(i, owner->decode_iteration);
     }
 
+    struct PhaseOwnerIndex {
+        std::vector<const PhaseInterval *> intervals;
+        std::vector<uint64_t> prefix_end_us;
+    };
+    std::map<int, PhaseOwnerIndex> phase_owners;
+    for (const auto & interval : phase_intervals) phase_owners[interval.logical_input].intervals.push_back(&interval);
+    for (auto & [input, index] : phase_owners) {
+        (void)input;
+        std::ranges::sort(index.intervals, {}, &PhaseInterval::start_us);
+        uint64_t end_us = 0;
+        for (const auto * interval : index.intervals) {
+            end_us = std::max(end_us, interval->end_us);
+            index.prefix_end_us.push_back(end_us);
+        }
+    }
+
     const auto find_owner = [&](const core::DagNode & node, uint64_t anchor_us) {
+        const auto found = phase_owners.find(node.gpu_id);
+        if (found == phase_owners.end()) return static_cast<const PhaseInterval *>(nullptr);
+
+        const auto & index = found->second;
+        auto at = std::ranges::upper_bound(index.intervals, anchor_us, {}, &PhaseInterval::start_us);
         const PhaseInterval * owner = nullptr;
-        for (const auto & interval : phase_intervals) {
-            if (interval.logical_input != node.gpu_id || anchor_us < interval.start_us || anchor_us >= interval.end_us) continue;
+        // Earlier intervals whose cumulative end has passed cannot contain
+        // this anchor. Keep checking all overlapping candidates: overlap is
+        // still an ownership conflict, not permission to choose the latest.
+        while (at != index.intervals.begin()) {
+            const auto position = static_cast<size_t>(std::distance(index.intervals.begin(), --at));
+            if (index.prefix_end_us[position] <= anchor_us) break;
+            if (anchor_us >= (*at)->end_us) continue;
+
             if (owner != nullptr) {
                 ++audit.phase_owner_conflict_count;
                 return static_cast<const PhaseInterval *>(nullptr);
             }
-            owner = &interval;
+            owner = *at;
         }
         return owner;
     };
@@ -472,7 +490,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us, node.duration, "HiCache kernel family duration exceeds uint64 range");
         phase.kernel_duration_us = core::checked_add_u64(phase.kernel_duration_us, node.duration, "HiCache phase kernel duration exceeds uint64 range");
         if (owner->kind == PhaseKind::Decode) { observation.decode_kernel_node_ids.push_back(node.id); }
-        else if (is_hicache_paged_attention(event.name)) {
+        else if (adapters::sglang::is_attention_kernel(event.name)) {
             observation.prefill_prefix_attention_node_ids.push_back(node.id);
             observation.prefill_prefix_attention_duration_us = core::checked_add_u64(observation.prefill_prefix_attention_duration_us,
                                                                                      node.duration,

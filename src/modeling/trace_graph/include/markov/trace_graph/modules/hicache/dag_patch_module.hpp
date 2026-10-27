@@ -6,8 +6,10 @@
 
 #ifdef DEBUG
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
+#include "markov/trace_graph/modules/hicache/diagnostics/allocator_preparation.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
 #include "markov/trace_graph/modules/hicache/patch/applied_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
@@ -17,9 +19,7 @@
 #include "markov/trace_graph/modules/hicache/patch/io_resource_model.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_patch.hpp"
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
 #include <cstdint>
@@ -54,7 +54,7 @@ struct HiCacheDagPatchResult {
     size_t phase_duration_update_count = 0;
     size_t phase_owner_conflict_count = 0;
     HiCachePhaseCarrierAudit phase_carrier;
-    runtime::AllocatorPreparationPlan runtime_preparation;
+    diagnostics::AllocatorPreparationPlan runtime_preparation;
     patch::HiCacheLayerWaitPatch layer_wait_patch;
     patch::CpuCollectivePatch cpu_collective_patch;
     core::DagMutationPlan plan;

@@ -1,4 +1,5 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 
@@ -20,11 +21,11 @@ struct HiCacheLayerWaitRemoval {
 
 /** Remove only observed call-owned work; preserve surrounding gaps and stream order.
  * A zero return leaves a submission anchor for later dynamic expansion. */
-HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const HiCacheSourceDagIndex & source,
-                                                        std::span<const HiCacheLayerWaitRemoval> changes, core::DagMutationPlan & plan);
+HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
+                                                         core::DagMutationPlan & plan);
 
 /** Appends only a complete call transition plan; source observations never supply target state. */
-HiCacheLayerWaitPatch append_hicache_layer_wait_plan(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
+HiCacheLayerWaitPatch append_hicache_layer_wait_plan(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
                                                      std::vector<HiCacheRewriteDecision> & decisions, core::DagMutationPlan & plan);
 
 } // namespace markov::trace_graph::modules::hicache::patch

@@ -1,12 +1,15 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache {
 namespace {
-using Fact = patch::HiCacheSourceFactNode;
+using Fact = adapters::sglang::HiCacheFactObservation;
 using Event = core::TraceEvent;
 uint64_t end(const Event & event) { return event.ts + event.dur; }
 struct ProcessEvidence {
@@ -14,8 +17,8 @@ struct ProcessEvidence {
     std::set<int> ranks;
 };
 
-PrefetchControlObservation observe_call(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives, const Fact & progress,
-                                        std::string_view policy, const ProcessEvidence & process) {
+PrefetchControlObservation observe_call(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives,
+                                        const Fact & progress, std::string_view policy, const ProcessEvidence & process) {
     PrefetchControlObservation result{ .progress_fact = progress.node_id };
     const auto & observations = source.graph().runtime_observations();
     const auto finish = progress.timestamp_us + progress.duration_us;
@@ -28,8 +31,8 @@ PrefetchControlObservation observe_call(const patch::HiCacheSourceDagIndex & sou
     const auto contained = [&](const Event & event, uint64_t begin, uint64_t limit) {
         return event.pid == progress.pid && event.tid == progress.tid && event.ts >= begin && end(event) <= limit;
     };
-    const auto fail = [&](const char * issue) {
-        result.issue = issue;
+    const auto fail = [&](std::string issue) {
+        result.issue = std::move(issue);
         return result;
     };
     for (size_t id = 0; id < observations.size(); ++id) {
@@ -87,8 +90,16 @@ PrefetchControlObservation observe_call(const patch::HiCacheSourceDagIndex & sou
             if (event.arg("request_id") != progress.request_id || event.arg("operation") != "all_reduce" || reduction != (state ? "MAX" : "MIN")
                 || event.arg("numel") != (state ? "2" : "1"))
                 return fail("prefetch_collective_signature");
-            if (!round.issue.empty() || std::ranges::any_of(round.calls, [](const auto & member) { return !member.issue.empty(); }))
-                return fail("prefetch_collective_incomplete");
+            if (!round.issue.empty()) return fail("prefetch_collective_incomplete:" + round.issue);
+            const auto incomplete = std::ranges::find_if(round.calls, [](const auto & member) { return !member.issue.empty(); });
+            if (incomplete != round.calls.end()) {
+                const auto & failed = observations[incomplete->observation];
+                auto detail = "prefetch_collective_incomplete:" + incomplete->issue + ":rank=" + std::to_string(incomplete->rank)
+                              + ":at_us=" + std::to_string(failed.ts) + ":duration_us=" + std::to_string(failed.dur)
+                              + ":caller_nodes=" + std::to_string(incomplete->cpu.owned_node_ids.size());
+                if (!incomplete->cpu.owned_node_ids.empty()) detail += ":first=" + source.graph().event_for_node(incomplete->cpu.owned_node_ids.front()).name;
+                return fail(std::move(detail));
+            }
             auto & slot = state ? result.state_round : result.completion_round;
             if (slot) return fail("multiple_prefetch_collective_groups");
             if (result.rank && (*result.rank != call.rank || group != round.group)) return fail("prefetch_collective_group_changed");
@@ -130,8 +141,8 @@ PrefetchControlObservation observe_call(const patch::HiCacheSourceDagIndex & sou
 }
 } // namespace
 
-std::vector<PrefetchControlObservation> observe_prefetch_control(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives,
-                                                                 std::string_view source_policy) {
+std::vector<PrefetchControlObservation> observe_prefetch_control(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                 const CpuCollectiveObservation & collectives, std::string_view source_policy) {
     std::vector<PrefetchControlObservation> result;
     std::map<std::string, ProcessEvidence> processes;
     const auto & observations = source.graph().runtime_observations();
@@ -148,7 +159,7 @@ std::vector<PrefetchControlObservation> observe_prefetch_control(const patch::Hi
     return result;
 }
 
-PrefetchRequestObservations observe_prefetch_requests(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives,
+PrefetchRequestObservations observe_prefetch_requests(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives,
                                                       std::string_view policy, const std::set<std::string> * requests) {
     PrefetchRequestObservations grouped;
     for (auto & call : observe_prefetch_control(source, collectives, policy)) {
@@ -163,7 +174,7 @@ PrefetchRequestObservations observe_prefetch_requests(const patch::HiCacheSource
 }
 
 
-std::vector<PrefetchServiceObservation> observe_prefetch_services(const patch::HiCacheSourceDagIndex & source) {
+std::vector<PrefetchServiceObservation> observe_prefetch_services(const adapters::sglang::HiCacheSourceIndex & source) {
     const auto & observations = source.graph().runtime_observations();
     std::vector<PrefetchServiceObservation> results;
     for (const auto & fact : source.fact_nodes()) {

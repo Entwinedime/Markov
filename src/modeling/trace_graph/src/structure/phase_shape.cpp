@@ -1,5 +1,6 @@
 #include "markov/trace_graph/structure/phase_shape.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/structure/tensor_program.hpp"
 
 #include <type_traits>
 
@@ -17,6 +18,22 @@ void append_page_table_work(std::map<std::string, double> & features, uint64_t c
 }
 
 } // namespace
+
+std::string_view tensor_execution_name(TensorExecutionKind kind) {
+    switch (kind) {
+    case TensorExecutionKind::AsyncDevice:
+        return "async_device";
+    case TensorExecutionKind::CpuService:
+        return "cpu_service";
+    case TensorExecutionKind::BlockingContextReadback:
+        return "blocking_readback";
+    case TensorExecutionKind::DirectBlockingDevice:
+        return "direct_blocking_device";
+    case TensorExecutionKind::LayerReady:
+        return "hicache_layer_ready";
+    }
+    return "unknown";
+}
 
 double PrefillShape::attention_work_pairs() const {
     return static_cast<double>(new_tokens) * (static_cast<double>(context_tokens) + static_cast<double>(new_tokens) / 2.0);

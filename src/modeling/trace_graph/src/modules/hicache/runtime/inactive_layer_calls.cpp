@@ -1,6 +1,7 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -16,10 +17,10 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
         inactive.push_back(&call);
         groups[{ *call.before, *call.after }].push_back(&call);
     }
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto positions = patch::observe_inactive_layer_positions(source, waits, inactive);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    std::map<std::pair<size_t, size_t>, std::optional<LoadIndexResources>> resources;
+    std::map<std::pair<size_t, size_t>, std::optional<HostDeviceResources>> resources;
     core::DagMutationPlan insertion{ .component = "hicache_layer_wait" };
     struct PlannedCall {
         Call call;
@@ -76,7 +77,7 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
             };
             if (position.issue.empty()) {
                 const auto key = std::pair{ graph.node(before).lane_id, position.device_lane };
-                if (!resources.contains(key)) resources.emplace(key, observe_load_index_resources(source, queues, before, position.after));
+                if (!resources.contains(key)) resources.emplace(key, observe_host_device_resources(source, queues, before, position.after));
                 if (const auto & r = resources.at(key)) target.program = generate_layer_wait(graph, before, r->worker, r->compute);
                 else target.insertion_issue = "forward_worker_resource_missing";
             }

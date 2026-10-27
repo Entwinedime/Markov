@@ -3,6 +3,8 @@
  * @brief Shared exact-ledger attribution helper implementation.
  */
 #include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -23,14 +25,14 @@ void sort_unique(std::vector<size_t> & values) {
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
-uint64_t fact_end(const HiCacheSourceFactNode & fact) {
+uint64_t fact_end(const adapters::sglang::HiCacheFactObservation & fact) {
     if (fact.timestamp_us > std::numeric_limits<uint64_t>::max() - fact.duration_us) return std::numeric_limits<uint64_t>::max();
     return fact.timestamp_us + fact.duration_us;
 }
 
-uint64_t fact_boundary(const HiCacheSourceFactNode & fact) { return fact.phase == "end" ? fact_end(fact) : fact.timestamp_us; }
+uint64_t fact_boundary(const adapters::sglang::HiCacheFactObservation & fact) { return fact.phase == "end" ? fact_end(fact) : fact.timestamp_us; }
 
-bool fact_precedes(const HiCacheSourceFactNode & left, const HiCacheSourceFactNode & right) {
+bool fact_precedes(const adapters::sglang::HiCacheFactObservation & left, const adapters::sglang::HiCacheFactObservation & right) {
     if (left.timestamp_us != right.timestamp_us) return left.timestamp_us < right.timestamp_us;
     if (left.event_index != right.event_index) return left.event_index < right.event_index;
     return left.node_id < right.node_id;
@@ -49,7 +51,7 @@ namespace {
 
 using TimeInterval = std::pair<uint64_t, uint64_t>;
 
-std::vector<TimeInterval> snapshot_intervals(const HiCacheSourceDagIndex & source, std::string_view pid, std::string_view tid, uint64_t start_us,
+std::vector<TimeInterval> snapshot_intervals(const adapters::sglang::HiCacheSourceIndex & source, std::string_view pid, std::string_view tid, uint64_t start_us,
                                              uint64_t end_us) {
     std::vector<TimeInterval> intervals;
     for (size_t node_id : source.nodes_for_fact_role("state_snapshot")) {
@@ -74,8 +76,8 @@ bool overlaps_any(uint64_t start_us, uint64_t end_us, std::span<const TimeInterv
 
 } // namespace
 
-void append_snapshot_isolated_control_ownership(const HiCacheSourceDagIndex & source, const HiCacheTimingIntervalOwnership & ownership, std::string_view pid,
-                                                std::string_view tid, HiCacheSourceAttribution & output) {
+void append_snapshot_isolated_control_ownership(const adapters::sglang::HiCacheSourceIndex & source, const source_dag::TimingIntervalOwnership & ownership,
+                                                std::string_view pid, std::string_view tid, HiCacheSourceAttribution & output) {
     if (ownership.status != "ready") return;
     const auto excluded = snapshot_intervals(source, pid, tid, ownership.interval_start_us, ownership.interval_end_us);
     for (size_t node_id : ownership.owned_node_ids) {
@@ -114,7 +116,7 @@ void finalize_source_control_ownership(HiCacheSourceAttribution & output) {
         if (left.owned_start_us != right.owned_start_us) return left.owned_start_us < right.owned_start_us;
         return left.owned_end_us < right.owned_end_us;
     });
-    std::vector<HiCacheCpuGapSlice> merged;
+    std::vector<source_dag::CpuGapSlice> merged;
     for (const auto & gap : output.source_control_gap_slices) {
         if (!merged.empty() && merged.back().owner_node_id == gap.owner_node_id && gap.owned_start_us <= merged.back().owned_end_us) {
             merged.back().owned_end_us = std::max(merged.back().owned_end_us, gap.owned_end_us);
@@ -124,7 +126,8 @@ void finalize_source_control_ownership(HiCacheSourceAttribution & output) {
     output.source_control_gap_slices = std::move(merged);
 }
 
-void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size_t> carrier_nodes, std::string reason, HiCacheSourceAttribution & output) {
+void assign_carrier_nodes(const adapters::sglang::HiCacheSourceIndex & source, std::vector<size_t> carrier_nodes, std::string reason,
+                          HiCacheSourceAttribution & output) {
     sort_unique(carrier_nodes);
     if (carrier_nodes.empty()) return;
     const std::unordered_set<size_t> carrier_set(carrier_nodes.begin(), carrier_nodes.end());
@@ -138,9 +141,9 @@ void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size
     for (size_t node_id : output.carrier_nodes) {
         const auto & event = source.graph().event_for_node(node_id);
         if (!earliest || event.ts < source.graph().event_for_node(*earliest).ts) earliest = node_id;
-        const auto event_end = fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur });
-        const auto latest_end = latest ? fact_end(HiCacheSourceFactNode{ .timestamp_us = source.graph().event_for_node(*latest).ts,
-                                                                         .duration_us = source.graph().event_for_node(*latest).dur })
+        const auto event_end = fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = event.ts, .duration_us = event.dur });
+        const auto latest_end = latest ? fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = source.graph().event_for_node(*latest).ts,
+                                                                                            .duration_us = source.graph().event_for_node(*latest).dur })
                                        : 0;
         if (!latest || event_end > latest_end) latest = node_id;
         for (size_t edge_index : source.incoming_edge_ids(node_id)) {

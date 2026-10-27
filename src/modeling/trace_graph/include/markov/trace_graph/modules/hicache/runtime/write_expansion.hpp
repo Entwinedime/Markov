@@ -1,4 +1,5 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
@@ -101,9 +102,9 @@ void bind_cpu_control(HiCacheHostExpansion & plan, double cpu_us, double residua
 [[nodiscard]] std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph);
 /** Refresh insertion endpoints disabled by another source-region replacement.
  * Empty positions describe target-only streams and remain empty. */
-void rebind_host_stream_position(const patch::HiCacheSourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
+void rebind_host_stream_position(const adapters::sglang::HiCacheSourceIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
                                  const std::string & tid, uint64_t at_us);
-void rebind_host_stream_positions(const patch::HiCacheSourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
+void rebind_host_stream_positions(const adapters::sglang::HiCacheSourceIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
                                   const std::string & pid, const std::string & tid, uint64_t at_us);
 /** Rebind copied tasks using the final source graph's exact worker lanes. */
 void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members, std::span<HiCacheHostExpansion *> plans);
@@ -127,12 +128,13 @@ void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size
  * its caller must hand them over during removal and preserve their source
  * nodes through expansion, including when generating different tensor work.
  */
-[[nodiscard]] HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+[[nodiscard]] HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                           const HiCacheHostTemplate & host,
                                                           std::string_view prefix = "target control: ", std::span<const size_t> callback_points = {},
                                                           bool retain_collective_completions = false);
-[[nodiscard]] HiCacheWriteExpansion prepare_write_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                            const patch::HiCacheIoOperationRecord & write, const HiCacheHostTemplate & host, size_t completion);
+[[nodiscard]] HiCacheWriteExpansion prepare_write_expansion(const adapters::sglang::HiCacheSourceIndex & source,
+                                                            const simulation::detail::CpuTaskQueues & queues, const patch::HiCacheIoOperationRecord & write,
+                                                            const HiCacheHostTemplate & host, size_t completion);
 
 struct HiCacheExpandedWrite {
     size_t host_return, write_start, completion;

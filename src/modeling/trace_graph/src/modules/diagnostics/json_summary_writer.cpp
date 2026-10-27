@@ -5,7 +5,7 @@
 #include "markov/trace_graph/modules/diagnostics/json_summary_writer.hpp"
 
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
-#include "markov/trace_graph/structure/hicache/report.hpp"
+#include "markov/trace_graph/reporting/hicache_structure.hpp"
 
 #include <cstddef>
 #include <nlohmann/json.hpp>
@@ -103,7 +103,7 @@ Json patch_summary(const hicache::HiCacheDagPatchModule & module) {
         { "hicache_dag_patch",
          {
          { "status", result.status },
-         { "target_effects", structure::hicache::effect_rows(module.effect_decisions()) },
+         { "target_effects", reporting::effect_rows(module.effect_decisions()) },
          { "source_target_same_config", result.source_target_same_config },
          { "io_resources", io_resource_summary(result.io_resources) },
          { "source_attribution", source_attribution_summary(result.source_attribution) },

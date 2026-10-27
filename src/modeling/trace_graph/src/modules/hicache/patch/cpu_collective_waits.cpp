@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
 #include <algorithm>
 #include <set>
@@ -43,7 +44,10 @@ CallerOrderIssues observe_caller_order(const core::DagGraph & graph) {
 
 class Planner {
 public:
-    Planner(const HiCacheSourceDagIndex & source, const CallerOrderIssues & caller_order) : source(source), graph(source.graph()), caller_order(caller_order) {}
+    Planner(const adapters::sglang::HiCacheSourceIndex & source, const CallerOrderIssues & caller_order)
+        : source(source),
+          graph(source.graph()),
+          caller_order(caller_order) {}
     CpuCollectiveWaitPlan run(const std::vector<const CpuCollectiveRound *> & rounds) {
         check_call_order(rounds);
         for (const auto * round : rounds) add_round(*round);
@@ -55,7 +59,7 @@ public:
     }
 
 private:
-    const HiCacheSourceDagIndex & source;
+    const adapters::sglang::HiCacheSourceIndex & source;
     const core::DagGraph & graph;
     const CallerOrderIssues & caller_order;
     CpuCollectiveWaitPlan result;
@@ -264,7 +268,7 @@ private:
 };
 } // namespace
 
-CpuCollectiveWaitPlanner::CpuCollectiveWaitPlanner(const HiCacheSourceDagIndex & source)
+CpuCollectiveWaitPlanner::CpuCollectiveWaitPlanner(const adapters::sglang::HiCacheSourceIndex & source)
     : source_(source),
       caller_order_issues_(observe_caller_order(source.graph())) {}
 
@@ -272,7 +276,7 @@ CpuCollectiveWaitPlan CpuCollectiveWaitPlanner::plan(const std::vector<const Cpu
     return Planner(source_, caller_order_issues_).run(rounds);
 }
 
-CpuCollectiveWaitPlan plan_cpu_collective_waits(const HiCacheSourceDagIndex & source, const std::vector<const CpuCollectiveRound *> & rounds) {
+CpuCollectiveWaitPlan plan_cpu_collective_waits(const adapters::sglang::HiCacheSourceIndex & source, const std::vector<const CpuCollectiveRound *> & rounds) {
     return CpuCollectiveWaitPlanner(source).plan(rounds);
 }
 } // namespace markov::trace_graph::modules::hicache::patch

@@ -4,7 +4,8 @@
 
 namespace markov::trace_graph::modules::hicache {
 // Resolve exclusive measured host ranges in the source DAG before allocating CPU.
-// Return measured recorder writes retained because their source boundary is ambiguous.
+// Real host work requires complete ownership. Return recorder-only corrections
+// retained because their source partition is ambiguous or outside retained work.
 nlohmann::json attach_host_cpu_service(core::DagGraph &, const nlohmann::json & measurements);
 // Apply measured recorder writes only outside previously corrected source ranges.
 // Returns correction totals and retained boundary diagnostics; never removes unknown CPU costs.

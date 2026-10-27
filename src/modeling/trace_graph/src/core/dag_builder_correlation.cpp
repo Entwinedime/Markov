@@ -145,7 +145,7 @@ CorrelationGroupResult build_connection_group(const DagGraph & graph, const Caus
     auto & nodes = *entry.second;
     order_submission_roles(graph, nodes);
     CorrelationGroupResult result{ .key = entry.first, .edges = {}, .submits = {} };
-    if (nodes.size() >= 3 && graph.event_for_node(nodes.front()).name != "Node@launch") return result;
+    if (nodes.size() >= 3 && graph.event_for_node(nodes.front()).boundary != TraceBoundary::NodeLaunch) return result;
     result.submits.reserve(nodes.size());
     add_submit_metadata_for_device_suffix(graph, nodes, result);
     append_causality_chain(nodes, result);

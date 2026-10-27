@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/patch/prefetch_control_region.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
@@ -18,7 +19,7 @@ struct SourceSpan {
     uint64_t begin, end;
     std::vector<size_t> rounds;
 };
-SourceSpan span_for(const PrefetchControlObservation & c, const HiCacheSourceDagIndex & source) {
+SourceSpan span_for(const PrefetchControlObservation & c, const adapters::sglang::HiCacheSourceIndex & source) {
     if (!c.issue.empty() || !c.rank || c.cpu.empty()) throw std::invalid_argument("Control replacement requires fully observed calls");
     const auto * fact = source.fact_node(c.progress_fact);
     if (!fact) throw std::invalid_argument("Control replacement has no source fact");
@@ -79,7 +80,7 @@ std::vector<PrefetchControlRegion> prepare_spans(core::DagGraph & graph, const s
             for (const auto i : missing.at(point)) bound[i] = ids.front();
     if (std::ranges::any_of(bound, [](const auto & p) { return !p; }))
         throw std::runtime_error("Control replacement lacks unique unchanged entry/exit boundaries");
-    const HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     core::DagMutationPlan plan{ .component = "hicache_control_execution", .reason = "replace observed control calls with target execution" };
     std::vector<PrefetchControlRegion> regions;
     std::map<size_t, size_t> main_owner;
@@ -208,7 +209,7 @@ std::vector<PrefetchControlRegion> prepare_spans(core::DagGraph & graph, const s
 std::vector<PrefetchControlRegion> prepare_prefetch_wait_regions(core::DagGraph & graph, const std::vector<PrefetchControlObservation> & controls,
                                                                  const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers) {
     if (controls.empty()) return {};
-    const HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     std::map<std::string, std::map<int, std::vector<PrefetchControlObservation>>> requests;
     for (const auto & c : controls) {
         (void)span_for(c, source);

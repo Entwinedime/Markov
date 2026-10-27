@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
@@ -9,7 +10,7 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::bind_capacity_calls(const patch::HiCacheSourceDagIndex & source) {
+void HiCacheWriteCalls::bind_capacity_calls(const adapters::sglang::HiCacheSourceIndex & source) {
     const auto & graph = source.graph();
     std::map<std::pair<std::string, std::string>, std::map<size_t, size_t>> samples;
     for (const auto & [key, resources] : write_resources_) {
@@ -49,16 +50,6 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
                                                          std::optional<size_t> previous) {
     const auto * work = replay_.state().eviction_work(fact);
     if (!work) return std::nullopt;
-    if (!work->rejected_candidates.empty()) {
-        std::string reasons;
-        for (const auto & rejected : work->rejected_candidates) {
-            if (rejected.reason == "locked_node") continue;
-            reasons += " [" + rejected.reason + " node=" + std::to_string(rejected.node) + " before_victim=" + std::to_string(rejected.before_victim) + "]";
-        }
-        if (!reasons.empty())
-            throw std::runtime_error("Capacity branch lacks rejected-candidate control work: request=" + fact.request_id + " pid=" + fact.pid
-                                     + " fact=" + std::to_string(fact.source_node_id) + reasons);
-    }
     using Kind = HiCacheEvictionRegion::Kind;
     const auto queued = replay_.state().unacknowledged_device_writes(fact);
     const auto predict_control = [&](std::string operation, std::string implementation, std::string timing_scope) {
@@ -121,6 +112,28 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             // calibration of scheduler delay or an entire eviction envelope.
             bind_cpu_control(step_plan, cpu_us, 0, remainder);
             step_lanes.clear();
+            return step_plan;
+        }
+        if (step.kind == Kind::RejectedBackup) {
+            const auto & rejected = work->rejected_candidates.at(*step.rejected_candidate);
+            const structure::OperationWork primitive{
+                "hicache_io_control",
+                "eviction.backup_rejected",
+                "sglang.HiRadixCache.write_backup",
+                "thread_cpu_service",
+                { { "requested_tokens", static_cast<double>(rejected.backup_pages) * page_size_ },
+                  { "page_size_tokens", static_cast<double>(page_size_) },
+                  { "host_candidates", static_cast<double>(rejected.host_candidates) },
+                  { "host_released_tokens", static_cast<double>(rejected.host_released_pages) * page_size_ } }
+            };
+            const auto cpu_us = operator_provider_.estimate(primitive).duration_us;
+            step_plan = generate_cpu_control(call.lane, "target rejected write backup");
+            auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
+            // Failed host allocation submits no DMA. This primitive measures
+            // the CPU retry/cleanup path, without a scheduler-wait coefficient.
+            bind_cpu_control(step_plan, cpu_us, 0, remainder);
+            step_lanes.clear();
+            ++generated_control_steps_;
             return step_plan;
         }
         if (step.kind == Kind::ReleaseBackup || step.kind == Kind::ReleaseRegular) {

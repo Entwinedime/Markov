@@ -94,9 +94,6 @@ struct HiCachePhaseObservationAudit {
     [[nodiscard]] bool ready() const { return status == "ready"; }
 };
 
-/** @brief Share Decode attention classification between observation and patch. */
-[[nodiscard]] bool is_hicache_paged_attention(std::string_view name);
-
 /**
  * @brief Joins request-bearing cache-extend facts to Torch phase markers.
  *

@@ -123,6 +123,9 @@ void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState
         const auto parent_id = node->parent;
         const bool release_after_write = policy_.write_back_enabled() && node->residency.device_dirty;
         const bool backed_up = release_after_write || has_host_backup(*node);
+        const auto backup_pages = static_cast<uint64_t>(node->pages.size());
+        const auto host_candidates = scope.capacity.host_candidate_count();
+        const auto host_pages_before = scope.capacity.snapshot().occupied_host_pages;
         const auto pages = evict_device_node(fact, scope, id);
         if (pages) {
             work.victims.push_back({ id, pages, release_after_write, backed_up });
@@ -131,7 +134,13 @@ void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState
         }
         else {
             work.rejected_candidates.push_back(
-                { id, work.victims.size(), release_after_write ? "host_backup_rejected" : "device_release_rejected", heap_size });
+                { id,
+                  work.victims.size(),
+                  release_after_write ? "host_backup_rejected" : "device_release_rejected",
+                  heap_size,
+                  backup_pages,
+                  host_candidates,
+                  core::checked_subtract_u64(host_pages_before, scope.capacity.snapshot().occupied_host_pages, "Rejected backup cannot add host residency") });
         }
         // A failed host reservation does not prevent trying another victim.
         // Selected children still occupy GPU pages until the final wait ends.
@@ -217,10 +226,13 @@ DeviceCapacityEnforcementResult HiCacheState::enforce_device_capacity(const HiCa
     sync_capacity(scope, normalized_scope(fact), {});
     if (!scope.device_allocator.should_evict(requested_pages)) { return result; }
     auto target = requested_pages;
+    std::set<HiCacheNodeId> rejected;
     while (target > 0) {
         sync_capacity(scope, normalized_scope(fact), {});
-        const auto victim = scope.capacity.first_device_victim();
-        if (!victim) break;
+        const auto candidates = scope.capacity.device_victims();
+        const auto victim = std::ranges::find_if(candidates, [&](auto id) { return !rejected.contains(id); });
+        if (victim == candidates.end()) break;
+
         const auto * victim_node = scope.tree.node(*victim);
         const bool dirty_writeback = victim_node != nullptr && policy_.write_back_enabled() && victim_node->residency.device_dirty;
         const auto released_pages = evict_device_node(fact, scope, *victim);
@@ -235,7 +247,13 @@ DeviceCapacityEnforcementResult HiCacheState::enforce_device_capacity(const HiCa
                     core::checked_add_u64(result.dirty_evicted_page_count, released_pages, "device cleanup dirty-page count exceeds uint64 range");
             }
         }
-        if (released_pages == 0 || released_pages >= target) break;
+        // Static preparation follows the same skip-and-continue rule as the
+        // execution path; a failed backup is not the end of the victim heap.
+        if (released_pages == 0) {
+            rejected.insert(*victim);
+            continue;
+        }
+        if (released_pages >= target) break;
         target -= released_pages;
     }
     return result;

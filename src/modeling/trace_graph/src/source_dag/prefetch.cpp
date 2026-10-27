@@ -1,5 +1,7 @@
 #include "markov/trace_graph/source_dag/prefetch.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include <algorithm>
 #include <set>
@@ -11,12 +13,12 @@ using namespace modules::hicache::model;
 
 namespace {
 using Control = PrefetchControlObservation;
-using Fact = patch::HiCacheSourceFactNode;
+using Fact = adapters::sglang::HiCacheFactObservation;
 uint64_t end(const core::TraceEvent & e) { return e.ts + e.dur; }
-bool complete(const patch::HiCacheTimingIntervalOwnership & interval) { return interval.status == "ready" || interval.status == "zero_duration"; }
+bool complete(const source_dag::TimingIntervalOwnership & interval) { return interval.status == "ready" || interval.status == "zero_duration"; }
 } // namespace
 
-PrefetchSchedulerBody observe_prefetch_scheduler_body(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives,
+PrefetchSchedulerBody observe_prefetch_scheduler_body(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives,
                                                       const PrefetchWorkerObservations & workers, const std::vector<Control> & previous,
                                                       const std::vector<Control> & next) {
     PrefetchSchedulerBody body;
@@ -137,6 +139,10 @@ PrefetchSchedulerBody observe_prefetch_scheduler_body(const patch::HiCacheSource
         if (!complete(body.tail.at(rank))) return fail("scheduler_body_incomplete_tail");
         for (size_t i = 0; i < events.size(); ++i) {
             const auto & e = events[i];
+            // Shape-bearing Torch envelopes are read-only copies. Their CPU
+            // leaves are already owned by the lane, not extra scheduler work.
+            if (e.source_channel == core::TraceSourceChannel::Torch && e.routing == core::TraceRouting::Execution && e.cat == "cpu_op") continue;
+
             if (e.pid == f->pid && e.tid == f->tid && e.ts < lane.interval_end_us && end(e) > lane.interval_start_us && !included_events.contains(i))
                 return fail("scheduler_body_unhandled_runtime_work:" + e.name);
         }
@@ -148,7 +154,7 @@ PrefetchSchedulerTiming prefetch_scheduler_timing(const PrefetchSchedulerBody & 
     if (!observed.issue.empty() || observed.steps.empty() || observed.lanes.empty())
         throw std::invalid_argument("Scheduler timing requires a fully observed loop body");
     PrefetchSchedulerTiming timing;
-    const auto local = [&](const patch::HiCacheTimingIntervalOwnership & interval) {
+    const auto local = [&](const source_dag::TimingIntervalOwnership & interval) {
         if (interval.owned_node_duration_us > interval.observed_duration_us
             || interval.owned_gap_duration_us != interval.observed_duration_us - interval.owned_node_duration_us)
             throw std::invalid_argument("Scheduler local work and gap do not account for the observed interval");
@@ -176,7 +182,7 @@ PrefetchSchedulerTiming prefetch_scheduler_timing(const PrefetchSchedulerBody & 
     return timing;
 }
 
-PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const patch::HiCacheSourceDagIndex & source) {
+PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const adapters::sglang::HiCacheSourceIndex & source) {
     if (!observed.issue.empty()) throw std::invalid_argument("Prefetch CPU template requires a complete observed call");
     const auto * fact = source.fact_node(observed.progress_fact);
     if (!fact) throw std::invalid_argument("Prefetch service has no source identity");

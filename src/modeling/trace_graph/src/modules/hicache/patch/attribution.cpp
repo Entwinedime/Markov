@@ -3,6 +3,7 @@
  * @brief Conservative source-effect attribution implementation.
  */
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 
 #include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
@@ -20,7 +21,7 @@ using model::HiCacheSourceCarrierState;
 
 enum class ConsumerAnchorResolution : std::uint8_t { Missing, Ready, Invalid };
 
-ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
+ConsumerAnchorResolution append_target_consumer(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheEffectDecision & decision,
                                                 HiCacheSourceAttribution & output) {
     if (!decision.consumer_boundary.source_node_id) return ConsumerAnchorResolution::Missing;
     const auto * fact = source.fact_node(*decision.consumer_boundary.source_node_id);
@@ -36,7 +37,7 @@ ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & so
     return ConsumerAnchorResolution::Ready;
 }
 
-HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
+HiCacheSourceAttribution attribute_one(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheEffectDecision & decision,
                                        const HiCacheIoOperationLedger & operations) {
     HiCacheSourceAttribution output{
         .effect_id = decision.effect_key,
@@ -139,7 +140,8 @@ uint64_t HiCacheSourceAttributionCatalog::attributed_count() const {
 
 uint64_t HiCacheSourceAttributionCatalog::unresolved_count() const { return static_cast<uint64_t>(records.size()) - attributed_count(); }
 
-HiCacheSourceAttributionCatalog build_hicache_source_attribution(const HiCacheSourceDagIndex & source, const model::HiCacheEffectDecisionLedger & decisions,
+HiCacheSourceAttributionCatalog build_hicache_source_attribution(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                 const model::HiCacheEffectDecisionLedger & decisions,
                                                                  const HiCacheIoOperationLedger & operations) {
     HiCacheSourceAttributionCatalog catalog;
     catalog.records.reserve(decisions.decisions.size());

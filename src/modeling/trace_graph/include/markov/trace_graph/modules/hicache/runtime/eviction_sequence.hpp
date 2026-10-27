@@ -13,6 +13,7 @@ struct HiCacheEvictionStep {
     std::optional<size_t> victim;
     std::optional<HiCacheEvictionRegion::Kind> preceding_kind;
     size_t heap_size = 0;
+    std::optional<size_t> rejected_candidate;
 };
 
 [[nodiscard]] std::vector<HiCacheEvictionStep> eviction_sequence(const model::HiCacheEvictionWork & work, bool write_back);

@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
@@ -6,6 +7,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <tuple>
 
@@ -16,7 +18,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
     if (state_) throw std::logic_error("Queue confirmations are already bound");
     state_ = &replay.state();
     write_work_ = std::move(write_work);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto collectives = observe_cpu_collectives(source);
     const auto workers = observe_prefetch_workers(source, collectives);
     const auto & events = graph.runtime_observations();
@@ -46,12 +48,14 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
     struct CacheIdentity {
         const HiCacheFact * fact = nullptr;
         bool ambiguous = false;
+        uint64_t first_input_us = std::numeric_limits<uint64_t>::max();
     };
     std::map<std::string, CacheIdentity> cache_identities;
     for (const auto & item : replay.facts()) {
         auto & identity = cache_identities[item.fact.pid];
         identity.ambiguous |= identity.fact && identity.fact->cache_scope != item.fact.cache_scope;
         identity.fact = &item.fact;
+        identity.first_input_us = std::min(identity.first_input_us, item.fact.ts);
     }
 
     std::vector<core::TraceEvent> points;
@@ -81,6 +85,41 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
             return event.ts >= begin && (event.ts <= finish || event.arg("formal_window_context") == "causal_tail");
         };
         if (!std::ranges::any_of(round.calls, inside)) continue;
+        // At the opening cut one rank can enter the same MIN just before the
+        // client starts, while another enters just after it. No target cache
+        // work can precede its first input on that rank's scheduler lane. If
+        // every observed load queue stays empty until this check returns,
+        // retain the surviving source work instead of inventing a missing
+        // prefix or replaying a state change. Membership/signature, both queue
+        // counters and the return-before-first-input proof are all required.
+        const bool crosses_opening = std::ranges::any_of(round.calls, [&](const auto & call) { return events.at(call.observation).ts < begin; });
+        if (role == "load_completion_check" && crosses_opening && round.issue.empty() && round.calls.size() == round.members.size()) {
+            const bool unchanged_empty_check = std::ranges::all_of(round.calls, [&](const auto & call) {
+                const auto & event = events.at(call.observation);
+                const auto identity = cache_identities.find(event.pid);
+                if (identity == cache_identities.end() || identity->second.ambiguous || event.ts + event.dur < begin) return false;
+
+                const auto found = completion_envelopes.find({ event.pid, event.tid, "runtime.hicache.load_completion" });
+                if (found == completion_envelopes.end()) return false;
+
+                const core::TraceEvent * envelope = nullptr;
+                for (const auto * candidate : found->second.calls) {
+                    if (candidate->ts > event.ts) break;
+                    if (candidate->ts + candidate->dur < event.ts + event.dur) continue;
+                    if (envelope) return false;
+
+                    envelope = candidate;
+                }
+                return envelope && envelope->ts < begin && envelope->ts + envelope->dur <= identity->second.first_input_us
+                       && envelope->arg("status") == "returned" && envelope->arg("blocking") == "false" && envelope->arg("batches_before") == "0"
+                       && envelope->arg("operations_before") == "0" && envelope->arg("batches_after") == "0" && envelope->arg("operations_after") == "0";
+            });
+            if (unchanged_empty_check) {
+                ++coverage_.retained_empty_opening_rounds;
+                continue;
+            }
+        }
+
         if (!std::ranges::all_of(round.calls, inside) || round.calls.size() != round.members.size()) {
             ++coverage_.partial_window_rounds;
             continue;
@@ -195,7 +234,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
 }
 
 void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     struct Tail {
         size_t entry, exit;
@@ -221,7 +260,7 @@ void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
     // These are complete, bound MIN rounds. Target completion is sampled by
     // the queue state, so old source EventSynchronize dependencies must leave
     // with the old tail. Reference release remains at the generated return.
-    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, regions));
+    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, regions));
 }
 
 void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::FutureDag & future) {
@@ -253,8 +292,7 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
         }
         if (action.phase == Phase::Work) {
             if (check.write) {
-                if (const auto last = write_work_({ action.check, action.rank, fact, common.writes }, future))
-                    future.depend(*last, check.return_nodes.at(action.rank));
+                if (const auto last = write_work_({ fact, common.writes }, future)) future.depend(*last, check.return_nodes.at(action.rank));
             }
             else {
                 if (common.loads > state_->load_completion_count(fact)) throw std::logic_error("Target load confirmation prefix is no longer complete");

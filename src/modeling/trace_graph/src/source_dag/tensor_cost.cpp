@@ -1,6 +1,8 @@
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
+#include "markov/trace_graph/adapters/runtimes/ascend/operator_bindings.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
 
 #include <algorithm>
@@ -13,7 +15,7 @@
 
 namespace markov::trace_graph::source_dag {
 
-std::optional<double> observe_device_event_wait_service(const modules::hicache::patch::HiCacheSourceDagIndex & source, size_t node) {
+std::optional<double> observe_device_event_wait_service(const SourceDagIndex & source, size_t node) {
     const auto & graph = source.graph();
     const auto & wait = graph.node(node);
     const auto & event = graph.event_for_node(node);
@@ -36,7 +38,7 @@ std::optional<double> observe_device_event_wait_service(const modules::hicache::
     return static_cast<double>(event.dur) + static_cast<double>(event.dur_submicro_ns) / 1000.0;
 }
 
-std::optional<uint64_t> observe_nonblocking_cpu_service(const modules::hicache::patch::HiCacheSourceDagIndex & source, size_t node) {
+std::optional<uint64_t> observe_nonblocking_cpu_service(const SourceDagIndex & source, size_t node) {
     const auto & graph = source.graph();
     const auto & event = graph.event_for_node(node);
     if (graph.node(node).kind != core::DagNodeKind::TraceEvent) return std::nullopt;
@@ -70,7 +72,7 @@ std::optional<uint64_t> observe_nonblocking_cpu_service(const modules::hicache::
 
 namespace {
 
-std::optional<uint64_t> readback_ready_us(const core::DagGraph & graph, const SynchronousReadback & readback) {
+std::optional<uint64_t> readback_ready_us(const core::DagGraph & graph, const adapters::ascend::SynchronousReadback & readback) {
     const auto & wait = graph.event_for_node(readback.synchronization);
     const auto & device = graph.event_for_node(readback.device_completion);
     const auto ready_ns = std::max(wait.start_ns(), device.end_ns());
@@ -82,7 +84,7 @@ std::optional<uint64_t> readback_ready_us(const core::DagGraph & graph, const Sy
 
 // The caller establishes serial ordering separately. This function only
 // determines whether every member retains a raw device-service measurement.
-std::optional<double> measured_device_service(const modules::hicache::patch::HiCacheSourceDagIndex & source, const std::set<size_t> & devices) {
+std::optional<double> measured_device_service(const SourceDagIndex & source, const std::set<size_t> & devices) {
     const auto & graph = source.graph();
     double duration = 0;
     for (const auto node : devices) {
@@ -97,8 +99,8 @@ std::optional<double> measured_device_service(const modules::hicache::patch::HiC
     return duration;
 }
 
-std::optional<uint64_t> blocking_return_begin(const modules::hicache::patch::HiCacheSourceDagIndex & source, size_t device_completion,
-                                              const std::vector<size_t> & caller_nodes, uint64_t submitted, uint64_t end) {
+std::optional<uint64_t> blocking_return_begin(const SourceDagIndex & source, size_t device_completion, const std::vector<size_t> & caller_nodes,
+                                              uint64_t submitted, uint64_t end) {
     const auto & graph = source.graph();
     bool synchronized = false;
     auto ready = submitted;
@@ -139,7 +141,7 @@ struct LaunchMeasurement {
 // Framework input metadata establishes dtype/layout. Native task labels
 // additionally corroborate operator family, order and execution engine.
 bool matches_native_launch(const structure::OperationWork & work, const LaunchMeasurement & measured) {
-    const auto expected = native_launch_label(work.implementation);
+    const auto expected = adapters::ascend::native_launch_label(work.implementation);
     return expected && measured.device_name.ends_with(*expected);
 }
 
@@ -148,9 +150,8 @@ struct TaskMeasurement {
     std::optional<uint64_t> return_us, return_residual_us;
 };
 
-std::optional<TaskMeasurement> observe_worker_launch_sequence(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                              const simulation::detail::CpuTaskQueues & queues, std::vector<size_t> workers,
-                                                              const std::set<size_t> & devices) {
+std::optional<TaskMeasurement> observe_worker_launch_sequence(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                              std::vector<size_t> workers, const std::set<size_t> & devices) {
     if (workers.empty()) return std::nullopt;
     const auto & graph = source.graph();
     std::ranges::sort(workers, {}, [&](size_t node) { return std::pair{ graph.event_for_node(node).ts, node }; });
@@ -231,9 +232,8 @@ std::optional<TaskMeasurement> observe_worker_launch_sequence(const modules::hic
 }
 } // namespace
 
-std::optional<WorkerLaunchObservation> observe_worker_launch(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                             const simulation::detail::CpuTaskQueues & queues, std::vector<size_t> workers,
-                                                             const std::set<size_t> & devices) {
+std::optional<WorkerLaunchObservation> observe_worker_launch(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                             std::vector<size_t> workers, const std::set<size_t> & devices) {
     const auto task = observe_worker_launch_sequence(source, queues, std::move(workers), devices);
     if (!task || task->launches.size() != 1) return std::nullopt;
     const auto & launch = task->launches.front();
@@ -241,8 +241,8 @@ std::optional<WorkerLaunchObservation> observe_worker_launch(const modules::hica
     return WorkerLaunchObservation{ *launch.worker_us, *launch.residual_us, *task->return_us, *task->return_residual_us };
 }
 
-nlohmann::json queued_task_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                        const QueuedCallTask & observed, const structure::OperationWork & work, bool cpu_service_applied) {
+nlohmann::json queued_task_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues, const QueuedCallTask & observed,
+                                        const structure::OperationWork & work, bool cpu_service_applied) {
     const auto & graph = source.graph();
     const auto & task = queues.tasks.at(observed.task);
     auto rows = nlohmann::json::array();
@@ -293,9 +293,8 @@ nlohmann::json queued_task_observations(const modules::hicache::patch::HiCacheSo
     return rows;
 }
 
-bool append_cpu_interval_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const core::TraceEvent & outer,
-                                      const structure::OperationWork & work, uint64_t begin, uint64_t end, bool corrected, nlohmann::json & rows,
-                                      std::optional<size_t> permitted_submission) {
+bool append_cpu_interval_observations(const SourceDagIndex & source, const core::TraceEvent & outer, const structure::OperationWork & work, uint64_t begin,
+                                      uint64_t end, bool corrected, nlohmann::json & rows, std::optional<size_t> permitted_submission) {
     const auto & graph = source.graph();
     const auto position = measurement_position(outer);
     if (!position) return false;
@@ -333,7 +332,7 @@ bool append_cpu_interval_observations(const modules::hicache::patch::HiCacheSour
     return true;
 }
 
-nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             const structure::OperationWork & work, size_t index, std::set<size_t> & measured_devices, bool cpu_service_applied,
                                             bool include_caller_scopes, std::span<const structure::OperationWork> device_launches) {
     const auto & graph = source.graph();
@@ -347,7 +346,7 @@ nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCac
     if (work.implementation.starts_with("aten._local_scalar_dense:") || work.implementation == "aten.to.cpu"
         || work.implementation.starts_with("aten.to.cpu:")) {
         if (!include_caller_scopes) return rows;
-        const auto readback = observe_synchronous_readback(source, region);
+        const auto readback = adapters::ascend::observe_synchronous_readback(source, region);
         if (!readback) return rows;
         const auto & envelope = graph.runtime_observations().at(index);
         const auto & sync = graph.event_for_node(readback->synchronization);
@@ -532,7 +531,7 @@ nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCac
     return rows;
 }
 
-void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+void append_tensor_program_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
                                         std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes,
                                         std::optional<size_t> omitted_caller_operation) {
@@ -551,7 +550,7 @@ void append_tensor_program_observations(const modules::hicache::patch::HiCacheSo
     }
 }
 
-nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const SubmittedCallRegion & region,
+nlohmann::json tensor_program_outer_observations(const SourceDagIndex & source, const SubmittedCallRegion & region,
                                                  std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
                                                  bool cpu_service_applied, std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits) {
     const auto & graph = source.graph();

@@ -3,9 +3,10 @@
  * @brief Historical static HiCache patch used by diagnostic oracle replay.
  */
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/static_phase.hpp"
+#include "markov/trace_graph/modules/hicache/diagnostics/static_phase.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 
 #include <algorithm>
@@ -193,7 +194,7 @@ std::string decode_phase_effect(const model::HiCacheDecodeWorkItem & item, std::
     return "hicache_phase:" + item.request_id + ":decode:" + std::to_string(item.logical_input) + ":" + std::string(family);
 }
 
-void apply_phase_oracle_cost_replay(cost::StaticPhaseCosts & phase_work, const std::string & filename, HiCachePhaseOracleCostReplayAudit & audit) {
+void apply_phase_oracle_cost_replay(diagnostics::StaticPhaseCosts & phase_work, const std::string & filename, HiCachePhaseOracleCostReplayAudit & audit) {
     if (filename.empty()) return;
     std::ifstream stream(filename);
     if (!stream) throw std::invalid_argument("cannot open HiCache phase oracle-cost replay input: " + filename);
@@ -231,7 +232,7 @@ void apply_phase_oracle_cost_replay(cost::StaticPhaseCosts & phase_work, const s
     audit.status = "validating";
     audit.supplied_cost_count = supplied.size();
     std::unordered_set<std::string> consumed;
-    const auto apply = [&](cost::StaticPhaseNodeCost & cost, const std::string & effect) {
+    const auto apply = [&](diagnostics::StaticPhaseNodeCost & cost, const std::string & effect) {
         ++audit.required_cost_count;
         const auto found = supplied.find(effect);
         if (found == supplied.end()) throw std::invalid_argument("missing HiCache phase oracle cost for effect: " + effect);
@@ -269,9 +270,9 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
 
     result_.source_target_same_config = source_target_same_config_;
     const auto & phase_work = model_result_->phase_work;
-    auto phase_costs = cost::bind_static_phase_costs(graph, phase_work, phase_cost_);
+    auto phase_costs = diagnostics::bind_static_phase_costs(graph, phase_work, phase_cost_);
     apply_phase_oracle_cost_replay(phase_costs, phase_oracle_cost_replay_path_, result_.phase_oracle_cost_replay);
-    const auto source_index = patch::HiCacheSourceDagIndex(graph);
+    const auto source_index = adapters::sglang::HiCacheSourceIndex(graph);
     result_.io_operation_ledger = patch::build_hicache_io_operation_ledger(source_index);
     result_.source_attribution = patch::build_hicache_source_attribution(source_index, model_result_->effect_decisions, result_.io_operation_ledger);
     result_.io_resources = patch::build_hicache_io_resource_plan(model_result_->effect_decisions, io_cost_);
@@ -307,7 +308,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
     }
     if (result_.apply_blockers.empty() && phase_cost_.enabled) {
         auto & preparation = result_.runtime_preparation;
-        preparation = runtime::plan_allocator_preparations(graph, phase_work.allocator_calls);
+        preparation = diagnostics::plan_allocator_preparations(graph, phase_work.allocator_calls);
         for (const auto & change : preparation.mutation.set_cpu_gaps) {
             if (std::ranges::any_of(result_.plan.set_cpu_gaps, [&](const auto & existing) { return existing.node_id == change.node_id; }))
                 ++preparation.blockers["preparation_conflicts_with_hicache_patch"];

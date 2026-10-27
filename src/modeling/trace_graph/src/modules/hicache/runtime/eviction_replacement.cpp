@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
@@ -17,7 +18,7 @@ void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
             if (action == Action::Submit) submissions.push_back(call);
     if (submissions.empty()) return;
 
-    const patch::HiCacheSourceDagIndex observed(graph);
+    const adapters::sglang::HiCacheSourceIndex observed(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<std::vector<size_t>> opening_nodes;
     hosts.reserve(submissions.size());
@@ -55,7 +56,7 @@ void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
     // Resolve against the surviving stream order, not the removed payload's
     // observed GPU timestamps. Generated host returns delay the original
     // continuation; asynchronous completion does not block it unnecessarily.
-    const patch::HiCacheSourceDagIndex surviving(graph);
+    const adapters::sglang::HiCacheSourceIndex surviving(graph);
     for (const auto id : submissions) {
         auto & call = calls_[id];
         call.successors = { call.return_node };
@@ -71,9 +72,9 @@ void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
 void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end) {
     // Replace both policy directions as complete envelopes. The target state
     // chooses writes/releases; the successful allocation return is retained.
-    std::vector<patch::HiCacheSourceFactNode> evictions;
+    std::vector<adapters::sglang::HiCacheFactObservation> evictions;
     std::vector<core::TraceEvent> points;
-    const patch::HiCacheSourceDagIndex observed(graph);
+    const adapters::sglang::HiCacheSourceIndex observed(graph);
     for (const auto & fact : observed.fact_nodes()) {
         if (fact.fact_role != "capacity_result_observed" || fact.phase != "end" || !fact.duration_us || fact.timestamp_us < begin
             || fact.timestamp_us + fact.duration_us > end)
@@ -93,7 +94,7 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
     }
     if (evictions.empty()) return;
     const auto bound = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<Call> replacements;
     hosts.reserve(evictions.size());
@@ -164,7 +165,7 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
             if (action == Action::Submit) source_owners_.insert(calls_[index].owner);
             if (action == Action::Wait) wait_owners_.insert(calls_[index].owner);
         }
-    const patch::HiCacheSourceDagIndex surviving(graph);
+    const adapters::sglang::HiCacheSourceIndex surviving(graph);
     for (auto & call : replacements) {
         for (const auto & [id, donor] : observed_write_fragments_)
             if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.resources);

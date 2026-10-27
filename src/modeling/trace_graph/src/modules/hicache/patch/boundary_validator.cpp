@@ -3,6 +3,7 @@
  * @brief Effect-local boundary and no-double-count validation implementation.
  */
 #include "markov/trace_graph/modules/hicache/patch/boundary_validator.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -36,7 +37,7 @@ bool duration_removed(const core::DagGraph & graph, const core::DagMutationPlan 
                == 1;
     });
     std::set<size_t> owned_gap_nodes;
-    const auto append_gap = [&](const HiCacheCpuGapSlice & gap) { owned_gap_nodes.insert(gap.owner_node_id); };
+    const auto append_gap = [&](const source_dag::CpuGapSlice & gap) { owned_gap_nodes.insert(gap.owner_node_id); };
     if (decision.replaces_source_completion_wait()) {
         for (const auto & gap : decision.completion_wait_slices) append_gap(gap);
     }
@@ -313,17 +314,13 @@ bool completion_join_dependencies(const core::DagGraph & graph, const core::DagM
     const bool service_branch = has_service_branch == decision.completion_join_uses_service;
     const bool policy_branch = decision.policy_wait_duration_us == 0
                                || (policy_wait_node(plan, decision) != nullptr
-                                   && has_added_edge(plan,
-                                                     ingress,
-                                                     core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
-                                                     decision.effect_id)
+                                   && has_added_edge(plan, ingress, core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id), decision.effect_id)
                                    && has_added_edge(plan,
                                                      core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
                                                      core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
                                                      decision.effect_id));
     if ((!ingress.existing_node_id && ingress.synthetic_id.empty())
-        || !has_added_edge(plan, ingress, core::DagNodeRef::synthetic(decision.synthetic_id), decision.effect_id)
-        || !service_branch || !policy_branch
+        || !has_added_edge(plan, ingress, core::DagNodeRef::synthetic(decision.synthetic_id), decision.effect_id) || !service_branch || !policy_branch
         || (decision.target_host_control_terminal ? (!has_added_edge(plan,
                                                                      core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
                                                                      core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
@@ -410,13 +407,12 @@ HiCacheBoundaryValidation validate_one(const core::DagGraph & graph, const HiCac
             const auto * join = completion_join_node(shadow.plan, decision);
             const auto * policy_wait = policy_wait_node(shadow.plan, decision);
             const bool policy_wait_ready = decision.policy_wait_duration_us == 0
-                                           ? policy_wait == nullptr
-                                           : policy_wait != nullptr && policy_wait->node.duration == decision.policy_wait_duration_us
-                                                 && !policy_wait->node.is_cpu && !policy_wait->node.counts_toward_e2e;
+                                               ? policy_wait == nullptr
+                                               : policy_wait != nullptr && policy_wait->node.duration == decision.policy_wait_duration_us
+                                                     && !policy_wait->node.is_cpu && !policy_wait->node.counts_toward_e2e;
             const bool dependencies = completion_join_dependencies(graph, shadow.plan, decision);
             validation.target_cost_materialized = synthetic != nullptr && synthetic->node.duration == decision.duration_us && join != nullptr
-                                                  && join->node.duration == 0 && policy_wait_ready
-                                                  && target_host_control_materialized(shadow.plan, decision);
+                                                  && join->node.duration == 0 && policy_wait_ready && target_host_control_materialized(shadow.plan, decision);
             validation.ingress_preserved = dependencies;
             validation.consumer_dependency_ready = dependencies;
         }

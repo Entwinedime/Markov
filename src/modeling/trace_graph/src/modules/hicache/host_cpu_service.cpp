@@ -1,11 +1,14 @@
 #include "markov/trace_graph/modules/hicache/host_cpu_service.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
+#include <string>
+#include <tuple>
 
 namespace markov::trace_graph::modules::hicache {
 namespace {
@@ -13,6 +16,34 @@ struct Piece {
     uint64_t begin, end;
     bool sync;
 };
+
+using LayerKey = std::tuple<core::CpuServiceCost::Lane, std::string, std::string>;
+using LayerCallBatches = std::map<LayerKey, std::vector<std::vector<const HiCacheLayerWaitCall *>>>;
+
+LayerCallBatches layer_call_batches(const core::DagGraph & graph, const HiCacheLayerWaitObservation & layers) {
+    std::map<LayerKey, std::map<uint64_t, std::vector<const HiCacheLayerWaitCall *>>> grouped;
+    for (const auto & call : layers.calls) {
+        if (!call.before) continue;
+
+        const auto & event = graph.event_for_node(*call.before);
+        const LayerKey key{
+            { event.pid, event.tid },
+            call.request_id,
+            "step[" + call.phase
+        };
+        grouped[key][call.batch_start_ns].push_back(&call);
+    }
+
+    LayerCallBatches result;
+    for (auto & [key, batches] : grouped) {
+        auto & ordered = result[key];
+        for (auto & [start, calls] : batches) {
+            std::ranges::sort(calls, {}, [](const auto * call) { return call->start_ns; });
+            ordered.push_back(std::move(calls));
+        }
+    }
+    return result;
+}
 
 // Match Python round rather than llround (which rounds ties away from zero).
 int64_t rounded_change(double value) {
@@ -28,32 +59,27 @@ int64_t rounded_change(double value) {
 
 nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::json & measurements) {
     auto retained = nlohmann::json::array();
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const bool has_layers =
         std::ranges::any_of(measurements.at("rows"), [](const auto & row) { return row.value("method", std::string{}) == "hicache.layer_wait"; });
     const auto layers = has_layers ? observe_hicache_layer_waits(source) : HiCacheLayerWaitObservation{};
     if (has_layers && layers.status != "ready") throw std::runtime_error("Layer CPU service requires aligned source call observations");
+    const auto batches = layer_call_batches(graph, layers);
     using Lane = std::pair<std::string, std::string>;
     const auto identity = [](const nlohmann::json & value) { return value.is_string() ? value.get<std::string>() : std::to_string(value.get<uint64_t>()); };
     std::map<Lane, std::vector<core::CpuServiceCost::Span>> corrections;
     for (const auto & call : measurements.at("rows")) {
         const Lane lane{ identity(call.at("pid")), identity(call.at("tid")) };
+        const auto method = call.value("method", std::string{});
+        const bool recorder_write = method == "profiling.recorder_write";
         auto ranges = call.at("exclusive_ranges_ns");
-        if (call.value("method", std::string{}) == "hicache.layer_wait") {
+        if (method == "hicache.layer_wait") {
             // CPU deltas use paired thread timers. Source geometry must use
             // the profiler clock, joined by identity rather than wall proximity.
-            std::map<uint64_t, std::vector<const HiCacheLayerWaitCall *>> batches;
-            for (const auto & observed : layers.calls) {
-                if (observed.request_id != call.at("request_id").get<std::string>() || "step[" + observed.phase != call.at("phase").get<std::string>()
-                    || !observed.before)
-                    continue;
-                const auto & event = graph.event_for_node(*observed.before);
-                if (event.pid == lane.first && event.tid == lane.second) batches[observed.batch_start_ns].push_back(&observed);
-            }
+            const auto found = batches.find({ lane, call.at("request_id").get<std::string>(), call.at("phase").get<std::string>() });
             const auto ordinal = call.value("forward_ordinal", size_t{ 0 });
-            if (ordinal >= batches.size()) throw std::runtime_error("Layer CPU forward ordinal is absent from source");
-            auto & selected = std::next(batches.begin(), ordinal)->second;
-            std::ranges::sort(selected, {}, [](const auto * observed) { return observed->start_ns; });
+            if (found == batches.end() || ordinal >= found->second.size()) throw std::runtime_error("Layer CPU forward ordinal is absent from source");
+            const auto & selected = found->second[ordinal];
             const auto & expected = call.at("layer_calls");
             if (selected.empty() || selected.size() != expected.size()) throw std::runtime_error("Layer CPU source calls differ from measured work");
             ranges = nlohmann::json::array();
@@ -92,7 +118,7 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
                 const auto & event = graph.event_for_node(id);
                 const auto stop = event.ts + event.dur;
                 if (event.cat != "cpu_op" || !event.name.ends_with(".self")) {
-                    if (call.value("method", std::string{}) == "profiling.recorder_write") {
+                    if (recorder_write) {
                         // Do not distribute this CPU budget across a semantic/wait
                         // boundary. Retain the whole write, including any earlier pieces.
                         retained.push_back({
@@ -108,9 +134,9 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
                         retain_recorder = true;
                         break;
                     }
-                    throw std::runtime_error("Host CPU boundary is not an ordinary self slice: method=" + call.value("method", std::string{})
-                                             + " pid=" + lane.first + " tid=" + lane.second + " range=" + std::to_string(begin) + ":" + std::to_string(end)
-                                             + " node=" + event.name + " interval=" + std::to_string(event.ts) + ":" + std::to_string(stop));
+                    throw std::runtime_error("Host CPU boundary is not an ordinary self slice: method=" + method + " pid=" + lane.first + " tid=" + lane.second
+                                             + " range=" + std::to_string(begin) + ":" + std::to_string(end) + " node=" + event.name
+                                             + " interval=" + std::to_string(event.ts) + ":" + std::to_string(stop));
                 }
                 spans.push_back({ std::max(begin, event.ts), std::min(end, stop), false });
             }
@@ -118,11 +144,33 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
             auto ordered = spans;
             std::ranges::sort(ordered, [](const auto & a, const auto & b) { return std::pair{ a.begin, a.end } < std::pair{ b.begin, b.end }; });
             auto cursor = begin;
+            bool partitioned = true;
             for (const auto & piece : ordered) {
-                if (piece.begin != cursor || piece.end <= cursor) throw std::runtime_error("Host CPU ownership has gaps or overlapping slices");
+                if (piece.begin != cursor || piece.end <= cursor) {
+                    partitioned = false;
+                    break;
+                }
                 cursor = piece.end;
             }
-            if (cursor != end) throw std::runtime_error("Host CPU ownership is incomplete");
+            if (!partitioned || cursor != end) {
+                // Observer writes can outlive the final retained CPU event.
+                // Keep an unpartitioned write, never invent DAG work to remove it.
+                if (recorder_write) {
+                    retained.push_back({
+                        {           "measurement",                                                               call },
+                        {                "reason",                                  "incomplete_source_cpu_partition" },
+                        {        "range_begin_us",                                                              begin },
+                        {          "range_end_us",                                                                end },
+                        {         "covered_to_us",                                                             cursor },
+                        { "retained_reduction_us", rounded_change(call.at("measured_service_delta_us").get<double>()) }
+                    });
+                    retain_recorder = true;
+                    break;
+                }
+                throw std::runtime_error("Host CPU ownership is incomplete or overlapping: method=" + method + " pid=" + lane.first + " tid=" + lane.second
+                                         + " range_us=" + std::to_string(begin) + ":" + std::to_string(end) + " covered_to_us=" + std::to_string(cursor)
+                                         + " reason=" + owned.reason);
+            }
             for (const auto & piece : spans)
                 if (!piece.sync) pieces.push_back(piece);
         }
@@ -194,7 +242,7 @@ nlohmann::json attach_hook_recorder_cpu_service(core::DagGraph & graph, const nl
 
 nlohmann::json attach_recorder_cpu_service(core::DagGraph & graph, const nlohmann::json & writes) {
     auto rows = nlohmann::json::array();
-    core::CpuServiceCost selected_ranges;
+    std::map<core::CpuServiceCost::Lane, std::vector<core::CpuServiceCost::Span>> selected_ranges;
     double cpu_us = 0;
     int64_t reduction_us = 0;
     for (const auto & write : writes) {
@@ -217,7 +265,7 @@ nlohmann::json attach_recorder_cpu_service(core::DagGraph & graph, const nlohman
         const auto reduction = rounded_change(cpu);
         if (reduction < 0 || static_cast<uint64_t>(reduction) > end - begin)
             throw std::runtime_error("Measured recorder CPU does not fit graph time resolution");
-        selected_ranges.add(lane, { begin, end, 0 });
+        selected_ranges[lane].push_back({ begin, end, 0 });
         rows.push_back({
             {                       "pid",            write.at("pid") },
             {                       "tid",            write.at("tid") },
@@ -231,6 +279,12 @@ nlohmann::json attach_recorder_cpu_service(core::DagGraph & graph, const nlohman
         cpu_us += cpu;
         reduction_us += reduction;
     }
+
+    // Validate the same selected writes before applying any recorder cost,
+    // without inserting each interval into the middle of a growing vector.
+    core::CpuServiceCost selected;
+    for (auto & [lane, spans] : selected_ranges) selected.add_spans(lane, std::move(spans));
+
     const auto retained = rows.empty() ? nlohmann::json::array()
                                        : attach_host_cpu_service(graph,
                                                                  {

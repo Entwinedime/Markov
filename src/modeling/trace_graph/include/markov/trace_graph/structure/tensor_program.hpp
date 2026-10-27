@@ -35,10 +35,4 @@ struct TensorOperation {
     std::vector<OperationWork> device_launches;
 };
 
-/** Dense computation with measurable outer CPU boundaries: nonquantized
- * F.linear, fused SwiGLU, RMSNorm or residual-add RMSNorm.
- * Geometry/implementation are supplied by the framework rule or measurement;
- * this function neither chooses a target token layout nor reads costs. */
-[[nodiscard]] std::vector<TensorOperation> dense_tensor_program(const std::string & component, const std::string & implementation, const DenseShape & shape);
-
 } // namespace markov::trace_graph::structure

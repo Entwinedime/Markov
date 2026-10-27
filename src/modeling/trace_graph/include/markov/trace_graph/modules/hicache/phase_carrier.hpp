@@ -5,7 +5,7 @@
 #pragma once
 
 #include "markov/trace_graph/core/dag_mutation.hpp"
-#include "markov/trace_graph/cost/static_phase.hpp"
+#include "markov/trace_graph/modules/hicache/diagnostics/static_phase.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
@@ -43,7 +43,7 @@ struct HiCachePhaseCarrierAudit {
  * and synchronization dependencies. Zero-cost start/complete nodes connect phases
  * to I/O and requests. Unobserved operator families require a separate template.
  */
-[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const cost::StaticPhaseCosts & phase_work,
+[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const diagnostics::StaticPhaseCosts & phase_work,
                                                                          core::DagMutationPlan & plan);
 
 #ifdef DEBUG

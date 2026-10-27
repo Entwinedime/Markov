@@ -1,8 +1,9 @@
 #pragma once
 
-#include "markov/trace_graph/cost/hicache_io.hpp"
+#include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/structure/hicache/io_completion.hpp"
 
 #include <map>
 #include <string>
@@ -17,9 +18,9 @@ namespace markov::trace_graph::modules::hicache::runtime {
  */
 class HiCacheStorageWrites {
 public:
-    HiCacheStorageWrites(model::HiCacheState & state, const frontend::HiCacheConfig & config)
+    HiCacheStorageWrites(model::HiCacheState & state, const frontend::HiCacheConfig & config, const structure::hicache::IoCompletionProvider & completion)
         : state_(state),
-          completion_(cost::io_completion_provider(config.io_cost)),
+          completion_(completion),
           page_bytes_(config.kv_bytes_per_page) {}
 
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);

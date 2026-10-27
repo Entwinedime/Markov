@@ -241,7 +241,9 @@ private:
 
     [[nodiscard]] bool accepts_event(const TraceEvent & event, bool saw_phase) const {
         if (event.name.empty()) return false;
-        const bool executable = saw_phase && event.ph == 'X' && (options_.include_validation_only || !validation_only_event(event))
+        const bool selected_name =
+            options_.name_prefixes.empty() || std::ranges::any_of(options_.name_prefixes, [&](const auto & prefix) { return event.name.starts_with(prefix); });
+        const bool executable = saw_phase && event.ph == 'X' && (options_.include_validation_only || !validation_only_event(event)) && selected_name
                                 && (options_.include_ignored_duration || !ignored_duration_event_name(event.name));
         const bool metadata = options_.include_metadata && event.ph == 'M';
         return executable || metadata;

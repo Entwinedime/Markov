@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_patch.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_io.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
 #include <algorithm>
@@ -24,7 +25,7 @@ struct RequestLoadbacks {
 
 // Keep stream order and downstream synchronizations, but not the removed
 // wait's Record dependency. Adjacent removed waits are traversed together.
-void bypass_device_waits(const HiCacheSourceDagIndex & source, const std::set<size_t> & removed, core::DagMutationPlan & plan) {
+void bypass_device_waits(const adapters::sglang::HiCacheSourceIndex & source, const std::set<size_t> & removed, core::DagMutationPlan & plan) {
     const auto & graph = source.graph();
     std::set<std::tuple<size_t, size_t, Kind>> additions;
     for (const auto id : removed) {
@@ -62,7 +63,7 @@ void bypass_device_waits(const HiCacheSourceDagIndex & source, const std::set<si
 }
 } // namespace
 
-static HiCacheLayerWaitPatch build_layer_wait_plan(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
+static HiCacheLayerWaitPatch build_layer_wait_plan(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
                                                    std::vector<HiCacheRewriteDecision> & decisions, core::DagMutationPlan & plan) {
     HiCacheLayerWaitPatch audit;
     if (waits.status == "unavailable") return audit;
@@ -269,8 +270,8 @@ static HiCacheLayerWaitPatch build_layer_wait_plan(const HiCacheSourceDagIndex &
     return audit;
 }
 
-HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const HiCacheSourceDagIndex & source,
-                                                        std::span<const HiCacheLayerWaitRemoval> changes, core::DagMutationPlan & plan) {
+HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
+                                                         core::DagMutationPlan & plan) {
     HiCacheLayerWaitPatch audit;
     const auto & graph = source.graph();
     core::DagMutationPlan addition{ .component = effect };
@@ -296,7 +297,7 @@ HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const HiCacheSourceDagI
         audit.removed_main_cpu_us += graph.node(*call->submission).duration;
         for (const auto & gap : call->cpu.owned_gap_slices) {
             gap_removal[gap.owner_node_id] += gap.owned_end_us - gap.owned_start_us;
-            removed_ranges[gap.owner_node_id].emplace_back(gap.owned_start_us,gap.owned_end_us);
+            removed_ranges[gap.owner_node_id].emplace_back(gap.owned_start_us, gap.owned_end_us);
         }
         workers.insert(*call->worker);
         devices.insert(*call->device_wait);
@@ -315,23 +316,22 @@ HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const HiCacheSourceDagI
         std::optional<core::DagGraph::CpuGapRanges> retained;
         if (graph.node(id).cpu_gap_after == graph.node(id).original_cpu_gap_after) {
             retained.emplace();
-            const auto& event = graph.event_for_node(id);
-            auto cursor = event.ts+event.dur;
-            const auto end = cursor+graph.node(id).original_cpu_gap_after;
-            auto& cuts = removed_ranges.at(id);
+            const auto & event = graph.event_for_node(id);
+            auto cursor = event.ts + event.dur;
+            const auto end = cursor + graph.node(id).original_cpu_gap_after;
+            auto & cuts = removed_ranges.at(id);
             std::ranges::sort(cuts);
-            for (const auto& [lo,hi] : cuts) {
-                if (lo<cursor || hi<=lo || hi>end) {
+            for (const auto & [lo, hi] : cuts) {
+                if (lo < cursor || hi <= lo || hi > end) {
                     ++audit.blockers["call_gap_ranges_overlap_or_exceed_source"];
                     break;
                 }
-                if (cursor<lo) retained->emplace_back(cursor,lo);
-                cursor=hi;
+                if (cursor < lo) retained->emplace_back(cursor, lo);
+                cursor = hi;
             }
-            if (cursor<end) retained->emplace_back(cursor,end);
-        } else if (!graph.cpu_service_cost().empty()) {
-            ++audit.blockers["call_gap_source_coordinates_already_modified"];
+            if (cursor < end) retained->emplace_back(cursor, end);
         }
+        else if (!graph.cpu_service_cost().empty()) { ++audit.blockers["call_gap_source_coordinates_already_modified"]; }
         addition.set_cpu_gaps.push_back({ .node_id = id,
                                           .duration = graph.node(id).cpu_gap_after - removed,
                                           .effect_id = effect,
@@ -359,7 +359,7 @@ HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const HiCacheSourceDagI
     return audit;
 }
 
-HiCacheLayerWaitPatch append_hicache_layer_wait_plan(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
+HiCacheLayerWaitPatch append_hicache_layer_wait_plan(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
                                                      std::vector<HiCacheRewriteDecision> & decisions, core::DagMutationPlan & plan) {
     auto candidate = plan;
     auto effects = decisions;

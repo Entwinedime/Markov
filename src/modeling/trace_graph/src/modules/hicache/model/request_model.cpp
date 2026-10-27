@@ -4,9 +4,12 @@
  */
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <map>
+#include <nlohmann/json.hpp>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -102,7 +105,6 @@ void HiCacheState::update_request_state(const HiCacheFact & fact, ScopedState & 
     request.device_pages = lookup.device_pages;
     request.host_pages = lookup.host_pages;
     request.device_chain = lookup.device_chain;
-    request.host_chain = lookup.host_chain;
 }
 
 /**
@@ -114,6 +116,63 @@ void HiCacheState::update_request_state(const HiCacheFact & fact, ScopedState & 
  * sufficient loadback intent and SGLang retries failed allocation after radix eviction.
  */
 void HiCacheState::admit_load(const HiCacheFact & fact) { apply_cache_lookup_input(fact, true); }
+
+HiCachePrefillAdmission HiCacheState::prefill_admission(const HiCacheFact & lookup, uint64_t prompt_tokens, uint64_t generation_reservation_tokens) const {
+    const auto path = runtime::resolve_cache_lookup_path(lookup);
+    const auto pages = pager_.project(lookup, path.tokens);
+    return { normalized_scope(lookup), pages.page_ids(), pages.page_size, prompt_tokens, generation_reservation_tokens };
+}
+
+bool HiCacheState::can_admit_prefill(const HiCachePrefillAdmission & work) const {
+    const auto capacity_pages = policy_.l1_capacity_pages();
+    if (!capacity_pages) return true;
+
+    const auto scope = scopes_.find(work.cache_scope);
+    const auto * state = scope == scopes_.end() ? nullptr : &scope->second;
+    uint64_t available_pages = state && state->device_allocator.initialized ? state->device_allocator.available_pages() : capacity_pages;
+    uint64_t prefix_pages = 0;
+    if (state) {
+        for (const auto & node : state->tree.nodes())
+            if (node.active && node.residency.device_present && !node.refs.lock_ref_total)
+                available_pages = core::checked_add_u64(available_pages, node.pages.size(), "Admission reclaimable pages overflow");
+
+        for (const auto & page : work.lookup_pages) {
+            const auto owner = state->tree.node_for_page(page);
+            if (!owner) break;
+            const auto & node = *state->tree.node(*owner);
+            if (!node.residency.device_present) break;
+
+            ++prefix_pages;
+            if (!node.refs.lock_ref_total) --available_pages;
+        }
+    }
+
+    const auto page_size = work.page_size_tokens;
+    const auto prefix_tokens = core::checked_multiply_u64(prefix_pages, page_size, "Admission device prefix overflow");
+    const auto extended_tokens = core::checked_subtract_u64(work.prompt_tokens, prefix_tokens, "Admission prefix exceeds its prompt");
+    const auto requested_tokens =
+        core::checked_add_u64(core::checked_add_u64(extended_tokens, work.generation_reservation_tokens, "Admission reservation overflow"),
+                              page_size,
+                              "Admission page overhead overflow");
+    const auto available_tokens = core::checked_multiply_u64(available_pages, page_size, "Admission available tokens overflow");
+    if (requested_tokens < available_tokens) return true;
+
+    if (!state || (state->pending_write_through_backups.empty() && state->load_ack_queue.empty()))
+        throw structure::MissingWork("Target prefill cannot be admitted within its device capacity and has no pending acknowledgement to make progress",
+                                     {
+                                         { "required_operation", "prefill_admission" },
+                                         {   "requested_tokens",    requested_tokens },
+                                         {   "available_tokens",    available_tokens },
+                                         {     "capacity_pages",      capacity_pages }
+        });
+    return false;
+}
+
+void HiCacheState::match_rejected_prefill(const HiCachePrefillAdmission & work) {
+    auto & scope = scopes_.at(work.cache_scope);
+    const auto matched = scope.tree.lookup(work.lookup_pages);
+    sync_capacity(scope, work.cache_scope, matched.topology_chain);
+}
 
 void HiCacheState::apply_cache_lookup_input(const HiCacheFact & fact, bool admission) {
     auto & scope = scope_state(fact);
@@ -391,9 +450,8 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
                                             }),
                                             page_size);
 
-    // The scheduler owns each accepted prefix before it asks the allocator to
-    // make room for extension.  Refresh the canonical node chain after prefetch
-    // and host cleanup, then hold that chain across the device-eviction pass.
+    // The scheduler locks the accepted device prefix before extension. Host
+    // pins belong to in-flight I/O; a failed load must leave its host hit evictable.
     for (const auto & intent : batch_intent.requests) {
         auto request_fact = batch_request_fact(fact, intent.request_id, intent.accepted_tokens);
         update_request_state(request_fact, scope, intent.full_pages);
@@ -403,8 +461,6 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
         auto ref = scope.refs.release_owner(scope.tree, owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref);
         ref = scope.refs.acquire_lock(scope.tree, owner, it->second.device_chain);
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref);
-        ref = scope.refs.acquire_host(scope.tree, owner, it->second.host_chain);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref);
     }
 
@@ -418,7 +474,43 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
         // count. The scheduler's conservative eviction budget is not its
         // release-queue merge threshold (nor the generic CUDA allocator's).
         scope.device_allocator.merge_before_page_allocation(batch_intent.allocated_pages);
-        if (!scope.device_allocator.can_allocate(batch_intent.allocated_pages)) throw std::runtime_error("Target extend allocation is out of device pages");
+        if (!scope.device_allocator.can_allocate(batch_intent.allocated_pages)) {
+            std::string requests;
+            for (const auto & intent : batch_intent.requests) {
+                if (!requests.empty()) requests += ",";
+                requests += intent.request_id + "(tokens=" + std::to_string(intent.accepted_tokens)
+                            + ",prefix=" + std::to_string(intent.allocation_prefix_tokens) + ")";
+            }
+
+            std::map<std::string, uint64_t> locked_pages;
+            for (const auto & node : scope.tree.nodes()) {
+                if (!node.active || !node.residency.device_present) continue;
+
+                for (const auto & owner : node.refs.lock_refs_by_owner | std::views::keys) locked_pages[owner] += node.pages.size();
+            }
+
+            std::map<std::string, uint64_t> rejected;
+            auto victims = nlohmann::json::array();
+            if (const auto work = scope.eviction_work.find(fact.source_node_id); work != scope.eviction_work.end()) {
+                for (const auto & candidate : work->second.rejected_candidates) ++rejected[candidate.reason];
+                for (const auto & victim : work->second.victims)
+                    victims.push_back({
+                        {               "pages",          victim.page_count },
+                        { "release_after_write", victim.release_after_write },
+                        {           "backed_up",           victim.backed_up }
+                    });
+            }
+
+            throw std::runtime_error(
+                "Target extend allocation is out of device pages: requests=" + requests + " pid=" + fact.pid
+                + " allocated_pages=" + std::to_string(batch_intent.allocated_pages) + " eviction_budget_pages=" + std::to_string(batch_intent.requested_pages)
+                + " capacity_pages=" + std::to_string(scope.device_allocator.capacity_pages)
+                + " free_pages=" + std::to_string(scope.device_allocator.free_pages) + " release_pages=" + std::to_string(scope.device_allocator.release_pages)
+                + " radix_pages=" + std::to_string(scope.capacity.snapshot().occupied_device_pages) + " pending_writes="
+                + std::to_string(scope.pending_write_through_backups.size()) + " lock_owners=" + nlohmann::json(locked_pages).dump() + " rejected_victims="
+                + nlohmann::json(rejected).dump() + " host_occupied_pages=" + std::to_string(scope.capacity.snapshot().occupied_host_pages)
+                + " host_reserved_pages=" + std::to_string(scope.capacity.snapshot().reserved_host_pages) + " evicted_victims=" + victims.dump());
+        }
 
         HiCacheAllocatorWorkItem allocation{
             .source_fact_id = fact.source_node_id,
@@ -473,8 +565,6 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
             request.lifecycle_state = "extended";
             ref = scope.refs.acquire_lock(scope.tree, owner, request.device_chain);
             sync_capacity_for_ref(scope, normalized_scope(fact), ref);
-            ref = scope.refs.acquire_host(scope.tree, owner, request.host_chain);
-            sync_capacity_for_ref(scope, normalized_scope(fact), ref);
         }
 
         drain_prefetch_after_cache_extend(entry_facts, scope);
@@ -513,8 +603,22 @@ void HiCacheState::apply_cache_lifecycle_commit(const HiCacheFact & fact, HiCach
     const auto extended_pages = ceil_div(allocated_tokens, page_path.page_size);
     const auto total_committed_pages = ceil_div(lifecycle_token_count, page_path.page_size);
     const auto decode_allocated_pages = bounded_subtract(total_committed_pages, extended_pages);
-    if (execution_prefetch_control_ && request.extended_tokens && decode_allocated_pages)
-        throw std::runtime_error("Lifecycle reached unobserved decode page allocations");
+    if (execution_prefetch_control_ && request.extended_tokens && decode_allocated_pages) {
+        // A finished output does not prove that overlap scheduling performed
+        // no further allocation. Cost samples cannot supply this missing work.
+        throw structure::MissingWork("Lifecycle reached unobserved decode page allocations",
+                                     {
+                                         { "required_operation",     "decode_allocation" },
+                                         {         "request_id",         fact.request_id },
+                                         {                "pid",                fact.pid },
+                                         { "source_event_index", fact.source_event_index },
+                                         {    "extended_tokens", request.extended_tokens },
+                                         {     "decoded_tokens",  request.decoded_tokens },
+                                         {   "committed_tokens",   lifecycle_token_count },
+                                         {   "page_size_tokens",     page_path.page_size },
+                                         {   "unobserved_pages",  decode_allocated_pages }
+        });
+    }
     uint64_t consumed_decode_pages = 0;
     for (uint64_t page = 0; page < decode_allocated_pages; ++page) {
         enforce_device_capacity(fact, scope, 1);
@@ -600,8 +704,6 @@ void HiCacheState::complete_lifecycle_return(const HiCacheFact & fact) {
         auto ref = scope.refs.release_owner(scope.tree, owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref);
         ref = scope.refs.acquire_lock(scope.tree, owner, it->second.device_chain);
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref);
-        ref = scope.refs.acquire_host(scope.tree, owner, it->second.host_chain);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref);
     }
     else {

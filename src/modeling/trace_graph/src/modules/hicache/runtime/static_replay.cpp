@@ -1,7 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/static_replay.hpp"
 
-#include "markov/trace_graph/cost/hicache_io.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/io_completion.hpp"
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -9,7 +9,7 @@ model::HiCacheModelResult replay_hicache_static(core::DagGraph & graph, const fr
                                                 const model::HiCacheFactClock & execution_clock) {
     model::HiCacheModelReplay replay(graph,
                                      config,
-                                     cost::io_completion_provider(config.io_cost),
+                                     runtime::io_completion_provider(config.io_cost),
                                      config.io_cost.storage_batch_pages,
                                      config.io_cost.resource_lanes,
                                      false,

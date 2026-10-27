@@ -1,10 +1,15 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 
 #include <cstddef>
 #include <span>
 #include <string>
+
+namespace markov::trace_graph::simulation::detail {
+struct CpuTaskQueues;
+}
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -20,8 +25,8 @@ struct HiCacheHostRegion {
 /** Plan a zero-cost entry before existing CPU work, retaining that work and its
  * outgoing gap. The source index must describe the graph before the whole plan.
  * Resolve the returned symbolic node only after applying the plan. */
-[[nodiscard]] core::DagNodeRef append_host_entry_gate(const patch::HiCacheSourceDagIndex & source, size_t first, core::DagObservedPoint point, std::string id,
-                                                      std::string name, core::DagMutationPlan & plan);
+[[nodiscard]] core::DagNodeRef append_host_entry_gate(const adapters::sglang::HiCacheSourceIndex & source, size_t first, core::DagObservedPoint point,
+                                                      std::string id, std::string name, core::DagMutationPlan & plan);
 
 /** Remove complete observed calls before simulation. Entry/exit gates survive
  * for target insertion. Event consumers must belong to the removed region;
@@ -32,8 +37,14 @@ struct HiCacheHostRegion {
  * to new submission boundaries in the enclosing mutation plan. Those tasks
  * remain outside removal; the supplied host regions describe caller work only.
  * Planning does not modify the graph or assign any replacement cost. */
-[[nodiscard]] core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & source, std::span<const HiCacheHostRegion> regions,
+[[nodiscard]] core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheHostRegion> regions,
                                                       std::span<const size_t> collective_handoffs = {},
+                                                      std::span<const core::DagRedirectEdgeMutation> submission_handoffs = {});
+
+/** Reuse task identities already discovered from this same, unmodified graph.
+ * The caller must apply no mutation between discovery and removal planning. */
+[[nodiscard]] core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                      std::span<const HiCacheHostRegion> regions, std::span<const size_t> collective_handoffs = {},
                                                       std::span<const core::DagRedirectEdgeMutation> submission_handoffs = {});
 
 } // namespace markov::trace_graph::modules::hicache::runtime

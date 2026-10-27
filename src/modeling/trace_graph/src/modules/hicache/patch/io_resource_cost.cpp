@@ -34,7 +34,7 @@ std::optional<uint64_t> project_service(HiCacheIoCostRecord & record, const mode
     record.storage_new_byte_count = core::checked_multiply_u64(decision.storage_new_page_count, page_bytes, "HiCache new-storage bytes exceed uint64 range");
     uint64_t duration = 0;
     const auto add = [&](uint64_t pages, uint64_t calls, uint64_t existing, std::optional<uint64_t> copied = std::nullopt) {
-        const auto cost = hicache_service_cost(service, page_bytes, pages, calls, existing, copied);
+        const auto cost = cost::estimate_io_service(service, page_bytes, pages, calls, existing, copied);
         if (!cost) return false;
         duration = core::checked_add_u64(duration, cost->duration_us, "I/O service duration overflow");
         record.calibration_setup_us += cost->setup_us;

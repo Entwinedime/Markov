@@ -19,7 +19,7 @@ namespace markov::trace_graph::core {
 
 namespace {
 
-using dag_builder_detail::is_hicache_control_event;
+using dag_builder_detail::is_control_envelope;
 using dag_builder_detail::node_end_ts;
 using dag_builder_detail::resolve_event_lane;
 
@@ -135,10 +135,10 @@ private:
     void coalesce_boundary_group(size_t begin, size_t end) {
         for (size_t device_position = begin; device_position < end; ++device_position) {
             const auto device_index = boundary_order_[device_position];
-            if (dropped_[device_index] || is_hicache_control_event(events_[device_index]) || !events_[device_index].has_arg("Physic Stream Id")) continue;
+            if (dropped_[device_index] || is_control_envelope(events_[device_index]) || !events_[device_index].has_arg("Physic Stream Id")) continue;
             for (size_t position = begin; position < end; ++position) {
                 const auto index = boundary_order_[position];
-                if (index == device_index || dropped_[index] || is_hicache_control_event(events_[index])
+                if (index == device_index || dropped_[index] || is_control_envelope(events_[index])
                     || dag_builder_detail::is_submit_anchor_event(events_[index]))
                     continue;
                 if (!compatible_operation(events_[device_index], events_[index])) continue;
@@ -146,7 +146,12 @@ private:
                     && !shared_operation_identity(events_[device_index], events_[index]))
                     continue;
                 events_[device_index].merge_args_from(events_[index]);
-                if (events_[index].tid == "0") events_[device_index].name = events_[index].name;
+                if (events_[index].tid == "0") {
+                    events_[device_index].name = events_[index].name;
+                    events_[device_index].boundary = events_[index].boundary;
+                    events_[device_index].submit_anchor = events_[index].submit_anchor;
+                    events_[device_index].collective_envelope = events_[index].collective_envelope;
+                }
                 dropped_[index] = true;
             }
         }
@@ -202,7 +207,7 @@ private:
         std::vector<TraceEvent> result;
         result.reserve(events.size());
         for (const auto index : std::views::iota(size_t{ 0 }, events.size())) {
-            if (is_hicache_control_event(events[index]) || events[index].arg("formal_window_cpu_parent") == "true") selection.is_leaf[index] = false;
+            if (is_control_envelope(events[index]) || events[index].arg("formal_window_cpu_parent") == "true") selection.is_leaf[index] = false;
         }
         append_hicache_control_self_time(events, lanes, selection, result);
         partition_control_self_time(result, observations);
@@ -230,7 +235,7 @@ private:
                                                const LeafSelection & selection) {
         std::unordered_set<std::string> copy_connections;
         for (const auto & event : events)
-            if (event.name == "MEMCPY_ASYNC" && resolve_event_lane(event, false).is_device) {
+            if (event.boundary == TraceBoundary::DeviceCopy && resolve_event_lane(event, false).is_device) {
                 const auto connection = event.arg("connection_id");
                 if (!connection.empty()) copy_connections.insert(connection);
             }
@@ -247,9 +252,7 @@ private:
                 for (auto it = begin; it != items.indices.end() && events[*it].ts <= node_end_ts(parent); ++it) {
                     const auto id = *it;
                     const auto & child = events[id];
-                    if (!selection.is_leaf[id] || selection.discarded[id]
-                        || (child.name != "AscendCL@aclrtMemcpyAsync" && child.name != "AscendCL@aclrtMemcpy2dAsync"))
-                        continue;
+                    if (!selection.is_leaf[id] || selection.discarded[id] || child.boundary != TraceBoundary::AsyncCopy) continue;
                     if (submicro_timestamp(child) < submicro_timestamp(parent)
                         || submicro_timestamp(child) + submicro_duration(child) > submicro_timestamp(parent) + submicro_duration(parent))
                         continue;
@@ -279,9 +282,7 @@ private:
             // generated self-time preserves cost while making ownership exact;
             // real measured leaves are appended only after this partition.
             const bool operator_envelope = call.source_channel == TraceSourceChannel::Torch && call.cat == "cpu_op" && call.ph == 'X';
-            if (!operator_envelope && call.name != "runtime.cpu_collective" && call.name != "runtime.hicache.prefetch_check"
-                && call.name != "runtime.hicache.prefetch_stop" && call.name != "runtime.hicache.prefetch_enqueue")
-                continue;
+            if (!operator_envelope && call.call_role != TraceCallRole::ControlBoundary) continue;
             auto & times = boundaries[{ call.pid, call.tid }];
             times.push_back(call.ts);
             times.push_back(node_end_ts(call));
@@ -317,7 +318,7 @@ private:
             }
             for (const auto marker_index : lane_events.indices) {
                 const auto & marker = events[marker_index];
-                if (!is_hicache_control_event(marker)) continue;
+                if (!is_control_envelope(marker)) continue;
                 const auto marker_end = node_end_ts(marker);
                 if (marker_end <= marker.ts) continue;
 
@@ -342,7 +343,7 @@ private:
                     if (child_index == marker_index) continue;
                     const auto & child = events[child_index];
                     if (child.ts >= marker_end) break;
-                    if (!is_hicache_control_event(child) || child.dur == 0) continue;
+                    if (!is_control_envelope(child) || child.dur == 0) continue;
                     const auto child_end = node_end_ts(child);
                     const bool nested_control =
                         child.ts >= marker.ts && child_end <= marker_end && (child.ts > marker.ts || child_end < marker_end || child.index > marker.index);
@@ -418,11 +419,11 @@ private:
                 stack.pop_back();
                 continue;
             }
-            if (parent.name == "Node@launch" || parent.cat == "enqueue" || current.name.starts_with("Runtime@")) {
+            if (parent.boundary == TraceBoundary::NodeLaunch || parent.cat == "enqueue" || current.boundary == TraceBoundary::RuntimeDetail) {
                 selection.discarded[current_index] = true;
                 return;
             }
-            if (parent.name != "AscendCL@aclrtRecordEvent") selection.is_leaf[parent_index] = false;
+            if (parent.boundary != TraceBoundary::HostEventRecord) selection.is_leaf[parent_index] = false;
             if (current_correlation_id.empty()) {
                 const auto parent_correlation_id = correlation_id(parent);
                 if (!parent_correlation_id.empty()) current.set_arg("correlation_id", parent_correlation_id);
@@ -450,7 +451,7 @@ private:
         std::vector<size_t> stack;
         for (const size_t current_index : indices) {
             auto & current = events[current_index];
-            if (is_hicache_control_event(current)) continue;
+            if (is_control_envelope(current)) continue;
             const auto current_correlation_id = correlation_id(current);
             resolve_nested_parent(events, current_index, stack, selection, current_correlation_id);
             if (!selection.discarded[current_index]) stack.push_back(current_index);
@@ -477,12 +478,20 @@ std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events, std::sp
     auto normalized = EventNormalizer(std::move(events), runtime_observations).run();
     // A candidate must not participate in leaf selection: a zero-duration
     // child could otherwise discard a real call crossing the window cut.
+    const auto retained_count = normalized.size();
     for (auto & head : heads) {
         const auto covered =
             std::ranges::any_of(normalized, [&](const auto & event) { return event.pid == head.pid && event.tid == head.tid && event.ts <= head.ts; });
         if (!covered) normalized.push_back(std::move(head));
     }
-    if (!heads.empty()) std::ranges::stable_sort(normalized, {}, &TraceEvent::ts);
+
+    // The executable events are already timestamp-ordered. Merge only the new
+    // heads, preserving the old stable order without sorting large events again.
+    if (normalized.size() > retained_count) {
+        auto first_head = normalized.begin() + static_cast<std::ptrdiff_t>(retained_count);
+        std::ranges::stable_sort(first_head, normalized.end(), {}, &TraceEvent::ts);
+        std::ranges::inplace_merge(normalized.begin(), first_head, normalized.end(), {}, &TraceEvent::ts);
+    }
     return normalized;
 }
 

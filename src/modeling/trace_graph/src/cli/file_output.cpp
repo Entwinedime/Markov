@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <stdexcept>
 
 namespace markov::trace_graph::cli {
@@ -18,7 +19,9 @@ void write_json_file(const std::string & filename, const nlohmann::json & value)
     std::ofstream output(path);
     if (!output.is_open()) throw std::runtime_error("Failed to write file: " + filename);
 
-    output << value.dump(2) << '\n';
+    // Stream large experiment reports without constructing another complete
+    // JSON string. The two-space formatting stays identical to dump(2).
+    output << std::setw(2) << value << '\n';
     output.flush();
     if (!output) throw std::runtime_error("Failed to complete file write: " + filename);
 }

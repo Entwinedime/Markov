@@ -1,4 +1,5 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
@@ -19,8 +20,8 @@ struct HiCacheWriteStreamPosition {
  */
 // stream_node may be an inactive donor: only its rank/lane identify the resource.
 // Returned dependency endpoints always belong to the surviving active stream.
-[[nodiscard]] HiCacheWriteStreamPosition observe_write_stream_position(const patch::HiCacheSourceDagIndex & source, size_t stream_node, const std::string & pid,
-                                                                       const std::string & tid, uint64_t at_us);
+[[nodiscard]] HiCacheWriteStreamPosition observe_write_stream_position(const adapters::sglang::HiCacheSourceIndex & source, size_t stream_node,
+                                                                       const std::string & pid, const std::string & tid, uint64_t at_us);
 
 /** D2H service and completion, not cache publication or allocation continuation.
  * Source sites are observations used to identify resources and removal scope,
@@ -31,10 +32,10 @@ struct HiCacheWriteStreamPosition {
 class HiCacheWrites {
 public:
     explicit HiCacheWrites(model::HiCacheState & state) : state_(state) {}
-    void add_source(const patch::HiCacheSourceDagIndex & source, const patch::HiCacheIoOperationRecord & record);
+    void add_source(const adapters::sglang::HiCacheSourceIndex & source, const patch::HiCacheIoOperationRecord & record);
     /** Recover the donor's compute stream through its actual Record -> Wait.
      * Reuse the stream identity, never the donor request's data predecessor. */
-    [[nodiscard]] size_t source_start_record(const patch::HiCacheSourceDagIndex & source, size_t source_fact) const;
+    [[nodiscard]] size_t source_start_record(const adapters::sglang::HiCacheSourceIndex & source, size_t source_fact) const;
     [[nodiscard]] size_t source_completion(size_t source_fact) const { return sources_.at(source_fact).completion; }
     /** Retained payload and completion nodes of a proven source call. Entirely
      * pre-window transfers are absent; this is removal ownership, not work size. */

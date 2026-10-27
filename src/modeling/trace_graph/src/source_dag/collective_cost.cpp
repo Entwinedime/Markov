@@ -1,5 +1,6 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/source_dag/device_collectives.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
@@ -24,12 +25,12 @@ std::optional<std::pair<uint64_t, uint64_t>> raw_interval_ns(const core::DagGrap
 
 } // namespace
 
-nlohmann::json collective_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+nlohmann::json collective_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                 const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied) {
     const auto & graph = source.graph();
-    const auto positions = phase_call_positions(phases);
-    const auto observed = observe_device_collectives(source, queues, phases, positions);
-    std::map<size_t, const DeviceCollectiveCall *> calls;
+    const auto positions = adapters::sglang::phase_call_positions(phases);
+    const auto observed = adapters::sglang::observe_device_collectives(source, queues, phases, positions);
+    std::map<size_t, const adapters::sglang::DeviceCollectiveCall *> calls;
     for (const auto & call : observed.calls) calls.emplace(call.region.observation, &call);
     auto rows = nlohmann::json::array();
 
@@ -48,7 +49,7 @@ nlohmann::json collective_operator_observations(const modules::hicache::patch::H
         // tasks. Caller intervals end at each enqueue, not at the last
         // enqueue of the whole call; worker/device work is measured separately.
         if (const auto tasks = observe_queued_call_tasks(source, queues, call.region)) {
-            if (const auto caller = observe_collective_caller_intervals(source, queues, call, *tasks)) {
+            if (const auto caller = adapters::sglang::observe_collective_caller_intervals(source, queues, call, *tasks)) {
                 const auto steps = structure::hicache::ordinary_collective_caller_steps(call.transfer);
                 const auto & envelope = graph.runtime_observations().at(call.region.observation);
                 for (const auto & interval : *caller) {
@@ -66,7 +67,7 @@ nlohmann::json collective_operator_observations(const modules::hicache::patch::H
 
             for (const auto & task : *tasks) {
                 const auto & submit = graph.event_for_node(queues.tasks.at(task.task).submission);
-                const auto primitive = collective_task_kind(submit.name);
+                const auto primitive = adapters::sglang::collective_task_kind(submit.name);
                 if (!primitive) continue;
 
                 const auto task_work = structure::hicache::collective_task_work(work, *primitive);

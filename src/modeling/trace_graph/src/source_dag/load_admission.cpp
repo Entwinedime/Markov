@@ -1,5 +1,5 @@
 #include "markov/trace_graph/source_dag/load_admission.hpp"
-#include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/model/input.hpp"
 
 #include <set>
 #include <stdexcept>

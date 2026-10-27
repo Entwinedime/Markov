@@ -1,5 +1,7 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -46,7 +48,7 @@ void HiCacheWriteCalls::bind_lifecycle_writes(core::DagGraph & graph, uint64_t b
         append(std::move(end));
     }
     const auto nodes = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     for (size_t i = 0; i < points.size(); ++i) {
         if (!nodes[i]) throw std::runtime_error("Lifecycle write lacks an exact ready boundary");
         Call call{ .owner = owners[i], .pid = points[i].pid, .tid = points[i].tid, .at_us = points[i].ts, .entry_node = *nodes[i] };
@@ -76,8 +78,15 @@ void HiCacheWriteCalls::submit_lifecycle_writes(size_t node, uint64_t time, simu
         for (const auto & pending : replay_.state().pending_device_writes(fact)) {
             const auto key = std::pair{ pending.header.cache_scope, pending.header.operation_id };
             if (pending.header.source_node_id != call.owner || completions_.contains(key)) continue;
-            const auto & donor = write_resources_.at({ call.pid, call.tid });
-            const auto expanded = submit_target_write(donor, fact, pending, sequence, future);
+            const auto resources = write_resources_.find({ call.pid, call.tid });
+            if (resources == write_resources_.end())
+                throw structure::MissingWork("Lifecycle write has no observed scheduler resources",
+                                             {
+                                                 {               "pid",                       call.pid },
+                                                 {               "tid",                       call.tid },
+                                                 { "required_resource", "scheduler_compute_and_worker" }
+                });
+            const auto expanded = submit_target_write(resources->second, fact, pending, sequence, future);
             for (const auto successor : call.successors) future.depend(expanded.host_return, successor);
         }
     }

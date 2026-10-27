@@ -1,4 +1,5 @@
 #include "markov/trace_graph/source_dag/submission_cost.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 
@@ -19,7 +20,7 @@ using modules::hicache::runtime::HiCacheWriteExpansion;
 
 namespace {
 
-std::vector<HostOperationMeasurement> observe_caller_costs(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source) {
+std::vector<HostOperationMeasurement> observe_caller_costs(const HiCacheHostExpansion & plan, const adapters::sglang::HiCacheSourceIndex & source) {
     std::vector<HostOperationMeasurement> costs(plan.nodes.size());
     for (size_t i = 0; i < plan.nodes.size(); ++i) {
         const auto & node = plan.nodes[i];
@@ -66,8 +67,8 @@ void add_measurement(std::optional<uint64_t> & total, std::optional<uint64_t> va
     else total.reset();
 }
 
-void observe_worker_cost(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                         size_t submission, HostOperationMeasurement & cost) {
+void observe_worker_cost(const HiCacheHostExpansion & plan, const adapters::sglang::HiCacheSourceIndex & source,
+                         const simulation::detail::CpuTaskQueues & queues, size_t submission, HostOperationMeasurement & cost) {
     std::vector<size_t> workers;
     std::set<size_t> devices;
     std::optional<size_t> first;
@@ -149,7 +150,7 @@ void append_host_operation_observations(nlohmann::json & rows, const structure::
     if (submitted) append("device_service", measured.device_us);
 }
 
-std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source,
+std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHostExpansion & plan, const adapters::sglang::HiCacheSourceIndex & source,
                                                                const simulation::detail::CpuTaskQueues & queues, uint64_t tokens, uint64_t page_size,
                                                                std::span<const uint64_t> clone_lengths, std::string_view position, bool corrected) {
     if (!page_size || !tokens || tokens % page_size || plan.streams.size() != 1 || !plan.waits.empty() || !plan.event_waits.empty()) return std::nullopt;
@@ -235,7 +236,7 @@ std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHost
     return rows;
 }
 
-std::optional<PagedReleaseMeasurement> observe_paged_release_cost(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source,
+std::optional<PagedReleaseMeasurement> observe_paged_release_cost(const HiCacheHostExpansion & plan, const adapters::sglang::HiCacheSourceIndex & source,
                                                                   const simulation::detail::CpuTaskQueues & queues, bool paged) {
     if (plan.waits.size() != (paged ? 2 : 0) || plan.streams.size() != 1 || !plan.event_waits.empty()) return std::nullopt;
     const auto & nodes = plan.nodes;
@@ -296,7 +297,7 @@ std::optional<PagedReleaseMeasurement> observe_paged_release_cost(const HiCacheH
 }
 
 std::optional<PageFirstSubmissionMeasurement> observe_page_first_submission_cost(const HiCacheWriteExpansion & plan,
-                                                                                 const patch::HiCacheSourceDagIndex & source,
+                                                                                 const adapters::sglang::HiCacheSourceIndex & source,
                                                                                  const simulation::detail::CpuTaskQueues & queues, size_t completion_count) {
     if (!plan.event_waits.empty() || plan.waits.size() != 1 || !completion_count) return std::nullopt;
     const auto & nodes = plan.nodes;

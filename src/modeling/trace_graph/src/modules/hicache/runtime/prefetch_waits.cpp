@@ -1,8 +1,10 @@
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/source_dag/prefetch.hpp"
 #include "markov/trace_graph/structure/cpu_collective.hpp"
 #include "markov/trace_graph/structure/hicache/query.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
 #include <optional>
 #include <set>
@@ -61,11 +63,12 @@ CpuCollectiveCallTiming collective_cost(cost::OperatorCostProvider & costs, stru
 } // namespace
 
 void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, std::string_view source_policy, const std::string & target_policy,
-                                const core::ClientRequestChain & chain, cost::OperatorCostProvider & costs) {
+                                const core::ClientRequestChain & chain, cost::OperatorCostProvider & costs, HiCacheQueueConfirmations::WriteWork write_work) {
     if (state_) throw std::logic_error("Prefetch waits are already bound");
     state_ = &replay.state();
+    write_work_ = std::move(write_work);
     clients_ = chain.requests;
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto rounds = observe_cpu_collectives(source);
     std::set<std::string> requests;
     for (const auto & request : clients_) requests.insert(request.request_id);
@@ -76,13 +79,32 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
     std::vector<int> participants;
     if (!grouped.empty())
         for (const auto & [rank, calls] : grouped.begin()->second) participants.push_back(rank);
-    const auto receive_group = target_policy == "best_effort" ? std::nullopt : observe_receive_group(graph, rounds, participants);
+    const auto receive_group = observe_receive_group(graph, rounds, participants);
+
+    using RequestKey = std::pair<std::string, std::string>;
+    std::map<RequestKey, const HiCacheFact *> lookups;
+    std::map<RequestKey, const HiCacheBatchPathEntry *> inputs;
+    for (const auto & item : replay.facts()) {
+        if (item.role == HiCacheFactRole::CacheLookupInput) {
+            auto & latest = lookups[{ item.fact.pid, item.fact.request_id }];
+            if (!latest || item.fact.source_ts > latest->source_ts) latest = &item.fact;
+        }
+        else if (item.role == HiCacheFactRole::CacheExtendInput)
+            for (const auto & path : item.fact.batch_paths) inputs.emplace(RequestKey{ item.fact.pid, path.request_id }, &path);
+    }
 
     std::vector<Control> selected;
     for (const auto & [request, ranks] : grouped)
         for (const auto & [rank, calls] : ranks) selected.insert(selected.end(), calls.begin(), calls.end());
     const auto regions = patch::prepare_prefetch_wait_regions(graph, selected, rounds, observe_prefetch_workers(source, rounds));
     for (const auto & request : clients_) {
+        if (!request.generation_reservation_tokens)
+            throw structure::MissingWork("Prefill admission needs the workload's declared generation limit, not its measured output length",
+                                         {
+                                             { "required_observation", "generation_reservation_tokens" },
+                                             {           "request_id",              request.request_id }
+            });
+
         const auto & ranks = grouped.at(request.request_id);
         auto wait = std::make_unique<Wait>();
         wait->request = request.request_id;
@@ -100,6 +122,8 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
             fact.role = "prefetch_progress_observed";
             fact.source_ts = first->timestamp_us + first->duration_us;
             wait->facts[rank] = std::move(fact);
+            const RequestKey key{ first->pid, request.request_id };
+            wait->admissions.emplace(rank, state_->prefill_admission(*lookups.at(key), inputs.at(key)->token_count, *request.generation_reservation_tokens));
             // Only this request's unchanged local return can migrate directly.
             // A donor from another source request would be an online cost fit.
             std::optional<uint64_t> local;
@@ -141,7 +165,7 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
                         auto communication = collective_cost(costs, std::move(work));
                         communication.entry_ranks = (action == Action::Receive ? broadcast : all_reduce).at(rank);
                         step.communication.calls.emplace(rank, std::move(communication));
-                        step.after[rank] = local(rank, name + ".after");
+                        if (action != Action::WriteCompletion) step.after[rank] = local(rank, name + ".after");
                     }
                 }
                 for (const auto rank : participants) body.tail[rank] = local(rank, "tail");
@@ -159,20 +183,39 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
             [&costs, count = ranks.size()](int rank, bool completion) {
                 return collective_cost(costs, structure::hicache::prefetch_check_collective(completion, rank, count, ""));
             },
-            [this, stable](const model::PrefetchSchedulerBoundary & boundary, uint64_t time, simulation::FutureDag &) {
-                scheduler_action(*stable, boundary, time);
+            [this, stable](const model::PrefetchSchedulerBoundary & boundary, uint64_t time, size_t node, simulation::FutureDag & future) {
+                scheduler_action(*stable, boundary, time, node, future);
+            },
+            [this, stable](int rank) {
+                const auto admitted = state_->can_admit_prefill(stable->admissions.at(rank));
+                stable->rejected_admissions[rank] = !admitted;
+                return admitted;
             });
         waits_.push_back(std::move(wait));
     }
 }
 
-void HiCachePrefetchWaits::scheduler_action(Wait & wait, const model::PrefetchSchedulerBoundary & boundary, uint64_t time) {
+void HiCachePrefetchWaits::scheduler_action(Wait & wait, const model::PrefetchSchedulerBoundary & boundary, uint64_t time, size_t node,
+                                            simulation::FutureDag & future) {
     const auto action = boundary.action;
     if (!active_http_ || *active_http_ != wait.request) throw std::runtime_error("Scheduler wait is outside its active serial HTTP request");
     // The next serial HTTP request cannot arrive until this one completes.
-    if (action == Action::Receive) return;
+    // A rejected admission did run match_prefix before returning to receive.
+    // Its split can change the pending write's publication work, even though
+    // no device allocation was admitted. The non-forward scheduler interval
+    // covers this local CPU work only as a coarse independent approximation.
+    if (action == Action::Receive) {
+        const auto rejected = wait.rejected_admissions.find(boundary.rank);
+        if (!boundary.apply && rejected != wait.rejected_admissions.end() && rejected->second) {
+            state_->match_rejected_prefill(wait.admissions.at(boundary.rank));
+            rejected->second = false;
+            ++admission_retry_rank_calls_;
+        }
+        return;
+    }
     auto fact = wait.facts.at(boundary.rank);
     fact.ts = time;
+    fact.execution_anchor_node_id = node;
     auto & samples = wait.samples[boundary.action];
     if (!boundary.apply) {
         samples[boundary.rank] = action == Action::LoadCompletion ? state_->load_completion_count(fact) : state_->write_completion_count(fact);
@@ -181,7 +224,9 @@ void HiCachePrefetchWaits::scheduler_action(Wait & wait, const model::PrefetchSc
     if (samples.size() != wait.facts.size()) throw std::runtime_error("Wait confirmation returned before all local samples");
     const auto count = std::ranges::min_element(samples, {}, [](const auto & pair) { return pair.second; })->second;
     if (action == Action::LoadCompletion) state_->acknowledge_loads(fact, count);
-    else if (action == Action::WriteCompletion) state_->acknowledge_writes(fact, count);
+    else if (action == Action::WriteCompletion) {
+        if (const auto returned = write_work_({ fact, count }, future)) future.depend(*returned, boundary.continuation);
+    }
     else throw std::runtime_error("Storage drain must be handled by the shared wait executor");
 }
 

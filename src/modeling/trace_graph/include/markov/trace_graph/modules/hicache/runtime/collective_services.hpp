@@ -1,7 +1,7 @@
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
-#include "markov/trace_graph/source_dag/device_collectives.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 
 #include <cstddef>
@@ -28,7 +28,7 @@ namespace markov::trace_graph::modules::hicache::runtime {
  */
 class HiCacheCollectiveServices {
 public:
-    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::DeviceCollectiveCall> calls, uint64_t begin_us,
+    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us,
               uint64_t end_us);
     void set_work(const structure::hicache::DeviceCollectivePlan & work);
     /** Null for unrelated nodes. A service reached without admitted target
@@ -45,7 +45,7 @@ public:
     [[nodiscard]] size_t prepared_callers() const { return caller_segments_.size(); }
 
 private:
-    void bind_callers(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::DeviceCollectiveCall> calls, uint64_t begin_us,
+    void bind_callers(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us,
                       uint64_t end_us);
 
     std::set<size_t> owned_;

@@ -4,6 +4,7 @@
 #include "markov/trace_graph/modules/hicache/model/prefetch_wait_execution.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/patch/prefetch_control_region.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -17,24 +18,29 @@ namespace markov::trace_graph::modules::hicache::runtime {
 class HiCachePrefetchWaits {
 public:
     void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, std::string_view source_policy, const std::string & target_policy,
-              const core::ClientRequestChain & chain, cost::OperatorCostProvider & costs);
+              const core::ClientRequestChain & chain, cost::OperatorCostProvider & costs, HiCacheQueueConfirmations::WriteWork write_work);
     void start(simulation::FutureDag & future);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
     [[nodiscard]] const std::vector<core::TraceEvent> & replaced_intervals() const { return replaced_; }
+    [[nodiscard]] size_t admission_retry_rank_calls() const { return admission_retry_rank_calls_; }
 
 private:
     struct Wait {
         std::string request;
         std::map<int, HiCacheFact> facts;
+        std::map<int, model::HiCachePrefillAdmission> admissions;
+        std::map<int, bool> rejected_admissions;
         std::vector<patch::PrefetchControlRegion> regions;
         std::map<model::PrefetchSchedulerAction, std::map<int, uint64_t>> samples;
         std::unique_ptr<model::HiCachePrefetchWaitExecution> execution;
     };
-    void scheduler_action(Wait & wait, const model::PrefetchSchedulerBoundary & boundary, uint64_t time);
+    void scheduler_action(Wait & wait, const model::PrefetchSchedulerBoundary & boundary, uint64_t time, size_t node, simulation::FutureDag & future);
     std::vector<std::unique_ptr<Wait>> waits_;
     std::vector<core::ClientRequestNodes> clients_;
     std::optional<std::string> active_http_;
     model::HiCacheState * state_ = nullptr;
+    HiCacheQueueConfirmations::WriteWork write_work_;
+    size_t admission_retry_rank_calls_ = 0;
     std::vector<core::TraceEvent> replaced_;
 };
 

@@ -42,18 +42,35 @@ std::vector<HiCacheEvictionStep> eviction_sequence(const model::HiCacheEvictionW
     };
     size_t skipped = 0, previous = 0;
     for (const auto & rejected : work.rejected_candidates) {
-        if (rejected.reason != "locked_node" || rejected.before_victim < previous || rejected.before_victim > work.victims.size())
+        if ((rejected.reason != "locked_node" && rejected.reason != "host_backup_rejected") || rejected.before_victim < previous
+            || rejected.before_victim > work.victims.size())
             throw std::invalid_argument("Unsupported or out-of-order rejected eviction candidate: " + rejected.reason);
         previous = rejected.before_victim;
     }
+    bool first_call = true;
+    const auto selection = [&] {
+        if (!first_call) control(Phase::Selection);
+        first_call = false;
+    };
     const auto skips_before = [&](size_t victim) {
         while (skipped < work.rejected_candidates.size() && work.rejected_candidates[skipped].before_victim == victim) {
-            steps.push_back({ Kind::SkipLocked });
-            steps.back().heap_size = work.rejected_candidates[skipped].heap_size;
+            const auto & rejected = work.rejected_candidates[skipped];
+            if (rejected.reason == "host_backup_rejected") {
+                if (!write_back) throw std::invalid_argument("Rejected write-back requires write-back policy");
+                selection();
+                steps.push_back({ Kind::RejectedBackup });
+                steps.back().rejected_candidate = skipped;
+            }
+            else {
+                steps.push_back({ Kind::SkipLocked });
+                steps.back().heap_size = rejected.heap_size;
+            }
             ++skipped;
         }
     };
-    if (work.victims.empty()) {
+    const bool has_write_attempt =
+        std::ranges::any_of(work.rejected_candidates, [](const auto & rejected) { return rejected.reason == "host_backup_rejected"; });
+    if (work.victims.empty() && !has_write_attempt) {
         control(Phase::Empty);
         skips_before(0);
         if (write_back) {
@@ -66,8 +83,8 @@ std::vector<HiCacheEvictionStep> eviction_sequence(const model::HiCacheEvictionW
     for (size_t i = 0; i < work.victims.size(); ++i) {
         const auto & victim = work.victims[i];
         if (victim.release_after_write && !write_back) throw std::invalid_argument("Post-write release requires write-back policy");
-        if (i) control(Phase::Selection);
         skips_before(i);
+        selection();
         const auto kind = victim.release_after_write ? Kind::WriteBackup : victim.backed_up ? Kind::ReleaseBackup : Kind::ReleaseRegular;
         steps.push_back({ kind, Phase::None, i });
     }

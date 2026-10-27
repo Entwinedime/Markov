@@ -1,4 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/phase_calls.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
@@ -42,16 +45,16 @@ void inherit_collective_completions(const core::DagGraph & graph, const HiCacheH
 
 } // namespace
 
-void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::AttentionCall> calls,
-                             std::span<const source_dag::AttentionMetadataCall> metadata, std::span<const source_dag::DenseCall> dense, uint64_t begin_us,
-                             uint64_t end_us) {
+void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::AttentionCall> calls,
+                             std::span<const adapters::sglang::AttentionMetadataCall> metadata, std::span<const adapters::sglang::DenseCall> dense,
+                             uint64_t begin_us, uint64_t end_us) {
     struct Boundary {
         size_t observation;
-        const structure::hicache::AscendAttentionConditions * conditions;
+        const adapters::sglang::AscendAttentionConditions * conditions;
     };
     std::vector<Boundary> selected;
     std::vector<core::TraceEvent> points;
-    const auto select = [&](size_t observation, const structure::hicache::AscendAttentionConditions * conditions) {
+    const auto select = [&](size_t observation, const adapters::sglang::AscendAttentionConditions * conditions) {
         const auto & event = original.runtime_observations().at(observation);
         // Call ownership was resolved against admitted source phases. Keep
         // crossing calls and their explicitly retained causal tail together;
@@ -74,11 +77,11 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<Call> replacements;
-    std::map<std::pair<size_t, size_t>, std::optional<LoadIndexResources>> observed_resources;
+    std::map<std::pair<size_t, size_t>, std::optional<HostDeviceResources>> observed_resources;
     hosts.reserve(selected.size());
     replacements.reserve(selected.size());
     for (size_t i = 0; i < selected.size(); ++i) {
@@ -105,11 +108,11 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
         for (const auto & [original_node, copied_node] : retained.source_nodes) source_members[copied_node].push_back(original_node);
         for (const auto & [copied_node, members] : source_members)
             retained.nodes.at(copied_node).work.attrs["retained_phase_source_nodes"] = nlohmann::json(members).dump();
-        std::optional<LoadIndexResources> resources;
+        std::optional<HostDeviceResources> resources;
         if (const auto compute = resources_.find({ event.pid, event.tid }); compute != resources_.end()) {
             const auto key = std::pair{ graph.node(*boundaries[2 * i]).lane_id, graph.node(compute->second).lane_id };
             const auto [at, inserted] = observed_resources.try_emplace(key);
-            if (inserted) at->second = observe_load_index_resources(source, queues, *boundaries[2 * i], compute->second);
+            if (inserted) at->second = observe_host_device_resources(source, queues, *boundaries[2 * i], compute->second);
             resources = at->second;
         }
         replacements.push_back(
@@ -130,7 +133,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
             }
         }
     }
-    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, regions, collective_handoffs));
+    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, regions, collective_handoffs));
 
     for (auto & call : replacements) {
         for (const auto & [original_node, local] : call.retained.source_nodes) owned_.insert(original_node);
@@ -138,7 +141,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     }
 }
 
-void HiCachePhaseCalls::rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & workers) {
+void HiCachePhaseCalls::rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers) {
     std::vector<HiCacheHostExpansion *> retained;
     for (auto & [entry, call] : calls_) {
         retained.push_back(&call.retained);
@@ -156,7 +159,7 @@ void HiCachePhaseCalls::rebind_retained_resources(const patch::HiCacheSourceDagI
     rebind_host_worker_queues(source.graph(), workers, retained);
 }
 
-void HiCachePhaseCalls::set_work(const structure::hicache::PhaseCallPlan & work) { work_.insert_or_assign(work.source_observation, work); }
+void HiCachePhaseCalls::set_work(structure::hicache::PhaseCallPlan work) { work_.insert_or_assign(work.source_observation, std::move(work)); }
 
 void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCacheLayerCalls::Consumer & consumer, simulation::FutureDag & future) {
     const auto found = calls_.find(node);
@@ -213,6 +216,11 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
         future.append({ .name = "after target phase call", .lane_key = call.retained.nodes.front().work.lane_key, .cpu_gap_after = outside_us });
     future.depend(host_return, returned);
     future.depend(returned, call.exit, core::DagEdgeKind::Sequential);
+
+    // Expanded work now lives in the DAG. Release this consumer's source
+    // template and work copy; ownership and total prepared counts stay intact.
+    work_.erase(call.observation);
+    calls_.erase(found);
     ++executed_;
 }
 

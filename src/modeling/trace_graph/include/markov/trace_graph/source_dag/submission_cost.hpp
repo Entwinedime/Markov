@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 
@@ -38,7 +39,7 @@ void append_host_operation_observations(nlohmann::json & rows, const structure::
  * An empty clone_lengths is admissible only for a single full-length clone.
  * Durations retain corrected CPU/residual scopes and fractional device time. */
 [[nodiscard]] std::optional<nlohmann::json> load_index_operator_observations(const modules::hicache::runtime::HiCacheHostExpansion & plan,
-                                                                             const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                                             const adapters::sglang::HiCacheSourceIndex & source,
                                                                              const simulation::detail::CpuTaskQueues & queues, uint64_t tokens,
                                                                              uint64_t page_size, std::span<const uint64_t> clone_lengths,
                                                                              std::string_view position, bool corrected);
@@ -59,11 +60,11 @@ struct PageFirstSubmissionMeasurement {
  * Repeated primitive values are summarized within this one observed call.
  * These functions export measurements, never generate a target program. */
 [[nodiscard]] std::optional<PagedReleaseMeasurement> observe_paged_release_cost(const modules::hicache::runtime::HiCacheHostExpansion & plan,
-                                                                                const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                                                const adapters::sglang::HiCacheSourceIndex & source,
                                                                                 const simulation::detail::CpuTaskQueues & queues, bool paged = true);
 
 [[nodiscard]] std::optional<PageFirstSubmissionMeasurement> observe_page_first_submission_cost(const modules::hicache::runtime::HiCacheWriteExpansion & plan,
-                                                                                               const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                                                               const adapters::sglang::HiCacheSourceIndex & source,
                                                                                                const simulation::detail::CpuTaskQueues & queues,
                                                                                                size_t completion_count);
 

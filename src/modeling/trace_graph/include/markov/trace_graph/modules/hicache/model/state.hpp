@@ -59,6 +59,15 @@ using runtime::HiCacheTargetPager;
 using runtime::HiCacheTokenResolution;
 using storage::HiCacheStorageDirectory;
 
+/** Request geometry used by read-only, target-side Prefill admission. */
+struct HiCachePrefillAdmission {
+    std::string cache_scope;
+    std::vector<std::string> lookup_pages;
+    uint64_t page_size_tokens;
+    uint64_t prompt_tokens;
+    uint64_t generation_reservation_tokens;
+};
+
 /** @brief Structural work performed by one allocator-driven device cleanup pass. */
 struct DeviceCapacityEnforcementResult {
     uint64_t evicted_node_count = 0;
@@ -83,6 +92,9 @@ struct HiCacheEvictionWork {
         size_t before_victim;
         std::string reason;
         size_t heap_size = 0; // Candidate count before this pop, from predicted state.
+        uint64_t backup_pages = 0;
+        size_t host_candidates = 0;
+        uint64_t host_released_pages = 0;
     };
     std::vector<RejectedCandidate> rejected_candidates;
     std::vector<Victim> victims;
@@ -184,6 +196,18 @@ public:
      */
     void admit_load(const HiCacheFact & fact);
 
+    /** Prepare request geometry once; neither this nor the readiness query
+     * changes cache residency, references, access order or operation costs. */
+    [[nodiscard]] HiCachePrefillAdmission prefill_admission(const HiCacheFact & lookup, uint64_t prompt_tokens, uint64_t generation_reservation_tokens) const;
+    /** SGLang's serial, non-chunked admission budget after protecting the
+     * reusable device prefix. A false result needs scheduler confirmations,
+     * not forced unlocks or a blocking write-back call. */
+    [[nodiscard]] bool can_admit_prefill(const HiCachePrefillAdmission & work) const;
+    /** A rejected scheduler attempt still matched its request before testing
+     * memory. Preserve its radix split/access effects without taking request
+     * references or admitting any allocation. */
+    void match_rejected_prefill(const HiCachePrefillAdmission & work);
+
     /** Retain cache residency and reset request-local state. Execution-driven
      * prefetch requires explicit query, stop, visibility and scheduler events;
      * it does not infer them from future cache-extend facts or end of trace.
@@ -283,7 +307,6 @@ private:
         std::vector<std::string> device_pages;
         std::vector<std::string> host_pages;
         std::vector<HiCacheNodeId> device_chain;
-        std::vector<HiCacheNodeId> host_chain;
         std::string lifecycle_state;
     };
 

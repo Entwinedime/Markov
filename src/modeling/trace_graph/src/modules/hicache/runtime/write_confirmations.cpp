@@ -1,15 +1,18 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/structure/hicache/confirmation.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
@@ -84,9 +87,14 @@ void HiCacheWriteConfirmations::prepare(core::DagGraph & graph, uint64_t begin, 
                                         std::optional<uint64_t> idle_since_us) {
     graph_ = &graph;
     const auto & observations = graph.runtime_observations();
+    std::map<Lane, std::vector<const core::TraceEvent *>> reductions;
+    for (const auto & item : observations)
+        if (item.name == "runtime.cpu_collective" && item.arg("role") == "write_completion_check") reductions[{ item.pid, item.tid }].push_back(&item);
+    for (auto & [lane, calls] : reductions) std::ranges::stable_sort(calls, {}, [](const auto * call) { return call->ts; });
+
     for (const auto & event : observations) {
-        if (event.name != "runtime.hicache.write_completion" || event.arg("status") != "returned" || event.arg("blocking") != "false" || event.ts > end
-            || (event.ts < begin && (!idle_since_us || event.ts < *idle_since_us)))
+        if (event.name != "runtime.hicache.write_completion" || event.arg("status") != "returned" || event.arg("blocking") != "false"
+            || (event.ts > end && event.arg("formal_window_context") != "causal_tail") || (event.ts < begin && (!idle_since_us || event.ts < *idle_since_us)))
             continue;
         if (std::ranges::any_of(replaced, [&](const auto & span) {
                 return event.pid == span.pid && event.tid == span.tid && span.ts <= event.ts && span.ts + span.dur >= event.ts + event.dur;
@@ -94,16 +102,23 @@ void HiCacheWriteConfirmations::prepare(core::DagGraph & graph, uint64_t begin, 
             continue;
 
         const core::TraceEvent * reduction = nullptr;
-        for (const auto & item : observations)
-            if (item.name == "runtime.cpu_collective" && item.arg("role") == "write_completion_check" && item.pid == event.pid && item.tid == event.tid
-                && item.ts >= event.ts && item.ts + item.dur <= event.ts + event.dur) {
+        const auto lane = reductions.find({ event.pid, event.tid });
+        if (lane != reductions.end()) {
+            const auto finish_us = event.ts + event.dur;
+            auto call = std::ranges::lower_bound(lane->second, event.ts, {}, [](const auto * item) { return item->ts; });
+            for (; call != lane->second.end() && (*call)->ts <= finish_us; ++call) {
+                const auto * item = *call;
+                if (item->ts + item->dur > finish_us) continue;
+
                 if (reduction) throw std::runtime_error("Write confirmation has multiple MIN calls");
-                reduction = &item;
+                reduction = item;
             }
+        }
         if (!reduction) throw std::runtime_error("Write confirmation has no MIN return");
-        // This outer check began by the HTTP endpoint. Keep its complete MIN
-        // and acknowledgement tail, including a MIN beginning in causal-tail
-        // context. Background work does not extend the scoring endpoint.
+        // A check admitted by the HTTP endpoint or its retained lifecycle
+        // context owns its complete MIN/acknowledgement tail. Remove those
+        // source consumers before replacing their write producers, even when
+        // the check starts after the cut. This does not extend HTTP scoring.
         if (reduction->ts < begin) continue;
         tails_.push_back({ event.pid, event.tid, reduction->ts + reduction->dur, event.ts + event.dur });
     }
@@ -116,7 +131,7 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
         points.push_back(boundary(tail.pid, tail.tid, tail.end));
     }
     const auto bound = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(tails_.size());
@@ -129,11 +144,11 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
         const auto key = Lane{ tails_[i].pid, tails_[i].tid };
         const auto compute = compute_resources_.find(key);
         if (!worker_members_.contains(key) && compute != compute_resources_.end()) {
-            if (const auto resource = observe_load_index_resources(source, queues, *bound[2 * i], compute->second))
+            if (const auto resource = observe_host_device_resources(source, queues, *bound[2 * i], compute->second))
                 worker_members_.emplace(key, resource->worker);
         }
     }
-    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, regions));
+    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, regions));
 }
 
 void HiCacheWriteConfirmations::rebind_resources(const std::map<size_t, size_t> & workers) {

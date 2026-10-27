@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
 #include <algorithm>
 #include <set>
@@ -43,7 +44,7 @@ void append(core::DagMutationPlan & plan, const core::DagMutationPlan & addition
 }
 } // namespace
 
-CpuCollectivePatch append_retained_cpu_collectives(const HiCacheSourceDagIndex & source, const CpuCollectiveObservation & observation,
+CpuCollectivePatch append_retained_cpu_collectives(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & observation,
                                                    core::DagMutationPlan & plan) {
     CpuCollectivePatch result;
     result.observed_rounds = observation.rounds.size();

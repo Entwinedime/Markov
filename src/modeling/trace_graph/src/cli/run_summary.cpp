@@ -382,19 +382,11 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
             };
         }
 
-        size_t phase_migration_candidates = 0, phase_generated_plans = 0;
-        std::map<std::string, size_t> phase_plan_issues;
         size_t planned_collectives = 0;
         std::map<std::string, size_t> collective_plan_issues;
         for (const auto & call : result.collective_work) {
             if (call.service) ++planned_collectives;
             else ++collective_plan_issues[call.reason];
-        }
-        for (const auto & call : result.phase_tensor_work) {
-            using Action = structure::hicache::PhaseCallPlan::Action;
-            if (call.action == Action::RetainCompute) ++phase_migration_candidates;
-            else if (call.action == Action::Generate) ++phase_generated_plans;
-            else ++phase_plan_issues[call.reason];
         }
         if (include_source_observations)
             summary["module_results"]["hicache"] = {
@@ -408,10 +400,10 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
              { { "status", "applied_calls_partial_structure_coverage" },
              { "prepared_calls", result.prepared_phase_calls },
              { "executed_calls", result.executed_phase_calls },
-             { "migration_candidates", phase_migration_candidates },
-             { "generated_plans", phase_generated_plans },
+             { "migration_candidates", result.phase_migration_candidates },
+             { "generated_plans", result.phase_generated_plans },
              { "source_observation_issues", result.phase_observation_issues },
-             { "planning_issues", phase_plan_issues },
+             { "planning_issues", result.phase_plan_issues },
              { "execution_granularity",
              "Tensor operations with atomic runtime worker tasks and serial device service; native launches within a worker task are not separately "
              "scheduled." } }                                                                                                                           },
@@ -458,6 +450,7 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
             {                      "consumed_facts",                                                                               result.consumed_facts },
             {                  "decode_allocations",                                                                           result.decode_allocations },
             {                    "phase_admissions",                                                                             result.phase_admissions },
+            {          "admission_retry_rank_calls",                                                                   result.admission_retry_rank_calls },
             {                   "changed_operators",                                                                            result.changed_operators },
             {             "source_load_submissions",                                                                      result.source_load_submissions },
             { "load_submission_shared_cost_batches",                                                          result.load_submission_shared_cost_batches },
@@ -477,6 +470,7 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
              { "write_rounds", result.confirmations.write_rounds },
              { "storage_rounds", result.confirmations.storage_rounds },
              { "replaced_rounds", result.confirmations.replaced_rounds },
+             { "retained_empty_opening_rounds", result.confirmations.retained_empty_opening_rounds },
              { "partial_window_rounds", result.confirmations.partial_window_rounds } }                                                                  },
             {                     "cpu_collectives",
              { { "status", result.cpu_collectives.status },
@@ -485,6 +479,10 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
              { "retained", result.cpu_collectives.source_retained_rounds } }                                                                            },
             {            "remaining_approximations",                        { "source_cpu_branch_costs", "writeback_blocking", "source_residual_waits" } }
         };
+        if (result.admission_retry_rank_calls)
+            summary["module_results"]["hicache_execution"]["remaining_approximations"].push_back(
+                "prefill_admission_retry_cpu_uses_coarse_independent_scheduler_intervals");
+
         // Full HTTP includes every retained cost. Target ownership projections
         // are not implemented yet; zero would falsely look like a valid score.
         summary["component_metrics_status"] = "unavailable_target_ownership";

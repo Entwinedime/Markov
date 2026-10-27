@@ -1,6 +1,7 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
@@ -11,7 +12,8 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 
-void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
+void HiCacheWriteCalls::prepare_generated_load_admissions(const adapters::sglang::HiCacheSourceIndex & source,
+                                                          const simulation::detail::CpuTaskQueues & queues) {
     const auto & graph = source.graph();
     for (const auto & branch : load_branches_) {
         const auto key = std::pair{ branch.envelope.pid, branch.envelope.tid };
@@ -28,7 +30,7 @@ void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSo
         for (const auto & donor : observed_eviction_fragments_)
             if (donor.pid == key.first && donor.tid == key.second && donor.compute) witness(*donor.compute);
         if (!compute) continue; // Required only if this target needs a new branch.
-        const auto resources = observe_load_index_resources(source, queues, branch.entry_node, *compute);
+        const auto resources = observe_host_device_resources(source, queues, branch.entry_node, *compute);
         if (!resources) continue;
         const auto operation = [&](const char * name) {
             return LoadStep{
@@ -54,7 +56,7 @@ size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const s
     throw std::runtime_error("Generated allocation lacks proven scheduler compute/worker resources");
 }
 
-void HiCacheWriteCalls::bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program) {
+void HiCacheWriteCalls::bind_load_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, const LoadAdmissionProgram & program) {
     if (program.clone) bind_call_resources(source, call, program.clone->program.plan.resource_nodes(), true);
     for (const auto & step : program.allocation) bind_call_resources(source, call, step.program.plan.resource_nodes(), true);
     if (allocator_need_sort_) {
@@ -110,9 +112,11 @@ HiCacheHostExpansion HiCacheWriteCalls::load_prefix_concat(const LoadAdmissionPr
     // The supported op-api cat filters empty 1-D inputs and returns an empty
     // tensor without dispatch. This branch is chosen by shape, never by cost.
     auto plan = generate_cpu_control(program.main_lane, "target empty prefix concatenation");
-    const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
-    std::pair<double, double> remainder{};
-    bind_cpu_control(plan, costs.main_us, costs.main_residual_us, remainder);
+    operation.implementation = "torch_npu.cat.empty";
+    operation.timing_scope = "control_interval";
+    plan.nodes.front().work.duration = operator_provider_.estimate(operation).duration_us;
+    plan.nodes.front().work.attrs["cost_timing_scope"] = "control_interval";
+    plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
     return plan;
 }
 
@@ -127,6 +131,15 @@ HiCacheHostExpansion HiCacheWriteCalls::load_admission_tail(const LoadAdmissionP
           { "page_size_tokens", static_cast<double>(page_size_) },
           { "requested_tokens", static_cast<double>(core::checked_multiply_u64(pages, page_size_, "Load token count overflow")) } }
     };
+    if (!allocated) {
+        // Unlock, host-pin release and warning logging form one local control
+        // interval. Its wall time is not a measurement of pure CPU service.
+        work.timing_scope = "control_interval";
+        plan.nodes.front().work.duration = operator_provider_.estimate(work).duration_us;
+        plan.nodes.front().work.attrs["cost_timing_scope"] = "control_interval";
+        plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
+        return plan;
+    }
     const auto costs = cost::estimate_host_operation(operator_provider_, work, false);
     std::pair<double, double> remainder{};
     bind_cpu_control(plan, costs.main_us, costs.main_residual_us, remainder);

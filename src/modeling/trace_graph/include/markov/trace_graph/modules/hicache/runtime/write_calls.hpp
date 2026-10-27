@@ -1,13 +1,15 @@
 #pragma once
-#include "markov/trace_graph/cost/hicache_io.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
+#include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/lifecycle_observation.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/source_dag/load_admission.hpp"
+#include "markov/trace_graph/structure/hicache/io_completion.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +24,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 /** Source call ownership from explicit envelopes and same-request inputs. */
-[[nodiscard]] size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts,
+[[nodiscard]] size_t observe_write_call_owner(const adapters::sglang::HiCacheSourceIndex & source, std::span<const model::HiCacheReplayFact> facts,
                                               const std::string & pid, const std::string & tid, uint64_t begin, uint64_t end);
 
 struct HiCacheCapacityGuard {
@@ -33,7 +35,7 @@ struct HiCacheCapacityGuard {
 };
 
 using source_dag::HiCacheLoadBranch;
-[[nodiscard]] std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSourceDagIndex & source,
+[[nodiscard]] std::vector<HiCacheCapacityGuard> observe_capacity_guards(const adapters::sglang::HiCacheSourceIndex & source,
                                                                         std::span<const model::HiCacheReplayFact> facts,
                                                                         std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end);
 
@@ -46,7 +48,8 @@ public:
         return completions_.at({ write.header.cache_scope, write.header.operation_id });
     }
     HiCacheWriteCalls(model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, HiCacheWriteStreamInsertions & insertions,
-                      const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider)
+                      const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider,
+                      const structure::hicache::IoCompletionProvider & completion)
         : replay_(replay),
           writes_(replay.state()),
           stream_insertions_(insertions),
@@ -55,7 +58,7 @@ public:
           write_back_(config.write_policy == "write_back"),
           allocator_need_sort_(config.device_allocator_need_sort),
           operator_provider_(provider),
-          io_completion_(cost::io_completion_provider(config.io_cost)),
+          io_completion_(completion),
           compute_resources_(compute_resources) {}
     // A crossing source call keeps only its exact retained CPU suffix. Its
     // entry follows initial lifecycle state at the HTTP availability gate;
@@ -63,7 +66,7 @@ public:
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end, size_t opening_node);
     void replace_active_load_branches(core::DagGraph & graph);
     // Finalize resource and consumer bindings after all source replacements.
-    void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members);
     void applied(const model::HiCacheReplayFact & input) const;
     /** Returns facts whose allocations completed at this boundary. */
     std::vector<size_t> advance(size_t node, uint64_t time, simulation::FutureDag & future);
@@ -93,9 +96,9 @@ private:
     };
     // Candidate load/capacity resources are required only when target work uses
     // them. Other calls fail immediately if their observed resource is unbound.
-    void bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
+    void bind_call_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
     [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
-    void bind_capacity_calls(const patch::HiCacheSourceDagIndex & source);
+    void bind_capacity_calls(const adapters::sglang::HiCacheSourceIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void replace_source_write_calls(core::DagGraph & graph);
     void bind_lifecycle_writes(core::DagGraph & graph, uint64_t begin_us);
@@ -104,7 +107,7 @@ private:
     void bind_load_attempts(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void bind_load_branches(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void prepare_empty_load_branches(core::DagGraph & graph);
-    void prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
+    void prepare_generated_load_admissions(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues);
     void start_load_branch(size_t node, uint64_t time, simulation::FutureDag & future);
     std::optional<size_t> expand_capacity(Call & call, const HiCacheFact & fact, simulation::FutureDag & future, std::optional<size_t> previous = std::nullopt);
     model::HiCacheModelReplay & replay_;
@@ -169,7 +172,7 @@ private:
     std::vector<LoadAdmissionProgram> load_admissions_;
     // Cost selection never changes allocation or clone execution rules.
     [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid) const;
-    void bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program);
+    void bind_load_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, const LoadAdmissionProgram & program);
     [[nodiscard]] HiCacheHostExpansion cost_load_step(const LoadStep & step, uint64_t pages, bool first_clone = false) const;
     [[nodiscard]] HiCacheHostExpansion bind_load_operation(const LoadStep & step, structure::OperationWork work) const;
     [[nodiscard]] HiCacheHostExpansion load_prefix_concat(const LoadAdmissionProgram & program, const model::HiCacheLoadAdmissionWork & work) const;

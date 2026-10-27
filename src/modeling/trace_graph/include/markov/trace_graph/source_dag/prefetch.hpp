@@ -1,8 +1,10 @@
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/model/prefetch_scheduler_body.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +22,6 @@ using modules::hicache::PrefetchControlObservation;
 using modules::hicache::PrefetchWorkerObservations;
 using modules::hicache::model::PrefetchSchedulerAction;
 using modules::hicache::model::PrefetchSchedulerTiming;
-namespace patch = modules::hicache::patch;
 
 /** All complete query groups in the requested window. Per-call identity is
  * retained; no first-call template or cross-call averaging. Intervals include
@@ -39,20 +40,21 @@ struct PrefetchCheckCpuTiming {
 // absent in this observation; independent samples train their cost models.
 // A measured zero remains distinct from an unobserved branch.
 // Reads service costs on unchanged observation coordinates from the same graph.
-[[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const patch::HiCacheSourceDagIndex & source);
+[[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed,
+                                                                const adapters::sglang::HiCacheSourceIndex & source);
 struct PrefetchSchedulerStep {
     PrefetchSchedulerAction action;
     size_t source_round;
     CpuCollectiveTiming communication;
     // Ordinary CPU and residual time, excluding collective calls. Not a pure
     // CPU-service calibration. after includes the observed confirmation/drain.
-    std::map<int, patch::HiCacheTimingIntervalOwnership> before, after;
+    std::map<int, source_dag::TimingIntervalOwnership> before, after;
     // Absent in old captures: a zero after interval then does NOT prove that
     // confirmation/release is free or that it occurs at collective return.
     std::map<int, size_t> completion_observations;
 };
 struct PrefetchSchedulerBody {
-    std::map<int, patch::HiCacheTimingIntervalOwnership> lanes, tail;
+    std::map<int, source_dag::TimingIntervalOwnership> lanes, tail;
     std::vector<PrefetchSchedulerStep> steps;
     std::string issue;
 };
@@ -63,8 +65,8 @@ struct PrefetchSchedulerBody {
  * entry. Captures timing/shape, never queue values or target retry counts.
  * Observation alone does not authorize removal of external graph dependencies.
  */
-[[nodiscard]] PrefetchSchedulerBody observe_prefetch_scheduler_body(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives,
-                                                                    const PrefetchWorkerObservations & workers,
+[[nodiscard]] PrefetchSchedulerBody observe_prefetch_scheduler_body(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                    const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers,
                                                                     const std::vector<PrefetchControlObservation> & previous,
                                                                     const std::vector<PrefetchControlObservation> & next);
 

@@ -1,13 +1,15 @@
 #pragma once
-#include "markov/trace_graph/cost/hicache_io.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
+#include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_io.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_consumers.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/structure/hicache/io_completion.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include <set>
 
@@ -26,9 +28,10 @@ namespace markov::trace_graph::modules::hicache::runtime {
 class HiCacheLoads {
 public:
     explicit HiCacheLoads(HiCacheWriteStreamInsertions & insertions, const frontend::HiCacheConfig & config,
-                          const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider)
+                          const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider,
+                          const structure::hicache::IoCompletionProvider & completion)
         : page_bytes_(config.kv_bytes_per_page),
-          io_completion_(cost::io_completion_provider(config.io_cost)),
+          io_completion_(completion),
           operator_provider_(provider),
           compute_resources_(compute_resources),
           stream_insertions_(insertions) {}
@@ -36,7 +39,7 @@ public:
     // Layer consumers must first detach from the old completion records.
     void replace_source_submissions(core::DagGraph & graph);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
-    void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members);
     [[nodiscard]] size_t source_submissions() const { return loads_.size(); }
     [[nodiscard]] size_t completed_batches() const { return completed_; }
     [[nodiscard]] size_t shared_cost_batches() const { return shared_cost_batches_; }

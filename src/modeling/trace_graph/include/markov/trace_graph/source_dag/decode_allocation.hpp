@@ -10,7 +10,8 @@
 
 namespace markov::trace_graph::core {
 class DagGraph;
-}
+struct TraceEvent;
+} // namespace markov::trace_graph::core
 
 namespace markov::trace_graph::modules::hicache {
 struct HiCachePhaseObservationAudit;
@@ -32,6 +33,13 @@ using DecodeOperatorContexts = std::map<size_t, DecodeOperationContext>;
 
 [[nodiscard]] DecodeOperatorContexts decode_operator_contexts(const modules::hicache::HiCachePhaseObservationAudit & phases,
                                                               const ObservedDecodeContexts & contexts);
+
+/** Successful allocations before the HTTP cut initialize request-owned KV.
+ * They use approved prelude inputs and scalar allocation observations, not
+ * output-length guesses. These actions are context, never charged HTTP work.
+ */
+[[nodiscard]] std::vector<modules::hicache::model::HiCacheReplayFact>
+    observe_prelude_decode_allocations(std::span<const core::TraceEvent> context, std::span<const modules::hicache::model::HiCacheReplayFact> facts);
 
 /** Observed context tokens keyed by (pid, request), then zero-based round.
  * Only complete, unambiguous single-request non-speculative observations are

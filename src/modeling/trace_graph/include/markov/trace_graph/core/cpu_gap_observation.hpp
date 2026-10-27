@@ -13,14 +13,15 @@ struct CpuGapBoundaryNodes {
 };
 
 /**
- * Split a unique, unchanged CPU sequential gap at an observed interval's ends.
+ * Split unique, unchanged CPU sequential gaps at observed intervals' ends.
  * A zero-duration observation produces one point (begin == end), not an interval.
  * All time remains gap, not new execution cost; other dependencies are retained.
  * The gap is partitioned relative to the predecessor's modeled completion:
  * adjacent node costs may differ from their source durations without changing it.
- * Unsupported or ambiguous placement returns nullopt without changing the graph.
+ * Process observations in input order, indexing original gaps once. Unsupported
+ * or ambiguous placement leaves that observation unbound and the graph unchanged.
  */
-[[nodiscard]] std::optional<CpuGapBoundaryNodes> insert_cpu_gap_observation(DagGraph & graph, TraceEvent observation);
+void insert_cpu_gap_observations(DagGraph & graph, std::span<const TraceEvent> observations);
 
 /** Batch version for points only, in input order. Equal points share a node.
  * Indexes eligible gaps once; unsupported points return nullopt. Never splits

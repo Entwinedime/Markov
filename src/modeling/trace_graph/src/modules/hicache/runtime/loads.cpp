@@ -1,9 +1,10 @@
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include <algorithm>
 #include <set>
 #include <stdexcept>
@@ -14,7 +15,7 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
     if (state_) throw std::logic_error("Loads are already bound");
     state_ = &replay.state();
     graph_ = &graph;
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto ledger = patch::build_hicache_io_operation_ledger(source);
     const auto waits = observe_hicache_layer_waits(source);
     // Query facts name the radix tree and its controller directly. Nested

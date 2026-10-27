@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
 /**
  * @file
  * @brief Source-supported phase operators with zero-cost request boundaries.
@@ -25,9 +26,9 @@ std::string hicache_phase_carrier_synthetic_id(std::string_view request_id, int 
 
 namespace {
 
-using StaticDecodeCost = cost::StaticDecodeCost;
-using StaticPhaseNodeCost = cost::StaticPhaseNodeCost;
-using StaticPrefillCost = cost::StaticPrefillCost;
+using StaticDecodeCost = diagnostics::StaticDecodeCost;
+using StaticPhaseNodeCost = diagnostics::StaticPhaseNodeCost;
+using StaticPrefillCost = diagnostics::StaticPrefillCost;
 
 void add_blocker(HiCachePhaseCarrierAudit & audit, std::string blocker) {
     (void)core::checked_increment_u64(audit.blockers[std::move(blocker)], "HiCache phase-carrier blocker count exceeds uint64 range");
@@ -111,7 +112,7 @@ bool project_decode_kernels(const core::DagGraph & graph, const StaticDecodeCost
             add_blocker(audit, "phase_source_owner_invalid");
             return false;
         }
-        auto & family = is_hicache_paged_attention(graph.event_for_node(id).name) ? attention : common;
+        auto & family = adapters::sglang::is_attention_kernel(graph.event_for_node(id).name) ? attention : common;
         family.source_node_ids.push_back(id);
     }
     // Keep the existing aggregate effect identity, but never spread attention
@@ -237,7 +238,7 @@ bool append_record(const core::DagGraph & graph, const StaticPrefillCost & prefi
 
 } // namespace
 
-HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const cost::StaticPhaseCosts & phase_work,
+HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const diagnostics::StaticPhaseCosts & phase_work,
                                                            core::DagMutationPlan & plan) {
     HiCachePhaseCarrierAudit audit;
     if (phase_work.status != "ready" || phase_work.cost_status != "ready") {

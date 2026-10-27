@@ -4,9 +4,10 @@
  */
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,9 +32,9 @@ struct HiCacheSourceAttribution {
     std::vector<std::string> io_operation_record_ids;
     std::vector<size_t> carrier_nodes;
     std::vector<size_t> owned_duration_nodes;
-    std::vector<HiCacheCpuGapSlice> owned_gap_slices;
+    std::vector<source_dag::CpuGapSlice> owned_gap_slices;
     std::vector<size_t> source_control_duration_nodes;
-    std::vector<HiCacheCpuGapSlice> source_control_gap_slices;
+    std::vector<source_dag::CpuGapSlice> source_control_gap_slices;
     uint64_t source_completed_token_count = 0;
     uint64_t target_effective_token_count = 0;
     uint64_t owned_gap_duration_us = 0;
@@ -54,7 +55,7 @@ struct HiCacheSourceAttribution {
     std::vector<size_t> completion_wait_owned_node_ids;
     std::vector<size_t> source_completion_node_ids;
     std::vector<size_t> readiness_join_node_ids;
-    std::vector<HiCacheCpuGapSlice> completion_wait_slices;
+    std::vector<source_dag::CpuGapSlice> completion_wait_slices;
     std::vector<size_t> carrier_entry_edges;
     std::vector<size_t> carrier_exit_edges;
     std::optional<size_t> start_anchor = std::nullopt;
@@ -76,7 +77,7 @@ struct HiCacheSourceAttributionCatalog {
 };
 
 /** @brief Builds a read-only attribution inventory without modifying target decisions. */
-[[nodiscard]] HiCacheSourceAttributionCatalog build_hicache_source_attribution(const HiCacheSourceDagIndex & source,
+[[nodiscard]] HiCacheSourceAttributionCatalog build_hicache_source_attribution(const adapters::sglang::HiCacheSourceIndex & source,
                                                                                const model::HiCacheEffectDecisionLedger & decisions,
                                                                                const HiCacheIoOperationLedger & operations);
 

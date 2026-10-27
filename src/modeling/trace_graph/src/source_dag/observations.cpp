@@ -1,11 +1,12 @@
 #include "markov/trace_graph/source_dag/observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/allocator_preparation.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 #include "markov/trace_graph/source_dag/confirmation.hpp"
@@ -40,7 +41,7 @@ std::optional<std::string> measurement_position(const core::TraceEvent & event) 
 nlohmann::json phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
                                            bool cpu_service_applied) {
     nlohmann::json rows = nlohmann::json::array();
-    const modules::hicache::patch::HiCacheSourceDagIndex source_index(graph);
+    const adapters::sglang::HiCacheSourceIndex source_index(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     // Device event instructions have one physical identity, independent of
     // whether HiCache or a collective submitted them. Export each raw event
@@ -73,7 +74,7 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
     // Preparation owns its CPU spans and residual intervals, not phase
     // compute. Import only observations whose specialization and interval
     // ownership are known; a missing shape is not an inferred training point.
-    const auto preparations = modules::hicache::runtime::observe_allocator_preparations(graph);
+    const auto preparations = adapters::sglang::observe_allocator_preparations(graph);
     std::map<std::pair<std::string, size_t>, std::string> preparation_positions;
     for (const auto & event : graph.hicache_fact_events()) {
         if (const auto position = measurement_position(event)) preparation_positions.emplace(std::pair{ event.pid, event.index }, *position);
@@ -86,7 +87,7 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
 
         // Compilation overlap is an observed outcome, not a deployment
         // feature that can be copied from a base run to target execution.
-        const auto work = structure::hicache::allocator_preparation_operation({ "required", call.specialization, call.path, call.first_load });
+        const auto work = adapters::sglang::allocator_preparation_operation({ "required", call.specialization, call.path, call.first_load });
         const auto & outer = graph.runtime_observations().at(*call.allocator_observation);
         nlohmann::json intervals = nlohmann::json::array();
         bool complete = true;
@@ -158,8 +159,8 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
     return rows;
 }
 
-nlohmann::json layer_wait_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
-                                                const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+nlohmann::json layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
+                                                bool cpu_service_applied) {
     const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
     std::map<std::pair<std::string, uint64_t>, std::string> layer_positions;
@@ -274,7 +275,7 @@ nlohmann::json layer_wait_operator_observations(const modules::hicache::patch::H
 
 namespace {
 
-void append_blocking_write_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+void append_blocking_write_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         const core::TraceEvent & event, bool corrected, nlohmann::json & rows) {
     const auto before = core::parse_u64(event.arg("operations_before"));
     const auto after = core::parse_u64(event.arg("operations_after"));
@@ -295,8 +296,8 @@ void append_blocking_write_observations(const modules::hicache::patch::HiCacheSo
 
 } // namespace
 
-nlohmann::json confirmation_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
-                                                  const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
+                                                  bool cpu_service_applied) {
     const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
     // Nonblocking confirmation costs are observed after the MIN returns;
@@ -410,7 +411,7 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
     // independent exporter. Never change the source graph or relax overlaps.
     auto graph = input;
     (void)modules::hicache::bind_hicache_control_points(graph, points);
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     for (const auto & event : graph.runtime_observations()) {
         if (event.name != "runtime.hicache.load_admission" || event.arg("status") != "returned") continue;
@@ -529,8 +530,8 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
     return rows;
 }
 
-nlohmann::json prefix_concat_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                   const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+nlohmann::json prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                   bool cpu_service_applied) {
     const auto & graph = source.graph();
     nlohmann::json rows = nlohmann::json::array();
     for (const auto & admission : graph.runtime_observations()) {
@@ -568,12 +569,12 @@ nlohmann::json prefix_concat_operator_observations(const modules::hicache::patch
         };
         const auto emit = [&](const std::string & operation, const std::string & scope, double duration) {
             rows.push_back({
-                {       "position", "prefix_concat:" + *position + ":" + operation },
-                {      "operation",                                      operation },
-                { "implementation",                             "ascend.aclnn_cat" },
-                {       "features",                                       features },
-                {    "duration_us",                                       duration },
-                {   "timing_scope",                                          scope },
+                {       "position",             "prefix_concat:" + *position + ":" + operation },
+                {      "operation",                                                  operation },
+                { "implementation", output_tokens ? "ascend.aclnn_cat" : "torch_npu.cat.empty" },
+                {       "features",                                                   features },
+                {    "duration_us",                                                   duration },
+                {   "timing_scope",                                                      scope },
             });
         };
         std::vector<size_t> workers, devices;
@@ -595,8 +596,7 @@ nlohmann::json prefix_concat_operator_observations(const modules::hicache::patch
             }
             if (!measurable) continue;
             for (const auto & node : plan.nodes) residual_us += node.work.cpu_gap_after;
-            emit("load.admission.prefix_concat", cpu_service_applied ? "cpu_service" : "profiled_cpu", cpu_us);
-            emit("load.admission.prefix_concat", cpu_service_applied ? "residual_interval" : "profiled_residual_interval", residual_us);
+            emit("load.admission.prefix_concat", cpu_service_applied ? "control_interval" : "profiled_control_interval", cpu_us + residual_us);
             continue;
         }
         if (workers.empty() || devices.size() != 1 || plan.streams.size() != 1) continue;

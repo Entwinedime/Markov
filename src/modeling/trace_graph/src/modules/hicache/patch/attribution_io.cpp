@@ -2,6 +2,7 @@
  * @file
  * @brief Prefetch and Load request I/O ledger attribution.
  */
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include <algorithm>
@@ -15,11 +16,14 @@ using model::HiCacheSourceCarrierState;
 
 namespace {
 
-bool same_process(const HiCacheSourceFactNode & fact, const HiCacheSourceFactNode & anchor) { return fact.pid == anchor.pid; }
+bool same_process(const adapters::sglang::HiCacheFactObservation & fact, const adapters::sglang::HiCacheFactObservation & anchor) {
+    return fact.pid == anchor.pid;
+}
 
-const HiCacheSourceFactNode * next_request_opportunity(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
-                                                       const HiCacheSourceFactNode & anchor) {
-    const HiCacheSourceFactNode * next = nullptr;
+const adapters::sglang::HiCacheFactObservation * next_request_opportunity(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                          const HiCacheEffectDecision & decision,
+                                                                          const adapters::sglang::HiCacheFactObservation & anchor) {
+    const adapters::sglang::HiCacheFactObservation * next = nullptr;
     if (decision.request_id_provenance.empty()) return next;
     for (size_t node_id : source.nodes_for_request(decision.request_id_provenance)) {
         const auto * candidate = source.fact_node(node_id);
@@ -50,8 +54,9 @@ std::optional<HiCacheIoOperationKind> operation_kind_for_effect(HiCacheEffectTyp
 
 } // namespace
 
-void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations, const HiCacheEffectDecision & decision,
-                             const HiCacheSourceFactNode & anchor, HiCacheSourceAttribution & output) {
+void classify_io_from_ledger(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheIoOperationLedger & operations,
+                             const HiCacheEffectDecision & decision, const adapters::sglang::HiCacheFactObservation & anchor,
+                             HiCacheSourceAttribution & output) {
     const auto kind = operation_kind_for_effect(decision.effect_type);
     if (!kind) {
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
@@ -82,7 +87,7 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
                 output.completion_join_contract_ready = true;
                 output.control_ready_us = event.ts;
                 output.wait_exit_start_us = event.ts;
-                output.wait_exit_end_us = fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur });
+                output.wait_exit_end_us = fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = event.ts, .duration_us = event.dur });
                 output.control_ready_anchor_node_id = consumer;
                 output.wait_exit_anchor_node_id = consumer;
                 output.terminal_control_anchor_node_id = consumer;

@@ -1,7 +1,7 @@
 /** @file Source call sites and dependency ownership for HiCache layer waits. */
 #pragma once
 
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <map>
 #include <string>
 #include <unordered_set>
@@ -20,7 +20,7 @@ struct HiCacheLayerWaitCall {
     uint64_t start_ns = 0;
     uint64_t end_ns = 0;
     std::optional<size_t> before, after, submission, worker, device_wait, record;
-    patch::HiCacheTimingIntervalOwnership cpu;
+    source_dag::TimingIntervalOwnership cpu;
     std::string issue;
 };
 
@@ -36,6 +36,6 @@ struct HiCacheLayerWaitObservation {
  * Opening-cut batch context is not admitted as a remodelable forward; its
  * selected executable tail remains in the source DAG.
  */
-HiCacheLayerWaitObservation observe_hicache_layer_waits(const patch::HiCacheSourceDagIndex & source);
+HiCacheLayerWaitObservation observe_hicache_layer_waits(const source_dag::SourceDagIndex & source);
 
 } // namespace markov::trace_graph::modules::hicache

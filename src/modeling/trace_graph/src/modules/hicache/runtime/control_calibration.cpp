@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
@@ -17,9 +18,9 @@ namespace markov::trace_graph::modules::hicache::runtime {
 using Json = nlohmann::json;
 
 Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t end, bool release_only) {
-    const patch::HiCacheSourceDagIndex initial(graph);
+    const adapters::sglang::HiCacheSourceIndex initial(graph);
     std::vector<core::TraceEvent> points;
-    std::vector<std::pair<patch::HiCacheSourceFactNode, HiCacheEvictionRegion>> regions;
+    std::vector<std::pair<adapters::sglang::HiCacheFactObservation, HiCacheEvictionRegion>> regions;
     std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>> inactive_loads;
     const auto boundary = [&](const auto & fact, uint64_t first, uint64_t last) {
         for (const auto at : { first, last }) {
@@ -65,7 +66,7 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
         }
     }
     (void)bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     Json result{
         {                  "rows", Json::array() },

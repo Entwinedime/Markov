@@ -8,6 +8,7 @@
 #include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_resource_model.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include <cstdint>
 #include <map>
@@ -59,9 +60,9 @@ struct HiCacheRewriteDecision {
     std::string policy_wait_synthetic_id;
     std::vector<size_t> carrier_nodes;
     std::vector<size_t> owned_duration_nodes;
-    std::vector<HiCacheCpuGapSlice> owned_gap_slices;
+    std::vector<source_dag::CpuGapSlice> owned_gap_slices;
     std::vector<size_t> source_control_duration_nodes;
-    std::vector<HiCacheCpuGapSlice> source_control_gap_slices;
+    std::vector<source_dag::CpuGapSlice> source_control_gap_slices;
     uint64_t owned_gap_duration_us = 0;
     uint64_t target_host_control_duration_us = 0;
     bool target_host_control_required = false;
@@ -91,7 +92,7 @@ struct HiCacheRewriteDecision {
     std::vector<size_t> completion_wait_owned_node_ids;
     std::vector<size_t> source_completion_node_ids;
     std::vector<size_t> readiness_join_node_ids;
-    std::vector<HiCacheCpuGapSlice> completion_wait_slices;
+    std::vector<source_dag::CpuGapSlice> completion_wait_slices;
     std::vector<size_t> carrier_entry_edges;
     std::vector<size_t> carrier_exit_edges;
     /** @brief Semantic source-fact identity retained for diagnostics. */
@@ -105,8 +106,8 @@ struct HiCacheRewriteDecision {
 
     /** Source waiting must be replaced even when the target needs no I/O join. */
     [[nodiscard]] bool replaces_source_completion_wait() const {
-        return completion_join_required || (effect_type == model::HiCacheEffectType::PrefetchIo
-            && completion_join_contract_ready && source_completion_wait_blocking);
+        return completion_join_required
+               || (effect_type == model::HiCacheEffectType::PrefetchIo && completion_join_contract_ready && source_completion_wait_blocking);
     }
 };
 

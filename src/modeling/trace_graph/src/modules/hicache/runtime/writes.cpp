@@ -1,14 +1,25 @@
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWrites::add_source(const patch::HiCacheSourceDagIndex & source, const patch::HiCacheIoOperationRecord & record) {
+void HiCacheWrites::add_source(const adapters::sglang::HiCacheSourceIndex & source, const patch::HiCacheIoOperationRecord & record) {
     if (record.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost || record.device_transfer_node_ids.empty())
-        throw std::invalid_argument("Write site requires an observed D2H payload: pid=" + record.pid + " tid=" + record.tid + " begin_us="
-                                    + std::to_string(record.source_start_us) + " end_us=" + std::to_string(record.source_end_us) + " reason=" + record.reason);
+        throw structure::MissingWork("Write site requires an observed D2H payload",
+                                     {
+                                         {            "operation",                                                             "device_to_host" },
+                                         {                  "pid",                                                                   record.pid },
+                                         {                  "tid",                                                                   record.tid },
+                                         {      "source_begin_us",                                                       record.source_start_us },
+                                         {        "source_end_us",                                                         record.source_end_us },
+                                         {               "reason",                                                                record.reason },
+                                         { "required_observation", "DMA direction, byte geometry and caller-to-device completion relationships" }
+        });
+
     const auto & graph = source.graph();
     Source site;
     site.pid = record.pid;

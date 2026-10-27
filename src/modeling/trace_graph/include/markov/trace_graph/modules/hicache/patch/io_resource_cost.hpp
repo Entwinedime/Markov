@@ -4,8 +4,8 @@
  */
 #pragma once
 
+#include "markov/trace_graph/cost/io_service.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_resource_demand.hpp"
-#include "markov/trace_graph/modules/hicache/service_model.hpp"
 
 namespace markov::trace_graph::modules::hicache::patch::io_resource_model_detail {
 

@@ -9,9 +9,7 @@
 #include <limits>
 #include <queue>
 #include <ranges>
-#include <set>
 #include <string_view>
-#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -359,7 +357,7 @@ struct TopologyEdgeView {
     size_t issue_edge_index = kInvalidIndex;
 };
 
-using MutationEdgeKey = std::tuple<size_t, size_t, DagEdgeKind, std::string_view>;
+using MutationEdgeSet = std::unordered_set<EffectEdgeKey, EffectEdgeKeyHash>;
 
 struct TopologyScan {
     DagTopologyValidationReport report;
@@ -384,10 +382,9 @@ bool validate_active_edge_endpoints(const TopologyEdgeView & edge, const std::ve
     return true;
 }
 
-bool validate_mutation_edge_uniqueness(const TopologyEdgeView & edge, std::set<MutationEdgeKey> & seen, std::vector<DagTopologyIssue> & issues) {
+bool validate_mutation_edge_uniqueness(const TopologyEdgeView & edge, MutationEdgeSet & seen, std::vector<DagTopologyIssue> & issues) {
     if (edge.kind != DagEdgeKind::Mutation && edge.effect_id.empty()) return true;
-    const auto key = std::make_tuple(edge.src, edge.dst, edge.kind, edge.effect_id);
-    if (seen.insert(key).second) return true;
+    if (seen.insert(effect_edge_key(edge.src, edge.dst, edge.kind, edge.effect_id)).second) return true;
     add_issue(issues, "duplicate_mutation_edge", "active graph contains a duplicate mutation edge", { edge.src, edge.dst }, { edge.issue_edge_index });
     return false;
 }
@@ -402,7 +399,7 @@ TopologyScan scan_topology_edges(const std::vector<bool> & active_nodes, size_t 
     scan.indegree.resize(active_nodes.size(), 0);
     scan.valid_edges.resize(edge_count, 0);
 
-    std::set<MutationEdgeKey> mutation_edges;
+    MutationEdgeSet mutation_edges;
     for (size_t edge_index = 0; edge_index < edge_count; ++edge_index) {
         const auto edge = edge_at(edge_index);
         if (!edge.active) continue;

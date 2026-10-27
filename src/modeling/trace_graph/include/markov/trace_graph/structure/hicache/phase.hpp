@@ -1,9 +1,9 @@
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
-#include "markov/trace_graph/source_dag/phase_calls.hpp"
 #include "markov/trace_graph/structure/hicache/collective.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
@@ -57,7 +57,7 @@ struct PhaseCallWork {
  * collectives retain peer identities. Unavailable rules remain explicit plans.
  * No graph mutation, cost query or target trace access takes place here.
  */
-[[nodiscard]] PhaseCallWork plan_phase_calls(const source_dag::PhaseCallAudit & source, size_t source_phase,
+[[nodiscard]] PhaseCallWork plan_phase_calls(const adapters::sglang::PhaseCallAudit & source, size_t source_phase,
                                              const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                              const modules::hicache::model::HiCacheDecodeWorkItem & decode);
 

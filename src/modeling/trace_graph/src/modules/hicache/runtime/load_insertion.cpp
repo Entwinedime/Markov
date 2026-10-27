@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include <stdexcept>
@@ -5,7 +6,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(loads_.size());
@@ -28,9 +29,9 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
 
     // Consumers must already be detached from original layer records. Replace
     // all submissions together; no source copy count survives as target work.
-    const auto removal = plan_host_removal(source, regions);
+    const auto removal = plan_host_removal(source, queues, regions);
     (void)core::apply_dag_mutation_plan(graph, removal);
-    const patch::HiCacheSourceDagIndex retained(graph);
+    const adapters::sglang::HiCacheSourceIndex retained(graph);
     submit_at_.clear();
     for (size_t i = 0; i < loads_.size(); ++i) {
         auto & load = loads_[i];
@@ -49,7 +50,7 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
     }
 }
 
-void HiCacheLoads::rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members) {
+void HiCacheLoads::rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members) {
     const auto & graph = source.graph();
     for (auto & [index, insertion] : insertions_) {
         const auto & record = loads_[index].record;

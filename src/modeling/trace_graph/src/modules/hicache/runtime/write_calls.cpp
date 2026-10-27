@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include <algorithm>
@@ -6,7 +7,8 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate) {
+void HiCacheWriteCalls::bind_call_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, std::span<const size_t> resources,
+                                            bool candidate) {
     for (const auto node : resources) {
         const auto lane = source.graph().node(node).lane_id;
         if (call.positions.contains(lane)) continue;
@@ -31,11 +33,11 @@ void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex &
 }
 
 void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues) {
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto bind = [&](const std::string & pid, const std::string & tid, size_t main, size_t compute, std::optional<size_t> transfer) {
         const auto key = std::pair{ pid, tid };
         if (write_resources_.contains(key)) return;
-        const auto resources = observe_load_index_resources(source, queues, main, compute);
+        const auto resources = observe_host_device_resources(source, queues, main, compute);
         if (!resources) return;
 
         // A legal target write can introduce its controller transfer stream
@@ -58,6 +60,17 @@ void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const si
 
         bind(sample.pid, sample.tid, *sample.main, *sample.compute, std::nullopt);
     }
+    // A lifecycle can gain a write under the target policy even when the
+    // source never submitted one. Its scheduler stream/worker role is shared
+    // with allocation; no source write template or cost is needed to bind it.
+    for (const auto & insert : lifecycle_inserts_) {
+        const auto & event = insert.envelope;
+        const auto compute = compute_resources_.find({ event.pid, event.tid });
+        if (compute == compute_resources_.end()) continue;
+        if (const auto main = source.cpu_boundary_at_or_before(event.pid, event.tid, event.ts))
+            bind(event.pid, event.tid, *main, compute->second, std::nullopt);
+    }
+
     for (auto & call : calls_) {
         if (call.source) continue;
         const auto compute = compute_resources_.find({ call.pid, call.tid });
@@ -123,7 +136,7 @@ HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources
     return expanded;
 }
 
-size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts, const std::string & pid,
+size_t observe_write_call_owner(const adapters::sglang::HiCacheSourceIndex & source, std::span<const model::HiCacheReplayFact> facts, const std::string & pid,
                                 const std::string & tid, uint64_t begin, uint64_t end) {
     const model::HiCacheReplayFact * owner = nullptr;
     for (const auto & item : facts) {
@@ -139,7 +152,7 @@ size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std
     if (owner) return owner->fact.source_node_id;
     // init_load_back carries request identity and encloses allocation/eviction.
     // Its source hit counts and output pages are deliberately not consulted.
-    const patch::HiCacheSourceFactNode * admission = nullptr;
+    const adapters::sglang::HiCacheFactObservation * admission = nullptr;
     for (const auto & fact : source.fact_nodes()) {
         if (fact.fact_role != "loadback_decision_observed" || fact.phase != "end" || fact.pid != pid || fact.tid != tid) continue;
         if (fact.timestamp_us <= begin && fact.timestamp_us + fact.duration_us >= end) {
@@ -174,7 +187,7 @@ size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std
     return owner->fact.source_node_id;
 }
 
-std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts,
+std::vector<HiCacheCapacityGuard> observe_capacity_guards(const adapters::sglang::HiCacheSourceIndex & source, std::span<const model::HiCacheReplayFact> facts,
                                                           std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end) {
     std::vector<HiCacheCapacityGuard> guards;
     std::set<size_t> owners;
@@ -204,7 +217,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     };
     bind_load_branches(graph, begin, end);
     bind_load_attempts(graph, begin, end);
-    capacity_guards_ = observe_capacity_guards(patch::HiCacheSourceDagIndex(graph), replay_.facts(), graph.runtime_observations(), begin, end);
+    capacity_guards_ = observe_capacity_guards(adapters::sglang::HiCacheSourceIndex(graph), replay_.facts(), graph.runtime_observations(), begin, end);
     std::vector<core::TraceEvent> guard_points;
     for (const auto & guard : capacity_guards_) {
         for (const auto at : { guard.begin, guard.end }) {
@@ -248,7 +261,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     // Only pure control-self remainders and gaps can be partitioned. The host
     // observer below still rejects boundaries that cut a real executable leaf.
     (void)bind_hicache_control_points(graph, host_boundaries);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto ledger = patch::build_hicache_io_operation_ledger(source);
     std::vector<core::TraceEvent> points;
     std::vector<std::pair<Action, size_t>> actions;
@@ -310,7 +323,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     if (!opening.add_edges.empty()) (void)core::apply_dag_mutation_plan(graph, opening);
     // Call boundaries may split host self/gap pieces. Observe fragments only
     // after those edits so their leaf ownership matches the execution graph.
-    const patch::HiCacheSourceDagIndex bound_source(graph);
+    const adapters::sglang::HiCacheSourceIndex bound_source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     for (const auto & record : ledger.records) {
         if (record.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost || record.source_start_us < begin || record.source_end_us > end) continue;
@@ -376,7 +389,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     prepare_generated_load_admissions(bound_source, queues);
     replace_source_evictions(graph, begin, end);
     replace_source_write_calls(graph);
-    bind_capacity_calls(patch::HiCacheSourceDagIndex(graph));
+    bind_capacity_calls(adapters::sglang::HiCacheSourceIndex(graph));
     prepare_empty_load_branches(graph);
     bind_lifecycle_writes(graph, begin);
 }

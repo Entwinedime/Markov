@@ -18,9 +18,9 @@ namespace markov::trace_graph::core {
 namespace dag_builder_detail {
 
 [[nodiscard]] bool is_usable_lane_value(const std::string & value);
-[[nodiscard]] bool is_stream_sync_event(const std::string & name);
-[[nodiscard]] bool is_event_sync_event(const std::string & name);
-[[nodiscard]] bool is_device_sync_event(const std::string & name);
+[[nodiscard]] bool is_stream_sync_event(const TraceEvent & event);
+[[nodiscard]] bool is_event_sync_event(const TraceEvent & event);
+[[nodiscard]] bool is_device_sync_event(const TraceEvent & event);
 
 } // namespace dag_builder_detail
 

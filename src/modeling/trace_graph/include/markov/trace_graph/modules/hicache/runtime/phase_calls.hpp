@@ -1,5 +1,7 @@
 #pragma once
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
@@ -25,13 +27,14 @@ public:
           resources_(resources),
           provider_(provider) {}
 
-    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::AttentionCall> calls,
-              std::span<const source_dag::AttentionMetadataCall> metadata, std::span<const source_dag::DenseCall> dense, uint64_t begin_us, uint64_t end_us);
-    void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & workers);
-    void set_work(const structure::hicache::PhaseCallPlan & work);
+    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::AttentionCall> calls,
+              std::span<const adapters::sglang::AttentionMetadataCall> metadata, std::span<const adapters::sglang::DenseCall> dense, uint64_t begin_us,
+              uint64_t end_us);
+    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers);
+    void set_work(structure::hicache::PhaseCallPlan work);
     void advance(core::DagGraph & graph, size_t node, const HiCacheLayerCalls::Consumer & consumer, simulation::FutureDag & future);
     [[nodiscard]] bool owns(size_t source_node) const { return owned_.contains(source_node); }
-    [[nodiscard]] size_t prepared() const { return calls_.size(); }
+    [[nodiscard]] size_t prepared() const { return calls_.size() + executed_; }
     [[nodiscard]] size_t executed() const { return executed_; }
 
 private:
@@ -42,7 +45,7 @@ private:
         HiCacheHostExpansion retained;
         std::vector<HiCacheLayerCalls::NestedCall> layers;
         std::map<size_t, HiCacheWriteStreamPosition> positions;
-        std::optional<LoadIndexResources> resources;
+        std::optional<HostDeviceResources> resources;
     };
     HiCacheLayerCalls & layers_;
     HiCacheWriteStreamInsertions & insertions_;

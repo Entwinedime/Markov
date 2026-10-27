@@ -25,29 +25,22 @@ namespace dag_builder_detail {
 
 uint64_t node_end_ts(const TraceEvent & event) { return checked_add_u64(event.ts, event.dur, "trace event end timestamp overflow"); }
 
-bool is_submit_anchor_event(const TraceEvent & event) {
-    if (event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue") return true;
-    if (event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync") || event.name == "AscendCL@aclrtMemcpy2dAsync")
-        return true;
-    return event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
-}
+bool is_submit_anchor_event(const TraceEvent & event) { return event.submit_anchor; }
 
 bool is_usable_lane_value(const std::string & value) { return !value.empty() && value != "-1"; }
 
-bool is_hicache_fact_event(const TraceEvent & event) { return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
-
-bool is_hicache_control_event(const TraceEvent & event) {
-    return event.name.starts_with("hicache.control.") && !event.name.ends_with(".self") && event.ph == 'X';
+bool is_control_envelope(const TraceEvent & event) {
+    return event.call_role == TraceCallRole::ControlEnvelope || event.call_role == TraceCallRole::HostLoadEnvelope;
 }
 
-struct ExecutionAndFactEvents {
+struct SourceEventGroups {
     std::vector<TraceEvent> executable_events;
     std::vector<TraceEvent> hicache_fact_events;
     std::vector<TraceEvent> request_observations;
     std::vector<TraceEvent> runtime_observations;
 };
 
-void retain_modeled_operator_envelopes(ExecutionAndFactEvents & split) {
+void retain_modeled_operator_envelopes(SourceEventGroups & split) {
     using Interval = std::pair<uint64_t, uint64_t>;
     std::map<std::pair<std::string, std::string>, std::vector<Interval>> lanes;
     const auto interval = [](const TraceEvent & event) { return Interval{ event.start_ns(), event.end_ns() }; };
@@ -55,8 +48,7 @@ void retain_modeled_operator_envelopes(ExecutionAndFactEvents & split) {
         // Phase probes carry source geometry, not execution nodes. Retain
         // nested Torch envelopes for every such descriptor; individual
         // operation readers decide which implementations they understand.
-        if (event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.extend_allocator" || event.name == "runtime.hicache.decode_allocator")
-            lanes[{ event.pid, event.tid }].push_back(interval(event));
+        if (event.call_role == TraceCallRole::ModelWork) lanes[{ event.pid, event.tid }].push_back(interval(event));
     }
     for (auto & [lane, calls] : lanes) {
         std::ranges::sort(calls);
@@ -95,9 +87,7 @@ std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::
                                                                      int gpu_id) {
     std::vector<DagControlExclusionInterval> intervals;
     for (const auto & event : events) {
-        const bool profiling_snapshot =
-            event.name.ends_with(":state_snapshot") || (event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("state_snapshot"));
-        if (event.ph == 'X' && profiling_snapshot && event.dur > 0) {
+        if (event.ph == 'X' && event.snapshot_overhead && event.dur > 0) {
             intervals.push_back(DagControlExclusionInterval{
                 .gpu_id = gpu_id,
                 .start_us = event.ts,
@@ -111,13 +101,13 @@ std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::
     // for the control metric instead of independently selecting and sorting phases.
     std::vector<const TraceEvent *> decodes;
     for (const auto & marker : markers) {
-        if (marker.event.name.starts_with("step[DECODE")) decodes.push_back(&marker.event);
+        if (marker.event.call_role == TraceCallRole::DecodeMarker) decodes.push_back(&marker.event);
     }
 
     size_t decode_index = 0;
     for (const auto & marker : markers) {
         const auto & extend = marker.event;
-        if (!extend.name.starts_with("step[EXTEND")) continue;
+        if (extend.call_role != TraceCallRole::PrefillMarker) continue;
 
         while (decode_index < decodes.size() && node_end_ts(*decodes[decode_index]) <= extend.ts) ++decode_index;
         if (decode_index >= decodes.size()) break;
@@ -136,8 +126,7 @@ std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::
 std::vector<DagPhaseMarkerEvent> phase_marker_events(const std::vector<TraceEvent> & events, int gpu_id) {
     std::vector<DagPhaseMarkerEvent> markers;
     for (const auto & event : events) {
-        if (event.source_channel != TraceSourceChannel::Torch || event.ph != 'X' || event.pid != event.tid) continue;
-        if (!event.name.starts_with("step[EXTEND") && !event.name.starts_with("step[DECODE")) continue;
+        if (event.call_role != TraceCallRole::PrefillMarker && event.call_role != TraceCallRole::DecodeMarker) continue;
         markers.push_back(DagPhaseMarkerEvent{ .gpu_id = gpu_id, .event = event });
     }
     std::ranges::sort(markers, [](const auto & left, const auto & right) {
@@ -147,50 +136,38 @@ std::vector<DagPhaseMarkerEvent> phase_marker_events(const std::vector<TraceEven
     return markers;
 }
 
-ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events) {
-    ExecutionAndFactEvents split;
+SourceEventGroups split_observation_events(std::vector<TraceEvent> events) {
+    SourceEventGroups split;
     split.executable_events.reserve(events.size());
     for (auto & event : events) {
-        // Keep the admission envelope even when child work covers all of its
-        // self time. The original still participates in CPU normalization.
-        if (event.source_channel == TraceSourceChannel::Torch && event.ph == 'X' && event.name == "hicache.control.host_load_branch")
-            split.runtime_observations.push_back(event);
-        // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
-        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
-            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.allocator.kernel"
-                || event.name == "runtime.cpu_collective" || event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.layer_waits"
-                || event.name == "runtime.hicache.prefetch_check" || event.name == "runtime.hicache.prefetch_progress"
-                || event.name == "runtime.hicache.write_policy_check" || event.name == "runtime.hicache.radix_insert"
-                || event.name == "runtime.hicache.node_publish" || event.name == "runtime.hicache.device_restore"
-                || event.name == "runtime.hicache.prefetch_stop" || event.name == "runtime.hicache.prefetch_publish"
-                || event.name == "runtime.hicache.prefetch_read" || event.name == "runtime.hicache.prefetch_query"
-                || event.name == "runtime.hicache.host_release" || event.name == "runtime.hicache.storage_drain"
-                || event.name == "runtime.hicache.prefetch_enqueue" || event.name == "runtime.hicache.load_completion"
-                || event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.write_ack"
-                || event.name == "runtime.hicache.decode_allocation" || event.name == "runtime.hicache.extend_allocation"
-                || event.name == "runtime.hicache.decode_allocator" || event.name == "runtime.hicache.extend_allocator"
-                || event.name == "runtime.hicache.capacity_guard" || event.name == "runtime.hicache.load_allocation"
-                || event.name == "runtime.hicache.load_admission" || event.name == "runtime.hicache.host_load_check"
-                || event.name == "runtime.hicache.device_release_backup" || event.name == "runtime.hicache.allocator_free"
-                || event.name == "runtime.hicache.device_release_regular") {
-                split.runtime_observations.push_back(std::move(event));
-                continue;
-            }
-            if (event.name == "runtime.request.receive") {
-                // The envelope contains existing work and waits. Only expose
-                // its start; dispatch_ready already supplies the end point.
-                event.name += ".begin";
-                event.dur = 0;
-                event.dur_submicro_ns = 0;
-                split.request_observations.push_back(std::move(event));
-            }
-            else if (event.name == "runtime.response.scheduler_send" || event.name == "runtime.request.socket_received"
-                     || event.name == "runtime.request.dispatch_ready")
-                split.request_observations.push_back(std::move(event));
-            continue;
+        // An admission envelope supplies observations even when its children
+        // cover all self time; it still participates in leaf normalization.
+        if (event.call_role == TraceCallRole::HostLoadEnvelope) split.runtime_observations.push_back(event);
+
+        switch (event.routing) {
+        case TraceRouting::RuntimeObservation:
+            split.runtime_observations.push_back(std::move(event));
+            break;
+        case TraceRouting::RequestBegin:
+            // Only the start is a point. The separately observed dispatch
+            // boundary supplies the end; the envelope is not extra service.
+            event.name += ".begin";
+            event.dur = 0;
+            event.dur_submicro_ns = 0;
+            split.request_observations.push_back(std::move(event));
+            break;
+        case TraceRouting::RequestObservation:
+            split.request_observations.push_back(std::move(event));
+            break;
+        case TraceRouting::CacheFact:
+            split.hicache_fact_events.push_back(std::move(event));
+            break;
+        case TraceRouting::Execution:
+            split.executable_events.push_back(std::move(event));
+            break;
+        case TraceRouting::Ignore:
+            break;
         }
-        if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));
-        else split.executable_events.push_back(std::move(event));
     }
     return split;
 }
@@ -238,7 +215,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto parsed_count = events.size();
     auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
     auto exclusions = dag_builder_detail::control_exclusion_intervals(events, phase_markers, gpu_id);
-    auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
+    auto split = dag_builder_detail::split_observation_events(std::move(events));
     dag_builder_detail::retain_modeled_operator_envelopes(split);
     auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
     DagGraph graph(std::move(normalized), gpu_id);
@@ -260,11 +237,9 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     finalize_sync_nodes(graph, index);
     normalize_cpu_queue_waits(graph);
     std::ranges::sort(split.request_observations, {}, &TraceEvent::ts);
-    for (const auto & observation : split.request_observations) {
-        // These points carry no extra cost or E2E eligibility. A future response
-        // path must separately prove complete request binding before using them.
-        (void)insert_cpu_gap_observation(graph, observation);
-    }
+    // These boundaries carry no extra cost or E2E eligibility. A future response
+    // path must separately prove complete request binding before using them.
+    insert_cpu_gap_observations(graph, split.request_observations);
     return graph;
 }
 

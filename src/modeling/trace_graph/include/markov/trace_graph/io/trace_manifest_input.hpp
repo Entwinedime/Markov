@@ -69,12 +69,16 @@ struct ManifestTraceInput {
 struct ManifestClientInput {
     std::string status;
     std::vector<core::ClientRequestTiming> requests;
-    /** Successful workload idle barrier, with no subsequent pre-window work. */
+    /** Successful idle barrier before the selected execution prefix. */
     std::optional<uint64_t> hicache_idle_since_us;
+    /** Preparation is an execution prefix, never part of formal HTTP latency. */
+    size_t formal_begin_index = 0;
 };
 
-/** Source manifest only; absent or unsupported client observations stay explicit. */
-[[nodiscard]] ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path);
+/** Source manifest only. Optional preparation contains declared serial requests
+ * after the last idle barrier. Valid request timings remain available when
+ * frontend attribution is missing; only status=ready permits a client chain. */
+[[nodiscard]] ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path, bool include_preparation = false);
 
 /**
  * @brief Loads selected manifest channels and produces independent logical inputs.

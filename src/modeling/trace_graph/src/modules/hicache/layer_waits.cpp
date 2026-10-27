@@ -1,7 +1,10 @@
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache {
 namespace {
@@ -11,7 +14,7 @@ using core::DagEdgeKind;
 uint64_t start_ns(const core::TraceEvent & event) { return event.ts * 1'000 + event.ts_submicro_ns; }
 uint64_t end_ns(const core::TraceEvent & event) { return start_ns(event) + event.dur * 1'000 + event.dur_submicro_ns; }
 
-void observe_call(const patch::HiCacheSourceDagIndex & source, const core::TraceEvent & batch, std::span<const size_t> lane, HiCacheLayerWaitCall & call) {
+void observe_call(const source_dag::SourceDagIndex & source, const core::TraceEvent & batch, std::span<const size_t> lane, HiCacheLayerWaitCall & call) {
     const auto & graph = source.graph();
     const auto first = std::ranges::lower_bound(lane, call.start_ns, {}, [&](size_t id) { return start_ns(graph.event_for_node(id)); });
     const auto last = std::ranges::lower_bound(first, lane.end(), call.end_ns, {}, [&](size_t id) { return start_ns(graph.event_for_node(id)); });
@@ -88,7 +91,7 @@ void observe_call(const patch::HiCacheSourceDagIndex & source, const core::Trace
 }
 } // namespace
 
-HiCacheLayerWaitObservation observe_hicache_layer_waits(const patch::HiCacheSourceDagIndex & source) {
+HiCacheLayerWaitObservation observe_hicache_layer_waits(const source_dag::SourceDagIndex & source) {
     HiCacheLayerWaitObservation result;
     std::map<std::pair<std::string, std::string>, std::vector<size_t>> precise_lanes;
     for (const auto & batch : source.graph().runtime_observations()) {
@@ -119,10 +122,19 @@ HiCacheLayerWaitObservation observe_hicache_layer_waits(const patch::HiCacheSour
         auto [lane, inserted] = precise_lanes.try_emplace({ batch.pid, batch.tid });
         if (inserted) {
             const auto nodes = source.cpu_nodes_on_lane(batch.pid, batch.tid);
-            lane->second.assign(nodes.begin(), nodes.end());
             // Exact call sites need fractional order; the materialized CPU
             // gap index must keep the builder's integer self-fragment order.
-            std::ranges::sort(lane->second, {}, [&](size_t id) { return std::pair{ start_ns(source.graph().event_for_node(id)), id }; });
+            // Read each graph coordinate once before sorting a long lane.
+            std::vector<std::pair<uint64_t, size_t>> order;
+            order.reserve(nodes.size());
+            for (const auto id : nodes) order.emplace_back(start_ns(source.graph().event_for_node(id)), id);
+            std::ranges::sort(order);
+
+            lane->second.reserve(order.size());
+            for (const auto & [timestamp, id] : order) {
+                (void)timestamp;
+                lane->second.push_back(id);
+            }
         }
         const bool enabled = std::stoll(batch.arg("consumer_index")) >= 0;
         std::map<uint64_t, size_t> positions;

@@ -1,4 +1,7 @@
 #include "markov/trace_graph/structure/hicache/phase.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/dense_program.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
@@ -79,7 +82,7 @@ OperationWork collective_caller_work(const OperationWork & collective, const Col
 
 namespace {
 
-PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
+PhaseCallPlan plan_attention_call(const adapters::sglang::AttentionCall & source, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                   const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
@@ -90,9 +93,10 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
         result.reason = "target_attention_batch_rule_not_implemented";
         return result;
     }
-    const AttentionRequestShape request = source.position.decode_iteration
-                                              ? AttentionRequestShape{ 1, decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) }
-                                              : AttentionRequestShape{ prefill.prefill_token_count, prefill.prompt_token_count };
+    const adapters::sglang::AttentionRequestShape request =
+        source.position.decode_iteration
+            ? adapters::sglang::AttentionRequestShape{ 1, decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) }
+            : adapters::sglang::AttentionRequestShape{ prefill.prefill_token_count, prefill.prompt_token_count };
     const auto page_tokens = source.position.decode_iteration ? decode.target_page_size : prefill.target_page_size;
     const auto & original = source.batch.requests.front();
     if (request.query_tokens == original.query_tokens && request.context_tokens == original.context_tokens && page_tokens == source.batch.page_tokens) {
@@ -101,12 +105,12 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
         return result;
     }
 
-    std::optional<AttentionInputs> inputs;
+    std::optional<adapters::sglang::AttentionInputs> inputs;
     if (source.position.decode_iteration && source.conditions.graph && request.context_tokens == original.context_tokens) {
         // Only the cache page geometry changed. The same request/round retains
         // graph eligibility and captured query batch; do not infer a new graph
         // bucket for changed batching or context lengths from a source sample.
-        inputs = AttentionInputs{ source.batch, source.cache_write };
+        inputs = adapters::sglang::AttentionInputs{ source.batch, source.cache_write };
         inputs->batch.page_tokens = page_tokens;
     }
     else if (source.padding) {
@@ -114,18 +118,18 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
             result.reason = "target_tbo_choice_not_established";
             return result;
         }
-        inputs = target_eager_attention_inputs(source.conditions,
-                                               source.batch,
-                                               source.cache_write,
-                                               *source.padding,
-                                               std::span<const AttentionRequestShape>{ &request, 1 },
-                                               page_tokens);
+        inputs = adapters::sglang::target_eager_attention_inputs(source.conditions,
+                                                                 source.batch,
+                                                                 source.cache_write,
+                                                                 *source.padding,
+                                                                 std::span<const adapters::sglang::AttentionRequestShape>{ &request, 1 },
+                                                                 page_tokens);
     }
     if (!inputs) {
         result.reason = "target_attention_layout_rule_or_metadata_missing";
         return result;
     }
-    auto operations = ascend_attention_tensor_program(source.conditions, inputs->batch, inputs->cache_write);
+    auto operations = adapters::sglang::ascend_attention_tensor_program(source.conditions, inputs->batch, inputs->cache_write);
     if (!operations) {
         result.reason = "target_attention_program_rule_not_implemented";
         return result;
@@ -135,7 +139,8 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
     return result;
 }
 
-PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCall & source, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
+PhaseCallPlan plan_attention_metadata_call(const adapters::sglang::AttentionMetadataCall & source,
+                                           const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                            const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
@@ -166,7 +171,7 @@ PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCa
         result.reason = "target_metadata_graph_dispatch_not_established";
         return result;
     }
-    auto program = ascend_attention_metadata_program(source.position.decode_iteration ? "decode" : "prefill", target);
+    auto program = adapters::sglang::ascend_attention_metadata_program(source.position.decode_iteration ? "decode" : "prefill", target);
     if (!program) {
         result.reason = "target_metadata_backend_lowering_unavailable";
         return result;
@@ -176,7 +181,7 @@ PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCa
     return result;
 }
 
-PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source_dag::AttentionCall & attention,
+PhaseCallPlan plan_dense_call(const adapters::sglang::DenseCall & source, const adapters::sglang::AttentionCall & attention,
                               const modules::hicache::model::HiCachePrefillWorkItem & prefill) {
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
@@ -225,14 +230,15 @@ PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source
         return result;
     }
     result.action = PhaseCallPlan::Action::Generate;
-    result.operations = dense_tensor_program(source.position.decode_iteration ? "decode" : "prefill", source.region.implementation, *shape);
+    result.operations = adapters::sglang::dense_tensor_program(source.position.decode_iteration ? "decode" : "prefill", source.region.implementation, *shape);
     return result;
 }
 
-DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollectiveCall & source, std::span<const source_dag::AttentionCall> attention_calls,
+DeviceCollectivePlan plan_device_collective_call(const adapters::sglang::DeviceCollectiveCall & source,
+                                                 std::span<const adapters::sglang::AttentionCall> attention_calls,
                                                  const modules::hicache::model::HiCachePrefillWorkItem & prefill) {
     DeviceCollectivePlan result{ source.region.observation, source.peer_observations, std::nullopt, {} };
-    const source_dag::AttentionCall * attention = nullptr;
+    const adapters::sglang::AttentionCall * attention = nullptr;
     for (const auto & call : attention_calls) {
         if (call.position != source.position || call.conditions.cache_layer_index != source.layer_index) continue;
         if (attention) {
@@ -280,8 +286,8 @@ DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollect
 
 } // namespace
 
-PhaseCallWork plan_phase_calls(const source_dag::PhaseCallAudit & source, size_t source_phase, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
-                               const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
+PhaseCallWork plan_phase_calls(const adapters::sglang::PhaseCallAudit & source, size_t source_phase,
+                               const modules::hicache::model::HiCachePrefillWorkItem & prefill, const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     PhaseCallWork result;
     for (const auto & call : source.attention.calls)
         if (call.position.phase_index == source_phase) result.tensors.push_back(plan_attention_call(call, prefill, decode));
@@ -322,7 +328,7 @@ std::map<size_t, CostMigration> phase_migration_candidates(const core::DagGraph 
     const bool same_context = decode.prompt_token_count == source.prompt_token_count && prefill.batch_size == source.batch_size;
     const bool same_pages = decode.target_page_size == source.source_page_size;
     for (const auto id : decode.kernel_nodes) {
-        const bool attention = modules::hicache::is_hicache_paged_attention(graph.event_for_node(id).name);
+        const bool attention = adapters::sglang::is_attention_kernel(graph.event_for_node(id).name);
         // Non-attention names do not establish cache independence: forward
         // metadata also submits indexing, casts and page-table division here.
         // Until semantic ownership proves otherwise, require the same cache

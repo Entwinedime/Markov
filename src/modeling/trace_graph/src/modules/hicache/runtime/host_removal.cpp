@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
@@ -7,10 +8,11 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-core::DagNodeRef append_host_entry_gate(const patch::HiCacheSourceDagIndex & source, size_t first, core::DagObservedPoint point, std::string id,
+core::DagNodeRef append_host_entry_gate(const adapters::sglang::HiCacheSourceIndex & source, size_t first, core::DagObservedPoint point, std::string id,
                                         std::string name, core::DagMutationPlan & plan) {
     const auto & graph = source.graph();
     const auto gate = core::DagNodeRef::synthetic(std::move(id));
@@ -25,8 +27,15 @@ core::DagNodeRef append_host_entry_gate(const patch::HiCacheSourceDagIndex & sou
     return gate;
 }
 
-core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & source, std::span<const HiCacheHostRegion> regions,
+core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheHostRegion> regions,
                                         std::span<const size_t> collective_handoffs, std::span<const core::DagRedirectEdgeMutation> submission_handoffs) {
+    const auto queues = simulation::detail::discover_cpu_task_queues(source.graph());
+    return plan_host_removal(source, queues, regions, collective_handoffs, submission_handoffs);
+}
+
+core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        std::span<const HiCacheHostRegion> regions, std::span<const size_t> collective_handoffs,
+                                        std::span<const core::DagRedirectEdgeMutation> submission_handoffs) {
     using Kind = core::DagEdgeKind;
     const auto & graph = source.graph();
     core::DagMutationPlan plan{ .component = "hicache_host_replacement" };
@@ -109,7 +118,6 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
     }
     // Discover removal ownership from the complete CPU chain, including
     // zero-duration enqueue points and nested replacement gates.
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<size_t> submitted(removed.begin(), removed.end());
     for (size_t i = 0; i < submitted.size(); ++i)
         for (const auto edge_id : source.outgoing_edge_ids(submitted[i])) {
@@ -141,27 +149,36 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
         }
     const auto placeholders = source_dag::interior_stream_placeholders(source, removed);
     removed.insert(placeholders.begin(), placeholders.end());
+    plan.disable_nodes.assign(removed.begin(), removed.end());
+    // Ownership is complete now. Index the final removal list once: auditing
+    // every graph edge must not repeat tree searches through millions of IDs.
+    // The sorted plan remains the mutation's canonical removal order.
+    const auto removed_nodes = [&] {
+        std::vector<bool> nodes(graph.node_count());
+        for (const auto id : plan.disable_nodes) nodes[id] = true;
+
+        return nodes;
+    }();
 
     for (const auto & region : regions)
         for (const auto id : region.host->worker_nodes)
             if (!workers.contains(id)) throw std::runtime_error("Host worker has no owned submission path");
     for (const auto id : gates)
-        if (removed.contains(id)) throw std::runtime_error("Host removal contains another region's gate");
+        if (removed_nodes[id]) throw std::runtime_error("Host removal contains another region's gate");
     for (const auto id : transferred_submissions) {
         const auto & edge = graph.edge(id);
-        if (!main.contains(edge.src) || removed.contains(edge.dst))
-            throw std::runtime_error("Caller handoff must leave its complete worker task outside removal");
+        if (!main.contains(edge.src) || removed_nodes[edge.dst]) throw std::runtime_error("Caller handoff must leave its complete worker task outside removal");
     }
     for (const auto id : workers) {
         const auto task = queues.node_task.at(id);
-        if (task == core::DagNode::kNoNode || !removed.contains(queues.tasks.at(task).submission))
+        if (task == core::DagNode::kNoNode || !removed_nodes[queues.tasks.at(task).submission])
             throw std::runtime_error("Host removal worker lacks its owned submission");
         if (transferred_submission_nodes.contains(queues.tasks.at(task).submission))
             throw std::runtime_error("Caller handoff cannot remove part of its retained worker task");
     }
     for (size_t id = 0; id < queues.node_task.size(); ++id) {
         const auto task = queues.node_task[id];
-        if (task != core::DagNode::kNoNode && removed.contains(queues.tasks[task].submission)
+        if (task != core::DagNode::kNoNode && removed_nodes[queues.tasks[task].submission]
             && !transferred_submission_nodes.contains(queues.tasks[task].submission) && !workers.contains(id))
             throw std::runtime_error("Host removal owns only part of a worker task: " + std::to_string(id) + " " + graph.event_for_node(id).name);
     }
@@ -177,15 +194,15 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
                 const auto & edge = graph.edge(id);
                 if (!edge.active || edge.kind != order) continue;
                 if (graph.node(edge.src).lane_id != graph.node(node).lane_id) throw std::runtime_error("Host removal order crosses resource lanes");
-                if (removed.contains(edge.src)) pending.push_back(edge.src);
+                if (removed_nodes[edge.src]) pending.push_back(edge.src);
                 else additions.emplace(edge.src, consumer, output);
             }
         }
     };
     for (size_t edge_id = 0; edge_id < graph.edges().size(); ++edge_id) {
         const auto & edge = graph.edge(edge_id);
-        if (!edge.active || removed.contains(edge.src) == removed.contains(edge.dst)) continue;
-        const bool outgoing = removed.contains(edge.src);
+        if (!edge.active || removed_nodes[edge.src] == removed_nodes[edge.dst]) continue;
+        const bool outgoing = removed_nodes[edge.src];
         const auto id = outgoing ? edge.src : edge.dst, peer = outgoing ? edge.dst : edge.src;
         if (const auto at = main.find(id); at != main.end()) {
             if (outgoing && transferred_submissions.contains(edge_id)) continue;
@@ -217,7 +234,6 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
             throw std::runtime_error("Removed device work has an external submission");
         }
     }
-    plan.disable_nodes.assign(removed.begin(), removed.end());
     for (const auto & [from, to, kind] : additions) {
         bool exists = false;
         for (const auto id : source.outgoing_edge_ids(from)) {

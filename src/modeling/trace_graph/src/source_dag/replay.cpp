@@ -147,7 +147,7 @@ nlohmann::json replay_report(const core::DagGraph & source, const core::ClientRe
          "Builder synchronization and CPU queue normalization replace observed waits with dependencies; replay is not an untouched sum of raw trace "
          "durations." } }                                                                                               },
         {   "event_coverage",
-         { { "scope", "normalized executable events selected by manifest channels and formal window" },
+         { { "scope", "normalized executable events selected by manifest channels and execution window, including any preparation prefix" },
          { "selected_joined_records", source.parsed_record_count() },
          { "normalized_executable_events", execution_event_count },
          { "represented_normalized_events", represented_count },
@@ -181,7 +181,7 @@ nlohmann::json replay_report(const core::DagGraph & source, const core::ClientRe
     double request_max_ape = 0.0;
     // connect_client_requests preserves the validated serial input order.
     // Compare each request's own latency, excluding the inter-request pause.
-    for (size_t i = 0; i < chain.requests.size(); ++i) {
+    for (size_t i = chain.formal_begin_index; i < chain.requests.size(); ++i) {
         const auto & request = chain.requests[i];
         const auto & observed = requests[i];
         const auto start = graph.node(request.start).completion_time;
@@ -205,14 +205,17 @@ nlohmann::json replay_report(const core::DagGraph & source, const core::ClientRe
             { "absolute_percentage_error",                ape }
         });
     }
-    const auto observed_us = requests.back().end_us - requests.front().start_us;
-    const auto replayed_us = completion - graph.node(chain.requests.front().start).completion_time;
+    const auto observed_us = requests.back().end_us - requests[chain.formal_begin_index].start_us;
+    const auto formal_start_us = graph.node(chain.requests[chain.formal_begin_index].start).completion_time;
+    const auto replayed_us = completion - formal_start_us;
+    const auto formal_request_count = chain.requests.size() - chain.formal_begin_index;
     const auto signed_error = static_cast<double>(replayed_us) - static_cast<double>(observed_us);
     report.update({
         {                    "status",                                                  "reported"                                      },
         {                     "scope",                                                                 "same_profile_http_formal_window" },
         {           "observed_e2e_us",                                                                                       observed_us },
         {           "replayed_e2e_us",                                                                                       replayed_us },
+        {           "formal_start_us",                                                                                   formal_start_us },
         {           "signed_error_us",                                                                                      signed_error },
         {         "absolute_error_us",                                                                            std::abs(signed_error) },
         { "absolute_percentage_error", observed_us > 0 ? Json(std::abs(signed_error) / static_cast<double>(observed_us)) : Json(nullptr) },
@@ -220,8 +223,9 @@ nlohmann::json replay_report(const core::DagGraph & source, const core::ClientRe
          { { "scope", "same-profile per-request HTTP latency, excluding inter-request pauses" },
          { "wape", request_absolute_error_sum_us / request_observed_sum_us },
          { "max_ape", request_max_ape },
-         { "request_count", chain.requests.size() } }                                                                                   },
-        {             "request_count",                                                                             chain.requests.size() },
+         { "request_count", formal_request_count } }                                                                                    },
+        {             "request_count",                                                                              formal_request_count },
+        { "preparation_request_count",                                                                          chain.formal_begin_index },
         {          "graph_node_count",                                                                             source.nodes().size() },
         {                  "requests",                                                                                 replayed_requests },
     });

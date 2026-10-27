@@ -1,7 +1,7 @@
 #pragma once
 #include "markov/trace_graph/core/client_requests.hpp"
-#include "markov/trace_graph/cost/hicache_phase.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
+#include "markov/trace_graph/cost/source_migration.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
@@ -26,10 +26,11 @@ struct HiCacheWindowResult {
     model::HiCacheModelResult model;
     patch::CpuCollectivePatch cpu_collectives;
     QueueConfirmationCoverage confirmations;
-    cost::PhaseCostCoverage phase_operator_costs;
+    cost::SourceCostCoverage phase_operator_costs;
     std::map<std::string, ExecutedCostTotals> executed_cost_sources;
-    // Work decisions and actual replacement counts are reported separately.
-    std::vector<structure::hicache::PhaseCallPlan> phase_tensor_work;
+    // Full tensor plans belong to pending calls; reports need only these totals.
+    size_t phase_migration_candidates = 0, phase_generated_plans = 0;
+    std::map<std::string, size_t> phase_plan_issues;
     // Device completion and reduction worker segments have separate costs.
     std::vector<structure::hicache::DeviceCollectivePlan> collective_work;
     size_t prepared_collective_services = 0, executed_collective_services = 0;
@@ -43,6 +44,7 @@ struct HiCacheWindowResult {
     std::map<cost::OperatorCostProvider::QueryKey, cost::OperatorQuerySummary> independent_operator_queries;
     size_t prepared_facts = 0, consumed_facts = 0, phase_admissions = 0;
     size_t decode_allocations = 0;
+    size_t admission_retry_rank_calls = 0;
     size_t source_load_submissions = 0, completed_load_batches = 0;
     size_t load_submission_shared_cost_batches = 0;
     size_t prepared_layer_calls = 0, active_layer_calls = 0, inactive_layer_calls = 0;

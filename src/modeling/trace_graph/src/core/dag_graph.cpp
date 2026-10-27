@@ -39,14 +39,6 @@ std::string edge_kind_name(DagEdgeKind kind) {
     return "unknown";
 }
 
-namespace dag_graph_detail {
-
-bool contains_hccl_name(const std::string & name) { return name.contains("hcom") || name.contains("HCCL") || name.contains("hccl"); }
-
-} // namespace dag_graph_detail
-
-using dag_graph_detail::contains_hccl_name;
-
 DagEdge::DagEdge(size_t src_value, size_t dst_value, DagEdgeKind kind_value, std::string_view effect_id_value, std::string_view reason_value)
     : src(src_value),
       dst(dst_value),
@@ -503,7 +495,7 @@ private:
     void inspect_trace_node(const DagGraph & graph, const GraphRelocation & relocation, size_t local_node_id, const DagNode & node) {
         if (!node.active || node.kind == DagNodeKind::Synthetic) return;
         const auto & event = graph.event_for_node(local_node_id);
-        if (!node.is_cpu && contains_hccl_name(event.name)) hccl_groups_[event.name][relocation.graph_index].push_back(local_node_id + relocation.node_offset);
+        if (!node.is_cpu && event.collective_envelope) hccl_groups_[event.name][relocation.graph_index].push_back(local_node_id + relocation.node_offset);
 #ifdef DEBUG
         if (!has_real_time_ || event.ts < real_min_) real_min_ = event.ts;
         real_max_ = std::max(real_max_, checked_add_u64(event.ts, event.dur, "trace timestamp overflow while merging DAGs"));

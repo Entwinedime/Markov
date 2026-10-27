@@ -1,3 +1,5 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
@@ -10,24 +12,24 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const core::DagGraph & original, std::span<const source_dag::DeviceCollectiveCall> calls,
-                                             uint64_t begin_us, uint64_t end_us) {
+void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const core::DagGraph & original,
+                                             std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us, uint64_t end_us) {
     using Ref = core::DagNodeRef;
     using Kind = core::DagEdgeKind;
     struct Selected {
-        const source_dag::DeviceCollectiveCall * call;
-        std::vector<source_dag::CollectiveCallerInterval> intervals;
+        const adapters::sglang::DeviceCollectiveCall * call;
+        std::vector<adapters::sglang::CollectiveCallerInterval> intervals;
     };
     std::vector<Selected> selected;
     std::vector<core::TraceEvent> points;
-    const patch::HiCacheSourceDagIndex original_index(original);
+    const adapters::sglang::HiCacheSourceIndex original_index(original);
     const auto queues = simulation::detail::discover_cpu_task_queues(original);
     for (const auto & call : calls) {
         const auto & event = original.runtime_observations().at(call.region.observation);
         const auto end = core::checked_add_u64(event.ts, event.dur, "Collective caller end overflow");
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
         const auto tasks = source_dag::observe_queued_call_tasks(original_index, queues, call.region);
-        const auto intervals = tasks ? source_dag::observe_collective_caller_intervals(original_index, queues, call, *tasks) : std::nullopt;
+        const auto intervals = tasks ? adapters::sglang::observe_collective_caller_intervals(original_index, queues, call, *tasks) : std::nullopt;
         if (!intervals) throw std::runtime_error("Collective caller needs a supported event protocol with proven stream handoffs");
         selected.push_back({ &call, *intervals });
         for (const auto at : { event.ts, end }) {
@@ -42,7 +44,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const core:
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<HiCacheHostRegion> regions;
     std::vector<core::DagSyntheticNodeMutation> nodes;

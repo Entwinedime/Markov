@@ -1,7 +1,7 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include <algorithm>
 #include <tuple>
 
@@ -31,7 +31,7 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
     }
     const auto gaps = core::insert_cpu_gap_points(graph, missing);
     for (size_t i = 0; i < gaps.size(); ++i) result[positions[i]] = gaps[i];
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     std::map<size_t, std::map<uint64_t, std::vector<size_t>>> splits;
     std::map<Coordinate, std::vector<size_t>> entries;
     for (const auto i : positions) {
@@ -42,7 +42,10 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
             continue;
         }
         std::vector<size_t> covering;
-        for (const auto id : source.cpu_nodes_on_lane(point.pid, point.tid)) {
+        // A strictly containing leaf overlaps the integer tick before this
+        // point. Keep the original endpoint and uniqueness checks below.
+        const auto preceding_us = point.ts == 0 ? 0 : point.ts - 1;
+        for (const auto id : source.cpu_interval_candidates(point.pid, point.tid, preceding_us, point.ts)) {
             const auto & event = graph.event_for_node(id);
             if (event.ts < point.ts && point.ts < event.ts + event.dur) covering.push_back(id);
         }
@@ -106,7 +109,7 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
     // and leave the actual CPU work and its outgoing dependencies untouched.
     if (entries.empty()) return result;
 
-    const patch::HiCacheSourceDagIndex split_source(graph);
+    const adapters::sglang::HiCacheSourceIndex split_source(graph);
     core::DagMutationPlan entry_plan{ .component = "hicache_control_boundaries" };
     std::map<std::string, std::vector<size_t>> entry_results;
     for (const auto & [coordinate, indices] : entries) {

@@ -1,4 +1,5 @@
 #pragma once
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/cpu_collectives.hpp"
 
 namespace markov::trace_graph::modules::hicache {
@@ -40,6 +41,7 @@ struct PrefetchWorkerObservations {
  * Round membership is checked separately from unavailable Torch worker costs.
  * Observed counts and timestamps must not be reused as target state decisions.
  */
-[[nodiscard]] PrefetchWorkerObservations observe_prefetch_workers(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & collectives);
+[[nodiscard]] PrefetchWorkerObservations observe_prefetch_workers(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                  const CpuCollectiveObservation & collectives);
 
 } // namespace markov::trace_graph::modules::hicache

@@ -18,23 +18,19 @@ namespace markov::trace_graph::core {
 
 namespace dag_builder_detail {
 
-bool is_stream_sync_event(const std::string & name) {
-    return name == "AscendCL@aclrtSynchronizeStream" || name == "AscendCL@aclrtSynchronizeStreamWithTimeout";
-}
+bool is_stream_sync_event(const TraceEvent & event) { return event.boundary == TraceBoundary::StreamSync; }
 
-bool is_event_sync_event(const std::string & name) { return name == "AscendCL@aclrtSynchronizeEvent" || name == "AscendCL@aclrtSynchronizeEventWithTimeout"; }
+bool is_event_sync_event(const TraceEvent & event) { return event.boundary == TraceBoundary::EventSync; }
 
-bool is_device_sync_event(const std::string & name) {
-    return name == "AscendCL@aclrtSynchronizeDevice" || name == "AscendCL@aclrtSynchronizeDeviceWithTimeout";
-}
+bool is_device_sync_event(const TraceEvent & event) { return event.boundary == TraceBoundary::DeviceSync; }
 
 } // namespace dag_builder_detail
 
 bool synchronizes_device_frontier(const TraceEvent & event) {
-    return dag_builder_detail::is_stream_sync_event(event.name) || dag_builder_detail::is_device_sync_event(event.name);
+    return dag_builder_detail::is_stream_sync_event(event) || dag_builder_detail::is_device_sync_event(event);
 }
 
-bool synchronizes_recorded_event(const TraceEvent & event) { return dag_builder_detail::is_event_sync_event(event.name); }
+bool synchronizes_recorded_event(const TraceEvent & event) { return dag_builder_detail::is_event_sync_event(event); }
 
 namespace {
 

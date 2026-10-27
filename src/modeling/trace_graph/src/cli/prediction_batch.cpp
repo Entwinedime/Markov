@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -70,7 +71,7 @@ std::vector<TargetRun> target_runs(const CliOptions & source_options, const nloh
     return runs;
 }
 
-int execute_target(TargetRun & run, PreparedSource source, core::Logger & logger) {
+int execute_target(TargetRun & run, PreparedSource & source, core::Logger & logger) {
     const int log = open(run.log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (log < 0) throw std::system_error(errno, std::generic_category(), "open target log");
     const bool redirected = dup2(log, STDOUT_FILENO) >= 0 && dup2(log, STDERR_FILENO) >= 0;
@@ -79,7 +80,7 @@ int execute_target(TargetRun & run, PreparedSource source, core::Logger & logger
     if (!redirected) throw std::system_error(error, std::generic_category(), "redirect target log");
 
     try {
-        return run_prepared_workflow(run.options, run.modules, std::move(source), logger);
+        return run_prepared_workflow(run.options, run.modules, source, logger);
     }
     catch (const std::exception & failure) {
         logger.error() << failure.what();
@@ -102,7 +103,10 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
     if (jobs <= 0 || plan.at("runs").empty()) throw CliUsageError("target plan requires positive jobs and at least one run");
     const bool continue_on_error = plan.at("continue_on_error").get<bool>();
     auto runs = target_runs(options, plan);
-    auto source = prepare_source(options);
+    const auto preparation_started = std::chrono::steady_clock::now();
+    auto source = prepare_source(options, true);
+    const auto preparation_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started).count();
+    std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec } }.dump() << '\n' << std::flush;
 
     // Input loading/build futures have joined. Fork before target work: const
     // TraceEvent access may populate lazy maps and is not thread-safe.
@@ -119,7 +123,7 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
             if (pid < 0) throw std::system_error(errno, std::generic_category(), "fork target execution");
             if (pid == 0) {
                 try {
-                    _exit(execute_target(runs[next], std::move(source), logger));
+                    _exit(execute_target(runs[next], source, logger));
                 }
                 catch (const std::exception & error) {
                     logger.error() << error.what();
@@ -129,6 +133,7 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
             // Capacity is reserved before creating children; registering an
             // owned PID must not fail through a subsequent allocation.
             children.active.emplace_back(pid, next++);
+            std::cout << nlohmann::json{ { "event", "target_started" }, { "index", next - 1 } }.dump() << '\n' << std::flush;
         }
 
         int status = 0;

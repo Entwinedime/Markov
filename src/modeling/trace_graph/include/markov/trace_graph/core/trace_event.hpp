@@ -33,6 +33,28 @@ using TraceArgMap = std::unordered_map<std::string, std::string, TraceArgHash, s
 /** @brief Physical manifest channel that supplied one trace event. */
 enum class TraceSourceChannel : std::uint8_t { Unknown, Torch, LdPreload, PythonProbe, Synthetic };
 
+/** Source interpretation is assigned at the input boundary, not inferred by
+ * graph mutation or cost models. These tags do not change the raw record. */
+enum class TraceRouting : std::uint8_t { Execution, CacheFact, RuntimeObservation, RequestObservation, RequestBegin, Ignore };
+enum class TraceCallRole : std::uint8_t { Ordinary, ControlEnvelope, HostLoadEnvelope, ModelWork, ControlBoundary, PrefillMarker, DecodeMarker };
+enum class TraceBoundary : std::uint8_t {
+    None,
+    DeviceEventRecord,
+    DeviceEventWait,
+    StreamWait,
+    StreamSync,
+    EventSync,
+    DeviceSync,
+    NotifyRecord,
+    NotifyWait,
+    ModelExecute,
+    HostEventRecord,
+    AsyncCopy,
+    DeviceCopy,
+    NodeLaunch,
+    RuntimeDetail
+};
+
 /**
  * @brief Unified event representation used throughout the C++ backend.
  *
@@ -63,6 +85,12 @@ struct TraceEvent {
 
     /** @brief Typed source provenance retained without allocating an argument per event. */
     TraceSourceChannel source_channel = TraceSourceChannel::Unknown;
+    TraceRouting routing = TraceRouting::Execution;
+    TraceCallRole call_role = TraceCallRole::Ordinary;
+    TraceBoundary boundary = TraceBoundary::None;
+    bool submit_anchor = false;
+    bool snapshot_overhead = false;
+    bool collective_envelope = false;
 
     /** @brief Optional external event ID; most duration events do not provide one. */
     std::string event_id;

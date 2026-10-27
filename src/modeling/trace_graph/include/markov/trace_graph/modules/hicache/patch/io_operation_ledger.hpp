@@ -4,7 +4,8 @@
  */
 #pragma once
 
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -63,13 +64,13 @@ struct HiCacheIoOperationRecord {
     std::vector<size_t> runtime_node_ids;
     std::vector<size_t> admission_explicit_node_ids;
     std::vector<size_t> admission_python_self_node_ids;
-    std::vector<HiCacheCpuGapSlice> admission_cpu_gap_slices;
+    std::vector<source_dag::CpuGapSlice> admission_cpu_gap_slices;
     std::vector<size_t> device_transfer_node_ids;
     std::vector<size_t> device_completion_node_ids;
     std::vector<size_t> readiness_join_node_ids;
     uint64_t device_transfer_duration_us = 0;
     bool source_readiness_topology_ready = false;
-    std::vector<HiCacheCpuGapSlice> cpu_gap_slices;
+    std::vector<source_dag::CpuGapSlice> cpu_gap_slices;
     std::optional<size_t> source_anchor_node_id = std::nullopt;
     std::optional<size_t> completion_anchor_node_id = std::nullopt;
     std::optional<size_t> consumer_anchor_node_id = std::nullopt;
@@ -91,7 +92,7 @@ struct HiCacheIoOperationRecord {
     std::optional<size_t> wait_exit_anchor_node_id = std::nullopt;
     std::optional<size_t> terminal_control_anchor_node_id = std::nullopt;
     std::vector<size_t> completion_wait_owned_node_ids;
-    std::vector<HiCacheCpuGapSlice> completion_wait_slices;
+    std::vector<source_dag::CpuGapSlice> completion_wait_slices;
     bool runtime_copy_observed = false;
     bool foreground_consumer_required = false;
     std::string reason;
@@ -109,6 +110,6 @@ struct HiCacheIoOperationLedger {
 
 [[nodiscard]] bool hicache_io_operation_record_ready(const HiCacheIoOperationRecord & record);
 [[nodiscard]] std::string hicache_io_operation_kind_name(HiCacheIoOperationKind kind);
-[[nodiscard]] HiCacheIoOperationLedger build_hicache_io_operation_ledger(const HiCacheSourceDagIndex & source);
+[[nodiscard]] HiCacheIoOperationLedger build_hicache_io_operation_ledger(const adapters::sglang::HiCacheSourceIndex & source);
 
 } // namespace markov::trace_graph::modules::hicache::patch

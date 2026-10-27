@@ -1,4 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/allocator_calls.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
@@ -15,8 +18,8 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const model::HiCacheReplayFact> facts,
-                                 const structure::hicache::SchedulerComputeResources & resources, const AllocatorPreparationObservation & preparation,
-                                 uint64_t begin_us, uint64_t end_us) {
+                                 const structure::hicache::SchedulerComputeResources & resources,
+                                 const adapters::sglang::AllocatorPreparationObservation & preparation, uint64_t begin_us, uint64_t end_us) {
     using Lane = std::pair<std::string, std::string>;
     std::map<Lane, std::vector<const HiCacheFact *>> outer_calls;
     std::map<size_t, const HiCacheFact *> extend_facts;
@@ -34,15 +37,15 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
     }
     for (auto & [lane, calls] : outer_calls) std::ranges::sort(calls, {}, [](const auto * fact) { return fact->source_ts; });
 
-    const patch::HiCacheSourceDagIndex original_index(original);
+    const adapters::sglang::HiCacheSourceIndex original_index(original);
     const auto original_queues = simulation::detail::discover_cpu_task_queues(original);
-    const auto regions = source_dag::observe_allocator_regions(original_index, original_queues);
+    const auto regions = adapters::sglang::observe_allocator_regions(original_index, original_queues);
     struct Selection {
         const HiCacheFact * fact;
-        const source_dag::AllocatorRegion * region;
-        const AllocatorPreparationSourceCall * preparation;
+        const adapters::sglang::AllocatorRegion * region;
+        const adapters::sglang::AllocatorPreparationSourceCall * preparation;
     };
-    std::map<size_t, const AllocatorPreparationSourceCall *> extend_observations;
+    std::map<size_t, const adapters::sglang::AllocatorPreparationSourceCall *> extend_observations;
     for (const auto & call : preparation.calls) {
         if (!extend_facts.contains(call.source_fact_id)) continue;
         if (!call.allocator_observation || !call.issues.empty() || !call.allocator_work || !call.prefix_dtype || !call.page_count_supplied)
@@ -58,7 +61,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
 
         const HiCacheFact * fact;
-        const AllocatorPreparationSourceCall * observed_preparation = nullptr;
+        const adapters::sglang::AllocatorPreparationSourceCall * observed_preparation = nullptr;
         if (region.phase == model::HiCacheAllocatorPhase::Extend) {
             const auto observed = extend_observations.find(region.work.observation);
             if (observed == extend_observations.end()) throw std::runtime_error("Extend allocator has no uniquely observed workload boundary");
@@ -93,22 +96,22 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(selected.size());
     std::vector<HiCacheHostRegion> removals;
-    std::map<std::pair<size_t, size_t>, std::optional<LoadIndexResources>> observed_resources;
+    std::map<std::pair<size_t, size_t>, std::optional<HostDeviceResources>> observed_resources;
     for (size_t i = 0; i < selected.size(); ++i) {
         const auto & region = *selected[i].region;
         const auto & event = original.runtime_observations().at(region.work.observation);
         if (!boundaries[2 * i] || !boundaries[2 * i + 1]) throw std::runtime_error("Allocator requires exact entry and exit boundaries");
         const auto compute = resources.find({ event.pid, event.tid });
-        const auto deployment = source_dag::observed_allocator_inputs(event);
+        const auto deployment = adapters::sglang::observed_allocator_inputs(event);
         if (compute == resources.end() || !deployment) throw std::runtime_error("Allocator lacks compute resource or deployment metadata");
         const auto resource_key = std::pair{ graph.node(*boundaries[2 * i]).lane_id, graph.node(compute->second).lane_id };
         const auto [resource, added] = observed_resources.try_emplace(resource_key);
-        if (added) resource->second = observe_load_index_resources(source, queues, *boundaries[2 * i], compute->second);
+        if (added) resource->second = observe_host_device_resources(source, queues, *boundaries[2 * i], compute->second);
         const auto & execution = resource->second;
         if (!execution) throw std::runtime_error("Allocator lacks a proven submission worker");
 
@@ -116,7 +119,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
         hosts.push_back(observe_host_template(source, event.pid, event.tid, event.ts, points[2 * i + 1].ts));
         removals.push_back({ entry, exit, &hosts.back() });
         const auto * observed_preparation = selected[i].preparation;
-        auto source_work = observed_preparation ? observed_preparation->allocator_work : source_dag::observed_allocator_work(event);
+        auto source_work = observed_preparation ? observed_preparation->allocator_work : adapters::sglang::observed_allocator_work(event);
         if (source_work && !observed_preparation) {
             const auto & fact = *selected[i].fact;
             for (size_t request = 0; request < fact.batch_paths.size(); ++request) {
@@ -137,20 +140,20 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
         if (observed_preparation) {
             call.prefix_dtype = observed_preparation->prefix_dtype;
             call.page_count_supplied = observed_preparation->page_count_supplied;
-            call.source_preparation = structure::hicache::AllocatorPreparation{ observed_preparation->required ? "required" : "not_required",
-                                                                                observed_preparation->specialization,
-                                                                                observed_preparation->path,
-                                                                                observed_preparation->first_load };
+            call.source_preparation = adapters::sglang::AllocatorPreparation{ observed_preparation->required ? "required" : "not_required",
+                                                                              observed_preparation->specialization,
+                                                                              observed_preparation->path,
+                                                                              observed_preparation->first_load };
         }
         if (!calls_.emplace(entry, std::move(call)).second) throw std::runtime_error("Allocator calls share an entry boundary");
         fact_entries_.emplace(selected[i].fact->source_node_id, entry);
         owned_.insert(region.work.caller.owned_node_ids.begin(), region.work.caller.owned_node_ids.end());
         owned_.insert(region.work.submitted_nodes.begin(), region.work.submitted_nodes.end());
     }
-    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, removals));
+    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, removals));
 }
 
-void HiCacheAllocatorCalls::rebind_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & workers) {
+void HiCacheAllocatorCalls::rebind_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers) {
     std::vector<HiCacheHostExpansion *> retained;
     for (auto & [entry, call] : calls_) {
         retained.push_back(&call.retained);
@@ -166,7 +169,7 @@ void HiCacheAllocatorCalls::rebind_resources(const patch::HiCacheSourceDagIndex 
     rebind_host_worker_queues(source.graph(), workers, retained);
 }
 
-void HiCacheAllocatorCalls::set_work(const model::HiCacheAllocatorWorkItem & work, const structure::hicache::AllocatorPreparation & preparation) {
+void HiCacheAllocatorCalls::set_work(const model::HiCacheAllocatorWorkItem & work, const adapters::sglang::AllocatorPreparation & preparation) {
     if (!work.formal) return;
     auto & call = calls_.at(fact_entries_.at(work.source_fact_id));
     call.work = work;
@@ -188,7 +191,7 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
                                     || (call.preparation.specialization == source_preparation.specialization && call.preparation.path == source_preparation.path
                                         && call.preparation.first_load == source_preparation.first_load));
     }
-    const bool unchanged = preparation_unchanged && call.source_work && structure::hicache::allocator_work_unchanged(*call.source_work, work);
+    const bool unchanged = preparation_unchanged && call.source_work && adapters::sglang::allocator_work_unchanged(*call.source_work, work);
     HiCacheHostExpansion plan;
     if (unchanged) {
         plan = std::move(call.retained);
@@ -199,16 +202,16 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
         // lowering rule. New work does: an unknown device must not silently
         // inherit the inspected 910B implementation.
         std::optional<std::vector<structure::TensorOperation>> program;
-        if (decode) { program = structure::hicache::ascend_decode_allocator_program(work, call.inputs); }
+        if (decode) { program = adapters::sglang::ascend_decode_allocator_program(work, call.inputs); }
         else if (call.preparation.status == "naive_path") {
-            program = structure::hicache::ascend_naive_extend_allocator_program(work, call.inputs, call.prefix_dtype.value(), call.page_count_supplied.value());
+            program = adapters::sglang::ascend_naive_extend_allocator_program(work, call.inputs, call.prefix_dtype.value(), call.page_count_supplied.value());
         }
         else {
-            program = structure::hicache::ascend_fused_extend_allocator_program(work,
-                                                                                call.inputs,
-                                                                                call.prefix_dtype.value(),
-                                                                                call.page_count_supplied.value(),
-                                                                                call.preparation);
+            program = adapters::sglang::ascend_fused_extend_allocator_program(work,
+                                                                              call.inputs,
+                                                                              call.prefix_dtype.value(),
+                                                                              call.page_count_supplied.value(),
+                                                                              call.preparation);
         }
         if (!program)
             throw std::runtime_error("Target allocator has no implemented program for its device/dtype/execution inputs; device_name="

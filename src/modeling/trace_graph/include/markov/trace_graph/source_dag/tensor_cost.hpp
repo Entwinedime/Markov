@@ -2,6 +2,7 @@
 
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
 
@@ -21,13 +22,13 @@ namespace markov::trace_graph::source_dag {
  * synchronization producers or a producer still running at API entry yield
  * no sample. Returned microseconds use this capture's CPU correction, when
  * supplied; otherwise they remain profiled measurements. */
-[[nodiscard]] std::optional<uint64_t> observe_nonblocking_cpu_service(const modules::hicache::patch::HiCacheSourceDagIndex & source, size_t node);
+[[nodiscard]] std::optional<uint64_t> observe_nonblocking_cpu_service(const SourceDagIndex & source, size_t node);
 
 /** Measure a raw device EVENT_WAIT only when its recorded event completed
  * before the wait began. Logical/synthetic waits and unresolved or blocking
  * waits have no service sample. Never return the builder's fixed sync cost.
  * Returned microseconds retain the raw event's sub-microsecond precision. */
-[[nodiscard]] std::optional<double> observe_device_event_wait_service(const modules::hicache::patch::HiCacheSourceDagIndex & source, size_t node);
+[[nodiscard]] std::optional<double> observe_device_event_wait_service(const SourceDagIndex & source, size_t node);
 
 struct WorkerLaunchObservation {
     uint64_t launch_us = 0, launch_residual_us = 0;
@@ -39,18 +40,16 @@ struct WorkerLaunchObservation {
  * multiple launch points yield no sample. A device-side event wait does not
  * invalidate nonblocking CPU submission measurements; its elapsed wait is
  * never measured as device service here. Durations are microseconds. */
-[[nodiscard]] std::optional<WorkerLaunchObservation> observe_worker_launch(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                                           const simulation::detail::CpuTaskQueues & queues, std::vector<size_t> workers,
-                                                                           const std::set<size_t> & devices);
+[[nodiscard]] std::optional<WorkerLaunchObservation> observe_worker_launch(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                                           std::vector<size_t> workers, const std::set<size_t> & devices);
 
 /** Measure one already-attributed queued task, not the enclosing call. A
  * single launch yields independent launch/return scopes; a CPU-only task
  * yields worker_service and worker_residual_interval. Dispatch is separate.
  * No caller or device service is emitted. Tasks with multiple launch points
  * need an explicit native program rather than a pooled worker sample. */
-[[nodiscard]] nlohmann::json queued_task_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                      const simulation::detail::CpuTaskQueues & queues, const QueuedCallTask & task,
-                                                      const structure::OperationWork & work, bool cpu_service_applied);
+[[nodiscard]] nlohmann::json queued_task_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                      const QueuedCallTask & task, const structure::OperationWork & work, bool cpu_service_applied);
 
 /** Extract a tensor call's separately attributable device, submit, return,
  * worker and dispatch measurements. Partial scopes remain partial: never
@@ -84,17 +83,17 @@ struct WorkerLaunchObservation {
  * synchronization service or producer waiting; it cannot replace the full
  * blocking_readback_interval without a separately estimated sync service.
  */
-[[nodiscard]] nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                          const simulation::detail::CpuTaskQueues & queues, const structure::OperationWork & work,
-                                                          size_t observation, std::set<size_t> & measured_devices, bool cpu_service_applied,
-                                                          bool include_caller_scopes = true, std::span<const structure::OperationWork> device_launches = {});
+[[nodiscard]] nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                                          const structure::OperationWork & work, size_t observation, std::set<size_t> & measured_devices,
+                                                          bool cpu_service_applied, bool include_caller_scopes = true,
+                                                          std::span<const structure::OperationWork> device_launches = {});
 
 /** Append samples for the matched operators of an already-described program.
  * Program indices and observation indices remain source-local. Device ownership
  * accumulates in measured_devices across calls; source and program are unchanged.
  * Cold preparation can exclude all caller scopes or just one program index,
  * without discarding independently measurable device/worker scopes. */
-void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+void append_tensor_program_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
                                         std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes = true,
                                         std::optional<size_t> omitted_caller_operation = std::nullopt);
@@ -105,9 +104,9 @@ void append_tensor_program_observations(const modules::hicache::patch::HiCacheSo
  * ambiguous, overlapping or unmeasured intervals return an empty array, not zeros.
  * Layer waits are source boundaries only, never extra costs of the outer call.
  * The caller separately excludes cold preparation and incomplete native mappings. */
-[[nodiscard]] nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                               const SubmittedCallRegion & region, std::span<const structure::TensorOperation> program,
-                                                               const std::map<size_t, size_t> & matched, bool cpu_service_applied,
+[[nodiscard]] nlohmann::json tensor_program_outer_observations(const SourceDagIndex & source, const SubmittedCallRegion & region,
+                                                               std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
+                                                               bool cpu_service_applied,
                                                                std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits = {});
 
 /** Append CPU and residual scopes only if the complete interval is owned and
@@ -118,8 +117,7 @@ void append_tensor_program_observations(const modules::hicache::patch::HiCacheSo
  * False appends nothing.
  * Source interval coordinates and operation identity establish sample identity.
  */
-bool append_cpu_interval_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const core::TraceEvent & outer,
-                                      const structure::OperationWork & work, uint64_t begin, uint64_t end, bool corrected, nlohmann::json & rows,
-                                      std::optional<size_t> permitted_submission = std::nullopt);
+bool append_cpu_interval_observations(const SourceDagIndex & source, const core::TraceEvent & outer, const structure::OperationWork & work, uint64_t begin,
+                                      uint64_t end, bool corrected, nlohmann::json & rows, std::optional<size_t> permitted_submission = std::nullopt);
 
 } // namespace markov::trace_graph::source_dag

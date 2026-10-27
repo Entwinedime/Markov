@@ -3,12 +3,13 @@
  * @brief Score-side canonical Direct and phase carriers for target observations.
  */
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #ifdef DEBUG
 
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 
 #include <algorithm>
 #include <map>
@@ -24,12 +25,12 @@ namespace markov::trace_graph::modules::hicache {
 namespace {
 
 using DirectAudit = HiCacheObservedPhaseCarrierResult::DirectCarrierAudit;
-using patch::HiCacheCpuGapSlice;
 using patch::HiCacheIoOperationKind;
 using patch::HiCacheIoOperationLedger;
 using patch::HiCacheIoOperationRecord;
+using source_dag::CpuGapSlice;
 
-cost::StaticPhaseCosts observed_phase_costs(const core::DagGraph & graph, const HiCachePhaseObservationAudit & observed) {
+diagnostics::StaticPhaseCosts observed_phase_costs(const core::DagGraph & graph, const HiCachePhaseObservationAudit & observed) {
     model::HiCachePhaseWorkLedger work;
     for (const auto & row : observed.observations) {
         if (row.request_ids.size() != 1) continue;
@@ -60,7 +61,7 @@ cost::StaticPhaseCosts observed_phase_costs(const core::DagGraph & graph, const 
     work.prefill_status = work.prefills.size() == observed.observations.size() ? "ready" : "not_ready";
     work.decode_status = work.decodes.size() == work.prefills.size() ? "ready" : "not_ready";
     work.status = observed.ready() && work.prefill_status == "ready" && work.decode_status == "ready" ? "ready" : "not_ready";
-    return cost::observed_static_phase_costs(graph, work);
+    return diagnostics::observed_static_phase_costs(graph, work);
 }
 
 void add_blocker(DirectAudit & audit, std::string blocker) {
@@ -191,8 +192,8 @@ bool append_prefetch(const core::DagGraph & graph, const HiCacheIoOperationRecor
     return true;
 }
 
-DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCacheIoOperationLedger & operations, const cost::StaticPhaseCosts & phase_work,
-                                        core::DagMutationPlan & plan) {
+DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCacheIoOperationLedger & operations,
+                                        const diagnostics::StaticPhaseCosts & phase_work, core::DagMutationPlan & plan) {
     DirectAudit audit;
     audit.observed_operation_count = operations.records.size();
     std::vector<CanonicalPrefetch> prefetched;
@@ -227,7 +228,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
     using RequestKey = std::pair<std::string, std::string>;
     std::map<RequestKey, const CanonicalPrefetch *> prefetch_by_request_rank;
     for (const auto & prefetch : prefetched) prefetch_by_request_rank.emplace(RequestKey{ prefetch.operation->pid, prefetch.operation->request_id }, &prefetch);
-    std::map<RequestKey, const cost::StaticPrefillCost *> prefill_by_request_rank;
+    std::map<RequestKey, const diagnostics::StaticPrefillCost *> prefill_by_request_rank;
     for (const auto & prefill : phase_work.prefills) prefill_by_request_rank.emplace(RequestKey{ prefill.pid, prefill.request_id }, &prefill);
     for (const auto & operation : operations.records) {
         if (operation.kind != HiCacheIoOperationKind::Load) continue;
@@ -269,7 +270,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
                         audit);
         }
     }
-    std::map<RequestKey, const cost::StaticDecodeCost *> decode_by_request_rank;
+    std::map<RequestKey, const diagnostics::StaticDecodeCost *> decode_by_request_rank;
     for (const auto & decode : phase_work.decodes) decode_by_request_rank.emplace(RequestKey{ decode.pid, decode.request_id }, &decode);
     struct RequestBoundary {
         int logical_input = 0;
@@ -325,7 +326,7 @@ void own_nodes(core::DagGraph & graph, const std::vector<size_t> & nodes) {
 
 void mark_noncanonical_direct_scope(core::DagGraph & graph, const HiCacheIoOperationLedger & operations) {
     std::map<size_t, std::vector<std::pair<uint64_t, uint64_t>>> gaps;
-    const auto add_gaps = [&](const std::vector<HiCacheCpuGapSlice> & slices) {
+    const auto add_gaps = [&](const std::vector<source_dag::CpuGapSlice> & slices) {
         for (const auto & slice : slices) {
             if (slice.owned_end_us > slice.owned_start_us) gaps[slice.owner_node_id].emplace_back(slice.owned_start_us, slice.owned_end_us);
         }
@@ -380,7 +381,7 @@ std::string_view HiCacheObservedPhaseCarrierModule::name() const noexcept { retu
 
 void HiCacheObservedPhaseCarrierModule::apply(core::DagGraph & graph) {
     result_.observed = observe_hicache_phases(graph);
-    const patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto operations = patch::build_hicache_io_operation_ledger(source);
     auto work = observed_phase_costs(graph, result_.observed);
     core::DagMutationPlan plan{

@@ -3,6 +3,7 @@
 #include "markov/trace_graph/modules/hicache/model/prefetch_queue_execution.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
+#include "markov/trace_graph/structure/hicache/io_completion.hpp"
 #include <memory>
 
 namespace markov::trace_graph::cost {
@@ -19,8 +20,8 @@ namespace markov::trace_graph::modules::hicache::runtime {
  */
 class HiCachePrefetchQueries {
 public:
-    void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, cost::OperatorCostProvider & costs,
-              std::map<size_t, std::vector<size_t>> & facts_at);
+    void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, cost::OperatorCostProvider & costs, std::map<size_t, std::vector<size_t>> & facts_at,
+              const structure::hicache::IoCompletionProvider & completion);
     void start(simulation::FutureDag & future);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
 

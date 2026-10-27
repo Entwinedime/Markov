@@ -87,15 +87,15 @@ private:
 
     /** @brief Classifies synchronization anchors without changing observed time. */
     void classify_special_event(TraceEvent & event, size_t node_id) {
-        if (event.name == "EVENT_RECORD") index_.event_record_nodes.push_back(node_id);
-        else if (event.name == "EVENT_WAIT") index_.event_wait_nodes.push_back(node_id);
-        else if (event.name == "AscendCL@aclrtStreamWaitEvent") index_.native_stream_wait_nodes.push_back(node_id);
-        else if (is_stream_sync_event(event.name)) index_.stream_sync_nodes.push_back(node_id);
-        else if (is_event_sync_event(event.name)) index_.event_sync_nodes.push_back(node_id);
-        else if (is_device_sync_event(event.name)) index_.device_sync_nodes.push_back(node_id);
-        else if (event.name == "NOTIFY_RECORD") index_.notify_record_nodes.push_back(node_id);
-        else if (event.name == "NOTIFY_WAIT") index_.notify_wait_candidate_count++;
-        else if (event.name == "MODEL_EXECUTE") index_.model_execute_nodes.push_back(node_id);
+        if (event.boundary == TraceBoundary::DeviceEventRecord) index_.event_record_nodes.push_back(node_id);
+        else if (event.boundary == TraceBoundary::DeviceEventWait) index_.event_wait_nodes.push_back(node_id);
+        else if (event.boundary == TraceBoundary::StreamWait) index_.native_stream_wait_nodes.push_back(node_id);
+        else if (is_stream_sync_event(event)) index_.stream_sync_nodes.push_back(node_id);
+        else if (is_event_sync_event(event)) index_.event_sync_nodes.push_back(node_id);
+        else if (is_device_sync_event(event)) index_.device_sync_nodes.push_back(node_id);
+        else if (event.boundary == TraceBoundary::NotifyRecord) index_.notify_record_nodes.push_back(node_id);
+        else if (event.boundary == TraceBoundary::NotifyWait) index_.notify_wait_candidate_count++;
+        else if (event.boundary == TraceBoundary::ModelExecute) index_.model_execute_nodes.push_back(node_id);
     }
 
     DagGraph & graph_;

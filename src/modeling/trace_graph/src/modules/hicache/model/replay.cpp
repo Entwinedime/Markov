@@ -114,6 +114,10 @@ HiCacheModelReplay::HiCacheModelReplay(const core::DagGraph & graph, const front
     for (const auto & item : facts_) state_.register_effect_identity(item.fact);
     for (const auto & item : prelude)
         if (item.role == HiCacheFactRole::CacheExtendInput) state_.register_prefetch_control_boundary(item.fact);
+
+    auto prelude_decodes = source_dag::observe_prelude_decode_allocations(graph.prelude_context_events(), prelude);
+    for (auto & item : prelude_decodes) prelude.push_back(std::move(item));
+    std::ranges::stable_sort(prelude, {}, [](const auto & item) { return item.fact.ts; });
     for (const auto & item : prelude) state_.apply_fact(item.fact, item.role, false);
     // Backend descriptors and other diagnostic context do not initialize
     // cache state. Only accepted prelude facts need a state/window transition.

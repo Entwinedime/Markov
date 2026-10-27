@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_io.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include <algorithm>
 #include <set>
@@ -7,8 +8,8 @@
 
 namespace markov::trace_graph::modules::hicache::patch {
 
-std::vector<HiCacheLayerTransferTemplate> observe_hicache_layer_transfers(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
-                                                                          const HiCacheRewriteDecision & donor) {
+std::vector<HiCacheLayerTransferTemplate> observe_hicache_layer_transfers(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                          const HiCacheLayerWaitObservation & waits, const HiCacheRewriteDecision & donor) {
     if (!donor.source_readiness_topology_reused || donor.owned_duration_nodes.empty()) return {};
     const auto * fact = source.fact_node(donor.source_fact_node_id);
     if (!fact) return {};

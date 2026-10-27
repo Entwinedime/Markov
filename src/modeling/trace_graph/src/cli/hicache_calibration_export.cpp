@@ -1,4 +1,5 @@
 // Offline extraction from an explicitly selected independent calibration only.
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
@@ -7,7 +8,7 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_io.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/source_dag/build.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
@@ -49,7 +50,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         if (!output) throw std::runtime_error("Failed to persist operation calibration");
     };
 
-    const hc::patch::HiCacheSourceDagIndex source(graph);
+    const adapters::sglang::HiCacheSourceIndex source(graph);
     if (operation == "prefetch-query") {
         const auto rounds = hc::observe_cpu_collectives(source);
         auto rows = source_dag::prefetch_query_observations(graph, rounds, hc::observe_prefetch_workers(source, rounds), begin_us, end_us);
@@ -73,7 +74,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                                                   : "Independent capture has no complete write operation");
         // Write extraction splits boundaries. Its consumers need indices of
         // that graph, not the source snapshot taken before the split.
-        const hc::patch::HiCacheSourceDagIndex calibrated(graph);
+        const adapters::sglang::HiCacheSourceIndex calibrated(graph);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         for (const auto & observation : source_dag::confirmation_operator_observations(calibrated, queues, corrected))
             document["operator_observations"].push_back(observation);
@@ -274,7 +275,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                     points.push_back(std::move(point));
                 }
         (void)hc::bind_hicache_control_points(graph, points);
-        const hc::patch::HiCacheSourceDagIndex bounded(graph);
+        const adapters::sglang::HiCacheSourceIndex bounded(graph);
         const auto waits = hc::observe_hicache_layer_waits(bounded);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         auto rows = nlohmann::json::array();
@@ -404,7 +405,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             }
         }
         (void)hc::bind_hicache_control_points(graph, points);
-        const hc::patch::HiCacheSourceDagIndex bounded(graph);
+        const adapters::sglang::HiCacheSourceIndex bounded(graph);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         nlohmann::json rows = nlohmann::json::array();
         auto operator_rows = nlohmann::json::array();

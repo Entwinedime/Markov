@@ -1,4 +1,5 @@
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include <set>
 #include <stdexcept>
@@ -107,8 +108,8 @@ std::map<std::string, size_t> write_resource_roles(const core::DagGraph & graph,
     return roles;
 }
 
-std::optional<LoadIndexResources> observe_load_index_resources(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                               size_t main_node, size_t compute_node) {
+std::optional<HostDeviceResources> observe_host_device_resources(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                 const simulation::detail::CpuTaskQueues & queues, size_t main_node, size_t compute_node) {
     const auto & graph = source.graph();
     if (!graph.node(main_node).is_cpu || graph.node(compute_node).is_cpu || graph.node(main_node).gpu_id != graph.node(compute_node).gpu_id)
         throw std::invalid_argument("Load resources require a same-rank main thread and compute stream");
@@ -139,7 +140,7 @@ std::optional<LoadIndexResources> observe_load_index_resources(const patch::HiCa
         }
     }
     if (!worker) return std::nullopt;
-    return LoadIndexResources{ *worker, compute_node };
+    return HostDeviceResources{ *worker, compute_node };
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

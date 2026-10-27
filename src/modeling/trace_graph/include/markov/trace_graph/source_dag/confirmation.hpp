@@ -1,6 +1,6 @@
 #pragma once
 
-#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 
 #include <cstddef>
@@ -18,7 +18,7 @@ namespace markov::trace_graph::source_dag {
  * exported as a target execution rule. Unsupported/partial intervals add no
  * fabricated costs; already complete independent scopes remain useful.
  */
-void append_write_confirmation_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+void append_write_confirmation_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             size_t observation, uint64_t begin_us, uint64_t confirmed_batches, bool corrected, nlohmann::json & rows);
 
 } // namespace markov::trace_graph::source_dag

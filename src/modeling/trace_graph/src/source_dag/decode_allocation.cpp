@@ -1,11 +1,15 @@
 #include "markov/trace_graph/source_dag/decode_allocation.hpp"
+#include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/model/input.hpp"
+#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -19,6 +23,91 @@ using modules::hicache::HiCacheFact;
 using modules::hicache::HiCacheFactRole;
 using modules::hicache::HiCachePhaseObservationAudit;
 using modules::hicache::model::HiCacheReplayFact;
+
+namespace {
+
+using RequestKey = std::pair<std::string, std::string>; // pid, request id
+struct DecodeInput {
+    const HiCacheFact * fact = nullptr;
+    const HiCacheBatchPathEntry * path = nullptr;
+    std::optional<uint64_t> iterations;
+    uint64_t observed = 0;
+};
+
+HiCacheFact observed_decode_action(const core::TraceEvent & event, size_t identity, std::map<RequestKey, DecodeInput> & inputs) {
+    if (event.arg("status") != "returned" || event.arg("token_per_req") != "1")
+        throw std::runtime_error("Decode allocation requires a successful non-speculative single-token call");
+
+    const auto requests = nlohmann::json::parse(event.arg("requests"));
+    if (!requests.is_array() || requests.empty()) throw std::runtime_error("Decode allocation has no request identities");
+    HiCacheFact action;
+    for (const auto & request : requests) {
+        const auto id = request.at("request_id").get<std::string>();
+        const auto found = inputs.find({ event.pid, id });
+        if (found == inputs.end() || !found->second.fact) throw std::runtime_error("Decode allocation lacks an approved workload input");
+
+        auto & origin = found->second;
+        if (origin.fact->cache_scope != event.arg("cache_scope") || origin.fact->tid != event.tid || event.ts <= origin.fact->source_ts)
+            throw std::runtime_error("Decode allocation disagrees with its cache-extend origin");
+        const auto iteration = request.at("decode_batch_idx").get<uint64_t>();
+        const auto length = core::checked_add_u64(origin.path->token_count, iteration, "Observed decode length overflow");
+        if (iteration != origin.observed || (origin.iterations && iteration >= *origin.iterations) || request.at("kv_committed_len") != length
+            || request.at("kv_allocated_len") != length)
+            throw std::runtime_error("Decode allocation has incomplete iteration or length observations: request=" + id + " pid=" + event.pid
+                                     + " iteration=" + std::to_string(iteration) + " observed=" + std::to_string(origin.observed)
+                                     + " expected_iterations=" + (origin.iterations ? std::to_string(*origin.iterations) : "prelude")
+                                     + " prompt_tokens=" + std::to_string(origin.path->token_count) + " committed=" + request.at("kv_committed_len").dump()
+                                     + " allocated=" + request.at("kv_allocated_len").dump());
+
+        if (action.batch_paths.empty()) {
+            action = *origin.fact;
+            action.batch_paths.clear();
+        }
+        auto path = *origin.path;
+        path.position = action.batch_paths.size();
+        action.batch_paths.push_back(std::move(path));
+        action.decode_iterations.push_back(iteration);
+        ++origin.observed;
+    }
+
+    action.source_node_id = identity;
+    action.source_event_index = event.index;
+    action.source_ts = action.ts = event.ts;
+    action.dur = event.dur;
+    action.event_name = event.name;
+    action.role = "cache_decode_allocation";
+    action.batch_kind = "decode";
+    action.batch_size = action.batch_paths.size();
+    action.execution_anchor_node_id.reset();
+    return action;
+}
+
+} // namespace
+
+std::vector<HiCacheReplayFact> observe_prelude_decode_allocations(std::span<const core::TraceEvent> context, std::span<const HiCacheReplayFact> facts) {
+    std::map<RequestKey, DecodeInput> inputs;
+    for (const auto & item : facts) {
+        if (item.role != HiCacheFactRole::CacheExtendInput) continue;
+        for (const auto & path : item.fact.batch_paths)
+            if (!inputs.emplace(RequestKey{ item.fact.pid, path.request_id }, DecodeInput{ .fact = &item.fact, .path = &path }).second)
+                throw std::runtime_error("Prelude decode input has multiple cache-extend origins");
+    }
+
+    std::vector<const core::TraceEvent *> allocations;
+    for (const auto & event : context)
+        if (event.name == "runtime.hicache.decode_allocation") allocations.push_back(&event);
+    std::ranges::sort(allocations, {}, [](const auto * event) { return std::tuple{ event->ts, event->pid, event->tid, event->index }; });
+
+    std::vector<HiCacheReplayFact> derived;
+    for (const auto * event : allocations) {
+        // Match the existing prelude identity space. The scalar descriptor
+        // has its own source record; it is not an executable graph node.
+        const auto identity = std::numeric_limits<size_t>::max() - event->index;
+        auto action = observed_decode_action(*event, identity, inputs);
+        derived.push_back({ std::move(action), HiCacheFactRole::CacheDecodeAllocation });
+    }
+    return derived;
+}
 
 ObservedDecodeContexts observe_decode_contexts(const core::DagGraph & graph, const HiCachePhaseObservationAudit & phases) {
     using RequestKey = std::pair<std::string, std::string>;
@@ -78,15 +167,10 @@ std::vector<HiCacheReplayFact> observe_decode_allocations(const core::DagGraph &
                                                           const HiCachePhaseObservationAudit & phases, uint64_t begin, uint64_t end) {
     using Json = nlohmann::json;
     using Key = std::pair<std::string, std::string>; // pid, request id
-    struct Origin {
-        const HiCacheFact * fact = nullptr;
-        const HiCacheBatchPathEntry * path = nullptr;
-        uint64_t iterations = 0, observed = 0;
-    };
-    std::map<Key, Origin> inputs;
+    std::map<Key, DecodeInput> inputs;
     for (const auto & phase : phases.observations)
         for (const auto & request : phase.request_ids)
-            if (!inputs.emplace(Key{ phase.pid, request }, Origin{ .iterations = phase.decode_iteration_count }).second)
+            if (!inputs.emplace(Key{ phase.pid, request }, DecodeInput{ .iterations = phase.decode_iteration_count }).second)
                 throw std::runtime_error("Decode allocation requires an unambiguous request phase");
     size_t next_id = 0;
     for (const auto & item : facts) {
@@ -114,37 +198,10 @@ std::vector<HiCacheReplayFact> observe_decode_allocations(const core::DagGraph &
     std::set<const core::TraceEvent *> used_forwards;
     std::vector<HiCacheReplayFact> derived;
     for (const auto * event : allocations) {
-        if (event->arg("status") != "returned" || event->arg("token_per_req") != "1")
-            throw std::runtime_error("Decode allocation requires a successful non-speculative single-token call");
-
-        const auto requests = Json::parse(event->arg("requests"));
-        if (!requests.is_array() || requests.empty()) throw std::runtime_error("Decode allocation has no request identities");
-        HiCacheFact action;
+        auto action = observed_decode_action(*event, next_id, inputs);
+        next_id = core::checked_add_u64(next_id, 1, "Decode action identity overflow");
         std::vector<std::string> ids;
-        for (const auto & request : requests) {
-            const auto id = request.at("request_id").get<std::string>();
-            const auto found = inputs.find({ event->pid, id });
-            if (found == inputs.end() || !found->second.fact) throw std::runtime_error("Decode allocation lacks an approved workload input");
-
-            auto & origin = found->second;
-            if (origin.fact->cache_scope != event->arg("cache_scope") || origin.fact->tid != event->tid || event->ts <= origin.fact->source_ts)
-                throw std::runtime_error("Decode allocation disagrees with its cache-extend origin");
-            const auto iteration = request.at("decode_batch_idx").get<uint64_t>();
-            const auto length = core::checked_add_u64(origin.path->token_count, iteration, "Observed decode length overflow");
-            if (iteration != origin.observed || iteration >= origin.iterations || request.at("kv_committed_len") != length
-                || request.at("kv_allocated_len") != length)
-                throw std::runtime_error("Decode allocation has incomplete iteration or length observations");
-            if (ids.empty()) {
-                action = *origin.fact;
-                action.batch_paths.clear();
-            }
-            auto path = *origin.path;
-            path.position = action.batch_paths.size();
-            action.batch_paths.push_back(std::move(path));
-            action.decode_iterations.push_back(iteration);
-            ids.push_back(id);
-            ++origin.observed;
-        }
+        for (const auto & path : action.batch_paths) ids.push_back(path.request_id);
 
         auto & lane = forwards[{ event->pid, event->tid }];
         const auto finish = core::checked_add_u64(event->ts, event->dur, "Decode allocation observation end overflow");
@@ -152,16 +209,6 @@ std::vector<HiCacheReplayFact> observe_decode_allocations(const core::DagGraph &
         if (next == lane.end() || (*next)->arg("status") != "returned" || Json::parse((*next)->arg("request_ids")) != Json(ids)
             || !used_forwards.insert(*next).second)
             throw std::runtime_error("Decode allocation has no unique subsequent forward");
-        action.source_node_id = next_id;
-        next_id = core::checked_add_u64(next_id, 1, "Decode action identity overflow");
-        action.source_event_index = event->index;
-        action.source_ts = action.ts = event->ts;
-        action.dur = event->dur;
-        action.event_name = event->name;
-        action.role = "cache_decode_allocation";
-        action.batch_kind = "decode";
-        action.batch_size = action.batch_paths.size();
-        action.execution_anchor_node_id.reset();
         derived.push_back({ std::move(action), HiCacheFactRole::CacheDecodeAllocation });
     }
 

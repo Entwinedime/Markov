@@ -10,11 +10,10 @@ namespace markov::trace_graph::modules::hicache::runtime {
 struct QueueConfirmationCoverage {
     size_t load_rounds = 0, write_rounds = 0, storage_rounds = 0;
     size_t replaced_rounds = 0, partial_window_rounds = 0;
+    size_t retained_empty_opening_rounds = 0;
 };
 
 struct WriteConfirmationWork {
-    size_t round;
-    int rank;
     HiCacheFact fact;
     uint64_t confirmed_writes;
 };
@@ -30,6 +29,9 @@ struct WriteConfirmationWork {
  * They do not extend that endpoint. A verified idle barrier or an observed
  * empty load/write setup can supply a missing outer head prefix when all MIN
  * entries are inside the window and the live target sample remains empty.
+ * An empty load check whose MIN straddles the opening cut is unchanged source
+ * work when every rank returns before its first modeled cache input. Its
+ * observed tail stays in the DAG; it neither consumes nor publishes state.
  * Other missing prefixes/partial MIN rounds are reported, not executed. Every
  * admitted return needs a real CPU boundary.
  */

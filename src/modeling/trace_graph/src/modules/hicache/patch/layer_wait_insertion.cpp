@@ -1,10 +1,11 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include <algorithm>
 #include <array>
 #include <set>
-#include <tuple>
 #include <stdexcept>
+#include <tuple>
 
 namespace markov::trace_graph::modules::hicache::patch {
 namespace {
@@ -22,7 +23,7 @@ struct CallTemplate {
 };
 
 // CPU program order is the insertion clock, even when the device is far behind.
-std::optional<size_t> main_submission(const HiCacheSourceDagIndex & source, size_t id, size_t lane) {
+std::optional<size_t> main_submission(const adapters::sglang::HiCacheSourceIndex & source, size_t id, size_t lane) {
     const auto & graph = source.graph();
     if (graph.node(id).is_cpu && graph.node(id).lane_id == lane) return id;
     std::set<size_t> found;
@@ -51,7 +52,7 @@ struct DeviceSubmission {
     size_t device = 0;
 };
 
-std::optional<DevicePlacement> placement(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitCall & call, const CallTemplate & sample,
+std::optional<DevicePlacement> placement(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitCall & call, const CallTemplate & sample,
                                          const std::vector<DeviceSubmission> & submissions, std::string & issue) {
     const auto & graph = source.graph();
     const auto next = std::ranges::lower_bound(submissions, call.end_ns, {}, &DeviceSubmission::begin);
@@ -103,28 +104,28 @@ std::optional<DevicePlacement> placement(const HiCacheSourceDagIndex & source, c
 }
 } // namespace
 
-std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(
-    const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
-    std::span<const HiCacheLayerWaitCall * const> calls) {
+std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                                                  const HiCacheLayerWaitObservation & waits,
+                                                                                                  std::span<const HiCacheLayerWaitCall * const> calls) {
     const auto & graph = source.graph();
     std::map<SampleKey, CallTemplate> samples;
     for (const auto & call : waits.calls) {
         if (!call.enabled || !call.issue.empty()) continue;
-        samples.try_emplace({call.logical_input, call.phase}, CallTemplate{
-            .main_lane = graph.node(*call.submission).lane_id,
-            .worker_lane = graph.node(*call.worker).lane_id,
-            .device_lane = graph.node(*call.device_wait).lane_id});
+        samples.try_emplace({ call.logical_input, call.phase },
+                            CallTemplate{ .main_lane = graph.node(*call.submission).lane_id,
+                                          .worker_lane = graph.node(*call.worker).lane_id,
+                                          .device_lane = graph.node(*call.device_wait).lane_id });
     }
     using Lanes = std::pair<size_t, size_t>;
     std::map<Lanes, std::vector<DeviceSubmission>> indices;
     std::map<size_t, std::vector<DeviceSubmission>> ordinary_submissions;
     for (const auto * call : calls) {
-        if (!samples.contains({call->logical_input, call->phase})) {
+        if (!samples.contains({ call->logical_input, call->phase })) {
             ordinary_submissions.try_emplace(graph.node(*call->before).lane_id);
             continue;
         }
-        const auto & sample = samples.at({call->logical_input, call->phase});
-        indices.try_emplace({sample.main_lane, sample.device_lane});
+        const auto & sample = samples.at({ call->logical_input, call->phase });
+        indices.try_emplace({ sample.main_lane, sample.device_lane });
     }
     // A disabled wait has no donor, but the next ordinary device submission
     // in this forward still identifies the stream consuming that layer's KV.
@@ -135,34 +136,38 @@ std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactiv
             const auto & name = graph.event_for_node(node.id).name;
             if (name == "EVENT_RECORD" || name == "EVENT_WAIT" || name == "logical_event_wait") continue;
             if (const auto submit = main_submission(source, node.id, main_lane)) {
-                entries.push_back({start_ns(graph.event_for_node(*submit)), node.id});
-                indices.try_emplace({main_lane, node.lane_id});
+                entries.push_back({ start_ns(graph.event_for_node(*submit)), node.id });
+                indices.try_emplace({ main_lane, node.lane_id });
             }
         }
-        std::ranges::sort(entries, {}, [](const auto & entry) { return std::pair{entry.begin, entry.device}; });
+        std::ranges::sort(entries, {}, [](const auto & entry) { return std::pair{ entry.begin, entry.device }; });
     }
     for (auto & [lanes, entries] : indices) {
         for (const auto & node : graph.nodes()) {
             if (!node.active || node.is_cpu || node.lane_id != lanes.second) continue;
-            if (const auto submit = main_submission(source, node.id, lanes.first))
-                entries.push_back({start_ns(graph.event_for_node(*submit)), node.id});
+            if (const auto submit = main_submission(source, node.id, lanes.first)) entries.push_back({ start_ns(graph.event_for_node(*submit)), node.id });
         }
-        std::ranges::sort(entries, {}, [](const auto & entry) { return std::pair{entry.begin, entry.device}; });
+        std::ranges::sort(entries, {}, [](const auto & entry) { return std::pair{ entry.begin, entry.device }; });
     }
+
+    // A later layer belongs to this forward, not to every forward in the
+    // workload. Keep all original observations in each identity group so the
+    // strict layer/time comparison below has exactly the same candidates.
+    std::map<std::pair<int, uint64_t>, std::vector<const HiCacheLayerWaitCall *>> forward_calls;
+    for (const auto & call : waits.calls) forward_calls[{ call.logical_input, call.batch_start_ns }].push_back(&call);
+
     std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> result;
     for (const auto * call : calls) {
         CallTemplate sample;
-        if (!samples.contains({call->logical_input, call->phase})) {
+        if (!samples.contains({ call->logical_input, call->phase })) {
             const auto main_lane = graph.node(*call->before).lane_id;
             const auto & entries = ordinary_submissions.at(main_lane);
             const auto next = std::ranges::lower_bound(entries, call->end_ns, {}, &DeviceSubmission::begin);
             uint64_t next_layer = UINT64_MAX;
-            for (const auto & other : waits.calls)
-                if (other.logical_input == call->logical_input && other.batch_start_ns == call->batch_start_ns
-                    && other.layer > call->layer && other.start_ns > call->start_ns)
-                    next_layer = std::min(next_layer, other.start_ns);
+            for (const auto * other : forward_calls.at({ call->logical_input, call->batch_start_ns }))
+                if (other->layer > call->layer && other->start_ns > call->start_ns) next_layer = std::min(next_layer, other->start_ns);
             if (next == entries.end() || next->begin >= next_layer) {
-                result.emplace(call, HiCacheLayerWaitPosition{.issue = "forward_device_submission_missing"});
+                result.emplace(call, HiCacheLayerWaitPosition{ .issue = "forward_device_submission_missing" });
                 continue;
             }
             sample.main_lane = main_lane;
@@ -171,19 +176,20 @@ std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactiv
             for (auto candidate = next; candidate != entries.end() && candidate->begin == next->begin; ++candidate)
                 ambiguous |= graph.node(candidate->device).lane_id != sample.device_lane;
             if (ambiguous) {
-                result.emplace(call, HiCacheLayerWaitPosition{.issue = "forward_submission_has_multiple_streams"});
+                result.emplace(call, HiCacheLayerWaitPosition{ .issue = "forward_submission_has_multiple_streams" });
                 continue;
             }
-        } else sample = samples.at({call->logical_input, call->phase});
+        }
+        else sample = samples.at({ call->logical_input, call->phase });
         std::string issue;
-        const auto position = placement(source, *call, sample, indices.at({sample.main_lane, sample.device_lane}), issue);
+        const auto position = placement(source, *call, sample, indices.at({ sample.main_lane, sample.device_lane }), issue);
         if (!position) result.emplace(call, HiCacheLayerWaitPosition{ .issue = std::move(issue) });
-        else result.emplace(call, HiCacheLayerWaitPosition{position->before, position->syncs, position->after, sample.device_lane, {}});
+        else result.emplace(call, HiCacheLayerWaitPosition{ position->before, position->syncs, position->after, sample.device_lane, {} });
     }
     return result;
 }
 
-HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const HiCacheSourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
+HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
                                                                  const std::vector<HiCacheLayerWaitInsertion> & insertions) {
     HiCacheLayerWaitInsertionPlan result;
     if (insertions.empty()) {

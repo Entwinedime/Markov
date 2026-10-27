@@ -3,6 +3,8 @@
  * @brief Source-observed HiCache I/O operation ledger construction.
  */
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger_detail.hpp"
 
@@ -67,20 +69,21 @@ std::string observed_span_semantics(HiCacheIoOperationKind kind) {
     return "unknown";
 }
 
-uint64_t fact_end(const HiCacheSourceFactNode & fact) {
+uint64_t fact_end(const adapters::sglang::HiCacheFactObservation & fact) {
     return fact.timestamp_us > std::numeric_limits<uint64_t>::max() - fact.duration_us ? std::numeric_limits<uint64_t>::max()
                                                                                        : fact.timestamp_us + fact.duration_us;
 }
 
-uint64_t fact_boundary(const HiCacheSourceFactNode & fact) { return fact.phase == "end" ? fact_end(fact) : fact.timestamp_us; }
+uint64_t fact_boundary(const adapters::sglang::HiCacheFactObservation & fact) { return fact.phase == "end" ? fact_end(fact) : fact.timestamp_us; }
 
-bool contains_object_node(const HiCacheSourceFactNode & fact, uint64_t object_node_id) {
+bool contains_object_node(const adapters::sglang::HiCacheFactObservation & fact, uint64_t object_node_id) {
     return std::ranges::find(fact.operation_node_ids, object_node_id) != fact.operation_node_ids.end();
 }
 
-const HiCacheSourceFactNode * paired_call_start(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & end) {
-    const HiCacheSourceFactNode * match = nullptr;
-    const auto consider = [&](const HiCacheSourceFactNode & candidate) {
+const adapters::sglang::HiCacheFactObservation * paired_call_start(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                   const adapters::sglang::HiCacheFactObservation & end) {
+    const adapters::sglang::HiCacheFactObservation * match = nullptr;
+    const auto consider = [&](const adapters::sglang::HiCacheFactObservation & candidate) {
         if (candidate.phase != "start" || candidate.target_id != end.target_id || candidate.pid != end.pid || candidate.tid != end.tid
             || candidate.timestamp_us != end.timestamp_us)
             return true;
@@ -98,16 +101,17 @@ const HiCacheSourceFactNode * paired_call_start(const HiCacheSourceDagIndex & so
     return match;
 }
 
-std::vector<const HiCacheSourceFactNode *> nested_storage_services(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & timing,
-                                                                   HiCacheIoOperationKind kind) {
+std::vector<const adapters::sglang::HiCacheFactObservation *> nested_storage_services(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                                      const adapters::sglang::HiCacheFactObservation & timing,
+                                                                                      HiCacheIoOperationKind kind) {
     std::string_view role;
     if (kind == HiCacheIoOperationKind::Prefetch) role = "storage_read_service_observed";
     else if (kind == HiCacheIoOperationKind::WriteHostToStorage) role = "storage_write_service_observed";
     else return {};
 
     const auto timing_end = fact_end(timing);
-    std::vector<const HiCacheSourceFactNode *> matches;
-    const auto consider = [&](const HiCacheSourceFactNode & candidate) {
+    std::vector<const adapters::sglang::HiCacheFactObservation *> matches;
+    const auto consider = [&](const adapters::sglang::HiCacheFactObservation & candidate) {
         if (candidate.fact_role != role || candidate.pid != timing.pid || candidate.tid != timing.tid || candidate.timestamp_us < timing.timestamp_us
             || fact_end(candidate) > timing_end)
             return;
@@ -119,7 +123,7 @@ std::vector<const HiCacheSourceFactNode *> nested_storage_services(const HiCache
         if (candidate != nullptr) consider(*candidate);
     }
     for (const auto & candidate : source.tail_context_facts()) { consider(candidate); }
-    std::ranges::sort(matches, {}, &HiCacheSourceFactNode::timestamp_us);
+    std::ranges::sort(matches, {}, &adapters::sglang::HiCacheFactObservation::timestamp_us);
     for (size_t i = 1; i < matches.size(); ++i) {
         const auto & previous = *matches[i - 1];
         const auto & current = *matches[i];
@@ -131,7 +135,7 @@ std::vector<const HiCacheSourceFactNode *> nested_storage_services(const HiCache
     return matches;
 }
 
-uint64_t page_size_for_scope(const HiCacheSourceDagIndex & source, std::string_view cache_scope) {
+uint64_t page_size_for_scope(const adapters::sglang::HiCacheSourceIndex & source, std::string_view cache_scope) {
     uint64_t page_size = 0;
     for (const auto & fact : source.fact_nodes()) {
         if (fact.cache_scope != cache_scope || fact.source_page_size == 0) continue;
@@ -146,9 +150,9 @@ uint64_t page_size_for_scope(const HiCacheSourceDagIndex & source, std::string_v
     return page_size;
 }
 
-uint64_t unique_source_page_size(const HiCacheSourceDagIndex & source) {
+uint64_t unique_source_page_size(const adapters::sglang::HiCacheSourceIndex & source) {
     uint64_t page_size = 0;
-    const auto consider = [&](const HiCacheSourceFactNode & fact) {
+    const auto consider = [&](const adapters::sglang::HiCacheFactObservation & fact) {
         if (fact.source_page_size == 0) return true;
         if (page_size != 0 && page_size != fact.source_page_size) return false;
         page_size = fact.source_page_size;
@@ -163,8 +167,9 @@ uint64_t unique_source_page_size(const HiCacheSourceDagIndex & source) {
     return page_size;
 }
 
-const HiCacheSourceFactNode * load_decision_for_timing(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & timing) {
-    const HiCacheSourceFactNode * latest = nullptr;
+const adapters::sglang::HiCacheFactObservation * load_decision_for_timing(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                          const adapters::sglang::HiCacheFactObservation & timing) {
+    const adapters::sglang::HiCacheFactObservation * latest = nullptr;
     for (size_t node_id : source.nodes_for_fact_role("loadback_decision_observed")) {
         const auto * candidate = source.fact_node(node_id);
         if (candidate == nullptr || candidate->pid != timing.pid || !candidate->object_node_id || !contains_object_node(timing, *candidate->object_node_id)
@@ -175,9 +180,9 @@ const HiCacheSourceFactNode * load_decision_for_timing(const HiCacheSourceDagInd
     return latest;
 }
 
-const HiCacheSourceFactNode * request_consumer(const HiCacheSourceDagIndex & source, std::string_view request_id, std::string_view pid,
-                                               uint64_t source_end_us) {
-    const HiCacheSourceFactNode * earliest = nullptr;
+const adapters::sglang::HiCacheFactObservation * request_consumer(const adapters::sglang::HiCacheSourceIndex & source, std::string_view request_id,
+                                                                  std::string_view pid, uint64_t source_end_us) {
+    const adapters::sglang::HiCacheFactObservation * earliest = nullptr;
     for (size_t node_id : source.nodes_for_request(request_id)) {
         const auto * candidate = source.fact_node(node_id);
         if (candidate == nullptr || candidate->pid != pid
@@ -189,9 +194,9 @@ const HiCacheSourceFactNode * request_consumer(const HiCacheSourceDagIndex & sou
     return earliest;
 }
 
-const HiCacheSourceFactNode * request_role_before(const HiCacheSourceDagIndex & source, std::string_view request_id, std::string_view pid,
-                                                  std::string_view role, uint64_t timestamp_us) {
-    const HiCacheSourceFactNode * latest = nullptr;
+const adapters::sglang::HiCacheFactObservation * request_role_before(const adapters::sglang::HiCacheSourceIndex & source, std::string_view request_id,
+                                                                     std::string_view pid, std::string_view role, uint64_t timestamp_us) {
+    const adapters::sglang::HiCacheFactObservation * latest = nullptr;
     for (size_t node_id : source.nodes_for_request(request_id)) {
         const auto * candidate = source.fact_node(node_id);
         if (candidate == nullptr || candidate->pid != pid || candidate->fact_role != role || fact_boundary(*candidate) > timestamp_us) continue;
@@ -200,9 +205,10 @@ const HiCacheSourceFactNode * request_role_before(const HiCacheSourceDagIndex & 
     return latest;
 }
 
-const HiCacheSourceFactNode * write_consumer(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & timing) {
-    const HiCacheSourceFactNode * earliest = nullptr;
-    const auto consider = [&](const HiCacheSourceFactNode & candidate) {
+const adapters::sglang::HiCacheFactObservation * write_consumer(const adapters::sglang::HiCacheSourceIndex & source,
+                                                                const adapters::sglang::HiCacheFactObservation & timing) {
+    const adapters::sglang::HiCacheFactObservation * earliest = nullptr;
+    const auto consider = [&](const adapters::sglang::HiCacheFactObservation & candidate) {
         if (candidate.fact_role != "commit_capacity_release_observed" || candidate.phase != "end" || candidate.pid != timing.pid
             || candidate.timestamp_us < fact_end(timing))
             return;
@@ -221,7 +227,7 @@ const HiCacheSourceFactNode * write_consumer(const HiCacheSourceDagIndex & sourc
     return earliest;
 }
 
-uint64_t completed_tokens(const HiCacheSourceFactNode & fact) {
+uint64_t completed_tokens(const adapters::sglang::HiCacheFactObservation & fact) {
     if (fact.completed_token_count_present) return fact.completed_token_count;
     if (fact.effective_token_count > 0) return fact.effective_token_count;
     return fact.token_count;
@@ -233,7 +239,7 @@ void append_reason(HiCacheIoOperationRecord & record, std::string reason) {
     record.reason += std::move(reason);
 }
 
-bool fact_less(const HiCacheSourceFactNode * left, const HiCacheSourceFactNode * right) {
+bool fact_less(const adapters::sglang::HiCacheFactObservation * left, const adapters::sglang::HiCacheFactObservation * right) {
     if (left->timestamp_us != right->timestamp_us) return left->timestamp_us < right->timestamp_us;
     if (left->event_index != right->event_index) return left->event_index < right->event_index;
     return left->node_id < right->node_id;
@@ -244,7 +250,7 @@ void sort_unique(std::vector<size_t> & values) {
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
-std::vector<size_t> explicit_control_nodes(const HiCacheSourceDagIndex & source, const HiCacheTimingIntervalOwnership & ownership) {
+std::vector<size_t> explicit_control_nodes(const adapters::sglang::HiCacheSourceIndex & source, const source_dag::TimingIntervalOwnership & ownership) {
     std::vector<size_t> nodes;
     for (const auto node_id : ownership.owned_node_ids) {
         const auto & node = source.graph().node(node_id);
@@ -258,14 +264,14 @@ std::vector<size_t> explicit_control_nodes(const HiCacheSourceDagIndex & source,
     return nodes;
 }
 
-uint64_t explicit_control_duration(const HiCacheSourceDagIndex & source, const std::vector<size_t> & nodes) {
+uint64_t explicit_control_duration(const adapters::sglang::HiCacheSourceIndex & source, const std::vector<size_t> & nodes) {
     uint64_t duration = 0;
     for (const auto node_id : nodes)
         duration = core::checked_add_u64(duration, source.graph().cpu_service_node_duration(node_id), "HiCache explicit control duration overflow");
     return duration;
 }
 
-void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record) {
+void build_prefetch_completion_wait_contract(const adapters::sglang::HiCacheSourceIndex & source, HiCacheIoOperationRecord & record) {
     record.completion_wait_status = "unresolved";
     record.source_completion_us = record.source_end_us;
     if (record.request_id.empty()) {
@@ -273,8 +279,8 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
         return;
     }
 
-    std::vector<const HiCacheSourceFactNode *> false_checks;
-    std::vector<const HiCacheSourceFactNode *> true_checks;
+    std::vector<const adapters::sglang::HiCacheFactObservation *> false_checks;
+    std::vector<const adapters::sglang::HiCacheFactObservation *> true_checks;
     for (size_t node_id : source.nodes_for_request(record.request_id)) {
         const auto * fact = source.fact_node(node_id);
         if (fact == nullptr || fact->pid != record.pid || fact->fact_role != "prefetch_progress_observed" || fact->phase != "end" || !fact->progress_ready)
@@ -284,8 +290,8 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     std::ranges::sort(false_checks, fact_less);
     std::ranges::sort(true_checks, fact_less);
 
-    const HiCacheSourceFactNode * first_false = false_checks.empty() ? nullptr : false_checks.front();
-    const HiCacheSourceFactNode * first_true = nullptr;
+    const adapters::sglang::HiCacheFactObservation * first_false = false_checks.empty() ? nullptr : false_checks.front();
+    const adapters::sglang::HiCacheFactObservation * first_true = nullptr;
     if (first_false != nullptr) {
         const auto match = std::ranges::find_if(true_checks, [&](const auto * fact) { return fact->timestamp_us >= first_false->timestamp_us; });
         if (match != true_checks.end()) first_true = *match;
@@ -353,7 +359,8 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     record.completion_wait_reason = "first false progress is control-ready; storage completion and one retained terminal true check close the foreground wait";
 }
 
-void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record, const HiCacheDeviceTransferClosure & closure) {
+void build_loadback_readiness_contract(const adapters::sglang::HiCacheSourceIndex & source, HiCacheIoOperationRecord & record,
+                                       const adapters::sglang::DeviceTransferClosure & closure) {
     record.completion_wait_status = "unresolved";
     record.device_transfer_node_ids = closure.transfer_node_ids;
     record.device_completion_node_ids = closure.completion_node_ids;
@@ -373,14 +380,14 @@ void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiC
     const auto & consumer = source.graph().event_for_node(*record.consumer_anchor_node_id);
     record.control_ready_us = consumer.ts;
     record.wait_exit_start_us = consumer.ts;
-    record.wait_exit_end_us = fact_end(HiCacheSourceFactNode{ .timestamp_us = consumer.ts, .duration_us = consumer.dur });
+    record.wait_exit_end_us = fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = consumer.ts, .duration_us = consumer.dur });
     record.retained_terminal_control_us = consumer.dur;
     record.source_completion_us = 0;
     for (size_t node_id : record.device_transfer_node_ids) {
         if (node_id >= source.graph().node_count()) continue;
         const auto & event = source.graph().event_for_node(node_id);
         record.source_completion_us =
-            std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
+            std::max(record.source_completion_us, fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = event.ts, .duration_us = event.dur }));
     }
     record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
     record.source_completion_wait_blocking = true;
@@ -391,8 +398,8 @@ void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiC
         "host submission is preserved while direction-matched device transfers retain their existing event record/wait joins to the consumer";
 }
 
-void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record,
-                                             const HiCacheDeviceTransferClosure & closure) {
+void build_device_to_host_readiness_contract(const adapters::sglang::HiCacheSourceIndex & source, HiCacheIoOperationRecord & record,
+                                             const adapters::sglang::DeviceTransferClosure & closure) {
     record.completion_wait_status = "unresolved";
     record.device_transfer_node_ids = closure.transfer_node_ids;
     record.device_completion_node_ids = closure.completion_node_ids;
@@ -403,7 +410,7 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
         if (node_id >= source.graph().node_count()) continue;
         const auto & event = source.graph().event_for_node(node_id);
         record.source_completion_us =
-            std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
+            std::max(record.source_completion_us, fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = event.ts, .duration_us = event.dur }));
     }
     if (closure.status == "transfer_only") {
         record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
@@ -424,7 +431,8 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
     record.completion_wait_reason = "host submission is preserved while direction-matched device-to-host transfers retain their existing completion topology";
 }
 
-void build_load_admission_control(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & decision, HiCacheIoOperationRecord & record) {
+void build_load_admission_control(const adapters::sglang::HiCacheSourceIndex & source, const adapters::sglang::HiCacheFactObservation & decision,
+                                  HiCacheIoOperationRecord & record) {
     constexpr std::string_view control_event_name = "hicache.control.load_back_admission";
     const auto resolved = source.enclosing_control_interval_ownership(decision, control_event_name);
     if (!resolved) return;
@@ -464,9 +472,9 @@ std::string hicache_io_operation_kind_name(HiCacheIoOperationKind kind) {
     return "unknown";
 }
 
-HiCacheIoOperationLedger build_hicache_io_operation_ledger(const HiCacheSourceDagIndex & source) {
+HiCacheIoOperationLedger build_hicache_io_operation_ledger(const adapters::sglang::HiCacheSourceIndex & source) {
     HiCacheIoOperationLedger ledger;
-    const auto append_fact = [&](const HiCacheSourceFactNode & fact, bool causal_tail) {
+    const auto append_fact = [&](const adapters::sglang::HiCacheFactObservation & fact, bool causal_tail) {
         const auto kind = io_operation_ledger_detail::operation_kind(fact.fact_role);
         if (!kind || fact.fact_class != "timing_observation" || fact.phase != "end" || fact.duration_us == 0) return;
         auto record = io_operation_ledger_detail::build_record(source, fact, *kind);

@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/patch/rewrite_mutation.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -187,7 +188,7 @@ void append_gap_updates(const core::DagGraph & graph, core::DagMutationPlan & pl
     std::map<size_t, std::vector<std::pair<uint64_t, uint64_t>>> slices_by_node;
     for (const auto & decision : decisions) {
         if (!decision.shadow_plan_ready || decision.rewrite_kind == HiCacheRewriteKind::NoOp || decision.rewrite_kind == HiCacheRewriteKind::Reject) continue;
-        const auto append = [&](const HiCacheCpuGapSlice & gap) {
+        const auto append = [&](const source_dag::CpuGapSlice & gap) {
             if (gap.owned_end_us > gap.owned_start_us) slices_by_node[gap.owner_node_id].emplace_back(gap.owned_start_us, gap.owned_end_us);
         };
         if (decision.replaces_source_completion_wait()) {

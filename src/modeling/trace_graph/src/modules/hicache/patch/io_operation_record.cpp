@@ -2,6 +2,7 @@
  * @file
  * @brief Materializes one source-observed HiCache I/O operation record.
  */
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger_detail.hpp"
 
@@ -10,7 +11,8 @@
 
 namespace markov::trace_graph::modules::hicache::patch::io_operation_ledger_detail {
 
-HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & timing, HiCacheIoOperationKind kind) {
+HiCacheIoOperationRecord build_record(const adapters::sglang::HiCacheSourceIndex & source, const adapters::sglang::HiCacheFactObservation & timing,
+                                      HiCacheIoOperationKind kind) {
     auto timing_view = timing;
     const auto * call_start = paired_call_start(source, timing);
     if (call_start != nullptr) {
@@ -115,7 +117,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         }
     }
 
-    const HiCacheSourceFactNode * consumer = nullptr;
+    const adapters::sglang::HiCacheFactObservation * consumer = nullptr;
     if (!record.request_id.empty()) consumer = request_consumer(source, record.request_id, record.pid, record.source_end_us);
     else if (kind == HiCacheIoOperationKind::WriteDeviceToHost || kind == HiCacheIoOperationKind::WriteHostToStorage) consumer = write_consumer(source, timing);
     if (consumer != nullptr) {
@@ -165,7 +167,8 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
             const auto & consumer_event = source.graph().event_for_node(*record.consumer_anchor_node_id);
             record.control_ready_us = consumer_event.ts;
             record.wait_exit_start_us = consumer_event.ts;
-            record.wait_exit_end_us = fact_end(HiCacheSourceFactNode{ .timestamp_us = consumer_event.ts, .duration_us = consumer_event.dur });
+            record.wait_exit_end_us =
+                fact_end(adapters::sglang::HiCacheFactObservation{ .timestamp_us = consumer_event.ts, .duration_us = consumer_event.dur });
             record.retained_terminal_control_us = consumer_event.dur;
             record.control_ready_anchor_node_id = record.consumer_anchor_node_id;
             record.wait_exit_anchor_node_id = record.consumer_anchor_node_id;

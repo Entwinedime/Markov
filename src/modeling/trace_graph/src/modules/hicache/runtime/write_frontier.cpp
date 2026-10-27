@@ -1,3 +1,4 @@
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include <stdexcept>
@@ -5,7 +6,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
 
-bool transparent_stream_placeholder(const patch::HiCacheSourceDagIndex & source, size_t node_id) {
+bool transparent_stream_placeholder(const adapters::sglang::HiCacheSourceIndex & source, size_t node_id) {
     const auto & graph = source.graph();
     const auto & node = graph.node(node_id);
     const auto & event = graph.event_for_node(node_id);
@@ -24,7 +25,7 @@ bool transparent_stream_placeholder(const patch::HiCacheSourceDagIndex & source,
 
 } // namespace
 
-size_t HiCacheWrites::source_start_record(const patch::HiCacheSourceDagIndex & source, size_t source_fact) const {
+size_t HiCacheWrites::source_start_record(const adapters::sglang::HiCacheSourceIndex & source, size_t source_fact) const {
     const auto & site = sources_.at(source_fact);
     const auto & graph = source.graph();
     auto current = site.transfers.front().first;
@@ -56,7 +57,7 @@ size_t HiCacheWrites::source_start_record(const patch::HiCacheSourceDagIndex & s
     throw std::runtime_error("Write template lacks its initial stream Wait");
 }
 
-HiCacheWriteStreamPosition observe_write_stream_position(const patch::HiCacheSourceDagIndex & source, size_t stream_node, const std::string & pid,
+HiCacheWriteStreamPosition observe_write_stream_position(const adapters::sglang::HiCacheSourceIndex & source, size_t stream_node, const std::string & pid,
                                                          const std::string & tid, uint64_t at_us) {
     const auto & graph = source.graph();
     const auto & sample = graph.node(stream_node);

@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
@@ -11,7 +12,7 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-std::map<std::pair<std::string, std::string>, std::string> observe_controller_scopes(const patch::HiCacheSourceDagIndex & source) {
+std::map<std::pair<std::string, std::string>, std::string> observe_controller_scopes(const adapters::sglang::HiCacheSourceIndex & source) {
     std::map<std::pair<std::string, std::string>, std::string> scopes;
     const auto associate = [&](const std::string & pid, const std::string & controller, const std::string & tree) {
         const auto [at, inserted] = scopes.emplace(std::pair{ pid, controller }, tree);
@@ -56,13 +57,13 @@ std::map<std::pair<std::string, std::string>, std::string> observe_controller_sc
     return scopes;
 }
 
-const patch::HiCacheSourceFactNode & observe_write_envelope(const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid,
-                                                            uint64_t begin, uint64_t end) {
-    const patch::HiCacheSourceFactNode * outer = nullptr;
+const adapters::sglang::HiCacheFactObservation & observe_write_envelope(const adapters::sglang::HiCacheSourceIndex & source, const std::string & pid,
+                                                                        const std::string & tid, uint64_t begin, uint64_t end) {
+    const adapters::sglang::HiCacheFactObservation * outer = nullptr;
     // An admitted request lifecycle may finish after the HTTP endpoint. Its
     // write record and enclosing call live in the same preserved tail context;
     // looking up that envelope must not extend the measured request window.
-    for (const auto facts : { std::span<const patch::HiCacheSourceFactNode>(source.fact_nodes()), source.tail_context_facts() }) {
+    for (const auto facts : { std::span<const adapters::sglang::HiCacheFactObservation>(source.fact_nodes()), source.tail_context_facts() }) {
         for (const auto & fact : facts) {
             if (fact.fact_role != "commit_device_to_host_enqueue_observed" || fact.phase != "end" || fact.pid != pid || fact.tid != tid
                 || fact.timestamp_us > begin || fact.timestamp_us + fact.duration_us < end)
@@ -77,7 +78,7 @@ const patch::HiCacheSourceFactNode & observe_write_envelope(const patch::HiCache
     return *outer;
 }
 
-HiCacheHostTemplate observe_write_host_template(const patch::HiCacheSourceDagIndex & source, const patch::HiCacheIoOperationRecord & write) {
+HiCacheHostTemplate observe_write_host_template(const adapters::sglang::HiCacheSourceIndex & source, const patch::HiCacheIoOperationRecord & write) {
     if (write.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost) throw std::invalid_argument("Write host template requires a D2H call");
     const auto & outer = observe_write_envelope(source, write.pid, write.tid, write.source_start_us, write.source_end_us);
     auto host = observe_host_template(source, write.pid, write.tid, outer.timestamp_us, outer.timestamp_us + outer.duration_us);
@@ -85,7 +86,7 @@ HiCacheHostTemplate observe_write_host_template(const patch::HiCacheSourceDagInd
     return host;
 }
 
-HiCacheHostTemplate observe_host_template(const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid, uint64_t begin,
+HiCacheHostTemplate observe_host_template(const adapters::sglang::HiCacheSourceIndex & source, const std::string & pid, const std::string & tid, uint64_t begin,
                                           uint64_t end) {
     if (end <= begin) throw std::invalid_argument("Host template requires a nonempty interval");
     HiCacheHostTemplate result{ .main = source.call_interval_ownership(pid, tid, begin, end - begin) };
@@ -120,7 +121,8 @@ HiCacheHostTemplate observe_host_template(const patch::HiCacheSourceDagIndex & s
     return result;
 }
 
-std::vector<HiCacheEvictionRegion> observe_eviction_regions(const patch::HiCacheSourceDagIndex & source, const patch::HiCacheSourceFactNode & eviction) {
+std::vector<HiCacheEvictionRegion> observe_eviction_regions(const adapters::sglang::HiCacheSourceIndex & source,
+                                                            const adapters::sglang::HiCacheFactObservation & eviction) {
     using Kind = HiCacheEvictionRegion::Kind;
     if (eviction.fact_role != "capacity_result_observed" || eviction.phase != "end" || !eviction.duration_us)
         throw std::invalid_argument("Eviction regions require a complete source evict envelope");
@@ -172,7 +174,7 @@ std::vector<HiCacheEvictionRegion> observe_eviction_regions(const patch::HiCache
     return regions;
 }
 
-HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             const HiCacheHostTemplate & host, std::string_view prefix, std::span<const size_t> callback_points,
                                             bool retain_collective_completions) {
     const auto & graph = source.graph();
@@ -389,7 +391,7 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
     return plan;
 }
 
-HiCacheWriteExpansion prepare_write_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+HiCacheWriteExpansion prepare_write_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                               const patch::HiCacheIoOperationRecord & write, const HiCacheHostTemplate & host, size_t completion) {
     HiCacheWriteExpansion plan{ prepare_host_expansion(source, queues, host, "target write: ") };
     if (!plan.event_waits.empty()) throw std::runtime_error("Write template needs an explicit event-completion binding");

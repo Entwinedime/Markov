@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/modules/hicache/radix/token_radix_tree.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -82,6 +83,8 @@ public:
 
     /** @brief Returns the first unreferenced L2 victim, or no value when none is evictable. */
     [[nodiscard]] std::optional<HiCacheNodeId> first_host_victim() const;
+    /** Host heap size before reference checks; includes pinned leaves that cleanup skips. */
+    [[nodiscard]] size_t host_candidate_count() const { return evictable_host_leaves_.size(); }
 
 private:
     struct VictimKey {

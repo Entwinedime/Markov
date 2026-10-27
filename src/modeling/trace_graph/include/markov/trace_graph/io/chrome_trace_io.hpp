@@ -29,6 +29,9 @@ struct TraceReadOptions {
 
     /** @brief Number of parser partitions inside one file; one selects the serial scanner. */
     size_t threads = 1;
+
+    /** @brief Select duration-event names by prefix; empty selects all. Metadata is unaffected. */
+    std::vector<std::string> name_prefixes;
 };
 
 /**

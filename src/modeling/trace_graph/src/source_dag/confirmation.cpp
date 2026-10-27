@@ -1,4 +1,5 @@
 #include "markov/trace_graph/source_dag/confirmation.hpp"
+#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -14,7 +15,7 @@
 
 namespace markov::trace_graph::source_dag {
 
-void append_write_confirmation_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+void append_write_confirmation_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             size_t observation, uint64_t begin_us, uint64_t confirmed_batches, bool corrected, nlohmann::json & rows) {
     const auto & graph = source.graph();
     const auto & outer = graph.runtime_observations().at(observation);

@@ -33,7 +33,10 @@ PrefetchSchedulerExecution append_prefetch_scheduler_body(const PrefetchSchedule
         }
         current = append_cpu_collective(step.communication, current, future);
         for (auto & [rank, node] : current) {
-            node = local(rank, node, step.after.at(rank));
+            // The write-confirmation owner expands the whole post-MIN tail,
+            // including publication and asynchronous event destruction.
+            // A fixed scheduler tail must not charge the same work again.
+            if (kind != PrefetchSchedulerAction::WriteCompletion) node = local(rank, node, step.after.at(rank));
             node = action(kind, rank, node, true);
         }
     }

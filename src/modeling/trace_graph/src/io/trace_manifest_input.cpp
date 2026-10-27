@@ -3,9 +3,11 @@
  * @brief Selects and loads logical trace inputs from `profile_manifest.json`.
  */
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
+#include "markov/trace_graph/adapters/runtimes/ascend/event_semantics.hpp"
 
 #include "markov/trace_graph/io/trace_channel_join.hpp"
 
+#include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/dag_builder_normalization.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
@@ -38,12 +40,15 @@ using Json = nlohmann::json;
 
 constexpr std::string_view kWorkspacePrefix = "/workspace/trace-sim";
 constexpr std::string_view kOptPrefix = "/opt/trace-sim";
+// SGLang clips scheduler reservations, never actual generated output.
+constexpr uint64_t kSglangDefaultGenerationReservationTokens = 4'096;
 
 struct ManifestPaths {
     std::vector<std::string> torch;
     std::vector<std::string> ld_preload;
     std::vector<std::string> python_probe;
     std::unordered_map<std::string, Json> host_clocks;
+    std::unordered_map<std::string, std::vector<std::string>> cann_runtime_traces;
 };
 
 std::vector<std::string> manifest_input_contracts(const Json & manifest) {
@@ -119,7 +124,10 @@ ManifestPaths selected_paths(const Json & manifest, const ManifestTraceInputOpti
             options.include_python_probe ? existing_paths(sidecar.value("python_probe_files", Json::array()), "Python probe") : std::vector<std::string>{},
     };
     for (const auto & entry : trace.value("torch_trace_files", Json::array())) {
-        if (entry.contains("host_clock")) paths.host_clocks.emplace(map_repo_path(entry.at("path").get<std::string>()), entry.at("host_clock"));
+        const auto path = map_repo_path(entry.at("path").get<std::string>());
+        if (entry.contains("host_clock")) paths.host_clocks.emplace(path, entry.at("host_clock"));
+        if (options.include_torch && entry.contains("cann_runtime_trace_files"))
+            paths.cann_runtime_traces.emplace(path, existing_paths(entry.at("cann_runtime_trace_files"), "CANN runtime"));
     }
     return paths;
 }
@@ -188,7 +196,7 @@ bool semantic_tail_context_event(const TraceEvent & event) { return event.source
 
 bool semantic_prelude_context_event(const TraceEvent & event) {
     return event.source_channel == TraceSourceChannel::PythonProbe
-           && (event.has_arg_key_hint("fact") || event.name == "runtime.hicache.host_load_check"
+           && (event.has_arg_key_hint("fact") || event.name == "runtime.hicache.host_load_check" || event.name == "runtime.hicache.decode_allocation"
                || (event.name == "runtime.phase.attention" && event.arg("descriptor_present") != "false")
                || (event.name == "runtime.hicache.layer_waits" && event.arg("consumer_index") == "-1" && event.arg("status") == "returned"));
 }
@@ -231,6 +239,65 @@ void mark_causal_tail(TraceEvent & event, std::unordered_set<std::string> & conn
     event.set_arg("counts_toward_e2e", "false");
     append_causality_identity(event, "connection_id", connection_ids);
     append_causality_identity(event, "correlation_id", correlation_ids);
+}
+
+void retain_completion_peers(std::vector<ManifestTraceInput> & inputs, uint64_t end_us) {
+    using Lane = std::pair<std::string, std::string>;
+    using CollectiveKey = std::tuple<std::string, std::string, uint64_t>;
+    std::map<Lane, std::vector<TraceEvent *>> envelopes;
+    std::map<CollectiveKey, std::vector<TraceEvent *>> rounds;
+    for (auto & input : inputs) {
+        for (auto & event : input.events) {
+            if (event.source_channel != TraceSourceChannel::PythonProbe) continue;
+
+            if ((event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.load_completion") && event.arg("status") == "returned"
+                && event.arg("blocking") == "false")
+                envelopes[{ event.pid, event.tid }].push_back(&event);
+            if (event.name == "runtime.cpu_collective" && !event.arg("group").empty() && !event.arg("members").empty()
+                && !event.arg("collective_index").empty())
+                rounds[{ event.arg("group"), event.arg("members"), event.arg_u64("collective_index") }].push_back(&event);
+        }
+    }
+    for (auto & [lane, calls] : envelopes) std::ranges::sort(calls, {}, [](const auto * event) { return event->ts; });
+
+    // Resolve each rank's outer check before any rank is cropped. A matching
+    // collective identity, not a time margin, establishes the peer relation.
+    for (auto & [identity, calls] : rounds) {
+        for (auto *& call : calls) {
+            const auto lane = envelopes.find({ call->pid, call->tid });
+            TraceEvent * parent = nullptr;
+            if (lane != envelopes.end()) {
+                auto candidate = std::ranges::upper_bound(lane->second, call->ts, {}, [](const auto * event) { return event->ts; });
+                if (candidate != lane->second.begin()) {
+                    --candidate;
+                    if (call->ts + call->dur <= (*candidate)->ts + (*candidate)->dur) parent = *candidate;
+                }
+            }
+            call = parent;
+        }
+    }
+
+    // One already-started check can have several communication groups. Close
+    // only their observed peers; a subsequent polling round has a new identity.
+    // Missing envelopes remain missing and are rejected by the normal observer.
+    bool changed;
+    do {
+        changed = false;
+        for (const auto & [identity, calls] : rounds) {
+            const bool retained = std::ranges::any_of(calls, [&](const auto * call) {
+                return call && ((call->ts <= end_us && call->ts + call->dur > end_us) || call->arg("formal_window_context") == "causal_tail");
+            });
+            if (!retained) continue;
+
+            for (auto * call : calls) {
+                if (!call || call->ts <= end_us || call->arg("formal_window_context") == "causal_tail") continue;
+
+                call->set_arg("formal_window_context", "causal_tail");
+                call->set_arg("counts_toward_e2e", "false");
+                changed = true;
+            }
+        }
+    } while (changed);
 }
 
 void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOptions & options) {
@@ -306,7 +373,8 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         // even when those children begin after the client response. Retain the
         // observed call, not subsequent polling rounds or a time margin.
         if (event.source_channel == TraceSourceChannel::PythonProbe && (semantic_tail_context_event(event) || generation_batch || completion_check)
-            && event.dur > 0 && event.ts <= end && event_end > end && !event.tid.empty() && event.tid != "-1") {
+            && event.dur > 0 && (event.ts <= end || event.arg("formal_window_context") == "causal_tail") && event_end > end && !event.tid.empty()
+            && event.tid != "-1") {
             cross_boundary_semantic_calls.push_back(ThreadCallInterval{
                 .start_us = event.ts,
                 .end_us = event_end,
@@ -569,6 +637,7 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         arrival.tid = "formal_window.queue:" + task.worker.second;
         arrival.ts = opening_queue_times.at(task.worker);
         arrival.source_channel = TraceSourceChannel::Synthetic;
+        arrival.submit_anchor = true;
         arrival.set_arg("correlation_id", task.enqueue->arg("correlation_id"));
         arrival.set_arg("counts_toward_e2e", "false");
         arrival.set_arg("formal_window_context", "causal_head");
@@ -580,6 +649,14 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
 
     input.window_removed_record_count = std::erase_if(input.events, [&](const TraceEvent & event) {
         if (head_descriptors.contains(event.index)) return false;
+        // Future bookkeeping facts can overlap a new polling check after the
+        // HTTP cut. That overlap does not admit its native event wait: retain
+        // waits only within an already-started semantic call (or its proven
+        // peer). Otherwise a producer in the modeled window keeps an orphan
+        // consumer from an unmodeled subsequent confirmation round.
+        if (event.ts > end && core::synchronizes_recorded_event(event) && !strictly_nested_in_cross_boundary_call(event, cross_boundary_semantic_calls))
+            return true;
+
         // Pre-window preparation is model context, not pre-window execution.
         // DagBuilder retains these envelopes only as non-executable metadata.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
@@ -614,6 +691,10 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
 }
 
 void select_input_events(ManifestTraceInput & input, const ManifestTraceInputOptions & options) {
+    // Native submission roles are needed during opening-cut retention, before
+    // framework observations are routed by the source construction boundary.
+    for (auto & event : input.events) adapters::ascend::classify_event(event);
+
     input.joined_record_count = input.events.size();
     detail::retain_duration_events(input.events);
     input.duration_record_count = input.events.size();
@@ -647,7 +728,6 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
     input.input_contracts = input_contracts;
     append_trace_files(input, paths.ld_preload, sidecar_read_options(options), TraceSourceChannel::LdPreload);
     append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
-    select_input_events(input, options);
     return input;
 }
 
@@ -683,6 +763,17 @@ ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::ve
     ManifestTraceInput input;
     input.input_contracts = input_contracts;
     input.events = read_channel_trace(paths.torch[index], profiler_read_options(options), TraceSourceChannel::Torch);
+    if (const auto native = paths.cann_runtime_traces.find(paths.torch[index]); native != paths.cann_runtime_traces.end()) {
+        // These are the host roles pruned from Level0's display timeline.
+        // Device records already exist in trace_view and must not be doubled.
+        const TraceReadOptions runtime_options{
+            .include_metadata = true,
+            .threads = options.file_threads,
+            .name_prefixes =
+                std::vector<std::string>(adapters::ascend::level0_pruned_event_prefixes.begin(), adapters::ascend::level0_pruned_event_prefixes.end()),
+        };
+        append_trace_files(input, native->second, runtime_options, TraceSourceChannel::Torch);
+    }
     // Join containment and formal-window selection must see one clock. Raw
     // trace files and their original manifest transform remain unchanged.
     normalize_profiler_clock(input.events, clock);
@@ -692,7 +783,6 @@ ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::ve
     }
     append_trace_files(input, select_sidecars(paths.python_probe, pid), sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     normalize_wait_clock(input.events, clock);
-    select_input_events(input, options);
     return input;
 }
 
@@ -702,35 +792,35 @@ std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::strin
     const auto manifest = load_manifest(manifest_path);
     const auto paths = selected_paths(manifest, options);
     const auto input_contracts = manifest_input_contracts(manifest);
+    std::vector<ManifestTraceInput> inputs(paths.torch.size());
     if (paths.torch.empty()) {
         if (paths.ld_preload.empty() && paths.python_probe.empty()) {
             throw std::runtime_error("profile manifest has no usable trace inputs: " + manifest_path);
         }
-        return { load_state_only_group(paths, input_contracts, options) };
+        inputs.push_back(load_state_only_group(paths, input_contracts, options));
     }
-
-    std::vector<ManifestTraceInput> inputs(paths.torch.size());
-    const size_t concurrency = std::max<size_t>(1, std::min(options.threads, paths.torch.size()));
-    if (concurrency == 1) {
-        for (size_t index = 0; index < paths.torch.size(); ++index) { inputs[index] = load_logical_input(paths, input_contracts, index, options); }
-        return inputs;
-    }
-
-    for (size_t begin = 0; begin < paths.torch.size(); begin += concurrency) {
-        const auto end = std::min(paths.torch.size(), begin + concurrency);
-        std::vector<std::future<ManifestTraceInput>> futures;
-        futures.reserve(end - begin);
-        for (size_t index = begin; index < end; ++index) {
-            futures.push_back(std::async(std::launch::async,
-                                         [&paths, &input_contracts, &options, index] { return load_logical_input(paths, input_contracts, index, options); }));
+    else {
+        const size_t concurrency = std::max<size_t>(1, std::min(options.threads, paths.torch.size()));
+        for (size_t begin = 0; begin < paths.torch.size(); begin += concurrency) {
+            const auto end = std::min(paths.torch.size(), begin + concurrency);
+            std::vector<std::future<ManifestTraceInput>> futures;
+            futures.reserve(end - begin);
+            for (size_t index = begin; index < end; ++index) {
+                futures.push_back(std::async(std::launch::async, [&paths, &input_contracts, &options, index] {
+                    return load_logical_input(paths, input_contracts, index, options);
+                }));
+            }
+            // Join in manifest order, independently of worker completion order.
+            for (size_t index = begin; index < end; ++index) inputs[index] = futures[index - begin].get();
         }
-        // Join in manifest order, independently of worker completion order.
-        for (size_t index = begin; index < end; ++index) inputs[index] = futures[index - begin].get();
     }
+
+    if (options.window_start_us && options.window_end_us) retain_completion_peers(inputs, *options.window_end_us);
+    for (auto & input : inputs) select_input_events(input, options);
     return inputs;
 }
 
-ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path) {
+ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path, bool include_preparation) {
     const auto manifest = load_manifest(manifest_path);
     const auto reports = manifest.value("bench", Json::object()).value("workload_report_files", Json::array());
     if (reports.size() != 1) return { "missing_or_multiple_workload_reports", {} };
@@ -749,7 +839,38 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
     };
     const auto begin = timestamp(window, "formal_begin_ms");
     const auto end = timestamp(window, "formal_end_ms");
+    uint64_t generation_clip = std::numeric_limits<uint64_t>::max();
+    if (manifest.at("framework") == "sglang") {
+        Json config;
+        std::ifstream(map_repo_path(manifest.at("config_path").get<std::string>())) >> config;
+        const auto environment = config.value("env", Json::object());
+        const auto limit = environment.contains("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION")
+                               ? core::parse_u64(environment.at("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION").get<std::string>())
+                               : std::optional<uint64_t>{ kSglangDefaultGenerationReservationTokens };
+        if (!limit) throw std::runtime_error("SGLang generation reservation limit must be a nonnegative token count");
+
+        generation_clip = *limit;
+    }
+
     ManifestClientInput result{ "ready", {} };
+    std::vector<core::ClientRequestTiming> preparation;
+    std::optional<uint64_t> preparation_idle_since_us;
+    const auto request_timing = [&](const Json & row, uint64_t start, uint64_t finish) {
+        std::optional<uint64_t> generation_limit;
+        if (row.contains("output_token_limit")) generation_limit = row.at("output_token_limit").get<uint64_t>();
+        else if (report.value("forced_token", Json::object()).value("mode", "") == "replay" && row.contains("forced_output_count")
+                 && !row.contains("finish_reason")) {
+            // Fixed-length replay declares its complete output budget. EOS
+            // records must retain their explicit upper limit instead.
+            generation_limit = row.at("forced_output_count").get<uint64_t>();
+        }
+
+        return core::ClientRequestTiming{ row.at("logical_request_id").get<std::string>(),
+                                          start,
+                                          finish,
+                                          0,
+                                          generation_limit ? std::optional{ std::min(*generation_limit, generation_clip) } : std::nullopt };
+    };
     bool inside = false;
     uint64_t prelude_finish = 0;
     bool prelude_ordered = true;
@@ -761,22 +882,37 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
         }
         const auto start = timestamp(row, "start_time_ms"), finish = timestamp(row, "end_time_ms");
         if (finish <= begin) {
+            if (include_preparation && row.value("kind", "") == "request") {
+                if (row.value("status", "") != "ok") return { "failed_preparation_request", {} };
+                if (preparation.empty()) preparation_idle_since_us = result.hicache_idle_since_us;
+
+                preparation.push_back(request_timing(row, start, finish));
+            }
             prelude_ordered &= start >= prelude_finish && finish >= start && result.requests.empty();
             prelude_finish = std::max(prelude_finish, finish);
-            if (row.value("kind", "") == "barrier" && row.value("scope", "") == "hicache_idle" && row.value("status", "") == "ok" && prelude_ordered)
+            if (row.value("kind", "") == "barrier" && row.value("scope", "") == "hicache_idle" && row.value("status", "") == "ok" && prelude_ordered) {
                 result.hicache_idle_since_us = finish;
+                preparation.clear();
+            }
             else if (!prelude_ordered || row.value("kind", "") != "checkpoint" || row.value("status", "") != "ok") result.hicache_idle_since_us.reset();
             continue;
         }
         if (start >= end) continue;
         if (row.value("kind", "") != "request") return { "formal_control_step_not_modeled", {} };
         if (row.value("status", "") != "ok") return { "failed_formal_request", {} };
-        result.requests.push_back({ row.at("logical_request_id").get<std::string>(), start, finish, 0 });
+        result.requests.push_back(request_timing(row, start, finish));
         inside = finish < end;
     }
     std::ranges::sort(result.requests, {}, &core::ClientRequestTiming::start_us);
     if (result.requests.empty() || result.requests.front().start_us != begin || result.requests.back().end_us != end)
         return { "formal_request_envelope_mismatch", {} };
+
+    if (!preparation.empty()) {
+        std::ranges::sort(preparation, {}, &core::ClientRequestTiming::start_us);
+        result.formal_begin_index = preparation.size();
+        result.requests.insert(result.requests.begin(), preparation.begin(), preparation.end());
+        result.hicache_idle_since_us = preparation_idle_since_us;
+    }
 
     std::unordered_map<std::string, std::vector<uint64_t>> submits;
     TraceReadOptions options;
@@ -791,7 +927,10 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
     }
     for (auto & request : result.requests) {
         const auto & found = submits[request.request_id];
-        if (found.size() != 1) return { "missing_or_ambiguous_tokenizer_submit", {} };
+        if (found.size() != 1) {
+            result.status = "missing_or_ambiguous_tokenizer_submit";
+            return result;
+        }
         request.frontend_end_us = found.front();
     }
     return result;
