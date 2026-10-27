@@ -1985,3 +1985,25 @@
 **验证：** token-output-geometry新来源及6/6正式展开complete，本任务native 156.109391000s、processing 67.610753520s；PP重处理6/6 complete、native为0。最终本开发轮5次native/759.262550510s、processing 481.075479820s，失败和中止费用计入，所有pending为空。最终稳定镜像markov-next-sglang:ubuntu22.04为7c86173ea040，原生栈继承bc4f未重新安装，包内三份修改Python hash与工作区一致，四项主要依赖版本不变；最终Python语法、C++构建/格式、Git diff检查通过。数据检查确认12份结果存在、原冻结报告哈希不变、原始记录及失败保留；简明结果在开发根目录results/source-adaptation.md，机器审查摘要在results/batch-review.json。
 
 **结论与限制：** 两个来源机制取得限定开发资格；原B错误和未执行项仍按当时事实保留，其他域及逐rank独立对照不能据此算通过。核心有实质修改，后续A继续收口后须重新完整B。本批代码、文档和数据完成关联审查；7134755、7398dd3、fd37c8d三个代码提交已推送并核对远端fd37c8d4ccd5aab4eb42db2672a725bca9f658be，文档随本提交交付。用户reference暂存与deprecated/data均不纳入提交。
+
+
+## 2026-10-28 — S8-A：公共修复的跨域来源复用启动
+
+**范围：** 交付起点1eb6a10bb257d34368d35b9841ca4feb3dd892b7；上一批是实质推进，本批继续未闭合的MoE/其他PP来源能力，S8–S12范围及性能后置不变。
+
+**改动：** 先复用完整B中Qwen3 MoE P/D双方TP=EP2、MoE TP=EP2×PP3、Dense TP2×PP3的已完成原生记录，按当前公共归一化重新解释、构库和展开。编排仅在data/20261027T233148.469927Z_s8-a-source-reuse，使用现有example与正式workflow；原JSON输入/physical用硬链接保留，解释结果由原子发布隔离，原冻结来源不修改。新任务记录当前处理环境，原生环境及来源路径另保留为来源证据，不冒充新采集。
+
+**验证：** 启动前核对当前工作区仅有用户reference改动，代码基线与交付一致，并联查PD嵌套来源、role-plan、解释与构库入口。三个任务native额度和尝试cap均为0，processing各900s，轮总3000s、临时128GiB/保留96GiB、串行；旧B/A的失败和费用不重置。尚未执行本批流程，不在此授予跨域资格。
+
+**结论与限制：** 先用已有事实判明公共修复的适用性及剩余差异，再决定必要实现；本批不追加shape点、不启动原生Engine，不修改旧B报告或将开发重处理称作独立验收。
+
+
+## 2026-10-28 — S8-A：三个来源域完整重处理及机制归属
+
+**范围：** 三个预定域全部结束后统一分析；不在运行途中改代码，不扩大输入或采集点。
+
+**改动：** 结果保留在本批results/report.md及review.json。确认MoE Decode输入行数为并行补齐后的B，现有辅助原型只提供普通B定义，已有普通行原型不能直接填补补齐行的执行分支。另沿原始clamp操作定位到官方compute_local_num_token_non_padded：model_tokens为256/162/2、TP2时上限128/81/1，被当作整个父块固定literal，阻碍同块index分支复用。需要修正原生helper的动态标量语义，不能先删literal隔离。旧PP来源缺执行上下文，CPU重处理不会补造原生事实。
+
+**验证：** 共16项目标，MoE P/D 0/4、MoE EP2×PP3 2/6、dense TP2×PP3 3/6成功，三个任务均partial；新增native=0，processing 299.610587880s，所有pending为空，原失败和来源保留。实际镜像中的forward_batch_info.py与官方checkout内容一致，排除本文件被环境patch修改；未新增业务代码。
+
+**结论与限制：** 本批确认下一步应完善适配来源的有限几何族及动态标量边界，不把它们误判成要放宽核心检查。上述机制尚未证明是每个拒绝的唯一根因，PP/P/D整体因果差异仍单列。当前维护批结束，先完成文档/数据检查与提交，再启动来源实现；全量独立B仍后置于A收口。
