@@ -21,6 +21,7 @@ SourceContext::SourceContext(Observations && observations)
     for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
         for (const auto request : observations_.compute_frames[frame].requests) request_frames_[observations_.names[request]].push_back(frame);
     }
+    device_services_ = bind_device_services(observations_, graph_);
 
     // The context is read-only now; keep semantic tables, not parser interning.
     observations_.release_intake_indexes();

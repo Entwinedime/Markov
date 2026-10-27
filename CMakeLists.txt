@@ -23,6 +23,7 @@ add_library(markov_source
     src/markov/trace_graph/source/clients.cpp
     src/markov/trace_graph/source/build.cpp
     src/markov/trace_graph/source/context.cpp
+    src/markov/trace_graph/source/services.cpp
     src/markov/trace_graph/planning/token_paths.cpp
     src/markov/trace_graph/planning/radix_tree.cpp
     src/markov/trace_graph/planning/cache.cpp

@@ -3,6 +3,7 @@
 #include "markov/trace_graph/simulation/execution.hpp"
 #include "markov/trace_graph/source/build.hpp"
 #include "markov/trace_graph/source/observations.hpp"
+#include "markov/trace_graph/source/services.hpp"
 
 #include <functional>
 #include <map>
@@ -29,6 +30,7 @@ public:
     simulation::ExecutionResult replay() const;
     std::span<const Index> frame_operations(Index frame) const { return frame_operations_[frame]; }
     std::span<const Index> request_frames(std::string_view request) const;
+    const DeviceService & device_service(Index work) const { return device_services_[work]; }
 
 private:
     Observations observations_;
@@ -36,6 +38,7 @@ private:
     Time origin_ns_;
     std::vector<std::vector<Index>> frame_operations_;
     std::map<std::string, std::vector<Index>, std::less<>> request_frames_;
+    std::vector<DeviceService> device_services_;
 };
 
 } // namespace markov::trace_graph::source

@@ -35,7 +35,8 @@ ComputePlan project_compute(const source::SourceContext & source, source::Index 
             }
             result.work.push_back(definition.describe(phase, input));
         }
-        result.operations.push_back({ binding->second, operation });
+        const auto unchanged = result.work[binding->second] == observed.work_descriptions[call.description].observed;
+        result.operations.push_back({ binding->second, operation, unchanged });
     }
     return result;
 }

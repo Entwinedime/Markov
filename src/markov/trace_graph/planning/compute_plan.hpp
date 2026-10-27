@@ -10,6 +10,10 @@ namespace markov::trace_graph::planning {
 struct ComputeInstance {
     std::size_t work;
     source::Index source_operation;
+
+    // Identity evidence within this source deployment, not permission to reuse
+    // a CPU wall envelope or to transfer across resources/implementations.
+    bool source_work_unchanged;
 };
 
 struct ComputePlan {

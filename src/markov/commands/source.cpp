@@ -31,6 +31,80 @@ Json work_json(const planning::Work & work) {
     };
 }
 
+Json device_service_summary(const source::SourceContext & source) {
+    struct Summary {
+        std::map<std::string, std::size_t> statuses;
+        std::size_t nodes = 0;
+        graph::Time minimum_ns = std::numeric_limits<graph::Time>::max(), maximum_ns = 0;
+        std::optional<source::Index> example;
+    };
+    const auto & observed = source.observations();
+    std::vector<Summary> summaries(observed.work_descriptions.size());
+    std::map<std::string, std::size_t> totals;
+    for (source::Index id = 0; id < observed.work_observations.size(); ++id) {
+        const auto & service = source.device_service(id);
+        const char * status = service.available() ? "bound" : "no_observed_launch";
+        if (service.issue) {
+            switch (*service.issue) {
+            case source::ServiceIssue::SharedProbe:
+                status = "shared_probe";
+                break;
+            case source::ServiceIssue::AmbiguousOwner:
+                status = "ambiguous_owner";
+                break;
+            case source::ServiceIssue::UnmatchedDevice:
+                status = "unmatched_device_port";
+                break;
+            case source::ServiceIssue::NonServiceDevice:
+                status = "non_service_device";
+                break;
+            }
+        }
+        ++totals[status];
+        auto & summary = summaries[observed.work_observations[id].description];
+        ++summary.statuses[status];
+        if (!service.available()) continue;
+
+        graph::Time duration_ns = 0;
+        for (const auto node : service.nodes) duration_ns += source.graph().graph.nodes()[node].duration_ns;
+        summary.nodes += service.nodes.size();
+        summary.minimum_ns = std::min(summary.minimum_ns, duration_ns);
+        summary.maximum_ns = std::max(summary.maximum_ns, duration_ns);
+        if (!summary.example) summary.example = id;
+    }
+    auto descriptions = Json::array();
+    for (std::size_t id = 0; id < summaries.size(); ++id) {
+        const auto & summary = summaries[id];
+        Json example = nullptr;
+        if (summary.example) {
+            const auto & call = observed.work_observations[*summary.example];
+            const auto & service = source.device_service(*summary.example);
+            const auto & origin = source.graph().node_origins[service.nodes.front()];
+            const auto & device = observed.spans[origin.span];
+            example = {
+                {     "work_observation",                                                         *summary.example },
+                {                "probe",     { { "file", call.record.file }, { "record", call.record.position } } },
+                { "first_device_service", { { "file", device.record.file }, { "record", device.record.position } } }
+            };
+        }
+        descriptions.push_back({
+            {      "work_description",                                                         id },
+            {              "statuses",                                           summary.statuses },
+            { "bound_exclusive_nodes",                                              summary.nodes },
+            {    "minimum_service_ns", summary.example ? Json(summary.minimum_ns) : Json(nullptr) },
+            {    "maximum_service_ns", summary.example ? Json(summary.maximum_ns) : Json(nullptr) },
+            {               "example",                                         std::move(example) }
+        });
+    }
+    return {
+        {      "statuses",totals                          },
+        {  "descriptions", std::move(descriptions) },
+        { "qualification",
+         "Observed native submission ownership only; no probe wall costs, ambiguous parent partitioning, capture-completeness or cross-deployment transfer "
+         "claim."                                 }
+    };
+}
+
 Json source_compute_alignment(const source::SourceContext & source) {
     const auto & captured = source.observations();
     std::size_t unavailable = 0, missing_bindings = 0, compared = 0, mismatched = 0;
@@ -297,6 +371,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {         "work_description_scope",                                                                                       "observed_compute_geometry_subset" },
         {                 "compute_frames",                                                                                                        std::move(frames) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
+        {         "device_service_binding",                                                                                          device_service_summary(context) },
         {                 "request_tokens",                                                                                          request_token_summary(captured) },
         {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
         {        "work_observation_counts",                                                                                                   std::move(work_counts) },
@@ -322,6 +397,9 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     const auto & paths = observations.token_paths;
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
+        struct WorkCounts {
+            std::size_t instances = 0, source_work_unchanged = 0, source_service_bound = 0;
+        };
         std::size_t corpus_pages = 0;
         for (const auto & [identity, tokens] : observations.request_tokens) {
             if (tokens.committed) corpus_pages += paths.length(tokens.committed->path) / size;
@@ -330,7 +408,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         // This diagnostic retains the complete corpus as one logical layer.
         // Its capacity follows the input; it is not a target hardware setting.
         planning::Cache prefixes({ corpus_pages, 0, 1, std::nullopt });
-        std::map<planning::Work, std::size_t> projected_work;
+        std::map<planning::Work, WorkCounts> projected_work;
         std::size_t missing_projection_inputs = 0, missing_row_bindings = 0;
         auto requests = Json::array();
         for (const auto & request : observations.requests) {
@@ -369,7 +447,12 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
                 const auto plan = planning::project_compute(source.context, frame_id, { query, query, context, 1, static_cast<double>(size) });
                 missing_row_bindings += plan.missing_row_bindings.size();
-                for (const auto & operation : plan.operations) ++projected_work[plan.work[operation.work]];
+                for (const auto & operation : plan.operations) {
+                    auto & counts = projected_work[plan.work[operation.work]];
+                    ++counts.instances;
+                    counts.source_work_unchanged += operation.source_work_unchanged;
+                    counts.source_service_bound += operation.source_work_unchanged && source.context.device_service(operation.source_operation).available();
+                }
             }
             requests.push_back({
                 {                        "request",                                  request.identity },
@@ -384,9 +467,11 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             });
         }
         auto compute = Json::array();
-        for (const auto & [work, count] : projected_work) {
+        for (const auto & [work, counts] : projected_work) {
             auto value = work_json(work);
-            value["instances"] = count;
+            value["instances"] = counts.instances;
+            value["source_work_unchanged"] = counts.source_work_unchanged;
+            value["source_service_bound"] = counts.source_service_bound;
             compute.push_back(std::move(value));
         }
         auto segments = Json::array();
