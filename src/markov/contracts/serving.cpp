@@ -41,6 +41,8 @@ std::string_view ServingAction::step_name() const {
     switch (step) {
     case ServingStep::Batch:
         return "batch";
+    case ServingStep::Select:
+        return "select";
     case ServingStep::Stage:
         return "stage";
     case ServingStep::ReadResult:

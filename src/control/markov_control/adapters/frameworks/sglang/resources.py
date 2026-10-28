@@ -99,25 +99,3 @@ class PageAllocator:
         self.group = None
         if pending:
             self.free(torch.cat(pending))
-
-
-class BatchAllocation:
-    def __init__(self, schedule_batch) -> None:
-        self.extend = schedule_batch.alloc_for_extend
-        self.decode = schedule_batch.alloc_for_decode
-        schedule_batch.alloc_for_extend = self.for_extend
-        schedule_batch.alloc_for_decode = self.for_decode
-
-    def for_extend(self, batch):
-        allocator = batch.token_to_kv_pool_allocator
-        allocator.batch = batch
-        allocator.phase = "prefill"
-        allocator.tokens = batch.extend_lens
-        return self.extend(batch)
-
-    def for_decode(self, batch, token_per_req):
-        allocator = batch.token_to_kv_pool_allocator
-        allocator.batch = batch
-        allocator.phase = "decode"
-        allocator.tokens = [token_per_req] * len(batch.reqs)
-        return self.decode(batch, token_per_req)

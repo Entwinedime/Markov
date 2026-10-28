@@ -7,8 +7,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+from markov_control.adapters.frameworks.sglang.batches import BatchAllocation, NativeBatch
 from markov_control.adapters.frameworks.sglang.requests import RequestInput
-from markov_control.adapters.frameworks.sglang.resources import BatchAllocation
 from markov_control.adapters.frameworks.sglang.runner import MetadataRunner
 from markov_control.peer import ControlPeer
 from sglang.srt.distributed import parallel_state
@@ -50,6 +50,8 @@ class NativeScheduler(Scheduler):
         model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=rendezvous)
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog
         BatchAllocation(schedule_batch)
+        schedule_batch.ScheduleBatch = NativeBatch
+        scheduler_module.ScheduleBatch = NativeBatch
         args = ServerArgs(
             model_path=model_path,
             dtype=dtype,
@@ -107,6 +109,13 @@ class NativeScheduler(Scheduler):
             finally:
                 parallel_state.destroy_model_parallel()
                 parallel_state.destroy_distributed_environment()
+
+    def update_running_batch(self, batch):
+        batch.control_selection = True
+        try:
+            return super().update_running_batch(batch)
+        finally:
+            batch.control_selection = False
 
     def model_result(self, batch, **kwargs):
         self.peer.call("model")

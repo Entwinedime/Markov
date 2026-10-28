@@ -1,5 +1,6 @@
 #include "markov/adapters/frameworks/sglang/batches.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace markov::sglang {
@@ -23,23 +24,39 @@ std::map<std::string, std::size_t> BatchViews::columns(const std::map<std::strin
 std::size_t BatchViews::admission_members() const {
 
     // Native admission precedes Decode filtering, while the preceding Prefill is filtered first.
-    return (running_ ? static_cast<std::size_t>(running_->members) : 0) + (prefill_ ? prefill_->kept_rows.size() : 0);
+    return (running_ ? running_->requests.size() : 0) + (prefill_ ? prefill_->kept_rows.size() : 0);
 }
 
 void BatchViews::advance(Phase phase) {
+    join_prefill(phase);
+    if (phase == Phase::Decode) filter(running_.value(), "decode");
+}
+
+void BatchViews::join_prefill(Phase phase) {
     const std::string name = phase == Phase::Prefill ? "prefill" : "decode";
 
     // Native scheduling filters the preceding Prefill before joining it to the running view.
     if (prefill_) {
         filter(*prefill_, name);
-        if (prefill_->members != 0) {
+        if (!prefill_->requests.empty()) {
             if (running_) merge(*running_, *prefill_, name);
             else running_ = std::move(prefill_);
         }
         prefill_.reset();
     }
+}
 
-    if (phase == Phase::Decode) filter(running_.value(), name);
+std::size_t BatchViews::select(std::span<const BatchMember> members) {
+    auto & view = running_.value();
+    view.kept_rows.clear();
+    for (const auto & member : members) {
+        const auto row = std::ranges::find(view.requests, member.request);
+        if (row == view.requests.end()) throw LayoutMismatch("selected request has no running batch column");
+        view.kept_rows.push_back(row - view.requests.begin());
+    }
+    const auto filtered = filter(view, "decode");
+    if (view.requests.empty()) running_.reset();
+    return filtered;
 }
 
 std::map<std::string, std::size_t> BatchViews::decode_inputs() const {
@@ -70,8 +87,9 @@ std::optional<std::size_t> BatchViews::idle() {
 }
 
 void BatchViews::remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects) {
-    View view{ columns(ports), static_cast<std::int64_t>(effects.members.size()), {} };
+    View view{ columns(ports), {}, {} };
     for (std::size_t row = 0; row < effects.members.size(); ++row) {
+        view.requests.push_back(effects.members[row].request);
         if (!effects.members[row].finished) view.kept_rows.push_back(static_cast<std::int64_t>(row));
     }
 
@@ -86,10 +104,10 @@ void BatchViews::live_values(std::vector<std::size_t *> & values) {
     }
 }
 
-void BatchViews::filter(View & view, const std::string & phase) {
+std::size_t BatchViews::filter(View & view, const std::string & phase) {
     Invocation invocation;
     invocation.parameters = {
-        { "before_members",                                     view.members },
+        { "before_members",  static_cast<std::int64_t>(view.requests.size()) },
         {  "after_members", static_cast<std::int64_t>(view.kept_rows.size()) }
     };
     const auto filtered = graph_.append("batch_filter", phase, invocation, view.columns);
@@ -106,7 +124,7 @@ void BatchViews::filter(View & view, const std::string & phase) {
         }
 
         // Selection contents annotate the observed index tensor without removing its native work.
-        if (view.kept_rows.size() != static_cast<std::size_t>(view.members)) {
+        if (view.kept_rows.size() != view.requests.size()) {
             IntegerData rows;
             for (const auto row : view.kept_rows) rows.append(row);
             graph_.bind_integers(filtered.ports.outputs.at("kept_rows"), std::move(rows));
@@ -115,15 +133,18 @@ void BatchViews::filter(View & view, const std::string & phase) {
     }
     else view.columns.clear();
 
-    view.members = static_cast<std::int64_t>(view.kept_rows.size());
+    std::vector<std::size_t> selected;
+    for (const auto row : view.kept_rows) selected.push_back(view.requests.at(static_cast<std::size_t>(row)));
+    view.requests = std::move(selected);
     for (std::size_t row = 0; row < view.kept_rows.size(); ++row) view.kept_rows[row] = static_cast<std::int64_t>(row);
+    return filtered.region;
 }
 
 void BatchViews::merge(View & left, const View & right, const std::string & phase) {
     Invocation invocation;
     invocation.parameters = {
-        { "before_members",  left.members },
-        {  "added_members", right.members }
+        { "before_members",  static_cast<std::int64_t>(left.requests.size()) },
+        {  "added_members", static_cast<std::int64_t>(right.requests.size()) }
     };
     std::map<std::string, std::size_t> inputs;
     for (const auto & [name, value] : left.columns) inputs.emplace("left." + name, value);
@@ -142,8 +163,8 @@ void BatchViews::merge(View & left, const View & right, const std::string & phas
         graph_.bind_integers(value, std::move(joined));
     }
 
-    for (const auto row : right.kept_rows) left.kept_rows.push_back(left.members + row);
-    left.members += right.members;
+    for (const auto row : right.kept_rows) left.kept_rows.push_back(static_cast<std::int64_t>(left.requests.size()) + row);
+    left.requests.insert(left.requests.end(), right.requests.begin(), right.requests.end());
     left.columns = std::move(outputs);
 }
 

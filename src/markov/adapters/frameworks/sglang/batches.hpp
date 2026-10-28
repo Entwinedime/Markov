@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,8 @@ public:
 
     std::size_t admission_members() const;
     void advance(Phase phase);
+    void join_prefill(Phase phase);
+    std::size_t select(std::span<const BatchMember> members);
     std::optional<std::size_t> idle();
     std::map<std::string, std::size_t> decode_inputs() const;
     void remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects);
@@ -28,12 +31,12 @@ public:
 private:
     struct View {
         std::map<std::string, std::size_t> columns;
-        std::int64_t members;
+        std::vector<std::size_t> requests;
         std::vector<std::int64_t> kept_rows;
     };
 
     std::map<std::string, std::size_t> columns(const std::map<std::string, std::size_t> & ports) const;
-    void filter(View & view, const std::string & phase);
+    std::size_t filter(View & view, const std::string & phase);
     void merge(View & left, const View & right, const std::string & phase);
 
     TargetGraph & graph_;

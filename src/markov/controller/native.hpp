@@ -30,6 +30,7 @@ public:
 
 private:
     nlohmann::json resource_call(const nlohmann::json & message);
+    Batch resident_batch(const nlohmann::json & requests) const;
     BatchEffects result_effects(const nlohmann::json & members) const;
 
     std::vector<Request> requests_;
@@ -43,8 +44,9 @@ private:
     std::size_t arrived_ = 0;
     std::size_t completed_ = 0;
     std::size_t sequence_ = 0;
+    std::optional<std::size_t> input_sequence_;
     std::size_t flow_ = 0;
-    ServingStep next_ = ServingStep::Stage;
+    ServingStep next_ = ServingStep::Batch;
 };
 
 } // namespace markov

@@ -32,27 +32,56 @@ NativeController::NativeController(ServingSettings settings, std::vector<Request
 
 std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const GroupAdmission &) {
     if (running_ || done()) return std::nullopt;
-    if (next_ == ServingStep::Stage) {
-        auto arrivals = nlohmann::json::array();
-        while (arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns) {
-            const auto & input = requests_[arrived_];
-            arrivals.push_back({
-                {       "request",          arrived_++ },
-                { "prompt_tokens", input.prompt_tokens },
-                { "output_tokens", input.output_tokens }
-            });
-        }
-        peer_.send({
-            {     "kind",           "advance" },
-            {   "now_ns",              now_ns },
-            { "arrivals", std::move(arrivals) }
-        });
-    }
-
     for (;;) {
+        if (next_ == ServingStep::Batch) {
+
+            // An idle native iteration can finish cleanup; poll again only after actual work or a new arrival.
+            const bool arrived = arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns;
+            if (input_sequence_ == sequence_ && !arrived) return std::nullopt;
+            input_sequence_ = sequence_;
+            auto arrivals = nlohmann::json::array();
+            while (arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns) {
+                const auto & input = requests_[arrived_];
+                arrivals.push_back({
+                    {       "request",          arrived_++ },
+                    { "prompt_tokens", input.prompt_tokens },
+                    { "output_tokens", input.output_tokens }
+                });
+            }
+            peer_.send({
+                {     "kind",           "advance" },
+                {   "now_ns",              now_ns },
+                { "arrivals", std::move(arrivals) }
+            });
+            next_ = ServingStep::Stage;
+        }
+
         const auto message = peer_.receive();
         const auto kind = message.at("kind").get<std::string>();
-        if (kind == "idle") return std::nullopt;
+        if (kind == "idle") {
+            next_ = ServingStep::Batch;
+            continue;
+        }
+        if (kind == "select" || (kind == "release_request" && next_ == ServingStep::Stage)) {
+            if (next_ != ServingStep::Stage) throw std::invalid_argument("native selection is outside batch preparation");
+            auto batch = resident_batch(kind == "select" ? message.at("requests") : nlohmann::json::array({ message.at("request") }));
+            BatchEffects effects;
+            if (kind == "release_request") {
+                const auto & member = batch.members.front();
+                effects.members.push_back({ member.request,
+                                            member.slot,
+                                            member.context_tokens - requests_.at(member.request).prompt_tokens + 1,
+                                            member.context_tokens,
+                                            true,
+                                            false,
+                                            resources_.residence(member.request).pages });
+            }
+            return ServingAction{
+                { group_, sequence_ },
+                std::make_shared<BatchWork>(std::move(batch), std::move(effects)), now_ns, flow_, 0,
+                std::nullopt,          kind == "select" ? ServingStep::Select : ServingStep::Release
+            };
+        }
         if (kind == "model" || kind == "read_result" || kind == "result") {
             const auto step = kind == "model" ? ServingStep::Stage : kind == "read_result" ? ServingStep::ReadResult : ServingStep::Result;
             if (!batch_ || step != next_) throw std::invalid_argument("native work does not follow allocation/model/read completion");
@@ -112,13 +141,26 @@ nlohmann::json NativeController::resource_call(const nlohmann::json & message) {
         return nullptr;
     }
     if (kind == "release_pages") {
-        if (next_ != ServingStep::Result) throw std::invalid_argument("native page release is outside result processing");
+        if (next_ != ServingStep::Result && next_ != ServingStep::Stage)
+            throw std::invalid_argument("native page release is outside preparation or result processing");
         const auto pages = message.at("pages").get<std::vector<std::size_t>>();
-        const auto position = batch_->phase == Phase::Prefill ? released_pages_.begin() : released_pages_.end();
+        const auto position = next_ == ServingStep::Stage || batch_->phase == Phase::Prefill ? released_pages_.begin() : released_pages_.end();
         released_pages_.insert(position, pages.begin(), pages.end());
         return nullptr;
     }
     throw std::invalid_argument("unknown native control message: " + kind);
+}
+
+Batch NativeController::resident_batch(const nlohmann::json & requests) const {
+    std::vector<KvDemand> demands;
+    std::set<std::size_t> members;
+    for (const auto & value : requests) {
+        const auto identity = value.get<std::size_t>();
+        if (identity >= arrived_ || !members.insert(identity).second || !resources_.residence(identity).slot)
+            throw std::invalid_argument("native selection requires unique resident requests");
+        demands.push_back({ identity, 0 });
+    }
+    return resources_.plan(Phase::Decode, demands);
 }
 
 BatchEffects NativeController::result_effects(const nlohmann::json & members) const {
@@ -158,7 +200,15 @@ void NativeController::finish(const ServingAction & action, std::span<const std:
     running_.reset();
     if (action.step == ServingStep::Stage) next_ = ServingStep::ReadResult;
     else if (action.step == ServingStep::ReadResult) next_ = ServingStep::Result;
-    else {
+    else if (action.step == ServingStep::Release) {
+
+        // Retraction frees residency, not request progress; native code decides when to retry Prefill.
+        if (!std::ranges::equal(returned_pages, released_pages_)) throw std::invalid_argument("native retraction differs from release graph effects");
+        resources_.release(action.work->batch.members.front().request);
+        resources_.return_pages(returned_pages);
+        released_pages_.clear();
+    }
+    else if (action.step == ServingStep::Result) {
 
         // Native effects describe releases; graph completion makes those resources reusable.
         if (!std::ranges::equal(returned_pages, released_pages_)) throw std::invalid_argument("native releases differ from result graph effects");
@@ -173,7 +223,7 @@ void NativeController::finish(const ServingAction & action, std::span<const std:
         released_requests_.clear();
         released_pages_.clear();
         batch_.reset();
-        next_ = ServingStep::Stage;
+        next_ = ServingStep::Batch;
         ++flow_;
     }
     peer_.send({

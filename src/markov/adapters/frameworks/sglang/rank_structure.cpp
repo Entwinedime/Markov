@@ -109,6 +109,8 @@ RankProgram RankStructure::expand(const ServingAction & action) {
         const auto output = model(batch, inputs);
         return complete(batch, effects, action.lane, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), action.step == ServingStep::Model);
     }
+    case ServingStep::Select:
+        return select(batch, action.lane);
     case ServingStep::Reserve:
         return reserve(batch);
     case ServingStep::Accept:
@@ -120,22 +122,51 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     }
 }
 
+void RankStructure::begin_schedule(Phase phase, std::size_t members) {
+    std::map<std::string, std::size_t> state;
+    if (free_pages_) state.emplace("free_pages", *free_pages_);
+    if (request_map_) state.emplace("request_map", *request_map_);
+    graph_.begin_composition("Schedule",
+                             phase == Phase::Prefill ? "prefill" : "decode",
+                             {
+                                 { "scheduled_members", static_cast<std::int64_t>(members) }
+    },
+                             state);
+}
+
+RankProgram RankStructure::select(const Batch & batch, std::size_t lane) {
+    const auto begin = shared_.regions.size();
+    auto & views = views_.at(lane);
+    if (!graph_.composition()) {
+        begin_schedule(batch.phase, batch.members.size());
+        views.join_prefill(batch.phase);
+    }
+    const auto filtered = views.select(batch.members);
+    auto completion = shared_.execution.region_call(filtered).returned;
+    if (batch.members.empty()) {
+        const auto schedule = graph_.composition().value();
+        graph_.end_composition({});
+        completion = shared_.execution.region_call(schedule).returned;
+    }
+    stamp(begin);
+    return { std::nullopt, completion, {} };
+}
+
 std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, std::size_t lane) {
     const auto begin = shared_.regions.size();
     merge_pages(batch);
     const auto columns = batch_operands(batch, settings_.page_size);
     const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
-    std::map<std::string, std::size_t> state;
-    if (free_pages_) state.emplace("free_pages", *free_pages_);
-    if (request_map_) state.emplace("request_map", *request_map_);
-    graph_.begin_composition("Schedule",
-                             phase,
-                             {
-                                 { "scheduled_members", static_cast<std::int64_t>(batch.members.size()) }
-    },
-                             state);
     auto & views = views_.at(lane);
-    views.advance(batch.phase);
+    if (!graph_.composition()) {
+        begin_schedule(batch.phase, batch.members.size());
+        views.advance(batch.phase);
+    }
+    else {
+
+        // Native filtering and resource releases already opened this scheduling call.
+        shared_.regions.at(*graph_.composition())["parameters"]["scheduled_members"] = batch.members.size();
+    }
     auto invocation = this->invocation(batch);
 
     GroupValues groups;
