@@ -18,7 +18,7 @@ public:
           columns_(columns),
           sequence_dtype_(std::move(sequence_dtype)),
           extend_dtype_(std::move(extend_dtype)) {}
-    std::vector<NativeCall> describe(Phase phase, const AttentionInput & input) const override;
+    std::vector<NativeCall> describe(Phase phase, const AttentionInput & input, std::span<const Work>) const override;
 
 private:
     double capacity_, rows_, columns_;
@@ -41,7 +41,7 @@ void append(std::vector<NativeCall> & calls, const std::string & prefix, const F
     calls.push_back(std::move(call));
 }
 
-std::vector<NativeCall> Metadata::describe(Phase phase, const AttentionInput & input) const {
+std::vector<NativeCall> Metadata::describe(Phase phase, const AttentionInput & input, std::span<const Work>) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill.metadata." : "decode.metadata.";
     const auto pages = std::ceil(input.context_tokens / input.page_tokens);
     const Features shape{

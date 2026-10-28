@@ -105,10 +105,15 @@ std::vector<ComputeObservation> read_tensor_work(const ProbeEvent & event) {
         };
         std::vector<Copies> groups;
         for (const auto & slot : a.at("slots")) {
-            if (!slot.at("copy_from_batch").get<bool>() || !slot.at("source_tensor").get<bool>() || slot.at("buffer_device") == "cpu") continue;
-            if (slot.at("custom_source").get<bool>() || slot.at("custom_slice").get<bool>() || slot.at("post_fill").get<bool>()
-                || slot.at("buffer_device") != "npu" || slot.at("source_device") != "npu")
-                return {};
+            if (slot.at("custom_source").get<bool>() || slot.at("post_fill").get<bool>()) return {};
+            if (!slot.at("copy_from_batch").get<bool>() || !slot.at("source_tensor").get<bool>()) continue;
+            if (slot.at("custom_slice").get<bool>() || slot.at("source_device") != slot.at("buffer_device")) return {};
+            if (slot.at("buffer_device") == "cpu") {
+                // The measured host preparation owns same-dtype batch lengths.
+                if (slot.at("axis") != "bs" || slot.at("source_dtype") != slot.at("buffer_dtype") || slot.at("source_shape").size() != 1) return {};
+                continue;
+            }
+            if (slot.at("buffer_device") != "npu") return {};
             double width = 1;
             for (std::size_t i = 1; i < slot.at("source_shape").size(); ++i) width *= slot.at("source_shape").at(i).get<double>();
             const auto source_type = slot.at("source_dtype").get<std::string>(), destination_type = slot.at("buffer_dtype").get<std::string>();
@@ -116,6 +121,9 @@ std::vector<ComputeObservation> read_tensor_work(const ProbeEvent & event) {
                 std::ranges::find_if(groups, [&](const Copies & copy) { return copy.source_type == source_type && copy.destination_type == destination_type; });
             if (group == groups.end()) group = groups.insert(groups.end(), { source_type, destination_type });
             ++group->tensors;
+
+            // Mixed-dtype foreach submits separately for each converted tensor.
+            if (source_type != destination_type && group->tensors > 1) return {};
             if (slot.at("axis") == "tokens") group->per_query += width;
             else if (slot.at("axis") == "bs") group->per_batch += width;
             else return {};
@@ -172,6 +180,13 @@ std::vector<ComputeObservation> read_tensor_work(const ProbeEvent & event) {
         std::vector<ComputeObservation> result;
         result.push_back(tensor("rotary_table.gather", "aten.index_select" + types, a.at("positions_shape").at(0), 1, fixed, scaled));
         result.push_back(tensor("rotary_table.repeat", "aten.repeat" + types, a.at("positions_shape").at(0), 1, fixed, scaled));
+        for (const auto * output : { "cos_copy", "sin_copy" }) {
+            auto copy = tensor(std::string("rotary_table.") + output, "aten.clone" + types, a.at("positions_shape").at(0), 1, fixed, scaled);
+
+            // Chunked outputs have row stride 2*width; a single row is a view.
+            std::get<TensorGeometry>(copy.operation.geometry).single_query_view = true;
+            result.push_back(std::move(copy));
+        }
         return result;
     }
     if (name == "runtime.phase.qkv_norm_rope") {

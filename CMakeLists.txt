@@ -55,6 +55,7 @@ add_library(markov_adapters
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/sglang/observations.cpp
     src/markov/adapters/sglang/dense.cpp
+    src/markov/adapters/sglang/dense_calls.cpp
     src/markov/adapters/sglang/cache.cpp
     src/markov/adapters/sglang/metadata.cpp
 )

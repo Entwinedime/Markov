@@ -14,6 +14,8 @@ std::vector<Work> ComputeOperation::describe(Phase phase, const ComputeInput & i
     const std::string prefix = phase == Phase::Prefill ? "prefill." : "decode.";
     if (const auto * shape = std::get_if<TensorGeometry>(&geometry)) {
         const auto & frame = std::get<AttentionInput>(input);
+        if (shape->single_query_view && frame.query_tokens == 1) return {};
+
         auto features = shape->fixed;
         for (const auto & [name, count] : shape->per_query_token) features[name] += count * frame.query_tokens;
         for (const auto & [name, count] : shape->per_request) features[name] += count * frame.batch_size;

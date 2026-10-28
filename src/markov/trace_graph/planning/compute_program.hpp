@@ -20,8 +20,9 @@ struct FrameCompute {
 };
 
 struct ComputeStats {
-    std::size_t collective_services = 0, participant_arrivals = 0, queue_dependencies = 0;
-    std::size_t metadata_sequences = 0, native_operations = 0, dispatch_delays = 0;
+    std::size_t collective_services = 0, participant_arrivals = 0;
+    std::size_t compute_calls = 0, compute_services = 0;
+    std::size_t metadata_sequences = 0, metadata_operations = 0, native_operations = 0, dispatch_delays = 0;
     graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
     void add(const ComputeStats & other);
 };
@@ -43,21 +44,19 @@ public:
     const ComputeStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, MetadataDone, Complete };
+    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, Complete };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {
-        std::size_t first, last;
+        NativePlan plan;
         std::optional<std::size_t> collective;
-        std::size_t participant;
-        std::optional<std::size_t> metadata = std::nullopt;
+        std::size_t participant = 0;
+        ComputeStats stats;
     };
     struct Frame {
-        FrameCompute compute;
         std::vector<Segment> segments;
         std::size_t at = 0;
         std::optional<std::size_t> next;
-        std::vector<NativePlan> metadata;
     };
     struct Arrival {
         graph::Time time_ns;
@@ -71,6 +70,7 @@ private:
     };
 
     void segment(ProgramRuntime & runtime, std::size_t frame, std::optional<graph::NodeId> cause);
+    bool append_compute(const FrameCompute & frame, std::size_t first, std::size_t last, CallResources resources, Segment & segment);
     void arrive(ProgramRuntime & runtime, std::size_t frame, const simulation::Event & event);
 
     const source::SourceContext & source_;

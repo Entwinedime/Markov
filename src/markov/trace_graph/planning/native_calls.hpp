@@ -24,17 +24,18 @@ struct NativeCall {
 class CallSequence {
 public:
     virtual ~CallSequence() = default;
-    virtual std::vector<NativeCall> describe(Phase phase, const AttentionInput & input) const = 0;
+    virtual std::vector<NativeCall> describe(Phase phase, const AttentionInput & input, std::span<const Work> work = {}) const = 0;
 };
 
 struct CallResources {
     std::size_t caller, worker, device;
+    bool operator==(const CallResources &) const = default;
 };
 
 class NativePlan {
 public:
-    NativePlan(std::span<const NativeCall> calls, CallResources resources);
-    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, graph::NodeId cause) const;
+    void extend(std::span<const NativeCall> calls, CallResources resources);
+    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
     std::size_t operations() const { return work_.size(); }
     std::size_t delays() const;
 

@@ -54,14 +54,10 @@ struct SubsetExecution {
         }
         auto result = simulation::ProgramExecution(program, costs, program.resources()).run();
         executed_nodes += result.execution.executed;
-        std::size_t bound = 0;
-        for (const auto & [kind, count] : result.coverage) {
-            coverage[cost_coverage_name(kind)] += count;
-            bound += count;
-        }
+        for (const auto & [kind, count] : result.coverage) { coverage[cost_coverage_name(kind)] += count; }
         const auto & stats = program.stats();
         compute.add(stats);
-        service_operations += bound - stats.collective_services - stats.native_operations;
+        service_operations += stats.compute_services;
         if (result.cost_gap) {
             issue = cost_gap_json(*result.cost_gap);
             return;
@@ -76,12 +72,13 @@ struct SubsetExecution {
             {        "completed_frames",                                      completed_frames },
             {          "executed_nodes",                                        executed_nodes },
             {      "service_operations",                                    service_operations },
-            {      "queue_dependencies",                            compute.queue_dependencies },
+            {           "compute_calls",                                 compute.compute_calls },
             {     "collective_services",                           compute.collective_services },
             {    "participant_arrivals",                          compute.participant_arrivals },
             {     "participant_wait_ns",                           compute.participant_wait_ns },
             { "maximum_arrival_span_ns",                       compute.maximum_arrival_span_ns },
             {      "metadata_sequences",                            compute.metadata_sequences },
+            {     "metadata_operations",                           compute.metadata_operations },
             {       "native_operations",                             compute.native_operations },
             {         "dispatch_delays",                               compute.dispatch_delays },
             {                "coverage",                                              coverage },
@@ -90,10 +87,10 @@ struct SubsetExecution {
             {                   "issue",                                                 issue },
             {           "e2e_predicted",                                                 false },
             {           "qualification",
-             "Known compute and attention metadata with caller/worker/device dependencies and blocking collective rendezvous. Metadata completes before "
-             "the device-only body; body CPU overlap is not modeled. Idle synchronization approximates ready-state service, not wake-up under load. All "
-             "participants share the latest collective completion. Placement changes, other cross-stream data, cache and remaining CPU dependencies are "
-             "incomplete; no frame or E2E latency is reported."                               }
+             "Known compute calls and attention metadata share caller/worker/device chains and blocking collective rendezvous. Idle synchronization "
+             "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call and "
+             "collective CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
+             "reported."                                                                      }
         };
     }
 };
@@ -164,10 +161,10 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {       "response_evaluations",                                       queries.evaluations() - evaluation_begin },
         {              "e2e_predicted",                                                                          false },
         {              "qualification",
-         "Cache I/O, known compute and attention metadata only. Metadata includes caller/worker/device work; its final join precedes the device-only body. "
-         "Idle synchronization approximates ready-state service, not wake-up under load. Symmetric participant services and dedicated copy queues are "
-         "assumed. Query/admission, body CPU and other cross-stream dependencies remain incomplete. All participants share the latest collective "
-         "completion, omitting per-rank completion spread. No HTTP latency is reported."                              }
+         "Cache I/O, known compute calls and attention metadata share one clock. Native calls share continuous caller/worker/device chains. Idle "
+         "synchronization approximates ready-state service, not wake-up under load. Symmetric participant services and dedicated copy queues are assumed. "
+         "Query/admission, inter-call and collective CPU and other cross-stream dependencies remain incomplete. All participants share the latest "
+         "collective completion, omitting per-rank completion spread. No HTTP latency is reported."                   }
     };
     const auto & compute = program.compute_stats();
     report["collective_execution"] = {
@@ -177,9 +174,14 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
     };
     report["metadata_execution"] = {
-        {       "sequences", compute.metadata_sequences },
-        {      "operations",  compute.native_operations },
-        { "dispatch_delays",    compute.dispatch_delays }
+        {  "sequences",  compute.metadata_sequences },
+        { "operations", compute.metadata_operations }
+    };
+    report["native_call_execution"] = {
+        {    "compute_calls",     compute.compute_calls },
+        { "compute_services",  compute.compute_services },
+        {       "operations", compute.native_operations },
+        {  "dispatch_delays",   compute.dispatch_delays }
     };
     if (const auto * storage = program.storage()) {
         const auto & stats = storage->stats();

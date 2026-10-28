@@ -292,7 +292,11 @@ void ProbeReader::observe_compute(const ProbeEvent & event) {
         for (auto & operation : part.operation.describe(frame.phase, part.input)) work.push_back(std::move(operation));
         recipe.push_back({ std::move(part.operation), part.rows });
     }
-    const auto description = output_.describe_work(std::move(work), std::move(recipe));
+    const auto caller = event.name + ":" + args.value("implementation", std::string{});
+    auto calls = read_dense_calls(event, recipe);
+    const auto description = output_.describe_work(std::move(work), std::move(recipe), caller, std::move(calls.parameters));
+    auto & definition = output_.work_descriptions[description];
+    if (!definition.calls) definition.calls = std::move(calls.definition);
     output_.work_observations.push_back({ description, resource, event.begin_ns, event.end_ns, event.record, context->second, layer });
 }
 

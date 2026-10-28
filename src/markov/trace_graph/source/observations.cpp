@@ -48,9 +48,10 @@ void Observations::normalize_resources() {
         for (auto & call : frame.metadata) call.region.resource = canonical_resource(call.region.resource);
 }
 
-Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe) {
-    const auto [entry, inserted] = work_ids_.try_emplace(std::pair(recipe, work), work_descriptions.size());
-    if (inserted) work_descriptions.push_back({ std::move(work), std::move(recipe) });
+Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe, std::string caller,
+                                  planning::Features call_parameters) {
+    const auto [entry, inserted] = work_ids_.try_emplace(std::tuple(recipe, work, std::move(caller), std::move(call_parameters)), work_descriptions.size());
+    if (inserted) work_descriptions.push_back({ std::move(work), std::move(recipe), nullptr });
     return entry->second;
 }
 

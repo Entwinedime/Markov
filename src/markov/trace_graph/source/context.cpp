@@ -42,14 +42,14 @@ void SourceContext::index_cpu_intervals() {
 
     auto intervals = cpu_intervals(observations_, graph_, regions);
     auto at = observations_.work_observations.size();
-    const auto resources = call_resources(observations_, std::span(regions).subspan(at));
-    std::size_t resource = 0;
+    auto resources = call_resources(observations_, regions);
     for (const auto & frame : observations_.compute_frames) {
         metadata_intervals_.emplace_back(intervals.begin() + at, intervals.begin() + at + frame.metadata.size());
-        metadata_resources_.emplace_back(resources.begin() + resource, resources.begin() + resource + frame.metadata.size());
+        metadata_resources_.emplace_back(resources.begin() + at, resources.begin() + at + frame.metadata.size());
         at += frame.metadata.size();
-        resource += frame.metadata.size();
     }
+    resources.resize(observations_.work_observations.size());
+    compute_resources_ = std::move(resources);
     intervals.resize(observations_.work_observations.size());
     cpu_work_intervals_ = std::move(intervals);
 }

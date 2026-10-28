@@ -25,7 +25,7 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
     append(work, residual, resource, tail);
 }
 
-NativePlan::NativePlan(std::span<const NativeCall> calls, CallResources resources) {
+void NativePlan::extend(std::span<const NativeCall> calls, CallResources resources) {
     for (const auto & call : calls) {
         cpu(call.work, "cpu_service", "residual_interval", resources.caller, caller_);
         if (call.kind == CallKind::Cpu) continue;
@@ -59,7 +59,8 @@ NativePlan::NativePlan(std::span<const NativeCall> calls, CallResources resource
 
 std::size_t NativePlan::delays() const { return std::ranges::count(steps_, true, &Step::delay); }
 
-PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, graph::NodeId cause) const {
+PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion,
+                                     std::optional<graph::NodeId> cause) const {
     PlannedMutation result{ owner, {}, {} };
     std::vector<bool> has_input(work_.size(), false);
     for (std::size_t id = 0; id < work_.size(); ++id)
@@ -69,13 +70,13 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
         has_input[edge.to] = true;
     }
     for (std::size_t id = 0; id < has_input.size(); ++id)
-        if (!has_input[id]) result.dependencies.push_back({ cause, begin + id, graph::EdgeKind::DataDependency });
+        if (cause && !has_input[id]) result.dependencies.push_back({ *cause, begin + id, graph::EdgeKind::DataDependency });
 
     const auto end = begin + work_.size();
     result.operations.push_back({ 0, Boundary{}, completion });
     for (const auto tail : { caller_, worker_, device_ })
         if (tail) result.dependencies.push_back({ begin + *tail, end, graph::EdgeKind::DataDependency });
-    if (work_.empty()) result.dependencies.push_back({ cause, end, graph::EdgeKind::DataDependency });
+    if (work_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
     return result;
 }
 

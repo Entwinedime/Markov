@@ -40,9 +40,11 @@ Json cpu_interval_summary(const source::SourceContext & source) {
     };
     const auto & observed = source.observations();
     std::vector<Summary> compute(observed.work_descriptions.size());
+    std::vector<std::size_t> native_bindings(compute.size(), 0);
     for (source::Index id = 0; id < observed.work_observations.size(); ++id) {
         const auto & work = observed.work_observations[id];
         compute[work.description].include(source.cpu_work_interval(id), work.end_ns - work.begin_ns);
+        native_bindings[work.description] += source.compute_resources(id).has_value();
     }
     Summary metadata;
     std::size_t metadata_rules = 0, metadata_queues = 0;
@@ -68,6 +70,8 @@ Json cpu_interval_summary(const source::SourceContext & source) {
     for (std::size_t id = 0; id < compute.size(); ++id) {
         auto item = describe(compute[id]);
         item["work_description"] = id;
+        item["native_resource_bindings"] = native_bindings[id];
+        item["native_call_rule"] = observed.work_descriptions[id].calls != nullptr;
         descriptions.push_back(std::move(item));
     }
     return {

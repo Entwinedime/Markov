@@ -62,6 +62,7 @@ struct CacheWriteGeometry {
 struct TensorGeometry {
     std::string operation;
     Features fixed, per_query_token, per_request;
+    bool single_query_view = false;
     auto operator<=>(const TensorGeometry &) const = default;
 };
 

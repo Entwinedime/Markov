@@ -1,10 +1,8 @@
 #include "markov/trace_graph/planning/compute_program.hpp"
 
 #include <algorithm>
-#include <functional>
 #include <limits>
 #include <map>
-#include <span>
 #include <tuple>
 #include <utility>
 
@@ -13,48 +11,45 @@ namespace markov::trace_graph::planning {
 void ComputeStats::add(const ComputeStats & other) {
     collective_services += other.collective_services;
     participant_arrivals += other.participant_arrivals;
-    queue_dependencies += other.queue_dependencies;
+    compute_calls += other.compute_calls;
+    compute_services += other.compute_services;
     metadata_sequences += other.metadata_sequences;
+    metadata_operations += other.metadata_operations;
     native_operations += other.native_operations;
     dispatch_delays += other.dispatch_delays;
     participant_wait_ns += other.participant_wait_ns;
     maximum_arrival_span_ns = std::max(maximum_arrival_span_ns, other.maximum_arrival_span_ns);
 }
 
-namespace {
-
-PlannedMutation compute_segment(const source::SourceContext & source, const FrameCompute & frame, std::size_t first, std::size_t last, graph::NodeId begin,
-                                simulation::Action completion, std::optional<graph::NodeId> cause) {
-    PlannedMutation mutation{ ComputeProgram::owner, {}, {} };
-    const auto & plan = frame.plan;
-    for (auto at = first; at < last; ++at) {
-        const auto & operation = plan.operations[at];
-        const auto resource = operation.work ? source.device_service(operation.source_operation).resource.value() : 0;
-        if (operation.work) mutation.operations.push_back({ resource, std::cref(plan.work[*operation.work]) });
-        else mutation.operations.push_back({ resource, Boundary{} });
-    }
-
-    std::vector<bool> has_input(last - first, false), has_successor(last - first, false);
-    for (const auto edges : { std::span(plan.dependencies), std::span(plan.queue_dependencies) }) {
-        auto at = std::ranges::lower_bound(edges, first, {}, &graph::Edge::from);
-        for (; at != edges.end() && at->from < last; ++at) {
-            if (at->to < first || at->to >= last) continue;
-            mutation.dependencies.push_back({ begin + at->from - first, begin + at->to - first, at->kind });
-            has_input[at->to - first] = true;
-            has_successor[at->from - first] = true;
+bool ComputeProgram::append_compute(const FrameCompute & frame, std::size_t first, std::size_t last, CallResources resources, Segment & segment) {
+    const auto & observed = source_.observations();
+    for (auto at = first; at < last;) {
+        const auto source_call = frame.plan.operations[at].source_operation;
+        const auto & call = observed.work_observations[source_call];
+        const auto & description = observed.work_descriptions[call.description];
+        if (!description.calls) {
+            issue_ = "compute_call_rule_unavailable";
+            return false;
         }
+        // A source view has no task. Its target copy uses the same proven frame
+        // execution context; an observed device call still needs its own binding.
+        const auto & binding = source_.compute_resources(source_call);
+        if ((!description.observed.empty() && !binding) || (binding && *binding != resources)) {
+            issue_ = "compute_call_queue_binding_unavailable";
+            return false;
+        }
+        std::vector<Work> work;
+        while (at < last && frame.plan.operations[at].source_operation == source_call) {
+            const auto & instance = frame.plan.operations[at++];
+            if (instance.work) work.push_back(frame.plan.work[*instance.work]);
+        }
+        const auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
+        segment.plan.extend(calls, resources);
+        ++segment.stats.compute_calls;
+        segment.stats.compute_services += work.size();
     }
-    const auto end = begin + mutation.operations.size();
-    mutation.operations.push_back({ 0, Boundary{}, completion });
-    for (std::size_t id = 0; id < has_successor.size(); ++id) {
-        if (cause && !has_input[id]) mutation.dependencies.push_back({ *cause, begin + id, graph::EdgeKind::DataDependency });
-        if (!has_successor[id]) mutation.dependencies.push_back({ begin + id, end, graph::EdgeKind::DataDependency });
-    }
-    if (first == last && cause) mutation.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
-    return mutation;
+    return true;
 }
-
-} // namespace
 
 ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource)
     : source_(source),
@@ -62,7 +57,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
     const auto & observed = source.observations();
     std::map<std::tuple<source::Index, WorkKind, source::Index>, std::size_t> jobs;
     std::map<source::Index, std::size_t> tails;
-    for (auto & input : frames) {
+    for (const auto & input : frames) {
         const auto operations = source.frame_operations(input.frame);
         if (operations.empty() || !input.plan.missing_row_bindings.empty() || !source.frame_queue_issues(input.frame).empty()) {
             issue_ = "unresolved_compute_work_or_queue";
@@ -73,6 +68,20 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             issue_ = "cross_thread_compute_requires_explicit_ports";
             return;
         }
+        if (std::ranges::any_of(input.plan.queue_dependencies, [](const graph::Edge & edge) { return edge.from > edge.to; })) {
+            issue_ = "source_stream_order_contradicts_caller_order";
+            return;
+        }
+        std::optional<CallResources> resources;
+        for (const auto call : operations)
+            if (source.compute_resources(call)) {
+                resources = source.compute_resources(call);
+                break;
+            }
+        if (!resources) {
+            issue_ = "frame_execution_resources_unavailable";
+            return;
+        }
         const auto id = frames_.size();
         const auto [tail, inserted] = tails.try_emplace(participant, id);
         if (inserted) roots_.push_back(id);
@@ -80,7 +89,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             frames_[tail->second].next = id;
             tail->second = id;
         }
-        frames_.push_back({ std::move(input), {}, 0, std::nullopt, {} });
+        frames_.push_back({});
         auto & frame = frames_.back();
         struct Fence {
             source::Time begin, end;
@@ -88,37 +97,38 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             bool metadata;
         };
         std::vector<Fence> fences;
-        for (const auto call_id : source.frame_collectives(frame.compute.frame)) {
+        for (const auto call_id : source.frame_collectives(input.frame)) {
             const auto & call = observed.collectives[call_id];
             fences.push_back({ call.begin_ns, call.end_ns, call_id, false });
         }
-        const auto & metadata = observed.compute_frames[frame.compute.frame].metadata;
-        const auto resources = source.metadata_resources(frame.compute.frame);
+        const auto & metadata = observed.compute_frames[input.frame].metadata;
+        const auto metadata_resources = source.metadata_resources(input.frame);
         for (std::size_t i = 0; i < metadata.size(); ++i) {
-            if (!metadata[i].definition || !resources[i] || resources[i]->caller != participant) {
+            if (!metadata[i].definition || !metadata_resources[i] || *metadata_resources[i] != *resources) {
                 issue_ = "metadata_rule_or_resources_unavailable";
                 return;
             }
             fences.push_back({ metadata[i].region.begin_ns, metadata[i].region.end_ns, i, true });
-            const auto calls = metadata[i].definition->describe(observed.compute_frames[frame.compute.frame].phase, frame.compute.variables);
-            frame.metadata.emplace_back(calls, *resources[i]);
         }
         std::ranges::sort(fences, {}, &Fence::begin);
         std::size_t first = 0;
+        Segment pending;
         for (const auto & fence : fences) {
             auto last = first;
-            while (last < frame.compute.plan.operations.size()
-                   && observed.work_observations[frame.compute.plan.operations[last].source_operation].end_ns <= fence.begin)
+            while (last < input.plan.operations.size() && observed.work_observations[input.plan.operations[last].source_operation].end_ns <= fence.begin)
                 ++last;
-            if (last < frame.compute.plan.operations.size()
-                && observed.work_observations[frame.compute.plan.operations[last].source_operation].begin_ns < fence.end) {
+            if (last < input.plan.operations.size() && observed.work_observations[input.plan.operations[last].source_operation].begin_ns < fence.end) {
                 issue_ = "overlapping_compute_call_requires_explicit_ports";
                 return;
             }
-
+            if (!append_compute(input, first, last, *resources, pending)) return;
+            first = last;
             if (fence.metadata) {
-                frame.segments.push_back({ first, last, std::nullopt, 0, fence.id });
-                first = last;
+                const auto calls = metadata[fence.id].definition->describe(observed.compute_frames[input.frame].phase, input.variables);
+                const auto before = pending.plan.operations();
+                pending.plan.extend(calls, *resources);
+                pending.stats.metadata_operations += pending.plan.operations() - before;
+                ++pending.stats.metadata_sequences;
                 continue;
             }
             const auto & call = observed.collectives[fence.id];
@@ -127,9 +137,8 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 issue_ = "collective_and_compute_have_different_callers";
                 return;
             }
-
             auto work = call.work;
-            const auto items = call.rows.basis == RowBasis::QueryTokens ? frame.compute.variables.query_tokens : frame.compute.variables.batch_size;
+            const auto items = call.rows.basis == RowBasis::QueryTokens ? input.variables.query_tokens : input.variables.batch_size;
             work.features["rows"] = items * call.rows.rows_per_item;
             work.features["logical_tensor_bytes"] = work.features.at("rows") * work.features.at("width") * work.features.at("element_bytes");
             const auto [job, created] = jobs.try_emplace(std::tuple(call.group, work.kind, call.sequence), collectives_.size());
@@ -145,21 +154,13 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 return;
             }
             collective.peers[member] = id;
-            frame.segments.push_back({ first, last, job->second, static_cast<std::size_t>(member) });
-            first = last;
+            pending.collective = job->second;
+            pending.participant = static_cast<std::size_t>(member);
+            frame.segments.push_back(std::move(pending));
+            pending = Segment{};
         }
-        frame.segments.push_back({ first, frame.compute.plan.operations.size(), std::nullopt, 0 });
-        std::vector<std::size_t> segment_ids(frame.compute.plan.operations.size());
-        for (std::size_t segment = 0; segment < frame.segments.size(); ++segment) {
-            const auto & range = frame.segments[segment];
-            std::fill(segment_ids.begin() + range.first, segment_ids.begin() + range.last, segment);
-        }
-        for (const auto & edge : frame.compute.plan.queue_dependencies) {
-            if (segment_ids[edge.from] > segment_ids[edge.to]) {
-                issue_ = "source_queue_order_contradicts_call_fence";
-                return;
-            }
-        }
+        if (!append_compute(input, first, input.plan.operations.size(), *resources, pending)) return;
+        frame.segments.push_back(std::move(pending));
     }
     for (const auto & collective : collectives_) {
         if (std::ranges::any_of(collective.peers, [](const auto & peer) { return !peer; })) {
@@ -178,23 +179,16 @@ void ComputeProgram::start(ProgramRuntime & runtime, std::optional<graph::NodeId
 void ComputeProgram::segment(ProgramRuntime & runtime, std::size_t id, std::optional<graph::NodeId> cause) {
     const auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
-    auto mutation = compute_segment(source_, frame.compute, range.first, range.last, runtime.next_node(), action(ActionKind::SegmentDone, id), cause);
-    const auto queues = std::ranges::count(mutation.dependencies, graph::EdgeKind::ResourceOrder, &graph::Edge::kind);
-    if (runtime.submit(std::move(mutation))) stats_.queue_dependencies += queues;
+    if (runtime.submit(range.plan.mutation(owner, runtime.next_node(), action(ActionKind::SegmentDone, id), cause))) {
+        stats_.add(range.stats);
+        stats_.native_operations += range.plan.operations();
+        stats_.dispatch_delays += range.plan.delays();
+    }
 }
 
 void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simulation::Event & event) {
     auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
-    if (range.metadata) {
-        const auto & plan = frame.metadata[*range.metadata];
-        if (runtime.submit(plan.mutation(owner, runtime.next_node(), action(ActionKind::MetadataDone, id), event.identity))) {
-            ++stats_.metadata_sequences;
-            stats_.native_operations += plan.operations();
-            stats_.dispatch_delays += plan.delays();
-        }
-        return;
-    }
     if (!range.collective) {
         if (frame.next) segment(runtime, *frame.next, event.identity);
         else {
@@ -242,10 +236,6 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
             ++frames_[*peer].at;
             segment(runtime, *peer, event.identity);
         }
-    }
-    else if (event.action.kind == std::to_underlying(ActionKind::MetadataDone)) {
-        ++frames_[event.action.subject].at;
-        segment(runtime, event.action.subject, event.identity);
     }
     else complete_ = true;
 }
