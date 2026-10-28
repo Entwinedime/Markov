@@ -63,8 +63,9 @@ source_compute_projection 用源变量核对这些原语是否保持原工作描
 源报告的 work_observations 计一次原生计算 probe 调用，work_descriptions 中每项的 operations 列出该配方展开的操作；操作数与调用数分别统计。
 projected_compute_dependencies 只计配方内部的数据依赖，尚不包含调用之间、跨层及 I/O 发布依赖，不能当作完整目标图的边数。
 提供 models 时，cost_execution 将已解释计算子集绑定独立成本并交给统一执行器，保留配方内部依赖和已证明的源设备队列顺序。
-缺工作变量、资源依据或成本时停止该目标的数值执行，其他独立目标继续；结构工作量仍完整生成，不能因模型缺失删除操作。
-这一子集已包含已解释的原生调用、注意力准备、分配和阻塞通信，但尚缺其余 CPU 和完整跨流依赖，不给出完整 E2E 耗时，也不验证目标 DAG 相似度或性能。
+缺工作变量、资源依据或成本时停止该目标的数值执行，其他独立目标继续；已生成的合法工作不因缺模型删除；尚未触发的动态分支不算已构建。
+成本缺口在 issue.gaps 汇总，scope 为 first_incomplete_mutation；相同工作点只出现一次。这只是首个无法提交片段的需求，不是整条目标路径的完整补采清单。
+这一子集已描述已解释的原生调用、注意力准备、分配、输入准备和阻塞通信，但尚缺其余 CPU 和完整跨流依赖，不给出完整 E2E 耗时，也不验证目标 DAG 相似度或性能。
 source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独立覆盖类别，不归入派发延迟或设备服务。
 可选 source_cpu_costs 为这些区间提供与 manifest 绑定的校正值，未覆盖部分仍保留原值；报告分别列覆盖、未校正量和估计值。
 近似假设同 caller 配方下间隔保持，不能推广为任意配置的 CPU 精度。来源未覆盖、含未建模原生提交或尚未表达依赖的已知等待时报告带原始坐标的缺口，不补零。
@@ -82,7 +83,8 @@ source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独�
 这个组件假设每个参与进程有独立的回载和备份队列，未包含其余 CPU 和完整跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
 
 数值执行须声明目标的 kernel_cache_initial_state。empty 表示相关内存与磁盘缓存均空；prepared 表示本次所需规格已经全部准备，不应将部分磁盘命中填成 prepared。
-每个目标单独维护规格准备状态；首次使用新规格时加入编译和加载，复用规格不重复加入。报告中的 planned_specializations/planned_first_loads 是计划数量，未完成目标不能据此认定真实执行完成。
+每个目标单独维护规格准备状态；首次使用新规格时加入编译和加载，复用规格不重复加入。每种启动器接口分别首次加载，共享运行环境只在第一个接口的对应观察中计入。
+报告中的 planned_specializations、planned_first_loads 和 planned_runtime_initializations 都是计划数量，未完成目标不能据此认定真实执行完成。
 未声明初始状态、分配输入缺失或工作不在已支持的签名/分支内时，目标明确停止；不能把该部分当作零成本。当前仅覆盖未排序 NPU 页池的融合 Prefill 分配及单 token Decode 分配。
 
 cache 内可增加 storage 对象，声明 backend 为 file、initial_state 为 empty，以及 prefetch_stop_policy。
