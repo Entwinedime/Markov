@@ -128,11 +128,13 @@ deployment 沿用预测请求的六项条件。每项工作为 operation、imple
 
 选定模型文件只有 deployment 和 models 两项。每个模型给出相同的操作/实现/计时口径、response、
 特征 ranges、完整 measured_points、extrapolation_features、allow_new_combinations 及 sources。
+可选 limitations 是已知测量与预测限制的文字列表；未提供时为空，不改变工作域或公式。
 response.form 为 affine 时包含 intercept_ns 和 coefficients_ns；为 coefficient_curve 时包含 feature 与 points，
 每个测点含 coordinate、intercept_ns 和 coefficients_ns。测点严格递增，曲线坐标的适用范围不得超出测点区间。
 这些是离线维护结果，不在查询过程中拟合；旧成本资产需显式转换单位和合同，程序不猜格式或长期兼容两套字段。
 
 报告逐项返回状态、可用时的整数 duration_ns、覆盖类别和模型来源引用。缺失或不支持的耗时为 null。
+used_models 同时保留 sources 和 limitations；page-work 的 cost_catalog.queried_model_limitations 汇总本次共享查询会话遇到的限制，不表示这些工作已经提交或执行。
 模型的部署条件必须与请求一致；不同 scope 的耗时不会被自动求和。查询完成不代表目标结构、完整 HTTP 或精度验收通过。
 报告不能覆盖查询文件或选定模型文件，写入失败时不以不完整文件替代原报告。
 
