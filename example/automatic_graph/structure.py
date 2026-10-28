@@ -374,16 +374,23 @@ class StructureComparison:
             index = target[key].popleft()
             native = self.batch_operations(self.observed, self.native_batches, batch["id"], True)
             predicted = self.batch_operations(self.prediction["graph"], self.target_batches, index, False)
+            paired, correspondence = self.operations.correspondence(native, predicted)
+            if correspondence["complete"]:
+                predicted = [paired[operation["id"]] for operation in native]
             comparison = self.operations.compare(native, predicted)
+            comparison["correspondence"] = correspondence
+            comparison["checks"]["call_correspondence"] = True if correspondence["complete"] else None
+            comparison["checks"]["caller_order"] = correspondence["caller_order"]
             work = native_work[batch["id"]]
             predicted_work = target_work[index]
             comparison["checks"].update(self.state(batch, index))
             self.compare_work(comparison, work, predicted_work)
             comparison.update(native_batch=batch["id"], target_flow=index)
-            if comparison["same_calls"]:
-                operation_pairs.update((left["id"], right) for left, right in zip(native, predicted, strict=True))
+            if paired:
+                operation_pairs.update(paired)
+                known = [operation for operation in native if operation["id"] in paired]
                 comparison["execution"] = ExecutionComparison(
-                    native, predicted, self.prediction["graph"]["execution"]
+                    known, [paired[operation["id"]] for operation in known], self.prediction["graph"]["execution"]
                 ).compare()
                 comparison["checks"]["execution_relations"] = comparison["execution"]["same"]
 

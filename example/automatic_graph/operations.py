@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from itertools import pairwise
 from typing import Any
+
+from execution import reachable_links
 
 
 class OperationComparison:
@@ -14,6 +17,78 @@ class OperationComparison:
         self.target_successors: dict[int, set[int]] = defaultdict(set)
         for edge in target["dependencies"]:
             self.target_successors[edge["source"]].add(edge["target"])
+
+        execution = target["execution"]
+        self.target_calls = {call["operation"]: call for call in execution["host_calls"] if "operation" in call}
+        entries = {call["entry"] for call in self.target_calls.values()}
+        resources = {node["id"]: node["resource"] for node in execution["nodes"] if node["id"] in entries}
+        self.target_actors = {operation: resources[call["entry"]] for operation, call in self.target_calls.items()}
+
+    def correspondence(
+        self, native: list[dict[str, Any]], target: list[dict[str, Any]]
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        native_groups = defaultdict(list)
+        target_groups = defaultdict(list)
+        for operation in native:
+
+            # Opaque native services declare their own resource, independently of the calling CPU thread.
+            service = operation.get("native_work")
+            actor = (
+                ("service", service["resource"])
+                if service is not None
+                else ("thread", self.source["regions"][operation["region"]]["thread"])
+            )
+            native_groups[actor].append(operation)
+        for operation in target:
+            target_groups[self.target_actors[operation["id"]]].append(operation)
+
+        # Concurrent actors may interleave differently; repeated calls retain their actor-local occurrence.
+        sequences = defaultdict(list)
+        for operations in native_groups.values():
+            signature = tuple((operation["kind"], operation["name"]) for operation in operations)
+            sequences[signature].append(operations)
+        candidates = defaultdict(list)
+        for operations in target_groups.values():
+            signature = tuple((operation["kind"], operation["name"]) for operation in operations)
+            candidates[signature].append(operations)
+        paired = {}
+        required = set()
+        unresolved = []
+        for signature, groups in sequences.items():
+            matches = candidates.get(signature, [])
+            if len(groups) != 1 or len(matches) != 1:
+                unresolved.append({"native_actors": len(groups), "target_candidates": len(matches)})
+                continue
+            (operations,) = groups
+            (matched,) = matches
+            paired.update((left["id"], right) for left, right in zip(operations, matched, strict=True))
+            required.update(
+                (self.target_calls[left["id"]]["return"], self.target_calls[right["id"]]["entry"])
+                for left, right in pairwise(matched)
+            )
+
+        # Matching a sequence does not prove that the target enforces the declared caller/service order.
+        missing = required - reachable_links(self.target_graph["execution"], required)
+        complete = len(paired) == len(native) == len(target)
+        return paired, {
+            "complete": complete,
+            "native_actors": len(native_groups),
+            "target_actors": len(target_groups),
+            "paired_operations": len(paired),
+            "unmatched_native_operations": len(native) - len(paired),
+            "unmatched_target_operations": len(target) - len(paired),
+            "unresolved_sequences": len(unresolved),
+            "unresolved_examples": unresolved[:3],
+            "same_serialized_order": (
+                [paired[operation["id"]]["id"] for operation in native] == [operation["id"] for operation in target]
+                if complete
+                else None
+            ),
+            "caller_order": not missing,
+            "caller_completion_links": len(required),
+            "missing_caller_links": len(missing),
+            "missing_examples": sorted(missing)[:3],
+        }
 
     def operation_rows(self, graph: dict[str, Any], selected: list[dict[str, Any]], observed: bool) -> list[Any]:
         values = self.source["values"] if observed else graph["values"]
