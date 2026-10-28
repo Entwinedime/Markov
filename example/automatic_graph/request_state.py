@@ -1,6 +1,7 @@
 """Check recorded ownership changes without choosing batches, slots or pages."""
 
 from collections import Counter
+from itertools import pairwise
 
 
 class RequestStateEvidence:
@@ -55,7 +56,12 @@ class RequestStateEvidence:
             )
             self.require(0 <= slot < self.pools[pool]["max_running_requests"], "slot_bounds", action, request)
             if allocate:
-                expected_tokens = self.requests[request]["prompt_tokens"] if action["phase"] == "prefill" else 1
+
+                # Recomputed Prefill includes the output history retained across a residency release.
+                expected_tokens = (
+                    self.requests[request]["prompt_tokens"] + self.generated[request]
+                    if action["phase"] == "prefill" else 1
+                )
                 self.require(member["new_tokens"] == expected_tokens, "model_input_tokens", action, request)
                 if key not in self.resident:
                     self.require(slot not in self.slots[pool], "exclusive_slot", action, request)
@@ -150,7 +156,7 @@ class RequestStateEvidence:
         )
         ordered = (
             [event[0] for event in events] == list(range(len(events)))
-            and all(left[1] <= right[1] for left, right in zip(events, events[1:]))
+            and all(left[1] <= right[1] for left, right in pairwise(events))
             and all(action["submitted_order"] < action["completed_order"] for action in actions)
         )
         if not ordered:
@@ -170,7 +176,7 @@ class RequestStateEvidence:
         )
         return {
             "status": "matched" if not self.failures and completed and recovered else "differences",
-            "scope": "cold KV, complete prefill, no prefix cache or preemption",
+            "scope": "cold KV, complete or recomputed prefill, explicit residency releases, no prefix cache",
             "state_events": len(events),
             "completed_requests": completed,
             "recovered_ownership": recovered,

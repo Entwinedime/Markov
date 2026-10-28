@@ -134,7 +134,7 @@ class ExecutionEvidence:
         required_steps = {"reserve", "model", "transfer", "accept", "release"}
         handoffs = defaultdict(dict)
         for item in decisions:
-            if item["step"] in required_steps:
+            if "pd" in self.result["configuration"] and item["step"] in required_steps:
                 for member in item["members"]:
                     handoffs[member["id"]].setdefault(item["step"], []).append(item)
         complete = {
