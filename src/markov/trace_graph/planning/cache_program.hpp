@@ -2,11 +2,14 @@
 
 #include "markov/trace_graph/planning/cache.hpp"
 #include "markov/trace_graph/planning/program.hpp"
+#include "markov/trace_graph/planning/storage.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::planning {
@@ -14,6 +17,7 @@ namespace markov::trace_graph::planning {
 struct CacheBackend {
     std::size_t layers, bytes_per_token, participants, minimum_load_tokens;
     WorkKind load, backup;
+    StorageBackend storage;
 };
 
 struct CacheRequestResult {
@@ -21,33 +25,41 @@ struct CacheRequestResult {
     bool completed = false;
 };
 
-// Finite two-tier cache and the known compute subset share one clock. Storage,
-// CPU and cross-stream communication are not represented by this component.
+// Cache/storage and the known compute subset share one clock. CPU,
+// communication and complete cross-stream dependencies remain outside this component.
 class CacheProgram final : public Program {
 public:
-    CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend);
+    CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
+                 std::optional<StorageConfig> storage = std::nullopt);
+
+    // Storage borrows this cache, so the program must remain at one address.
+    CacheProgram(const CacheProgram &) = delete;
     void start(ProgramRuntime & runtime) override;
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
-    bool complete() const override { return (issue_.has_value() || request_ == requests_.size()) && copies_.empty(); }
+    bool complete() const override { return (issue_.has_value() || request_ == requests_.size()) && copies_.empty() && (!storage_ || storage_->idle()); }
 
-    std::size_t resources() const { return source_.observations().resources.size() + 2 * backend_.participants; }
+    std::size_t resources() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
+    const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
     const std::vector<CacheRequestResult> & requests() const { return requests_; }
     const std::optional<std::string> & issue() const { return issue_; }
     std::size_t backups() const { return backups_; }
     std::size_t loads() const { return loads_; }
     std::size_t device_evictions() const { return device_evictions_; }
-    std::size_t host_evictions() const { return host_evictions_; }
-    std::size_t peak_device_pages() const { return peak_device_pages_; }
-    std::size_t peak_host_pages() const { return peak_host_pages_; }
+    std::size_t host_evictions() const { return host_evictions_ + (storage_ ? storage_->stats().host_evictions : 0); }
+    std::size_t peak_device_pages() const { return cache_.peak_pages(Tier::Device); }
+    std::size_t peak_host_pages() const { return cache_.peak_pages(Tier::Host); }
 
 private:
-    enum ActionKind { PhaseDone, CopyDone, EvictionDone };
+    enum class ActionKind : std::uint32_t { PhaseDone, CopyDone, EvictionDone };
+    static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
+
     struct PendingCopy {
         RadixId node;
         bool evict_after;
         CopyKind kind;
         std::size_t pages;
         graph::NodeId completion;
+        std::vector<PrefixId> storage_pages;
     };
 
     void advance(ProgramRuntime & runtime);
@@ -57,12 +69,12 @@ private:
     bool make_host_room(std::size_t pages);
     bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
-    void record_peak();
 
     const source::SourceContext & source_;
     const std::size_t page_tokens_;
     Cache cache_;
     const CacheBackend backend_;
+    std::optional<Storage> storage_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;
     std::vector<RadixId> pending_evictions_;
@@ -73,9 +85,9 @@ private:
     std::optional<graph::NodeId> cause_;
     std::size_t request_ = 0;
     std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evictions_ = 0;
-    std::size_t peak_device_pages_ = 0, peak_host_pages_ = 0;
     Phase phase_ = Phase::Prefill;
     bool waiting_ = false;
+    bool eviction_wait_ = false;
 };
 
 } // namespace markov::trace_graph::planning

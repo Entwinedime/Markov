@@ -29,6 +29,8 @@ public:
     graph::NodeId next_node() const override { return clock_.next_node(); }
     graph::Time now_ns() const override { return clock_.now_ns(); }
     std::optional<graph::NodeId> submit(planning::PlannedMutation mutation) override;
+    std::size_t schedule_at(graph::Time time_ns, Component owner, Action action) override { return clock_.schedule_at(time_ns, owner, action); }
+    void cancel_timer(std::size_t timer) override { clock_.cancel_timer(timer); }
 
 private:
     void on_event(Execution & execution, const Event & event) override;

@@ -39,6 +39,7 @@ target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_prediction
     src/markov/trace_graph/planning/cache_program.cpp
+    src/markov/trace_graph/planning/storage.cpp
     src/markov/trace_graph/planning/compute_program.cpp
     src/markov/trace_graph/simulation/program_execution.cpp
 )

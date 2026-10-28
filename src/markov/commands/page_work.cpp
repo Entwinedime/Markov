@@ -95,18 +95,38 @@ struct SubsetExecution {
 Json cache_execution(const source::SourceContext & source, std::size_t page_tokens, const adapters::sglang::CacheSettings & settings,
                      const planning::CacheBackend & backend, cost::Queries & queries) {
     const auto query_begin = queries.requests(), evaluation_begin = queries.evaluations();
-    planning::CacheProgram program(source, page_tokens, { settings.device_pages, settings.host_pages, backend.layers, settings.backup_after_hits }, backend);
+    planning::CacheProgram program(source,
+                                   page_tokens,
+                                   { settings.device_pages, settings.host_pages, backend.layers, settings.backup_after_hits },
+                                   backend,
+                                   settings.storage);
     auto result = simulation::ProgramExecution(program, queries, program.resources()).run();
     auto requests = Json::array();
     for (std::size_t i = 0; i < program.requests().size(); ++i) {
         const auto & request = program.requests()[i];
-        requests.push_back({
+        auto item = Json{
             {             "request", source.observations().requests[i].identity },
             {           "completed",                          request.completed },
             { "reused_device_pages",                   request.device_hit_pages },
             {        "loaded_pages",                       request.loaded_pages },
             {      "prefill_tokens",                     request.prefill_tokens }
-        });
+        };
+        if (const auto * storage = program.storage()) {
+            const auto & prefetch = storage->results()[i];
+            item["prefetch"] = {
+                {            "examined",        prefetch.examined },
+                {    "controller_ready",           prefetch.ready },
+                {         "worker_done",     prefetch.worker_done },
+                {     "requested_pages", prefetch.requested_pages },
+                {       "queried_pages",   prefetch.queried_pages },
+                {     "published_pages", prefetch.published_pages },
+                {      "accepted_pages",  prefetch.accepted_pages },
+                { "inserted_host_pages",  prefetch.inserted_pages },
+                {       "stopped_early",   prefetch.stopped_early },
+                {      "rebased_suffix",  prefetch.rebased_suffix }
+            };
+        }
+        requests.push_back(std::move(item));
     }
     Json issue = nullptr;
     if (result.cost_gap) issue = cost_gap_json(*result.cost_gap);
@@ -116,31 +136,62 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         };
     std::map<std::string, std::size_t> coverage;
     for (const auto & [kind, count] : result.coverage) coverage[cost_coverage_name(kind)] = count;
-    return {
+    Json report = {
         {                     "status",issue.is_null() ? "known_cache_compute_subset_executed" : "stopped"                                       },
-        {                      "issue",                                                                     std::move(issue) },
-        {      "device_capacity_pages",                                                                settings.device_pages },
-        {        "host_capacity_pages",                                                                  settings.host_pages },
-        {          "backup_after_hits",       settings.backup_after_hits ? Json(*settings.backup_after_hits) : Json(nullptr) },
-        {               "participants",                                                                 backend.participants },
-        {                     "layers",                                                                       backend.layers },
-        { "page_bytes_per_participant",                                                page_tokens * backend.bytes_per_token },
-        {          "peak_device_pages",                                                          program.peak_device_pages() },
-        {            "peak_host_pages",                                                            program.peak_host_pages() },
-        {         "backup_submissions",                                                                    program.backups() },
-        {           "load_submissions",                                                                      program.loads() },
-        {           "device_evictions",                                                           program.device_evictions() },
-        {             "host_evictions",                                                             program.host_evictions() },
-        {                   "requests",                                                                  std::move(requests) },
-        {             "executed_nodes",                                                            result.execution.executed },
-        {                   "coverage",                                                                  std::move(coverage) },
-        {            "logical_queries",                                                     queries.requests() - query_begin },
-        {       "response_evaluations",                                             queries.evaluations() - evaluation_begin },
-        {              "e2e_predicted",                                                                                false },
+        {                      "issue",                                                               std::move(issue) },
+        {      "device_capacity_pages",                                                          settings.device_pages },
+        {        "host_capacity_pages",                                                            settings.host_pages },
+        {          "backup_after_hits", settings.backup_after_hits ? Json(*settings.backup_after_hits) : Json(nullptr) },
+        {               "participants",                                                           backend.participants },
+        {                     "layers",                                                                 backend.layers },
+        { "page_bytes_per_participant",                                          page_tokens * backend.bytes_per_token },
+        {          "peak_device_pages",                                                    program.peak_device_pages() },
+        {            "peak_host_pages",                                                      program.peak_host_pages() },
+        {         "backup_submissions",                                                              program.backups() },
+        {           "load_submissions",                                                                program.loads() },
+        {           "device_evictions",                                                     program.device_evictions() },
+        {             "host_evictions",                                                       program.host_evictions() },
+        {                   "requests",                                                            std::move(requests) },
+        {             "executed_nodes",                                                      result.execution.executed },
+        {                   "coverage",                                                            std::move(coverage) },
+        {            "logical_queries",                                               queries.requests() - query_begin },
+        {       "response_evaluations",                                       queries.evaluations() - evaluation_begin },
+        {              "e2e_predicted",                                                                          false },
         {              "qualification",
-         "Finite two-tier cache with all-layer DMA and the known compute subset only. Dedicated per-participant copy queues are assumed; storage, CPU, "
-         "communication and complete cross-stream dependencies remain outside this component. No HTTP latency is reported." }
+         "Cache I/O and the known compute subset only. Symmetric participant services and dedicated copy queues are assumed. Query/admission and other CPU, "
+         "communication and complete cross-stream dependencies remain omitted; no HTTP latency is reported."          }
     };
+    if (const auto * storage = program.storage()) {
+        const auto & stats = storage->stats();
+        const auto & config = *settings.storage;
+        const std::map<planning::PrefetchPolicy, std::string> policies{
+            {   planning::PrefetchPolicy::Complete, "wait_complete" },
+            { planning::PrefetchPolicy::BestEffort,   "best_effort" },
+            {    planning::PrefetchPolicy::Timeout,       "timeout" }
+        };
+        report["storage"] = {
+            {        "initial_state",                         "empty"                                     },
+            {       "capacity_pages", config.capacity_pages ? Json(*config.capacity_pages) : Json(nullptr) },
+            { "prefetch_stop_policy",                                           policies.at(config.policy) },
+            {              "queries",                                                        stats.queries },
+            {           "prefetches",                                                     stats.prefetches },
+            {           "read_pages",                                                     stats.read_pages },
+            {         "copied_pages",                                                   stats.copied_pages },
+            {      "rejected_copies",                                                stats.rejected_copies },
+            {       "write_enqueues",                                                         stats.writes },
+            {            "new_pages",                                                      stats.new_pages },
+            {       "existing_pages",                                                 stats.existing_pages },
+            {       "disk_evictions",                                                 stats.disk_evictions },
+            {  "peak_reserved_pages",                                            stats.peak_reserved_pages },
+            {    "peak_stored_pages",                                              stats.peak_stored_pages },
+            {                 "idle",                                                      storage->idle() },
+            {        "qualification",
+             "Native service order with inferred stage costs. Queries and admission are logical only; best effort therefore stops at immediate admission. "
+             "Timeouts use this partial cost set, not complete runtime latency. Existing-key materialization is used to infer the write split; phase "
+             "durations are not separately measured."                                                     }
+        };
+    }
+    return report;
 }
 
 } // namespace

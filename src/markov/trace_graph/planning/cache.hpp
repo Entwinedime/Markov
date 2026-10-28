@@ -70,6 +70,7 @@ public:
     const CacheNode & node(RadixId id) const { return nodes_[id]; }
     std::size_t page_count(RadixId node) const;
     std::size_t used_pages(Tier tier) const;
+    std::size_t peak_pages(Tier tier) const { return tier == Tier::Device ? peak_device_pages_ : peak_host_pages_; }
     std::size_t available_pages(Tier tier) const;
     std::size_t ready_layers(RadixId node, Tier tier) const;
 
@@ -80,6 +81,8 @@ public:
     RadixId commit_device(std::span<const PrefixId> pages, BufferId buffer);
     RadixId commit_host(std::span<const PrefixId> pages, BufferId buffer);
     void release(BufferId buffer);
+    void trim(BufferId buffer, std::size_t remaining_pages);
+    std::size_t reclaim_host(std::size_t required_pages);
 
     void pin_device(RadixId node);
     void unpin_device(RadixId node);
@@ -128,6 +131,7 @@ private:
     };
     std::size_t used_device_pages_ = 0;
     std::size_t used_host_pages_ = 0;
+    std::size_t peak_device_pages_ = 0, peak_host_pages_ = 0;
     std::size_t next_identity_ = 0;
     std::size_t access_sequence_ = 0;
     std::map<BufferId, Buffer> buffers_;

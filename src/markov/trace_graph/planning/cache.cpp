@@ -77,6 +77,8 @@ std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
 bool Cache::take_pages(Tier tier, std::size_t pages) {
     if (pages > available_pages(tier)) return false;
     (tier == Tier::Device ? used_device_pages_ : used_host_pages_) += pages;
+    auto & peak = tier == Tier::Device ? peak_device_pages_ : peak_host_pages_;
+    peak = std::max(peak, used_pages(tier));
     return true;
 }
 
@@ -117,19 +119,16 @@ RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer) {
 RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
     const auto matched = match(pages);
     auto & allocation = buffers_.at(buffer);
-    auto needed = pages.size() - matched.pages;
-    for (const auto id : path(matched.node)) {
-        if (!nodes_[id].host) needed += tree_.nodes()[id].pages.size();
-    }
+    const auto needed = pages.size() - matched.pages;
     if (allocation.tier != Tier::Host || allocation.pages < needed) throw std::runtime_error("Host commit exceeds its reserved buffer");
 
     const auto inserted = tree_.insert(pages);
     apply_split(inserted);
-    for (const auto id : path(inserted.node)) {
-        if (!nodes_[id].host) {
-            nodes_[id].host = CacheSlot{};
-            allocation.pages -= tree_.nodes()[id].pages.size();
-        }
+    // Native host insertion discards any already-present radix prefix, even
+    // when that prefix is device-only; only a new suffix gets host allocation.
+    if (needed != 0) {
+        nodes_[inserted.node].host = CacheSlot{};
+        allocation.pages -= needed;
     }
     touch(inserted);
     return inserted.node;
@@ -139,6 +138,22 @@ void Cache::release(BufferId buffer) {
     const auto allocation = buffers_.at(buffer);
     return_pages(allocation.tier, allocation.pages);
     buffers_.erase(buffer);
+}
+
+void Cache::trim(BufferId buffer, std::size_t remaining_pages) {
+    auto & allocation = buffers_.at(buffer);
+    if (remaining_pages > allocation.pages) throw std::runtime_error("Cannot grow a reserved cache buffer by trimming it");
+    return_pages(allocation.tier, allocation.pages - remaining_pages);
+    allocation.pages = remaining_pages;
+}
+
+std::size_t Cache::reclaim_host(std::size_t required_pages) {
+    std::size_t removed = 0;
+    for (const auto node : eviction_order(Tier::Host)) {
+        if (available_pages(Tier::Host) >= required_pages) break;
+        removed += evict_host(node);
+    }
+    return removed;
 }
 
 void Cache::pin_device(RadixId node) {

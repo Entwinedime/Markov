@@ -3,30 +3,33 @@
 #include "markov/trace_graph/planning/compute_plan.hpp"
 #include "markov/trace_graph/planning/compute_program.hpp"
 
-#include <algorithm>
 #include <functional>
 #include <iterator>
 #include <utility>
 
 namespace markov::trace_graph::planning {
 
-CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend)
+CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
+                           std::optional<StorageConfig> storage)
     : source_(source),
       page_tokens_(page_tokens),
       cache_(config),
       backend_(std::move(backend)),
-      requests_(source.observations().requests.size()) {}
-
-void CacheProgram::record_peak() {
-    peak_device_pages_ = std::max(peak_device_pages_, cache_.used_pages(Tier::Device));
-    peak_host_pages_ = std::max(peak_host_pages_, cache_.used_pages(Tier::Host));
+      requests_(source.observations().requests.size()) {
+    if (storage)
+        storage_.emplace(cache_,
+                         source.observations().token_paths,
+                         page_tokens_,
+                         backend_.bytes_per_token,
+                         backend_.participants,
+                         source.observations().resources.size() + 2 * backend_.participants,
+                         requests_.size(),
+                         *storage,
+                         backend_.storage);
 }
 
 bool CacheProgram::make_host_room(std::size_t pages) {
-    for (const auto node : cache_.eviction_order(Tier::Host)) {
-        if (cache_.available_pages(Tier::Host) >= pages) break;
-        if (cache_.evict_host(node)) ++host_evictions_;
-    }
+    host_evictions_ += cache_.reclaim_host(pages);
     return cache_.available_pages(Tier::Host) >= pages;
 }
 
@@ -43,25 +46,26 @@ bool CacheProgram::submit(ProgramRuntime & runtime, PlannedMutation mutation) {
 }
 
 bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after) {
-    record_peak();
     const double page_bytes = page_tokens_ * backend_.bytes_per_token;
     const Work work{
         kind == CopyKind::Load ? backend_.load : backend_.backup,
         { { "bytes", pages * page_bytes }, { "operations", 1 }, { "page_bytes", page_bytes } }
     };
     const auto begin = runtime.next_node();
-    copies_.emplace(transfer, PendingCopy{ node, evict_after, kind, pages, begin + backend_.participants });
+    copies_.emplace(transfer,
+                    PendingCopy{ node,
+                                 evict_after,
+                                 kind,
+                                 pages,
+                                 begin + backend_.participants,
+                                 kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
     PlannedMutation mutation{ 0, {}, {} };
     for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
         const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
         mutation.operations.push_back({ resource, std::cref(work) });
         mutation.dependencies.push_back({ begin + rank, begin + backend_.participants, graph::EdgeKind::DataDependency });
     }
-    mutation.operations.push_back({
-        0,
-        Boundary{},
-        simulation::Action{ CopyDone, transfer }
-    });
+    mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::CopyDone, transfer) });
     const auto submitted = submit(runtime, std::move(mutation));
     if (submitted) kind == CopyKind::Load ? ++loads_ : ++backups_;
     return submitted;
@@ -84,24 +88,25 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
         }
     }
     if (!backups.empty()) {
+        eviction_wait_ = true;
         const auto end = runtime.next_node();
-        PlannedMutation batch{ 0, { { 0, Boundary{}, simulation::Action{ EvictionDone, request_ } } }, {} };
+        PlannedMutation batch{ 0, { { 0, Boundary{}, action(ActionKind::EvictionDone, request_) } }, {} };
         for (const auto completion : backups) batch.dependencies.push_back({ completion, end, graph::EdgeKind::DataDependency });
         submit(runtime, std::move(batch));
         return false;
     }
     if (cache_.available_pages(Tier::Device) >= pages) return true;
-    if (copies_.empty()) issue_ = "device_capacity_unavailable";
+    if (copies_.empty() && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
     return false;
 }
 
 void CacheProgram::start(ProgramRuntime & runtime) { advance(runtime); }
 
 void CacheProgram::advance(ProgramRuntime & runtime) {
-    if (issue_ || request_ == requests_.size()) return;
+    if (issue_ || eviction_wait_ || request_ == requests_.size()) return;
     waiting_ = true;
     for (const auto & barrier : source_.observations().workload_barriers) {
-        if (barrier.before_request == request_ && !copies_.empty()) return;
+        if (barrier.before_request == request_ && (!copies_.empty() || (storage_ && !storage_->idle()))) return;
     }
     if (request_pin_) {
         cache_.unpin_device(*request_pin_);
@@ -115,6 +120,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto & request = observed.requests[request_];
     const auto & tokens = observed.request_tokens.at(request.identity);
     const auto lookup = observed.token_paths.pages(tokens.lookup_input.value().path, page_tokens_);
+    if (storage_ && !storage_->prepare(runtime, request_, lookup, cause_)) { return; }
     const auto matched = cache_.match(lookup);
     request_pin_ = matched.device;
     cache_.pin_device(*request_pin_);
@@ -130,6 +136,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
         if (cache_.ready_layers(matched.host, Tier::Host) != backend_.layers) return;
         if (!make_device_room(runtime, host_pages - device_pages)) return;
         const auto started = cache_.begin_load(matched.host);
+        if (started.status == CopyStatus::SourceNotReady) return;
         if (started.status == CopyStatus::Started) {
             cache_.unpin_host(*host_pin_);
             host_pin_.reset();
@@ -142,7 +149,6 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
     if (!make_device_room(runtime, active_pages - device_pages)) return;
     buffer_ = cache_.reserve(Tier::Device, active_pages - device_pages).value();
-    record_peak();
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
@@ -192,11 +198,7 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         return;
     }
     const auto end = begin + mutation.operations.size();
-    mutation.operations.push_back({
-        0,
-        Boundary{},
-        simulation::Action{ PhaseDone, request_ }
-    });
+    mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::PhaseDone, request_) });
     for (const auto completion : completions) mutation.dependencies.push_back({ completion, end, graph::EdgeKind::DataDependency });
     submit(runtime, std::move(mutation));
 }
@@ -223,14 +225,23 @@ void CacheProgram::commit(ProgramRuntime & runtime) {
 }
 
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
+    if (event.owner == Storage::owner) {
+        const auto changed = storage_->on_event(runtime, event);
+        if (changed && waiting_) {
+            cause_ = event.origin == simulation::EventOrigin::Completion ? std::optional(event.identity) : std::nullopt;
+            advance(runtime);
+        }
+        return;
+    }
     cause_ = event.identity;
-    if (event.action.kind == CopyDone) {
+    if (event.action.kind == std::to_underlying(ActionKind::CopyDone)) {
         const auto transfer = event.action.subject;
-        const auto pending = copies_.at(transfer);
+        auto pending = std::move(copies_.at(transfer));
         // This backend copies every layer in one DMA; publish once after all
         // participating copies, then acknowledge and release their pins.
         cache_.publish_all(transfer);
         cache_.acknowledge(transfer);
+        if (storage_ && pending.kind == CopyKind::Backup) storage_->enqueue_write(runtime, pending.node, std::move(pending.storage_pages), event.identity);
         copies_.erase(transfer);
         if (pending.kind == CopyKind::Load) requests_[request_].loaded_pages += pending.pages;
         if (pending.evict_after) {
@@ -239,7 +250,8 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         if (waiting_) advance(runtime);
     }
-    else if (event.action.kind == EvictionDone) {
+    else if (event.action.kind == std::to_underlying(ActionKind::EvictionDone)) {
+        eviction_wait_ = false;
         // The explicit join preserves the whole backup batch in the DAG,
         // instead of depending only on whichever rank happened to finish last.
         for (const auto node : pending_evictions_) {

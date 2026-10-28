@@ -35,6 +35,8 @@ public:
     virtual graph::NodeId next_node() const = 0;
     virtual graph::Time now_ns() const = 0;
     virtual std::optional<graph::NodeId> submit(PlannedMutation mutation) = 0;
+    virtual std::size_t schedule_at(graph::Time time_ns, simulation::Component owner, simulation::Action action) = 0;
+    virtual void cancel_timer(std::size_t timer) = 0;
 };
 
 class Program {

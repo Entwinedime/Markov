@@ -5,7 +5,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -13,9 +15,54 @@
 #include <variant>
 
 namespace markov::adapters::sglang {
+namespace {
+
+trace_graph::planning::StorageConfig read_storage(const nlohmann::json & raw, std::size_t device_pages, std::size_t host_pages) {
+    using namespace trace_graph::planning;
+    const std::set<std::string> fields{ "backend", "initial_state", "capacity_pages", "prefetch_stop_policy", "prefetch_threshold_tokens", "prefetch_timeout" };
+    if (!raw.is_object()) throw std::runtime_error("Storage settings must be an object");
+    for (const auto & [key, value] : raw.items()) {
+        if (!fields.contains(key)) throw std::runtime_error("Unknown storage setting: " + key);
+    }
+    if (raw.at("backend") != "file" || raw.at("initial_state") != "empty")
+        throw std::runtime_error("Storage execution currently requires file storage with declared empty initial contents");
+    std::optional<std::size_t> capacity;
+    if (raw.contains("capacity_pages") && !raw.at("capacity_pages").is_null()) {
+        if (!raw.at("capacity_pages").is_number_integer() || raw.at("capacity_pages").get<std::int64_t>() < 1)
+            throw std::runtime_error("Storage capacity must be a positive page count or null");
+        capacity = raw.at("capacity_pages").get<std::size_t>();
+    }
+    const auto policy = raw.at("prefetch_stop_policy").get<std::string>();
+    PrefetchPolicy stop;
+    if (policy == "wait_complete") stop = PrefetchPolicy::Complete;
+    else if (policy == "best_effort") stop = PrefetchPolicy::BestEffort;
+    else if (policy == "timeout") stop = PrefetchPolicy::Timeout;
+    else throw std::runtime_error("Unsupported prefetch policy: " + policy);
+    const auto threshold = raw.value("prefetch_threshold_tokens", nlohmann::json(256));
+    if (!threshold.is_number_integer() || threshold.get<std::int64_t>() < 1) throw std::runtime_error("Prefetch threshold must be positive tokens");
+    auto timeout = raw.value("prefetch_timeout", nlohmann::json::object());
+    for (const auto & [key, value] : timeout.items()) {
+        if (key != "base_sec" && key != "per_ki_token_sec" && key != "max_sec") throw std::runtime_error("Unknown prefetch timeout field: " + key);
+    }
+    const auto ns = [](double seconds) {
+        const auto value = static_cast<long double>(seconds) * 1e9L;
+        if (!std::isfinite(value) || value < 0 || value >= std::numeric_limits<trace_graph::graph::Time>::max())
+            throw std::runtime_error("Prefetch timeout must be nonnegative finite seconds within the clock range");
+        return static_cast<trace_graph::graph::Time>(std::round(value));
+    };
+    return { capacity,
+             stop,
+             threshold.get<std::size_t>(),
+             host_pages > device_pages ? 0.8 * (host_pages - device_pages) : 0,
+             ns(timeout.value("base_sec", 2.0)),
+             ns(timeout.value("per_ki_token_sec", 0.1)),
+             ns(timeout.value("max_sec", 30.0)) };
+}
+
+} // namespace
 
 CacheSettings read_cache_settings(const nlohmann::json & raw) {
-    const std::set<std::string> fields{ "device_pages", "host_pages", "write_policy", "io_backend", "host_layout" };
+    const std::set<std::string> fields{ "device_pages", "host_pages", "write_policy", "io_backend", "host_layout", "storage" };
     if (!raw.is_object()) throw std::runtime_error("Cache settings must be an object");
     for (const auto & [key, value] : raw.items()) {
         if (!fields.contains(key)) throw std::runtime_error("Unknown cache setting: " + key);
@@ -31,7 +78,9 @@ CacheSettings read_cache_settings(const nlohmann::json & raw) {
     if (policy == "write_through") hits = 1;
     else if (policy == "write_through_selective") hits = 2;
     else if (policy != "write_back") throw std::runtime_error("Unsupported cache write policy: " + policy);
-    return { raw.at("device_pages").get<std::size_t>(), raw.at("host_pages").get<std::size_t>(), hits };
+    CacheSettings settings{ raw.at("device_pages").get<std::size_t>(), raw.at("host_pages").get<std::size_t>(), hits, std::nullopt };
+    if (raw.contains("storage")) settings.storage = read_storage(raw.at("storage"), settings.device_pages, settings.host_pages);
+    return settings;
 }
 
 trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::SourceContext & source) {
@@ -73,8 +122,16 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
         static_cast<std::size_t>(bytes_per_token),
         participants.size(),
         10,
-        {   "cache.load", "kernel_ascend.page_first_direct", "device_service" },
-        { "cache.backup", "kernel_ascend.page_first_direct", "device_service" }
+        { "cache.load", "kernel_ascend.page_first_direct", "device_service" },
+        { "cache.backup", "kernel_ascend.page_first_direct", "device_service" },
+        { 128,
+          { "cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service" },
+          { "cache.prefetch.read_page", "file.generic_page_get", "storage_worker_service" },
+          { "cache.prefetch.page_publish", "file.generic_page_get", "storage_worker_service" },
+          { "cache.prefetch.return", "file.generic_page_get", "storage_worker_service" },
+          { "cache.storage_write.gather_check", "file.materialize_then_batch_set", "storage_worker_service" },
+          { "cache.storage_write.new_prepare", "file.materialize_then_batch_set", "storage_worker_service" },
+          { "cache.storage_write.new_page", "file.materialize_then_batch_set", "storage_worker_service" } }
     };
 }
 
