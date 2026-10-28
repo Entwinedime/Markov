@@ -46,4 +46,15 @@ const Response & Queries::query(const planning::Work & work) {
     return responses_.emplace(work, models_.query(work)).first->second;
 }
 
+const Response & Queries::query_source_delay(graph::NodeId id, std::size_t resource) {
+    if (!source_) throw std::logic_error("Source delay requested without source evidence");
+    const auto & node = source_->graph().graph.nodes()[id];
+    if (node.resource != resource || node.kind != graph::NodeKind::ResidualGap
+        || source_->observations().resources[resource].kind != source::ResourceKind::Client)
+        throw std::logic_error("Source delay is not a retained client interval on the target resource");
+
+    ++requests_;
+    return source_delays_.try_emplace(id, Response{ Status::Ready, node.duration_ns, Coverage::SourceResidual, {}, std::nullopt }).first->second;
+}
+
 } // namespace markov::trace_graph::cost

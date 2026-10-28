@@ -27,6 +27,7 @@ struct SourceGraph {
     struct HttpEndpoint {
         RequestWindow request;
         graph::NodeId start;
+        graph::NodeId ingress;
         graph::NodeId completion;
     };
     std::vector<HttpEndpoint> requests;

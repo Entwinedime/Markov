@@ -183,7 +183,7 @@ SourceGraph build_source_graph(Observations & observations) {
         result.graph.connect(start, ingress, graph::EdgeKind::ClientOrder);
         result.graph.connect(ingress, result.point_nodes[*request.received], graph::EdgeKind::ClientOrder);
         result.graph.connect(result.point_nodes[*request.sent], response, graph::EdgeKind::ClientOrder);
-        result.requests.push_back({ request, start, response });
+        result.requests.push_back({ request, start, ingress, response });
         previous_http = response;
         previous_end = request.end_ns;
     }

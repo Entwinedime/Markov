@@ -45,7 +45,7 @@ struct Model {
 };
 
 enum class Status { Ready, MissingModel, MissingFeatures, OutsideDomain, UnmeasuredCombination, InvalidResponse };
-enum class Coverage { Measured, NewCombination, Extrapolated, SourceService };
+enum class Coverage { Measured, NewCombination, Extrapolated, SourceService, SourceResidual };
 
 struct Response {
     Status status;

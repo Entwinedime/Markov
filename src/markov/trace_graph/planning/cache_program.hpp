@@ -6,6 +6,7 @@
 #include "markov/trace_graph/planning/storage.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -24,6 +25,7 @@ struct CacheBackend {
 struct CacheRequestResult {
     std::size_t device_hit_pages = 0, loaded_pages = 0, prefill_tokens = 0;
     bool completed = false;
+    std::optional<graph::NodeId> start, received, response;
 };
 
 // Cache/storage, known compute and blocking collectives share one clock.
@@ -52,7 +54,8 @@ public:
     std::size_t peak_host_pages() const { return cache_.peak_pages(Tier::Host); }
 
 private:
-    enum class ActionKind : std::uint32_t { CopyDone, EvictionDone };
+    enum class ActionKind : std::uint32_t { CopyDone, EvictionDone, Received, ResponseDone };
+    enum class RequestStage { BeforeStart, Ingress, Active, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -65,6 +68,8 @@ private:
     };
 
     void advance(ProgramRuntime & runtime);
+    void begin_request(ProgramRuntime & runtime, bool drain);
+    void respond(ProgramRuntime & runtime);
     void compute(ProgramRuntime & runtime, Phase phase);
     void commit(ProgramRuntime & runtime);
     bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
@@ -82,6 +87,7 @@ private:
     ComputeStats compute_stats_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;
+    std::array<std::optional<graph::NodeId>, 2> copy_frontier_;
     std::vector<RadixId> pending_evictions_;
     std::optional<BufferId> buffer_;
     std::optional<RadixId> request_pin_;
@@ -91,6 +97,7 @@ private:
     std::size_t request_ = 0;
     std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evictions_ = 0;
     Phase phase_ = Phase::Prefill;
+    RequestStage request_stage_ = RequestStage::BeforeStart;
     bool waiting_ = false;
     bool eviction_wait_ = false;
 };

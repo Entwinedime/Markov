@@ -104,6 +104,10 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
                                    backend,
                                    settings.storage);
     auto result = simulation::ProgramExecution(program, queries, program.resources()).run();
+    const auto time = [&](std::optional<graph::NodeId> node, bool start = false) -> Json {
+        if (!node || result.execution.states[*node] != simulation::OperationState::Complete) return nullptr;
+        return start ? result.execution.starts_ns[*node] : result.execution.completions_ns[*node];
+    };
     auto requests = Json::array();
     for (std::size_t i = 0; i < program.requests().size(); ++i) {
         const auto & request = program.requests()[i];
@@ -114,6 +118,19 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             {        "loaded_pages",                       request.loaded_pages },
             {      "prefill_tokens",                     request.prefill_tokens }
         };
+        item["partial_request_ports"] = {
+            { "start_ns", time(request.start) },
+            { "received_ns", time(request.received) },
+            { "response_start_ns", time(request.response, true) },
+            { "response_complete_ns", time(request.response) }
+        };
+        if (source.graph().requests.size() == program.requests().size()) {
+            const auto & endpoint = source.graph().requests[i];
+            item["source_residuals"] = {
+                {       "ingress_ns",    source.graph().graph.nodes()[endpoint.ingress].duration_ns },
+                { "response_tail_ns", source.graph().graph.nodes()[endpoint.completion].duration_ns }
+            };
+        }
         if (const auto * storage = program.storage()) {
             const auto & prefetch = storage->results()[i];
             item["prefetch"] = {
@@ -140,31 +157,34 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
     std::map<std::string, std::size_t> coverage;
     for (const auto & [kind, count] : result.coverage) coverage[cost_coverage_name(kind)] = count;
     Json report = {
-        {                     "status",issue.is_null() ? "known_cache_compute_subset_executed" : "stopped"                                       },
-        {                      "issue",                                                               std::move(issue) },
-        {      "device_capacity_pages",                                                          settings.device_pages },
-        {        "host_capacity_pages",                                                            settings.host_pages },
-        {          "backup_after_hits", settings.backup_after_hits ? Json(*settings.backup_after_hits) : Json(nullptr) },
-        {               "participants",                                                           backend.participants },
-        {                     "layers",                                                                 backend.layers },
-        { "page_bytes_per_participant",                                          page_tokens * backend.bytes_per_token },
-        {          "peak_device_pages",                                                    program.peak_device_pages() },
-        {            "peak_host_pages",                                                      program.peak_host_pages() },
-        {         "backup_submissions",                                                              program.backups() },
-        {           "load_submissions",                                                                program.loads() },
-        {           "device_evictions",                                                     program.device_evictions() },
-        {             "host_evictions",                                                       program.host_evictions() },
-        {                   "requests",                                                            std::move(requests) },
-        {             "executed_nodes",                                                      result.execution.executed },
-        {                   "coverage",                                                            std::move(coverage) },
-        {            "logical_queries",                                               queries.requests() - query_begin },
-        {       "response_evaluations",                                       queries.evaluations() - evaluation_begin },
-        {              "e2e_predicted",                                                                          false },
+        {                     "status",        issue.is_null() ? "known_cache_compute_subset_executed" : "stopped"                                       },
+        {                      "issue",                                                                                                  std::move(issue) },
+        {      "device_capacity_pages",                                                                                             settings.device_pages },
+        {        "host_capacity_pages",                                                                                               settings.host_pages },
+        {          "backup_after_hits",                                    settings.backup_after_hits ? Json(*settings.backup_after_hits) : Json(nullptr) },
+        {               "participants",                                                                                              backend.participants },
+        {                     "layers",                                                                                                    backend.layers },
+        { "page_bytes_per_participant",                                                                             page_tokens * backend.bytes_per_token },
+        {          "peak_device_pages",                                                                                       program.peak_device_pages() },
+        {            "peak_host_pages",                                                                                         program.peak_host_pages() },
+        {         "backup_submissions",                                                                                                 program.backups() },
+        {           "load_submissions",                                                                                                   program.loads() },
+        {           "device_evictions",                                                                                        program.device_evictions() },
+        {             "host_evictions",                                                                                          program.host_evictions() },
+        {                   "requests",                                                                                               std::move(requests) },
+        {             "executed_nodes",                                                                                         result.execution.executed },
+        {           "subset_finish_ns", result.execution.completions_ns.empty() ? Json(nullptr) : Json(std::ranges::max(result.execution.completions_ns)) },
+        {                   "coverage",                                                                                               std::move(coverage) },
+        {            "logical_queries",                                                                                  queries.requests() - query_begin },
+        {       "response_evaluations",                                                                          queries.evaluations() - evaluation_begin },
+        {              "e2e_predicted",                                                                                                             false },
         {              "qualification",
          "Cache I/O, known compute calls and attention metadata share one clock. Native calls share continuous caller/worker/device chains. Idle "
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
-         "Query/admission, inter-call and collective CPU and other cross-stream dependencies remain incomplete. All participants share the latest "
-         "collective completion, omitting per-rank completion spread. No HTTP latency is reported."                   }
+         "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
+         "Partial request ports exclude query/admission, inter-call and collective CPU, other cross-stream dependencies and client pacing. "
+         "Response currently follows selected compute completion; native overlap/result handoff is not implemented. "
+         "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
     const auto & compute = program.compute_stats();
     report["collective_execution"] = {
@@ -381,6 +401,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             {             "logical_queries",                                                                                                            queries->requests() },
             {        "response_evaluations",                                                                                                         queries->evaluations() },
             {  "source_service_evaluations",                                                                                                  queries->source_evaluations() },
+            { "source_residual_evaluations",                                                                                                queries->residual_evaluations() },
             { "source_deployment_qualified",                                                                                                                          false },
             {               "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
         };

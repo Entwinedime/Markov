@@ -4,6 +4,7 @@
 #include "markov/trace_graph/planning/program.hpp"
 #include "markov/trace_graph/planning/storage_config.hpp"
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -26,7 +27,8 @@ public:
     bool prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, std::optional<graph::NodeId> cause);
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
-    bool idle() const { return read_queue_.empty() && write_queue_.empty(); }
+    bool idle() const { return prefetches_.empty() && write_queue_.empty(); }
+    const std::array<std::optional<graph::NodeId>, 3> & completion_frontier() const { return completion_frontier_; }
     const std::vector<PrefetchResult> & results() const { return results_; }
     const StorageStats & stats() const { return stats_; }
 
@@ -79,6 +81,9 @@ private:
     std::map<std::size_t, Prefetch> prefetches_;
     std::deque<std::size_t> read_queue_;
     std::deque<Write> write_queue_;
+
+    // Read return, write completion and controller acceptance can finish apart.
+    std::array<std::optional<graph::NodeId>, 3> completion_frontier_;
 };
 
 } // namespace markov::trace_graph::planning

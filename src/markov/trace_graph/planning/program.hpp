@@ -14,12 +14,19 @@ namespace markov::trace_graph::planning {
 
 struct Boundary {};
 
+// A retained client interval is an explicit residual approximation, not a
+// migrated CPU service or a new cost-model feature.
+// shortcut: same request and frontend deployment; replace when transport work changes.
+struct SourceDelay {
+    graph::NodeId node;
+};
+
 struct PlannedOperation {
     std::size_t resource;
 
     // Work references live through the synchronous submit call. A boundary is
     // explicitly cost-free; missing work is never represented by a null pointer.
-    std::variant<Boundary, std::reference_wrapper<const Work>> cost;
+    std::variant<Boundary, std::reference_wrapper<const Work>, SourceDelay> cost;
     std::optional<simulation::Action> completion = std::nullopt;
     bool delay = false; // Readiness latency; it does not occupy a service resource.
     std::optional<std::size_t> source_operation = std::nullopt;

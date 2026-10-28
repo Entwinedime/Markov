@@ -211,6 +211,7 @@ bool Storage::accept(std::size_t request) {
 }
 
 bool Storage::finish_read(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause) {
+    completion_frontier_[0] = cause;
     auto & result = results_[request];
     auto & operation = prefetches_.at(request);
     result.worker_done = true;
@@ -280,6 +281,7 @@ bool Storage::write_page(ProgramRuntime & runtime, graph::NodeId cause) {
         return false;
     }
     cache_.unpin_host(operation.source);
+    completion_frontier_[1] = cause;
     write_queue_.pop_front();
     if (!write_queue_.empty()) start_write(runtime, cause);
     return true;
@@ -321,6 +323,7 @@ bool Storage::on_event(ProgramRuntime & runtime, const simulation::Event & event
         break;
     }
     case ActionKind::Accept:
+        completion_frontier_[2] = event.identity;
         return accept(request);
     case ActionKind::Timeout:
         stop(runtime, request, std::nullopt);

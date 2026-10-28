@@ -3,6 +3,7 @@
 #include "markov/trace_graph/planning/compute_plan.hpp"
 #include "markov/trace_graph/planning/compute_program.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <utility>
 
@@ -15,6 +16,10 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
       cache_(config),
       backend_(std::move(backend)),
       requests_(source.observations().requests.size()) {
+    if (source.graph().requests.size() != requests_.size()) {
+        issue_ = "request_boundaries_unavailable";
+        return;
+    }
     if (storage)
         storage_.emplace(cache_,
                          source.observations().token_paths,
@@ -42,7 +47,8 @@ bool CacheProgram::submit(ProgramRuntime & runtime, PlannedMutation mutation) {
     if (cause_) {
         const auto begin = runtime.next_node();
         std::vector<bool> has_input(mutation.operations.size(), false);
-        for (const auto & edge : mutation.dependencies) has_input[edge.to - begin] = true;
+        for (const auto & edge : mutation.dependencies)
+            if (edge.from >= begin) has_input[edge.to - begin] = true;
         for (std::size_t id = 0; id < has_input.size(); ++id) {
             if (!has_input[id]) mutation.dependencies.push_back({ *cause_, begin + id, graph::EdgeKind::DataDependency });
         }
@@ -72,7 +78,10 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
     }
     mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::CopyDone, transfer) });
     const auto submitted = submit(runtime, std::move(mutation));
-    if (submitted) kind == CopyKind::Load ? ++loads_ : ++backups_;
+    if (submitted) {
+        kind == CopyKind::Load ? ++loads_ : ++backups_;
+        copy_frontier_[kind == CopyKind::Load ? 0 : 1] = begin + backend_.participants;
+    }
     return submitted;
 }
 
@@ -107,11 +116,51 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
 
 void CacheProgram::start(ProgramRuntime & runtime) { advance(runtime); }
 
+void CacheProgram::begin_request(ProgramRuntime & runtime, bool drain) {
+    const auto & endpoint = source_.graph().requests[request_];
+    const auto resource = source_.graph().graph.nodes()[endpoint.ingress].resource;
+    const auto begin = runtime.next_node();
+    PlannedMutation mutation{
+        0,
+        { { resource, Boundary{} }, { resource, SourceDelay{ endpoint.ingress }, action(ActionKind::Received, request_) } },
+        { { begin, begin + 1, graph::EdgeKind::ClientOrder } }
+    };
+
+    // A drain may finish after the previous response; retain both causes.
+    if (request_) mutation.dependencies.push_back({ *requests_[request_ - 1].response, begin, graph::EdgeKind::ClientOrder });
+    if (drain) {
+        for (const auto tail : copy_frontier_)
+            if (tail) mutation.dependencies.push_back({ *tail, begin, graph::EdgeKind::Synchronization });
+        if (storage_)
+            for (const auto tail : storage_->completion_frontier())
+                if (tail) mutation.dependencies.push_back({ *tail, begin, graph::EdgeKind::Synchronization });
+    }
+    if (!submit(runtime, std::move(mutation))) return;
+    requests_[request_].start = begin;
+    requests_[request_].received = begin + 1;
+    request_stage_ = RequestStage::Ingress;
+    waiting_ = false;
+}
+
+void CacheProgram::respond(ProgramRuntime & runtime) {
+    const auto & endpoint = source_.graph().requests[request_];
+    const auto resource = source_.graph().graph.nodes()[endpoint.completion].resource;
+    const auto response = runtime.next_node();
+    if (!submit(runtime, { 0, { { resource, SourceDelay{ endpoint.completion }, action(ActionKind::ResponseDone, request_) } }, {} })) return;
+    requests_[request_].response = response;
+    request_stage_ = RequestStage::Response;
+    waiting_ = false;
+}
+
 void CacheProgram::advance(ProgramRuntime & runtime) {
     if (issue_ || eviction_wait_ || request_ == requests_.size()) return;
     waiting_ = true;
-    for (const auto & barrier : source_.observations().workload_barriers) {
-        if (barrier.before_request == request_ && (!copies_.empty() || (storage_ && !storage_->idle()))) return;
+    if (request_stage_ == RequestStage::BeforeStart) {
+        const auto & barriers = source_.observations().workload_barriers;
+        const auto drain = std::ranges::any_of(barriers, [&](const source::WorkloadBarrier & barrier) { return barrier.before_request == request_; });
+        if (drain && (!copies_.empty() || (storage_ && !storage_->idle()))) return;
+        begin_request(runtime, drain);
+        return;
     }
     if (request_pin_) {
         cache_.unpin_device(*request_pin_);
@@ -215,8 +264,7 @@ void CacheProgram::commit(ProgramRuntime & runtime) {
         const auto started = cache_.begin_backup(*at);
         if (started.status == CopyStatus::Started && !copy(runtime, *started.transfer, *at, CopyKind::Backup, started.pages, false)) return;
     }
-    requests_[request_++].completed = true;
-    advance(runtime);
+    respond(runtime);
 }
 
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
@@ -240,7 +288,16 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         return;
     }
     cause_ = event.identity;
-    if (event.action.kind == std::to_underlying(ActionKind::CopyDone)) {
+    if (event.action.kind == std::to_underlying(ActionKind::Received)) {
+        request_stage_ = RequestStage::Active;
+        advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::ResponseDone)) {
+        requests_[request_++].completed = true;
+        request_stage_ = RequestStage::BeforeStart;
+        advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::CopyDone)) {
         const auto transfer = event.action.subject;
         auto pending = std::move(copies_.at(transfer));
         // This backend copies every layer in one DMA; publish once after all

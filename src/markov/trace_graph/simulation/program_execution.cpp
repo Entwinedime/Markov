@@ -32,6 +32,14 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
                 operation.completion
             });
         }
+        else if (const auto * delay = std::get_if<planning::SourceDelay>(&operation.cost)) {
+            const auto & response = costs_.query_source_delay(delay->node, operation.resource);
+            ++coverage[*response.coverage];
+            bound.operations.push_back({
+                { *response.duration_ns, operation.resource, graph::NodeKind::Delay },
+                operation.completion
+            });
+        }
         else
             bound.operations.push_back({
                 { 0, operation.resource, graph::NodeKind::Boundary },

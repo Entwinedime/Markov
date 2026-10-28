@@ -32,10 +32,11 @@ const std::string & cost_status_name(trace_graph::cost::Status status) {
 const std::string & cost_coverage_name(trace_graph::cost::Coverage kind) {
     using namespace trace_graph::cost;
     static const std::map<Coverage, std::string> coverage{
-        {       Coverage::Measured,     "measured_work_point" },
-        { Coverage::NewCombination, "new_feature_combination" },
-        {   Coverage::Extrapolated,            "extrapolated" },
-        {  Coverage::SourceService,   "source_device_service" }
+        {       Coverage::Measured,           "measured_work_point" },
+        { Coverage::NewCombination,       "new_feature_combination" },
+        {   Coverage::Extrapolated,                  "extrapolated" },
+        {  Coverage::SourceService,         "source_device_service" },
+        { Coverage::SourceResidual, "source_residual_approximation" }
     };
     return coverage.at(kind);
 }
