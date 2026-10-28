@@ -402,7 +402,7 @@ class StructureComparison:
             )
         return checks
 
-    def window(self) -> dict[str, Any]:
+    def window(self, operation_pairs: dict[int, dict[str, Any]]) -> dict[str, Any]:
         model_batches = {
             self.native_batches[region["id"]]
             for region in self.source["regions"]
@@ -423,24 +423,37 @@ class StructureComparison:
             for operation in graph["operations"]
             if graph["regions"][operation["region"]].get("rank") == self.rank
         ]
-        report = self.compare_operations(native, target)
-        checks = report["checks"]
-        status = "differences" if False in checks.values() else "partial" if None in checks.values() else "matched"
-        if report["same_calls"]:
-            report["execution"] = ExecutionComparison(native, target, graph["execution"]).compare()
-            if report["execution"]["same"] is False:
-                status = "differences"
-            elif status == "matched" and report["execution"]["same"] is None:
-                status = "partial"
-        return {
-            **report,
+        paired = [operation_pairs[operation["id"]] for operation in native if operation["id"] in operation_pairs]
+        paired_ids = {operation["id"] for operation in paired}
+        target_ids = {operation["id"] for operation in target}
+        complete = len(paired) == len(native) == len(target) and paired_ids == target_ids
+        window = {
             "scope": (
                 "rank-local model/prebuilt window and request-owned transport, including intervening control; "
                 "terminal polling and other ranks excluded"
             ),
             "native_operations": len(native),
             "target_operations": len(target),
-            "status": status,
+            "correspondence": {
+                "complete": complete,
+                "paired_native_operations": len(paired),
+                "paired_target_operations": len(paired_ids),
+            },
+        }
+        if not complete:
+            return {**window, "status": "partial", "reason": "matched flows do not cover the entire window"}
+
+        # Align logical owners only; dependency and execution checks still use the unchanged target graph.
+        report = self.compare_operations(native, paired)
+        report["execution"] = ExecutionComparison(native, paired, graph["execution"]).compare()
+        report["checks"]["execution_relations"] = report["execution"]["same"]
+        checks = report["checks"]
+        same_order = [operation["id"] for operation in paired] == [operation["id"] for operation in target]
+        return {
+            **window,
+            **report,
+            "same_operation_order": same_order,
+            "status": "differences" if False in checks.values() else "partial" if None in checks.values() else "matched",
         }
 
     def compare(self) -> dict[str, Any]:
@@ -452,6 +465,7 @@ class StructureComparison:
         native_model_work = self.native_work(model_only=True)
         target_model_work = self.target_work(model_only=True)
         comparisons = []
+        operation_pairs = {}
         unmatched = []
         serving_batches = {
             self.native_batches[region["id"]]: region["role"]
@@ -476,6 +490,7 @@ class StructureComparison:
             self.compare_work(comparison, work, predicted_work)
             comparison.update(native_batch=batch["id"], target_flow=index)
             if comparison["same_calls"]:
+                operation_pairs.update((left["id"], right) for left, right in zip(native, predicted, strict=True))
                 comparison["execution"] = ExecutionComparison(
                     native, predicted, self.prediction["graph"]["execution"]
                 ).compare()
@@ -505,9 +520,9 @@ class StructureComparison:
         status = "matched"
         if unmatched or unmatched_target or unassociated or unverified or not comparisons:
             status = "partial"
-        if failures or (not unmatched and not unmatched_target and not same_batch_order):
+        if failures:
             status = "differences"
-        window = self.window()
+        window = self.window(operation_pairs)
 
         # A fully paired run also has to preserve the whole window's cross-call effects.
         if not unmatched and not unmatched_target and status != "differences":
@@ -518,7 +533,8 @@ class StructureComparison:
                 "rank-local matched flows: public geometry/native dependency order, available CPU state, "
                 "compute and async APIs; "
                 "named interface ports and ordered returns checked; "
-                "opaque geometry, captured inputs, timing and distributed progress unqualified"
+                "batch and serialized operation order reported separately; "
+                "opaque geometry, captured inputs, policy equivalence, timing and distributed progress unqualified"
             ),
             "status": status,
             "rank": self.rank,
