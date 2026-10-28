@@ -138,6 +138,17 @@ used_models 同时保留 sources 和 limitations；page-work 的 cost_catalog.qu
 模型的部署条件必须与请求一致；不同 scope 的耗时不会被自动求和。查询完成不代表目标结构、完整 HTTP 或精度验收通过。
 报告不能覆盖查询文件或选定模型文件，写入失败时不以不完整文件替代原报告。
 
+独立性能维护还提供 SGLang Ascend 输入内核采样模块。在已有推理 SDK 环境、本项目 Python 包可导入时运行：
+
+```bash
+python3 -m markov.adapters.sglang.input_kernels --recipe /path/to/recipe.json --output /path/to/new_capture
+```
+
+采样输入给出 device、table_columns、warmup、repeats 和 cases；每项工作量包含 query_tokens、prefix_tokens，均以 token 为单位。
+它用实际框架内核测量单行位置生成和请求页表写入，预热及结果校验位于 profiling 之外，输出原始 trace、逐任务 measurements 与完成记录 capture.json。
+任务数量、顺序与同步边界必须对应后才发布完成；新目录避免覆盖已有资产。外层负责设备空闲、串行、预算与进程回收，正式准备入口尚未接入这一模块。
+这些结果供独立成本维护使用；原始 DAG 仍由所选 base 的 profile_manifest.json 构建。
+
 ## workload 规模与可复现性
 
 请求数量、每请求输入与生成上限由 workload 显式控制，不按实验名称硬编码，也不裁剪已采 trace 来缩小 DAG。
