@@ -26,6 +26,13 @@ struct StateChange {
     std::optional<std::size_t> value;
 };
 
+// Borrowed bindings are rebound during compaction; open calls retain only their context and execution ports.
+struct GraphRoots {
+    std::vector<std::size_t *> values;
+    std::vector<std::size_t *> regions;
+    std::set<std::size_t> storage;
+};
+
 // Values, work and execution share this instance's identity space.
 struct RegionGraph {
     std::vector<ValueAccess> values;
@@ -44,7 +51,7 @@ struct RegionGraph {
     std::size_t resource_count = 0;
 
     // References belong to the adapter's live ports and are rebound before old values are released.
-    std::vector<std::size_t> retire(std::span<std::size_t *> roots, std::set<std::size_t> retained_storage);
+    std::vector<std::size_t> retire(GraphRoots roots);
     nlohmann::json document() const;
 };
 

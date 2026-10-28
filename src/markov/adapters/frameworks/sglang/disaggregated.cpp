@@ -196,11 +196,10 @@ std::vector<std::size_t> DisaggregatedStructure::idle() {
 const RegionGraph & DisaggregatedStructure::graph() const { return graph_; }
 
 std::vector<std::size_t> DisaggregatedStructure::retire() {
-    std::vector<std::size_t *> values;
-    std::set<std::size_t> storage;
-    prefill_.live_state(values, storage);
-    decode_.live_state(values, storage);
-    auto nodes = graph_.retire(values, std::move(storage));
+    GraphRoots roots;
+    prefill_.live_state(roots);
+    decode_.live_state(roots);
+    auto nodes = graph_.retire(std::move(roots));
 
     // A peer may become ready before the next control action; retain that time across IR compaction.
     for (const auto & [_, handoff] : handoffs_) {

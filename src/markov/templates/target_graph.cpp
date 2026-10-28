@@ -223,8 +223,11 @@ void TargetGraph::bind_integers(std::size_t value, IntegerData data) {
 
 const IntegerData & TargetGraph::integers(std::size_t value) const { return graph_.integer_data.at(value); }
 
-void TargetGraph::live_resources(std::set<std::size_t> & resources) const {
-    for (const auto & [_, resource] : external_resources_) resources.insert(resource);
+std::optional<std::size_t> TargetGraph::composition() const { return compositions_.empty() ? std::nullopt : std::optional(compositions_.back().identity); }
+
+void TargetGraph::live_state(GraphRoots & roots) {
+    for (const auto & [_, resource] : external_resources_) roots.storage.insert(resource);
+    for (auto & region : compositions_) roots.regions.push_back(&region.identity);
 }
 
 const RegionGraph & TargetGraph::graph() const { return graph_; }

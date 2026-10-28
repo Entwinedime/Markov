@@ -29,6 +29,16 @@ class PublishedRequests:
         self.identities.update(output.rids)
 
 
+class ResultReady:
+    def __init__(self, peer: ControlPeer) -> None:
+        self.peer = peer
+
+    def synchronize(self):
+
+        # The native consumer waits for the observed result-read subgraph, not every device stream.
+        self.peer.call("read_result")
+
+
 class NativeScheduler(Scheduler):
     def __init__(self, peer: ControlPeer, model_path: str, dtype: str, rendezvous: str) -> None:
         self.peer = peer
@@ -105,6 +115,7 @@ class NativeScheduler(Scheduler):
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.ones(len(batch.reqs), dtype=torch.int64),
+            copy_done=ResultReady(self.peer),
         )
 
     @staticmethod

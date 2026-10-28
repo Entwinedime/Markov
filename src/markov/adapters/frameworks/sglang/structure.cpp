@@ -79,6 +79,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     std::vector<RankWork> work;
     BatchProgram result{ std::nullopt, {}, {} };
     if (action.step == ServingStep::Stage) result = pipeline_stage(action, work);
+    else if (action.step == ServingStep::ReadResult) result = read_result(action, work);
     else if (action.step == ServingStep::Result) result = pipeline_result(action, work);
     else if ((action.step == ServingStep::Batch || action.step == ServingStep::Model) && topology_.stage_count(instance_.id) > 1) {
 
@@ -178,6 +179,17 @@ BatchProgram ServingStructure::pipeline_stage(const ServingAction & action, std:
     return result;
 }
 
+BatchProgram ServingStructure::read_result(const ServingAction & action, std::vector<RankWork> & work) {
+    const auto & flow = flows_.at(action.flow);
+    BatchProgram result{ std::nullopt, {}, {} };
+    for (const auto rank : instance_.members) {
+        const auto begin = graph_.operations.size();
+        result.completions.push_back(ranks_.at(rank)->begin_result(action.work->batch, flow.outputs.at(rank).at("sampled_tokens")).value());
+        work.push_back({ rank, begin, graph_.operations.size() });
+    }
+    return result;
+}
+
 BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std::vector<RankWork> & work) {
     const auto & batch = action.work->batch;
     const auto & flow = flows_.at(action.flow);
@@ -258,20 +270,19 @@ std::vector<std::size_t> ServingStructure::idle() {
 }
 
 std::vector<std::size_t> ServingStructure::retire() {
-    std::vector<std::size_t *> roots;
-    std::set<std::size_t> storage;
-    live_state(roots, storage);
-    return graph_.retire(roots, std::move(storage));
+    GraphRoots roots;
+    live_state(roots);
+    return graph_.retire(std::move(roots));
 }
 
-void ServingStructure::live_state(std::vector<std::size_t *> & roots, std::set<std::size_t> & storage) {
-    for (auto & [_, rank] : ranks_) rank->live_state(roots, storage);
+void ServingStructure::live_state(GraphRoots & roots) {
+    for (auto & [_, rank] : ranks_) rank->live_state(roots);
     for (auto & [_, flow] : flows_) {
         for (auto & [rank, inputs] : flow.inputs) {
-            for (auto & [name, value] : inputs) roots.push_back(&value);
+            for (auto & [name, value] : inputs) roots.values.push_back(&value);
         }
         for (auto & [rank, output] : flow.outputs) {
-            for (auto & [name, value] : output) roots.push_back(&value);
+            for (auto & [name, value] : output) roots.values.push_back(&value);
         }
     }
 }

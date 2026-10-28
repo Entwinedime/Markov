@@ -216,9 +216,47 @@ TargetRegion RankStructure::model(const Batch & batch, const std::map<std::strin
     return result;
 }
 
+std::optional<std::size_t> RankStructure::begin_result(const Batch & batch, std::optional<std::size_t> sampled_tokens) {
+    const auto begin = shared_.regions.size();
+    const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
+    std::map<std::string, std::size_t> state{
+        {  "free_pages",  free_pages_.value() },
+        { "request_map", request_map_.value() }
+    };
+    if (sampled_tokens) state.emplace("sampled_tokens", *sampled_tokens);
+    graph_.begin_composition(sampled_tokens ? "ResultProcessed" : "prebuilt_result",
+                             phase,
+                             {
+                                 { "result_members", static_cast<std::int64_t>(batch.members.size()) }
+    },
+                             state);
+
+    Invocation result_call;
+    result_call.parameters = {
+        { "B", static_cast<std::int64_t>(batch.members.size()) }
+    };
+    std::optional<std::size_t> ready;
+    if (sampled_tokens) {
+        const auto read = graph_.append("result_tokens",
+                                        phase,
+                                        result_call,
+                                        {
+                                            { "tensor", *sampled_tokens }
+        });
+        ready = shared_.execution.region_call(read.region).returned;
+    }
+    stamp(begin);
+    return ready;
+}
+
 RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
                                     const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens, bool handoff) {
+
+    // Native control resumes the caller opened at its read boundary; lightweight control expands it in one step.
+    if (!graph_.composition()) begin_result(batch, sampled_tokens);
     const auto begin = shared_.regions.size();
+    const auto result_region = graph_.composition().value();
+
     auto columns = model_columns;
     if (sampled_tokens) columns["model_tokens"] = *sampled_tokens;
     if (!handoff) views_.at(lane).remember(batch.phase, columns, effects);
@@ -228,30 +266,10 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     GroupValues group_values;
     std::vector<std::size_t> returned_pages;
     std::int64_t pending_tokens = 0;
-
-    std::map<std::string, std::size_t> state{
-        {  "free_pages",  free_pages_.value() },
-        { "request_map", request_map_.value() }
-    };
-    if (sampled_tokens) state.emplace("sampled_tokens", *sampled_tokens);
-    const auto result_region = graph_.begin_composition(sampled_tokens ? "ResultProcessed" : "prebuilt_result",
-                                                        phase,
-                                                        {
-                                                            { "result_members", static_cast<std::int64_t>(effects.members.size()) }
-    },
-                                                        state);
-
     Invocation result_call;
     result_call.parameters = {
         { "B", static_cast<std::int64_t>(batch.members.size()) }
     };
-    if (sampled_tokens)
-        graph_.append("result_tokens",
-                      phase,
-                      result_call,
-                      {
-                          { "tensor", *sampled_tokens }
-        });
 
     for (const auto & member : effects.members) {
         if (!member.finished && (!immediate || !sampled_tokens)) continue;
@@ -592,14 +610,14 @@ void RankStructure::merge_pages(const Batch & batch) {
     release_pages_ = merged.ports.outputs.at("release_pages");
 }
 
-void RankStructure::live_state(std::vector<std::size_t *> & values, std::set<std::size_t> & storage) {
+void RankStructure::live_state(GraphRoots & roots) {
 
     // References remain stable while the shared graph compacts its values and rebinds these ports.
     for (auto * value : { &free_pages_, &request_map_, &token_relay_, &release_pages_ }) {
-        if (*value) values.push_back(&value->value());
+        if (*value) roots.values.push_back(&value->value());
     }
-    for (auto & view : views_) view.live_values(values);
-    graph_.live_resources(storage);
+    for (auto & view : views_) view.live_values(roots.values);
+    graph_.live_state(roots);
 }
 
 std::optional<std::size_t> RankStructure::idle() {

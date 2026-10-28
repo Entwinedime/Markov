@@ -43,6 +43,8 @@ std::string_view ServingAction::step_name() const {
         return "batch";
     case ServingStep::Stage:
         return "stage";
+    case ServingStep::ReadResult:
+        return "read_result";
     case ServingStep::Result:
         return "result";
     case ServingStep::Reserve:

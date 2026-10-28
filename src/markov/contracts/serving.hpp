@@ -101,7 +101,7 @@ struct BatchWork {
     std::vector<KvPageCopy> transferred_pages{};
 };
 
-enum class ServingStep { Batch, Stage, Result, Reserve, Model, Transfer, Accept, Release };
+enum class ServingStep { Batch, Stage, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };
 
 // Task identifies one decision; flow identifies the model iteration crossing its stages.
 struct ServingAction {

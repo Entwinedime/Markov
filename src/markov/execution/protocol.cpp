@@ -359,7 +359,7 @@ void ExecutionGraph::connect_accesses(std::span<const ValueAccess> values, std::
 }
 
 std::vector<std::size_t> ExecutionGraph::retire(std::span<const ValueAccess> values, const std::map<std::size_t, std::size_t> & retained_values,
-                                                const std::set<std::size_t> & retained_storage) {
+                                                const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions) {
     std::map<std::size_t, std::size_t> ready;
     for (const auto & [old_value, new_value] : retained_values) {
         const auto & value = values[old_value];
@@ -378,11 +378,20 @@ std::vector<std::size_t> ExecutionGraph::retire(std::span<const ValueAccess> val
         for (const auto & [resource, node] : storage.readers) frontier.insert(node);
     }
 
+    // A suspended host call resumes with the same entry and resource sequence after its children are retired.
+    std::map<ExecutionOwner, ExecutionPorts> calls;
+    for (const auto & [old_region, new_region] : retained_regions) {
+        const auto ports = region_call(old_region);
+        calls.emplace(ExecutionOwner{ ExecutionOwner::Kind::Region, new_region }, ports);
+        frontier.insert(ports.entry);
+        frontier.insert(ports.returned);
+    }
+
     first_node_ += nodes_.size();
     nodes_.clear();
     dependencies_.clear();
     heads_.clear();
-    host_calls_.clear();
+    host_calls_ = std::move(calls);
     bound_operations_ = 0;
     return { frontier.begin(), frontier.end() };
 }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -30,11 +31,12 @@ public:
     std::size_t begin_composition(const std::string & role, const std::string & phase, const Parameters & parameters,
                                   const std::map<std::string, std::size_t> & inputs);
     void end_composition(const std::map<std::string, std::size_t> & outputs);
+    std::optional<std::size_t> composition() const;
 
     // Known contents do not remove a value's producer, transfers or storage dependencies.
     void bind_integers(std::size_t value, IntegerData data);
     const IntegerData & integers(std::size_t value) const;
-    void live_resources(std::set<std::size_t> & resources) const;
+    void live_state(GraphRoots & roots);
 
     const RegionGraph & graph() const;
     nlohmann::json document() const;

@@ -4,32 +4,52 @@
 
 namespace markov {
 
-std::vector<std::size_t> RegionGraph::retire(std::span<std::size_t *> roots, std::set<std::size_t> retained_storage) {
+std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
     std::map<std::size_t, std::size_t> bindings;
     std::vector<ValueAccess> kept_values;
     std::vector<nlohmann::json> kept_types;
     std::map<std::size_t, IntegerData> kept_integers;
-    for (auto * root : roots) {
-        const auto [binding, added] = bindings.try_emplace(*root, bindings.size());
+    const auto retain_value = [&](std::size_t value) {
+        const auto [binding, added] = bindings.try_emplace(value, bindings.size());
         if (added) {
-            const auto storage = values.at(*root).storage;
-            retained_storage.insert(storage);
+            const auto storage = values.at(value).storage;
+            roots.storage.insert(storage);
             kept_values.push_back({ storage, std::nullopt });
-            kept_types.push_back(std::move(types.at(*root)));
-            if (auto contents = integer_data.extract(*root); !contents.empty()) kept_integers.emplace(binding->second, std::move(contents.mapped()));
+            kept_types.push_back(std::move(types.at(value)));
+            if (auto contents = integer_data.extract(value); !contents.empty()) kept_integers.emplace(binding->second, std::move(contents.mapped()));
         }
+    };
+    for (const auto * root : roots.values) retain_value(*root);
+
+    std::map<std::size_t, std::size_t> region_bindings;
+    for (const auto * root : roots.regions) region_bindings.try_emplace(*root, region_bindings.size());
+    std::vector<nlohmann::json> kept_regions(region_bindings.size());
+    for (const auto & [old_region, new_region] : region_bindings) {
+        auto region = std::move(regions.at(old_region));
+        region["id"] = new_region;
+        if (!region.at("parent").is_null()) region["parent"] = region_bindings.at(region.at("parent").get<std::size_t>());
+        for (const auto * key : { "inputs", "outputs" }) {
+            for (auto & value : region[key]) {
+                const auto identity = value.get<std::size_t>();
+                retain_value(identity);
+                value = bindings.at(identity);
+            }
+            for (auto & value : region["ports"][key]) value = bindings.at(value.get<std::size_t>());
+        }
+        kept_regions[new_region] = std::move(region);
     }
 
     // Descriptors become incoming state; their CPU readiness remains in the execution frontier.
-    auto frontier = execution.retire(values, bindings, retained_storage);
-    for (auto * root : roots) *root = bindings.at(*root);
+    auto frontier = execution.retire(values, bindings, roots.storage, region_bindings);
+    for (auto * root : roots.values) *root = bindings.at(*root);
+    for (auto * root : roots.regions) *root = region_bindings.at(*root);
     values = std::move(kept_values);
     types = std::move(kept_types);
     integer_data = std::move(kept_integers);
     operations.clear();
     dependencies.clear();
     work.clear();
-    regions.clear();
+    regions = std::move(kept_regions);
     state_changes.clear();
     return frontier;
 }

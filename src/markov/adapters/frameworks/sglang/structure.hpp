@@ -39,7 +39,7 @@ public:
     PageReuse page_reuse() const;
     std::span<const TemplateAsset * const> sources() const;
     TargetRegion transfer(std::size_t rank, std::int64_t bytes, std::int64_t segments);
-    void live_state(std::vector<std::size_t *> & values, std::set<std::size_t> & storage);
+    void live_state(GraphRoots & roots);
 
 private:
     struct FlowViews {
@@ -48,6 +48,7 @@ private:
     };
 
     BatchProgram pipeline_stage(const ServingAction & action, std::vector<RankWork> & work);
+    BatchProgram read_result(const ServingAction & action, std::vector<RankWork> & work);
     BatchProgram pipeline_result(const ServingAction & action, std::vector<RankWork> & work);
 
     RegionGraph & graph_;

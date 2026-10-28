@@ -44,6 +44,7 @@ public:
     TargetRegion transfer(std::int64_t bytes, std::int64_t segments);
     std::map<std::string, std::size_t> prepare(const Batch & batch, std::size_t lane);
     TargetRegion model(const Batch & batch, const std::map<std::string, std::size_t> & inputs);
+    std::optional<std::size_t> begin_result(const Batch & batch, std::optional<std::size_t> sampled_tokens);
     RankProgram complete(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & model_columns,
                          std::optional<std::size_t> sampled_tokens, bool handoff = false);
     RankMessage message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending);
@@ -51,7 +52,7 @@ public:
     std::size_t receive_result(const Batch & batch, std::size_t sampled_tokens);
     std::optional<std::size_t> idle();
 
-    void live_state(std::vector<std::size_t *> & values, std::set<std::size_t> & storage);
+    void live_state(GraphRoots & roots);
 
 private:
     RankProgram reserve(const Batch & batch);

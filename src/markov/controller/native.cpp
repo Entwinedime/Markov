@@ -32,7 +32,7 @@ NativeController::NativeController(ServingSettings settings, std::vector<Request
 
 std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const GroupAdmission &) {
     if (running_ || done()) return std::nullopt;
-    if (!awaiting_result_) {
+    if (next_ == ServingStep::Stage) {
         auto arrivals = nlohmann::json::array();
         while (arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns) {
             const auto & input = requests_[arrived_];
@@ -53,10 +53,10 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
         const auto message = peer_.receive();
         const auto kind = message.at("kind").get<std::string>();
         if (kind == "idle") return std::nullopt;
-        if (kind == "model" || kind == "result") {
-            if (!batch_ || (kind == "result") != awaiting_result_) throw std::invalid_argument("native work does not follow allocation/model completion");
+        if (kind == "model" || kind == "read_result" || kind == "result") {
+            const auto step = kind == "model" ? ServingStep::Stage : kind == "read_result" ? ServingStep::ReadResult : ServingStep::Result;
+            if (!batch_ || step != next_) throw std::invalid_argument("native work does not follow allocation/model/read completion");
             auto effects = kind == "result" ? result_effects(message.at("members")) : BatchEffects{};
-            const auto step = kind == "model" ? ServingStep::Stage : ServingStep::Result;
             return ServingAction{
                 { group_, sequence_ },
                 std::make_shared<BatchWork>(*batch_, std::move(effects)),
@@ -107,12 +107,12 @@ nlohmann::json NativeController::resource_call(const nlohmann::json & message) {
     }
     if (kind == "release_request") {
         const auto identity = message.at("request").get<std::size_t>();
-        if (!awaiting_result_ || !resources_.residence(identity).slot || !released_requests_.insert(identity).second)
+        if (next_ != ServingStep::Result || !resources_.residence(identity).slot || !released_requests_.insert(identity).second)
             throw std::invalid_argument("native slot release is not an active result effect");
         return nullptr;
     }
     if (kind == "release_pages") {
-        if (!awaiting_result_) throw std::invalid_argument("native page release is outside result processing");
+        if (next_ != ServingStep::Result) throw std::invalid_argument("native page release is outside result processing");
         const auto pages = message.at("pages").get<std::vector<std::size_t>>();
         const auto position = batch_->phase == Phase::Prefill ? released_pages_.begin() : released_pages_.end();
         released_pages_.insert(position, pages.begin(), pages.end());
@@ -156,7 +156,8 @@ void NativeController::start(const ServingAction & action) {
 void NativeController::finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) {
     if (running_ != action.task) throw std::logic_error("native completion does not belong to the running work");
     running_.reset();
-    if (action.step == ServingStep::Stage) { awaiting_result_ = true; }
+    if (action.step == ServingStep::Stage) next_ = ServingStep::ReadResult;
+    else if (action.step == ServingStep::ReadResult) next_ = ServingStep::Result;
     else {
 
         // Native effects describe releases; graph completion makes those resources reusable.
@@ -172,7 +173,7 @@ void NativeController::finish(const ServingAction & action, std::span<const std:
         released_requests_.clear();
         released_pages_.clear();
         batch_.reset();
-        awaiting_result_ = false;
+        next_ = ServingStep::Stage;
         ++flow_;
     }
     peer_.send({

@@ -109,7 +109,7 @@ public:
 
     // Release historical IR, retaining state readiness and possibly unfinished execution frontiers.
     std::vector<std::size_t> retire(std::span<const ValueAccess> values, const std::map<std::size_t, std::size_t> & retained_values,
-                                    const std::set<std::size_t> & retained_storage);
+                                    const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions);
 
     std::size_t first_node() const;
     std::span<const ExecutionNode> nodes() const;

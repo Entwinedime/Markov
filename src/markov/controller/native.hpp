@@ -44,7 +44,7 @@ private:
     std::size_t completed_ = 0;
     std::size_t sequence_ = 0;
     std::size_t flow_ = 0;
-    bool awaiting_result_ = false;
+    ServingStep next_ = ServingStep::Stage;
 };
 
 } // namespace markov
