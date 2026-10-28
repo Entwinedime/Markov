@@ -162,6 +162,8 @@ TP1、TP2、Qwen1.5 MoE的EP2/4各完成8请求、13模型批次；详细图的�
 
 原生调用通道已改为独立编号应答，核心轮询就绪调用；适配在明确原生等待处交出时钟推进权，保留管道缓冲消息。`20261028T215356.466419Z_s9-native-call-dispatch`的六个正式场景与旧精简结果一致，TP2完整图/时间线相同；乱序应答、等待判定及超时/worker退出检查通过。当前仍仅一个TP/EP组，未增加第二份资源账或改原生选批；PP参与组和stage资源仍待接入。
 
+参与组状态已从通道协调器分离到`NativeGroup`，继续借用唯一KvPool；`20261028T221351.468056Z_s9-native-resource-groups`的双组交错诊断证明局部资源/完成不串组，六个正式场景及TP2完整图均保持旧结果。当前仍单个正式TP/EP组，组内单批次假设尚待改为按工作身份保留多个lane；这项分离不授予原生PP资格。调用通道已推送`2d63847`，本批待分层交付。
+
 ## 3. 模型与环境边界
 
 本轮七模型为Qwen3-8B、Mistral-7B-v0.3、Qwen1.5-MoE-A2.7B、Qwen3-30B-A3B、Meta Llama-3.1-8B-Instruct、AllenAI OLMoE-1B-7B-0924、GLM-4-9B-Chat。固定官方完整架构及revision，运行dummy权重；不裁层/专家，不宣称真实文本或自然路由精度。
@@ -190,6 +192,7 @@ TP1、TP2、Qwen1.5 MoE的EP2/4各完成8请求、13模型批次；详细图的�
 | `20261028T144023.928299Z_s9-native-control-feasibility` | S9十二次无设备探索与原生池生命周期证据；共同资源回归位于runs/resources；不作为正式接管资格 |
 | `20261028T175036.985082Z_s9-native-shared-execution` | S9.1共同资源、真实主循环、正式入口及限定开发证据；保留失败/费用与边界 |
 | `20261028T192906.251479Z_s9-native-resource-pressure` | 实际成员选择、撤回与重新Prefill；保留满池混合dtype拼接来源缺口 |
+| `20261028T221351.468056Z_s9-native-resource-groups` | 参与组资源/工作归属分离、双组状态交错及正式TP/EP回归；PP多lane尚未接入 |
 | `20261028T215356.466419Z_s9-native-call-dispatch` | 原生调用独立应答、时钟推进边界和既有TP/EP完整回归；PP组尚未接入 |
 | `20261028T212241.268714Z_s9-deferred-communication` | 跨动作消息、两端到达顺序、回收及六项入口回归；不是正式原生PP闭环 |
 | `20261028T205623.041370Z_s9-native-pipeline-boundaries` | 原生PP3控制探索、跨lane结果序列及完整入口回归；不是核心PP闭环 |
