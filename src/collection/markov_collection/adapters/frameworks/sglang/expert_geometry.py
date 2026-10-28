@@ -82,6 +82,22 @@ class ModelBufferCall(NativeCall):
         metadata["keywords"] = {"mapping": []}
 
 
+class LocalTokenCountCall(NativeCall):
+    def __init__(self, values: Any, original: Any) -> None:
+        super().__init__(
+            values.recording, values, original.__qualname__, original, {}, interface="model_local_token_count"
+        )
+
+    def completed(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
+    ) -> None:
+
+        # Native TP derives its clamp bound from this count; it is not a fixed implementation literal.
+        metadata["argument_relations"] = [{"value": self.values.value(args[0])}, {"scalar": "model_tokens"}]
+        metadata["keywords"] = {"mapping": []}
+        self.values.bind_shape(result, self.values.shapes.tensor(args[0]).shape)
+
+
 class ExpertModelGeometry:
     def __init__(self, values: Any) -> None:
         self.values = values
@@ -141,6 +157,9 @@ class ExpertModelGeometry:
             return original(*args, **kwargs)
         return ModelBufferCall(self.values, original)(*args, **kwargs)
 
+    def local_token_count(self, original: Any, global_num_token_non_padded: Any, num_tokens_per_dp: int) -> Any:
+        return LocalTokenCountCall(self.values, original)(global_num_token_non_padded, num_tokens_per_dp)
+
     def unpad(self, original: Any, batch: Any, logits: Any) -> Any:
         if self.values.recording.current_scope.get() is None:
             return original(batch, logits)
@@ -156,6 +175,7 @@ class ExpertModelGeometry:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
+            "sglang.srt.model_executor.forward_batch_info.compute_local_num_token_non_padded": self.local_token_count,
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch._pad_inputs_to_size": self.pad_inputs,
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch._pad_tensor_to_size": self.pad,
             "sglang.srt.layers.dp_attention.get_local_dp_buffer": self.buffer,
