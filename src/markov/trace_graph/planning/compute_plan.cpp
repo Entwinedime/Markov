@@ -15,8 +15,7 @@ ComputePlan project_compute(const source::SourceContext & source, source::Index 
     for (const auto operation : source.frame_operations(frame)) {
         const auto & call = observed.work_observations[operation];
         const auto & description = observed.work_descriptions[call.description];
-        if (std::ranges::any_of(description.recipe,
-                                [](const ComputePart & part) { return !std::holds_alternative<AttentionGeometry>(part.operation.geometry) && !part.rows; })) {
+        if (std::ranges::any_of(description.recipe, [](const ComputePart & part) { return !part.operation.uses_frame_input() && !part.rows; })) {
             result.missing_row_bindings.push_back(operation);
             continue;
         }
@@ -24,7 +23,7 @@ ComputePlan project_compute(const source::SourceContext & source, source::Index 
         if (inserted) {
             for (const auto & part : description.recipe) {
                 ComputeInput input = variables;
-                if (!std::holds_alternative<AttentionGeometry>(part.operation.geometry)) {
+                if (!part.operation.uses_frame_input()) {
                     const auto items = part.rows->basis == RowBasis::QueryTokens ? variables.query_tokens : variables.batch_size;
                     input = RowInput{ items * part.rows->rows_per_item };
                 }
@@ -38,6 +37,7 @@ ComputePlan project_compute(const source::SourceContext & source, source::Index 
         const auto unchanged =
             std::ranges::equal(original, binding->second, {}, std::identity{}, [&](std::size_t id) -> const Work & { return result.work[id]; });
         const auto begin = result.operations.size();
+        if (binding->second.empty()) result.operations.push_back({ std::nullopt, operation, unchanged });
         for (const auto work : binding->second) {
             const auto id = result.operations.size();
             result.operations.push_back({ work, operation, unchanged });

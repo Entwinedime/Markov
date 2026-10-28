@@ -4,8 +4,36 @@
 
 namespace markov::trace_graph::planning {
 
+bool ReshapeGeometry::is_view(double rows) const { return rows == 1 || input_row_stride == width || width == head_dim; }
+
+bool ComputeOperation::uses_frame_input() const {
+    return std::holds_alternative<AttentionGeometry>(geometry) || std::holds_alternative<TensorGeometry>(geometry);
+}
+
 std::vector<Work> ComputeOperation::describe(Phase phase, const ComputeInput & input) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill." : "decode.";
+    if (const auto * shape = std::get_if<TensorGeometry>(&geometry)) {
+        const auto & frame = std::get<AttentionInput>(input);
+        auto features = shape->fixed;
+        for (const auto & [name, count] : shape->per_query_token) features[name] += count * frame.query_tokens;
+        for (const auto & [name, count] : shape->per_request) features[name] += count * frame.batch_size;
+        return {
+            Work{ { prefix + shape->operation, implementation, "device_service" }, std::move(features) }
+        };
+    }
+    if (const auto * shape = std::get_if<ReshapeGeometry>(&geometry)) {
+        const auto rows = std::get<RowInput>(input).rows;
+        if (shape->is_view(rows)) return {};
+
+        return {
+            Work{ { prefix + "qk_reshape", implementation, "device_service" },
+                 { { "rows", rows },
+                    { "elements", rows * shape->width },
+                    { "heads", shape->width / shape->head_dim },
+                    { "head_dim", shape->head_dim },
+                    { "input_row_stride", shape->input_row_stride } } }
+        };
+    }
     if (const auto * shape = std::get_if<LinearGeometry>(&geometry)) {
         const auto m = std::get<RowInput>(input).rows;
         return {

@@ -9,7 +9,8 @@
 namespace markov::trace_graph::planning {
 
 struct ComputeInstance {
-    std::size_t work;
+    // A view-only call retains its dependency port without inventing a service.
+    std::optional<std::size_t> work;
     source::Index source_operation;
 
     // Identity evidence within this source deployment, not permission to reuse

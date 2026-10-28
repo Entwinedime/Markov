@@ -53,6 +53,7 @@ add_library(markov_adapters
     src/markov/adapters/ascend/causality.cpp
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/sglang/observations.cpp
+    src/markov/adapters/sglang/dense.cpp
     src/markov/adapters/sglang/cache.cpp
 )
 target_link_libraries(markov_adapters PUBLIC markov_prediction)

@@ -118,10 +118,12 @@ Json source_compute_alignment(const source::SourceContext & source) {
             const auto begin = at;
             while (at < plan.operations.size() && plan.operations[at].source_operation == operation) ++at;
             const auto actual_count = at - begin;
+            if (original.empty() && actual_count == 1 && !plan.operations[begin].work) continue;
             bool different = false;
             for (std::size_t i = 0; i < std::max(actual_count, original.size()); ++i) {
                 ++compared;
-                if (i < actual_count && i < original.size() && plan.work[plan.operations[begin + i].work] == original[i]) continue;
+                if (i < actual_count && i < original.size() && plan.operations[begin + i].work && plan.work[*plan.operations[begin + i].work] == original[i])
+                    continue;
 
                 ++mismatched;
                 different = true;

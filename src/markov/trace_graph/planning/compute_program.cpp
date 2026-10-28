@@ -15,11 +15,12 @@ PlannedMutation compute_mutation(const source::SourceContext & source, const Com
     PlannedMutation mutation{ owner, {}, {} };
     std::map<source::Index, Ports> ports;
     for (const auto & operation : plan.operations) {
-        const auto resource = source.device_service(operation.source_operation).resource.value();
+        const auto resource = operation.work ? source.device_service(operation.source_operation).resource.value() : 0;
         const auto id = begin + mutation.operations.size();
         const auto [port, inserted] = ports.try_emplace(operation.source_operation, Ports{ id, id });
         port->second.last = id;
-        mutation.operations.push_back({ resource, std::cref(plan.work[operation.work]) });
+        if (operation.work) mutation.operations.push_back({ resource, std::cref(plan.work[*operation.work]) });
+        else mutation.operations.push_back({ resource, Boundary{} });
     }
 
     std::vector<bool> has_successor(plan.operations.size(), false);

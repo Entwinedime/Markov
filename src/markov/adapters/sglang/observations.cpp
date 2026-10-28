@@ -1,8 +1,12 @@
 #include "markov/adapters/sglang/observations.hpp"
 
+#include "markov/adapters/sglang/dense.hpp"
+
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -13,14 +17,7 @@ namespace {
 
 using namespace trace_graph::planning;
 
-struct ComputeObservation {
-    ComputeOperation operation;
-    ComputeInput input;
-    std::optional<RowBinding> rows;
-};
-
 std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const ComputeFrame & frame, const AttentionDescriptor * descriptor) {
-    const auto & args = event.args;
     if (event.name == "runtime.phase.attention") {
         if (!descriptor->operation || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) return {};
         std::vector<ComputeObservation> result;
@@ -37,63 +34,7 @@ std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const Com
         return result;
     }
 
-    const auto input = args.at("input_shape").get<std::vector<double>>();
-    const auto stride = args.at("input_stride").get<std::vector<double>>();
-    if (input.size() != 2 || stride.size() != 2) return {};
-    const std::array<double, 2> input_stride{ stride[0], stride[1] };
-    const auto basis =
-        event.name == "runtime.phase.logits_projection" && args.at("last_token_projection").get<bool>() ? RowBasis::BatchSize : RowBasis::QueryTokens;
-    std::optional<RowBinding> rows;
-    if (args.contains("rows_per_token") && !args.at("rows_per_token").is_null()) rows = RowBinding{ basis, args.at("rows_per_token").get<double>() };
-
-    if (event.name == "runtime.phase.linear" || event.name == "runtime.phase.logits_projection") {
-        const auto weight = args.at("weight_shape").get<std::vector<double>>();
-        const auto weight_stride = args.at("weight_stride").get<std::vector<double>>();
-        if (weight.size() != 2 || weight_stride.size() != 2) return {};
-
-        const auto method = event.name == "runtime.phase.logits_projection" ? "torch.matmul.logits:" : "torch.linear:";
-        auto implementation = method + args.at("input_dtype").get<std::string>();
-        implementation += args.at("bias_shape").is_null() ? ":no_bias" : ":bias";
-        if (args.at("input_dtype") != args.at("weight_dtype")) implementation += ":weight=" + args.at("weight_dtype").get<std::string>();
-        return {
-            ComputeObservation{ { std::move(implementation), LinearGeometry{ weight[0], input[1], input_stride, { weight_stride[0], weight_stride[1] } } },
-                               RowInput{ input[0] },
-                               rows }
-        };
-    }
-    if (event.name == "runtime.phase.normalization") {
-        const auto implementation = "torch_npu.rms_norm:" + args.at("input_dtype").get<std::string>() + ":weight=" + args.at("weight_dtype").get<std::string>();
-        const ComputeObservation normalization{
-            { implementation, NormalizationGeometry{ input[1], args.at("epsilon").get<double>(), input_stride } },
-            RowInput{ input[0] },
-            rows
-        };
-        if (args.at("implementation") == "torch_npu.npu_rms_norm") return { normalization };
-        if (args.at("implementation") != "torch_npu.npu_add_rms_norm" || !args.at("split_residual_norm").get<bool>()
-            || args.at("post_residual_addition").get<bool>() || args.at("input_shape") != args.at("residual_shape")
-            || args.at("input_stride") != args.at("residual_stride") || args.at("input_dtype") != args.at("residual_dtype") || stride[0] != input[1]
-            || stride[1] != 1)
-            return {};
-
-        // The installed batch-invariant backend executes an add then RMSNorm.
-        // Preserve both operations; the enclosing probe wall is not charged.
-        return {
-            ComputeObservation{ { "aten.add:" + args.at("input_dtype").get<std::string>(), AdditionGeometry{ input[1], input_stride } },
-                               RowInput{ input[0] },
-                               rows },
-            normalization
-        };
-    }
-    if (event.name == "runtime.phase.gated_activation" && args.at("implementation") == "torch_npu.npu_swiglu") {
-        const auto output = args.at("output_shape").get<std::vector<double>>();
-        if (output.size() != 2) return {};
-        return {
-            ComputeObservation{ { "torch_npu.swiglu:" + args.at("input_dtype").get<std::string>(), ActivationGeometry{ output[1], input_stride } },
-                               RowInput{ input[0] },
-                               rows }
-        };
-    }
-    return {};
+    return read_dense_work(event);
 }
 
 std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::json & args) {
@@ -160,9 +101,28 @@ void ProbeReader::observe(const ProbeEvent & event) {
         output_.compute_frames.push_back(std::move(frame));
     }
 
-    if (name == "runtime.phase.linear" || name == "runtime.phase.logits_projection" || name == "runtime.phase.normalization"
-        || name == "runtime.phase.gated_activation" || name == "runtime.phase.attention")
-        observe_compute(event);
+    if (name == "runtime.phase.embedding" && args.at("status") == "returned") embedding_windows_[process] = { event.end_ns, 0 };
+    if (name == "runtime.phase.device_collective" && args.at("dense_role") == "input_embedding" && args.at("status") == "returned")
+        embedding_windows_.at(process).reduction_begin = event.begin_ns;
+    if (name == "runtime.phase.embedding_forward" && args.at("status") == "returned" && args.at("tp_size").get<int>() > 1) {
+        const auto window = embedding_windows_.at(process);
+        if (window.lookup_end < event.begin_ns || window.reduction_begin <= window.lookup_end || window.reduction_begin > event.end_ns)
+            throw std::runtime_error("Embedding mask has no bounded native lookup-to-reduction window");
+
+        auto mask = event;
+        mask.begin_ns = window.lookup_end;
+        mask.end_ns = window.reduction_begin;
+        observe_compute(mask);
+    }
+
+    constexpr std::array<std::string_view, 15> compute_roles{
+        "runtime.phase.linear",           "runtime.phase.logits_projection", "runtime.phase.normalization",
+        "runtime.phase.gated_activation", "runtime.phase.attention",         "runtime.phase.input_buffers",
+        "runtime.phase.embedding_mask",   "runtime.phase.embedding",         "runtime.phase.qk_reshape",
+        "runtime.phase.rotary",           "runtime.phase.rotary_table",      "runtime.phase.qkv_norm_rope",
+        "runtime.phase.logits_output",    "runtime.phase.logits_pruning",    "runtime.phase.greedy_sampling"
+    };
+    if (std::ranges::find(compute_roles, name) != compute_roles.end()) observe_compute(event);
 }
 
 trace_graph::planning::PrefixId ProbeReader::token_path(const nlohmann::json & dictionary) {
@@ -215,6 +175,10 @@ const AttentionDescriptor & ProbeReader::attention_descriptor(const ProbeEvent &
 void ProbeReader::observe_compute(const ProbeEvent & event) {
     const auto & args = event.args;
     if (args.at("status") != "returned") return;
+    if (event.name == "runtime.phase.logits_pruning" && args.at("passthrough").get<bool>()) {
+        ++output_.counts["compute_view_only.logits_pruning"];
+        return;
+    }
     const auto context = forward_frames_.find(event.process);
     if (context == forward_frames_.end()) {
         ++output_.counts["compute_work_without_forward_context"];

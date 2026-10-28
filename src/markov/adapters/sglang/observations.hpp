@@ -32,6 +32,10 @@ private:
     void observe_compute(const ProbeEvent & event);
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
+    struct EmbeddingWindow {
+        trace_graph::source::Time lookup_end, reduction_begin;
+    };
+    std::map<std::string, EmbeddingWindow> embedding_windows_;
     std::map<std::string, trace_graph::planning::PrefixId> token_descriptors_;
     std::map<std::tuple<std::string, trace_graph::planning::Phase, trace_graph::source::Index>, AttentionDescriptor> attention_descriptors_;
 };

@@ -68,7 +68,7 @@ struct SubsetExecution {
             return;
         }
         ++completed_frames;
-        service_operations += plan.operations.size();
+        for (const auto & operation : plan.operations) service_operations += operation.work.has_value();
         queue_dependencies += source.frame_queue_order(frame).size();
     }
 
@@ -220,7 +220,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         // Its capacity follows the input; it is not a target hardware setting.
         planning::Cache prefixes({ corpus_pages, 0, 1, std::nullopt });
         std::map<planning::Work, WorkCounts> projected_work;
-        std::size_t missing_projection_inputs = 0, missing_row_bindings = 0, dependencies = 0;
+        std::size_t missing_projection_inputs = 0, missing_row_bindings = 0, dependencies = 0, views = 0;
         auto requests = Json::array();
         for (const auto & request : observations.requests) {
             const auto found = observations.request_tokens.find(request.identity);
@@ -266,7 +266,11 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 if (queries && !cache) execution.evaluate(source.context, plan, *queries, frame_id);
                 dependencies += plan.dependencies.size();
                 for (const auto & operation : plan.operations) {
-                    auto & counts = projected_work[plan.work[operation.work]];
+                    if (!operation.work) {
+                        ++views;
+                        continue;
+                    }
+                    auto & counts = projected_work[plan.work[*operation.work]];
                     ++counts.instances;
                     counts.source_work_unchanged += operation.source_work_unchanged;
                     counts.source_service_bound += operation.source_work_unchanged && source.context.device_service(operation.source_operation).available();
@@ -309,6 +313,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             { "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
             { "projected_compute_work", std::move(compute) },
             { "projected_compute_dependencies", dependencies },
+            { "projected_view_operations", views },
             { "cost_execution",
              queries && !cache ? execution.report(queries->requests() - query_begin, queries->evaluations() - evaluation_begin) : Json(nullptr) },
             { "cache_execution", std::move(cache_result) },

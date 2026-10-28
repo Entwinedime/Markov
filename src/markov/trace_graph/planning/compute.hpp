@@ -57,7 +57,22 @@ struct CacheWriteGeometry {
     auto operator<=>(const CacheWriteGeometry &) const = default;
 };
 
-using ComputeGeometry = std::variant<LinearGeometry, NormalizationGeometry, ActivationGeometry, AdditionGeometry, AttentionGeometry, CacheWriteGeometry>;
+// These factors count tensor elements, not time. The adapter supplies native
+// geometry; the same description binds query length and batch size independently.
+struct TensorGeometry {
+    std::string operation;
+    Features fixed, per_query_token, per_request;
+    auto operator<=>(const TensorGeometry &) const = default;
+};
+
+struct ReshapeGeometry {
+    double width, head_dim, input_row_stride;
+    bool is_view(double rows) const;
+    auto operator<=>(const ReshapeGeometry &) const = default;
+};
+
+using ComputeGeometry = std::variant<LinearGeometry, NormalizationGeometry, ActivationGeometry, AdditionGeometry, AttentionGeometry, CacheWriteGeometry,
+                                     TensorGeometry, ReshapeGeometry>;
 
 struct RowInput {
     double rows;
@@ -78,6 +93,7 @@ struct ComputeOperation {
     std::string implementation;
     ComputeGeometry geometry;
 
+    bool uses_frame_input() const;
     std::vector<Work> describe(Phase phase, const ComputeInput & input) const;
     auto operator<=>(const ComputeOperation &) const = default;
 };
