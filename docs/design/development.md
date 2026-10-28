@@ -155,6 +155,26 @@ scripts/markov.sh simulate \
 
 逻辑 TP 在同一 `templates` 命令中重复 `--source`，每项后可接本次捕获的 `--physical`；输出一份共享 catalog 和独立 roles，`simulate` 只接收这一份文件。旧内部资产须从来源明确重建，不兼容读取。`simulate` 接受目标请求及给定耗时，由完成端口驱动后续组批；`--details` 额外保留图、批次和输出事件。`expand`/`compose` 的目标可用 `source_rank` 选择来源角色，默认 0；`compose` 按目标 `invocations` 的命名端口连接区域，只是公开诊断，不维护另一套 serving 控制。
 
+原生组批可以独立导出并回放，不增加 workload 字段：
+
+```bash
+scripts/markov.sh record-batches \
+  --source data/YOUR_RUN/captures/source/rank-0.json \
+  --input data/YOUR_RUN/inputs/serving.json \
+  --output data/YOUR_RUN/results/batches.json
+scripts/markov.sh simulate \
+  --templates data/YOUR_RUN/assets/templates.json \
+  --input data/YOUR_RUN/inputs/serving.json \
+  --batches data/YOUR_RUN/results/batches.json \
+  --output data/YOUR_RUN/results/replayed.json
+```
+
+导出使用保留的完整语义观察和同目录的 `session.json`，输入应为当次原生运行的请求，按原始输入顺序对应原生请求 ID。P/D 分别提供各实例 TP rank 0、PP rank 0 的 `--source`。SGLang adapter 过滤辅助观察，转换实际完成的 Prefill、Decode 和无模型接入批次；只导出实例内顺序、阶段、微批次上下文 `lane`、请求身份及 token 范围。PP 的 lane 直接观察原生调度循环，缺少此事实的旧 PP 记录不可回放；非 PP 只有 lane 0。记录不包含图、节点耗时或物理页号。
+
+共同控制消费记录选择成员，继续独占请求/KV 状态，并等待执行器的完成反馈；P/D 预约按记录的 P 批次顺序，交接按请求身份连接，支持多成员 Prefill 和接入。CLI 先统一校验、按到达时间稳定排序请求，再交给控制器与展开器；记录按 ID 对应，不依赖排序后的下标。默认不传 `--batches` 时仍使用轻量组批策略；结果的 `control_source` 区分两者。
+
+当前回放只接收冷缓存、完整 Prefill、逐 token Decode 及固定 lane 的完整序列，不支持 chunk、prefix cache 或 speculative。记录替代组批策略的选择，实际槽位、KV 容量和进度仍须满足；模板若缺少该批次的结构变体，仍会失败，不自动补采或放宽条件。回放固定组批条件以核对展开，不等于原生在线调度器，不重放原生物理分配顺序、跨实例事件时序或全部 PP 重叠。使用同一次观察建库再回放仅证明功能链路，不能作为独立泛化或性能精度验收。
+
 同一物理输入还包含搬运和等待的 `runtime_actions`。`runtime_coverage` 报告其操作归属，内部的 `native_arguments` 单独报告 API 参数观察及缺失名称；区域输出分别携带 `source_runtime_coverage` 与 `source_runtime_arguments`。没有物理观察时明确为 `not_observed`，参数覆盖不完整时保留 `partial`，二者都不能当成完整资源因果资格。
 
 同步回调与 API 按相同线程、归属和事件种类的一一调用顺序交接参数，允许回调出现在 API 前或后；数量不符或调用交错时保留缺口，不能依最近时间关联。私有 ELF 符号不可用不影响回调已观测到的 stream；是否排空队列仍需独立的原生协议依据。
