@@ -22,6 +22,61 @@ using namespace trace_graph;
 using Clock = std::chrono::steady_clock;
 using Json = nlohmann::json;
 
+Json cpu_interval_summary(const source::SourceContext & source) {
+    struct Summary {
+        std::size_t calls = 0;
+        source::Time wall_ns = 0;
+        source::CpuInterval interval;
+
+        void include(const source::CpuInterval & value, source::Time wall) {
+            ++calls;
+            wall_ns += wall;
+            interval.service_ns += value.service_ns;
+            interval.wait_ns += value.wait_ns;
+            interval.residual_ns += value.residual_ns;
+            interval.instrumentation_ns += value.instrumentation_ns;
+            interval.unobserved_ns += value.unobserved_ns;
+        }
+    };
+    const auto & observed = source.observations();
+    std::vector<Summary> compute(observed.work_descriptions.size());
+    for (source::Index id = 0; id < observed.work_observations.size(); ++id) {
+        const auto & work = observed.work_observations[id];
+        compute[work.description].include(source.cpu_work_interval(id), work.end_ns - work.begin_ns);
+    }
+    Summary metadata;
+    for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
+        const auto & regions = observed.compute_frames[frame].metadata;
+        const auto intervals = source.metadata_intervals(frame);
+        for (std::size_t i = 0; i < regions.size(); ++i) metadata.include(intervals[i], regions[i].end_ns - regions[i].begin_ns);
+    }
+    const auto describe = [](const Summary & summary) -> Json {
+        return {
+            {              "calls",                       summary.calls },
+            {            "wall_ns",                     summary.wall_ns },
+            {         "service_ns",         summary.interval.service_ns },
+            {   "observed_wait_ns",            summary.interval.wait_ns },
+            {    "residual_gap_ns",        summary.interval.residual_ns },
+            { "instrumentation_ns", summary.interval.instrumentation_ns },
+            {      "unobserved_ns",      summary.interval.unobserved_ns }
+        };
+    };
+    auto descriptions = Json::array();
+    for (std::size_t id = 0; id < compute.size(); ++id) {
+        auto item = describe(compute[id]);
+        item["work_description"] = id;
+        descriptions.push_back(std::move(item));
+    }
+    return {
+        {      "compute_calls",std::move(descriptions)                               },
+        { "attention_metadata",      describe(metadata) },
+        {      "qualification",
+         "Source caller intervals only: exclusive observed service, waits, gaps, and uncovered time are kept separate. "
+         "Profiler correction is not applied; these are neither normal CPU costs nor a complete request partition. Device/worker work is not charged "
+         "here."                                       }
+    };
+}
+
 Json device_service_summary(const source::SourceContext & source) {
     struct Summary {
         std::map<std::string, std::size_t> statuses;
@@ -394,6 +449,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {        "collective_observations",                                                                                              std::move(collective_calls) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
         {         "device_service_binding",                                                                                          device_service_summary(context) },
+        {             "cpu_work_intervals",                                                                                            cpu_interval_summary(context) },
         {                 "request_tokens",                                                                                          request_token_summary(captured) },
         {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
         {        "work_observation_counts",                                                                                                   std::move(work_counts) },

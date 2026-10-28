@@ -74,8 +74,13 @@ void ProbeReader::observe(const ProbeEvent & event) {
     const auto & args = event.args;
     const auto & process = event.process;
     if (name == "runtime.hicache.decode_allocation") {
-        ComputeFrame frame{ trace_graph::planning::Phase::Decode,      {},          args.at("sequence_lens_tokens").get<std::vector<double>>(), {},
-                            args.at("page_size_tokens").get<double>(), event.record };
+        ComputeFrame frame{ trace_graph::planning::Phase::Decode,
+                            {},
+                            args.at("sequence_lens_tokens").get<std::vector<double>>(),
+                            {},
+                            args.at("page_size_tokens").get<double>(),
+                            event.record,
+                            {} };
         for (const auto & identity : args.at("request_ids")) frame.requests.push_back(output_.name(identity.get<std::string>()));
         frame.query_tokens = std::vector<double>(frame.requests.size(), args.at("token_per_req").get<double>());
         forward_frames_[process] = output_.compute_frames.size();
@@ -90,7 +95,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
     if (name == "hicache_cache_extend_input_start") {
         const auto & dictionaries = args.at("token_dictionaries");
         const auto & identities = args.at("request_ids");
-        ComputeFrame frame{ trace_graph::planning::Phase::Prefill, {}, {}, std::nullopt, std::nullopt, event.record };
+        ComputeFrame frame{ trace_graph::planning::Phase::Prefill, {}, {}, std::nullopt, std::nullopt, event.record, {} };
         for (std::size_t i = 0; i < identities.size(); ++i) {
             const auto path = token_path(dictionaries.at(i));
             const auto request = identities[i].get<std::string>();
@@ -100,6 +105,15 @@ void ProbeReader::observe(const ProbeEvent & event) {
         }
         forward_frames_[process] = output_.compute_frames.size();
         output_.compute_frames.push_back(std::move(frame));
+    }
+
+    if (name == "runtime.phase.attention_metadata" && args.at("status") == "returned") {
+        const auto frame = forward_frames_.find(process);
+        if (frame == forward_frames_.end()) ++output_.counts["metadata_without_forward_context"];
+        else {
+            const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+            output_.compute_frames[frame->second].metadata.push_back({ resource, event.begin_ns, event.end_ns, event.record });
+        }
     }
 
     if (name == "runtime.phase.embedding" && args.at("status") == "returned") embedding_windows_[process] = { event.end_ns, 0 };

@@ -26,10 +26,27 @@ SourceContext::SourceContext(Observations && observations)
         for (const auto request : observations_.compute_frames[frame].requests) request_frames_[observations_.names[request]].push_back(frame);
     }
     device_services_ = bind_device_services(observations_, graph_);
+    index_cpu_intervals();
     index_compute_queues();
 
     // The context is read-only now; keep semantic tables, not parser interning.
     observations_.release_intake_indexes();
+}
+
+void SourceContext::index_cpu_intervals() {
+    std::vector<CpuRegion> regions;
+    regions.reserve(observations_.work_observations.size());
+    for (const auto & work : observations_.work_observations) regions.push_back({ work.resource, work.begin_ns, work.end_ns, work.record });
+    for (const auto & frame : observations_.compute_frames) regions.insert(regions.end(), frame.metadata.begin(), frame.metadata.end());
+
+    auto intervals = cpu_intervals(observations_, graph_, regions);
+    auto at = observations_.work_observations.size();
+    for (const auto & frame : observations_.compute_frames) {
+        metadata_intervals_.emplace_back(intervals.begin() + at, intervals.begin() + at + frame.metadata.size());
+        at += frame.metadata.size();
+    }
+    intervals.resize(observations_.work_observations.size());
+    cpu_work_intervals_ = std::move(intervals);
 }
 
 std::span<const Index> SourceContext::request_frames(std::string_view request) const {

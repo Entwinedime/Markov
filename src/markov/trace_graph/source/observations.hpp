@@ -105,6 +105,12 @@ struct WorkDescription {
     std::vector<planning::ComputePart> recipe;
 };
 
+struct CpuRegion {
+    Index resource;
+    Time begin_ns, end_ns;
+    RecordRef record;
+};
+
 struct ComputeFrame {
     planning::Phase phase;
     std::vector<Index> requests; // Indices into Observations::names, not requests.
@@ -112,6 +118,7 @@ struct ComputeFrame {
     std::optional<std::vector<double>> query_tokens;
     std::optional<double> page_tokens;
     RecordRef record;
+    std::vector<CpuRegion> metadata;
 };
 
 struct CollectiveGroup {

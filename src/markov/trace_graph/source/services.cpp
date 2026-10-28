@@ -8,6 +8,56 @@
 #include <utility>
 
 namespace markov::trace_graph::source {
+
+std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions) {
+    // LaneBuilder emits each source resource contiguously, in observed order.
+    // Retain only its index range, rather than another per-node timeline.
+    std::vector<std::pair<graph::NodeId, graph::NodeId>> lanes(observations.resources.size());
+    const auto & nodes = graph.graph.nodes();
+    for (graph::NodeId id = 0; id < nodes.size(); ++id) {
+        const auto resource = nodes[id].resource;
+        if (observations.resources[resource].kind != ResourceKind::CpuThread) continue;
+        auto & range = lanes[resource];
+        if (range.first == range.second) range.first = id;
+        range.second = id + 1;
+    }
+
+    std::vector<CpuInterval> result;
+    result.reserve(regions.size());
+    for (const auto & region : regions) {
+        auto & measured = result.emplace_back();
+        measured.unobserved_ns = region.end_ns - region.begin_ns;
+        const auto [first, last] = lanes[region.resource];
+        const auto origins = std::span(graph.node_origins).subspan(first, last - first);
+        auto at = std::ranges::lower_bound(origins, region.begin_ns, {}, &SourceGraph::NodeOrigin::begin_ns);
+        if (at != origins.begin()) --at;
+        for (; at != origins.end() && at->begin_ns < region.end_ns; ++at) {
+            const auto id = first + (at - origins.begin());
+            const auto & node = nodes[id];
+            const auto duration = std::min(region.end_ns, at->begin_ns + node.duration_ns) - std::max(region.begin_ns, at->begin_ns);
+            if (duration <= 0) continue;
+            switch (node.kind) {
+            case graph::NodeKind::Service:
+                measured.service_ns += duration;
+                break;
+            case graph::NodeKind::ObservedWait:
+                measured.wait_ns += duration;
+                break;
+            case graph::NodeKind::ResidualGap:
+                measured.residual_ns += duration;
+                break;
+            case graph::NodeKind::ProfilerOverhead:
+                measured.instrumentation_ns += duration;
+                break;
+            case graph::NodeKind::Boundary:
+                break;
+            }
+            measured.unobserved_ns -= duration;
+        }
+    }
+    return result;
+}
+
 namespace {
 
 struct Lane {
