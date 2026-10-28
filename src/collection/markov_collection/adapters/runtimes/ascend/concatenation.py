@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,17 @@ class AscendConcatenation:
         self.version = dict(line.split("=", 1) for line in information.read_text().splitlines())["version"]
 
     @classmethod
-    def points(cls) -> list[tuple[torch.dtype, tuple[int, ...]]]:
+    def points(cls) -> list[tuple[tuple[torch.dtype, int], ...]]:
         points = []
         for dtype in (torch.int32, torch.int64):
             aligned_extent = cls.alignment_bytes // cls.dtype_bytes[str(dtype)]
             count = cls.fan_in + 1
             for lengths in ((0, 0), (0, 2), (1, 2), (1,) * count, (aligned_extent,) * count):
-                points.append((dtype, lengths))
+                points.append(tuple((dtype, length) for length in lengths))
+
+        # Empty operands are removed before dispatch, but still participate in result type promotion.
+        for types in ((torch.int32, torch.int64), (torch.int64, torch.int32)):
+            points.extend(tuple(zip(types, lengths, strict=True)) for lengths in product((0, 2), repeat=2))
         return points
 
     def warmup(self) -> None:
@@ -46,8 +51,8 @@ class AscendConcatenation:
         if self.version != "9.0.0" or not torch.npu.get_device_name().startswith("Ascend910B"):
             raise NotImplementedError("integer concat lowering currently qualifies CANN 9.0 on Ascend910B")
 
-        for dtype, lengths in self.points():
-            tensors = [torch.ones(length, dtype=dtype, device="npu") for length in lengths]
+        for point in self.points():
+            tensors = [torch.ones(length, dtype=dtype, device="npu") for dtype, length in point]
             torch.cat(tensors)
         torch.npu.synchronize()
         self.warmed = True
@@ -55,10 +60,10 @@ class AscendConcatenation:
     def capture(self) -> None:
         if self.captured:
             return
-        for dtype, lengths in self.points():
+        for point in self.points():
             for observed in (False, True):
                 with self.operators.values.auxiliary():
-                    tensors = [torch.ones(length, dtype=dtype, device="npu") for length in lengths]
+                    tensors = [torch.ones(length, dtype=dtype, device="npu") for dtype, length in point]
                 identity = len(self.recording.batches)
                 self.recording.batches.append(
                     {
@@ -66,7 +71,7 @@ class AscendConcatenation:
                         "kind": "primitive",
                         "phase": "primitive",
                         "members": [],
-                        "parameters": {"L": len(lengths), "concat_extent": sum(lengths)},
+                        "parameters": {"L": len(point), "concat_extent": sum(length for _, length in point)},
                         "observation": "source" if observed else "baseline",
                     }
                 )
@@ -81,18 +86,45 @@ class AscendConcatenation:
                 torch.npu.synchronize()
         self.captured = True
 
+    @staticmethod
+    def typed_operands(metadata: dict[str, Any], values: list[dict[str, Any]]) -> None:
+
+        # Mixed types already fix operand order; named ports retain which empty operand removes a cast.
+        ports = {f"segment_{index}": value["id"] for index, value in enumerate(values)}
+        parameters = {f"extent_{index}": value["shape"][0] for index, value in enumerate(values)}
+        contracts = [
+            {"value": value["id"], "shape": [f"extent_{index}"]} for index, value in enumerate(values)
+        ]
+        total: Any = 0
+        for name in parameters:
+            total = name if total == 0 else ["add", total, name]
+        contracts.append({"value": metadata["outputs"][0], "shape": [total]})
+
+        metadata.pop("input_groups", None)
+        metadata.update(
+            parameters=parameters,
+            guards=[{"condition": ["eq", total, 0], "expected": not any(parameters.values())}],
+            argument_relations=metadata["arguments"],
+            shape_contracts=contracts,
+            ports={"inputs": ports, "outputs": {"result": metadata["outputs"][0]}},
+            call_family="concatenate",
+            entrypoint_phase=None,
+            execution_guards=[
+                {"condition": ["eq", name, 0], "expected": length == 0} for name, length in parameters.items()
+            ],
+        )
+
     @classmethod
     def declare(cls, regions: list[dict[str, Any]], source_values: list[dict[str, Any]]) -> None:
         for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "concatenate":
                 continue
-            group = metadata["input_groups"]["segments"]
-            members = group["members"]
-            values = [source_values[member["value"]] for member in members]
+            operands = metadata["arguments"][0]
+            values = [source_values[operand["value"]] for operand in operands]
             dtype = source_values[metadata["outputs"][0]]["dtype"]
             if (
-                group["device"] != "npu"
+                values[0]["device"] != "npu"
                 or dtype not in cls.dtype_bytes
                 or metadata["attributes"]["axis"] != 0
                 or any(
@@ -102,11 +134,14 @@ class AscendConcatenation:
             ):
                 continue
 
+            if len({value["dtype"] for value in values}) > 1:
+                cls.typed_operands(metadata, values)
+                continue
+
             # Filtering and alignment are functions of actual members, including a completely full KV pool.
+            group = metadata["input_groups"]["segments"]
+            members = group["members"]
             group["dtype"] = dtype
-            types = [value["dtype"] for value in values]
-            if any(member != dtype for member in types):
-                group["member_dtypes"] = types
             lengths = [member["parameters"]["extent"] for member in members]
             width = cls.dtype_bytes[group["dtype"]]
             nonempty = sum(length > 0 for length in lengths)
@@ -138,8 +173,7 @@ class AscendConcatenation:
             ]
             metadata["entrypoint_phase"] = None
 
-            # Mixed operands keep their native casts; homogeneous reduction prototypes cannot replace them.
-            if nonempty > 1 and "member_dtypes" not in group:
+            if nonempty > 1:
                 metadata["execution_reduction"] = {
                     "group": "segments",
                     "field": "extent",
