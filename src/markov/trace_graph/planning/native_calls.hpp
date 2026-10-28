@@ -14,7 +14,7 @@
 
 namespace markov::trace_graph::planning {
 
-enum class CallKind { Cpu, Queued, Readback };
+enum class CallKind { Cpu, Queued, Readback, HostUpload };
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;
@@ -31,6 +31,7 @@ struct NativeCall {
     // A mixed sequence uses the incoming producer here and the frame stream
     // for its other calls; one source binding cannot collapse both roles.
     bool incoming_stream = false;
+    std::optional<Work> worker_synchronization = std::nullopt;
 };
 
 struct NativeSequence {
@@ -81,7 +82,7 @@ public:
     PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
     std::size_t operations() const { return steps_.size(); }
     std::size_t delays() const;
-    std::optional<std::size_t> producer_device() const { return device_ ? std::optional(steps_[*device_].resource) : std::nullopt; }
+    std::optional<std::size_t> producer_device() const { return device_ ? std::optional(device_->device) : std::nullopt; }
 
 private:
     graph::NodeId append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay = false);
@@ -96,7 +97,12 @@ private:
     };
     std::vector<Step> steps_;
     std::vector<graph::Edge> edges_;
-    std::optional<graph::NodeId> caller_, worker_, device_;
+    std::optional<graph::NodeId> caller_, worker_;
+    struct DeviceProducer {
+        graph::NodeId completion;
+        std::size_t device;
+    };
+    std::optional<DeviceProducer> device_;
 };
 
 } // namespace markov::trace_graph::planning

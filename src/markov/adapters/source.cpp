@@ -2,6 +2,7 @@
 
 #include "markov/adapters/ascend/trace.hpp"
 #include "markov/adapters/probes.hpp"
+#include "markov/adapters/sglang/input_preparation.hpp"
 #include "markov/adapters/sglang/observations.hpp"
 #include "markov/trace_graph/source/chrome_reader.hpp"
 #include "markov/trace_graph/source/clients.hpp"
@@ -66,7 +67,8 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     source::Observations observations;
     ascend::RuntimeCausality causality;
     std::unique_ptr<ProbeReader> probes;
-    if (manifest.framework == "sglang") probes = std::make_unique<sglang::ProbeReader>(observations);
+    if (manifest.framework == "sglang")
+        probes = std::make_unique<sglang::ProbeReader>(observations, sglang::read_deterministic_sampling(manifest.configuration_path));
     else if (manifest.framework == "ktransformers") probes = std::make_unique<ProbeReader>(observations);
     else throw std::runtime_error("Framework probe interpretation is not implemented for " + manifest.framework);
     std::vector<std::size_t> counts;

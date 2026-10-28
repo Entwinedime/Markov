@@ -47,6 +47,10 @@ ProfileManifest inspect_manifest(const std::filesystem::path & path) {
     ProfileManifest result{ std::filesystem::absolute(path).lexically_normal(), raw.at("framework").get<std::string>(), {} };
     if (raw.contains("capture_origin_manifest")) result.capture_origin_manifest = raw.at("capture_origin_manifest").get<std::string>();
     const std::filesystem::path origin = raw.at("run_dir").get<std::string>();
+    if (raw.contains("config_path")) {
+        result.configuration_path = captured_path(result.path, origin, raw.at("config_path").get<std::string>()).lexically_normal();
+        (void)std::filesystem::file_size(*result.configuration_path);
+    }
     const auto & trace = raw.at("trace");
     append_files(result, trace.at("torch_trace_files"), origin, Channel::Torch);
     append_files(result, trace.at("ld_preload_trace_files"), origin, Channel::NativeHook);

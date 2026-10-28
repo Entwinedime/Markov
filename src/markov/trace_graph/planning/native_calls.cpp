@@ -73,7 +73,7 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         if (call.kind == CallKind::Readback) {
             const auto & synchronization = call.synchronization.value();
             const auto ready = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
-            depend(device_, ready);
+            depend(device_ ? std::optional(device_->completion) : std::nullopt, ready);
             depend(worker_, ready);
             append(returned, "post_sync_readback_interval", resources.caller, caller_);
             continue;
@@ -85,13 +85,32 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         // Dispatch samples start after both submission and the previous task.
         depend(worker_, ready);
         worker_ = ready;
+        const auto device = call.incoming_stream ? incoming.value() : resources.device;
+        if (call.kind == CallKind::HostUpload) {
+            cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_);
+            const auto & synchronization = call.worker_synchronization.value();
+            const auto synchronized = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.worker, worker_);
+            depend(device_ ? std::optional(device_->completion) : std::nullopt, synchronized);
+            const auto copied = append(call.work, "host_to_device_interval", resources.worker, worker_);
+
+            // Synchronous host copies produce device data without issuing a
+            // device task. Keep its location separate from the executing CPU.
+            device_ = DeviceProducer{ copied, device };
+        }
+        auto device_tail = device_ ? std::optional(device_->completion) : std::nullopt;
         for (const auto & launch : call.launches) {
             cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_);
-            const auto kernel = append(launch, "device_service", call.incoming_stream ? incoming.value() : resources.device, device_);
+            const auto kernel = append(launch, "device_service", device, device_tail);
+            device_ = DeviceProducer{ kernel, device };
             steps_[kernel].source_operation = call.source_operation;
             depend(worker_, kernel);
         }
         cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_);
+        if (call.kind == CallKind::HostUpload) {
+            const auto & synchronization = call.synchronization.value();
+            const auto synchronized = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
+            depend(worker_, synchronized);
+        }
         cpu(returned, "cpu_service", "residual_interval", resources.caller, caller_);
     }
     return true;
@@ -119,7 +138,7 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
 
     const auto end = begin + steps_.size();
     result.operations.push_back({ 0, Boundary{}, completion });
-    for (const auto tail : { caller_, worker_, device_ })
+    for (const auto tail : { caller_, worker_, device_ ? std::optional(device_->completion) : std::nullopt })
         if (tail) result.dependencies.push_back({ begin + *tail, end, graph::EdgeKind::DataDependency });
     if (steps_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
     return result;

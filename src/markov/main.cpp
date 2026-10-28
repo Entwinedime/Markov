@@ -36,12 +36,13 @@ nlohmann::json manifest_report(const markov::trace_graph::source::ProfileManifes
         });
 
     return {
-        {                "status",    "inputs_accessible" },
-        {              "manifest", manifest.path.string() },
-        {             "framework",     manifest.framework },
-        {                 "files",       std::move(files) },
-        { "trace_contents_parsed",                  false },
-        {             "dag_built",                  false }
+        {                "status",                                                                                           "inputs_accessible" },
+        {              "manifest",                                                                                        manifest.path.string() },
+        {         "configuration", manifest.configuration_path ? nlohmann::json(manifest.configuration_path->string()) : nlohmann::json(nullptr) },
+        {             "framework",                                                                                            manifest.framework },
+        {                 "files",                                                                                              std::move(files) },
+        { "trace_contents_parsed",                                                                                                         false },
+        {             "dag_built",                                                                                                         false }
     };
 }
 
@@ -114,6 +115,7 @@ int main(int argc, char ** argv) {
             if (selected_costs) inputs.push_back(*page_request->models_path);
             if (page_request && page_request->cpu_costs_path) inputs.push_back(*page_request->cpu_costs_path);
             if (manifest.capture_origin_manifest) inputs.push_back(*manifest.capture_origin_manifest);
+            if (manifest.configuration_path) inputs.push_back(*manifest.configuration_path);
             for (const auto & file : manifest.files) inputs.push_back(file.path);
             prepare_output(output, inputs);
             if (page_request)

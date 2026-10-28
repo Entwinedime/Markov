@@ -24,13 +24,16 @@ struct AttentionDescriptor {
 // state; their enclosing wall duration is not a second CPU service charge.
 class ProbeReader final : public adapters::ProbeReader {
 public:
-    using adapters::ProbeReader::ProbeReader;
+    ProbeReader(trace_graph::source::Observations & output, std::optional<bool> deterministic_sampling)
+        : adapters::ProbeReader(output),
+          deterministic_sampling_(deterministic_sampling) {}
 
 private:
     void observe(const ProbeEvent & event) override;
     trace_graph::planning::PrefixId token_path(const nlohmann::json & dictionary);
     void observe_compute(const ProbeEvent & event);
     void observe_collective(const ProbeEvent & event);
+    std::optional<bool> deterministic_sampling_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;

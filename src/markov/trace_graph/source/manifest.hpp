@@ -23,6 +23,7 @@ struct ProfileManifest {
     std::string framework;
     std::vector<ProfileFile> files;
     std::optional<std::filesystem::path> capture_origin_manifest = std::nullopt;
+    std::optional<std::filesystem::path> configuration_path = std::nullopt;
 };
 
 // Resolve files relative to their capture after moving a complete profile.

@@ -180,7 +180,8 @@ void ProbeReader::observe(const ProbeEvent & event) {
             const auto window = input_windows_.find(process);
             if (window != input_windows_.end() && window->second.table_write && window->second.forward) {
                 preparations.push_back({ *window->second.table_write, read_request_table_write(args), "request_table_write" });
-                preparations.push_back({ *window->second.forward, read_forward_inputs(args), "forward_inputs" });
+                preparations.push_back(
+                    { *window->second.forward, deterministic_sampling_ ? read_forward_inputs(args, *deterministic_sampling_) : nullptr, "forward_inputs" });
                 input_windows_.erase(window);
             }
             else ++output_.counts["input_preparation_boundaries_unavailable"];

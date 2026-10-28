@@ -510,6 +510,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
     return {
         {                         "status",                                                       "source_graph_replayed"                                           },
         {                       "manifest",                                                                                                   manifest.path.string() },
+        {                  "configuration",                                manifest.configuration_path ? Json(manifest.configuration_path->string()) : Json(nullptr) },
         {        "capture_origin_manifest",                      manifest.capture_origin_manifest ? Json(manifest.capture_origin_manifest->string()) : Json(nullptr) },
         {    "capture_completeness_proven",                                                                                                                    false },
         {                     "cost_basis",                                                            "observed_exclusive_wall_intervals_and_unclassified_cpu_gaps" },
