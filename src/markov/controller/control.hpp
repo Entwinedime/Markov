@@ -9,7 +9,7 @@
 
 namespace markov {
 
-// A control implementation owns request progress and allocation; workflow only delivers execution feedback.
+// Control owns request progress and coordinates shared resources; workflow delivers execution feedback.
 class ServingControl {
 public:
     virtual ~ServingControl() = default;

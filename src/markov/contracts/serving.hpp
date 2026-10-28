@@ -34,7 +34,7 @@ struct ServingSettings {
 
 enum class PageReuse { Immediate, DeferredSorted };
 
-// Framework facts constrain admission; the controller retains request and page ownership.
+// Framework facts constrain admission; control selects requests and the resource pool owns their pages.
 struct AdmissionConstraints {
     std::vector<std::size_t> occupied_members;
     std::int64_t prefill_token_granularity;

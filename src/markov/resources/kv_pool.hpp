@@ -17,7 +17,12 @@ struct KvResidence {
     std::vector<std::size_t> pages;
 };
 
-// Each serving instance owns one pool; request progress can outlive or move between these residences.
+struct KvDemand {
+    std::size_t request;
+    std::int64_t tokens;
+};
+
+// Shared resource ownership is independent of control policy and request progress.
 class KvPool {
 public:
     KvPool(std::size_t request_count, const ServingSettings & settings, PageReuse reuse = PageReuse::Immediate);
@@ -27,7 +32,7 @@ public:
     const std::deque<std::size_t> & free_slots() const;
     const std::deque<std::size_t> & free_pages() const;
     std::int64_t deferred_pages() const;
-    void assign_pages(Batch & batch) const;
+    Batch plan(Phase phase, std::span<const KvDemand> demands = {}) const;
 
     void reserve(const Batch & batch);
     void advance(std::size_t request, std::int64_t tokens);
@@ -35,6 +40,9 @@ public:
     void return_pages(std::span<const std::size_t> pages);
 
 private:
+    void assign_pages(Batch & batch) const;
+
+    std::int64_t request_capacity_;
     std::int64_t page_size_;
     std::vector<KvResidence> residences_;
     std::deque<std::size_t> free_slots_;

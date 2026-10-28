@@ -11,7 +11,7 @@ find_package(nlohmann_json 3.11 REQUIRED)
 add_library(markov_core
     src/markov/controller/batch_replay.cpp
     src/markov/controller/disaggregated.cpp
-    src/markov/controller/kv_pool.cpp
+    src/markov/resources/kv_pool.cpp
     src/markov/controller/serving.cpp
     src/markov/execution/protocol.cpp
     src/markov/execution/durations.cpp

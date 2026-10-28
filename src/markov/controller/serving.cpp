@@ -6,11 +6,11 @@
 
 namespace markov {
 
-ServingController::ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit,
-                                     BatchReplay * replay)
+ServingController::ServingController(ServingSettings settings, std::vector<Request> requests, KvPool & resources, std::string group, std::size_t stages,
+                                     std::size_t batch_limit, BatchReplay * replay)
     : settings_(settings),
       group_(std::move(group)),
-      kv_(requests.size(), settings),
+      kv_(resources),
       stages_(stages),
       batch_limit_(batch_limit),
       lanes_(stages),
@@ -115,30 +115,13 @@ std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane,
         if (selected.size() > batch_limit_ || (prefill && selected.size() > kv_.free_slots().size()))
             throw std::invalid_argument("recorded batch exceeds available request slots");
     }
-    Batch batch{ .phase = prefill ? Phase::Prefill : Phase::Decode,
-                 .request_capacity = settings_.max_running_requests,
-                 .free_pages_before = static_cast<std::int64_t>(kv_.free_pages().size()),
-                 .allocated_pages = 0,
-                 .members = {} };
-    for (std::size_t index = 0; index < selected.size(); ++index) {
-        const auto identity = selected[index];
-        const auto & state = requests_[identity];
-        const auto & resident = kv_.residence(identity);
-        const auto slot = prefill ? kv_.free_slots().at(index) : *resident.slot;
-        const auto tokens = prefill ? state.input.prompt_tokens : 1;
-        BatchMember member{ identity, slot, resident.tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()), {} };
-
-        const auto required = kv_.pages_for(resident.tokens + tokens) - static_cast<std::int64_t>(resident.pages.size());
-        if (batch.allocated_pages + required > static_cast<std::int64_t>(kv_.free_pages().size()))
-            throw std::invalid_argument("batch exceeds available KV pages");
-        for (std::int64_t page = 0; page < required; ++page) {
-            member.new_pages.push_back(kv_.free_pages().at(static_cast<std::size_t>(batch.allocated_pages)));
-            ++batch.allocated_pages;
-        }
-
-        batch.members.push_back(std::move(member));
+    std::vector<KvDemand> demands;
+    for (const auto identity : selected) {
+        const auto tokens = prefill ? requests_[identity].input.prompt_tokens : 1;
+        demands.push_back({ identity, tokens });
     }
 
+    auto batch = kv_.plan(prefill ? Phase::Prefill : Phase::Decode, demands);
     auto completion = effects(batch);
     return std::make_shared<BatchWork>(std::move(batch), std::move(completion));
 }

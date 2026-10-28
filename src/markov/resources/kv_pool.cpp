@@ -1,12 +1,15 @@
-#include "markov/controller/kv_pool.hpp"
+#include "markov/resources/kv_pool.hpp"
 
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
+#include <utility>
 
 namespace markov {
 
 KvPool::KvPool(std::size_t request_count, const ServingSettings & settings, PageReuse reuse)
-    : page_size_(settings.page_size),
+    : request_capacity_(settings.max_running_requests),
+      page_size_(settings.page_size),
       residences_(request_count),
       free_slots_(static_cast<std::size_t>(settings.max_running_requests)),
       free_pages_(static_cast<std::size_t>(settings.max_total_tokens / settings.page_size)),
@@ -21,6 +24,27 @@ const KvResidence & KvPool::residence(std::size_t request) const { return reside
 const std::deque<std::size_t> & KvPool::free_slots() const { return free_slots_; }
 const std::deque<std::size_t> & KvPool::free_pages() const { return free_pages_; }
 std::int64_t KvPool::deferred_pages() const { return static_cast<std::int64_t>(free_pages_.size()) - ready_pages_; }
+
+Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
+    Batch batch{ phase, request_capacity_, static_cast<std::int64_t>(free_pages_.size()), 0, {}, deferred_pages() };
+    std::size_t new_slots = 0;
+    for (const auto & [request, tokens] : demands) {
+        const auto & resident = residence(request);
+        const auto slot = resident.slot ? *resident.slot : free_slots_.at(new_slots++);
+        BatchMember member{ request, slot, resident.tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()), {} };
+
+        // Selection describes an allocation; reserve commits it when control submits the work.
+        const auto pages = pages_for(resident.tokens + tokens) - static_cast<std::int64_t>(resident.pages.size());
+        if (batch.allocated_pages + pages > static_cast<std::int64_t>(free_pages_.size())) throw std::invalid_argument("batch exceeds available KV pages");
+        for (std::int64_t index = 0; index < pages; ++index)
+            member.new_pages.push_back(free_pages_.at(static_cast<std::size_t>(batch.allocated_pages + index)));
+        batch.allocated_pages += pages;
+        batch.members.push_back(std::move(member));
+    }
+
+    assign_pages(batch);
+    return batch;
+}
 
 void KvPool::assign_pages(Batch & batch) const {
     if (batch.allocated_pages <= ready_pages_) return;

@@ -10,7 +10,7 @@
 
 #include "markov/controller/batch_replay.hpp"
 #include "markov/controller/control.hpp"
-#include "markov/controller/kv_pool.hpp"
+#include "markov/resources/kv_pool.hpp"
 
 namespace markov {
 
@@ -24,9 +24,9 @@ struct DisaggregatedGroups {
 class DisaggregatedController final : public ServingControl {
 public:
 
-    // Requests are validated in arrival order; replay uses the same request index space.
-    DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups, PageReuse reuse,
-                            BatchReplay * replay = nullptr);
+    // Requests are validated in arrival order; the caller keeps both resource pools and replay alive.
+    DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups,
+                            KvPool & prefill_resources, KvPool & decode_resources, BatchReplay * replay = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
     void start(const ServingAction & action) override;
@@ -50,9 +50,7 @@ private:
         bool transferred() const;
     };
 
-    Batch new_batch(const KvPool & pool, const ServingSettings & settings, Phase phase) const;
-    void append_member(Batch & batch, const KvPool & pool, std::size_t request, std::int64_t tokens) const;
-    Batch view(std::size_t request, const KvPool & pool, const ServingSettings & settings) const;
+    Batch view(std::size_t request, const KvPool & pool) const;
     ServingAction action(ServingStep step, Batch batch, BatchEffects effects, std::int64_t now_ns, std::size_t flow) const;
     BatchEffects effects(const Batch & batch, bool first_output) const;
     std::optional<std::size_t> next_waiting() const;
@@ -62,8 +60,8 @@ private:
     ServingSettings decode_settings_;
     DisaggregatedGroups groups_;
     std::vector<RequestState> requests_;
-    KvPool prefill_;
-    KvPool decode_;
+    KvPool & prefill_;
+    KvPool & decode_;
     std::vector<std::size_t> prefill_active_;
     std::vector<std::size_t> active_;
     std::size_t waiting_ = 0;

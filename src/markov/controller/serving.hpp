@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -10,7 +11,7 @@
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/batch_replay.hpp"
 #include "markov/controller/control.hpp"
-#include "markov/controller/kv_pool.hpp"
+#include "markov/resources/kv_pool.hpp"
 
 namespace markov {
 
@@ -18,9 +19,9 @@ namespace markov {
 class ServingController final : public ServingControl {
 public:
 
-    // Requests are validated in arrival order; replay uses the same request index space.
-    ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit,
-                      BatchReplay * replay = nullptr);
+    // Requests are validated in arrival order; the caller keeps resources and replay alive.
+    ServingController(ServingSettings settings, std::vector<Request> requests, KvPool & resources, std::string group, std::size_t stages,
+                      std::size_t batch_limit, BatchReplay * replay = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
 
@@ -49,7 +50,7 @@ private:
         std::optional<TaskIdentity> running;
     };
 
-    // Lanes retain request membership across iterations; progress and pages remain in requests_.
+    // Lanes retain request membership; progress is local, page ownership belongs to the shared pool.
     struct Lane {
         std::vector<std::size_t> active;
         std::optional<Flow> flow;
@@ -61,7 +62,7 @@ private:
     ServingSettings settings_;
     std::string group_;
     std::vector<RequestState> requests_;
-    KvPool kv_;
+    KvPool & kv_;
 
     std::size_t stages_;
     std::size_t batch_limit_;

@@ -26,6 +26,7 @@
 #include "markov/execution/durations.hpp"
 #include "markov/graph/source_graph.hpp"
 #include "markov/production/source_projection.hpp"
+#include "markov/resources/kv_pool.hpp"
 #include "markov/templates/instance.hpp"
 #include "markov/templates/library.hpp"
 #include "markov/templates/target_graph.hpp"
@@ -191,7 +192,10 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                                          devices,
                                                          expert_condition(p, input, *prefill_source),
                                                          expert_condition(d, input, *decode_source));
-        markov::DisaggregatedController controller(prefill, decode, std::move(requests), groups, expansion.page_reuse(), replay ? &*replay : nullptr);
+        markov::KvPool prefill_resources(requests.size(), prefill, expansion.page_reuse());
+        markov::KvPool decode_resources(requests.size(), decode, expansion.page_reuse());
+        markov::DisaggregatedController
+            controller(prefill, decode, std::move(requests), groups, prefill_resources, decode_resources, replay ? &*replay : nullptr);
         markov::ServingWorkflow workflow(controller, expansion, durations);
         auto result = workflow.run(details);
         if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
@@ -220,8 +224,10 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     const auto routes = expert_condition(configuration, input, assets.front());
     markov::RegionGraph graph;
     markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
+    markov::KvPool resources(requests.size(), settings);
     markov::ServingController controller(settings,
                                          std::move(requests),
+                                         resources,
                                          control_group,
                                          static_cast<std::size_t>(stages),
                                          static_cast<std::size_t>(batch_limit),
