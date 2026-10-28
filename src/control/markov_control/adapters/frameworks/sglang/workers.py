@@ -120,7 +120,7 @@ class NativeWorkers:
         try:
             scheduler = NativeScheduler(peer, settings, directory, source, rank)
             peer.send({"kind": "ready"})
-            scheduler.event_loop_normal()
+            scheduler.run_event_loop()
         finally:
             parallel_state.destroy_model_parallel()
             parallel_state.destroy_distributed_environment()
