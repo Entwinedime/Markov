@@ -31,6 +31,7 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
 
 struct CpuInterval {
     Time service_ns = 0, wait_ns = 0, residual_ns = 0, instrumentation_ns = 0, unobserved_ns = 0;
+    Time stream_wait_ns = 0;
     CpuCorrection service_correction, residual_correction, excluded_correction;
 };
 
@@ -49,6 +50,13 @@ struct CallBinding {
 struct NativeSequenceBinding {
     std::vector<Index> calls;
     std::optional<std::string> issue = "native_queue_identity_unavailable";
+    std::vector<planning::NativeCall> definitions;
+};
+
+struct CpuWorkRegion {
+    planning::Work work;
+    CpuRegion region;
+    bool stream_wait_generated = false;
 };
 
 std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions);

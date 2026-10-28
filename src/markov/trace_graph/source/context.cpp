@@ -30,6 +30,7 @@ SourceContext::SourceContext(Observations && observations)
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
     index_native_sequences();
+    index_native_cpu_work();
     index_compute_queues();
     index_frame_calls();
 
@@ -52,7 +53,7 @@ void SourceContext::index_native_sequences() {
         for (Index id = 0; id < frame.preparations.size(); ++id) {
             const auto & preparation = frame.preparations[id];
             if (!preparation.definition) continue;
-            const auto sequence = preparation.definition->describe(frame.phase, input);
+            auto sequence = preparation.definition->describe(frame.phase, input);
             if (sequence.issue || sequence.calls.empty()
                 || std::ranges::any_of(sequence.calls, [](const planning::NativeCall & call) { return call.queue_name.empty(); }))
                 continue;
@@ -82,6 +83,7 @@ void SourceContext::index_native_sequences() {
                     }
                 }
             }
+            if (!binding.issue) binding.definitions = std::move(sequence.calls);
         }
     }
 }

@@ -18,6 +18,11 @@ enum class CallKind { Cpu, Queued, Readback, HostUpload };
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;
+    bool operator==(const KernelPreparation &) const = default;
+};
+
+struct NativeCpuSources {
+    std::optional<std::size_t> caller_before, caller_after, worker_before, worker_after;
 };
 
 struct NativeCall {
@@ -40,6 +45,7 @@ struct NativeCall {
     // Optional native observation identity, interpreted by the adapter. It is
     // evidence for a source sequence, never a cost key or target branch rule.
     std::string queue_name = {};
+    NativeCpuSources source_cpu = {};
 };
 
 struct NativeSequence {
@@ -94,7 +100,8 @@ public:
 
 private:
     graph::NodeId append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay = false);
-    void cpu(const Work & work, const char * service, const char * residual, std::size_t resource, std::optional<graph::NodeId> & tail);
+    void cpu(const Work & work, const char * service, const char * residual, std::size_t resource, std::optional<graph::NodeId> & tail,
+             std::optional<std::size_t> source = std::nullopt);
     void depend(std::optional<graph::NodeId> before, graph::NodeId after);
 
     struct Step {
@@ -102,6 +109,7 @@ private:
         std::size_t resource;
         bool delay;
         std::optional<std::size_t> source_operation = std::nullopt;
+        std::optional<std::size_t> source_cpu_work = std::nullopt;
     };
     std::vector<Step> steps_;
     std::vector<graph::Edge> edges_;

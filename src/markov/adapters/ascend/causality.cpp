@@ -23,6 +23,7 @@ void RuntimeCausality::observe(const nlohmann::json & event, ObservedSpan & span
     if (name == "EVENT_WAIT" || name == "NOTIFY_WAIT" || name.starts_with("AscendCL@aclrtSynchronize") || name == "Runtime@StreamSynchronize"
         || name == "Runtime@EventSynchronize" || name == "Runtime@DeviceSynchronize")
         span.role = SpanRole::Wait;
+    if (name.starts_with("AscendCL@aclrtSynchronizeStream") || name == "Runtime@StreamSynchronize") span.role = SpanRole::StreamWait;
     if (device) {
         const auto & args = event.at("args");
         if (name != "EVENT_RECORD" && name != "EVENT_WAIT") return;

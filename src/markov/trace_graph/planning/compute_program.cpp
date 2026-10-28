@@ -129,7 +129,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = "preparation_rule_or_queues_unavailable";
                     return;
                 }
-                const auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
+                auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
                 if (calls.issue) {
                     issue_ = calls.issue;
                     return;
@@ -154,6 +154,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = "preparation_device_binding_unavailable";
                     return;
                 }
+                source.bind_native_cpu_sources(input.frame, entry.index, calls.calls);
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.

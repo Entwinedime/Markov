@@ -40,7 +40,8 @@ const std::string & cost_coverage_name(trace_graph::cost::Coverage kind) {
         {      Coverage::Extrapolated,                      "extrapolated" },
         {     Coverage::SourceService,             "source_device_service" },
         {    Coverage::SourceResidual,     "source_residual_approximation" },
-        { Coverage::SourceCpuResidual, "source_cpu_residual_approximation" }
+        { Coverage::SourceCpuResidual, "source_cpu_residual_approximation" },
+        { Coverage::SourceCpuEstimate,            "same_work_cpu_estimate" }
     };
     return coverage.at(kind);
 }

@@ -34,7 +34,7 @@ struct RecordRef {
     Index position;
 };
 
-enum class SpanRole { Service, Wait, ProfilerOverhead };
+enum class SpanRole { Service, Wait, ProfilerOverhead, StreamWait };
 
 struct ObservedSpan {
     Time begin_ns;
@@ -120,6 +120,11 @@ struct NativeQueueCall {
     CpuRegion submission, execution;
 };
 
+struct NativeRuntimeCall {
+    Index implementation;
+    CpuRegion region;
+};
+
 struct ObservedCallSequence {
     CpuRegion region;
     std::unique_ptr<const planning::CallSequence> definition;
@@ -185,6 +190,7 @@ public:
     std::vector<ObservedFlow> flows;
     std::vector<ObservedDependency> dependencies;
     std::vector<NativeQueueCall> native_queue_calls;
+    std::vector<NativeRuntimeCall> native_runtime_calls;
     std::map<std::string, std::size_t> flow_audit;
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;

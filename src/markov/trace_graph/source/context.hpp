@@ -50,6 +50,8 @@ public:
     std::span<const CpuInterval> preparation_intervals(Index frame) const { return preparation_intervals_[frame]; }
     std::span<const CallBinding> preparation_bindings(Index frame) const { return preparation_bindings_[frame]; }
     const NativeSequenceBinding & preparation_native_calls(Index frame, Index preparation) const { return preparation_native_calls_[frame][preparation]; }
+    std::span<const CpuWorkRegion> native_cpu_work() const { return native_cpu_work_; }
+    void bind_native_cpu_sources(Index frame, Index preparation, std::span<planning::NativeCall> calls) const;
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
     std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
@@ -63,6 +65,8 @@ private:
     void index_cpu_intervals();
     void index_frame_calls();
     void index_native_sequences();
+    void index_native_cpu_work();
+    Index retain_cpu_work(planning::Work work, const char * scope, CpuRegion region, bool stream_wait_generated = false);
 
     Observations observations_;
     SourceGraph graph_;
@@ -75,6 +79,7 @@ private:
     std::vector<std::vector<CpuInterval>> preparation_intervals_;
     std::vector<std::vector<CallBinding>> preparation_bindings_;
     std::vector<std::vector<NativeSequenceBinding>> preparation_native_calls_;
+    std::vector<CpuWorkRegion> native_cpu_work_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;
     std::vector<std::vector<Index>> frame_queue_issues_;
     std::vector<std::vector<Index>> frame_collectives_;

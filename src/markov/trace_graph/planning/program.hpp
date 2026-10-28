@@ -36,6 +36,7 @@ struct PlannedOperation {
     std::optional<simulation::Action> completion = std::nullopt;
     bool delay = false; // Readiness latency; it does not occupy a service resource.
     std::optional<std::size_t> source_operation = std::nullopt;
+    std::optional<std::size_t> source_cpu_work = std::nullopt;
 };
 
 struct PlannedMutation {

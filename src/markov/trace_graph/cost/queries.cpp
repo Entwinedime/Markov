@@ -12,6 +12,39 @@ Queries::Queries(const Models & models, const source::SourceContext * source, co
       source_responses_(source ? source->observations().work_observations.size() : 0) {
     if (source) source_cpu_gaps_ = source::cpu_intervals(source->observations(), source->graph(), source->cpu_gaps(), cpu_costs);
     source_cpu_responses_.resize(source_cpu_gaps_.size());
+    if (source) {
+        std::vector<source::CpuRegion> regions;
+        for (const auto & work : source->native_cpu_work()) regions.push_back(work.region);
+        source_cpu_work_ = source::cpu_intervals(source->observations(), source->graph(), regions, cpu_costs);
+        source_cpu_work_responses_.resize(regions.size());
+    }
+}
+
+const Response & Queries::query_source_cpu_work(const planning::Work & work, std::size_t interval, std::size_t resource) {
+    if (!source_) throw std::logic_error("Source CPU work requested without source evidence");
+    const auto & original = source_->native_cpu_work()[interval];
+    auto expected = original.work;
+    const bool residual = work.kind.timing_scope != expected.kind.timing_scope;
+    if (residual)
+        expected.kind.timing_scope = expected.kind.timing_scope == "cpu_service"
+                                         ? "residual_interval"
+                                         : expected.kind.timing_scope.substr(0, expected.kind.timing_scope.size() - 8) + "_residual_interval";
+    if (expected != work || original.region.resource != resource) return query(work);
+
+    const auto & observed = source_cpu_work_[interval];
+    const auto generated_wait = original.stream_wait_generated ? observed.stream_wait_ns : 0;
+    if (observed.unobserved_ns || observed.wait_ns != generated_wait) return query(work);
+
+    ++requests_;
+    auto & response = source_cpu_work_responses_[interval][residual ? 1 : 0];
+    if (!response) {
+        const auto raw = residual ? observed.residual_ns : observed.service_ns;
+        auto correction = residual ? observed.residual_correction : observed.service_correction;
+        correction.add({ 0, raw - correction.covered_ns });
+        response = Response{ Status::Ready, correction.cost_ns, Coverage::SourceCpuEstimate, {}, std::nullopt };
+        ++source_cpu_work_evaluations_;
+    }
+    return *response;
 }
 
 const Response & Queries::query_source_cpu_gap(std::size_t interval, std::size_t resource) {

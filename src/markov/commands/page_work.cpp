@@ -464,17 +464,19 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             });
         }
         report["cost_catalog"] = {
-            {       "queried_model_limitations",                                                                                                         std::move(limitations) },
-            {                      "deployment",                                                                                                              costs->deployment },
-            {                 "selected_models",                                                                                                           costs->models.size() },
-            {                 "logical_queries",                                                                                                            queries->requests() },
-            {            "response_evaluations",                                                                                                         queries->evaluations() },
-            {      "source_service_evaluations",                                                                                                  queries->source_evaluations() },
-            {     "source_residual_evaluations",                                                                                                queries->residual_evaluations() },
-            { "source_cpu_residual_evaluations",                                                                                            queries->cpu_residual_evaluations() },
-            {           "source_cpu_gap_domain",                                                                                   cpu_cost_summary(queries->source_cpu_gaps()) },
-            {     "source_deployment_qualified",                                                                                                                          false },
-            {                   "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
+            {          "queried_model_limitations",                                                                                                         std::move(limitations) },
+            {                         "deployment",                                                                                                              costs->deployment },
+            {                    "selected_models",                                                                                                           costs->models.size() },
+            {                    "logical_queries",                                                                                                            queries->requests() },
+            {               "response_evaluations",                                                                                                         queries->evaluations() },
+            {         "source_service_evaluations",                                                                                                  queries->source_evaluations() },
+            {        "source_residual_evaluations",                                                                                                queries->residual_evaluations() },
+            {    "source_cpu_residual_evaluations",                                                                                            queries->cpu_residual_evaluations() },
+            {              "source_cpu_gap_domain",                                                                                   cpu_cost_summary(queries->source_cpu_gaps()) },
+            {      "source_native_cpu_evaluations",                                                                                                queries->cpu_work_evaluations() },
+            { "source_native_cpu_candidate_domain",                                                                                   cpu_cost_summary(queries->source_cpu_work()) },
+            {        "source_deployment_qualified",                                                                                                                          false },
+            {                      "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
         };
     }
     report["source_replay"] = source_report(source);

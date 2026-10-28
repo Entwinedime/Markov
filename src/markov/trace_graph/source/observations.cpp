@@ -48,6 +48,7 @@ void Observations::normalize_resources() {
         call.submission.resource = canonical_resource(call.submission.resource);
         call.execution.resource = canonical_resource(call.execution.resource);
     }
+    for (auto & call : native_runtime_calls) call.region.resource = canonical_resource(call.region.resource);
     for (auto & frame : compute_frames)
         for (auto & call : frame.preparations) call.region.resource = canonical_resource(call.region.resource);
 }

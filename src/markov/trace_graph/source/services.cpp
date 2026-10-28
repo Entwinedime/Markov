@@ -79,6 +79,7 @@ std::vector<CpuInterval> cpu_intervals(const Observations & observations, const 
                 break;
             case graph::NodeKind::ObservedWait:
                 measured.wait_ns += duration;
+                if (observations.spans[at->span].role == SpanRole::StreamWait) measured.stream_wait_ns += duration;
                 measured.excluded_correction.add(correction);
                 break;
             case graph::NodeKind::ResidualGap:

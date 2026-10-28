@@ -103,6 +103,7 @@ private:
                 kind = graph::NodeKind::Service;
                 break;
             case SpanRole::Wait:
+            case SpanRole::StreamWait:
                 kind = graph::NodeKind::ObservedWait;
                 break;
             case SpanRole::ProfilerOverhead:
