@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <deque>
 #include <map>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -19,11 +22,12 @@ struct RankWork {
     std::size_t end;
 };
 
-// Match collective and directed message interfaces within one logical task and its bound groups.
+// Collectives join one action; directed messages join the same flow even when peers arrive in separate actions.
 class ParallelComposition {
 public:
     explicit ParallelComposition(RegionGraph & graph);
-    void connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task);
+    void connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task, std::size_t flow);
+    void live_state(GraphRoots & roots);
 
 private:
     void require_geometry(std::span<const std::size_t> reference, std::span<const std::size_t> target) const;
@@ -33,6 +37,9 @@ private:
 
     RegionGraph & graph_;
     std::map<std::pair<std::string, std::vector<std::size_t>>, std::size_t> resources_;
+
+    using MessageKey = std::tuple<std::size_t, std::string, std::size_t, std::size_t, std::string, std::string>;
+    std::map<MessageKey, std::array<std::deque<std::size_t>, 2>> messages_;
 };
 
 } // namespace markov

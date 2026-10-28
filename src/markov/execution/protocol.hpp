@@ -109,7 +109,8 @@ public:
 
     // Release historical IR, retaining state readiness and possibly unfinished execution frontiers.
     std::vector<std::size_t> retire(std::span<const ValueAccess> values, const std::map<std::size_t, std::size_t> & retained_values,
-                                    const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions);
+                                    const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions,
+                                    const std::map<std::size_t, std::size_t> & retained_operations);
 
     std::size_t first_node() const;
     std::span<const ExecutionNode> nodes() const;
@@ -117,7 +118,7 @@ public:
     ExecutionPorts region_call(std::size_t region) const;
     std::span<const ExecutionRequirement> incoming_waits() const;
     bool has_unbound_accesses(std::size_t operation_count) const;
-    bool has_unbound_communications() const;
+    const std::map<std::size_t, ExecutionPorts> & pending_communications() const;
     nlohmann::json document() const;
 
 private:

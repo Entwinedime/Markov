@@ -8,17 +8,6 @@
 namespace markov {
 namespace {
 
-void remap_arguments(nlohmann::json & arguments, const std::vector<std::size_t> & values) {
-    if (arguments.is_object() && arguments.size() == 1 && arguments.contains("value")) {
-        arguments["value"] = values.at(arguments.at("value").get<std::size_t>());
-        return;
-    }
-
-    if (arguments.is_structured()) {
-        for (auto & item : arguments) remap_arguments(item, values);
-    }
-}
-
 ValuePorts remap_ports(const ValuePorts & ports, const std::vector<std::size_t> & values) {
     ValuePorts result;
     for (const auto & [name, value] : ports.inputs) result.inputs.emplace(name, values.at(value));

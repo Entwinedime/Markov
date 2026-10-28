@@ -359,7 +359,8 @@ void ExecutionGraph::connect_accesses(std::span<const ValueAccess> values, std::
 }
 
 std::vector<std::size_t> ExecutionGraph::retire(std::span<const ValueAccess> values, const std::map<std::size_t, std::size_t> & retained_values,
-                                                const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions) {
+                                                const std::set<std::size_t> & retained_storage, const std::map<std::size_t, std::size_t> & retained_regions,
+                                                const std::map<std::size_t, std::size_t> & retained_operations) {
     std::map<std::size_t, std::size_t> ready;
     for (const auto & [old_value, new_value] : retained_values) {
         const auto & value = values[old_value];
@@ -387,12 +388,27 @@ std::vector<std::size_t> ExecutionGraph::retire(std::span<const ValueAccess> val
         frontier.insert(ports.returned);
     }
 
+    // Unpaired endpoints keep their geometry and execution ports until the peer arrives.
+    std::map<std::size_t, ExecutionPorts> communications;
+    for (const auto & [old_operation, new_operation] : retained_operations) {
+        const auto ports = host_calls_.at({ ExecutionOwner::Kind::Operation, old_operation });
+        calls.emplace(ExecutionOwner{ ExecutionOwner::Kind::Operation, new_operation }, ports);
+        frontier.insert(ports.entry);
+        frontier.insert(ports.returned);
+    }
+    for (const auto & [operation, ports] : communications_) {
+        communications.emplace(retained_operations.at(operation), ports);
+        frontier.insert(ports.entry);
+        frontier.insert(ports.returned);
+    }
+
     first_node_ += nodes_.size();
     nodes_.clear();
     dependencies_.clear();
     heads_.clear();
     host_calls_ = std::move(calls);
-    bound_operations_ = 0;
+    communications_ = std::move(communications);
+    bound_operations_ = retained_operations.size();
     return { frontier.begin(), frontier.end() };
 }
 
@@ -402,7 +418,7 @@ std::span<const Dependency> ExecutionGraph::dependencies() const { return depend
 ExecutionPorts ExecutionGraph::region_call(std::size_t region) const { return host_calls_.at({ ExecutionOwner::Kind::Region, region }); }
 std::span<const ExecutionRequirement> ExecutionGraph::incoming_waits() const { return incoming_; }
 bool ExecutionGraph::has_unbound_accesses(std::size_t operation_count) const { return missing_call_ports_ || bound_operations_ != operation_count; }
-bool ExecutionGraph::has_unbound_communications() const { return !communications_.empty(); }
+const std::map<std::size_t, ExecutionPorts> & ExecutionGraph::pending_communications() const { return communications_; }
 
 nlohmann::json ExecutionGraph::document() const {
     nlohmann::json result{

@@ -26,10 +26,11 @@ struct StateChange {
     std::optional<std::size_t> value;
 };
 
-// Borrowed bindings are rebound during compaction; open calls retain only their context and execution ports.
+// Compaction rebinds live values, open calls and pending operations while preserving execution frontiers.
 struct GraphRoots {
     std::vector<std::size_t *> values;
     std::vector<std::size_t *> regions;
+    std::vector<std::size_t *> operations;
     std::set<std::size_t> storage;
 };
 

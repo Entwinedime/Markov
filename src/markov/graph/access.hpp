@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace markov {
 
 struct ValuePorts {
@@ -36,6 +38,19 @@ struct Dependency {
 };
 
 std::vector<std::size_t> remap(std::span<const std::size_t> identities, std::span<const std::size_t> bindings);
+
+// Expansion has a dense binding; compaction retains a sparse subset of values.
+template <typename Bindings> void remap_arguments(nlohmann::json & arguments, const Bindings & values) {
+    if (arguments.is_object() && arguments.size() == 1 && arguments.contains("value")) {
+        arguments["value"] = values.at(arguments.at("value").get<std::size_t>());
+        return;
+    }
+
+    if (arguments.is_structured()) {
+        for (auto & item : arguments) remap_arguments(item, values);
+    }
+}
+
 std::vector<Dependency> connect_accesses(std::span<const ValueAccess> values, std::span<const Operation> operations);
 
 } // namespace markov

@@ -140,6 +140,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
         if (!details) executor_.retain(expansion_.retire());
     }
 
+    if (!expansion_.graph().execution.pending_communications().empty()) throw std::invalid_argument("serving finished with unmatched communication endpoints");
     result["control_status"] = "complete";
     result["free_pages"] = controller_.free_pages();
     result["completed_ns"] = executor_.now_ns();

@@ -40,7 +40,9 @@ void Executor::ingest(const RegionGraph & graph) {
                                                       { "batch", scope.value("batch", nlohmann::json(nullptr)) } }.dump());
     }
     if (execution.has_unbound_accesses(graph.operations.size())) throw std::invalid_argument("execution has unresolved data access ports");
-    if (execution.has_unbound_communications()) throw std::invalid_argument("execution has unresolved collective participants");
+
+    std::set<std::size_t> awaiting_peer;
+    for (const auto & [_, ports] : execution.pending_communications()) awaiting_peer.insert(ports.returned);
 
     const auto begin = first_node_ + work_.size();
     const auto nodes = execution.nodes().subspan(begin - execution.first_node());
@@ -48,23 +50,40 @@ void Executor::ingest(const RegionGraph & graph) {
     for (const auto & node : nodes) {
         const auto duration = durations_.duration_ns(graph, node);
         if (duration < 0) throw std::invalid_argument("execution duration is negative");
-        added.push_back({ .resource = node.step.resource, .duration_ns = duration, .started_ns = std::nullopt, .successors = {}, .notifications = {} });
+        added.push_back({ .resource = node.step.resource,
+                          .duration_ns = duration,
+                          .started_ns = std::nullopt,
+                          .awaiting_peer = awaiting_peer.contains(begin + added.size()),
+                          .successors = {},
+                          .notifications = {} });
     }
 
-    // Validate the appended DAG before committing it; old predecessors are already part of a valid graph.
+    // Only a matched communication may add a predecessor to an already submitted, explicitly blocked port.
     const auto edges = execution.dependencies().subspan(consumed_edges_);
-    std::vector<std::size_t> remaining(added.size());
+    std::set<std::size_t> released;
     for (const auto & edge : edges) {
-        if (edge.target < begin) throw std::invalid_argument("new dependencies cannot change already submitted work");
-        auto & target = added.at(edge.target - begin);
-        if (edge.source >= begin) {
-            added.at(edge.source - begin).successors.push_back(edge.target);
-            ++remaining.at(edge.target - begin);
-            ++target.remaining;
-        }
-        else if (!completed(edge.source)) ++target.remaining;
+        if (edge.source >= begin + added.size() || edge.target >= begin + added.size())
+            throw std::invalid_argument("execution dependency references an undefined node");
+        if (edge.target >= begin) continue;
+        if (edge.target < first_node_ || !work_.at(edge.target - first_node_).awaiting_peer || awaiting_peer.contains(edge.target) || edge.source < begin
+            || execution.nodes()[edge.source - execution.first_node()].step.kind != ExecutionKind::Communication || !released.insert(edge.target).second)
+            throw std::invalid_argument("new dependencies can only resolve a pending communication port");
     }
 
+    // Late peers can close a cycle through older unfinished work; validate that whole live graph only in this case.
+    const auto check_begin = released.empty() ? begin : first_node_;
+    const auto check_size = begin + added.size() - check_begin;
+    std::vector<std::vector<std::size_t>> successors(check_size);
+    for (auto node = check_begin; node < begin; ++node) successors[node - check_begin] = work_.at(node - first_node_).successors;
+    for (const auto & edge : edges) {
+        if (edge.source >= check_begin) successors.at(edge.source - check_begin).push_back(edge.target);
+        else completed(edge.source);
+    }
+
+    std::vector<std::size_t> remaining(check_size);
+    for (const auto & targets : successors) {
+        for (const auto target : targets) ++remaining.at(target - check_begin);
+    }
     std::deque<std::size_t> ready_nodes;
     for (std::size_t index = 0; index < remaining.size(); ++index) {
         if (remaining[index] == 0) ready_nodes.push_back(index);
@@ -73,16 +92,24 @@ void Executor::ingest(const RegionGraph & graph) {
     while (!ready_nodes.empty()) {
         const auto node = ready_nodes.front();
         ready_nodes.pop_front();
-        for (const auto successor : added[node].successors) {
-            if (--remaining[successor - begin] == 0) ready_nodes.push_back(successor - begin);
+        for (const auto successor : successors[node]) {
+            if (--remaining[successor - check_begin] == 0) ready_nodes.push_back(successor - check_begin);
         }
         ++visited;
     }
-    if (visited != added.size()) throw std::invalid_argument("execution dependencies contain a cycle");
+    if (visited != check_size) throw std::invalid_argument("execution dependencies contain a cycle");
 
     work_.insert(work_.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
     for (const auto & edge : edges) {
-        if (edge.source < begin && !completed(edge.source)) work_.at(edge.source - first_node_).successors.push_back(edge.target);
+        if (!completed(edge.source)) {
+            work_.at(edge.source - first_node_).successors.push_back(edge.target);
+            ++work_.at(edge.target - first_node_).remaining;
+        }
+    }
+    for (const auto node : released) {
+        auto & work = work_.at(node - first_node_);
+        work.awaiting_peer = false;
+        if (work.remaining == 0) ready(node);
     }
     for (std::size_t node = begin; node < first_node_ + work_.size(); ++node) {
         if (work_[node - first_node_].remaining == 0) ready(node);
@@ -96,7 +123,10 @@ bool Executor::completed(std::size_t node) const {
     return true;
 }
 
-void Executor::ready(std::size_t node) { resources_[work_.at(node - first_node_).resource].ready.emplace(now_ns_, node); }
+void Executor::ready(std::size_t node) {
+    const auto & work = work_.at(node - first_node_);
+    if (!work.awaiting_peer) resources_[work.resource].ready.emplace(now_ns_, node);
+}
 
 void Executor::start_ready() {
     for (auto & [resource, state] : resources_) {
@@ -163,8 +193,8 @@ std::optional<ExecutionEvent> Executor::advance_until(std::optional<std::int64_t
             return event;
         }
         if (completions_.empty()) {
-            if (!tasks_.empty()) throw std::invalid_argument("execution has blocked work without a completion");
             if (deadline_ns) now_ns_ = *deadline_ns;
+            else if (!tasks_.empty()) throw std::invalid_argument("execution has blocked work without a completion");
             return std::nullopt;
         }
         if (deadline_ns && *deadline_ns < completions_.begin()->first) {

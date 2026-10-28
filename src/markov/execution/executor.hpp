@@ -50,6 +50,7 @@ private:
         std::size_t remaining = 0;
         std::optional<std::int64_t> started_ns;
         bool completed = false;
+        bool awaiting_peer = false;
         std::vector<std::size_t> successors;
         std::vector<Notification> notifications;
     };

@@ -4,7 +4,6 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -80,10 +79,8 @@ nlohmann::json ParallelComposition::exchange(std::span<const std::size_t> operat
     return signature;
 }
 
-void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task) {
+void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task, std::size_t flow) {
     std::map<std::string, std::vector<std::vector<std::size_t>>> groups;
-    using MessageKey = std::tuple<std::string, std::size_t, std::size_t, std::string, std::string>;
-    std::map<MessageKey, std::array<std::vector<std::size_t>, 2>> messages;
     for (const auto & rank : ranks) {
         for (auto operation = rank.begin; operation < rank.end; ++operation) {
             const auto & work = graph_.work[operation];
@@ -101,12 +98,13 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
                 if (offset < -count || offset >= count) throw std::invalid_argument("message peer lies outside its bound group");
                 const auto peer = group.members[(member + offset + count) % count];
                 const bool sending = primitive == "send";
-                const MessageKey key{ group.id,
+                const MessageKey key{ flow,
+                                      group.id,
                                       sending ? rank.rank : peer,
                                       sending ? peer : rank.rank,
                                       spec.at("channel").get<std::string>(),
                                       spec.at("field").get<std::string>() };
-                messages[key][sending ? 0 : 1].push_back(operation);
+                messages_[key][sending ? 0 : 1].push_back(operation);
                 continue;
             }
 
@@ -142,13 +140,13 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
         }
     }
 
-    // Match within a task, channel and tensor field; unrelated microbatches never share wire identity.
-    for (const auto & [key, calls] : messages) {
-        const auto & [group, source, target, channel, field] = key;
-        if (calls[0].size() != calls[1].size()) throw std::invalid_argument("message has no matching send or receive endpoint");
-        for (std::size_t index = 0; index < calls[0].size(); ++index) {
-            const auto send = calls[0][index];
-            const auto receive = calls[1][index];
+    // Flow identity survives stage actions and lane reuse; a peer cannot satisfy another microbatch's wait.
+    for (auto & [key, calls] : messages_) {
+        const auto & [message_flow, group, source, target, channel, field] = key;
+        std::size_t index = 0;
+        while (!calls[0].empty() && !calls[1].empty()) {
+            const auto send = calls[0].front();
+            const auto receive = calls[1].front();
             require_geometry(graph_.operations[send].inputs, graph_.operations[receive].outputs);
             const std::array operations{ send, receive };
             nlohmann::json specification{
@@ -160,7 +158,18 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
                 {     "field",          field }
             };
             graph_.dependencies.push_back({ send, receive, "message" });
-            connect_calls(operations, task, std::move(specification), index, "message", { source, target });
+            connect_calls(operations, task, std::move(specification), index++, "message", { source, target });
+            calls[0].pop_front();
+            calls[1].pop_front();
+        }
+    }
+    std::erase_if(messages_, [](const auto & item) { return item.second[0].empty() && item.second[1].empty(); });
+}
+
+void ParallelComposition::live_state(GraphRoots & roots) {
+    for (auto & [_, calls] : messages_) {
+        for (auto & endpoints : calls) {
+            for (auto & operation : endpoints) roots.operations.push_back(&operation);
         }
     }
 }

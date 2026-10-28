@@ -23,6 +23,22 @@ std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
 
     std::map<std::size_t, std::size_t> region_bindings;
     for (const auto * root : roots.regions) region_bindings.try_emplace(*root, region_bindings.size());
+
+    // Pending messages retain only their operands and enclosing calls, not the completed batch history.
+    std::map<std::size_t, std::size_t> operation_bindings;
+    for (const auto * root : roots.operations) {
+        operation_bindings.try_emplace(*root, operation_bindings.size());
+        const auto & operation = operations.at(*root);
+        for (const auto value : operation.inputs) retain_value(value);
+        for (const auto value : operation.outputs) retain_value(value);
+        auto region = operation.region;
+        while (true) {
+            region_bindings.try_emplace(region, region_bindings.size());
+            const auto & parent = regions.at(region).at("parent");
+            if (parent.is_null()) break;
+            region = parent.get<std::size_t>();
+        }
+    }
     std::vector<nlohmann::json> kept_regions(region_bindings.size());
     for (const auto & [old_region, new_region] : region_bindings) {
         auto region = std::move(regions.at(old_region));
@@ -40,15 +56,32 @@ std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
     }
 
     // Descriptors become incoming state; their CPU readiness remains in the execution frontier.
-    auto frontier = execution.retire(values, bindings, roots.storage, region_bindings);
+    auto frontier = execution.retire(values, bindings, roots.storage, region_bindings, operation_bindings);
+    std::vector<Operation> kept_operations(operation_bindings.size());
+    std::vector<nlohmann::json> kept_work(operation_bindings.size());
+    for (const auto & [old_operation, new_operation] : operation_bindings) {
+        auto operation = std::move(operations.at(old_operation));
+        operation.region = region_bindings.at(operation.region);
+        for (auto & value : operation.inputs) value = bindings.at(value);
+        for (auto & value : operation.outputs) value = bindings.at(value);
+        kept_operations[new_operation] = std::move(operation);
+        kept_work[new_operation] = std::move(work.at(old_operation));
+        remap_arguments(kept_work[new_operation]["arguments"], bindings);
+        remap_arguments(kept_work[new_operation]["keywords"], bindings);
+    }
+    for (const auto & [old_value, new_value] : bindings) {
+        const auto producer = values[old_value].producer;
+        if (producer && operation_bindings.contains(*producer)) kept_values[new_value].producer = operation_bindings.at(*producer);
+    }
     for (auto * root : roots.values) *root = bindings.at(*root);
     for (auto * root : roots.regions) *root = region_bindings.at(*root);
+    for (auto * root : roots.operations) *root = operation_bindings.at(*root);
     values = std::move(kept_values);
     types = std::move(kept_types);
     integer_data = std::move(kept_integers);
-    operations.clear();
+    operations = std::move(kept_operations);
     dependencies.clear();
-    work.clear();
+    work = std::move(kept_work);
     regions = std::move(kept_regions);
     state_changes.clear();
     return frontier;

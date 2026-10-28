@@ -112,7 +112,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
             result.completions.push_back(program.completion);
         }
     }
-    parallel_.connect(work, topology_.parallel(), action.task);
+    parallel_.connect(work, topology_.parallel(), action.task, action.flow);
 
     for (std::size_t region = region_begin; region < graph_.regions.size(); ++region) {
         graph_.regions[region]["batch"] = action.flow;
@@ -276,6 +276,7 @@ std::vector<std::size_t> ServingStructure::retire() {
 }
 
 void ServingStructure::live_state(GraphRoots & roots) {
+    parallel_.live_state(roots);
     for (auto & [_, rank] : ranks_) rank->live_state(roots);
     for (auto & [_, flow] : flows_) {
         for (auto & [rank, inputs] : flow.inputs) {
