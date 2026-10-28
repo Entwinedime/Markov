@@ -69,6 +69,14 @@ projected_compute_dependencies 只计配方内部的数据依赖，尚不包含�
 当前来源 manifest 尚不能建立完整模型/平台身份，source_deployment_qualified 会如实报告，不能把框架和几何匹配当作部署资格。
 源回放使用观测成本，不能当作目标预测精度。
 
+可选 cache 对象包含 device_pages、host_pages、write_policy、io_backend、host_layout；需要 SGLang 来源和已选 models。
+容量为每个参与进程的正整数页数，策略支持 write_back、write_through、write_through_selective；当前传输仅支持 kernel_ascend/page_first_direct。
+页大小仍由 page_sizes_tokens 逐项给出。原 requests 和 projected_compute_work 保留完整前缀语料的上限统计，
+另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
+回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
+不同参与进程的计算用显式汇合边界衔接，串行请求由预测的计算完成继续，不迁移源绝对时间或设备等待。
+这个组件假设每个参与进程有独立的回载和备份队列，未包含存储、CPU、通信和完整跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
+
 ## 统一任务入口的职责
 
 用户入口将结构化请求交给正式 Python 包，不要求手动串联内部 bundle、CPU 导出、模型训练和 C++ 二进制。
