@@ -47,7 +47,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
   build/modeling/Release/markov_core page-work /path/to/page_work_request.json /path/to/page_work_report.json
 ```
 
-诊断请求包含 manifest、page_sizes_tokens 及可选 models，例如 `{"manifest":"capture/profile_manifest.json","page_sizes_tokens":[64,128],"models":"performance/models.json"}`。
+诊断请求包含 manifest、page_sizes_tokens 及可选 models，例如 `{"manifest":"capture/profile_manifest.json","page_sizes_tokens":[64,128],"models":"performance/models.json","kernel_cache_initial_state":"empty"}`。
 manifest 与 models 的相对路径以请求文件所在目录为起点；页大小必须为正整数。这项诊断读取真实来源，共享一次准备后生成各页几何。
 同一 token 前缀在这次来源准备中只有一个身份，不能将该数字当作跨采集的地址。
 
@@ -64,7 +64,7 @@ source_compute_projection 用源变量核对这些原语是否保持原工作描
 projected_compute_dependencies 只计配方内部的数据依赖，尚不包含调用之间、跨层及 I/O 发布依赖，不能当作完整目标图的边数。
 提供 models 时，cost_execution 将已解释计算子集绑定独立成本并交给统一执行器，保留配方内部依赖和已证明的源设备队列顺序。
 缺工作变量、资源依据或成本时停止该目标的数值执行，其他独立目标继续；结构工作量仍完整生成，不能因模型缺失删除操作。
-这一子集尚缺跨流数据、CPU、通信和缓存依赖，不给出帧或 E2E 耗时，也不验证目标 DAG 相似度或性能。
+这一子集已包含已解释的原生调用、注意力准备、分配和阻塞通信，但尚缺其余 CPU 和完整跨流依赖，不给出完整 E2E 耗时，也不验证目标 DAG 相似度或性能。
 模型按完整工作点共享响应，报告分别统计查询次数、实际求值次数和已绑定操作覆盖；复用响应不减少覆盖计数。
 当前来源 manifest 尚不能建立完整模型/平台身份，source_deployment_qualified 会如实报告，不能把框架和几何匹配当作部署资格。
 源回放使用观测成本，不能当作目标预测精度。
@@ -74,8 +74,13 @@ projected_compute_dependencies 只计配方内部的数据依赖，尚不包含�
 页大小仍由 page_sizes_tokens 逐项给出。原 requests 和 projected_compute_work 保留完整前缀语料的上限统计，
 另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
 回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
-不同参与进程的计算用显式汇合边界衔接，串行请求由预测的计算完成继续，不迁移源绝对时间或设备等待。
-这个组件假设每个参与进程有独立的回载和备份队列，未包含完整 CPU、通信和跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
+不同参与进程的计算用显式汇合边界衔接，串行请求依赖前一响应完成；实验响应端口仍只覆盖部分路径，入口和尾部沿用同请求/前端的源残余近似。
+后台 I/O 可在响应后继续，显式清空屏障依赖其实际完成；不迁移源绝对时间、设备等待或诊断 checkpoint 的耗时。
+这个组件假设每个参与进程有独立的回载和备份队列，未包含其余 CPU 和完整跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
+
+数值执行须声明目标的 kernel_cache_initial_state。empty 表示相关内存与磁盘缓存均空；prepared 表示本次所需规格已经全部准备，不应将部分磁盘命中填成 prepared。
+每个目标单独维护规格准备状态；首次使用新规格时加入编译和加载，复用规格不重复加入。报告中的 planned_specializations/planned_first_loads 是计划数量，未完成目标不能据此认定真实执行完成。
+未声明初始状态、分配输入缺失或工作不在已支持的签名/分支内时，目标明确停止；不能把该部分当作零成本。当前仅覆盖未排序 NPU 页池的融合 Prefill 分配及单 token Decode 分配。
 
 cache 内可增加 storage 对象，声明 backend 为 file、initial_state 为 empty，以及 prefetch_stop_policy。
 capacity_pages 可为正整数或 null，分别表示每参与进程的文件页容量或不设该上限；预测不读取真实文件目录。
