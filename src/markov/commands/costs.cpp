@@ -19,12 +19,15 @@ nlohmann::json work_json(const trace_graph::planning::Work & work) {
 const std::string & cost_status_name(trace_graph::cost::Status status) {
     using namespace trace_graph::cost;
     static const std::map<Status, std::string> statuses{
-        {                 Status::Ready,                  "ready" },
-        {          Status::MissingModel,          "missing_model" },
-        {       Status::MissingFeatures,       "missing_features" },
-        {         Status::OutsideDomain,         "outside_domain" },
-        { Status::UnmeasuredCombination, "unmeasured_combination" },
-        {       Status::InvalidResponse,       "invalid_response" }
+        {                 Status::Ready,                      "ready" },
+        {          Status::MissingModel,              "missing_model" },
+        {       Status::MissingFeatures,           "missing_features" },
+        {         Status::OutsideDomain,             "outside_domain" },
+        { Status::UnmeasuredCombination,     "unmeasured_combination" },
+        {       Status::InvalidResponse,           "invalid_response" },
+        {      Status::UnobservedSource, "unobserved_source_interval" },
+        {  Status::UnresolvedSourceWait,     "unresolved_source_wait" },
+        {   Status::UnmodeledSourceWork,      "unmodeled_source_work" }
     };
     return statuses.at(status);
 }
@@ -32,11 +35,12 @@ const std::string & cost_status_name(trace_graph::cost::Status status) {
 const std::string & cost_coverage_name(trace_graph::cost::Coverage kind) {
     using namespace trace_graph::cost;
     static const std::map<Coverage, std::string> coverage{
-        {       Coverage::Measured,           "measured_work_point" },
-        { Coverage::NewCombination,       "new_feature_combination" },
-        {   Coverage::Extrapolated,                  "extrapolated" },
-        {  Coverage::SourceService,         "source_device_service" },
-        { Coverage::SourceResidual, "source_residual_approximation" }
+        {          Coverage::Measured,               "measured_work_point" },
+        {    Coverage::NewCombination,           "new_feature_combination" },
+        {      Coverage::Extrapolated,                      "extrapolated" },
+        {     Coverage::SourceService,             "source_device_service" },
+        {    Coverage::SourceResidual,     "source_residual_approximation" },
+        { Coverage::SourceCpuResidual, "source_cpu_residual_approximation" }
     };
     return coverage.at(kind);
 }

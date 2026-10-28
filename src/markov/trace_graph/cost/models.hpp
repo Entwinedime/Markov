@@ -44,8 +44,18 @@ struct Model {
     std::vector<std::string> sources;
 };
 
-enum class Status { Ready, MissingModel, MissingFeatures, OutsideDomain, UnmeasuredCombination, InvalidResponse };
-enum class Coverage { Measured, NewCombination, Extrapolated, SourceService, SourceResidual };
+enum class Status {
+    Ready,
+    MissingModel,
+    MissingFeatures,
+    OutsideDomain,
+    UnmeasuredCombination,
+    InvalidResponse,
+    UnobservedSource,
+    UnresolvedSourceWait,
+    UnmodeledSourceWork
+};
+enum class Coverage { Measured, NewCombination, Extrapolated, SourceService, SourceResidual, SourceCpuResidual };
 
 struct Response {
     Status status;

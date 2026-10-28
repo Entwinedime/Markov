@@ -24,13 +24,20 @@ void NativePlan::depend(std::optional<graph::NodeId> before, graph::NodeId after
 }
 
 graph::NodeId NativePlan::append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay) {
-    const auto id = work_.size();
-    work_.push_back(work);
-    work_.back().kind.timing_scope = scope;
-    steps_.push_back({ resource, delay });
+    const auto id = steps_.size();
+    auto owned = work;
+    owned.kind.timing_scope = scope;
+    steps_.push_back({ std::move(owned), resource, delay });
     depend(tail, id);
     tail = id;
     return id;
+}
+
+void NativePlan::source_cpu_gap(std::size_t interval, std::size_t caller) {
+    const auto id = steps_.size();
+    steps_.push_back({ SourceCpuGap{ interval }, caller, true });
+    depend(caller_, id);
+    caller_ = id;
 }
 
 void NativePlan::cpu(const Work & work, const char * service, const char * residual, std::size_t resource, std::optional<graph::NodeId> & tail) {
@@ -82,14 +89,19 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
     return true;
 }
 
-std::size_t NativePlan::delays() const { return std::ranges::count(steps_, true, &Step::delay); }
+std::size_t NativePlan::delays() const {
+    return std::ranges::count_if(steps_, [](const Step & step) { return step.delay && std::holds_alternative<Work>(step.cost); });
+}
 
 PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion,
                                      std::optional<graph::NodeId> cause) const {
     PlannedMutation result{ owner, {}, {} };
-    std::vector<bool> has_input(work_.size(), false);
-    for (std::size_t id = 0; id < work_.size(); ++id)
-        result.operations.push_back({ steps_[id].resource, std::cref(work_[id]), std::nullopt, steps_[id].delay, steps_[id].source_operation });
+    std::vector<bool> has_input(steps_.size(), false);
+    for (const auto & step : steps_) {
+        if (const auto * work = std::get_if<Work>(&step.cost))
+            result.operations.push_back({ step.resource, std::cref(*work), std::nullopt, step.delay, step.source_operation });
+        else result.operations.push_back({ step.resource, std::get<SourceCpuGap>(step.cost), std::nullopt, true });
+    }
     for (const auto & edge : edges_) {
         result.dependencies.push_back({ begin + edge.from, begin + edge.to, edge.kind });
         has_input[edge.to] = true;
@@ -97,11 +109,11 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
     for (std::size_t id = 0; id < has_input.size(); ++id)
         if (cause && !has_input[id]) result.dependencies.push_back({ *cause, begin + id, graph::EdgeKind::DataDependency });
 
-    const auto end = begin + work_.size();
+    const auto end = begin + steps_.size();
     result.operations.push_back({ 0, Boundary{}, completion });
     for (const auto tail : { caller_, worker_, device_ })
         if (tail) result.dependencies.push_back({ begin + *tail, end, graph::EdgeKind::DataDependency });
-    if (work_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
+    if (steps_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
     return result;
 }
 

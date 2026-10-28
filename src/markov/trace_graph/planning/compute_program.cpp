@@ -19,52 +19,50 @@ void ComputeStats::add(const ComputeStats & other) {
     }
     native_operations += other.native_operations;
     dispatch_delays += other.dispatch_delays;
+    source_cpu_gaps += other.source_cpu_gaps;
     participant_wait_ns += other.participant_wait_ns;
     maximum_arrival_span_ns = std::max(maximum_arrival_span_ns, other.maximum_arrival_span_ns);
 }
 
-bool ComputeProgram::append_compute(const FrameCompute & frame, std::size_t first, std::size_t last, CallResources resources, Segment & segment) {
+bool ComputeProgram::append_compute(const FrameCompute & frame, source::Index source_call, std::size_t & at, CallResources resources, Segment & segment) {
     const auto & observed = source_.observations();
-    for (auto at = first; at < last;) {
-        const auto source_call = frame.plan.operations[at].source_operation;
-        const auto unchanged = frame.plan.operations[at].source_work_unchanged;
-        const auto & call = observed.work_observations[source_call];
-        const auto & description = observed.work_descriptions[call.description];
-        if (!description.calls) {
-            issue_ = "compute_call_rule_unavailable";
-            return false;
-        }
-        // A source view has no task. Its target copy uses the same proven frame
-        // execution context; an observed device call still needs its own binding.
-        const auto & binding = source_.compute_resources(source_call);
-        if ((!description.observed.empty() && !binding) || (binding && *binding != resources)) {
-            issue_ = "compute_call_queue_binding_unavailable";
-            return false;
-        }
-        std::vector<Work> work;
-        while (at < last && frame.plan.operations[at].source_operation == source_call) {
-            const auto & instance = frame.plan.operations[at++];
-            if (instance.work) work.push_back(frame.plan.work[*instance.work]);
-        }
-        auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
-        if (calls.issue) {
-            issue_ = calls.issue;
-            return false;
-        }
-
-        // A single unchanged device operation has a source service candidate.
-        // The cost provider checks its exclusive ownership before migration.
-        if (unchanged && work.size() == 1) {
-            for (auto & native : calls.calls)
-                if (native.launches == work) native.source_operation = source_call;
-        }
-        if (!segment.plan.extend(calls.calls, resources, preparations_)) {
-            issue_ = "kernel_cache_initial_state_unavailable";
-            return false;
-        }
-        ++segment.stats.compute_calls;
-        segment.stats.compute_services += work.size();
+    const auto unchanged = frame.plan.operations[at].source_work_unchanged;
+    const auto & call = observed.work_observations[source_call];
+    const auto & description = observed.work_descriptions[call.description];
+    if (!description.calls) {
+        issue_ = "compute_call_rule_unavailable";
+        return false;
     }
+    // A source view has no task. Its target copy uses the same proven frame
+    // execution context; an observed device call still needs its own binding.
+    const auto & binding = source_.compute_resources(source_call);
+    if ((!description.observed.empty() && !binding) || (binding && *binding != resources)) {
+        issue_ = "compute_call_queue_binding_unavailable";
+        return false;
+    }
+    std::vector<Work> work;
+    while (at < frame.plan.operations.size() && frame.plan.operations[at].source_operation == source_call) {
+        const auto & instance = frame.plan.operations[at++];
+        if (instance.work) work.push_back(frame.plan.work[*instance.work]);
+    }
+    auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
+    if (calls.issue) {
+        issue_ = calls.issue;
+        return false;
+    }
+
+    // A single unchanged device operation has a source service candidate.
+    // The cost provider checks its exclusive ownership before migration.
+    if (unchanged && work.size() == 1) {
+        for (auto & native : calls.calls)
+            if (native.launches == work) native.source_operation = source_call;
+    }
+    if (!segment.plan.extend(calls.calls, resources, preparations_)) {
+        issue_ = "kernel_cache_initial_state_unavailable";
+        return false;
+    }
+    ++segment.stats.compute_calls;
+    segment.stats.compute_services += work.size();
     return true;
 }
 
@@ -83,10 +81,6 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             return;
         }
         const auto participant = observed.work_observations[operations.front()].resource;
-        if (std::ranges::any_of(operations, [&](source::Index operation) { return observed.work_observations[operation].resource != participant; })) {
-            issue_ = "cross_thread_compute_requires_explicit_ports";
-            return;
-        }
         if (std::ranges::any_of(input.plan.queue_dependencies, [](const graph::Edge & edge) { return edge.from > edge.to; })) {
             issue_ = "source_stream_order_contradicts_caller_order";
             return;
@@ -110,41 +104,30 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         }
         frames_.push_back({});
         auto & frame = frames_.back();
-        struct Fence {
-            source::Time begin, end;
-            source::Index id;
-            bool preparation;
-        };
-        std::vector<Fence> fences;
-        for (const auto call_id : source.frame_collectives(input.frame)) {
-            const auto & call = observed.collectives[call_id];
-            fences.push_back({ call.begin_ns, call.end_ns, call_id, false });
+        if (!source.frame_cpu_order_supported(input.frame)) {
+            issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
+            return;
         }
         const auto & preparations = observed.compute_frames[input.frame].preparations;
         const auto preparation_resources = source.preparation_resources(input.frame);
-        for (std::size_t i = 0; i < preparations.size(); ++i) {
-            if (!preparations[i].definition || !preparation_resources[i] || preparation_resources[i]->caller != resources->caller
-                || preparation_resources[i]->worker != resources->worker) {
-                issue_ = "preparation_rule_or_resources_unavailable";
-                return;
-            }
-            fences.push_back({ preparations[i].region.begin_ns, preparations[i].region.end_ns, i, true });
-        }
-        std::ranges::sort(fences, {}, &Fence::begin);
         std::size_t first = 0;
         Segment pending;
-        for (const auto & fence : fences) {
-            auto last = first;
-            while (last < input.plan.operations.size() && observed.work_observations[input.plan.operations[last].source_operation].end_ns <= fence.begin)
-                ++last;
-            if (last < input.plan.operations.size() && observed.work_observations[input.plan.operations[last].source_operation].begin_ns < fence.end) {
-                issue_ = "overlapping_compute_call_requires_explicit_ports";
-                return;
+        for (const auto & entry : source.frame_calls(input.frame)) {
+            if (entry.gap_before) {
+                pending.plan.source_cpu_gap(*entry.gap_before, participant);
+                ++pending.stats.source_cpu_gaps;
             }
-            if (!append_compute(input, first, last, *resources, pending)) return;
-            first = last;
-            if (fence.preparation) {
-                const auto & preparation = preparations[fence.id];
+            if (entry.kind == source::FrameCallKind::Compute) {
+                if (!append_compute(input, entry.index, first, *resources, pending)) return;
+                continue;
+            }
+            if (entry.kind == source::FrameCallKind::Preparation) {
+                const auto & preparation = preparations[entry.index];
+                const auto & binding = preparation_resources[entry.index];
+                if (!preparation.definition || !binding || binding->caller != resources->caller || binding->worker != resources->worker) {
+                    issue_ = "preparation_rule_or_resources_unavailable";
+                    return;
+                }
                 const auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
                 if (calls.issue) {
                     issue_ = calls.issue;
@@ -153,7 +136,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.
-                if (!pending.plan.extend(calls.calls, *preparation_resources[fence.id], preparations_)) {
+                if (!pending.plan.extend(calls.calls, *binding, preparations_)) {
                     issue_ = "kernel_cache_initial_state_unavailable";
                     return;
                 }
@@ -162,12 +145,8 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 ++stats.sequences;
                 continue;
             }
-            const auto & call = observed.collectives[fence.id];
+            const auto & call = observed.collectives[entry.index];
             const auto & group = observed.collective_groups[call.group];
-            if (call.resource != participant) {
-                issue_ = "collective_and_compute_have_different_callers";
-                return;
-            }
             auto work = call.work;
             const auto items = call.rows.basis == RowBasis::QueryTokens ? input.variables.query_tokens : input.variables.batch_size;
             work.features["rows"] = items * call.rows.rows_per_item;
@@ -190,7 +169,6 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             frame.segments.push_back(std::move(pending));
             pending = Segment{};
         }
-        if (!append_compute(input, first, input.plan.operations.size(), *resources, pending)) return;
         frame.segments.push_back(std::move(pending));
     }
     for (const auto & collective : collectives_) {

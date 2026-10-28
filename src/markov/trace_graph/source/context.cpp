@@ -1,6 +1,7 @@
 #include "markov/trace_graph/source/context.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <utility>
@@ -28,9 +29,74 @@ SourceContext::SourceContext(Observations && observations)
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
     index_compute_queues();
+    index_frame_calls();
 
     // The context is read-only now; keep semantic tables, not parser interning.
     observations_.release_intake_indexes();
+}
+
+void SourceContext::index_frame_calls() {
+    struct Entry {
+        FrameCall call;
+        CpuRegion region;
+    };
+    frame_calls_.resize(frame_operations_.size());
+    frame_cpu_order_supported_.resize(frame_operations_.size(), true);
+    for (Index frame = 0; frame < frame_operations_.size(); ++frame) {
+        std::vector<Entry> entries;
+        for (const auto id : frame_operations_[frame]) {
+            const auto & call = observations_.work_observations[id];
+            entries.push_back({
+                { FrameCallKind::Compute, id },
+                { call.resource, call.begin_ns, call.end_ns, call.record }
+            });
+        }
+        const auto & preparations = observations_.compute_frames[frame].preparations;
+        for (Index id = 0; id < preparations.size(); ++id)
+            entries.push_back({
+                { FrameCallKind::Preparation, id },
+                preparations[id].region
+            });
+        for (const auto id : frame_collectives_[frame]) {
+            const auto & call = observations_.collectives[id];
+            entries.push_back({
+                { FrameCallKind::Collective, id },
+                { call.resource, call.begin_ns, call.end_ns, call.record }
+            });
+        }
+        std::ranges::stable_sort(entries, {}, [](const Entry & entry) { return entry.region.begin_ns; });
+        for (Index i = 1; i < entries.size(); ++i) {
+            const auto & before = entries[i - 1].region;
+            const auto & after = entries[i].region;
+            if (before.resource != after.resource || before.end_ns > after.begin_ns) frame_cpu_order_supported_[frame] = false;
+        }
+        for (Index i = 0; i < entries.size(); ++i) {
+            auto call = entries[i].call;
+            if (frame_cpu_order_supported_[frame] && i && entries[i - 1].region.end_ns < entries[i].region.begin_ns) {
+                call.gap_before = cpu_gaps_.size();
+                const auto & after = entries[i].region;
+
+                // The following semantic record anchors this inter-call region.
+                cpu_gaps_.push_back({ after.resource, entries[i - 1].region.end_ns, after.begin_ns, after.record });
+            }
+            frame_calls_[frame].push_back(call);
+        }
+    }
+
+    // A gap containing a native submission cannot stand in for that missing
+    // work: its worker/device lifecycle must be generated explicitly.
+    cpu_gap_native_submissions_.resize(cpu_gaps_.size(), false);
+    std::vector<std::vector<Index>> lanes(observations_.resources.size());
+    for (Index id = 0; id < cpu_gaps_.size(); ++id) lanes[cpu_gaps_[id].resource].push_back(id);
+    for (auto & lane : lanes) std::ranges::sort(lane, {}, [&](Index id) { return cpu_gaps_[id].begin_ns; });
+    for (const auto & edge : observations_.dependencies) {
+        if (edge.kind == DependencyKind::Synchronization) continue;
+        const auto & point = observations_.points[edge.before];
+        if (point.resource == observations_.points[edge.after].resource) continue;
+        const auto & lane = lanes[point.resource];
+        const auto at = std::ranges::upper_bound(lane, point.time_ns, {}, [&](Index id) { return cpu_gaps_[id].begin_ns; });
+        if (at != lane.begin() && point.time_ns < cpu_gaps_[*std::prev(at)].end_ns) cpu_gap_native_submissions_[*std::prev(at)] = true;
+    }
 }
 
 void SourceContext::index_cpu_intervals() {

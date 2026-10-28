@@ -1,8 +1,10 @@
 #pragma once
 
 #include "markov/adapters/costs.hpp"
+#include "markov/trace_graph/source/services.hpp"
 
 #include <nlohmann/json.hpp>
+#include <span>
 #include <string>
 
 namespace markov::adapters {
@@ -19,5 +21,6 @@ nlohmann::json work_json(const trace_graph::planning::Work & work);
 // response is an operation cost, not evidence of structural or E2E accuracy.
 nlohmann::json cost_report(const adapters::CostQueries & queries, const adapters::SelectedCosts & selected);
 nlohmann::json source_cpu_cost_report(const adapters::PreparedSource & source);
+nlohmann::json cpu_cost_summary(std::span<const trace_graph::source::CpuInterval> intervals);
 
 } // namespace markov::commands

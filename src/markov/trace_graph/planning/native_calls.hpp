@@ -9,6 +9,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace markov::trace_graph::planning {
@@ -70,8 +71,9 @@ public:
     // Ordered tensor work may change device streams while retaining its
     // producer frontier. Caller/worker ownership remains with the same queues.
     bool extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations);
+    void source_cpu_gap(std::size_t interval, std::size_t caller);
     PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
-    std::size_t operations() const { return work_.size(); }
+    std::size_t operations() const { return steps_.size(); }
     std::size_t delays() const;
 
 private:
@@ -80,11 +82,11 @@ private:
     void depend(std::optional<graph::NodeId> before, graph::NodeId after);
 
     struct Step {
+        std::variant<Work, SourceCpuGap> cost;
         std::size_t resource;
         bool delay;
         std::optional<std::size_t> source_operation = std::nullopt;
     };
-    std::vector<Work> work_;
     std::vector<Step> steps_;
     std::vector<graph::Edge> edges_;
     std::optional<graph::NodeId> caller_, worker_, device_;

@@ -26,7 +26,7 @@ struct ComputeStats {
     };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
-    std::size_t native_operations = 0, dispatch_delays = 0;
+    std::size_t native_operations = 0, dispatch_delays = 0, source_cpu_gaps = 0;
     std::map<std::string, Preparation> preparations;
     graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
     void add(const ComputeStats & other);
@@ -75,7 +75,7 @@ private:
     };
 
     void segment(ProgramRuntime & runtime, std::size_t frame, std::optional<graph::NodeId> cause);
-    bool append_compute(const FrameCompute & frame, std::size_t first, std::size_t last, CallResources resources, Segment & segment);
+    bool append_compute(const FrameCompute & frame, source::Index source_call, std::size_t & at, CallResources resources, Segment & segment);
     void arrive(ProgramRuntime & runtime, std::size_t frame, const simulation::Event & event);
 
     const source::SourceContext & source_;

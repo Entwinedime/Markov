@@ -2,10 +2,12 @@
 
 #include "markov/trace_graph/cost/models.hpp"
 #include "markov/trace_graph/planning/work.hpp"
+#include "markov/trace_graph/source/services.hpp"
 
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace markov::trace_graph::source {
@@ -18,14 +20,17 @@ namespace markov::trace_graph::cost {
 // Independent responses are keyed by work; source services keep their identity.
 class Queries {
 public:
-    explicit Queries(const Models & models, const source::SourceContext * source = nullptr);
+    explicit Queries(const Models & models, const source::SourceContext * source = nullptr, const source::CpuCosts * cpu_costs = nullptr);
     const Response & query(const planning::Work & work);
     const Response & query_source(const planning::Work & work, std::size_t observation, std::size_t resource);
     const Response & query_source_delay(graph::NodeId node, std::size_t resource);
+    const Response & query_source_cpu_gap(std::size_t interval, std::size_t resource);
     std::size_t requests() const { return requests_; }
-    std::size_t evaluations() const { return responses_.size() + source_evaluations_ + source_delays_.size(); }
+    std::size_t evaluations() const { return responses_.size() + source_evaluations_ + source_delays_.size() + source_cpu_evaluations_; }
     std::size_t source_evaluations() const { return source_evaluations_; }
     std::size_t residual_evaluations() const { return source_delays_.size(); }
+    std::size_t cpu_residual_evaluations() const { return source_cpu_evaluations_; }
+    std::span<const source::CpuInterval> source_cpu_gaps() const { return source_cpu_gaps_; }
 
 private:
     const Models & models_;
@@ -33,6 +38,9 @@ private:
     std::map<planning::Work, Response> responses_;
     std::vector<std::optional<Response>> source_responses_;
     std::map<graph::NodeId, Response> source_delays_;
+    std::vector<source::CpuInterval> source_cpu_gaps_;
+    std::vector<std::optional<Response>> source_cpu_responses_;
+    std::size_t source_cpu_evaluations_ = 0;
     std::size_t source_evaluations_ = 0;
     std::size_t requests_ = 0;
 };

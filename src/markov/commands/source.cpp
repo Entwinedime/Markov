@@ -53,7 +53,9 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> contexts;
     };
     std::map<std::string, Preparation> preparations;
+    std::size_t unsupported_frames = 0;
     for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
+        unsupported_frames += !source.frame_cpu_order_supported(frame);
         const auto & regions = observed.compute_frames[frame].preparations;
         const auto intervals = source.preparation_intervals(frame);
         const auto resources = source.preparation_resources(frame);
@@ -105,13 +107,19 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         item["execution_contexts"] = std::move(contexts);
         preparation_report[role] = std::move(item);
     }
+    std::size_t unmodeled_gap_work = 0;
+    for (source::Index id = 0; id < source.cpu_gaps().size(); ++id) unmodeled_gap_work += source.cpu_gap_has_unmodeled_work(id);
+
     return {
-        { "compute_calls",std::move(descriptions)                          },
-        {  "preparations", std::move(preparation_report) },
-        { "qualification",
+        {                                 "compute_calls",std::move(descriptions)                                                          },
+        {                                  "preparations", std::move(preparation_report) },
+        {                        "inter_call_cpu_regions",      source.cpu_gaps().size() },
+        {             "frames_with_unsupported_cpu_order",            unsupported_frames },
+        { "inter_call_regions_with_unmodeled_submissions",            unmodeled_gap_work },
+        {                                 "qualification",
          "Source caller intervals only: exclusive observed service, waits, gaps, and uncovered time are kept separate. "
          "Profiler correction is not applied; these are neither normal CPU costs nor a complete request partition. Device/worker work is not charged "
-         "here."                                        }
+         "here."                                                                        }
     };
 }
 

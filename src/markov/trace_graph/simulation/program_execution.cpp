@@ -40,6 +40,19 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
                 operation.completion
             });
         }
+        else if (const auto * interval = std::get_if<planning::SourceCpuGap>(&operation.cost)) {
+            const auto & response = costs_.query_source_cpu_gap(interval->interval, operation.resource);
+            if (!response.duration_ns) {
+                gap_ = CostGap{ *interval, response };
+                clock_.stop();
+                return std::nullopt;
+            }
+            ++coverage[*response.coverage];
+            bound.operations.push_back({
+                { *response.duration_ns, operation.resource, graph::NodeKind::Delay },
+                operation.completion
+            });
+        }
         else
             bound.operations.push_back({
                 { 0, operation.resource, graph::NodeKind::Boundary },

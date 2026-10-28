@@ -41,15 +41,29 @@ Json kernel_cache_report(const planning::PreparationCache & cache) {
     };
 }
 
-Json cost_gap_json(const simulation::CostGap & gap) {
-    auto work = work_json(gap.work);
-    work["status"] = cost_status_name(gap.response.status);
-    work["affected_features"] = gap.response.affected_features;
-    work["model"] = gap.response.model ? Json(*gap.response.model) : Json(nullptr);
-    return {
-        { "kind",      "cost_gap" },
-        { "work", std::move(work) }
+Json cost_gap_json(const simulation::CostGap & gap, const source::SourceContext & source) {
+    Json result{
+        {              "kind",                                                     "cost_gap" },
+        {            "status",                          cost_status_name(gap.response.status) },
+        { "affected_features",                                 gap.response.affected_features },
+        {             "model", gap.response.model ? Json(*gap.response.model) : Json(nullptr) }
     };
+    if (gap.response.status == cost::Status::UnresolvedSourceWait) result["kind"] = "source_dependency_gap";
+    if (gap.response.status == cost::Status::UnmodeledSourceWork) result["kind"] = "source_work_gap";
+    if (const auto * work = std::get_if<planning::Work>(&gap.work)) result["work"] = work_json(*work);
+    else {
+        const auto id = std::get<planning::SourceCpuGap>(gap.work).interval;
+        const auto & region = source.cpu_gaps()[id];
+        result["source_cpu_gap"] = {
+            {         "interval",                                                        id },
+            {         "resource", source.observations().resources[region.resource].identity },
+            {         "begin_ns",                                           region.begin_ns },
+            {           "end_ns",                                             region.end_ns },
+            {   "following_file",                                        region.record.file },
+            { "following_record",                                    region.record.position }
+        };
+    }
+    return result;
 }
 
 struct SubsetExecution {
@@ -79,7 +93,7 @@ struct SubsetExecution {
         compute.add(stats);
         service_operations += stats.compute_services;
         if (result.cost_gap) {
-            issue = cost_gap_json(*result.cost_gap);
+            issue = cost_gap_json(*result.cost_gap, source);
             return;
         }
 
@@ -101,6 +115,7 @@ struct SubsetExecution {
             {            "kernel_cache",                     kernel_cache_report(preparations) },
             {       "native_operations",                             compute.native_operations },
             {         "dispatch_delays",                               compute.dispatch_delays },
+            {         "source_cpu_gaps",                               compute.source_cpu_gaps },
             {                "coverage",                                              coverage },
             {         "logical_queries",                                              requests },
             {    "response_evaluations",                                           evaluations },
@@ -110,8 +125,9 @@ struct SubsetExecution {
              "Known compute calls, metadata and admitted Prefill/Decode allocation share native chains and blocking collective rendezvous. "
              "Allocation uses its observed device stream and precedes forward inputs. Unsorted pools use int64 Prefill or int32 one-token Decode locations. "
              "Idle synchronization "
-             "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call and "
-             "collective CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
+             "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call CPU uses source "
+             "residual approximations for the same caller recipe. "
+             "Collective envelope CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
              "reported."                                                                      }
         };
     }
@@ -174,7 +190,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         requests.push_back(std::move(item));
     }
     Json issue = nullptr;
-    if (result.cost_gap) issue = cost_gap_json(*result.cost_gap);
+    if (result.cost_gap) issue = cost_gap_json(*result.cost_gap, source);
     else if (program.issue())
         issue = {
             { "kind", *program.issue() }
@@ -209,7 +225,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "locations. Idle "
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
-         "Partial request ports exclude query/admission, inter-call and collective CPU, other cross-stream dependencies and client pacing. "
+         "Inter-call CPU uses corrected source residual approximations for the same caller recipe; known waits require explicit dependencies. "
+         "Partial request ports exclude query/admission, collective envelope CPU, other cross-stream dependencies and client pacing. "
          "Response currently follows selected compute completion; native overlap/result handoff is not implemented. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
@@ -226,7 +243,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {    "compute_calls",     compute.compute_calls },
         { "compute_services",  compute.compute_services },
         {       "operations", compute.native_operations },
-        {  "dispatch_delays",   compute.dispatch_delays }
+        {  "dispatch_delays",   compute.dispatch_delays },
+        {  "source_cpu_gaps",   compute.source_cpu_gaps }
     };
     if (const auto * storage = program.storage()) {
         const auto & stats = storage->stats();
@@ -268,7 +286,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     const auto & observations = source.context.observations();
     const auto & paths = observations.token_paths;
     std::optional<cost::Queries> queries;
-    if (costs) queries.emplace(costs->models, &source.context);
+    if (costs) queries.emplace(costs->models, &source.context, source.cpu_costs ? &source.cpu_costs->intervals : nullptr);
     const auto backend = cache ? std::optional(adapters::sglang::cache_backend(source.context)) : std::nullopt;
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
@@ -423,14 +441,16 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     };
     if (costs) {
         report["cost_catalog"] = {
-            {                  "deployment",                                                                                                              costs->deployment },
-            {             "selected_models",                                                                                                           costs->models.size() },
-            {             "logical_queries",                                                                                                            queries->requests() },
-            {        "response_evaluations",                                                                                                         queries->evaluations() },
-            {  "source_service_evaluations",                                                                                                  queries->source_evaluations() },
-            { "source_residual_evaluations",                                                                                                queries->residual_evaluations() },
-            { "source_deployment_qualified",                                                                                                                          false },
-            {               "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
+            {                      "deployment",                                                                                                              costs->deployment },
+            {                 "selected_models",                                                                                                           costs->models.size() },
+            {                 "logical_queries",                                                                                                            queries->requests() },
+            {            "response_evaluations",                                                                                                         queries->evaluations() },
+            {      "source_service_evaluations",                                                                                                  queries->source_evaluations() },
+            {     "source_residual_evaluations",                                                                                                queries->residual_evaluations() },
+            { "source_cpu_residual_evaluations",                                                                                            queries->cpu_residual_evaluations() },
+            {           "source_cpu_gap_domain",                                                                                   cpu_cost_summary(queries->source_cpu_gaps()) },
+            {     "source_deployment_qualified",                                                                                                                          false },
+            {                   "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
         };
     }
     report["source_replay"] = source_report(source);

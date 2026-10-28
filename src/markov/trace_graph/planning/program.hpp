@@ -21,12 +21,18 @@ struct SourceDelay {
     graph::NodeId node;
 };
 
+// A source inter-call interval is a residual approximation, not proven service.
+// shortcut: preserve the same caller recipe; replace when host work changes.
+struct SourceCpuGap {
+    std::size_t interval;
+};
+
 struct PlannedOperation {
     std::size_t resource;
 
     // Work references live through the synchronous submit call. A boundary is
     // explicitly cost-free; missing work is never represented by a null pointer.
-    std::variant<Boundary, std::reference_wrapper<const Work>, SourceDelay> cost;
+    std::variant<Boundary, std::reference_wrapper<const Work>, SourceDelay, SourceCpuGap> cost;
     std::optional<simulation::Action> completion = std::nullopt;
     bool delay = false; // Readiness latency; it does not occupy a service resource.
     std::optional<std::size_t> source_operation = std::nullopt;

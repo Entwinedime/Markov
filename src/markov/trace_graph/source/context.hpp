@@ -20,6 +20,14 @@ struct WorkOrder {
     Index after;
 };
 
+enum class FrameCallKind { Compute, Preparation, Collective };
+
+struct FrameCall {
+    FrameCallKind kind;
+    Index index;
+    std::optional<Index> gap_before = std::nullopt;
+};
+
 // Own source observations and their graph once. Consumers borrow const views;
 // target state and corrected cost views cannot mutate the original capture.
 class SourceContext {
@@ -44,10 +52,15 @@ public:
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
     std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
+    std::span<const FrameCall> frame_calls(Index frame) const { return frame_calls_[frame]; }
+    bool frame_cpu_order_supported(Index frame) const { return frame_cpu_order_supported_[frame]; }
+    std::span<const CpuRegion> cpu_gaps() const { return cpu_gaps_; }
+    bool cpu_gap_has_unmodeled_work(Index interval) const { return cpu_gap_native_submissions_[interval]; }
 
 private:
     void index_compute_queues();
     void index_cpu_intervals();
+    void index_frame_calls();
 
     Observations observations_;
     SourceGraph graph_;
@@ -62,6 +75,10 @@ private:
     std::vector<std::vector<WorkOrder>> frame_queue_order_;
     std::vector<std::vector<Index>> frame_queue_issues_;
     std::vector<std::vector<Index>> frame_collectives_;
+    std::vector<std::vector<FrameCall>> frame_calls_;
+    std::vector<bool> frame_cpu_order_supported_;
+    std::vector<CpuRegion> cpu_gaps_;
+    std::vector<bool> cpu_gap_native_submissions_;
 };
 
 } // namespace markov::trace_graph::source

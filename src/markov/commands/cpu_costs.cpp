@@ -60,6 +60,12 @@ struct Summary {
 
 } // namespace
 
+Json cpu_cost_summary(std::span<const CpuInterval> intervals) {
+    Summary summary;
+    for (const auto & interval : intervals) summary.add(interval);
+    return summary.report();
+}
+
 Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
     if (!prepared.cpu_costs) return nullptr;
 
@@ -146,7 +152,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
         {        "caller_partition",               std::move(partition) },
         { "formal_caller_partition",        std::move(formal_partition) },
         {                "requests",                std::move(requests) },
-        {   "applied_to_prediction",                              false },
+        { "original_graph_modified",                              false },
         {           "qualification",
          "Source-coordinate estimates only. Known caller envelopes and their complement partition each HTTP window; worker, device "
          "and other threads are outside this summary. Corrections intersect observed service and residual separately. Wait/identified-overhead "

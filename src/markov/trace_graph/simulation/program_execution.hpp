@@ -6,11 +6,12 @@
 
 #include <map>
 #include <optional>
+#include <variant>
 
 namespace markov::trace_graph::simulation {
 
 struct CostGap {
-    planning::Work work;
+    std::variant<planning::Work, planning::SourceCpuGap> work;
     cost::Response response;
 };
 

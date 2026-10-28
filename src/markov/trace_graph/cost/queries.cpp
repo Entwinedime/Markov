@@ -6,10 +6,33 @@
 
 namespace markov::trace_graph::cost {
 
-Queries::Queries(const Models & models, const source::SourceContext * source)
+Queries::Queries(const Models & models, const source::SourceContext * source, const source::CpuCosts * cpu_costs)
     : models_(models),
       source_(source),
-      source_responses_(source ? source->observations().work_observations.size() : 0) {}
+      source_responses_(source ? source->observations().work_observations.size() : 0) {
+    if (source) source_cpu_gaps_ = source::cpu_intervals(source->observations(), source->graph(), source->cpu_gaps(), cpu_costs);
+    source_cpu_responses_.resize(source_cpu_gaps_.size());
+}
+
+const Response & Queries::query_source_cpu_gap(std::size_t interval, std::size_t resource) {
+    if (!source_ || source_->cpu_gaps()[interval].resource != resource) throw std::logic_error("Source CPU gap requires its original caller");
+    ++requests_;
+    auto & response = source_cpu_responses_[interval];
+    if (response) return *response;
+    ++source_cpu_evaluations_;
+    const auto & observed = source_cpu_gaps_[interval];
+    if (observed.unobserved_ns) response = Response{ Status::UnobservedSource, std::nullopt, std::nullopt, {}, std::nullopt };
+    else if (source_->cpu_gap_has_unmodeled_work(interval)) response = Response{ Status::UnmodeledSourceWork, std::nullopt, std::nullopt, {}, std::nullopt };
+    else if (observed.wait_ns) response = Response{ Status::UnresolvedSourceWait, std::nullopt, std::nullopt, {}, std::nullopt };
+    else {
+        auto cost = observed.service_correction;
+        cost.add(observed.residual_correction);
+        const auto uncorrected = observed.service_ns + observed.residual_ns - cost.covered_ns;
+        cost.add({ 0, uncorrected });
+        response = Response{ Status::Ready, cost.cost_ns, Coverage::SourceCpuResidual, {}, std::nullopt };
+    }
+    return *response;
+}
 
 const Response & Queries::query_source(const planning::Work & work, std::size_t observation, std::size_t resource) {
     if (!source_) throw std::logic_error("Source service requested without source evidence");
