@@ -87,20 +87,34 @@ class ExecutionEvidence:
             if region is None:
                 region = graph["operations"][node["operation"]]["region"]
             scope = graph["regions"][region]
-            identity = ("action", scope["action"]) if "action" in scope else ("control", scope["control"])
+            identity = (
+                ("action", scope["task"]["group"], scope["task"]["sequence"])
+                if "task" in scope else ("control", scope["control"])
+            )
             owned[identity].append(item)
             owner[node["id"]] = identity
         checks["exclusive_resources"] = all(
             left[1] <= right[0] for intervals in resources.values() for left, right in pairwise(sorted(intervals))
         )
         decisions = self.result["decisions"]
-        boundaries = {("action", item["task"]["sequence"]): item for item in decisions}
+        boundaries = {("action", item["task"]["group"], item["task"]["sequence"]): item for item in decisions}
         boundaries.update((("control", index), item) for index, item in enumerate(self.result["controls"]))
         checks["work_ownership"] = len(boundaries) == len(decisions) + len(self.result["controls"]) and set(
             owned
-        ) == set(boundaries)
+        ) <= set(boundaries)
         if not checks["work_ownership"]:
             return {"status": "differences", "checks": checks}
+
+        # A continuation can close an existing call without creating another operation or execution node.
+        checks["continuation_ownership"] = all(
+            identity in owned or all(
+                owner[port][0] == "action"
+                and boundaries[owner[port]]["task"]["group"] == boundary["task"]["group"]
+                and boundaries[owner[port]]["flow"] == boundary["flow"]
+                for port in boundary["execution_ports"]["completions"]
+            )
+            for identity, boundary in boundaries.items()
+        )
 
         checks["scheduled_work"] = all(
             item["status"] == "waiting" or boundaries[identity]["scheduled_ns"] <= item["started_ns"]
@@ -150,7 +164,10 @@ class ExecutionEvidence:
         checks["handoff_steps"] = set(complete) == set(handoffs) == expected
         checks["handoff_readiness"] = all(
             steps[first]["completed_ns"] <= steps[last]["scheduled_ns"]
-            and (("action", steps[first]["task"]["sequence"]), ("action", steps[last]["task"]["sequence"])) in cross
+            and (
+                ("action", steps[first]["task"]["group"], steps[first]["task"]["sequence"]),
+                ("action", steps[last]["task"]["group"], steps[last]["task"]["sequence"]),
+            ) in cross
             for steps in complete.values()
             for first, last in (
                 ("reserve", "transfer"),

@@ -29,11 +29,12 @@ class StructureComparison:
         )
         self.rank = self.source["environment"]["rank"]
         self.stage = self.source["environment"]["pp_rank"]
-        mode = self.source["environment"]["implementation"]["disaggregation_mode"]
-        self.instance = "model" if mode == "null" else mode
         self.native_batches = self.region_labels(self.source["regions"], True, "batch")
         self.target_batches = self.region_labels(self.prediction["graph"]["regions"], False, "batch")
-        self.target_actions = self.region_labels(self.prediction["graph"]["regions"], False, "action")
+        self.target_actions = [
+            None if task is None else (task["group"], task["sequence"])
+            for task in self.region_labels(self.prediction["graph"]["regions"], False, "task")
+        ]
         self.native_requests = self.region_labels(self.source["regions"], True, "request")
         self.native_model = self.model_regions(self.source["regions"])
         self.target_model = self.model_regions(self.prediction["graph"]["regions"])
@@ -60,13 +61,17 @@ class StructureComparison:
         self.completions = {}
 
         # A batch can span pipeline actions; P and D select their own member groups.
+        groups = {
+            group["id"] for group in self.prediction["graph"]["topology"]["groups"]
+            if self.rank in group["members"]
+        }
         for decision in self.prediction["decisions"]:
-            if decision["task"]["group"] != self.instance:
+            if decision["task"]["group"] not in groups:
                 continue
             flow = decision["flow"]
             if decision["commits_requests"] or decision["step"] == "model":
                 self.completions[flow] = decision
-            if decision["step"] in {"batch", "model", "accept"} or (
+            if decision["step"] in {"batch", "model", "compute", "accept"} or (
                 decision["step"] == "stage" and decision["stage"] == self.stage
             ):
                 self.decisions[flow] = decision
@@ -77,8 +82,8 @@ class StructureComparison:
             for flow, decision in self.decisions.items() if decision["phase"] == "prefill"
             for member in decision["members"]
         }
-        actions = {decision["task"]["sequence"]: decision for decision in self.prediction["decisions"]}
-        self.flow_actions: dict[int, set[int]] = defaultdict(set)
+        actions = {(item["task"]["group"], item["task"]["sequence"]): item for item in self.prediction["decisions"]}
+        self.flow_actions: dict[int, set[tuple[str, int]]] = defaultdict(set)
         for region in self.prediction["graph"]["regions"]:
             action = self.target_actions[region["id"]]
             if region.get("rank") != self.rank or action is None:
