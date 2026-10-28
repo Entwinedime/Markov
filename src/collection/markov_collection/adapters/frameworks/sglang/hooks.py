@@ -516,6 +516,9 @@ class SGLangObservation:
                     pool.page_size,
                     scheduler.req_to_token_pool.req_to_token.dtype,
                     ("B", "max_sequence_tokens"),
+
+                    # Prefill members remain unpadded; Decode follows native MLP token alignment.
+                    (1, self.ep_size),
                 )
                 with torch.npu.stream(self.model_stream):
                     self.matrices.prepare()

@@ -11,25 +11,40 @@ from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
 
 class AscendMaterializations:
-    def __init__(self, operators: Any, step: int, dtype: torch.dtype, axes: tuple[str, str]) -> None:
+    def __init__(
+        self, operators: Any, step: int, dtype: torch.dtype, axes: tuple[str, str], row_multiples: tuple[int, ...]
+    ) -> None:
         self.operators = operators
         self.recording = operators.recording
         self.step = step
         self.dtype = dtype
         self.axes = axes
+        self.row_multiples = row_multiples
         self.warmed = False
         self.captured = False
 
-    def points(self) -> tuple[tuple[int, int], ...]:
+    @staticmethod
+    def aligned_rows(rows: Any, multiple: int) -> Any:
+        return multiple * ((rows + multiple - 1) // multiple)
+
+    def points(self) -> tuple[tuple[int, int, int], ...]:
 
         # Cover no copy, unit-axis Slice, AsStrided, StridedSlice and the other unit-axis Slice.
-        return ((1, 1), (2, self.step), (2, self.step + 1), (2, 2 * self.step), (1, 2 * self.step))
+        shapes = ((1, 1), (2, self.step), (2, self.step + 1), (2, 2 * self.step), (1, 2 * self.step))
+        points = {}
+        for multiple in self.row_multiples:
+            for rows, columns in shapes:
+
+                # Keep each concrete shape once per row rule; different rules retain their own symbolic meaning.
+                key = (multiple, self.aligned_rows(rows, multiple), columns)
+                points.setdefault(key, (multiple, rows, columns))
+        return tuple(points.values())
 
     def warmup(self) -> None:
         if self.warmed:
             return
-        for rows, columns in self.points():
-            value = torch.ones((rows, columns), dtype=self.dtype, device="npu")
+        for multiple, rows, columns in self.points():
+            value = torch.ones((self.aligned_rows(rows, multiple), columns), dtype=self.dtype, device="npu")
             torch.floor_divide(value[:, :: self.step], self.step)
         torch.npu.synchronize()
         self.warmed = True
@@ -37,10 +52,10 @@ class AscendMaterializations:
     def capture(self) -> None:
         if self.captured:
             return
-        for rows, columns in self.points():
+        for multiple, rows, columns in self.points():
             for observed in (False, True):
                 with self.operators.values.auxiliary():
-                    value = torch.ones((rows, columns), dtype=self.dtype, device="npu")
+                    value = torch.ones((self.aligned_rows(rows, multiple), columns), dtype=self.dtype, device="npu")
                 identity = len(self.recording.batches)
                 self.recording.batches.append(
                     {
@@ -61,7 +76,7 @@ class AscendMaterializations:
                             columns_axis = self.operators.values.bounded_parameter(
                                 self.axes[1], 1, sys.maxsize
                             )
-                            shapes.bind_contiguous(value, (rows_axis, columns_axis))
+                            shapes.bind_contiguous(value, (self.aligned_rows(rows_axis, multiple), columns_axis))
                         torch.floor_divide(value[:, :: self.step], self.step)
                 else:
                     with TorchMarkers.scope(f"markov.baseline/{identity}"):
