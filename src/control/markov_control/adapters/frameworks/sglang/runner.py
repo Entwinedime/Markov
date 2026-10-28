@@ -32,12 +32,18 @@ class MetadataRunner(ModelRunner):
 
     def init_torch_distributed(self):
 
-        # A single native worker uses a real local process group without physical collectives.
+        # Native request/control collectives run on CPU; model collectives belong to the simulated graph.
         parallel_state.init_distributed_environment(
-            backend="gloo", world_size=1, rank=0, local_rank=0, distributed_init_method=self.rendezvous
+            backend="gloo",
+            world_size=self.tp_size,
+            rank=self.tp_rank,
+            local_rank=0,
+            distributed_init_method=self.rendezvous,
         )
         parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, expert_model_parallel_size=1
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=self.moe_ep_size,
         )
         initialize_dp_attention(self.server_args, self.model_config)
         self.tp_group = parallel_state.get_tp_group()

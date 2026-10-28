@@ -1,17 +1,14 @@
 """Run the native scheduler loop against core resource and execution services."""
 
-import json
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import torch
 from markov_control.adapters.frameworks.sglang.batches import BatchAllocation, NativeBatch
 from markov_control.adapters.frameworks.sglang.requests import RequestInput
 from markov_control.adapters.frameworks.sglang.runner import MetadataRunner
 from markov_control.peer import ControlPeer
-from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import schedule_batch
 from sglang.srt.managers import scheduler as scheduler_module
@@ -40,21 +37,18 @@ class ResultReady:
 
 
 class NativeScheduler(Scheduler):
-    def __init__(self, peer: ControlPeer, model_path: str, dtype: str, rendezvous: str) -> None:
+    def __init__(self, peer, settings, model_path: str, source, rank: int) -> None:
         self.peer = peer
-        configuration = peer.receive()
-        if configuration["kind"] != "configure":
-            raise ValueError("Native control requires core configuration first")
-        settings = configuration["settings"]
-
-        model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=rendezvous)
+        model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri())
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog
         BatchAllocation(schedule_batch)
         schedule_batch.ScheduleBatch = NativeBatch
         scheduler_module.ScheduleBatch = NativeBatch
         args = ServerArgs(
             model_path=model_path,
-            dtype=dtype,
+            dtype=source["dtype"].removeprefix("torch."),
+            tp_size=source["tp"],
+            ep_size=source["ep"],
             device="cpu",
             load_format="dummy",
             skip_tokenizer_init=True,
@@ -74,8 +68,8 @@ class NativeScheduler(Scheduler):
             args,
             PortArgs.init_new(args),
             gpu_id=0,
-            tp_rank=0,
-            moe_ep_rank=0,
+            tp_rank=rank,
+            moe_ep_rank=rank % source["ep"],
             pp_rank=0,
             attn_cp_rank=0,
             moe_dp_rank=0,
@@ -89,26 +83,6 @@ class NativeScheduler(Scheduler):
         self.model_worker.forward_batch_generation = self.model_result
         self.published = PublishedRequests()
         self.output_streamer.send_to_detokenizer = self.published
-
-    @classmethod
-    def run(cls, peer: ControlPeer) -> None:
-        source = peer.receive()
-        if source["kind"] != "source":
-            raise ValueError("Native control requires template model metadata first")
-
-        with TemporaryDirectory(prefix="markov-control-") as directory:
-
-            # The template supplies model metadata; prediction needs neither weights nor a second model choice.
-            Path(directory, "config.json").write_text(json.dumps(source["model_config"]))
-            try:
-                scheduler = cls(
-                    peer, directory, source["dtype"].removeprefix("torch."), Path(directory, "group").as_uri()
-                )
-                peer.send({"kind": "ready"})
-                scheduler.event_loop_normal()
-            finally:
-                parallel_state.destroy_model_parallel()
-                parallel_state.destroy_distributed_environment()
 
     def update_running_batch(self, batch):
         batch.control_selection = True

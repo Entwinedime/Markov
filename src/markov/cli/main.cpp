@@ -121,8 +121,8 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
     const bool disaggregated = configuration.contains("pd");
-    if (native && (disaggregated || assets.size() != 1 || !batches.is_null()))
-        throw std::invalid_argument("native control currently requires a single worker and no batch replay");
+    if (native && (disaggregated || !batches.is_null()))
+        throw std::invalid_argument("native control currently requires one serving instance and no batch replay");
     if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
     else
         check_fields(configuration,
@@ -220,6 +220,7 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                             integer(configuration.at("max_prefill_tokens")) };
     const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
     if (stages <= 0) throw std::invalid_argument("pp must be positive");
+    if (native && stages != 1) throw std::invalid_argument("native pipeline control is not yet connected");
     if (replay && replay->lanes("model") > static_cast<std::size_t>(stages)) throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
     const auto batch_limit =
         configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
@@ -234,11 +235,14 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     markov::ControlStream peer(std::cin, std::cout);
     std::unique_ptr<markov::ServingControl> controller;
     if (native) {
-        const auto & implementation = assets.front().environment().at("implementation");
+        const auto & environment = assets.front().environment();
+        const auto & implementation = environment.at("implementation");
         peer.send({
             {         "kind",                          "source" },
             { "model_config", implementation.at("model_config") },
-            {        "dtype",        implementation.at("dtype") }
+            {        "dtype",        implementation.at("dtype") },
+            {           "tp",      environment.at("logical_tp") },
+            {           "ep",      environment.at("logical_ep") }
         });
         controller = std::make_unique<markov::NativeController>(settings, std::move(requests), resources, control_group, peer);
     }

@@ -21,9 +21,9 @@ def main() -> None:
         os.environ["OMP_NUM_THREADS"] = "1"
         CpuDeclarations.install(arguments.kernel_python)
 
-        from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler
+        from markov_control.adapters.frameworks.sglang.workers import NativeWorkers
 
-        NativeScheduler.run(ControlPeer(sys.stdin, protocol))
+        NativeWorkers.run(ControlPeer(sys.stdin, protocol), arguments.kernel_python)
 
 
 if __name__ == "__main__":
