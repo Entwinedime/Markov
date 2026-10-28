@@ -77,12 +77,16 @@ std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
 bool Cache::take_pages(Tier tier, std::size_t pages) {
     if (pages > available_pages(tier)) return false;
     (tier == Tier::Device ? used_device_pages_ : used_host_pages_) += pages;
+    if (tier == Tier::Device) device_allocation_run_ += pages;
     auto & peak = tier == Tier::Device ? peak_device_pages_ : peak_host_pages_;
     peak = std::max(peak, used_pages(tier));
     return true;
 }
 
-void Cache::return_pages(Tier tier, std::size_t pages) { (tier == Tier::Device ? used_device_pages_ : used_host_pages_) -= pages; }
+void Cache::return_pages(Tier tier, std::size_t pages) {
+    (tier == Tier::Device ? used_device_pages_ : used_host_pages_) -= pages;
+    if (tier == Tier::Device && pages) device_allocation_run_ = 0;
+}
 
 std::optional<BufferId> Cache::reserve(Tier tier, std::size_t pages) {
     if (!take_pages(tier, pages)) return std::nullopt;

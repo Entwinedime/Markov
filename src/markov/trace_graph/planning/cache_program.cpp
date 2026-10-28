@@ -202,6 +202,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto committed_tokens = observed.token_paths.length(tokens.committed.value().path);
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
     if (!make_device_room(runtime, active_pages - device_pages)) return;
+    requests_[request_].device_pages_allocated_since_return = cache_.device_pages_allocated_since_return();
     buffer_ = cache_.reserve(Tier::Device, active_pages - device_pages).value();
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;

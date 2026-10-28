@@ -24,6 +24,7 @@ struct CacheBackend {
 
 struct CacheRequestResult {
     std::size_t device_hit_pages = 0, loaded_pages = 0, prefill_tokens = 0;
+    std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
     std::optional<graph::NodeId> start, received, response;
 };

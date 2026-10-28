@@ -72,6 +72,7 @@ public:
     std::size_t used_pages(Tier tier) const;
     std::size_t peak_pages(Tier tier) const { return tier == Tier::Device ? peak_device_pages_ : peak_host_pages_; }
     std::size_t available_pages(Tier tier) const;
+    std::size_t device_pages_allocated_since_return() const { return device_allocation_run_; }
     std::size_t ready_layers(RadixId node, Tier tier) const;
 
     // A buffer remains allocated until its owner commits pages or releases it.
@@ -130,6 +131,7 @@ private:
         CacheNode{ CacheSlot{}, CacheSlot{} }
     };
     std::size_t used_device_pages_ = 0;
+    std::size_t device_allocation_run_ = 0;
     std::size_t used_host_pages_ = 0;
     std::size_t peak_device_pages_ = 0, peak_host_pages_ = 0;
     std::size_t next_identity_ = 0;

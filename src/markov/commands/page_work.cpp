@@ -128,6 +128,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             {        "loaded_pages",                       request.loaded_pages },
             {      "prefill_tokens",                     request.prefill_tokens }
         };
+        item["device_pages_allocated_since_return"] =
+            request.device_pages_allocated_since_return ? Json(*request.device_pages_allocated_since_return) : Json(nullptr);
         item["partial_request_ports"] = {
             { "start_ns", time(request.start) },
             { "received_ns", time(request.received) },
