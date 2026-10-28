@@ -2,6 +2,7 @@
 #include "markov/adapters/sglang/kernel_preparation.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -90,6 +91,17 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
         if (phase == Phase::Prefill) {
             upload(calls, prefix + "prefix_pointers", "uint64", 8, shape);
             queued(calls, prefix + "request_table.write", "triton.ascend.write_req_to_token_pool", shape);
+            auto & work = calls.back().launches.front();
+
+            // The native kernels iterate over blocks of 512 token locations.
+            work.features = {
+                {    "batch_size",                                             input.batch_size },
+                {  "query_tokens",                                           input.query_tokens },
+                { "prefix_tokens",                    input.context_tokens - input.query_tokens },
+                {  "query_blocks",                          std::ceil(input.query_tokens / 512) },
+                { "prefix_blocks", std::ceil((input.context_tokens - input.query_tokens) / 512) },
+                { "table_columns",                                               table_columns_ }
+            };
             calls.back().preparation = triton_preparation(
                 "write_req_to_token_pool",
                 {
@@ -135,6 +147,12 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             upload(calls, prefix + "extend_lengths", "int32", 4, shape);
             upload(calls, prefix + "prefix_lengths", "int32", 4, shape);
             queued(calls, prefix + "positions", "triton.ascend.compute_position", tokens);
+            calls.back().launches.front().features = {
+                {   "batch_size",                    input.batch_size },
+                { "query_tokens",                  input.query_tokens },
+                { "query_blocks", std::ceil(input.query_tokens / 512) },
+                {   "has_prefix",                                   1 }
+            };
             calls.back().preparation = triton_preparation("compute_position",
                                                           {
                                                               { "has_prefix", 1 }
