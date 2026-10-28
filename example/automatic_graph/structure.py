@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from execution import ExecutionComparison
-from operations import OperationComparison
 from markov_collection.artifacts.json_file import write_json
+from operations import OperationComparison
 
 
 class StructureComparison:
@@ -58,14 +58,8 @@ class StructureComparison:
 
         self.decisions: dict[int, dict[str, Any]] = {}
         self.completions = {}
-        self.flow_actions: dict[int, set[int]] = defaultdict(set)
-        for region in self.prediction["graph"]["regions"]:
-            flow = self.target_batches[region["id"]]
-            action = self.target_actions[region["id"]]
-            if region.get("rank") == self.rank and flow is not None and action is not None:
-                self.flow_actions[flow].add(action)
 
-        # A flow can span pipeline actions; PD instances share its identity but own different work.
+        # A batch can span pipeline actions; P and D select their own member groups.
         for decision in self.prediction["decisions"]:
             if decision["task"]["group"] != self.instance:
                 continue
@@ -76,6 +70,26 @@ class StructureComparison:
                 decision["step"] == "stage" and decision["stage"] == self.stage
             ):
                 self.decisions[flow] = decision
+
+        # Request-owned transport attaches to that instance's initial batch on both sides.
+        target_handoffs = {
+            member["id"]: flow
+            for flow, decision in self.decisions.items() if decision["phase"] == "prefill"
+            for member in decision["members"]
+        }
+        actions = {decision["task"]["sequence"]: decision for decision in self.prediction["decisions"]}
+        self.flow_actions: dict[int, set[int]] = defaultdict(set)
+        for region in self.prediction["graph"]["regions"]:
+            action = self.target_actions[region["id"]]
+            if region.get("rank") != self.rank or action is None:
+                continue
+            decision = actions[action]
+            if decision["step"] in {"reserve", "transfer", "release"}:
+                (member,) = decision["members"]
+                self.target_batches[region["id"]] = target_handoffs[member["id"]]
+            flow = self.target_batches[region["id"]]
+            if flow is not None:
+                self.flow_actions[flow].add(action)
 
     @staticmethod
     def region_labels(regions: list[dict[str, Any]], observed: bool, field: str) -> list[Any]:
@@ -169,7 +183,11 @@ class StructureComparison:
             "device_and_runtime_actions": submitted_work,
             "communication_contracts": communications,
             "native_calls": sorted(
-                {region["metadata"]["path"] for region in self.source["regions"] if region["metadata"].get("control_only")}
+                {
+                    region["metadata"]["path"]
+                    for region in self.source["regions"]
+                    if region["metadata"].get("control_only")
+                }
             ),
             "scope": "declared native controller decisions; retained in observations, separate from modeled work",
         }

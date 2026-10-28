@@ -130,20 +130,28 @@ class ExecutionEvidence:
             for request in self.result["requests"]
         )
 
-        # Cross-instance ownership needs explicit edges as well as a legal execution time.
-        flows = defaultdict(dict)
+        # P and D may regroup members; each request still requires its own complete handoff.
+        required_steps = {"reserve", "model", "transfer", "accept", "release"}
+        handoffs = defaultdict(dict)
         for item in decisions:
-            if item["step"] in {"reserve", "model", "transfer", "accept", "release"}:
-                flows[item["flow"]][item["step"]] = item
-        cross = {(owner[edge["source"]], owner[edge["target"]]) for edge in execution["dependencies"]}
-        checks["handoff_steps"] = all(
-            set(steps) == {"reserve", "model", "transfer", "accept", "release"} for steps in flows.values()
+            if item["step"] in required_steps:
+                for member in item["members"]:
+                    handoffs[member["id"]].setdefault(item["step"], []).append(item)
+        complete = {
+            request: {step: actions[0] for step, actions in steps.items()}
+            for request, steps in handoffs.items()
+            if set(steps) == required_steps and all(len(actions) == 1 for actions in steps.values())
+        }
+        expected = (
+            {request["id"] for request in self.result["requests"]}
+            if "pd" in self.result["configuration"] else set()
         )
+        cross = {(owner[edge["source"]], owner[edge["target"]]) for edge in execution["dependencies"]}
+        checks["handoff_steps"] = set(complete) == set(handoffs) == expected
         checks["handoff_readiness"] = all(
             steps[first]["completed_ns"] <= steps[last]["scheduled_ns"]
             and (("action", steps[first]["task"]["sequence"]), ("action", steps[last]["task"]["sequence"])) in cross
-            for steps in flows.values()
-            if set(steps) == {"reserve", "model", "transfer", "accept", "release"}
+            for steps in complete.values()
             for first, last in (
                 ("reserve", "transfer"),
                 ("model", "transfer"),
@@ -160,7 +168,7 @@ class ExecutionEvidence:
             "node_states": dict(Counter(item["status"] for item in timeline.values())),
             "actions": len(decisions),
             "controls": len(self.result["controls"]),
-            "handoffs": len(flows),
+            "handoffs": len(handoffs),
             "request_state": state,
             "value_production": {
                 "scope": "host descriptor return before consumption; device contents and storage hazards are separate",
