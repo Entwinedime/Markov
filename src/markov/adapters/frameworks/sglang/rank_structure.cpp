@@ -200,10 +200,10 @@ std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, s
     if (coordinates_) graph_.append("batch_coordination", phase, {});
     graph_.end_composition(prepared.outputs);
 
-    // These are the actual prepared values, including the CPU length vector and prompt staging buffer.
-    inputs = views.columns(prepared.outputs);
-    inputs.emplace("kv_locations", prepared.outputs.at("kv_locations"));
-    if (batch.phase == Phase::Prefill) inputs.emplace("prompt_tokens", prepared.outputs.at("prompt_tokens"));
+    // Preparation owns model inputs; a P-only rank may never expose a batch-filter template.
+    inputs = prepared.outputs;
+    inputs.erase("free_pages");
+    inputs.erase("request_map");
     stamp(begin);
     return inputs;
 }
