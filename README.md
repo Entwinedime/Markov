@@ -34,7 +34,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
   build/modeling/Release/markov_core source /path/to/profile_manifest.json /path/to/source_report.json
 ```
 
-目前只验证过一份 SGLang 来源；报告保留源等待与 gap，分别列出请求回放和设备时间差异，不能当作正常运行预测精度。
+目前只验证过一份 SGLang 来源；报告保留源等待与 gap，分别列出请求回放，以及服务、等待和零时长边界的时间差异，不能当作正常运行预测精度。
 设备依赖与 KTransformers 尚未完成验收。此命令严格读取 manifest 声明的文件，不自动修复不完整采集。
 
 HiCache 页几何的实验诊断入口：
