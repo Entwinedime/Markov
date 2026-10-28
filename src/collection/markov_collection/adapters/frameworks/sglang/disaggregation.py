@@ -170,11 +170,37 @@ class DisaggregationObservation:
         if not self.serving.selected or request.rid not in self.serving.requests:
             return original(scheduler, request, *args, **kwargs)
 
+        from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewObservation
+
         metadata = self.request_metadata(request, scheduler.req_to_token_pool.size)
         self.rooms[request.bootstrap_room] = metadata
         with self.recording.scope("KvSend", **metadata) as scope:
             self.bind_metadata(scheduler.disagg_metadata_buffers, scope.metadata)
-            return original(scheduler, request, *args, **kwargs)
+
+            with self.values.metadata():
+                mapping = scheduler.req_to_token_pool.req_to_token
+                slot = int(request.req_pool_idx)
+                scope.metadata["parameters"]["request_slot"] = slot
+                scope.metadata["bindings"] = {"request_map_stride": mapping.stride(0)}
+                scope.metadata["ports"] = {
+                    "inputs": self.values.port_values({"request_map": mapping}),
+                    "outputs": {}
+                }
+
+                # Declare the complete-prefill slice before CPU materialization and its downstream views.
+                symbols = self.values.shapes
+                view = TensorViewObservation(
+                    self.values,
+                    [(mapping, (symbols.symbol("M"),))],
+                    start=symbols.symbol("request_slot") * symbols.symbol("request_map_stride"),
+                    index=(slot, slice(0, len(request.origin_input_ids))),
+                )
+
+            with view:
+                result = original(scheduler, request, *args, **kwargs)
+            if view.result is None:
+                raise ValueError("KV send did not read its declared complete-prefill slice")
+            return result
 
     def bind_metadata(self, buffers: Any, metadata: dict[str, Any]) -> None:
         import torch

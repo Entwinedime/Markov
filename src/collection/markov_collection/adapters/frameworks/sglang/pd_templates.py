@@ -25,7 +25,6 @@ class DisaggregatedTemplates:
         self.operations: dict[int, list[dict[str, Any]]] = {}
         self.children: dict[int, list[dict[str, Any]]] = {}
         self.request_maps: dict[int, int] = {}
-        self.request_slots: dict[int, int] = {}
         for operation in source["operations"]:
             owner = self.owners[operation["region"]]
             if owner is not None:
@@ -38,7 +37,6 @@ class DisaggregatedTemplates:
             if metadata.get("entrypoint") == "request_cache_retain":
                 batch = self.batches[region["id"]]
                 self.request_maps[batch] = metadata["ports"]["inputs"]["request_map"]
-                self.request_slots[batch] = metadata["parameters"]["request_slot"]
 
     @classmethod
     def declare(cls, source: dict[str, Any]) -> None:
@@ -179,31 +177,13 @@ class DisaggregatedTemplates:
 
     def send(self, region: dict[str, Any]) -> None:
         metadata = region["metadata"]
-        batch = self.batches[region["id"]]
-        mapping = self.request_maps[batch]
-        metadata.update(
-            entrypoint="kv_send", entrypoint_phase=None, ports={"inputs": {"request_map": mapping}, "outputs": {}}
-        )
-        metadata["parameters"]["request_slot"] = self.request_slots[batch]
+        metadata.update(entrypoint="kv_send", entrypoint_phase=None)
         metadata["guards"].extend(
             [
                 {"condition": ["lt", 0, "request_slot"], "expected": True},
                 {"condition": ["le", "request_slot", "R"], "expected": True},
             ]
         )
-        storage = self.values[mapping]["storage"]
-        for operation in self.operations[region["id"]]:
-            if not operation["inputs"] or self.values[operation["inputs"][0]]["storage"] != storage:
-                continue
-            relation = deepcopy(operation["arguments"])
-            if operation["name"] == "aten.select.int" and len(self.values[operation["inputs"][0]]["shape"]) == 2:
-                relation[2] = {"scalar": "request_slot"}
-                operation["argument_relations"] = relation
-            elif operation["name"] == "aten.slice.Tensor" and len(self.values[operation["inputs"][0]]["shape"]) == 1:
-                relation[3] = {"scalar": "M"}
-                operation["argument_relations"] = relation
-                for identity in operation["outputs"]:
-                    self.values[identity]["shape_relation"] = ["M"]
 
         for child in self.children[region["id"]]:
             if child["role"] != "HostRead" or child["metadata"]["path"] != "cpu":
@@ -224,6 +204,3 @@ class DisaggregatedTemplates:
                 arguments=[{"value": source}],
                 keywords={"mapping": []},
             )
-            self.values[source]["shape_relation"] = ["M"]
-            for identity in outputs:
-                self.values[identity]["shape_relation"] = ["M"]
