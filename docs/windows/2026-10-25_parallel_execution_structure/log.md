@@ -2574,3 +2574,13 @@
 **验证：** `data/20261028T175036.985082Z_s9-native-shared-execution`复用既有Qwen3 TP1模板，累计9次成功的无设备控制运行和2项预期失败检查，无硬件采集。普通8请求/13批及分时到达8请求/12批完成，现有13项执行/资源检查matched，32页恢复；原生主循环替换前后分时到达完整结果相同，模板模型元数据与先前独立目录输入的精简结果相同，默认/明细及最终watchdog调整后的精简结果相同。相同到达序列改变给定设备耗时后，成员组批与完成时刻改变。非法输入和超时均未发布结果、无所属残留容器。Docker Release及control镜像构建通过，Ruff、Python3.10语法、注释分段、Shell/Compose和Git空白检查通过；一次终检误按连续编号查找报告，定位已有成功结果后修正临时驱动编号，未重跑预测。累计processing 326.596935860s/1800s，native 0次，峰值约166.24MB/1GiB，保留量低于256MiB，pending为空；证据在results下的public-analysis、comparisons、public-boundaries与final-review。官方SGLang和两份冻结报告未变。
 
 **结论与限制：** 单worker的原生决定→核心资源/图执行→完成反馈已有正式入口与限定证据，但S9.1尚未收口。Stage目前交回模型调用host返回，CPU读token仍在后续结果图中，真实读取与控制观察点的等待对应须继续解决；资源不足触发的retract_decode也未接入。固定输出长度使用占位token，不是自然文本或性能精度证明；不会据此授予多worker、完整原生结构或独立泛化资格。代码`0b8d019`与文档分层交付，代码、文档及数据已关联检查，保留上述未完成项继续推进。
+
+## 2026-10-29 — S9.1：结果读取等待与开放调用回收
+
+**范围：** 以已推送`f616aa0`为起点，接通原生模型返回、CPU读取和结果处理之间的真实观察点；此前进度问答仅核对状态。本批保持单worker，联查原生结果处理、共同动作、框架图装配、历史回收和轻量/PP/PD消费者。
+
+**改动：** 原生copy_done在token读取前提交共同ReadResult，复用已有result_tokens子图，随后继续同一ResultProcessed调用；没有新增模型工作、全设备屏障或另一份结果处理算法。共同GraphRoots保留开放调用上下文、值与host端口，消费过的图历史照常释放。业务+151/-66，净增85行，example未改；计划、指导、状态及稳定接口说明同步。
+
+**验证：** 沿用`data/20261028T175036.985082Z_s9-native-shared-execution`，新增三次正式入口运行均完成8请求、恢复32页。两组详细案例的26次读取均等待实际读端口，读取期间不归还资源，输出在读取后；完整图除动作标签外、执行时间线和请求结果均与旧基线相同，默认/明细一致。四项轻量单worker、PP回放及PD默认/回放精简结果与旧基线一致，成功对照的重复文件已删除。Docker Release和控制镜像构建、C++格式、Python3.10语法、Ruff、注释分段及Git空白检查通过；累计processing 540.161037690s/1800s、native 0次、峰值223.37MB、pending为空，保留量低于256MiB，无所属残留容器。证据为results/read-boundary.json、read-retention.json、read-regression.json及read-review.json；两份冻结报告和官方SGLang工作树未变。
+
+**结论与限制：** 结果读取交接取得限定开发证据，尚不授予S9.1完整资格。源码确认资源压力通过原生retract_decode→release_req→release_kv_cache释放，禁用缓存时与已有request_cache_release属于同一释放实现；但控制释放、存活成员筛选以及重新Prefill仍须接入并验证，不能只把当前结果阶段校验放宽。待交付本批后继续该边界，TP/EP及PP/PD原生控制、全量独立验证和性能建设均未前移。
