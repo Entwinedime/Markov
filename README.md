@@ -44,10 +44,11 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
   build/modeling/Release/markov_core page-work /path/to/page_work_request.json /path/to/page_work_report.json
 ```
 
-请求文件包含 manifest 路径与 page_sizes_tokens 数组。它共享一次来源准备，按各页大小重新划分请求前缀，
+请求文件包含 manifest 路径与 page_sizes_tokens 数组，可选 models 指向独立模型。它共享一次来源准备，按各页大小重新划分请求前缀，
 同时给出压缩前缀树、先前提交的前缀交集及源回放；报告中的可复用上限没有考虑缓存容量和可见性，
 不能当作实际命中或目标 DAG 预测。已解释的计算原语也会按 query/context 重新生成工作量，
 但这只是在保留全部前缀、没有 padding 的假设下检查部分计算，不是完整目标程序或性能预测。
+提供 models 时，这部分工作会绑定独立成本并在统一执行器运行；缺成本明确停止，不给出帧或 E2E 耗时。
 
 独立成本查询已有单独入口，供模型维护时检查工作覆盖与响应：
 

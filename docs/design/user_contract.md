@@ -47,8 +47,8 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
   build/modeling/Release/markov_core page-work /path/to/page_work_request.json /path/to/page_work_report.json
 ```
 
-诊断请求只有 manifest 和 page_sizes_tokens，例如 `{"manifest":"capture/profile_manifest.json","page_sizes_tokens":[64,128]}`。
-manifest 的相对路径以请求文件所在目录为起点；页大小必须为正整数。这项诊断读取真实来源，共享一次准备后生成各页几何。
+诊断请求包含 manifest、page_sizes_tokens 及可选 models，例如 `{"manifest":"capture/profile_manifest.json","page_sizes_tokens":[64,128],"models":"performance/models.json"}`。
+manifest 与 models 的相对路径以请求文件所在目录为起点；页大小必须为正整数。这项诊断读取真实来源，共享一次准备后生成各页几何。
 同一 token 前缀在这次来源准备中只有一个身份，不能将该数字当作跨采集的地址。
 
 报告保留准备请求和正式请求，区分查询输入、完整 prompt 与实际提交路径；查询输入长度不是命中长度。
@@ -62,7 +62,12 @@ projected_compute_work 只列已解释计算原语的工作量及次数，假设
 source_compute_projection 用源变量核对这些原语是否保持原工作描述，不评价成本或完整 DAG。
 源报告的 work_observations 计一次原生计算 probe 调用，work_descriptions 中每项的 operations 列出该配方展开的操作；操作数与调用数分别统计。
 projected_compute_dependencies 只计配方内部的数据依赖，尚不包含调用之间、跨层及 I/O 发布依赖，不能当作完整目标图的边数。
-它不运行目标配置，也不验证目标 DAG 相似度或性能；源回放使用观测成本，不能当作目标预测精度。
+提供 models 时，cost_execution 将已解释计算子集绑定独立成本并交给统一执行器，保留配方内部依赖和已证明的源设备队列顺序。
+缺工作变量、资源依据或成本时停止该目标的数值执行，其他独立目标继续；结构工作量仍完整生成，不能因模型缺失删除操作。
+这一子集尚缺跨流数据、CPU、通信和缓存依赖，不给出帧或 E2E 耗时，也不验证目标 DAG 相似度或性能。
+模型按完整工作点共享响应，报告分别统计查询次数、实际求值次数和已绑定操作覆盖；复用响应不减少覆盖计数。
+当前来源 manifest 尚不能建立完整模型/平台身份，source_deployment_qualified 会如实报告，不能把框架和几何匹配当作部署资格。
+源回放使用观测成本，不能当作目标预测精度。
 
 ## 统一任务入口的职责
 
