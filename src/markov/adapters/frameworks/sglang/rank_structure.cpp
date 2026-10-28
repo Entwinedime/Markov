@@ -403,7 +403,7 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
 
     // The native prebuilt path installs token/state columns without another model forward.
     graph_.begin_composition("Schedule", "control", {}, {});
-    views_.at(lane).accept();
+    views_.at(lane).advance(Phase::Prefill);
     std::map<std::string, std::size_t> state{
         {  "free_pages",  free_pages_.value() },
         { "request_map", request_map_.value() }

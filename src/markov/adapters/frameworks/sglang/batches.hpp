@@ -20,7 +20,6 @@ public:
 
     std::size_t admission_members() const;
     void advance(Phase phase);
-    void accept();
     std::optional<std::size_t> idle();
     std::map<std::string, std::size_t> decode_inputs() const;
     void remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects);
