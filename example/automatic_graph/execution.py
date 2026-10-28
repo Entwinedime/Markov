@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from typing import Any
 
 
@@ -206,6 +206,13 @@ class ExecutionComparison:
             }
         )
 
+    @staticmethod
+    def owner_sequences(keys: list[tuple[int, str, str]]) -> dict[int, list[tuple[str, str]]]:
+        result = defaultdict(list)
+        for owner, kind, name in keys:
+            result[owner].append((kind, name))
+        return dict(result)
+
     def stream_frontiers(self) -> dict[str, Any]:
         self.streams: dict[int, list[dict[str, Any]]] = defaultdict(list)
         waits = defaultdict(list)
@@ -266,31 +273,44 @@ class ExecutionComparison:
                 target_waits[position, node["kind"], node["name"]].append(node)
         for items in target_streams.values():
             items.sort(key=lambda node: self.order[node["id"]])
+        target_keys = {
+            resource: [(self.positions[node["operation"]], node["kind"], node["name"]) for node in nodes]
+            for resource, nodes in target_streams.items()
+        }
+        target_owners = {resource: self.owner_sequences(keys) for resource, keys in target_keys.items()}
 
         bindings = {}
         mapped = {}
+        same_stream_order = True
         for stream, items in self.streams.items():
             if len({item["issue"][0] for item in items}) != 1:
                 return {"same": None, "reason": "stream work has multiple logical producers", "stream": stream}
             items.sort(key=lambda item: (item["issue"][1], item["order"], item["secondary"]))
             keys = [item["key"] for item in items]
+            owners = self.owner_sequences(keys)
             candidates = [
                 resource
-                for resource, nodes in target_streams.items()
-                if keys == [(self.positions[node["operation"]], node["kind"], node["name"]) for node in nodes]
+                for resource, expected in target_owners.items()
+                if owners == expected
             ]
             if len(candidates) != 1:
                 return {
                     "same": None if candidates else False,
-                    "reason": "native stream sequence has no unique target binding",
+                    "reason": "native owner-local stream work has no unique target binding",
                     "stream": stream,
                     "native_items": len(items),
                     "candidate_count": len(candidates),
                 }
             (resource,) = candidates
             bindings[stream] = resource
-            for index, node in enumerate(target_streams[resource]):
-                mapped[stream, index] = node["id"]
+            same_stream_order = same_stream_order and keys == target_keys[resource]
+
+            # Preserve work order within each owner; cross-owner interleaving does not define stream identity.
+            occurrences = defaultdict(deque)
+            for key, node in zip(target_keys[resource], target_streams[resource], strict=True):
+                occurrences[key].append(node["id"])
+            for index, key in enumerate(keys):
+                mapped[stream, index] = occurrences[key].popleft()
         if len(set(bindings.values())) != len(bindings) or set(bindings.values()) != set(target_streams):
             return {"same": False, "reason": "native and target stream inventories differ"}
 
@@ -368,6 +388,7 @@ class ExecutionComparison:
         # A cropped flow cannot certify earlier work or the drained initial state of its streams.
         return {
             "same": None if same and initial else same,
+            "same_stream_order": same_stream_order,
             "streams": len(bindings),
             "native_waits": native_waits,
             "kinds": dict(kinds),
