@@ -11,6 +11,7 @@ find_package(nlohmann_json 3.11 REQUIRED)
 add_library(markov_core
     src/markov/controller/batch_replay.cpp
     src/markov/controller/disaggregated.cpp
+    src/markov/controller/native.cpp
     src/markov/resources/kv_pool.cpp
     src/markov/controller/serving.cpp
     src/markov/execution/protocol.cpp
@@ -49,6 +50,7 @@ add_library(markov_application
     src/markov/adapters/frameworks/sglang/structure.cpp
     src/markov/adapters/frameworks/sglang/rank_structure.cpp
     src/markov/workflow/serving.cpp
+    src/markov/workflow/control_stream.cpp
 )
 target_link_libraries(markov_application PUBLIC markov_core)
 target_compile_options(markov_application PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

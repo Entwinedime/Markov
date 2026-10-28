@@ -27,6 +27,17 @@ x-common-env: &common-env
   ASCEND_RT_VISIBLE_DEVICES: ${ASCEND_RT_VISIBLE_DEVICES:-0}
 
 services:
+  control:
+    build:
+      context: ../..
+      dockerfile: docker/images/control/Dockerfile
+      network: none
+      args:
+        BASE_IMAGE: ${MARKOV_IMAGE_PREFIX:-markov-next}-sglang:ubuntu22.04
+    image: ${MARKOV_IMAGE_PREFIX:-markov-next}-control:ubuntu22.04
+    pull_policy: never
+    network_mode: none
+
   sglang-profile:
     <<: *profile-common
     build:

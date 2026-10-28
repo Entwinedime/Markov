@@ -14,9 +14,9 @@ class ServingControl {
 public:
     virtual ~ServingControl() = default;
 
-    virtual std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const = 0;
+    virtual std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) = 0;
 
-    // Construction must succeed before start; finish commits only the corresponding completion effects.
+    // Preparing native work may reserve resources; start accepts execution and finish commits completion effects.
     virtual void start(const ServingAction & action) = 0;
     virtual void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) = 0;
 

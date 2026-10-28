@@ -1,0 +1,123 @@
+"""Native-shaped metadata views backed by the core's unique slot and page ledger."""
+
+import torch
+from markov_control.peer import ControlPeer
+
+
+class RequestSlots:
+    def __init__(self, peer: ControlPeer, size: int, context: int) -> None:
+        self.peer = peer
+        self.size = size
+        self._alloc_size = size + 1
+        self.max_context_len = context
+        self.device = "cpu"
+
+        # This is the native tensor view of core allocation results, not an independent allocator.
+        self.req_to_token = torch.zeros((self._alloc_size, context), dtype=torch.int32)
+
+    def available_size(self):
+        return self.peer.call("capacity")["slots"]
+
+    @property
+    def free_slots(self):
+        return [slot + 1 for slot in self.peer.call("free_slots")]
+
+    def alloc(self, reqs):
+        bindings = self.peer.call("slots", members=[{"request": int(req.rid)} for req in reqs])
+        for req, binding in zip(reqs, bindings, strict=True):
+            req.req_pool_idx = binding["slot"] + 1
+        return [req.req_pool_idx for req in reqs]
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def free(self, req):
+        self.peer.call("release_request", request=int(req.rid))
+        req.req_pool_idx = None
+
+
+class KvStorage:
+    def __init__(self, size: int) -> None:
+        self.size = size
+
+
+class PageAllocator:
+    def __init__(self, peer: ControlPeer, size: int, page_size: int) -> None:
+        self.peer = peer
+        self.size = size
+        self.page_size = page_size
+        self.device = "cpu"
+        self.need_sort = False
+        self.storage = KvStorage(size)
+        self.batch = None
+        self.phase = None
+        self.tokens = []
+        self.group = None
+
+    def available_size(self):
+        return self.peer.call("capacity")["pages"] * self.page_size
+
+    def get_kvcache(self):
+        return self.storage
+
+    def allocate(self):
+        members = [
+            {"request": int(req.rid), "tokens": tokens}
+            for req, tokens in zip(self.batch.reqs, self.tokens, strict=True)
+        ]
+        bindings = self.peer.call("allocate", phase=self.phase, members=members)
+
+        # SGLang reserves physical page zero; core identities start at zero.
+        indices = [index + self.page_size for binding in bindings for index in binding["indices"]]
+        return torch.tensor(indices, dtype=torch.int64)
+
+    def alloc(self, need_size):
+        return self.allocate()
+
+    def alloc_extend(
+        self, prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, extend_num_tokens, num_new_pages=None
+    ):
+        return self.allocate()
+
+    def alloc_decode(self, seq_lens, seq_lens_cpu, last_loc):
+        return self.allocate()
+
+    def free(self, indices):
+        if indices.numel() == 0:
+            return
+        if self.group is not None:
+            self.group.append(indices)
+            return
+        pages = torch.unique(indices // self.page_size - 1).tolist()
+        self.peer.call("release_pages", pages=pages)
+
+    def free_group_begin(self):
+        self.group = []
+
+    def free_group_end(self):
+        pending = self.group
+        self.group = None
+        if pending:
+            self.free(torch.cat(pending))
+
+
+class BatchAllocation:
+    def __init__(self, schedule_batch) -> None:
+        self.extend = schedule_batch.alloc_for_extend
+        self.decode = schedule_batch.alloc_for_decode
+        schedule_batch.alloc_for_extend = self.for_extend
+        schedule_batch.alloc_for_decode = self.for_decode
+
+    def for_extend(self, batch):
+        allocator = batch.token_to_kv_pool_allocator
+        allocator.batch = batch
+        allocator.phase = "prefill"
+        allocator.tokens = batch.extend_lens
+        return self.extend(batch)
+
+    def for_decode(self, batch, token_per_req):
+        allocator = batch.token_to_kv_pool_allocator
+        allocator.batch = batch
+        allocator.phase = "decode"
+        allocator.tokens = [token_per_req] * len(batch.reqs)
+        return self.decode(batch, token_per_req)

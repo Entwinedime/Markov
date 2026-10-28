@@ -26,7 +26,7 @@ ServingController::ServingController(ServingSettings settings, std::vector<Reque
     }
 }
 
-std::optional<ServingAction> ServingController::plan(std::int64_t now_ns, const GroupAdmission & groups) const {
+std::optional<ServingAction> ServingController::plan(std::int64_t now_ns, const GroupAdmission & groups) {
     if (now_ns < last_event_ns_) throw std::invalid_argument("control time must not move backwards");
 
     std::vector<bool> busy(stages_ + 1);

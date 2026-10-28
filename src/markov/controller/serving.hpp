@@ -23,7 +23,7 @@ public:
     ServingController(ServingSettings settings, std::vector<Request> requests, KvPool & resources, std::string group, std::size_t stages,
                       std::size_t batch_limit, BatchReplay * replay = nullptr);
 
-    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
+    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
 
     // Submit the current plan only after its target graph has been assembled successfully.
     void start(const ServingAction & action) override;

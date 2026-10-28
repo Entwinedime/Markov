@@ -187,6 +187,18 @@ BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std
     std::map<std::size_t, std::size_t> completions;
     for (std::size_t tensor_rank = 0; tensor_rank < tp; ++tensor_rank) {
         const auto last = topology_.stage(instance_.id, stages - 1).members[tensor_rank];
+        if (stages == 1) {
+
+            // A local model result has no pipeline token ring.
+            const auto begin = graph_.operations.size();
+            const auto & outputs = flow.outputs.at(last);
+            auto program = ranks_.at(last)->complete(batch, action.work->effects, action.lane, outputs, outputs.at("sampled_tokens"), false);
+            if (program.publication) result.publication = program.publication;
+            if (last == instance_.members.front()) result.returned_pages = std::move(program.returned_pages);
+            completions.emplace(last, program.completion);
+            work.push_back({ last, begin, graph_.operations.size() });
+            continue;
+        }
         std::map<std::string, std::size_t> payload{
             { "next_token_ids", flow.outputs.at(last).at("sampled_tokens") }
         };

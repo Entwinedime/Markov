@@ -33,6 +33,7 @@ public:
     const std::deque<std::size_t> & free_pages() const;
     std::int64_t deferred_pages() const;
     Batch plan(Phase phase, std::span<const KvDemand> demands = {}) const;
+    std::vector<std::int64_t> indices(std::size_t request, std::int64_t begin, std::int64_t end) const;
 
     void reserve(const Batch & batch);
     void advance(std::size_t request, std::int64_t tokens);

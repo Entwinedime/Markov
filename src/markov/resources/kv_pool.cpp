@@ -58,6 +58,16 @@ void KvPool::assign_pages(Batch & batch) const {
     }
 }
 
+std::vector<std::int64_t> KvPool::indices(std::size_t request, std::int64_t begin, std::int64_t end) const {
+    const auto & pages = residence(request).pages;
+    std::vector<std::int64_t> result;
+    for (auto token = begin; token < end; ++token) {
+        const auto page = pages.at(static_cast<std::size_t>(token / page_size_));
+        result.push_back(static_cast<std::int64_t>(page) * page_size_ + token % page_size_);
+    }
+    return result;
+}
+
 void KvPool::reserve(const Batch & batch) {
     if (batch.allocated_pages > ready_pages_) {
         std::ranges::sort(free_pages_);

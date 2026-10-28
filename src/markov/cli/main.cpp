@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -22,6 +23,7 @@
 #include "markov/adapters/frameworks/sglang/structure.hpp"
 #include "markov/adapters/frameworks/sglang/topology.hpp"
 #include "markov/controller/disaggregated.hpp"
+#include "markov/controller/native.hpp"
 #include "markov/controller/serving.hpp"
 #include "markov/execution/durations.hpp"
 #include "markov/graph/source_graph.hpp"
@@ -30,6 +32,7 @@
 #include "markov/templates/instance.hpp"
 #include "markov/templates/library.hpp"
 #include "markov/templates/target_graph.hpp"
+#include "markov/workflow/control_stream.hpp"
 #include "markov/workflow/serving.hpp"
 
 namespace {
@@ -113,10 +116,13 @@ nlohmann::json expert_condition(const nlohmann::json & settings, const nlohmann:
     return conditions.at(id);
 }
 
-nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, bool details) {
+nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, bool details,
+                        bool native) {
     check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
     const bool disaggregated = configuration.contains("pd");
+    if (native && (disaggregated || assets.size() != 1 || !batches.is_null()))
+        throw std::invalid_argument("native control currently requires a single worker and no batch replay");
     if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
     else
         check_fields(configuration,
@@ -225,17 +231,29 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     markov::RegionGraph graph;
     markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
     markov::KvPool resources(requests.size(), settings);
-    markov::ServingController controller(settings,
-                                         std::move(requests),
-                                         resources,
-                                         control_group,
-                                         static_cast<std::size_t>(stages),
-                                         static_cast<std::size_t>(batch_limit),
-                                         replay ? &*replay : nullptr);
-    markov::ServingWorkflow workflow(controller, expansion, durations);
+    markov::ControlStream peer(std::cin, std::cout);
+    std::unique_ptr<markov::ServingControl> controller;
+    if (native) {
+        const auto & implementation = assets.front().environment().at("implementation");
+        peer.send({
+            {         "kind",                          "source" },
+            { "model_config", implementation.at("model_config") },
+            {        "dtype",        implementation.at("dtype") }
+        });
+        controller = std::make_unique<markov::NativeController>(settings, std::move(requests), resources, control_group, peer);
+    }
+    else
+        controller = std::make_unique<markov::ServingController>(settings,
+                                                                 std::move(requests),
+                                                                 resources,
+                                                                 control_group,
+                                                                 static_cast<std::size_t>(stages),
+                                                                 static_cast<std::size_t>(batch_limit),
+                                                                 replay ? &*replay : nullptr);
+    markov::ServingWorkflow workflow(*controller, expansion, durations);
     auto result = workflow.run(details);
     if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
-    result["control_source"] = replay ? "recorded_batches" : "lightweight_policy";
+    result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
     result["configuration"] = configuration;
     result["duration_source"] = "given_execution_kind_ns";
     result["structure"] = expansion.summary();
@@ -295,6 +313,7 @@ int main(int argc, char ** argv) {
             std::filesystem::path output;
             std::filesystem::path batches;
             bool details = false;
+            std::string control;
             for (int index = 2; index < argc; ++index) {
                 const std::string option = argv[index];
                 if (option == "--details" && !details) {
@@ -307,17 +326,20 @@ int main(int argc, char ** argv) {
                 else if (option == "--input" && input.empty()) input = value;
                 else if (option == "--output" && output.empty()) output = value;
                 else if (option == "--batches" && batches.empty()) batches = value;
+                else if (option == "--control" && control.empty()) control = value;
                 else throw std::invalid_argument("unknown or repeated simulate option: " + option);
             }
             if (template_path.empty() || input.empty() || output.empty()) throw std::invalid_argument("simulate requires templates, input and output");
+            if (!control.empty() && control != "native") throw std::invalid_argument("unknown control implementation: " + control);
             auto document = read_json(template_path);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto assets = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
-            const auto result = simulate(assets, read_json(input), batches.empty() ? nlohmann::json(nullptr) : read_json(batches), details);
+            const auto result =
+                simulate(assets, read_json(input), batches.empty() ? nlohmann::json(nullptr) : read_json(batches), details, control == "native");
             std::vector<std::filesystem::path> inputs{ template_path, input };
             if (!batches.empty()) inputs.push_back(batches);
             write_json(output, result, inputs, !details);
-            std::cout << nlohmann::json{
+            (control == "native" ? std::cerr : std::cout) << nlohmann::json{
                 {          "scope",                                result.at("scope") },
                 {         "status",                               result.at("status") },
                 { "control_status",                       result.at("control_status") },
@@ -390,7 +412,8 @@ int main(int argc, char ** argv) {
                          "       markov expand --templates templates.json --target target.json --output region.json\n"
                          "       markov compose --templates templates.json --target calls.json --output graph.json\n"
                          "       markov record-batches --source rank.json [--source peer.json] --input serving.json --output batches.json\n"
-                         "       markov simulate --templates templates.json --input serving.json --output result.json [--batches batches.json] [--details]\n";
+                         "       markov simulate --templates templates.json --input serving.json --output result.json [--batches batches.json | --control "
+                         "native] [--details]\n";
             return 2;
         }
 

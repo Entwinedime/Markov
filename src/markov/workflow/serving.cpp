@@ -73,7 +73,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
                 }
             }
 
-            // Construction and duration resolution succeed before request/page ownership changes.
+            // Resolve graph work before execution acceptance; a control backend may already hold its reservations.
             auto program = expansion_.expand(*action);
             const bool publishes = action->commits_requests() && std::ranges::any_of(action->work->effects.members, &RequestCompletion::emits_output);
             if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");

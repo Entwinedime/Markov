@@ -72,7 +72,7 @@ BatchEffects DisaggregatedController::effects(const Batch & batch, bool first_ou
     return result;
 }
 
-std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, const GroupAdmission &) const {
+std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, const GroupAdmission &) {
     if (now_ns < last_event_ns_) throw std::invalid_argument("control time must not move backwards");
 
     // Completed transport releases the source independently of destination token processing.

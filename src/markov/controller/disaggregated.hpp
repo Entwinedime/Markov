@@ -28,7 +28,7 @@ public:
     DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups,
                             KvPool & prefill_resources, KvPool & decode_resources, BatchReplay * replay = nullptr);
 
-    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
+    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
     void start(const ServingAction & action) override;
     void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) override;
     std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const override;
