@@ -122,6 +122,8 @@ scripts/markov.sh simulate \
 
 `expand --templates ... --target ... --output ...` 用于单区域诊断。例如模型 Decode 的目标参数可包含 `M`（新增 token）、`B`（本批成员）、`R`（请求池容量）和 `max_sequence_tokens`。固定模型绑定来自资产；动态参数和子调用仍须满足模板合同。`expand`/`compose` 的目标可用 `source_rank` 选择来源角色，默认 0；`compose` 按具名端口连接多个区域，不另建调度器。
 
+局部诊断核对给定输入条件下的模板行为，派生输出由模板计算；完整serving还需核对控制器怎样产生这些输入，以及跨调用的资源与完成关系。
+
 ## 辅助入口
 
 已有探索任务可以继续对指定目标做原生结构对照：
@@ -154,6 +156,7 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 | [collectives.py](collectives.py) | 观察原生 collective 及本地接口 |
 | [physical.py](physical.py) | 从保留的 trace/runtime 事实形成物理归属清单 |
 | [structure.py](structure.py) | 比较独立观察与预测的批次、工作、几何、状态及端口 |
+| [operations.py](operations.py) | 共用操作、端口及数据依赖核对，独立于serving配对和调度 |
 | [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿 |
 | [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
 | [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |

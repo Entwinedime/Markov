@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from execution import ExecutionComparison
+from operations import OperationComparison
 from markov_collection.artifacts.json_file import write_json
 
 
@@ -19,6 +20,7 @@ class StructureComparison:
         self.physical = json.loads(physical.read_text())
         self.observed = json.loads(observed.read_text())
         self.prediction = json.loads(prediction.read_text())
+        self.operations = OperationComparison(self.source, self.observed, self.prediction["graph"])
         specification = json.loads(input_path.read_text())
         session = json.loads((source.parent / "session.json").read_text())
         self.request_ids = dict(
@@ -54,14 +56,11 @@ class StructureComparison:
         self.decisions: dict[int, dict[str, Any]] = {}
         self.completions = {}
         self.flow_actions: dict[int, set[int]] = defaultdict(set)
-        self.target_successors: dict[int, set[int]] = defaultdict(set)
         for region in self.prediction["graph"]["regions"]:
             flow = self.target_batches[region["id"]]
             action = self.target_actions[region["id"]]
             if region.get("rank") == self.rank and flow is not None and action is not None:
                 self.flow_actions[flow].add(action)
-        for edge in self.prediction["graph"]["dependencies"]:
-            self.target_successors[edge["source"]].add(edge["target"])
 
         # A flow can span pipeline actions; PD instances share its identity but own different work.
         for decision in self.prediction["decisions"]:
@@ -116,146 +115,6 @@ class StructureComparison:
                 )
             )
         ]
-
-    def operation_rows(self, graph: dict[str, Any], selected: list[dict[str, Any]], observed: bool) -> list[Any]:
-        values = self.source["values"] if observed else graph["values"]
-        rows = []
-        for operation in selected:
-            communication = operation.get("communication")
-            if observed and isinstance(communication, dict):
-                communication = dict(communication)
-
-                # Resolve recorded split counts in their native scope, without using target routing rules.
-                for field in ("input_splits", "output_splits"):
-                    if field in communication:
-                        communication[field] = [
-                            self.native_parameter(operation["region"], item["scalar"])
-                            if isinstance(item, dict)
-                            else item
-                            for item in communication[field]
-                        ]
-            row = [operation["name"], communication]
-
-            # Native interfaces may expose opaque storage; their internal geometry is not a public tensor contract.
-            if operation["kind"] == "interface":
-                rows.append(row)
-                continue
-            for direction in ("inputs", "outputs"):
-                row.append(
-                    [
-                        {key: values[identity].get(key) for key in ("shape", "dtype", "device")}
-                        for identity in operation[direction]
-                    ]
-                )
-            rows.append(row)
-        return rows
-
-    def native_parameter(self, region: int, name: str) -> Any:
-        while region is not None:
-            scope = self.source["regions"][region]
-            parameters = scope["metadata"].get("parameters", {})
-            if name in parameters:
-                return parameters[name]
-            region = scope["parent"]
-        raise KeyError(f"native communication parameter is not recorded: {name}")
-
-    @staticmethod
-    def operation_edges(graph: dict[str, Any], selected: list[dict[str, Any]]) -> list[Any]:
-
-        # Local operation positions remove observation IDs while retaining actual dependency direction and kind.
-        positions = {operation["id"]: index for index, operation in enumerate(selected)}
-        edges = {
-            (positions[edge["source"]], positions[edge["target"]], edge["kind"])
-            for edge in graph["dependencies"]
-            if edge["source"] in positions and edge["target"] in positions
-        }
-        return sorted(edges)
-
-    @staticmethod
-    def operation_difference(native: list[Any], target: list[Any]) -> dict[str, Any]:
-        first = next(
-            (position for position, pair in enumerate(zip(native, target, strict=False)) if pair[0] != pair[1]),
-            min(len(native), len(target)),
-        )
-        return {
-            "counts": [len(native), len(target)],
-            "position": first,
-            "native": native[first : first + 1],
-            "target": target[first : first + 1],
-        }
-
-    def compare_operations(self, native: list[dict[str, Any]], target: list[dict[str, Any]]) -> dict[str, Any]:
-        left = self.operation_rows(self.observed, native, True)
-        right = self.operation_rows(self.prediction["graph"], target, False)
-        same_calls = [row[0] for row in left] == [row[0] for row in right]
-        ports = self.interface_ports(native, target) if same_calls else None
-        missing = self.missing_orders(self.operation_edges(self.observed, native), target) if same_calls else None
-        report: dict[str, Any] = {
-            "same_calls": same_calls,
-            "checks": {
-                "operations": left == right,
-                "native_dependency_order": not missing if same_calls else None,
-                "public_interface_ports": ports["same"] if ports is not None else None,
-            },
-        }
-        if ports is not None:
-            report["interface_ports"] = ports
-        if missing:
-            report["missing_dependency_orders"] = missing
-        if left != right:
-            report["operation_difference"] = self.operation_difference(left, right)
-        return report
-
-    def interface_ports(self, native: list[dict[str, Any]], target: list[dict[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "same": True,
-            "checked_ports": 0,
-            "opaque_geometry_ports": 0,
-            "interfaces_without_named_ports": 0,
-        }
-        for position, (left, right) in enumerate(zip(native, target, strict=True)):
-            if left["kind"] != "interface":
-                continue
-
-            # Captured private resources have no positional API contract; only named ports identify the same operand.
-            ports = self.source["regions"][left["region"]]["metadata"].get("ports")
-            if ports is None:
-                result["interfaces_without_named_ports"] += 1
-
-                # Unnamed interface returns retain their declared order; captured inputs do not.
-                ports = {"outputs": dict(enumerate(left["outputs"]))}
-                expected_ports = {"outputs": dict(enumerate(right["outputs"]))}
-            else:
-                expected_ports = self.prediction["graph"]["regions"][right["region"]]["ports"]
-            for direction in ports:
-                observed = {}
-                predicted = {}
-                for name, source in ports[direction].items():
-                    if name not in expected_ports[direction]:
-                        continue
-                    value = expected_ports[direction][name]
-                    actual = self.source["values"][source]
-                    expected = self.prediction["graph"]["values"][value]
-
-                    # Opaque resources still expose dtype/device; only declared target tensors promise geometry.
-                    fields = ("dtype", "device", "shape") if "shape" in expected else ("dtype", "device")
-                    observed[name] = {key: actual.get(key) for key in fields}
-                    predicted[name] = {key: expected.get(key) for key in fields}
-                    result["checked_ports"] += 1
-                    result["opaque_geometry_ports"] += "shape" not in expected
-
-                if ports[direction].keys() != expected_ports[direction].keys() or observed != predicted:
-                    result["same"] = False
-                    if "first_difference" not in result:
-                        result["first_difference"] = {
-                            "operation": position,
-                            "name": left["name"],
-                            "direction": direction,
-                            "port_names": [sorted(ports[direction]), sorted(expected_ports[direction])],
-                            "native": observed,
-                            "target": predicted,
-                        }
-        return result
 
     def native_batch(self, record: dict[str, Any], model_only: bool) -> int | None:
         region = record["region"]
@@ -318,31 +177,6 @@ class StructureComparison:
         if native != target:
             report["missing_work"] = dict(native - target)
             report["extra_work"] = dict(target - native)
-
-    def missing_orders(self, observed: list[Any], predicted: list[dict[str, Any]]) -> list[tuple[int, int]]:
-        required: dict[int, set[int]] = defaultdict(set)
-        for source, target, _ in observed:
-            required[source].add(target)
-
-        missing = []
-
-        # A local dependency may pass through another rank or flow before reaching its consumer.
-        for source, targets in required.items():
-            pending = {predicted[position]["id"]: position for position in targets}
-            successors = self.target_successors[predicted[source]["id"]]
-            for target in successors:
-                pending.pop(target, None)
-            visited = set()
-            frontier = deque(successors)
-            while frontier and pending:
-                target = frontier.popleft()
-                if target in visited:
-                    continue
-                visited.add(target)
-                pending.pop(target, None)
-                frontier.extend(self.target_successors[target] - visited)
-            missing.extend((source, target) for target in sorted(pending.values()))
-        return missing
 
     def state(self, batch: dict[str, Any], flow: int) -> dict[str, bool | None]:
         regions = [region for region in self.source["regions"] if self.native_batches[region["id"]] == batch["id"]]
@@ -444,7 +278,7 @@ class StructureComparison:
             return {**window, "status": "partial", "reason": "matched flows do not cover the entire window"}
 
         # Align logical owners only; dependency and execution checks still use the unchanged target graph.
-        report = self.compare_operations(native, paired)
+        report = self.operations.compare(native, paired)
         report["execution"] = ExecutionComparison(native, paired, graph["execution"]).compare()
         report["checks"]["execution_relations"] = report["execution"]["same"]
         checks = report["checks"]
@@ -483,7 +317,7 @@ class StructureComparison:
             index = target[key].popleft()
             native = self.batch_operations(self.observed, self.native_batches, batch["id"], True)
             predicted = self.batch_operations(self.prediction["graph"], self.target_batches, index, False)
-            comparison = self.compare_operations(native, predicted)
+            comparison = self.operations.compare(native, predicted)
             work = native_work[batch["id"]]
             predicted_work = target_work[index]
             comparison["checks"].update(self.state(batch, index))
@@ -501,7 +335,7 @@ class StructureComparison:
                 model_native = [operation for operation in native if self.native_model[operation["region"]]]
                 model_target = [operation for operation in predicted if self.target_model[operation["region"]]]
                 comparison["model_body"] = {
-                    **self.compare_operations(model_native, model_target),
+                    **self.operations.compare(model_native, model_target),
                     "native_operations": len(model_native),
                     "target_operations": len(model_target),
                 }
