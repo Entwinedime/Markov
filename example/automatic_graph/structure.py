@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict, deque
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ class StructureComparison:
         self.native_requests = self.region_labels(self.source["regions"], True, "request")
         self.native_model = self.model_regions(self.source["regions"])
         self.target_model = self.model_regions(self.prediction["graph"]["regions"])
+        self.native_controls = self.region_labels(self.source["regions"], True, "control_only")
+        self.excluded_control, self.control_scope = self.controller_scope()
 
         # KV ownership callbacks carry request IDs even when no native model batch is active.
         initial_batches = {
@@ -107,6 +110,7 @@ class StructureComparison:
             operation
             for operation in graph["operations"]
             if batches[operation["region"]] == batch
+            and (not observed or operation["id"] not in self.excluded_control)
             and (
                 observed
                 or (
@@ -116,13 +120,59 @@ class StructureComparison:
             )
         ]
 
-    def native_batch(self, record: dict[str, Any], model_only: bool) -> int | None:
+    def native_region(self, record: dict[str, Any]) -> int | None:
         region = record["region"]
         if region is None and record["operation"] is not None:
             region = self.source["operations"][record["operation"]]["region"]
+        return region
+
+    def native_batch(self, record: dict[str, Any], model_only: bool) -> int | None:
+        region = self.native_region(record)
         if region is None or (model_only and not self.native_model[region]):
             return None
+        if self.control_scope["closed"] and self.native_controls[region]:
+            return None
         return self.native_batches[region]
+
+    def controller_scope(self) -> tuple[set[int], dict[str, Any]]:
+        operations = [
+            operation for operation in self.observed["operations"] if self.native_controls[operation["region"]]
+        ]
+        identities = {operation["id"] for operation in operations}
+        crossing = sum(
+            (edge["source"] in identities) != (edge["target"] in identities)
+            for edge in self.observed["dependencies"]
+        )
+        actions = chain(
+            (work for work in self.physical["work"] if work["kind"] == "device"),
+            self.physical["runtime_actions"],
+        )
+
+        # Some runtime actions belong directly to a region, without an attached logical operation.
+        submitted_work = sum(
+            1
+            for action in actions
+            if not action["observer"]
+            and not action["auxiliary"]
+            and action["baseline"] is None
+            and (region := self.native_region(action)) is not None
+            and self.native_controls[region]
+        )
+        communications = sum(bool(operation.get("communication")) for operation in operations)
+        closed = not crossing and not submitted_work and not communications
+
+        # A declaration cannot hide data consumed by shared work or an unrepresented device/API dependency.
+        return (identities if closed else set()), {
+            "closed": closed,
+            "declared_operations": len(operations),
+            "crossing_dependencies": crossing,
+            "device_and_runtime_actions": submitted_work,
+            "communication_contracts": communications,
+            "native_calls": sorted(
+                {region["metadata"]["path"] for region in self.source["regions"] if region["metadata"].get("control_only")}
+            ),
+            "scope": "declared native controller decisions; retained in observations, separate from modeled work",
+        }
 
     def native_work(self, model_only: bool = False) -> dict[int, Counter[str]]:
         result: dict[int, Counter[str]] = defaultdict(Counter)
@@ -248,8 +298,11 @@ class StructureComparison:
         native = [
             operation
             for operation in self.observed["operations"]
-            if ((batch := self.native_batches[operation["region"]]) is not None and first <= batch <= last)
-            or self.native_requests[operation["region"]] in self.request_ids
+            if operation["id"] not in self.excluded_control
+            and (
+                ((batch := self.native_batches[operation["region"]]) is not None and first <= batch <= last)
+                or self.native_requests[operation["region"]] in self.request_ids
+            )
         ]
         graph = self.prediction["graph"]
         target = [
@@ -354,7 +407,7 @@ class StructureComparison:
         status = "matched"
         if unmatched or unmatched_target or unassociated or unverified or not comparisons:
             status = "partial"
-        if failures:
+        if failures or not self.control_scope["closed"]:
             status = "differences"
         window = self.window(operation_pairs)
 
@@ -370,6 +423,7 @@ class StructureComparison:
                 "batch and serialized operation order reported separately; "
                 "opaque geometry, captured inputs, policy equivalence, timing and distributed progress unqualified"
             ),
+            "controller_scope": self.control_scope,
             "status": status,
             "rank": self.rank,
             "same_batch_order": same_batch_order,
