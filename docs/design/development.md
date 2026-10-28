@@ -64,7 +64,7 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 | `src/control/markov_control/workflow` | 原生控制与核心进程的管道连接、运行时限、日志与清理 |
 | `example/automatic_graph` | 真实输入示例、机制观察及设备清单对照 |
 
-C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
+C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。真实采集时由原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
 
 ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求进度，独立 KvPool 持有槽位/页状态；CLI 保持资源池比控制器存活更久，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
 
@@ -84,11 +84,11 @@ bash scripts/markov-control.sh \
   --output data/YOUR_RUN/results/native.json
 ```
 
-启动端使用Python≥3.10、Docker与已有Release程序，启动C++执行容器和原生控制容器；后者按来源TP规模启动独立的原生worker。控制侧协调进程只交接消息，不选择批次或维护另一份KV账本。双方只通过本地管道交接必要值；不挂载设备、权重或目标观察，不启用网络。原生模型配置及dtype来自模板资产，不另选模型目录。`--timeout-seconds`默认300，使用真实单调时钟限制运行；正常完成、错误、中断或超时均清理本次拥有的容器；核心结果先写入本次临时目录，全部参与进程成功退出后才替换最终结果，失败保持旧结果。原生wall-clock watchdog不另起后台资源查询，运行时限统一由外层负责。
+启动端使用Python≥3.10、Docker与已有Release程序，启动C++执行容器和原生控制容器；后者按来源TP×PP规模启动独立的原生worker。控制侧协调进程只交接消息，不选择批次或维护另一份KV账本。双方只通过本地管道交接必要值；不挂载设备、权重或目标观察，不启用网络。原生模型配置及dtype来自模板资产，不另选模型目录。`--timeout-seconds`默认300，使用真实单调时钟限制运行；正常完成、错误、中断或超时均清理本次拥有的容器；核心结果先写入本次临时目录，全部参与进程成功退出后才替换最终结果，失败保持旧结果。原生wall-clock watchdog不另起后台资源查询，运行时限统一由外层负责。
 
 默认结果仍为精简JSON，`--details`才输出完整图与执行记录；上述命令的运行日志位于`results/native.logs/core.log`和`native.log`。内部C++接口为`simulate --control native`，其标准流属于协议；直接运行该接口需要连接控制端，通常使用外层脚本。
 
-当前接基础单worker及单阶段TP/EP，完整Prefill、无前缀缓存和无overlap；PP/PD与调度优化尚未接入。各worker运行真实原生主循环，入口成员沿原生CPU组广播请求；只读容量查询独立处理，一致的资源变更和执行动作只向核心提交一次，返回值形成各rank的本地视图。分片计算与设备通信仍由已有模板展开，不以控制进程间的CPU通信替代目标设备工作。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。原生运行批次的实际筛选作为Select动作交接，撤回通过独立Release归还驻留，原生保留输出历史并决定重新Prefill。给定输出长度用占位token驱动原生结果处理，不预测自然文本；目标释放路径仍须有合格模板，例如混合dtype且含空列表的拼接不能借用同dtype原型。入口可运行不代表完整结构资格或性能精度通过。
+当前接基础单worker、单阶段TP/EP及已有来源的PP，完整Prefill、无前缀缓存和无overlap；原生PD与调度优化尚未接入。各worker运行真实原生主循环，入口成员沿原生CPU组广播请求；只读容量查询独立处理，同stage的TP成员将一致的资源变更和执行动作只向核心提交一次，返回值形成各rank的本地视图。PP各stage通过独立资源域推进，原生输入/输出环只交换CPU元数据和工作身份；实际发送、接收与work等待由图反馈。分片计算与设备通信仍由已有模板展开，不以控制进程间的CPU通信替代目标设备工作。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。原生运行批次的实际筛选作为Select动作交接，撤回通过独立Release归还驻留，原生保留输出历史并决定重新Prefill。给定输出长度用占位token驱动原生结果处理，不预测自然文本；目标释放路径仍须有合格模板，例如混合dtype且含空列表的拼接不能借用同dtype原型。入口可运行不代表完整结构资格或性能精度通过。
 
 ## 来源与区域命令
 
@@ -121,7 +121,7 @@ PP语义观察在原生循环提交完已有proxy/output发送句柄后发布，
 
 `serving.py --observe-all-workers`提供相同的示例入口。共同实例的`--input`读取正式serving输入，当前要求请求同时到达；TP数量仍用`--tp-size`指定。输入包含EP拓扑时，adapter按请求、层及逻辑token将同一份`ep_routes`注入原生TopK结果，包含padding，保留原生组批、gate计算和真实dispatch/combine。baseline和观察路径使用相同条件，统一预热不变；辅助注入不进入待预测工作，其时长不能作为性能样本。这种对照检验给定路由下的结构，不验证自然专家选择或文本数值。
 
-仿真明细记录每个动作完成时已有的成员效果；`commits_requests` 表明该动作是否提交外部请求状态。中间stage、Prefill计算或资源交接可以有计划效果而不提交请求，不能把这些明细字段本身当作状态已提交；默认精简输出不保留动作历史。
+仿真明细用`task.group`和`task.sequence`共同标识动作，图范围使用同一`task`；通信动作另外记录`channel`。`commits_requests`表示动作提交所属资源域的请求进度，原生PP各stage分别提交，`state_committed_ns`记录最后完成的域，用户token时间仍只取实际发布端口。中间计算或资源交接可以携带计划效果，不能把这些字段本身当作状态已提交；默认精简输出不保留动作历史。原生分配RPC可以早于对应准备图提交，因此多域总空闲页快照不能只由图动作顺序反推；独立状态检查核对各域的实际分配、释放与最终守恒。
 
 固定预热配方由 `NativeServingSession.warmup_requests(page_size)` 维护，各采集入口共用。结构观察使用独立的 `structure_requests(page_size)` 五请求配方，覆盖页前/页边界/页后及对齐和非对齐输入，保留槽位复用后仍需Decode的尾请求；PD沿用相同prompt，保留较长输出和接入即结束的请求。原语辅助观察覆盖固定实现分支，不代替实际模型来源。当前 Ascend dense 路径还通过同目录原生观察库调用实际 allocator，按后端源码上界预留计算 stream 的 workspace，并记录预热及观察后的容量。单步的 `--input` 改变被观察请求及原生池配置，预热继续使用固定配方；`session-summary.json` 记录实际预热请求。PD 的 capture.json 保存采集输入，responses 目录保存各轮响应，二者职责分开，不预先跑完整目标序列。
 
