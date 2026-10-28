@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -46,14 +47,26 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         compute[work.description].include(source.cpu_work_interval(id), work.end_ns - work.begin_ns);
         native_bindings[work.description] += source.compute_resources(id).has_value();
     }
-    Summary metadata;
-    std::size_t metadata_rules = 0, metadata_queues = 0;
+    struct Preparation {
+        Summary intervals;
+        std::size_t rules = 0, resources = 0;
+        std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> contexts;
+    };
+    std::map<std::string, Preparation> preparations;
     for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
-        const auto & regions = observed.compute_frames[frame].metadata;
-        const auto intervals = source.metadata_intervals(frame);
-        for (std::size_t i = 0; i < regions.size(); ++i) metadata.include(intervals[i], regions[i].region.end_ns - regions[i].region.begin_ns);
-        for (const auto & call : regions) metadata_rules += call.definition != nullptr;
-        for (const auto & resources : source.metadata_resources(frame)) metadata_queues += resources.has_value();
+        const auto & regions = observed.compute_frames[frame].preparations;
+        const auto intervals = source.preparation_intervals(frame);
+        const auto resources = source.preparation_resources(frame);
+        for (std::size_t i = 0; i < regions.size(); ++i) {
+            auto & item = preparations[regions[i].role];
+            item.intervals.include(intervals[i], regions[i].region.end_ns - regions[i].region.begin_ns);
+            item.rules += regions[i].definition != nullptr;
+            item.resources += resources[i].has_value();
+            if (resources[i]) {
+                const auto & r = *resources[i];
+                ++item.contexts[{ r.caller, r.worker, r.device }];
+            }
+        }
     }
     const auto describe = [](const Summary & summary) -> Json {
         return {
@@ -74,15 +87,31 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         item["native_call_rule"] = observed.work_descriptions[id].calls != nullptr;
         descriptions.push_back(std::move(item));
     }
+    auto preparation_report = Json::object();
+    for (const auto & [role, preparation] : preparations) {
+        auto item = describe(preparation.intervals);
+        item["rules"] = preparation.rules;
+        item["native_resource_bindings"] = preparation.resources;
+        auto contexts = Json::array();
+        for (const auto & [context, count] : preparation.contexts) {
+            const auto [caller, worker, device] = context;
+            contexts.push_back({
+                { "caller", observed.resources[caller].identity },
+                { "worker", observed.resources[worker].identity },
+                { "device", observed.resources[device].identity },
+                {  "calls",                               count }
+            });
+        }
+        item["execution_contexts"] = std::move(contexts);
+        preparation_report[role] = std::move(item);
+    }
     return {
-        {              "compute_calls",std::move(descriptions)                                       },
-        {         "attention_metadata",      describe(metadata) },
-        {             "metadata_rules",          metadata_rules },
-        { "metadata_resource_bindings",         metadata_queues },
-        {              "qualification",
+        { "compute_calls",std::move(descriptions)                          },
+        {  "preparations", std::move(preparation_report) },
+        { "qualification",
          "Source caller intervals only: exclusive observed service, waits, gaps, and uncovered time are kept separate. "
          "Profiler correction is not applied; these are neither normal CPU costs nor a complete request partition. Device/worker work is not charged "
-         "here."                                               }
+         "here."                                        }
     };
 }
 

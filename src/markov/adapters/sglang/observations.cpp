@@ -1,5 +1,7 @@
 #include "markov/adapters/sglang/observations.hpp"
 
+#include "markov/adapters/sglang/allocation.hpp"
+
 #include "markov/adapters/sglang/dense.hpp"
 #include "markov/adapters/sglang/metadata.hpp"
 
@@ -74,6 +76,16 @@ void ProbeReader::observe(const ProbeEvent & event) {
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
+    if (name == "runtime.hicache.decode_allocator") {
+        const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+        if (pending_decode_allocations_.contains(process)) ++output_.counts["unbound_decode_allocator"];
+        pending_decode_allocations_.insert_or_assign(process,
+                                                     ObservedCallSequence{
+                                                         { resource, event.begin_ns, event.end_ns, event.record },
+                                                         read_decode_allocator(args),
+                                                         "decode_allocation"
+        });
+    }
     if (name == "runtime.hicache.decode_allocation") {
         ComputeFrame frame{ trace_graph::planning::Phase::Decode,
                             {},
@@ -84,6 +96,22 @@ void ProbeReader::observe(const ProbeEvent & event) {
                             {} };
         for (const auto & identity : args.at("request_ids")) frame.requests.push_back(output_.name(identity.get<std::string>()));
         frame.query_tokens = std::vector<double>(frame.requests.size(), args.at("token_per_req").get<double>());
+        const auto allocation = pending_decode_allocations_.find(process);
+        if (allocation != pending_decode_allocations_.end() && event.begin_ns <= allocation->second.region.begin_ns
+            && allocation->second.region.end_ns <= event.end_ns && args.at("token_per_req") == 1) {
+            // The inner allocator record is emitted before its enclosing call.
+            frame.preparations.push_back(std::move(allocation->second));
+            pending_decode_allocations_.erase(allocation);
+        }
+        else {
+            const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+            frame.preparations.push_back({
+                { resource, event.begin_ns, event.end_ns, event.record },
+                nullptr,
+                "decode_allocation"
+            });
+            ++output_.counts["decode_allocator_without_matching_call"];
+        }
         forward_frames_[process] = output_.compute_frames.size();
         output_.compute_frames.push_back(std::move(frame));
     }
@@ -113,9 +141,10 @@ void ProbeReader::observe(const ProbeEvent & event) {
         if (frame == forward_frames_.end()) ++output_.counts["metadata_without_forward_context"];
         else {
             const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
-            output_.compute_frames[frame->second].metadata.push_back({
+            output_.compute_frames[frame->second].preparations.push_back({
                 { resource, event.begin_ns, event.end_ns, event.record },
-                read_metadata(args)
+                read_metadata(args),
+                "attention_metadata"
             });
         }
     }

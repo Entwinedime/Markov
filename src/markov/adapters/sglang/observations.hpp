@@ -33,6 +33,7 @@ private:
     void observe_collective(const ProbeEvent & event);
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
+    std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;
     struct EmbeddingWindow {
         trace_graph::source::Time lookup_end, reduction_begin;
     };

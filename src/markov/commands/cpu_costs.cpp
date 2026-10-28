@@ -4,9 +4,9 @@
 #include "markov/trace_graph/source/services.hpp"
 
 #include <algorithm>
-#include <array>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -66,7 +66,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
     const auto & context = prepared.context;
     const auto & observed = context.observations();
     const auto & costs = *prepared.cpu_costs;
-    const std::array roles{ "compute_calls", "attention_metadata", "collective_envelopes", "outside_known_calls" };
+    std::vector<std::string> roles{ "compute_calls", "collective_envelopes", "outside_known_calls" };
     std::vector<CpuRegion> regions;
     std::vector<std::size_t> owners;
     std::vector<bool> formal;
@@ -82,12 +82,16 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
                     0
                 });
             }
-            for (const auto & call : observed.compute_frames[frame].metadata) lanes[call.region.resource].push_back({ call.region, 1 });
+            for (const auto & call : observed.compute_frames[frame].preparations) {
+                const auto role = static_cast<std::size_t>(std::ranges::find(roles, call.role) - roles.begin());
+                if (role == roles.size()) roles.push_back(call.role);
+                lanes[call.region.resource].push_back({ call.region, role });
+            }
             for (const auto id : context.frame_collectives(frame)) {
                 const auto & call = observed.collectives[id];
                 lanes[call.resource].push_back({
                     { call.resource, call.begin_ns, call.end_ns, call.record },
-                    2
+                    1
                 });
             }
         }
@@ -103,7 +107,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
                 if (begin < cursor) throw std::runtime_error("CPU call ownership overlaps inside request: " + request.identity);
                 if (cursor < begin) {
                     regions.push_back({ resource, cursor, begin, call.source.record });
-                    owners.push_back(3);
+                    owners.push_back(2);
                 }
                 regions.push_back({ resource, begin, end, call.source.record });
                 owners.push_back(call.role);
@@ -111,7 +115,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
             }
             if (cursor < request.end_ns) {
                 regions.push_back({ resource, cursor, request.end_ns, {} });
-                owners.push_back(3);
+                owners.push_back(2);
             }
         }
         formal.insert(formal.end(), regions.size() - first, request.formal);
@@ -124,7 +128,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
     }
 
     const auto measured = cpu_intervals(observed, context.graph(), regions, &costs.intervals);
-    std::array<Summary, roles.size()> summaries, formal_summaries;
+    std::vector<Summary> summaries(roles.size()), formal_summaries(roles.size());
     for (std::size_t i = 0; i < measured.size(); ++i) {
         summaries[owners[i]].add(measured[i]);
         if (formal[i]) formal_summaries[owners[i]].add(measured[i]);

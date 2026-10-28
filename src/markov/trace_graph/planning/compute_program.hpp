@@ -6,6 +6,7 @@
 #include "markov/trace_graph/source/context.hpp"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -20,9 +21,13 @@ struct FrameCompute {
 };
 
 struct ComputeStats {
+    struct Preparation {
+        std::size_t sequences = 0, operations = 0;
+    };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
-    std::size_t metadata_sequences = 0, metadata_operations = 0, native_operations = 0, dispatch_delays = 0;
+    std::size_t native_operations = 0, dispatch_delays = 0;
+    std::map<std::string, Preparation> preparations;
     graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
     void add(const ComputeStats & other);
 };

@@ -35,6 +35,8 @@ struct CallResources {
 
 class NativePlan {
 public:
+    // Ordered tensor work may change device streams while retaining its
+    // producer frontier. Caller/worker ownership remains with the same queues.
     void extend(std::span<const NativeCall> calls, CallResources resources);
     PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
     std::size_t operations() const { return work_.size(); }

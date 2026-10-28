@@ -13,8 +13,10 @@ void ComputeStats::add(const ComputeStats & other) {
     participant_arrivals += other.participant_arrivals;
     compute_calls += other.compute_calls;
     compute_services += other.compute_services;
-    metadata_sequences += other.metadata_sequences;
-    metadata_operations += other.metadata_operations;
+    for (const auto & [role, values] : other.preparations) {
+        preparations[role].sequences += values.sequences;
+        preparations[role].operations += values.operations;
+    }
     native_operations += other.native_operations;
     dispatch_delays += other.dispatch_delays;
     participant_wait_ns += other.participant_wait_ns;
@@ -102,21 +104,22 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         struct Fence {
             source::Time begin, end;
             source::Index id;
-            bool metadata;
+            bool preparation;
         };
         std::vector<Fence> fences;
         for (const auto call_id : source.frame_collectives(input.frame)) {
             const auto & call = observed.collectives[call_id];
             fences.push_back({ call.begin_ns, call.end_ns, call_id, false });
         }
-        const auto & metadata = observed.compute_frames[input.frame].metadata;
-        const auto metadata_resources = source.metadata_resources(input.frame);
-        for (std::size_t i = 0; i < metadata.size(); ++i) {
-            if (!metadata[i].definition || !metadata_resources[i] || *metadata_resources[i] != *resources) {
-                issue_ = "metadata_rule_or_resources_unavailable";
+        const auto & preparations = observed.compute_frames[input.frame].preparations;
+        const auto preparation_resources = source.preparation_resources(input.frame);
+        for (std::size_t i = 0; i < preparations.size(); ++i) {
+            if (!preparations[i].definition || !preparation_resources[i] || preparation_resources[i]->caller != resources->caller
+                || preparation_resources[i]->worker != resources->worker) {
+                issue_ = "preparation_rule_or_resources_unavailable";
                 return;
             }
-            fences.push_back({ metadata[i].region.begin_ns, metadata[i].region.end_ns, i, true });
+            fences.push_back({ preparations[i].region.begin_ns, preparations[i].region.end_ns, i, true });
         }
         std::ranges::sort(fences, {}, &Fence::begin);
         std::size_t first = 0;
@@ -131,12 +134,16 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             }
             if (!append_compute(input, first, last, *resources, pending)) return;
             first = last;
-            if (fence.metadata) {
-                const auto calls = metadata[fence.id].definition->describe(observed.compute_frames[input.frame].phase, input.variables);
+            if (fence.preparation) {
+                const auto & preparation = preparations[fence.id];
+                const auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
                 const auto before = pending.plan.operations();
-                pending.plan.extend(calls, *resources);
-                pending.stats.metadata_operations += pending.plan.operations() - before;
-                ++pending.stats.metadata_sequences;
+                // Preparation may produce inputs on another device stream.
+                // NativePlan retains that producer before subsequent forward work.
+                pending.plan.extend(calls, *preparation_resources[fence.id]);
+                auto & stats = pending.stats.preparations[preparation.role];
+                stats.operations += pending.plan.operations() - before;
+                ++stats.sequences;
                 continue;
             }
             const auto & call = observed.collectives[fence.id];

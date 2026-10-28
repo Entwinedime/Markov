@@ -118,6 +118,7 @@ struct CpuRegion {
 struct ObservedCallSequence {
     CpuRegion region;
     std::unique_ptr<const planning::CallSequence> definition;
+    std::string role;
 };
 
 struct ComputeFrame {
@@ -127,7 +128,7 @@ struct ComputeFrame {
     std::optional<std::vector<double>> query_tokens;
     std::optional<double> page_tokens;
     RecordRef record;
-    std::vector<ObservedCallSequence> metadata;
+    std::vector<ObservedCallSequence> preparations;
 };
 
 struct CollectiveGroup {

@@ -23,6 +23,16 @@ namespace {
 using namespace trace_graph;
 using Json = nlohmann::json;
 
+Json preparation_report(const planning::ComputeStats & stats) {
+    auto report = Json::object();
+    for (const auto & [role, counts] : stats.preparations)
+        report[role] = {
+            {  "sequences",  counts.sequences },
+            { "operations", counts.operations }
+        };
+    return report;
+}
+
 Json cost_gap_json(const simulation::CostGap & gap) {
     auto work = work_json(gap.work);
     work["status"] = cost_status_name(gap.response.status);
@@ -77,8 +87,7 @@ struct SubsetExecution {
             {    "participant_arrivals",                          compute.participant_arrivals },
             {     "participant_wait_ns",                           compute.participant_wait_ns },
             { "maximum_arrival_span_ns",                       compute.maximum_arrival_span_ns },
-            {      "metadata_sequences",                            compute.metadata_sequences },
-            {     "metadata_operations",                           compute.metadata_operations },
+            {            "preparations",                           preparation_report(compute) },
             {       "native_operations",                             compute.native_operations },
             {         "dispatch_delays",                               compute.dispatch_delays },
             {                "coverage",                                              coverage },
@@ -87,7 +96,8 @@ struct SubsetExecution {
             {                   "issue",                                                 issue },
             {           "e2e_predicted",                                                 false },
             {           "qualification",
-             "Known compute calls and attention metadata share caller/worker/device chains and blocking collective rendezvous. Idle synchronization "
+             "Known compute calls, attention metadata and one-token Decode allocation share native chains and blocking collective rendezvous. "
+             "Allocation uses its observed device stream and precedes forward inputs. Unsorted pools with int32 locations are supported. Idle synchronization "
              "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call and "
              "collective CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
              "reported."                                                                      }
@@ -179,7 +189,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {       "response_evaluations",                                                                          queries.evaluations() - evaluation_begin },
         {              "e2e_predicted",                                                                                                             false },
         {              "qualification",
-         "Cache I/O, known compute calls and attention metadata share one clock. Native calls share continuous caller/worker/device chains. Idle "
+         "Cache I/O, known compute calls, attention metadata and one-token Decode allocation share one clock. Native calls share caller/worker chains "
+         "and ordered device producers, preserving the allocation-to-forward stream handoff. Unsorted pools with int32 locations are supported. Idle "
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
          "Partial request ports exclude query/admission, inter-call and collective CPU, other cross-stream dependencies and client pacing. "
@@ -193,10 +204,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {     "participant_wait_ns",     compute.participant_wait_ns },
         { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
     };
-    report["metadata_execution"] = {
-        {  "sequences",  compute.metadata_sequences },
-        { "operations", compute.metadata_operations }
-    };
+    report["preparation_execution"] = preparation_report(compute);
     report["native_call_execution"] = {
         {    "compute_calls",     compute.compute_calls },
         { "compute_services",  compute.compute_services },
