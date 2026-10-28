@@ -272,11 +272,10 @@ Json timing_alignment(const source::Observations & observations, const source::S
         graph::Time max_absolute_delta_ns = 0;
         std::size_t largest_node = 0;
     };
-    std::map<std::pair<source::ResourceKind, bool>, Alignment> groups;
+    std::map<std::pair<source::ResourceKind, graph::NodeKind>, Alignment> groups;
     for (std::size_t id = 0; id < source.graph.nodes().size(); ++id) {
         const auto & node = source.graph.nodes()[id];
-        const bool profiler = node.kind == graph::NodeKind::ProfilerOverhead;
-        auto & group = groups[{ observations.resources[node.resource].kind, profiler }];
+        auto & group = groups[{ observations.resources[node.resource].kind, node.kind }];
         const auto delta = replay.starts_ns[id] + origin - source.node_origins[id].begin_ns;
         ++group.nodes;
         group.earlier += delta < 0;
@@ -289,8 +288,16 @@ Json timing_alignment(const source::Observations & observations, const source::S
     }
 
     auto result = Json::array();
+    const std::map<graph::NodeKind, std::string> node_kinds{
+        {          graph::NodeKind::Service,           "service" },
+        {     graph::NodeKind::ObservedWait,     "observed_wait" },
+        { graph::NodeKind::ProfilerOverhead, "profiler_overhead" },
+        {      graph::NodeKind::ResidualGap,      "residual_gap" },
+        {         graph::NodeKind::Boundary,          "boundary" },
+        {            graph::NodeKind::Delay,             "delay" }
+    };
     for (const auto & [identity, group] : groups) {
-        const auto [kind, profiler] = identity;
+        const auto [kind, node_kind] = identity;
         Json example = nullptr;
         if (group.max_absolute_delta_ns > 0) {
             const auto & node = source.node_origins[group.largest_node];
@@ -315,17 +322,25 @@ Json timing_alignment(const source::Observations & observations, const source::S
                     };
                 }
             }
+            if (!example.is_null()) {
+                const auto & operation = source.graph.nodes()[group.largest_node];
+                example["resource"] = observations.resources[operation.resource].identity;
+                example["observed_start_ns"] = node.begin_ns;
+                example["replayed_start_ns"] = replay.starts_ns[group.largest_node] + origin;
+                example["duration_ns"] = operation.duration_ns;
+            }
         }
         const auto label = kind == source::ResourceKind::CpuThread ? "cpu_thread" : kind == source::ResourceKind::DeviceStream ? "device_stream" : "client";
         result.push_back({
-            {                     "resource",                                            label },
-            {                    "cost_role", profiler ? "profiler_overhead" : "observed_work" },
-            {                        "nodes",                                      group.nodes },
-            {                "earlier_nodes",                                    group.earlier },
-            {                  "later_nodes",                                      group.later },
-            {  "max_absolute_start_delta_ns",                      group.max_absolute_delta_ns },
-            {     "largest_interval_example",                               std::move(example) },
-            { "mean_absolute_start_delta_ns",           group.absolute_delta_sum / group.nodes }
+            {                     "resource",                                                                                  label },
+            {                    "cost_role", node_kind == graph::NodeKind::ProfilerOverhead ? "profiler_overhead" : "observed_work" },
+            {                    "node_kind",                                                               node_kinds.at(node_kind) },
+            {                        "nodes",                                                                            group.nodes },
+            {                "earlier_nodes",                                                                          group.earlier },
+            {                  "later_nodes",                                                                            group.later },
+            {  "max_absolute_start_delta_ns",                                                            group.max_absolute_delta_ns },
+            {     "largest_interval_example",                                                                     std::move(example) },
+            { "mean_absolute_start_delta_ns",                                                 group.absolute_delta_sum / group.nodes }
         });
     }
     return result;

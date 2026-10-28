@@ -46,11 +46,21 @@ public:
             if (point < input_.points.size() && observations_.points[input_.points[point]].time_ns == time) {
                 flush_interval();
                 std::vector<graph::NodeId> next_frontier;
+                std::map<std::pair<Index, Index>, graph::NodeId> record_ports;
                 while (point < input_.points.size() && observations_.points[input_.points[point]].time_ns == time) {
                     const auto id = input_.points[point++];
-                    const auto node = append({ time, 0, no_span, graph::NodeKind::Boundary });
-                    output_.point_nodes[id] = node;
-                    next_frontier.push_back(node);
+                    const auto & record = observations_.points[id].record;
+                    const auto key = std::pair(record.file, record.position);
+                    const auto [port, inserted] = record_ports.try_emplace(key, 0);
+                    if (inserted) {
+                        port->second = append({ time, 0, no_span, graph::NodeKind::Boundary });
+                        next_frontier.push_back(port->second);
+                    }
+                    else ++output_.audit["reused_record_boundary_ports"];
+
+                    // One record's coincident ports denote the same fact; equal
+                    // timestamps on different records do not prove identity.
+                    output_.point_nodes[id] = port->second;
                 }
                 frontier_ = std::move(next_frontier);
             }

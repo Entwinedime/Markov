@@ -99,8 +99,13 @@ void RuntimeCausality::connect_events(Observations & observations, const std::ve
 
     for (const auto & binding : bindings) {
         const auto & hook = *binding.hook;
-        // Resolved native flows already own the submission edges.
-        if (binding.host && binding.device) ++observations.counts["ascend.event_submissions"];
+        // Connection IDs bind the actual command, including zero-duration
+        // records whose independent exported flow port is only a sibling.
+        if (binding.host && binding.device) {
+            observations.dependencies.push_back(
+                { port(observations, *binding.host, false), port(observations, *binding.device, false), DependencyKind::Submission });
+            ++observations.counts["ascend.event_submissions"];
+        }
         if (hook.kind == Kind::Record || hook.kind == Kind::StreamSynchronize) continue;
 
         const auto group = events.find({ hook.process, hook.identity });
