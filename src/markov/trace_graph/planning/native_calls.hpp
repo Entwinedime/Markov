@@ -31,7 +31,7 @@ struct NativeCall {
     // A mixed sequence uses the incoming producer here and the frame stream
     // for its other calls; one source binding cannot collapse both roles.
     bool incoming_stream = false;
-    std::optional<Work> worker_synchronization = std::nullopt;
+    std::optional<Work> host_transfer = std::nullopt;
 };
 
 struct NativeSequence {

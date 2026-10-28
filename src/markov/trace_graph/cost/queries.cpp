@@ -66,7 +66,9 @@ const Response & Queries::query(const planning::Work & work) {
     const auto found = responses_.find(work);
     if (found != responses_.end()) return found->second;
 
-    return responses_.emplace(work, models_.query(work)).first->second;
+    const auto & response = responses_.emplace(work, models_.query(work)).first->second;
+    if (response.model && !models_.model(*response.model).limitations.empty()) limited_models_.insert(*response.model);
+    return response;
 }
 
 const Response & Queries::query_source_delay(graph::NodeId id, std::size_t resource) {

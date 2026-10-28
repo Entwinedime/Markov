@@ -22,10 +22,10 @@ Json read_json(const std::filesystem::path & path) {
     return Json::parse(stream);
 }
 
-void fields(const Json & object, const std::set<std::string> & required) {
+void fields(const Json & object, const std::set<std::string> & required, const std::set<std::string> & optional = {}) {
     if (!object.is_object()) throw std::runtime_error("Cost input must be a JSON object");
     for (const auto & [key, value] : object.items()) {
-        if (!required.contains(key)) throw std::runtime_error("Unknown cost input field: " + key);
+        if (!required.contains(key) && !optional.contains(key)) throw std::runtime_error("Unknown cost input field: " + key);
     }
     for (const auto & key : required) object.at(key);
 }
@@ -85,7 +85,8 @@ cost::Model model(const Json & raw) {
              "measured_points",
              "extrapolation_features",
              "allow_new_combinations",
-             "sources" });
+             "sources" },
+           { "limitations" });
     cost::Model result{
         { raw.at("operation").get<std::string>(), raw.at("implementation").get<std::string>(), raw.at("timing_scope").get<std::string>() },
         formula(raw.at("response")),
@@ -96,6 +97,7 @@ cost::Model model(const Json & raw) {
         raw.at("sources").get<std::vector<std::string>>()
     };
     if (result.sources.empty()) throw std::runtime_error("Cost model needs measurement sources");
+    result.limitations = raw.value("limitations", std::vector<std::string>{});
 
     for (const auto & [name, values] : raw.at("ranges").get<std::map<std::string, std::vector<double>>>()) {
         if (values.size() != 2 || !std::isfinite(values[0]) || !std::isfinite(values[1]) || values[0] > values[1])

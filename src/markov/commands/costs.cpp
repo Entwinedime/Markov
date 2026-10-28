@@ -71,7 +71,8 @@ nlohmann::json cost_report(const adapters::CostQueries & queries, const adapters
             const auto key = std::to_string(*response.model);
             if (!used_models.contains(key))
                 used_models[key] = {
-                    { "sources", selected.models.model(*response.model).sources }
+                    {     "sources",     selected.models.model(*response.model).sources },
+                    { "limitations", selected.models.model(*response.model).limitations }
                 };
         }
     }

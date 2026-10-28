@@ -54,14 +54,15 @@ void upload(std::vector<NativeCall> & calls, const std::string & name, const std
     shape["element_bytes"] = element_bytes;
     shape["host_pinned"] = 0;
     shape["non_blocking"] = 1;
+    const auto bytes = shape.at("elements") * element_bytes;
     queued(calls, name, "aten.to.npu:" + dtype, std::move(shape), incoming_stream);
     auto & call = calls.back();
     call.kind = CallKind::HostUpload;
-    call.work.kind.timing_scope = "host_to_device_interval";
+    call.work.kind.timing_scope = "cpu_service";
     call.launches.clear();
-    call.worker_synchronization = Work{
-        { "runtime.stream_sync", "rtStreamSynchronize", "idle_stream_sync_interval" },
-        { { "previous_work_completed", 1 } }
+    call.host_transfer = Work{
+        {     "runtime.copy",   "aclrtMemcpyAsync",        "host_to_device_interval" },
+        { { "bytes", bytes }, { "host_pinned", 0 }, { "previous_work_completed", 1 } }
     };
     call.synchronization = Work{
         { "runtime.stream_sync", "aclrtSynchronizeStreamWithTimeout", "idle_stream_sync_interval" },

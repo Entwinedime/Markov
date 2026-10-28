@@ -451,7 +451,20 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
          "target DAG or E2E prediction."                                       }
     };
     if (costs) {
+        auto limitations = Json::array();
+        for (const auto id : queries->limited_models()) {
+            const auto & model = costs->models.model(id);
+            limitations.push_back({
+                {          "model",                        id },
+                {      "operation",      model.kind.operation },
+                { "implementation", model.kind.implementation },
+                {   "timing_scope",   model.kind.timing_scope },
+                {    "limitations",         model.limitations },
+                {        "sources",             model.sources }
+            });
+        }
         report["cost_catalog"] = {
+            {       "queried_model_limitations",                                                                                                         std::move(limitations) },
             {                      "deployment",                                                                                                              costs->deployment },
             {                 "selected_models",                                                                                                           costs->models.size() },
             {                 "logical_queries",                                                                                                            queries->requests() },

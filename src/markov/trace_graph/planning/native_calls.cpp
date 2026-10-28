@@ -88,10 +88,9 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         const auto device = call.incoming_stream ? incoming.value() : resources.device;
         if (call.kind == CallKind::HostUpload) {
             cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_);
-            const auto & synchronization = call.worker_synchronization.value();
-            const auto synchronized = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.worker, worker_);
-            depend(device_ ? std::optional(device_->completion) : std::nullopt, synchronized);
-            const auto copied = append(call.work, "host_to_device_interval", resources.worker, worker_);
+            const auto & transfer = call.host_transfer.value();
+            const auto copied = append(transfer, transfer.kind.timing_scope.c_str(), resources.worker, worker_);
+            depend(device_ ? std::optional(device_->completion) : std::nullopt, copied);
 
             // Synchronous host copies produce device data without issuing a
             // device task. Keep its location separate from the executing CPU.

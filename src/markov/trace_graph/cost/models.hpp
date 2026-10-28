@@ -42,6 +42,7 @@ struct Model {
     std::set<std::string> extrapolation_features;
     bool allow_new_combinations;
     std::vector<std::string> sources;
+    std::vector<std::string> limitations = {};
 };
 
 enum class Status {

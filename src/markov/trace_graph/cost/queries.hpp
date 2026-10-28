@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -31,11 +32,13 @@ public:
     std::size_t residual_evaluations() const { return source_delays_.size(); }
     std::size_t cpu_residual_evaluations() const { return source_cpu_evaluations_; }
     std::span<const source::CpuInterval> source_cpu_gaps() const { return source_cpu_gaps_; }
+    const std::set<std::size_t> & limited_models() const { return limited_models_; }
 
 private:
     const Models & models_;
     const source::SourceContext * source_;
     std::map<planning::Work, Response> responses_;
+    std::set<std::size_t> limited_models_;
     std::vector<std::optional<Response>> source_responses_;
     std::map<graph::NodeId, Response> source_delays_;
     std::vector<source::CpuInterval> source_cpu_gaps_;
