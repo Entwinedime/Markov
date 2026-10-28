@@ -55,6 +55,14 @@ class DisaggregationObservation:
         }
         return manager
 
+    def poll_readiness(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.recording.current_scope.get() is None:
+            return original(*args, **kwargs)
+
+        # Native status consensus selects requests; the target controller owns that decision.
+        with self.recording.scope("ReadinessPoll", control_only=True, path=original.__qualname__):
+            return original(*args, **kwargs)
+
     @staticmethod
     def request_metadata(request: Any, capacity: int) -> dict[str, Any]:
         prompt = len(request.origin_input_ids)
@@ -238,6 +246,7 @@ class DisaggregationObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group": self.poll_readiness,
             "concurrent.futures.ThreadPoolExecutor.submit": self.submit,
             "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager": self.registration,
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._init_kv_manager": self.registration,
