@@ -106,7 +106,7 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     case ServingStep::Batch:
     case ServingStep::Model: {
         const auto inputs = prepare(batch, action.lane);
-        const auto output = model(batch, inputs);
+        const auto output = model(batch, inputs.ports.outputs);
         return complete(batch, effects, action.lane, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), action.step == ServingStep::Model);
     }
     case ServingStep::Select:
@@ -152,7 +152,7 @@ RankProgram RankStructure::select(const Batch & batch, std::size_t lane) {
     return { std::nullopt, completion, {} };
 }
 
-std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, std::size_t lane) {
+TargetRegion RankStructure::prepare(const Batch & batch, std::size_t lane) {
     const auto begin = shared_.regions.size();
     merge_pages(batch);
     const auto columns = batch_operands(batch, settings_.page_size);
@@ -224,6 +224,7 @@ std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, s
     free_pages_ = prepared.outputs.at("free_pages");
     request_map_ = prepared.outputs.at("request_map");
     if (coordinates_) graph_.append("batch_coordination", phase, {});
+    const auto schedule = graph_.composition().value();
     graph_.end_composition(prepared.outputs);
 
     // Preparation owns model inputs; a P-only rank may never expose a batch-filter template.
@@ -231,7 +232,11 @@ std::map<std::string, std::size_t> RankStructure::prepare(const Batch & batch, s
     inputs.erase("free_pages");
     inputs.erase("request_map");
     stamp(begin);
-    return inputs;
+    return {
+        schedule,
+        { {}, std::move(inputs) },
+        {}
+    };
 }
 
 TargetRegion RankStructure::model(const Batch & batch, const std::map<std::string, std::size_t> & inputs) {
@@ -573,21 +578,24 @@ RankMessage RankStructure::message(const std::string & role, const Batch & batch
     return { std::move(result), std::move(arguments) };
 }
 
-void RankStructure::wait_message(const std::string & channel, const Batch & batch, const RankMessage & message) {
+std::vector<std::size_t> RankStructure::wait_message(const std::string & channel, const Batch & batch, const RankMessage & message) {
     const auto begin = shared_.regions.size();
+    std::vector<std::size_t> completions;
     const auto phase = batch.phase == Phase::Prefill ? "prefill" : "decode";
     for (const auto & [name, value] : message.region.ports.outputs) {
         if (!name.starts_with("wire.")) continue;
 
         // Work.wait observes the actual transmitted slice, while its invocation retains full payload dimensions.
-        graph_.append("pipeline_wait_" + channel + "_" + name.substr(5),
-                      phase,
-                      message.invocation,
-                      {
-                          { "tensor", value }
+        const auto wait = graph_.append("pipeline_wait_" + channel + "_" + name.substr(5),
+                                        phase,
+                                        message.invocation,
+                                        {
+                                            { "tensor", value }
         });
+        completions.push_back(shared_.execution.region_call(wait.region).returned);
     }
     stamp(begin);
+    return completions;
 }
 
 std::size_t RankStructure::receive_result(const Batch & batch, std::size_t sampled_tokens) {

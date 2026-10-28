@@ -170,7 +170,10 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
 
     for (auto region = region_begin; region < graph_.regions.size(); ++region) {
         graph_.regions[region]["batch"] = action.flow;
-        graph_.regions[region]["action"] = action.task.sequence;
+        graph_.regions[region]["task"] = {
+            {    "group",    action.task.group },
+            { "sequence", action.task.sequence }
+        };
     }
     if (action.step == ServingStep::Model || action.step == ServingStep::Batch) ++batches_;
     ++actions_;

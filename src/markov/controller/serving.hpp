@@ -16,10 +16,9 @@
 namespace markov {
 
 // Planning is read-only; start and finish commit allocation and completion effects.
+// Requests are validated in arrival order; the caller keeps resources and replay alive.
 class ServingController final : public ServingControl {
 public:
-
-    // Requests are validated in arrival order; the caller keeps resources and replay alive.
     ServingController(ServingSettings settings, std::vector<Request> requests, KvPool & resources, std::string group, std::size_t stages,
                       std::size_t batch_limit, BatchReplay * replay = nullptr);
 
@@ -27,7 +26,7 @@ public:
 
     // Submit the current plan only after its target graph has been assembled successfully.
     void start(const ServingAction & action) override;
-    void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) override;
+    void finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) override;
 
     std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const override;
     bool done() const override;

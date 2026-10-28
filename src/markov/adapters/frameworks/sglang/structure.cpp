@@ -78,7 +78,22 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     const auto region_begin = graph_.regions.size();
     std::vector<RankWork> work;
     BatchProgram result{ std::nullopt, {}, {} };
-    if (action.step == ServingStep::Stage) result = pipeline_stage(action, work);
+    const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute || action.step == ServingStep::Send
+                       || action.step == ServingStep::Receive || action.step == ServingStep::Wait
+                       || ((action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
+    if (local) {
+        for (const auto rank : group.members) {
+            auto program = rank_step(action, rank, work);
+            if (program.publication) {
+                if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
+                result.publication = program.publication;
+            }
+            if (rank == group.members.front()) result.returned_pages = std::move(program.returned_pages);
+            result.completions.insert(result.completions.end(), program.completions.begin(), program.completions.end());
+            result.values.merge(program.values);
+        }
+    }
+    else if (action.step == ServingStep::Stage) result = pipeline_stage(action, work);
     else if (action.step == ServingStep::ReadResult) result = read_result(action, work);
     else if (action.step == ServingStep::Result) result = pipeline_result(action, work);
     else if ((action.step == ServingStep::Batch || action.step == ServingStep::Model) && topology_.stage_count(instance_.id) > 1) {
@@ -116,11 +131,16 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
 
     for (std::size_t region = region_begin; region < graph_.regions.size(); ++region) {
         graph_.regions[region]["batch"] = action.flow;
-        graph_.regions[region]["action"] = action.task.sequence;
+        graph_.regions[region]["task"] = {
+            {    "group",    action.task.group },
+            { "sequence", action.task.sequence }
+        };
         graph_.regions[region]["lane"] = action.lane;
     }
     ++action_count_;
-    if (action.step == ServingStep::Batch || action.step == ServingStep::Model || action.stage == 0) ++batch_count_;
+    if (action.step == ServingStep::Batch || action.step == ServingStep::Model
+        || ((action.step == ServingStep::Stage || action.step == ServingStep::Compute) && action.stage == 0))
+        ++batch_count_;
     operation_count_ += graph_.operations.size() - operation_begin;
     node_count_ += graph_.execution.nodes().size() - node_begin;
     dependency_count_ += graph_.execution.dependencies().size() - dependency_begin;
@@ -128,123 +148,178 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     return result;
 }
 
-BatchProgram ServingStructure::pipeline_stage(const ServingAction & action, std::vector<RankWork> & work) {
+BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool handoff) {
+    const auto begin = graph_.operations.size();
     const auto & batch = action.work->batch;
+    auto & builder = *ranks_.at(rank);
+    if (action.step == ServingStep::Prepare) flows_.try_emplace(action.flow);
+    auto & flow = flows_.at(action.flow);
+    BatchProgram result{ std::nullopt, {}, {} };
+    switch (action.step) {
+    case ServingStep::Prepare: {
+        auto prepared = builder.prepare(batch, action.lane);
+        flow.inputs[rank] = std::move(prepared.ports.outputs);
+        result.completions.push_back(graph_.execution.region_call(prepared.region).returned);
+        break;
+    }
+    case ServingStep::Compute: {
+        auto model = builder.model(batch, flow.inputs.at(rank));
+        flow.inputs.erase(rank);
+        flow.outputs[rank] = std::move(model.ports.outputs);
+        flow.outputs[rank].erase("token_relay");
+        auto values = nlohmann::json::object();
+        for (const auto & [name, value] : flow.outputs.at(rank)) values[name] = graph_.types.at(value);
+        result.values.emplace(std::to_string(rank), std::move(values));
+        result.completions.push_back(graph_.execution.region_call(model.region).returned);
+        break;
+    }
+    case ServingStep::Send: {
+        auto & payload = flow.payloads[rank][action.channel];
+        if (action.channel == "proxy") {
+
+            // A stage sends its computed proxy, not the proxy received from its predecessor.
+            payload.clear();
+            auto & output = flow.outputs.at(rank);
+            for (auto item = output.begin(); item != output.end();) {
+                if (item->first.starts_with("proxy.")) {
+                    payload.emplace(item->first.substr(6), item->second);
+                    item = output.erase(item);
+                }
+                else ++item;
+            }
+        }
+        else if (payload.empty()) payload.emplace("next_token_ids", flow.outputs.at(rank).at("sampled_tokens"));
+        auto message = builder.message("pipeline_send_" + action.channel, batch, payload, true);
+        result.completions.push_back(graph_.execution.region_call(message.region.region).returned);
+        flow.messages[rank].emplace(action.channel, std::move(message));
+        break;
+    }
+    case ServingStep::Receive: {
+        const auto & members = topology_.parallel().group(rank, "pp").members;
+        const auto position = std::ranges::find(members, rank) - members.begin();
+        const auto sender = members[(static_cast<std::size_t>(position) + members.size() - 1) % members.size()];
+
+        // Native receive first obtains the sender's metadata; no fabricated model-specific dimensions are needed.
+        auto message = builder.message("pipeline_receive_" + action.channel, batch, flow.payloads.at(sender).at(action.channel), false);
+        flow.payloads[rank][action.channel] = std::move(message.region.ports.outputs);
+        if (action.channel == "proxy") {
+            for (const auto & [name, value] : flow.payloads.at(rank).at(action.channel)) flow.inputs.at(rank).emplace("proxy." + name, value);
+        }
+        result.completions.push_back(graph_.execution.region_call(message.region.region).returned);
+        break;
+    }
+    case ServingStep::Wait: {
+        auto & messages = flow.messages.at(rank);
+        result.completions = builder.wait_message(action.channel, batch, messages.at(action.channel));
+        messages.erase(action.channel);
+        if (messages.empty()) flow.messages.erase(rank);
+        break;
+    }
+    case ServingStep::ReadResult: {
+        const auto tokens = topology_.stage_count(instance_.id) == 1 ? flow.outputs.at(rank).at("sampled_tokens")
+                                                                     : builder.receive_result(batch, flow.payloads.at(rank).at("output").at("next_token_ids"));
+        flow.tokens[rank] = tokens;
+        result.completions.push_back(builder.begin_result(batch, tokens).value());
+        break;
+    }
+    case ServingStep::Result: {
+        const auto program = builder.complete(batch, action.work->effects, action.lane, flow.outputs.at(rank), flow.tokens.at(rank), handoff);
+        result.publication = program.publication;
+        result.returned_pages = program.returned_pages;
+        result.completions.push_back(program.completion);
+        flow.outputs.erase(rank);
+        flow.tokens.erase(rank);
+        break;
+    }
+    default:
+        throw std::logic_error("unknown local serving step");
+    }
+    work.push_back({ rank, begin, graph_.operations.size() });
+    if (flow.inputs.empty() && flow.outputs.empty() && flow.messages.empty()) flows_.erase(action.flow);
+    return result;
+}
+
+BatchProgram ServingStructure::pipeline_stage(const ServingAction & action, std::vector<RankWork> & work) {
+    auto step = action;
     const auto stage = action.stage.value();
     if (stage == 0) {
-        auto & flow = flows_.emplace(action.flow, FlowViews{}).first->second;
-
-        // Every rank encodes the same allocation once; only graph ports are retained per flow.
-        for (auto & [rank, builder] : ranks_) {
-            const auto begin = graph_.operations.size();
-            flow.inputs[rank] = builder->prepare(batch, action.lane);
-            work.push_back({ rank, begin, graph_.operations.size() });
-        }
+        step.step = ServingStep::Prepare;
+        for (const auto rank : instance_.members) rank_step(step, rank, work);
     }
-
-    auto & flow = flows_.at(action.flow);
     BatchProgram result{ std::nullopt, {}, {} };
     const auto & members = topology_.stage(instance_.id, stage).members;
     for (std::size_t peer = 0; peer < members.size(); ++peer) {
         const auto rank = members[peer];
-        const auto begin = graph_.operations.size();
-        const auto model = ranks_.at(rank)->model(batch, flow.inputs[rank]);
-        flow.inputs[rank].clear();
-        flow.outputs[rank] = model.ports.outputs;
-        flow.outputs[rank].erase("token_relay");
-        result.completions.push_back(graph_.execution.region_call(model.region).returned);
-        work.push_back({ rank, begin, graph_.operations.size() });
-
+        step.step = ServingStep::Compute;
+        auto model = rank_step(step, rank, work);
+        result.completions.insert(result.completions.end(), model.completions.begin(), model.completions.end());
+        result.values.merge(model.values);
         if (stage + 1 == topology_.stage_count(instance_.id)) continue;
-        std::map<std::string, std::size_t> payload;
-        for (const auto & [name, value] : model.ports.outputs) {
-            if (name.starts_with("proxy.")) {
-                payload.emplace(name.substr(6), value);
-                flow.outputs[rank].erase(name);
-            }
-        }
-        const auto send_begin = graph_.operations.size();
-        const auto sent = ranks_.at(rank)->message("pipeline_send_proxy", batch, payload, true);
-        ranks_.at(rank)->wait_message("proxy", batch, sent);
-        work.push_back({ rank, send_begin, graph_.operations.size() });
-        result.completions.push_back(graph_.execution.region_call(sent.region.region).returned);
 
-        const auto receiver = topology_.stage(instance_.id, stage + 1).members[peer];
-        const auto receive_begin = graph_.operations.size();
-        const auto received = ranks_.at(receiver)->message("pipeline_receive_proxy", batch, payload, false);
-        for (const auto & [name, value] : received.region.ports.outputs) flow.inputs[receiver].emplace("proxy." + name, value);
-        work.push_back({ receiver, receive_begin, graph_.operations.size() });
-        result.completions.push_back(graph_.execution.region_call(received.region.region).returned);
+        step.channel = "proxy";
+        step.step = ServingStep::Send;
+        auto sent = rank_step(step, rank, work);
+        step.step = ServingStep::Wait;
+        rank_step(step, rank, work);
+        result.completions.insert(result.completions.end(), sent.completions.begin(), sent.completions.end());
+        step.step = ServingStep::Receive;
+        auto received = rank_step(step, topology_.stage(instance_.id, stage + 1).members[peer], work);
+        result.completions.insert(result.completions.end(), received.completions.begin(), received.completions.end());
     }
     return result;
 }
 
 BatchProgram ServingStructure::read_result(const ServingAction & action, std::vector<RankWork> & work) {
-    const auto & flow = flows_.at(action.flow);
     BatchProgram result{ std::nullopt, {}, {} };
     for (const auto rank : instance_.members) {
-        const auto begin = graph_.operations.size();
-        result.completions.push_back(ranks_.at(rank)->begin_result(action.work->batch, flow.outputs.at(rank).at("sampled_tokens")).value());
-        work.push_back({ rank, begin, graph_.operations.size() });
+        auto program = rank_step(action, rank, work);
+        result.completions.insert(result.completions.end(), program.completions.begin(), program.completions.end());
     }
     return result;
 }
 
 BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std::vector<RankWork> & work) {
-    const auto & batch = action.work->batch;
-    const auto & flow = flows_.at(action.flow);
     const auto tp = topology_.tensor_parallel_size(instance_.id);
     const auto stages = topology_.stage_count(instance_.id);
+    auto step = action;
     BatchProgram result{ std::nullopt, {}, {} };
     std::map<std::size_t, std::size_t> completions;
     for (std::size_t tensor_rank = 0; tensor_rank < tp; ++tensor_rank) {
         const auto last = topology_.stage(instance_.id, stages - 1).members[tensor_rank];
-        if (stages == 1) {
-
-            // A local model result has no pipeline token ring.
-            const auto begin = graph_.operations.size();
-            const auto & outputs = flow.outputs.at(last);
-            auto program = ranks_.at(last)->complete(batch, action.work->effects, action.lane, outputs, outputs.at("sampled_tokens"), false);
-            if (program.publication) result.publication = program.publication;
-            if (last == instance_.members.front()) result.returned_pages = std::move(program.returned_pages);
-            completions.emplace(last, program.completion);
-            work.push_back({ last, begin, graph_.operations.size() });
-            continue;
+        step.channel = "output";
+        if (stages > 1) {
+            step.step = ServingStep::Send;
+            rank_step(step, last, work);
+            step.step = ServingStep::Wait;
+            rank_step(step, last, work);
         }
-        std::map<std::string, std::size_t> payload{
-            { "next_token_ids", flow.outputs.at(last).at("sampled_tokens") }
-        };
-        const auto send_begin = graph_.operations.size();
-        const auto sent = ranks_.at(last)->message("pipeline_send_output", batch, payload, true);
-        ranks_.at(last)->wait_message("output", batch, sent);
-        work.push_back({ last, send_begin, graph_.operations.size() });
-
-        // Native PP circulates sampled tokens through every stage before its local result is consumed.
         for (std::size_t stage = 0; stage < stages; ++stage) {
             const auto rank = topology_.stage(instance_.id, stage).members[tensor_rank];
-            const auto begin = graph_.operations.size();
-            const auto received = ranks_.at(rank)->message("pipeline_receive_output", batch, payload, false);
-            payload = received.region.ports.outputs;
-            const auto tokens = ranks_.at(rank)->receive_result(batch, payload.at("next_token_ids"));
-            auto program =
-                ranks_.at(rank)->complete(batch, action.work->effects, action.lane, flow.outputs.at(rank), tokens, action.step == ServingStep::Model);
+            if (stages > 1) {
+                step.step = ServingStep::Receive;
+                rank_step(step, rank, work);
+            }
+            if (!flows_.at(action.flow).tokens.contains(rank)) {
+                step.step = ServingStep::ReadResult;
+                rank_step(step, rank, work);
+            }
+            step.step = ServingStep::Result;
+            auto program = rank_step(step, rank, work, action.step == ServingStep::Model);
             if (program.publication) {
                 if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
                 result.publication = program.publication;
             }
             if (rank == instance_.members.front()) result.returned_pages = std::move(program.returned_pages);
-            completions.emplace(rank, program.completion);
+            completions.emplace(rank, program.completions.front());
             if (stage + 1 < stages) {
-                const auto forwarded = ranks_.at(rank)->message("pipeline_send_output", batch, payload, true);
-                ranks_.at(rank)->wait_message("output", batch, forwarded);
+                step.step = ServingStep::Send;
+                rank_step(step, rank, work);
+                step.step = ServingStep::Wait;
+                rank_step(step, rank, work);
             }
-            work.push_back({ rank, begin, graph_.operations.size() });
         }
     }
-
-    // PD readiness follows instance order, independently of the token ring's traversal.
     for (const auto rank : instance_.members) result.completions.push_back(completions.at(rank));
-    flows_.erase(action.flow);
     return result;
 }
 
@@ -285,6 +360,18 @@ void ServingStructure::live_state(GraphRoots & roots) {
         for (auto & [rank, output] : flow.outputs) {
             for (auto & [name, value] : output) roots.values.push_back(&value);
         }
+        for (auto & [rank, channels] : flow.payloads) {
+            for (auto & [channel, payload] : channels) {
+                for (auto & [name, value] : payload) roots.values.push_back(&value);
+            }
+        }
+        for (auto & [rank, messages] : flow.messages) {
+            for (auto & [channel, message] : messages) {
+                roots.regions.push_back(&message.region.region);
+                for (auto & [name, value] : message.region.ports.outputs) roots.values.push_back(&value);
+            }
+        }
+        for (auto & [rank, tokens] : flow.tokens) roots.values.push_back(&tokens);
     }
 }
 

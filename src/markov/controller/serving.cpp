@@ -175,7 +175,8 @@ BatchEffects ServingController::effects(const Batch & batch) const {
     return result;
 }
 
-void ServingController::finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) {
+void ServingController::finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) {
+    const auto & returned_pages = program.returned_pages;
     auto & lane = lanes_.at(action.lane);
     if (lane.flow->running != action.task) throw std::logic_error("completion does not belong to the in-flight action");
     if (completed_ns < last_event_ns_) throw std::invalid_argument("batch completion precedes submission");

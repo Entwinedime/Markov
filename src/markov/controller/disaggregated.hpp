@@ -21,16 +21,15 @@ struct DisaggregatedGroups {
 };
 
 // Request progress is unique; each instance independently owns its slots and KV residence.
+// Requests are validated in arrival order; the caller keeps both resource pools and replay alive.
 class DisaggregatedController final : public ServingControl {
 public:
-
-    // Requests are validated in arrival order; the caller keeps both resource pools and replay alive.
     DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups,
                             KvPool & prefill_resources, KvPool & decode_resources, BatchReplay * replay = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
     void start(const ServingAction & action) override;
-    void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) override;
+    void finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) override;
     std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const override;
     bool done() const override;
     std::size_t free_pages() const override;

@@ -3,6 +3,7 @@
 from array import array
 
 import zmq
+from markov_control.adapters.frameworks.sglang.workers import NativeStopped, StopInput
 from markov_control.peer import ControlPeer
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -17,9 +18,12 @@ class RequestInput:
     def recv_pyobj(self, flags):
         if self.arrivals is None:
             advance = self.peer.receive()
-            if advance["kind"] != "advance":
+            if advance["kind"] == "stop":
+                self.arrivals = iter([StopInput()])
+            elif advance["kind"] == "advance":
+                self.arrivals = iter(advance["arrivals"])
+            else:
                 raise ValueError("Native control expected an advance boundary")
-            self.arrivals = iter(advance["arrivals"])
 
         request = next(self.arrivals, None)
         if request is None:
@@ -27,6 +31,9 @@ class RequestInput:
             # End this native receive poll; the next poll waits for core progress.
             self.arrivals = None
             raise zmq.Again()
+
+        if isinstance(request, StopInput):
+            return request
 
         parameters = SamplingParams(max_new_tokens=request["output_tokens"], ignore_eos=True, temperature=0)
         parameters.normalize(None)
@@ -43,3 +50,14 @@ class RequestInput:
             token_ids_logprob=None,
             stream=True,
         )
+
+
+class NativeRequestReceiver:
+    def __init__(self, receiver) -> None:
+        self.receiver = receiver
+
+    def recv_requests(self):
+        requests = self.receiver.recv_requests()
+        if any(isinstance(request, StopInput) for request in requests):
+            raise NativeStopped()
+        return requests

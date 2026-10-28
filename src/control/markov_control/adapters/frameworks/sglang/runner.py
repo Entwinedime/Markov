@@ -3,6 +3,7 @@
 import torch
 from markov_control.adapters.frameworks.sglang.resources import PageAllocator, RequestSlots
 from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.layers.dp_attention import get_attention_tp_group, initialize_dp_attention
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -10,7 +11,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
 class UnexecutedModel(torch.nn.Module):
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, pp_proxy_tensors=None, **kwargs):
         raise RuntimeError("Model execution belongs to the core graph")
 
 
@@ -22,6 +23,9 @@ class MetadataRunner(ModelRunner):
 
     def load_model(self):
         self.model = UnexecutedModel()
+        self.model.start_layer, self.model.end_layer = get_pp_indices(
+            self.model_config.num_hidden_layers, self.pp_rank, self.pp_size
+        )
         self.dtype = self.model_config.dtype
         self.sliding_window_size = self.model_config.sliding_window_size
         self.weight_load_mem_usage = 0
@@ -35,14 +39,14 @@ class MetadataRunner(ModelRunner):
         # Native request/control collectives run on CPU; model collectives belong to the simulated graph.
         parallel_state.init_distributed_environment(
             backend="gloo",
-            world_size=self.tp_size,
-            rank=self.tp_rank,
+            world_size=self.tp_size * self.pp_size,
+            rank=self.pp_rank * self.tp_size + self.tp_rank,
             local_rank=0,
             distributed_init_method=self.rendezvous,
         )
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_size=self.pp_size,
             expert_model_parallel_size=self.moe_ep_size,
         )
         initialize_dp_attention(self.server_args, self.model_config)

@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace markov {
 
 enum class Phase { Prefill, Decode };
@@ -101,7 +103,7 @@ struct BatchWork {
     std::vector<KvPageCopy> transferred_pages{};
 };
 
-enum class ServingStep { Batch, Select, Stage, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };
+enum class ServingStep { Batch, Select, Stage, Prepare, Compute, Send, Receive, Wait, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };
 
 // Task identifies one decision; flow identifies the model iteration crossing its stages.
 struct ServingAction {
@@ -112,6 +114,7 @@ struct ServingAction {
     std::size_t lane;
     std::optional<std::size_t> stage;
     ServingStep step;
+    std::string channel{};
 
     bool commits_requests() const { return step == ServingStep::Batch || step == ServingStep::Result || step == ServingStep::Accept; }
     std::string_view step_name() const;
@@ -122,6 +125,9 @@ struct BatchProgram {
     std::optional<std::size_t> publication;
     std::vector<std::size_t> completions;
     std::vector<std::size_t> returned_pages;
+
+    // Native control consumes returned metadata; tensor values and device work remain in the graph.
+    std::map<std::string, nlohmann::json> values{};
 };
 
 } // namespace markov

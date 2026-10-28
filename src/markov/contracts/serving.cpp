@@ -45,6 +45,16 @@ std::string_view ServingAction::step_name() const {
         return "select";
     case ServingStep::Stage:
         return "stage";
+    case ServingStep::Prepare:
+        return "prepare";
+    case ServingStep::Compute:
+        return "compute";
+    case ServingStep::Send:
+        return "send";
+    case ServingStep::Receive:
+        return "receive";
+    case ServingStep::Wait:
+        return "wait";
     case ServingStep::ReadResult:
         return "read_result";
     case ServingStep::Result:

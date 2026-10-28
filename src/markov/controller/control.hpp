@@ -18,7 +18,7 @@ public:
 
     // Preparing native work may reserve resources; start accepts execution and finish commits completion effects.
     virtual void start(const ServingAction & action) = 0;
-    virtual void finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) = 0;
+    virtual void finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) = 0;
 
     virtual std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const = 0;
     virtual bool done() const = 0;

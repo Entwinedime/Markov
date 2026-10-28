@@ -45,8 +45,12 @@ private:
     struct FlowViews {
         std::map<std::size_t, std::map<std::string, std::size_t>> inputs;
         std::map<std::size_t, std::map<std::string, std::size_t>> outputs;
+        std::map<std::size_t, std::map<std::string, std::map<std::string, std::size_t>>> payloads;
+        std::map<std::size_t, std::map<std::string, RankMessage>> messages;
+        std::map<std::size_t, std::size_t> tokens;
     };
 
+    BatchProgram rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool handoff = false);
     BatchProgram pipeline_stage(const ServingAction & action, std::vector<RankWork> & work);
     BatchProgram read_result(const ServingAction & action, std::vector<RankWork> & work);
     BatchProgram pipeline_result(const ServingAction & action, std::vector<RankWork> & work);

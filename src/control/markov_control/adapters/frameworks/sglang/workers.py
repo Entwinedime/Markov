@@ -1,7 +1,7 @@
-"""Run native TP participants while applying each shared resource action once."""
+"""Run independent native groups while applying each group's resource action once."""
 
 import json
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import ExitStack
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -14,22 +14,32 @@ from markov_control.adapters.runtimes.cpu import CpuDeclarations
 from markov_control.peer import ControlPeer
 
 
+class NativeStopped(Exception):
+    """The core ended serving at a native request boundary."""
+
+
+@dataclass
+class StopInput:
+    pass
+
+
 class WorkerPeer(ControlPeer):
     def __init__(self, connection) -> None:
         self.connection = connection
+        self.context = {}
 
     def exchange(self, operation, message=None):
         self.connection.send((operation, message))
         return self.connection.recv()
 
     def send(self, message) -> None:
-        self.exchange("send", message)
+        self.exchange("send", {**self.context, **message})
 
     def receive(self):
         return self.exchange("receive")
 
     def call(self, kind: str, **parameters):
-        return self.exchange("call", {"kind": kind, **parameters})
+        return self.exchange("call", {**self.context, "kind": kind, **parameters})
 
 
 class NativeWorkers:
@@ -44,21 +54,21 @@ class NativeWorkers:
             # Prediction consumes metadata; weights and device work stay in the simulated graph.
             Path(directory, "config.json").write_text(json.dumps(source["model_config"]))
             connections, children = [], []
-            for _ in range(source["tp"]):
+            for _ in range(source["tp"] * source["pp"]):
                 parent, child = Pipe()
                 connections.append(resources.enter_context(parent))
                 children.append(resources.enter_context(child))
             context = multiprocessing.start_processes(
                 cls.worker,
                 args=(source, configuration["settings"], directory, kernel_python, children),
-                nprocs=source["tp"],
+                nprocs=source["tp"] * source["pp"],
                 start_method="spawn",
                 join=False,
             )
             for child in children:
                 child.close()
             try:
-                NativeCalls(peer, connections, context).run()
+                NativeCalls(peer, connections, context, source["tp"], configuration["groups"]).run()
             finally:
                 for process in context.processes:
                     if process.is_alive():
@@ -81,9 +91,13 @@ class NativeWorkers:
 
         peer = WorkerPeer(connections[rank])
         try:
-            scheduler = NativeScheduler(peer, settings, directory, source, rank)
+            from markov_control.adapters.frameworks.sglang.pipeline import PipelineScheduler
+
+            implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
+            scheduler = implementation(peer, settings, directory, source, rank)
             peer.send({"kind": "ready"})
             scheduler.run_event_loop()
+            peer.send({"kind": "stopped"})
         finally:
             parallel_state.destroy_model_parallel()
             parallel_state.destroy_distributed_environment()
@@ -100,10 +114,16 @@ class WorkerCall:
 class NativeCalls:
     """Keep worker calls suspended independently until their core response arrives."""
 
-    def __init__(self, peer, connections, context) -> None:
+    def __init__(self, peer, connections, context, tp, groups) -> None:
         self.peer = peer
         self.connections = connections
         self.context = context
+        self.tp = tp
+        self.groups = groups
+        self.packets = defaultdict(deque)
+        self.receivers = {}
+        self.closing = False
+        self.stopped = set()
         self.pending = {}
         self.ready = deque()
         self.awaiting = {}
@@ -111,21 +131,47 @@ class NativeCalls:
         self.polled = False
 
     def receive_worker(self, channel, rank, operation, message) -> None:
+        stage = rank // self.tp
+        members = tuple(self.connections[stage * self.tp : (stage + 1) * self.tp])
+        if operation in ("send_object", "receive_object"):
+            key = (message["source"], message["target"], message["channel"])
+            if operation == "send_object":
+                if key in self.receivers:
+                    self.receivers.pop(key).send(message["value"])
+                else:
+                    self.packets[key].append(message["value"])
+                channel.send(None)
+            elif self.closing and message["channel"] == "requests":
+                channel.send([StopInput()])
+            elif self.packets[key]:
+                channel.send(self.packets[key].popleft())
+            else:
+                self.receivers[key] = channel
+            return
         if operation == "receive":
             if rank != 0:
                 raise ValueError("Only the native input rank receives core arrivals")
-            self.ready.append(WorkerCall(operation, {"kind": "input"}, (channel,)))
-        elif message["kind"] in ("capacity", "free_slots"):
-
-            # Rank-local diagnostics are reads, not collective control decisions.
+            if self.closing:
+                channel.send({"kind": "stop"})
+            else:
+                self.ready.append(WorkerCall(operation, {"kind": "input"}, (channel,)))
+            return
+        message = {**message, "group": self.groups[stage]["id"]}
+        if message["kind"] in ("capacity", "free_slots"):
             self.ready.append(WorkerCall(operation, message, (channel,)))
-        else:
-            self.pending[channel] = (operation, message)
-            if len(self.pending) == len(self.connections):
-                if any(item != (operation, message) for item in self.pending.values()):
-                    raise ValueError(f"Native TP workers disagree on a core action: {list(self.pending.values())}")
-                self.ready.append(WorkerCall(operation, message, tuple(self.pending)))
-                self.pending.clear()
+            return
+        if message["kind"] == "ready":
+
+            # Initialization completes across the world before any participant starts its native loop.
+            members = tuple(self.connections)
+            message = {"kind": "ready"}
+        self.pending[channel] = (operation, message)
+        if all(participant in self.pending for participant in members):
+            if any(self.pending[participant] != (operation, message) for participant in members):
+                raise ValueError("Native TP workers disagree on a core action")
+            self.ready.append(WorkerCall(operation, message, members))
+            for participant in members:
+                del self.pending[participant]
 
     def receive_core(self) -> None:
         message = self.peer.receive()
@@ -133,6 +179,16 @@ class NativeCalls:
             if self.polled:
                 raise ValueError("Core issued an overlapping native poll")
             self.polled = True
+        elif message.get("kind") == "shutdown":
+            self.closing = True
+            for identity, call in list(self.awaiting.items()):
+                if call.operation == "receive":
+                    call.participants[0].send({"kind": "stop"})
+                    del self.awaiting[identity]
+            for key, channel in list(self.receivers.items()):
+                if key[2] == "requests":
+                    channel.send([StopInput()])
+                    del self.receivers[key]
         else:
             call = self.awaiting.pop(message["reply"])
             for channel in call.participants:
@@ -143,22 +199,34 @@ class NativeCalls:
             return
         if self.ready:
             call = self.ready.popleft()
+            if self.closing and call.operation == "receive":
+                call.participants[0].send({"kind": "stop"})
+                return
             identity = self.sequence
             self.sequence += 1
             self.peer.send({"kind": "call", "id": identity, "message": call.message})
             if call.operation == "send":
+                if call.message["kind"] == "stopped":
+                    self.stopped.update(call.participants)
                 for channel in call.participants:
                     channel.send(None)
             else:
                 self.awaiting[identity] = call
         else:
-            blocked = set(self.pending)
+            blocked = self.stopped | set(self.pending)
             for call in self.awaiting.values():
                 blocked.update(call.participants)
 
-            # At native input, the other TP ranks wait inside the native request broadcast.
-            input_wait = any(call.operation == "receive" for call in self.awaiting.values())
-            if not input_wait and len(blocked) != len(self.connections):
+            blocked.update(self.receivers.values())
+            input_waiters = {call.participants[0] for call in self.awaiting.values() if call.operation == "receive"}
+            input_waiters.update(channel for key, channel in self.receivers.items() if key[2] == "requests")
+
+            # Input rank waits represent only that stage's native TP broadcast, never all PP participants.
+            for stage in range(len(self.groups)):
+                members = self.connections[stage * self.tp : (stage + 1) * self.tp]
+                if members[0] in input_waiters:
+                    blocked.update(members)
+            if len(blocked) != len(self.connections):
                 return
             self.peer.send({"kind": "waiting"})
         self.polled = False

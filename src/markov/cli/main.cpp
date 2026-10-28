@@ -220,7 +220,6 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                             integer(configuration.at("max_prefill_tokens")) };
     const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
     if (stages <= 0) throw std::invalid_argument("pp must be positive");
-    if (native && stages != 1) throw std::invalid_argument("native pipeline control is not yet connected");
     if (replay && replay->lanes("model") > static_cast<std::size_t>(stages)) throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
     const auto batch_limit =
         configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
@@ -231,7 +230,9 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     const auto routes = expert_condition(configuration, input, assets.front());
     markov::RegionGraph graph;
     markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
-    markov::KvPool resources(requests.size(), settings);
+    std::vector<markov::KvPool> resources;
+    resources.reserve(static_cast<std::size_t>(stages));
+    for (std::int64_t stage = 0; stage < (native ? stages : 1); ++stage) resources.emplace_back(requests.size(), settings, expansion.page_reuse());
     markov::ControlStream peer(std::cin, std::cout);
     std::unique_ptr<markov::ServingControl> controller;
     if (native) {
@@ -242,14 +243,17 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
             { "model_config", implementation.at("model_config") },
             {        "dtype",        implementation.at("dtype") },
             {           "tp",      environment.at("logical_tp") },
-            {           "ep",      environment.at("logical_ep") }
+            {           "ep",      environment.at("logical_ep") },
+            {           "pp",      environment.at("logical_pp") }
         });
-        controller = std::make_unique<markov::NativeController>(settings, std::move(requests), resources, control_group, peer);
+        std::vector<markov::NativeParticipant> participants;
+        for (std::size_t stage = 0; stage < resources.size(); ++stage) participants.push_back({ topology.stage("model", stage).id, stage, resources[stage] });
+        controller = std::make_unique<markov::NativeController>(settings, std::move(requests), participants, static_cast<std::size_t>(batch_limit), peer);
     }
     else
         controller = std::make_unique<markov::ServingController>(settings,
                                                                  std::move(requests),
-                                                                 resources,
+                                                                 resources.front(),
                                                                  control_group,
                                                                  static_cast<std::size_t>(stages),
                                                                  static_cast<std::size_t>(batch_limit),

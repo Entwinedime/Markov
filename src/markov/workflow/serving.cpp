@@ -40,7 +40,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
     struct PendingWork {
         ServingAction action;
-        std::vector<std::size_t> returned_pages;
+        BatchProgram program;
         nlohmann::json decision;
     };
     std::map<TaskIdentity, PendingWork> pending;
@@ -58,6 +58,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
                 decision["lane"] = action->lane;
                 decision["stage"] = action->stage ? nlohmann::json(*action->stage) : nlohmann::json(nullptr);
                 decision["step"] = action->step_name();
+                if (!action->channel.empty()) decision["channel"] = action->channel;
                 decision["commits_requests"] = action->commits_requests();
                 decision["task"] = {
                     {    "group",    action->task.group },
@@ -88,9 +89,12 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
             // Keep the key before moving the snapshot; function argument evaluation must not move it first.
             const auto identity = action->task;
-            pending.emplace(identity, PendingWork{ std::move(*action), std::move(program.returned_pages), std::move(decision) });
+            pending.emplace(identity, PendingWork{ std::move(*action), std::move(program), std::move(decision) });
             continue;
         }
+
+        // A native participant can finish its control lifecycle without another graph action.
+        if (controller_.done() && pending.empty()) break;
 
         // Native control finishes in the idle interval, rather than after the next arrival.
         const auto arrival_ns = controller_.next_arrival_ns(executor_.now_ns());
@@ -125,12 +129,12 @@ nlohmann::json ServingWorkflow::run(bool details) {
         }
 
         // Publication does not release pages; result-processing completion commits those effects.
-        controller_.finish(work.action, work.returned_pages, event.time_ns);
+        controller_.finish(work.action, work.program, event.time_ns);
         if (details) {
             work.decision["completed_ns"] = event.time_ns;
             work.decision["completed_order"] = state_order++;
             work.decision["free_pages_after"] = controller_.free_pages();
-            work.decision["returned_pages"] = work.returned_pages;
+            work.decision["returned_pages"] = work.program.returned_pages;
         }
         if (details || work.action.commits_requests()) record_completion(result, work.decision, work.action, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));

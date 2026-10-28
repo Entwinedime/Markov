@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 from markov_control.adapters.frameworks.sglang.batches import BatchAllocation, NativeBatch
-from markov_control.adapters.frameworks.sglang.requests import RequestInput
+from markov_control.adapters.frameworks.sglang.requests import NativeRequestReceiver, RequestInput
 from markov_control.adapters.frameworks.sglang.runner import MetadataRunner
 from markov_control.peer import ControlPeer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -19,26 +19,31 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 class PublishedRequests:
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool) -> None:
         self.identities = set()
+        self.enabled = enabled
 
     def send_output(self, output, *args, **kwargs):
-        self.identities.update(output.rids)
+        if self.enabled:
+            self.identities.update(output.rids)
 
 
 class ResultReady:
-    def __init__(self, peer: ControlPeer) -> None:
+    def __init__(self, peer: ControlPeer, work) -> None:
         self.peer = peer
+        self.work = work
 
     def synchronize(self):
 
         # The native consumer waits for the observed result-read subgraph, not every device stream.
-        self.peer.call("read_result")
+        self.peer.call("read_result", **self.work)
 
 
 class NativeScheduler(Scheduler):
     def __init__(self, peer, settings, model_path: str, source, rank: int) -> None:
         self.peer = peer
+        self.control_rank = rank
+        self.control_round = 0
         model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri())
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog
         BatchAllocation(schedule_batch)
@@ -49,6 +54,8 @@ class NativeScheduler(Scheduler):
             dtype=source["dtype"].removeprefix("torch."),
             tp_size=source["tp"],
             ep_size=source["ep"],
+            pp_size=source["pp"],
+            pp_max_micro_batch_size=settings["microbatch_requests"],
             device="cpu",
             load_format="dummy",
             skip_tokenizer_init=True,
@@ -68,21 +75,34 @@ class NativeScheduler(Scheduler):
             args,
             PortArgs.init_new(args),
             gpu_id=0,
-            tp_rank=rank,
+            tp_rank=rank % source["tp"],
             moe_ep_rank=rank % source["ep"],
-            pp_rank=0,
+            pp_rank=rank // source["tp"],
             attn_cp_rank=0,
             moe_dp_rank=0,
             dp_rank=None,
         )
 
         # Preserve native receive, dispatch, selection, result processing and idle housekeeping.
-        self.request_receiver = replace(
-            self.request_receiver, recv_from_tokenizer=RequestInput(peer, self.model_config.vocab_size)
+        self.request_receiver = NativeRequestReceiver(
+            replace(self.request_receiver, recv_from_tokenizer=RequestInput(peer, self.model_config.vocab_size))
         )
         self.model_worker.forward_batch_generation = self.model_result
-        self.published = PublishedRequests()
+        self.published = PublishedRequests(self.ps.pp_rank == 0)
         self.output_streamer.send_to_detokenizer = self.published
+
+    def current_lane(self):
+        return 0
+
+    def get_next_batch_to_run(self):
+        self.peer.context = {"flow": self.control_round, "lane": self.current_lane()}
+        self.control_round += 1
+        self.peer.send({"kind": "begin"})
+        batch = super().get_next_batch_to_run()
+        if batch is not None:
+            batch.control_work = dict(self.peer.context)
+            self.peer.call("prepare")
+        return batch
 
     def update_running_batch(self, batch):
         batch.control_selection = True
@@ -98,7 +118,7 @@ class NativeScheduler(Scheduler):
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.ones(len(batch.reqs), dtype=torch.int64),
-            copy_done=ResultReady(self.peer),
+            copy_done=ResultReady(self.peer, dict(self.peer.context)),
         )
 
     @staticmethod
@@ -108,21 +128,28 @@ class NativeScheduler(Scheduler):
         return None
 
     def process_batch_result(self, batch, result):
-        self.published.identities.clear()
-        super().process_batch_result(batch, result)
-        completion = self.peer.call(
-            "result",
-            members=[
-                {
-                    "request": int(req.rid),
-                    "generated_tokens": len(req.output_ids),
-                    "finished": req.finished(),
-                    "emits_output": req.rid in self.published.identities,
-                }
-                for req in batch.reqs
-            ],
-        )
-        self.gracefully_exit = completion["done"]
+        previous = self.peer.context
+        self.peer.context = batch.control_work
+        try:
+            self.published.identities.clear()
+            super().process_batch_result(batch, result)
+            completion = self.peer.call(
+                "result",
+                members=[
+                    {
+                        "request": int(req.rid),
+                        "generated_tokens": len(req.output_ids),
+                        "finished": req.finished(),
+                        "emits_output": req.rid in self.published.identities,
+                    }
+                    for req in batch.reqs
+                ],
+            )
+            self.gracefully_exit = completion["done"]
+            if self.ps.pp_size == 1:
+                self.peer.call("release_work")
+        finally:
+            self.peer.context = previous
 
     def on_idle(self):
         super().on_idle()

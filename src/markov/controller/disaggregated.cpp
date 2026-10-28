@@ -134,7 +134,9 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         }
         const auto & next = requests_[*waiting].input;
         if (next.arrival_ns <= now_ns && decode_.pages_for(next.prompt_tokens + (next.output_tokens - 1)) <= remaining) {
-            const std::array demands{ KvDemand{ *waiting, next.prompt_tokens } };
+            const std::array demands{
+                KvDemand{ *waiting, next.prompt_tokens }
+            };
             auto batch = decode_.plan(Phase::Prefill, demands);
             return action(ServingStep::Reserve, std::move(batch), {}, now_ns, next_task_);
         }
@@ -167,7 +169,9 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
             if (state.stage != RequestStage::Reserved
                 || prefill_.pages_for(state.input.prompt_tokens) > static_cast<std::int64_t>(prefill_.free_pages().size()))
                 continue;
-            const std::array demands{ KvDemand{ request, state.input.prompt_tokens } };
+            const std::array demands{
+                KvDemand{ request, state.input.prompt_tokens }
+            };
             auto batch = prefill_.plan(Phase::Prefill, demands);
             BatchEffects completion{ { { request, batch.members.front().slot, 1, state.input.prompt_tokens, false, false, {} } } };
             return action(ServingStep::Model, std::move(batch), std::move(completion), now_ns, state.flow);
@@ -234,7 +238,8 @@ void DisaggregatedController::start(const ServingAction & action) {
     ++next_task_;
 }
 
-void DisaggregatedController::finish(const ServingAction & action, std::span<const std::size_t> returned_pages, std::int64_t completed_ns) {
+void DisaggregatedController::finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) {
+    const auto & returned_pages = program.returned_pages;
     auto & busy = channel(action.step);
     if (busy != action.task || completed_ns < last_event_ns_) throw std::logic_error("completion does not belong to the pending PD action");
     busy.reset();
