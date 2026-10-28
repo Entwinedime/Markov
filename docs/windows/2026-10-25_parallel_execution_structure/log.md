@@ -2150,3 +2150,36 @@
 **验证：** 原3 matched/23 differences变为9 matched/17 differences，仅PP4的rank0–5新增matched；各有51个native stream等待，必要完成边无缺失/多余，起点外未绑定前沿为0，原rank6/7及TP1基线保持通过。26项逐批检查、未配对批次和批次排列完全不变，Mistral/P/D差异未放宽。累计native=0、processing 169.108643210s，低于1500s轮额度，各任务pending为空、自有容器已释放；Python在modeling Docker语法及Git diff检查通过，两个原独立报告未修改。简明结果及机器复核在本批results/stream-bindings.md、review.json，原图直接复用前批，未重复生成。
 
 **结论与限制：** PP4现有案例的不同交错保持已观察到的必要关系，取得限定开发资格，仍需新的完整独立验证。Mistral存在共享池状态差异；P4/D2原生Prefill为1+7成员两批，轻量控制器按请求执行，另有具名准备块外的root Schedule操作。尚未判断这些差异全部合法或错误，没有新增排除规则；模板入口还包括根role/模型入口，不能只按metadata.entrypoint删图。事实保存在results/remaining-boundaries.json。代码、文档、数据完成维护审查后分层提交推送；其他S8缺口及后续阶段不取消，性能层继续后置。
+
+
+## 2026-10-28 — S8-A：原生状态条件下的局部模板核对启动
+
+**范围：** 起点4b18070abe7ff6d2c23ac2013551ae8ca9ca641c已推送并核对远端。本批复用同六案例26rank，在既有公开expand入口下验证KV释放的局部变换，继续区分不同控制策略的共享池状态与模板错误。
+
+**改动：** 从原生kv_release调用的已记录参数/绑定生成291个具名输入；显式排除其derived_parameters声明的派生输出，让模板自行计算输出形状。按完整清单先运行全部展开，再复用操作、端口及依赖检查核对原生子图；不复制调度器、改预测图、以节点名过滤或新增业务验证入口。输入位于data/20261028T021745.846849Z_s8-a-native-state-contexts。
+
+**验证：** 六域各processing600s、临时16GiB/保留12GiB，轮总processing4000s、临时128GiB/保留96GiB，native次数和秒数为0；原资产和前批费用保持，失败完整收齐后再决定实现修改。已联查Invocation读取、派生参数/端口绑定、TemplateInstance和NativeEvidence，确认现有CLI可做独立局部展开，无须新建控制路径。
+
+**结论与限制：** 本批输入包含原生状态条件，只检验局部模板，不证明轻量控制器已正确推导这些条件，也不授予serving或策略等价。Mistral/P/D整体差异与新完整独立验证继续保持未完成，性能层后置。
+
+
+## 2026-10-28 — S8-A：局部核对完成与回归入口纠正
+
+**范围：** 291个固定输入全部展开成功后，抽取共用操作图比较，并收齐第一轮局部核对及回归调用结果；业务代码不变。
+
+**改动：** 将操作、端口、参数解析及内部依赖检查从serving比较中移至OperationComparison，serving配对与原生局部子图共用一份算法，不新增业务CLI或复制规则。291项局部结果已生成；26项serving回归因编排脚本向analyze传入相对路径，在导入比较器前失败，纠正为绝对路径后只补跑回归，复用已有局部结果。初次结果保存在comparisons-initial.json，费用累计。
+
+**验证：** 291项的操作、数据依赖、公开端口及根端口几何均一致；其中114 matched、177因局部范围外等待前沿保持partial，无结构differences。新的共用模块与serving模块在modeling Docker语法检查通过。首次26项路径错误不构成代码回归结论，原26份图、旧报告及预算保持不变。
+
+**结论与限制：** 当前已证明这些原生条件下的局部变换，仍未证明完整serving控制或全部外部完成关系。待26项实际回归及周期结构/所有权审查结束后交付，不把窗口外等待改成成功。
+
+
+## 2026-10-28 — S8-A：局部条件核对与周期维护完成
+
+**范围：** 291项局部展开/比较和26项serving回归全部结束；本批按五个实质代码批次的节奏完成全流程重点路径审查，范围为层次、所有权和交接，并非重新逐行审计全部125个业务文件。
+
+**改动：** serving比较负责请求/批次配对，共用OperationComparison负责操作、端口和内部依赖；七个移动算法经AST核对保留原行为，局部和整窗口不再各维护一份规则。业务代码零增量，example净增16行，未新增业务CLI、配置、适配分支或test。联查CLI/Invocation/TemplateInstance、控制器/KvPool、完成反馈、图/执行协议、框架展开及采集预算/发布；核心未发现adapter/workflow反向include，instrumentation/artifacts没有具体adapter导入或deprecated路径依赖。当前原生need_sort由disaggregation_mode决定，单实例Immediate和PD双侧DeferredSorted与现有实现对齐，没有据未来可能性增加分支。
+
+**验证：** 291项操作、内部数据依赖、公开及根端口几何一致；114 matched、177仅因起点外stream前沿保持partial，无结构differences。Mistral示例原生23页加3得到26，完整预测27页加3得到30；排除声明的派生输出后，原库在原生输入条件下正确生成26。26份serving报告与前批逐字段相同，仍9 matched/17 differences。Docker内两份Python语法、七算法AST、Git diff及原冻结报告内容检查通过；初次26项回归路径错误及费用保留，修正后未重复局部比较。累计native=0、processing 441.948665880s，六任务pending为空、自有容器已释放；消费后的291份完整展开图已删除，输入/规范事实引用/逐项比较/日志保留，简明结果在本批results/native-contexts.md，复核在review.json。
+
+**结论与限制：** 取得的是给定原生状态条件下的局部模板证据，数据相关释放页数仍作为局部输入，不证明控制器怎样推导这些条件。下一步按各自轨迹核对请求/token进度、槽位与KV守恒、外部完成及P/D工作范围，不以不同全局池状态的逐值相等判模板错，也不把局部一致当完整serving通过。计划方法、状态、说明与主流程已对齐，代码/文档/数据完成维护后分层提交推送；S8及后续阶段继续，性能层后置。
