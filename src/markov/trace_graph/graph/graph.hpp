@@ -10,7 +10,7 @@ namespace markov::trace_graph::graph {
 using NodeId = std::size_t;
 using Time = std::int64_t;
 
-enum class NodeKind { Service, ObservedWait, ProfilerOverhead, ResidualGap, Boundary };
+enum class NodeKind { Service, ObservedWait, ProfilerOverhead, ResidualGap, Boundary, Delay };
 enum class EdgeKind { ResourceOrder, ObservedFlow, ClientOrder, Submission, Synchronization, DataDependency };
 
 struct Node {

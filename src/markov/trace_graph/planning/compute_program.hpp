@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/planning/compute_plan.hpp"
+#include "markov/trace_graph/planning/native_calls.hpp"
 #include "markov/trace_graph/planning/program.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
@@ -20,6 +21,7 @@ struct FrameCompute {
 
 struct ComputeStats {
     std::size_t collective_services = 0, participant_arrivals = 0, queue_dependencies = 0;
+    std::size_t metadata_sequences = 0, native_operations = 0, dispatch_delays = 0;
     graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
     void add(const ComputeStats & other);
 };
@@ -41,19 +43,21 @@ public:
     const ComputeStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, Complete };
+    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, MetadataDone, Complete };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {
         std::size_t first, last;
         std::optional<std::size_t> collective;
         std::size_t participant;
+        std::optional<std::size_t> metadata = std::nullopt;
     };
     struct Frame {
         FrameCompute compute;
         std::vector<Segment> segments;
         std::size_t at = 0;
         std::optional<std::size_t> next;
+        std::vector<NativePlan> metadata;
     };
     struct Arrival {
         graph::Time time_ns;

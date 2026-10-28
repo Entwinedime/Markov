@@ -45,10 +45,13 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         compute[work.description].include(source.cpu_work_interval(id), work.end_ns - work.begin_ns);
     }
     Summary metadata;
+    std::size_t metadata_rules = 0, metadata_queues = 0;
     for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
         const auto & regions = observed.compute_frames[frame].metadata;
         const auto intervals = source.metadata_intervals(frame);
-        for (std::size_t i = 0; i < regions.size(); ++i) metadata.include(intervals[i], regions[i].end_ns - regions[i].begin_ns);
+        for (std::size_t i = 0; i < regions.size(); ++i) metadata.include(intervals[i], regions[i].region.end_ns - regions[i].region.begin_ns);
+        for (const auto & call : regions) metadata_rules += call.definition != nullptr;
+        for (const auto & resources : source.metadata_resources(frame)) metadata_queues += resources.has_value();
     }
     const auto describe = [](const Summary & summary) -> Json {
         return {
@@ -68,12 +71,14 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         descriptions.push_back(std::move(item));
     }
     return {
-        {      "compute_calls",std::move(descriptions)                               },
-        { "attention_metadata",      describe(metadata) },
-        {      "qualification",
+        {              "compute_calls",std::move(descriptions)                                       },
+        {         "attention_metadata",      describe(metadata) },
+        {             "metadata_rules",          metadata_rules },
+        { "metadata_resource_bindings",         metadata_queues },
+        {              "qualification",
          "Source caller intervals only: exclusive observed service, waits, gaps, and uncovered time are kept separate. "
          "Profiler correction is not applied; these are neither normal CPU costs nor a complete request partition. Device/worker work is not charged "
-         "here."                                       }
+         "here."                                               }
     };
 }
 

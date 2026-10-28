@@ -27,7 +27,7 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             }
             ++coverage[*response.coverage];
             bound.operations.push_back({
-                { *response.duration_ns, operation.resource, graph::NodeKind::Service },
+                { *response.duration_ns, operation.resource, operation.delay ? graph::NodeKind::Delay : graph::NodeKind::Service },
                 operation.completion
             });
         }

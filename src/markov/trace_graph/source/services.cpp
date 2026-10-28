@@ -9,6 +9,35 @@
 
 namespace markov::trace_graph::source {
 
+std::vector<std::optional<planning::CallResources>> call_resources(const Observations & observations, std::span<const CpuRegion> regions) {
+    std::vector<std::vector<Index>> submissions(observations.resources.size());
+    for (Index id = 0; id < observations.dependencies.size(); ++id) {
+        const auto & edge = observations.dependencies[id];
+        const auto resource = observations.points[edge.before].resource;
+        if (observations.resources[resource].kind == ResourceKind::CpuThread && edge.kind != DependencyKind::Synchronization)
+            submissions[resource].push_back(id);
+    }
+    for (auto & lane : submissions) std::ranges::sort(lane, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
+
+    std::vector<std::optional<planning::CallResources>> result;
+    for (const auto & region : regions) {
+        const auto & lane = submissions[region.resource];
+        auto at =
+            std::ranges::lower_bound(lane, region.begin_ns, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
+        std::set<Index> workers, devices;
+        for (; at != lane.end(); ++at) {
+            const auto & edge = observations.dependencies[*at];
+            if (observations.points[edge.before].time_ns >= region.end_ns) break;
+            const auto resource = observations.points[edge.after].resource;
+            if (observations.resources[resource].kind == ResourceKind::DeviceStream) devices.insert(resource);
+            else if (edge.kind == DependencyKind::Submission && resource != region.resource) workers.insert(resource);
+        }
+        if (workers.size() == 1 && devices.size() == 1) result.push_back(planning::CallResources{ region.resource, *workers.begin(), *devices.begin() });
+        else result.push_back(std::nullopt);
+    }
+    return result;
+}
+
 std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions) {
     // LaneBuilder emits each source resource contiguously, in observed order.
     // Retain only its index range, rather than another per-node timeline.
@@ -44,6 +73,7 @@ std::vector<CpuInterval> cpu_intervals(const Observations & observations, const 
                 measured.wait_ns += duration;
                 break;
             case graph::NodeKind::ResidualGap:
+            case graph::NodeKind::Delay:
                 measured.residual_ns += duration;
                 break;
             case graph::NodeKind::ProfilerOverhead:

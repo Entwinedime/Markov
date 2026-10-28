@@ -1,12 +1,14 @@
 #pragma once
 
 #include "markov/trace_graph/planning/compute.hpp"
+#include "markov/trace_graph/planning/native_calls.hpp"
 #include "markov/trace_graph/planning/token_paths.hpp"
 #include "markov/trace_graph/planning/work.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,6 +113,11 @@ struct CpuRegion {
     RecordRef record;
 };
 
+struct ObservedCallSequence {
+    CpuRegion region;
+    std::unique_ptr<const planning::CallSequence> definition;
+};
+
 struct ComputeFrame {
     planning::Phase phase;
     std::vector<Index> requests; // Indices into Observations::names, not requests.
@@ -118,7 +125,7 @@ struct ComputeFrame {
     std::optional<std::vector<double>> query_tokens;
     std::optional<double> page_tokens;
     RecordRef record;
-    std::vector<CpuRegion> metadata;
+    std::vector<ObservedCallSequence> metadata;
 };
 
 struct CollectiveGroup {

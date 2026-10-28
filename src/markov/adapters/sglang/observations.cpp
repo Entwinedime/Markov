@@ -1,6 +1,7 @@
 #include "markov/adapters/sglang/observations.hpp"
 
 #include "markov/adapters/sglang/dense.hpp"
+#include "markov/adapters/sglang/metadata.hpp"
 
 #include <algorithm>
 #include <array>
@@ -112,7 +113,10 @@ void ProbeReader::observe(const ProbeEvent & event) {
         if (frame == forward_frames_.end()) ++output_.counts["metadata_without_forward_context"];
         else {
             const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
-            output_.compute_frames[frame->second].metadata.push_back({ resource, event.begin_ns, event.end_ns, event.record });
+            output_.compute_frames[frame->second].metadata.push_back({
+                { resource, event.begin_ns, event.end_ns, event.record },
+                read_metadata(args)
+            });
         }
     }
 

@@ -37,13 +37,18 @@ void SourceContext::index_cpu_intervals() {
     std::vector<CpuRegion> regions;
     regions.reserve(observations_.work_observations.size());
     for (const auto & work : observations_.work_observations) regions.push_back({ work.resource, work.begin_ns, work.end_ns, work.record });
-    for (const auto & frame : observations_.compute_frames) regions.insert(regions.end(), frame.metadata.begin(), frame.metadata.end());
+    for (const auto & frame : observations_.compute_frames)
+        for (const auto & call : frame.metadata) regions.push_back(call.region);
 
     auto intervals = cpu_intervals(observations_, graph_, regions);
     auto at = observations_.work_observations.size();
+    const auto resources = call_resources(observations_, std::span(regions).subspan(at));
+    std::size_t resource = 0;
     for (const auto & frame : observations_.compute_frames) {
         metadata_intervals_.emplace_back(intervals.begin() + at, intervals.begin() + at + frame.metadata.size());
+        metadata_resources_.emplace_back(resources.begin() + resource, resources.begin() + resource + frame.metadata.size());
         at += frame.metadata.size();
+        resource += frame.metadata.size();
     }
     intervals.resize(observations_.work_observations.size());
     cpu_work_intervals_ = std::move(intervals);

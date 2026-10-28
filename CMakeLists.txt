@@ -41,6 +41,7 @@ add_library(markov_prediction
     src/markov/trace_graph/planning/cache_program.cpp
     src/markov/trace_graph/planning/storage.cpp
     src/markov/trace_graph/planning/compute_program.cpp
+    src/markov/trace_graph/planning/native_calls.cpp
     src/markov/trace_graph/simulation/program_execution.cpp
 )
 target_link_libraries(markov_prediction PUBLIC markov_source markov_cost)
@@ -55,6 +56,7 @@ add_library(markov_adapters
     src/markov/adapters/sglang/observations.cpp
     src/markov/adapters/sglang/dense.cpp
     src/markov/adapters/sglang/cache.cpp
+    src/markov/adapters/sglang/metadata.cpp
 )
 target_link_libraries(markov_adapters PUBLIC markov_prediction)
 if(TRACE_GRAPH_DEBUG)

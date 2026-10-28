@@ -78,7 +78,7 @@ void TraceReader::record(std::size_t position, const nlohmann::json & event) {
             }
             else ++output_.counts["unresolved_native_kernel_flow_pair"];
         }
-        const auto kind = category == "HostToDevice" ? DependencyKind::Submission : DependencyKind::Flow;
+        const auto kind = category == "HostToDevice" || category == "async_task_queue" ? DependencyKind::Submission : DependencyKind::Flow;
         output_.flows.push_back({ std::move(identity), point, phase == "s", kind });
         return;
     }

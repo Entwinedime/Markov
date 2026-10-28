@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,6 +39,7 @@ public:
     const DeviceService & device_service(Index work) const { return device_services_[work]; }
     const CpuInterval & cpu_work_interval(Index work) const { return cpu_work_intervals_[work]; }
     std::span<const CpuInterval> metadata_intervals(Index frame) const { return metadata_intervals_[frame]; }
+    std::span<const std::optional<planning::CallResources>> metadata_resources(Index frame) const { return metadata_resources_[frame]; }
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
     std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
@@ -54,6 +56,7 @@ private:
     std::vector<DeviceService> device_services_;
     std::vector<CpuInterval> cpu_work_intervals_;
     std::vector<std::vector<CpuInterval>> metadata_intervals_;
+    std::vector<std::vector<std::optional<planning::CallResources>>> metadata_resources_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;
     std::vector<std::vector<Index>> frame_queue_issues_;
     std::vector<std::vector<Index>> frame_collectives_;

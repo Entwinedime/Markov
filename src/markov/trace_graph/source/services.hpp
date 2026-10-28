@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/trace_graph/planning/native_calls.hpp"
 #include "markov/trace_graph/source/build.hpp"
 #include "markov/trace_graph/source/observations.hpp"
 
@@ -32,5 +33,7 @@ struct CpuInterval {
 // Slice the source's exclusive CPU partition. Parent wall intervals and nested
 // children are never added together; original profiled costs stay uncorrected.
 std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions);
+
+std::vector<std::optional<planning::CallResources>> call_resources(const Observations & observations, std::span<const CpuRegion> regions);
 
 } // namespace markov::trace_graph::source

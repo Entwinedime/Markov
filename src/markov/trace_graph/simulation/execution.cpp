@@ -116,7 +116,7 @@ void Execution::ready(graph::NodeId id) {
 
 void Execution::available(graph::NodeId id) {
     if (result_.states[id] == OperationState::Cancelled) return;
-    if (node(id).kind == graph::NodeKind::Boundary) {
+    if (node(id).kind == graph::NodeKind::Boundary || node(id).kind == graph::NodeKind::Delay) {
         start(id);
         return;
     }
@@ -161,7 +161,7 @@ void Execution::complete(graph::NodeId id) {
     result_.states[id] = OperationState::Complete;
     ++result_.executed;
     const auto resource = node(id).resource;
-    const bool service = node(id).kind != graph::NodeKind::Boundary;
+    const bool service = node(id).kind != graph::NodeKind::Boundary && node(id).kind != graph::NodeKind::Delay;
     if (service) {
         lanes_[resource].running.reset();
         lanes_[resource].previous = id;

@@ -61,7 +61,7 @@ struct SubsetExecution {
         }
         const auto & stats = program.stats();
         compute.add(stats);
-        service_operations += bound - stats.collective_services;
+        service_operations += bound - stats.collective_services - stats.native_operations;
         if (result.cost_gap) {
             issue = cost_gap_json(*result.cost_gap);
             return;
@@ -81,15 +81,19 @@ struct SubsetExecution {
             {    "participant_arrivals",                          compute.participant_arrivals },
             {     "participant_wait_ns",                           compute.participant_wait_ns },
             { "maximum_arrival_span_ns",                       compute.maximum_arrival_span_ns },
+            {      "metadata_sequences",                            compute.metadata_sequences },
+            {       "native_operations",                             compute.native_operations },
+            {         "dispatch_delays",                               compute.dispatch_delays },
             {                "coverage",                                              coverage },
             {         "logical_queries",                                              requests },
             {    "response_evaluations",                                           evaluations },
             {                   "issue",                                                 issue },
             {           "e2e_predicted",                                                 false },
             {           "qualification",
-             "Known compute with blocking collective rendezvous and preserved intra-segment stream order. All participants share the latest collective "
-             "completion; per-rank completion spread is omitted. Placement changes, other cross-stream data, cache and CPU dependencies remain incomplete; "
-             "no frame or E2E latency is reported."                                           }
+             "Known compute and attention metadata with caller/worker/device dependencies and blocking collective rendezvous. Metadata completes before "
+             "the device-only body; body CPU overlap is not modeled. Idle synchronization approximates ready-state service, not wake-up under load. All "
+             "participants share the latest collective completion. Placement changes, other cross-stream data, cache and remaining CPU dependencies are "
+             "incomplete; no frame or E2E latency is reported."                               }
         };
     }
 };
@@ -160,8 +164,9 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {       "response_evaluations",                                       queries.evaluations() - evaluation_begin },
         {              "e2e_predicted",                                                                          false },
         {              "qualification",
-         "Cache I/O and the known compute subset only. Symmetric participant services and dedicated copy queues are assumed. Query/admission and other CPU, "
-         "other cross-stream dependencies remain omitted; blocking collective inputs are joined explicitly. All participants share the latest collective "
+         "Cache I/O, known compute and attention metadata only. Metadata includes caller/worker/device work; its final join precedes the device-only body. "
+         "Idle synchronization approximates ready-state service, not wake-up under load. Symmetric participant services and dedicated copy queues are "
+         "assumed. Query/admission, body CPU and other cross-stream dependencies remain incomplete. All participants share the latest collective "
          "completion, omitting per-rank completion spread. No HTTP latency is reported."                              }
     };
     const auto & compute = program.compute_stats();
@@ -170,6 +175,11 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {    "participant_arrivals",    compute.participant_arrivals },
         {     "participant_wait_ns",     compute.participant_wait_ns },
         { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
+    };
+    report["metadata_execution"] = {
+        {       "sequences", compute.metadata_sequences },
+        {      "operations",  compute.native_operations },
+        { "dispatch_delays",    compute.dispatch_delays }
     };
     if (const auto * storage = program.storage()) {
         const auto & stats = storage->stats();

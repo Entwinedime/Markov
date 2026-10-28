@@ -14,6 +14,9 @@ void ComputeStats::add(const ComputeStats & other) {
     collective_services += other.collective_services;
     participant_arrivals += other.participant_arrivals;
     queue_dependencies += other.queue_dependencies;
+    metadata_sequences += other.metadata_sequences;
+    native_operations += other.native_operations;
+    dispatch_delays += other.dispatch_delays;
     participant_wait_ns += other.participant_wait_ns;
     maximum_arrival_span_ns = std::max(maximum_arrival_span_ns, other.maximum_arrival_span_ns);
 }
@@ -77,23 +80,51 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             frames_[tail->second].next = id;
             tail->second = id;
         }
-        frames_.push_back({ std::move(input), {}, 0, std::nullopt });
+        frames_.push_back({ std::move(input), {}, 0, std::nullopt, {} });
         auto & frame = frames_.back();
-        std::size_t first = 0;
+        struct Fence {
+            source::Time begin, end;
+            source::Index id;
+            bool metadata;
+        };
+        std::vector<Fence> fences;
         for (const auto call_id : source.frame_collectives(frame.compute.frame)) {
             const auto & call = observed.collectives[call_id];
+            fences.push_back({ call.begin_ns, call.end_ns, call_id, false });
+        }
+        const auto & metadata = observed.compute_frames[frame.compute.frame].metadata;
+        const auto resources = source.metadata_resources(frame.compute.frame);
+        for (std::size_t i = 0; i < metadata.size(); ++i) {
+            if (!metadata[i].definition || !resources[i] || resources[i]->caller != participant) {
+                issue_ = "metadata_rule_or_resources_unavailable";
+                return;
+            }
+            fences.push_back({ metadata[i].region.begin_ns, metadata[i].region.end_ns, i, true });
+            const auto calls = metadata[i].definition->describe(observed.compute_frames[frame.compute.frame].phase, frame.compute.variables);
+            frame.metadata.emplace_back(calls, *resources[i]);
+        }
+        std::ranges::sort(fences, {}, &Fence::begin);
+        std::size_t first = 0;
+        for (const auto & fence : fences) {
+            auto last = first;
+            while (last < frame.compute.plan.operations.size()
+                   && observed.work_observations[frame.compute.plan.operations[last].source_operation].end_ns <= fence.begin)
+                ++last;
+            if (last < frame.compute.plan.operations.size()
+                && observed.work_observations[frame.compute.plan.operations[last].source_operation].begin_ns < fence.end) {
+                issue_ = "overlapping_compute_call_requires_explicit_ports";
+                return;
+            }
+
+            if (fence.metadata) {
+                frame.segments.push_back({ first, last, std::nullopt, 0, fence.id });
+                first = last;
+                continue;
+            }
+            const auto & call = observed.collectives[fence.id];
             const auto & group = observed.collective_groups[call.group];
             if (call.resource != participant) {
                 issue_ = "collective_and_compute_have_different_callers";
-                return;
-            }
-            auto last = first;
-            while (last < frame.compute.plan.operations.size()
-                   && observed.work_observations[frame.compute.plan.operations[last].source_operation].end_ns <= call.begin_ns)
-                ++last;
-            if (last < frame.compute.plan.operations.size()
-                && observed.work_observations[frame.compute.plan.operations[last].source_operation].begin_ns < call.end_ns) {
-                issue_ = "overlapping_compute_collective_requires_explicit_ports";
                 return;
             }
 
@@ -125,7 +156,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         }
         for (const auto & edge : frame.compute.plan.queue_dependencies) {
             if (segment_ids[edge.from] > segment_ids[edge.to]) {
-                issue_ = "source_queue_order_contradicts_collective_fence";
+                issue_ = "source_queue_order_contradicts_call_fence";
                 return;
             }
         }
@@ -155,6 +186,15 @@ void ComputeProgram::segment(ProgramRuntime & runtime, std::size_t id, std::opti
 void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simulation::Event & event) {
     auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
+    if (range.metadata) {
+        const auto & plan = frame.metadata[*range.metadata];
+        if (runtime.submit(plan.mutation(owner, runtime.next_node(), action(ActionKind::MetadataDone, id), event.identity))) {
+            ++stats_.metadata_sequences;
+            stats_.native_operations += plan.operations();
+            stats_.dispatch_delays += plan.delays();
+        }
+        return;
+    }
     if (!range.collective) {
         if (frame.next) segment(runtime, *frame.next, event.identity);
         else {
@@ -202,6 +242,10 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
             ++frames_[*peer].at;
             segment(runtime, *peer, event.identity);
         }
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::MetadataDone)) {
+        ++frames_[event.action.subject].at;
+        segment(runtime, event.action.subject, event.identity);
     }
     else complete_ = true;
 }

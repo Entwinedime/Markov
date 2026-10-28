@@ -45,7 +45,7 @@ void Observations::normalize_resources() {
     for (auto & work : work_observations) work.resource = canonical_resource(work.resource);
     for (auto & call : collectives) call.resource = canonical_resource(call.resource);
     for (auto & frame : compute_frames)
-        for (auto & region : frame.metadata) region.resource = canonical_resource(region.resource);
+        for (auto & call : frame.metadata) call.region.resource = canonical_resource(call.region.resource);
 }
 
 Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe) {

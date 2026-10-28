@@ -21,6 +21,7 @@ struct PlannedOperation {
     // explicitly cost-free; missing work is never represented by a null pointer.
     std::variant<Boundary, std::reference_wrapper<const Work>> cost;
     std::optional<simulation::Action> completion = std::nullopt;
+    bool delay = false; // Readiness latency; it does not occupy a service resource.
 };
 
 struct PlannedMutation {
