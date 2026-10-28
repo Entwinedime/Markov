@@ -111,11 +111,12 @@ void SourceContext::index_cpu_intervals() {
     auto resources = call_resources(observations_, regions);
     for (const auto & frame : observations_.compute_frames) {
         preparation_intervals_.emplace_back(intervals.begin() + at, intervals.begin() + at + frame.preparations.size());
-        preparation_resources_.emplace_back(resources.begin() + at, resources.begin() + at + frame.preparations.size());
+        preparation_bindings_.emplace_back(std::make_move_iterator(resources.begin() + at),
+                                           std::make_move_iterator(resources.begin() + at + frame.preparations.size()));
         at += frame.preparations.size();
     }
-    resources.resize(observations_.work_observations.size());
-    compute_resources_ = std::move(resources);
+    compute_resources_.reserve(observations_.work_observations.size());
+    for (Index id = 0; id < observations_.work_observations.size(); ++id) compute_resources_.push_back(resources[id].unique_resources());
     intervals.resize(observations_.work_observations.size());
     cpu_work_intervals_ = std::move(intervals);
 }

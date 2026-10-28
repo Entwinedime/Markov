@@ -1,4 +1,5 @@
 #include "markov/adapters/sglang/allocation.hpp"
+#include "markov/adapters/sglang/kernel_preparation.hpp"
 
 #include <bit>
 #include <cmath>
@@ -188,15 +189,13 @@ NativeSequence ExtendAllocation::describe(Phase, const FrameInput & input, std::
         {}
     });
     NativeCall launch{ kernel, CallKind::Queued, { kernel } };
-    // The first launcher load shares its ABI bootstrap across constexpr values.
-    // Compilation and later binary loads retain the specialization domain.
-    launch.preparation = KernelPreparation{
-        { { "allocator.extend", "sgl_kernel_npu.alloc_extend_kernel:int64", "kernel_specialization" },specialization                                                                                                      },
-        {      { "runtime.triton.compile", "triton.ascend.alloc_extend", "caller_blocking_interval" }, specialization },
-        {   { "runtime.triton.first_load", "triton.ascend.alloc_extend", "caller_blocking_interval" },
-         { { "pointer_arguments", 5 }, { "pointer_element_bytes", 8 }, { "constant_arguments", 4 } }                 },
-        {                      { "runtime.triton.load", "triton.ascend", "caller_blocking_interval" }, specialization }
-    };
+    launch.preparation = triton_preparation("alloc_extend",
+                                            std::move(specialization),
+                                            {
+                                                {     "pointer_arguments", 5 },
+                                                { "pointer_element_bytes", 8 },
+                                                {    "constant_arguments", 4 }
+    });
     calls.push_back(std::move(launch));
     Work cast{
         { prefix + "output_int", "aten._to_copy:int64_to_int32", "device_service" },

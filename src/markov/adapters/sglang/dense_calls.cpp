@@ -1,4 +1,5 @@
 #include "markov/adapters/sglang/dense.hpp"
+#include "markov/adapters/sglang/kernel_preparation.hpp"
 
 #include <optional>
 #include <string>
@@ -10,7 +11,7 @@ namespace {
 
 using namespace trace_graph::planning;
 
-enum class Kind { Simple, Normalization, Attention, InputBuffers, EmbeddingMask, Inner, Sampling, Pruning, Reshape, RotaryTable };
+enum class Kind { Simple, FusedQkv, Normalization, Attention, InputBuffers, EmbeddingMask, Inner, Sampling, Pruning, Reshape, RotaryTable };
 
 class DenseCalls final : public CallSequence {
 public:
@@ -133,6 +134,16 @@ NativeSequence DenseCalls::describe(Phase phase, const FrameInput & input, std::
     const auto & operation = work.front();
     cpu(calls, operation.kind.operation + ".entry", caller_, operation.features);
     queued(calls, operation);
+    if (kind_ == Kind::FusedQkv) {
+        auto specialization = operation.features;
+        specialization.erase("triton_task_queue_enabled");
+        calls.back().preparation = triton_preparation("split_qkv_rmsnorm_rope",
+                                                      std::move(specialization),
+                                                      {
+                                                          { "pointer_bfloat16_arguments",  8 },
+                                                          {         "constant_arguments", 18 }
+        });
+    }
     cpu(calls, operation.kind.operation + ".return", caller_, operation.features);
     return { std::move(calls), std::nullopt };
 }
@@ -157,7 +168,10 @@ ComputeCalls read_dense_calls(const ProbeEvent & event, std::span<const ComputeP
     else if (name == "runtime.phase.rotary") caller = "sglang.RotaryEmbedding.forward_npu";
     else if (name == "runtime.phase.qkv_norm_rope") {
         // Direct Triton launches do not have the queued worker lifecycle.
-        if (!args.at("triton_task_queue_enabled").get<bool>()) return {};
+        if (!args.at("triton_task_queue_enabled").get<bool>() || args.at("input_dtype") != "torch.bfloat16" || args.at("query_weight_dtype") != "torch.bfloat16"
+            || args.at("sin_dtype") != "torch.bfloat16")
+            return {};
+        kind = Kind::FusedQkv;
         caller = "sgl_kernel_npu.split_qkv_rmsnorm_rope";
     }
     else if (name == "runtime.phase.attention") {

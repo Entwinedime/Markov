@@ -49,7 +49,7 @@ Json cpu_interval_summary(const source::SourceContext & source) {
     }
     struct Preparation {
         Summary intervals;
-        std::size_t rules = 0, resources = 0;
+        std::size_t rules = 0, resources = 0, queues = 0;
         std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> contexts;
     };
     std::map<std::string, Preparation> preparations;
@@ -58,14 +58,16 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         unsupported_frames += !source.frame_cpu_order_supported(frame);
         const auto & regions = observed.compute_frames[frame].preparations;
         const auto intervals = source.preparation_intervals(frame);
-        const auto resources = source.preparation_resources(frame);
+        const auto bindings = source.preparation_bindings(frame);
         for (std::size_t i = 0; i < regions.size(); ++i) {
             auto & item = preparations[regions[i].role];
             item.intervals.include(intervals[i], regions[i].region.end_ns - regions[i].region.begin_ns);
             item.rules += regions[i].definition != nullptr;
-            item.resources += resources[i].has_value();
-            if (resources[i]) {
-                const auto & r = *resources[i];
+            const auto resources = bindings[i].unique_resources();
+            item.resources += resources.has_value();
+            item.queues += bindings[i].workers.size() == 1;
+            if (resources) {
+                const auto & r = *resources;
                 ++item.contexts[{ r.caller, r.worker, r.device }];
             }
         }
@@ -94,6 +96,7 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         auto item = describe(preparation.intervals);
         item["rules"] = preparation.rules;
         item["native_resource_bindings"] = preparation.resources;
+        item["native_queue_bindings"] = preparation.queues;
         auto contexts = Json::array();
         for (const auto & [context, count] : preparation.contexts) {
             const auto [caller, worker, device] = context;
@@ -108,7 +111,19 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         preparation_report[role] = std::move(item);
     }
     std::size_t unmodeled_gap_work = 0;
-    for (source::Index id = 0; id < source.cpu_gaps().size(); ++id) unmodeled_gap_work += source.cpu_gap_has_unmodeled_work(id);
+    std::map<std::string, std::size_t> gap_followers;
+    for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
+        for (const auto & entry : source.frame_calls(frame)) {
+            if (!entry.gap_before || !source.cpu_gap_has_unmodeled_work(*entry.gap_before)) continue;
+            ++unmodeled_gap_work;
+            if (entry.kind == source::FrameCallKind::Preparation) ++gap_followers[observed.compute_frames[frame].preparations[entry.index].role];
+            else if (entry.kind == source::FrameCallKind::Collective) ++gap_followers[observed.collectives[entry.index].work.kind.operation];
+            else {
+                const auto & description = observed.work_descriptions[observed.work_observations[entry.index].description];
+                ++gap_followers[description.observed.empty() ? "view_only" : description.observed.front().kind.operation];
+            }
+        }
+    }
 
     return {
         {                                 "compute_calls",std::move(descriptions)                                                          },
@@ -116,6 +131,7 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         {                        "inter_call_cpu_regions",      source.cpu_gaps().size() },
         {             "frames_with_unsupported_cpu_order",            unsupported_frames },
         { "inter_call_regions_with_unmodeled_submissions",            unmodeled_gap_work },
+        {                "unmodeled_submission_followers",                 gap_followers },
         {                                 "qualification",
          "Source caller intervals only: exclusive observed service, waits, gaps, and uncovered time are kept separate. "
          "Profiler correction is not applied; these are neither normal CPU costs nor a complete request partition. Device/worker work is not charged "

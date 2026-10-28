@@ -35,9 +35,10 @@ Json preparation_report(const planning::ComputeStats & stats) {
 
 Json kernel_cache_report(const planning::PreparationCache & cache) {
     return {
-        {           "initial_state", cache.initial() ? Json(*cache.initial() == planning::KernelCacheInitial::Empty ? "empty" : "prepared") : Json(nullptr) },
-        { "planned_specializations",                                                                                                cache.specializations() },
-        {     "planned_first_loads",                                                                                                    cache.first_loads() }
+        {                   "initial_state", cache.initial() ? Json(*cache.initial() == planning::KernelCacheInitial::Empty ? "empty" : "prepared") : Json(nullptr) },
+        {         "planned_specializations",                                                                                                cache.specializations() },
+        {             "planned_first_loads",                                                                                                    cache.first_loads() },
+        { "planned_runtime_initializations",                                                                                        cache.runtime_initializations() }
     };
 }
 
@@ -66,6 +67,16 @@ Json cost_gap_json(const simulation::CostGap & gap, const source::SourceContext 
     return result;
 }
 
+Json cost_gaps_json(const std::vector<simulation::CostGap> & gaps, const source::SourceContext & source) {
+    auto items = Json::array();
+    for (const auto & gap : gaps) items.push_back(cost_gap_json(gap, source));
+    return {
+        {  "kind",              "binding_gaps" },
+        { "scope", "first_incomplete_mutation" },
+        {  "gaps",            std::move(items) }
+    };
+}
+
 struct SubsetExecution {
     explicit SubsetExecution(std::optional<planning::KernelCacheInitial> initial) : preparations(initial) {}
     planning::PreparationCache preparations;
@@ -92,8 +103,8 @@ struct SubsetExecution {
         const auto & stats = program.stats();
         compute.add(stats);
         service_operations += stats.compute_services;
-        if (result.cost_gap) {
-            issue = cost_gap_json(*result.cost_gap, source);
+        if (!result.cost_gaps.empty()) {
+            issue = cost_gaps_json(result.cost_gaps, source);
             return;
         }
 
@@ -190,7 +201,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         requests.push_back(std::move(item));
     }
     Json issue = nullptr;
-    if (result.cost_gap) issue = cost_gap_json(*result.cost_gap, source);
+    if (!result.cost_gaps.empty()) issue = cost_gaps_json(result.cost_gaps, source);
     else if (program.issue())
         issue = {
             { "kind", *program.issue() }

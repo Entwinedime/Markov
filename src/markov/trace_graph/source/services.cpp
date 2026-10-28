@@ -9,7 +9,12 @@
 
 namespace markov::trace_graph::source {
 
-std::vector<std::optional<planning::CallResources>> call_resources(const Observations & observations, std::span<const CpuRegion> regions) {
+std::optional<planning::CallResources> CallBinding::unique_resources() const {
+    if (workers.size() != 1 || devices.size() != 1) return std::nullopt;
+    return planning::CallResources{ caller, *workers.begin(), *devices.begin() };
+}
+
+std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions) {
     std::vector<std::vector<Index>> submissions(observations.resources.size());
     for (Index id = 0; id < observations.dependencies.size(); ++id) {
         const auto & edge = observations.dependencies[id];
@@ -19,21 +24,19 @@ std::vector<std::optional<planning::CallResources>> call_resources(const Observa
     }
     for (auto & lane : submissions) std::ranges::sort(lane, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
 
-    std::vector<std::optional<planning::CallResources>> result;
+    std::vector<CallBinding> result;
     for (const auto & region : regions) {
         const auto & lane = submissions[region.resource];
         auto at =
             std::ranges::lower_bound(lane, region.begin_ns, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
-        std::set<Index> workers, devices;
+        auto & binding = result.emplace_back(region.resource, std::set<Index>{}, std::set<Index>{});
         for (; at != lane.end(); ++at) {
             const auto & edge = observations.dependencies[*at];
             if (observations.points[edge.before].time_ns >= region.end_ns) break;
             const auto resource = observations.points[edge.after].resource;
-            if (observations.resources[resource].kind == ResourceKind::DeviceStream) devices.insert(resource);
-            else if (edge.kind == DependencyKind::Submission && resource != region.resource) workers.insert(resource);
+            if (observations.resources[resource].kind == ResourceKind::DeviceStream) binding.devices.insert(resource);
+            else if (edge.kind == DependencyKind::Submission && resource != region.resource) binding.workers.insert(resource);
         }
-        if (workers.size() == 1 && devices.size() == 1) result.push_back(planning::CallResources{ region.resource, *workers.begin(), *devices.begin() });
-        else result.push_back(std::nullopt);
     }
     return result;
 }

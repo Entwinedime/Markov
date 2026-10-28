@@ -13,7 +13,7 @@ ProgramExecution::ProgramExecution(planning::Program & program, cost::Queries & 
       clock_(resources, *this) {}
 
 std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation mutation) {
-    if (gap_) return std::nullopt;
+    if (!gaps_.empty()) return std::nullopt;
 
     Mutation bound{ mutation.owner, {}, std::move(mutation.dependencies) };
     std::map<cost::Coverage, std::size_t> coverage;
@@ -22,9 +22,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             const auto & response =
                 operation.source_operation ? costs_.query_source(work->get(), *operation.source_operation, operation.resource) : costs_.query(work->get());
             if (!response.duration_ns) {
-                gap_ = CostGap{ work->get(), response };
-                clock_.stop();
-                return std::nullopt;
+                if (seen_gaps_.insert(&response).second) gaps_.push_back({ work->get(), response });
+                continue;
             }
             ++coverage[*response.coverage];
             bound.operations.push_back({
@@ -43,9 +42,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
         else if (const auto * interval = std::get_if<planning::SourceCpuGap>(&operation.cost)) {
             const auto & response = costs_.query_source_cpu_gap(interval->interval, operation.resource);
             if (!response.duration_ns) {
-                gap_ = CostGap{ *interval, response };
-                clock_.stop();
-                return std::nullopt;
+                if (seen_gaps_.insert(&response).second) gaps_.push_back({ *interval, response });
+                continue;
             }
             ++coverage[*response.coverage];
             bound.operations.push_back({
@@ -59,6 +57,10 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
                 operation.completion
             });
     }
+    if (!gaps_.empty()) {
+        clock_.stop();
+        return std::nullopt;
+    }
     const auto begin = clock_.submit(std::move(bound));
     for (const auto & [kind, count] : coverage) coverage_[kind] += count;
     return begin;
@@ -68,10 +70,10 @@ void ProgramExecution::on_event(Execution &, const Event & event) { program_.on_
 
 ProgramResult ProgramExecution::run() {
     program_.start(*this);
-    if (!gap_) clock_.run();
-    if (!gap_ && !program_.complete()) throw std::runtime_error("No pending event can complete the generated program");
+    if (gaps_.empty()) clock_.run();
+    if (gaps_.empty() && !program_.complete()) throw std::runtime_error("No pending event can complete the generated program");
 
-    return { clock_.take_result(), std::move(gap_), std::move(coverage_) };
+    return { clock_.take_result(), std::move(gaps_), std::move(coverage_) };
 }
 
 } // namespace markov::trace_graph::simulation

@@ -1,6 +1,7 @@
 #include "markov/adapters/sglang/observations.hpp"
 
 #include "markov/adapters/sglang/allocation.hpp"
+#include "markov/adapters/sglang/input_preparation.hpp"
 
 #include "markov/adapters/sglang/dense.hpp"
 #include "markov/adapters/sglang/metadata.hpp"
@@ -86,6 +87,12 @@ void ProbeReader::observe(const ProbeEvent & event) {
                 read_extend_allocator(args),
                 "prefill_allocation"
             });
+            input_windows_.insert_or_assign(process,
+                                            InputWindow{
+                                                { resource, event.begin_ns, event.end_ns, event.record },
+                                                {},
+                                                {}
+            });
         }
     }
     if (name == "runtime.hicache.decode_allocator") {
@@ -112,6 +119,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
         if (allocation != pending_decode_allocations_.end() && event.begin_ns <= allocation->second.region.begin_ns
             && allocation->second.region.end_ns <= event.end_ns && args.at("token_per_req") == 1) {
             // The inner allocator record is emitted before its enclosing call.
+            input_windows_.insert_or_assign(process, InputWindow{ allocation->second.region, {}, {} });
             frame.preparations.push_back(std::move(allocation->second));
             pending_decode_allocations_.erase(allocation);
         }
@@ -126,6 +134,21 @@ void ProbeReader::observe(const ProbeEvent & event) {
         }
         forward_frames_[process] = output_.compute_frames.size();
         output_.compute_frames.push_back(std::move(frame));
+    }
+
+    if ((name == "runtime.hicache.extend_allocation" || name == "runtime.hicache.decode_allocation") && args.at("status") == "returned") {
+        const auto window = input_windows_.find(process);
+        if (window != input_windows_.end()) {
+            const auto & allocator = window->second.allocator;
+            window->second.table_write = CpuRegion{ allocator.resource, allocator.end_ns, event.end_ns, event.record };
+        }
+    }
+    if (name == "runtime.phase.input_buffers" && args.at("status") == "returned") {
+        const auto window = input_windows_.find(process);
+        if (window != input_windows_.end() && window->second.table_write) {
+            const auto & table = *window->second.table_write;
+            window->second.forward = CpuRegion{ table.resource, table.end_ns, event.begin_ns, event.record };
+        }
     }
 
     if (name == "hicache_cache_lookup_input_end" || name == "hicache_cache_finished_req_lifecycle_commit_end") {
@@ -153,7 +176,16 @@ void ProbeReader::observe(const ProbeEvent & event) {
         if (frame == forward_frames_.end()) ++output_.counts["metadata_without_forward_context"];
         else {
             const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
-            output_.compute_frames[frame->second].preparations.push_back({
+            auto & preparations = output_.compute_frames[frame->second].preparations;
+            const auto window = input_windows_.find(process);
+            if (window != input_windows_.end() && window->second.table_write && window->second.forward) {
+                preparations.push_back({ *window->second.table_write, read_request_table_write(args), "request_table_write" });
+                preparations.push_back({ *window->second.forward, read_forward_inputs(args), "forward_inputs" });
+                input_windows_.erase(window);
+            }
+            else ++output_.counts["input_preparation_boundaries_unavailable"];
+            sequence_dtypes_[process] = args.at("sequence_dtype").get<std::string>();
+            preparations.push_back({
                 { resource, event.begin_ns, event.end_ns, event.record },
                 read_metadata(args),
                 "attention_metadata"
@@ -182,6 +214,22 @@ void ProbeReader::observe(const ProbeEvent & event) {
         "runtime.phase.rotary",           "runtime.phase.rotary_table",      "runtime.phase.qkv_norm_rope",
         "runtime.phase.logits_output",    "runtime.phase.logits_pruning",    "runtime.phase.greedy_sampling"
     };
+    if (name == "runtime.phase.logits_output" && args.at("status") == "returned") logits_output_ends_[process] = event.end_ns;
+    if (name == "runtime.phase.greedy_sampling" && args.at("status") == "returned") {
+        const auto frame = forward_frames_.find(process);
+        if (frame != forward_frames_.end() && output_.compute_frames[frame->second].phase == trace_graph::planning::Phase::Prefill) {
+            const auto before = logits_output_ends_.find(process);
+            if (before != logits_output_ends_.end()) {
+                const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+                output_.compute_frames[frame->second].preparations.push_back({
+                    { resource, before->second, event.begin_ns, event.record },
+                    sampling_positions(sequence_dtypes_.at(process)),
+                    "sampling_positions"
+                });
+            }
+            else ++output_.counts["sampling_position_boundary_unavailable"];
+        }
+    }
     if (std::ranges::find(compute_roles, name) != compute_roles.end()) observe_compute(event);
     if (name == "runtime.phase.device_collective") observe_collective(event);
 }

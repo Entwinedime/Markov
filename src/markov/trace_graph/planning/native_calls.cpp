@@ -6,16 +6,21 @@
 
 namespace markov::trace_graph::planning {
 
-KernelUse PreparationCache::use(const Work & specialization, std::size_t caller) {
-    if (initial_ == KernelCacheInitial::Prepared || !prepared_[caller].insert(specialization).second) return KernelUse::Prepared;
+KernelUse PreparationCache::use(const KernelPreparation & preparation, std::size_t caller) {
+    if (initial_ == KernelCacheInitial::Prepared || !prepared_[caller].insert(preparation.specialization).second) return KernelUse::Prepared;
 
-    // shortcut: one launcher ABI per caller; separate ABI loading when another family is modeled.
-    return loaded_.insert(caller).second ? KernelUse::FirstLoad : KernelUse::Load;
+    return loaded_[caller].insert(preparation.first_load).second ? KernelUse::FirstLoad : KernelUse::Load;
 }
 
 std::size_t PreparationCache::specializations() const {
     std::size_t count = 0;
     for (const auto & [caller, keys] : prepared_) count += keys.size();
+    return count;
+}
+
+std::size_t PreparationCache::first_loads() const {
+    std::size_t count = 0;
+    for (const auto & [caller, launchers] : loaded_) count += launchers.size();
     return count;
 }
 
@@ -46,14 +51,17 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
 }
 
 bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations) {
+    const auto incoming = producer_device();
     for (const auto & call : calls) {
         if (call.preparation) {
             if (!preparations.initial()) return false;
             const auto & preparation = *call.preparation;
-            const auto use = preparations.use(preparation.specialization, resources.caller);
+            const auto initialized = preparations.runtime_initialized(resources.caller);
+            const auto use = preparations.use(preparation, resources.caller);
             if (use != KernelUse::Prepared) {
                 append(preparation.compilation, preparation.compilation.kind.timing_scope.c_str(), resources.caller, caller_);
-                const auto & load = use == KernelUse::FirstLoad ? preparation.first_load : preparation.load;
+                auto load = use == KernelUse::FirstLoad ? preparation.first_load : preparation.load;
+                if (use == KernelUse::FirstLoad) load.features["runtime_initialized"] = initialized ? 1 : 0;
                 append(load, load.kind.timing_scope.c_str(), resources.caller, caller_);
             }
         }
@@ -79,7 +87,7 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         worker_ = ready;
         for (const auto & launch : call.launches) {
             cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_);
-            const auto kernel = append(launch, "device_service", resources.device, device_);
+            const auto kernel = append(launch, "device_service", call.incoming_stream ? incoming.value() : resources.device, device_);
             steps_[kernel].source_operation = call.source_operation;
             depend(worker_, kernel);
         }

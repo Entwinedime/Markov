@@ -6,6 +6,7 @@
 #include "markov/trace_graph/source/observations.hpp"
 
 #include <optional>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -38,6 +39,12 @@ struct CpuInterval {
 std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions,
                                        const CpuCosts * costs = nullptr);
 
-std::vector<std::optional<planning::CallResources>> call_resources(const Observations & observations, std::span<const CpuRegion> regions);
+struct CallBinding {
+    Index caller;
+    std::set<Index> workers, devices;
+    std::optional<planning::CallResources> unique_resources() const;
+};
+
+std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions);
 
 } // namespace markov::trace_graph::source

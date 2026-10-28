@@ -6,7 +6,9 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <variant>
+#include <vector>
 
 namespace markov::trace_graph::simulation {
 
@@ -17,7 +19,7 @@ struct CostGap {
 
 struct ProgramResult {
     ExecutionResult execution;
-    std::optional<CostGap> cost_gap;
+    std::vector<CostGap> cost_gaps;
     std::map<cost::Coverage, std::size_t> coverage;
 };
 
@@ -39,7 +41,11 @@ private:
     planning::Program & program_;
     cost::Queries & costs_;
     Execution clock_;
-    std::optional<CostGap> gap_;
+    std::vector<CostGap> gaps_;
+
+    // Cached response addresses are stable for this cost session. Preserve
+    // discovery order in gaps_ while merging repeated missing work points.
+    std::set<const cost::Response *> seen_gaps_;
     std::map<cost::Coverage, std::size_t> coverage_;
 };
 

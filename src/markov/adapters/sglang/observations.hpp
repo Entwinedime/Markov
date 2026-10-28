@@ -34,6 +34,13 @@ private:
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;
+    struct InputWindow {
+        trace_graph::source::CpuRegion allocator;
+        std::optional<trace_graph::source::CpuRegion> table_write, forward;
+    };
+    std::map<std::string, InputWindow> input_windows_;
+    std::map<std::string, std::string> sequence_dtypes_;
+    std::map<std::string, trace_graph::source::Time> logits_output_ends_;
     struct EmbeddingWindow {
         trace_graph::source::Time lookup_end, reduction_begin;
     };

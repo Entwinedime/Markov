@@ -27,6 +27,10 @@ struct NativeCall {
     std::optional<Work> synchronization = std::nullopt;
     std::optional<std::size_t> source_operation = std::nullopt;
     std::optional<KernelPreparation> preparation = std::nullopt;
+
+    // A mixed sequence uses the incoming producer here and the frame stream
+    // for its other calls; one source binding cannot collapse both roles.
+    bool incoming_stream = false;
 };
 
 struct NativeSequence {
@@ -43,14 +47,16 @@ class PreparationCache {
 public:
     explicit PreparationCache(std::optional<KernelCacheInitial> initial) : initial_(initial) {}
     std::optional<KernelCacheInitial> initial() const { return initial_; }
-    KernelUse use(const Work & specialization, std::size_t caller);
+    KernelUse use(const KernelPreparation & preparation, std::size_t caller);
+    bool runtime_initialized(std::size_t caller) const { return initial_ == KernelCacheInitial::Prepared || loaded_.contains(caller); }
     std::size_t specializations() const;
-    std::size_t first_loads() const { return loaded_.size(); }
+    std::size_t first_loads() const;
+    std::size_t runtime_initializations() const { return loaded_.size(); }
 
 private:
     std::optional<KernelCacheInitial> initial_;
     std::map<std::size_t, std::set<Work>> prepared_;
-    std::set<std::size_t> loaded_;
+    std::map<std::size_t, std::set<Work>> loaded_;
 };
 
 // Framework rules describe changing work; the common compiler owns the caller,
@@ -75,6 +81,7 @@ public:
     PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
     std::size_t operations() const { return steps_.size(); }
     std::size_t delays() const;
+    std::optional<std::size_t> producer_device() const { return device_ ? std::optional(steps_[*device_].resource) : std::nullopt; }
 
 private:
     graph::NodeId append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay = false);

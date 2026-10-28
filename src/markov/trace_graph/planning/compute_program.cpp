@@ -109,7 +109,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             return;
         }
         const auto & preparations = observed.compute_frames[input.frame].preparations;
-        const auto preparation_resources = source.preparation_resources(input.frame);
+        const auto preparation_bindings = source.preparation_bindings(input.frame);
         std::size_t first = 0;
         Segment pending;
         for (const auto & entry : source.frame_calls(input.frame)) {
@@ -123,9 +123,10 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             }
             if (entry.kind == source::FrameCallKind::Preparation) {
                 const auto & preparation = preparations[entry.index];
-                const auto & binding = preparation_resources[entry.index];
-                if (!preparation.definition || !binding || binding->caller != resources->caller || binding->worker != resources->worker) {
-                    issue_ = "preparation_rule_or_resources_unavailable";
+                const auto & binding = preparation_bindings[entry.index];
+                if (!preparation.definition || binding.caller != resources->caller || binding.workers.size() != 1
+                    || *binding.workers.begin() != resources->worker) {
+                    issue_ = "preparation_rule_or_queues_unavailable";
                     return;
                 }
                 const auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
@@ -133,10 +134,24 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = calls.issue;
                     return;
                 }
+                auto placement = binding.unique_resources();
+                if (std::ranges::any_of(calls.calls, [](const NativeCall & call) { return call.incoming_stream; })) {
+                    const auto incoming = pending.plan.producer_device();
+                    if (!incoming
+                        || std::ranges::any_of(binding.devices, [&](std::size_t device) { return device != *incoming && device != resources->device; })) {
+                        issue_ = "preparation_stream_binding_unavailable";
+                        return;
+                    }
+                    placement = resources;
+                }
+                if (!placement) {
+                    issue_ = "preparation_device_binding_unavailable";
+                    return;
+                }
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.
-                if (!pending.plan.extend(calls.calls, *binding, preparations_)) {
+                if (!pending.plan.extend(calls.calls, *placement, preparations_)) {
                     issue_ = "kernel_cache_initial_state_unavailable";
                     return;
                 }

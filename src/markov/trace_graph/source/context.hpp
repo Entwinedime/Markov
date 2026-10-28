@@ -48,7 +48,7 @@ public:
     const CpuInterval & cpu_work_interval(Index work) const { return cpu_work_intervals_[work]; }
     const std::optional<planning::CallResources> & compute_resources(Index work) const { return compute_resources_[work]; }
     std::span<const CpuInterval> preparation_intervals(Index frame) const { return preparation_intervals_[frame]; }
-    std::span<const std::optional<planning::CallResources>> preparation_resources(Index frame) const { return preparation_resources_[frame]; }
+    std::span<const CallBinding> preparation_bindings(Index frame) const { return preparation_bindings_[frame]; }
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
     std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
@@ -71,7 +71,7 @@ private:
     std::vector<CpuInterval> cpu_work_intervals_;
     std::vector<std::optional<planning::CallResources>> compute_resources_;
     std::vector<std::vector<CpuInterval>> preparation_intervals_;
-    std::vector<std::vector<std::optional<planning::CallResources>>> preparation_resources_;
+    std::vector<std::vector<CallBinding>> preparation_bindings_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;
     std::vector<std::vector<Index>> frame_queue_issues_;
     std::vector<std::vector<Index>> frame_collectives_;
