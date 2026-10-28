@@ -1,7 +1,7 @@
 # 全量重构当前状态
 
 更新日期：2026-10-28。**阶段 0、A 已交付；B—D 联合实施中，完整目标预测尚未接通。**
-整体约 51%；B 约 75%、C 约 82%、D 约 70%、E 约 10%，F/G 尚未实施。这是剩余工作量的粗估，不代表精度。
+整体约 52%；B 约 75%、C 约 84%、D 约 70%、E 约 10%，F/G 尚未实施。这是剩余工作量的粗估，不代表精度。
 计划与判据在 [plan.md](plan.md)，实际行动与历史失败在 [log.md](log.md)；此处只保留当前资格和恢复起点。
 
 ## 阶段进度
@@ -19,16 +19,16 @@
 
 ## 基线和资产
 
-- 分支 rebuild；代码检查点 ff9cbfa 修正原生事件事实端口，前一维护基线为 b80b11f。仍是 B—D 中途结果，不能作为联合阶段交付。
+- 分支 rebuild；代码检查点 2908bbb 修正同步主机上传与确定性种子，前一维护基线为 e3e9f91。仍是 B—D 中途结果，不能作为联合阶段交付。
 - A 交付基线 08b6576；旧可运行布局 8668eec、旧文档归档 824b458、筹备基线 c5b1cf2 保留。deprecated 的 586 个本地参考文件不再跟踪，活动代码不调用归档实现。
-- 旧自有源码 88,814 行、546 文件；当前 90 文件、9,513 行，均含空行。归档不算瘦身，当前规模不代表完整实现。
-- 旧资产位于 data/archive，新输入与结果在 data/rebuild。旧搜索保持终止；本批只复核 base 的原生记录，没有新设备采集、target 真值读取、模型改参或数据清理。
+- 旧自有源码 88,814 行、546 文件；当前 90 文件、9,597 行，均含空行。归档不算瘦身，当前规模不代表完整实现。
+- 旧资产位于 data/archive，新输入与结果在 data/rebuild。旧搜索保持终止；本批新增一次有界 NPU 原生上传观察，没有 target 真值读取、模型改参或数据清理。
 
 ## 当前验证结论
 
-最新公开入口为 data/rebuild/source_device_causality/ports_verified/，checks.json 核对本批端口修正；输入准备的前批依据保留在 input_preparation_final/。
-32/64/128-token 三个目标已进入首个 Prefill 片段的成本绑定，各有 161 个不同工作/计时点缺模型；三个目标的缺失集合相同。
-这些是当前片段的查询点，不是 161 个 target 专用模型，也不是整条目标路径的完整补采清单。片段未提交、请求未完成，没有用给定成本补零强行推进。
+最新公开入口为 data/rebuild/input_preparation_semantics/verified/，checks.json 核对本批上传修正；source_device_causality/ports_verified/ 与 input_preparation_final/ 保留前批依据。
+32/64/128-token 三个目标已进入首个 Prefill 片段的成本绑定，各有 174 个不同工作/计时点缺模型，缺失集合相同；增加项来自补回种子上传及 worker 同步，未按目标误差增参。
+这些是当前片段的查询点，不是 174 个 target 专用模型，也不是整条目标路径的完整补采清单。片段未提交、请求未完成，没有用给定成本补零强行推进。
 
 输入准备已有证据，端口修正后仍保持：
 
@@ -42,8 +42,12 @@
 costs/input_preparation_import/ 保存样本、来源和导入修正。公开独立查询的九个已测准备点可返回中位响应，四个不符运行环境初始上下文的点明确域外。
 input_preparation_expected.json 保留独立源边界，input_preparation_cost_needs.json 只保存当前片段共享缺口；sampling_gap_observations.json、forward_input_flow_contexts.json 保留相关原生观察。
 
-本批最终入口约 92.8 秒、峰值约 2.38 GiB，单个 8 GiB/2 CPU 无设备/网络容器，来源只准备一次；这不是完整预测时间或提速成绩。
+本批最终入口约 93.0 秒、峰值约 2.37 GiB，单个 8 GiB/2 CPU 无设备/网络容器，来源只准备一次；原图/回放和 CPU 划分仅增加配置来源引用，其余不变。这不是完整预测时间或提速成绩。
 Release/Debug、格式及关联代码/文档/数据检查已完成。Decode 与融合 QKV 的新增准备目前只有静态、构建、源队列和独立成本查询依据，尚未经历目标数值执行。
+
+input_preparation_semantics/upload_capture/ 用独立小张量观察未固定主机内存的 NPU 上传：一次启动、5 次预热、30 次有效上传，覆盖四 dtype、五工作点及空闲/已有计算两种条件。
+30 条上传均有 worker 等流、Runtime@MemCopySync 和 caller 同步，没有设备上传任务；同捕获有 180 个计算任务。脚本计时约 6.1 秒（不含导入），保留约 2.51 MiB，设备已释放；profiler 停止状态警告保留，不授予完整捕获或正常 CPU 成本资格。
+目标生成这条同步主机路径，数据位置与完成节点所属资源分别维护；manifest 声明的 config_path 决定是否增加采样种子，缺设置依据不默认为关闭。native_plan_checks.json 是给定耗时的依赖检查，不是精度结果；cost_needs.json 保存修正后的共享缺口。
 
 ## 已有组件及边界
 
@@ -61,12 +65,12 @@ Ascend kernel_ascend/page_first_direct 按整批跨层 DMA 发布；查询/准�
 
 入口与响应尾部引用同一请求/前端的来源残余，不占 CPU 服务资源。串行请求依赖前一响应，drain 另等真实后台完成。
 响应仍接在选定计算全部完成之后；原生重叠提交、结果可读与返回之间的交接未完整表达，也未覆盖完整请求控制和跨流依赖。
-新增准备规则仍需核对完整原生子操作、上传阻塞语义及采样选项；旧 probe 对这些选项的声明不足，尚未授予完整语义资格。
+新增准备已核对当前 runtime 的未固定主机内存上传路径及配置决定的种子；其他采样选项、固定主机内存与不同 runtime 尚未授予完整语义资格。
 调用间 CPU 只在无未建模提交、无未表达等待、来源完整且同 caller 配方的区间保留残余近似；覆盖部分用校正，未覆盖部分保留原值，不能授予任意 shape 的 CPU 精度。
 
 ## 来源资格仍未完成
 
-显式来源为 data/rebuild/source_inputs/first_capture/profile_manifest.json，声明 8 文件、1,828,026,950 字节。
+显式来源为 data/rebuild/source_inputs/first_capture/profile_manifest.json，声明 8 个通道文件、1,828,026,950 字节，另含 base 配置引用。
 原 hook/probe 缺 JSON 结尾，一次性导入只补容器，原文件与记录保留；不能据此证明采集完整。
 当前原图 14,240,016 节点、16,181,216 边；47 请求中有 12 个正式请求，源 HTTP 重建依赖观测等待与 gap，不代表正常预测精度。
 
@@ -80,7 +84,7 @@ Ascend kernel_ascend/page_first_direct 按整批跨层 DMA 发布；查询/准�
 ## 恢复起点
 
 1. 继续核对原生实际派发及同步时钟：最大首次通信已定位到长 launch 包络，但内部提交端口未解释，不能统一将箭头改接调用结束；146 条时序违例及部分同步前沿仍需必要观察。source_device_causality/separated/ 是未改图的分类基线，ports_verified/ 是当前结果，不能用 HTTP 一致代替因果验收。
-2. 输入准备的常规成本需要整组共享的独立测量；从当前 161 点区分公共原生 API 与真正不同的控制工作，不逐点照抄系数，也不将当前片段当成全部采样需求。相关原生文件为 SGLang mem_cache/common.py、sampling/sampling_batch_info.py、model_executor/forward_batch_info.py 与 triton_ops/position.py。
+2. 输入准备的常规成本需要整组共享的独立测量；从当前 174 点区分公共原生 API 与真正不同的控制工作，不逐点照抄系数，也不将当前片段当成全部采样需求。上传应测实际 host_to_device_interval、worker runtime 同步及独占 CPU 前后段，不能再采一份虚构设备上传服务或把带等待包络拟合为 CPU 服务。
 3. 补齐必要源事实、常规成本及完整请求控制，验证新增 Decode/QKV 分支、提交/结果可读/响应/后台完成端口；然后继续 self、跨配置和同源多目标。原生结果交接、任意跨流及 KTransformers 真实来源仍缺。
 4. 完成 B—D 联合交付，再推进 E、F、G；E 的最小必要依赖可前移，正式采集与数据库维护不能长期依赖本批一次性导入。代表输入在 data/archive/rebuild/inputs/representatives.json。
 
