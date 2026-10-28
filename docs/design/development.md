@@ -49,7 +49,8 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 | `src/markov/contracts`、`graph` | 有限表达式、值与存储依赖、来源检查 |
 | `src/markov/production` | 声明接口与私有实现的公开投影 |
 | `src/markov/templates` | 分层归一化、资产编译、区域选择与逻辑实例化 |
-| `src/markov/controller` | 请求进度、批次、槽位和逻辑页的唯一状态 |
+| `src/markov/controller` | 请求进度和批次决策，借用共同资源 |
+| `src/markov/resources` | 槽位、逻辑页和驻留的唯一状态，按请求需求生成分配结果 |
 | `src/markov/execution` | 节点耗时接口、资源/依赖推进与完成事件 |
 | `src/markov/adapters` | 原生端口、状态编码、并行角色及目标模板绑定 |
 | `src/markov/workflow` | 控制、图装配、执行和状态提交的 serving 主循环 |
@@ -63,9 +64,9 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 
 C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
 
-ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求/KV 状态，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
+ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求进度，独立 KvPool 持有槽位/页状态；CLI 保持资源池比控制器存活更久，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
 
-PD 由 DisaggregatedController 维护一份请求进度和两个 KvPool；页组件同时支持即时归还与待合并后排序，决策不复制页所有权。SGLang 的 DisaggregatedStructure 组合两个 RankStructure，绑定预约、无模型接入、搬运和释放；原生 sorted allocator 的两个缓冲区保持独立，只有分配需要时展开合并模板。框架观察、声明和双服务生命周期分开维护，memfabric 接口事实留在 Ascend runtime adapter。详细结果保留动作完成时刻、页复制对应和展开入口名；默认结果保留请求、两池终态和来源资格。
+PD 由 DisaggregatedController 维护一份请求进度，借用两个独立 KvPool；页组件同时支持即时归还与待合并后排序，决策不复制页所有权。SGLang 的 DisaggregatedStructure 组合两个 RankStructure，绑定预约、无模型接入、搬运和释放；原生 sorted allocator 的两个缓冲区保持独立，只有分配需要时展开合并模板。框架观察、声明和双服务生命周期分开维护，memfabric 接口事实留在 Ascend runtime adapter。详细结果保留动作完成时刻、页复制对应和展开入口名；默认结果保留请求、两池终态和来源资格。
 
 TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
 

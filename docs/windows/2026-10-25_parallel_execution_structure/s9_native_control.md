@@ -115,7 +115,7 @@ S9资源服务实现所选普通KV语义，S10再接一级设备前缀缓存；�
 | [ServingControl::plan/start/finish](../../../src/markov/controller/control.hpp) | `plan const`、构图成功后才 start；原生选批期间已有资源副作用 | 改成有状态地推进至工作/等待边界，返回带身份的工作或等待条件；不克隆整个原生对象来假装无副作用 |
 | [Batch / BatchWork / BatchEffects](../../../src/markov/contracts/serving.hpp) | 一个 batch.phase、预先确定整批结束效果 | 成员自带阶段、逻辑 token 范围和有效 context；模型完成和结果处理效果分开，不重复预测原生下一状态 |
 | [ServingWorkflow](../../../src/markov/workflow/serving.cpp) | 先扩整批，随后统一 finish；idle 只在特定空闲路径推进 | 共同处理资源调用、提交、等待及完成；无模型工作也能形成片段，workflow 不读私有队列 |
-| [KvPool](../../../src/markov/controller/kv_pool.hpp) 与轻量/PD 控制 | 页管理属于控制器成员，尚无共同前缀/就绪服务 | 整体移入有真实消费者的资源模块，轻量同步迁移；原生 facade 访问同一服务 |
+| [KvPool](../../../src/markov/resources/kv_pool.hpp) 与轻量/PD 控制 | 页/槽位已独立为共同对象并由轻量控制借用，原生资源尚未接入 | 原生 facade 访问同一服务，补充实际使用的映射/就绪接口；前缀缓存留S10 |
 | [SGLangRankStructure](../../../src/markov/adapters/frameworks/sglang/rank_structure.cpp) | 维护空闲池/请求映射的图值，并基于批次效果推导回收 | 图值和存储版本继续保留；数值分配与状态变化绑定资源服务结果，删除独立推测页账/回收的职责 |
 | [Executor](../../../src/markov/execution/executor.hpp) | 已有就绪资源、任务和 Published/Completed | 扩展必要端口和唤醒，不另建时间轴、事件模拟器或全局屏障 |
 | 现有采集会话及 hooks | 关闭chunk/cache/overlap时的普通batch来源不授予新机制资格 | S9核对基础闭环来源；S10取得chunk/mixed/cache来源，观察与控制适配分开 |
@@ -147,7 +147,7 @@ S9返回当前调用所需的有效索引，原生需要的CPU tensor由这些�
 | --- | --- | --- |
 | 共同工作、资源结果和完成合同 | `src/markov/contracts/` | SGLang类、私有字段、torch对象、原生函数名分支 |
 | 控制交接及轻量实现 | `src/markov/controller/` | 设备替身、原生导入hooks、第二套框架策略 |
-| 页/槽位、映射、引用与就绪；S10增加前缀缓存 | `src/markov/resources/`，由现有KvPool整体迁入 | 框架队列、选择下一批、独立的原生页账 |
+| 页/槽位、映射、引用与就绪；S10增加前缀缓存 | `src/markov/resources/`，现有KvPool与轻量消费者已迁入 | 框架队列、选择下一批、独立的原生页账 |
 | 子图实例化、连接、模拟时间及完成反馈 | 现有`src/markov/templates/`、`graph/`、`execution/` | 私自重写PP轮转、PD准入，真实框架/SDK初始化 |
 | C++侧SGLang语义工作与图绑定 | 现有`src/markov/adapters/frameworks/sglang/` | Python进程管理、通用协议传输和验证编排 |
 | 原生控制适配 | `src/control/markov_control/adapters/frameworks/sglang/` | 通用图/资源算法、采集器、第二份请求或缓存状态机 |
@@ -216,6 +216,8 @@ S10在这条闭环上增加chunked prefill、混合组批、Decode优先和一�
 此前四个无设备探针表明现有Ascend推理镜像在普通导入时受`torch_npu`检测阻碍；CPU开关和关闭Torch自动加载不足以解决Transformers再次导入NPU backend的问题。证据在`data/20261028T144023.928299Z_s9-native-control-feasibility/`，精确费用和状态留在status/log。探针没有安装Simulator hooks，不能用它的失败否定上游无设备方法。
 
 后续隔离探索确认：移除torch-npu插件，向Triton声明期提供显式拒绝实际benchmark的driver，并替换sgl_kernel二进制loader后，上述原生模块可无设备导入。Triton-Ascend当前版本在构造Autotuner时仍访问driver，仅传do_bench参数不能阻止硬件初始化。该边界只承接未执行kernel的声明；实际模型执行仍须交给共同图执行，不能把拒绝函数改成静默成功。
+
+进一步探索已执行真实Scheduler构造和三个请求的原生选批/结果生命周期。原生分页分配仍会调用Triton索引kernel；探索使用上游alloc_extend_naive完成CPU索引计算，容量和页账仍由原生管理。请求参数须沿SamplingParams.normalize/verify形成有效输入。该探索的模型完成结果明确为给定token，未接Markov图或核心资源，不作为原生预测交付。正式资源facade须以核心返回的索引取代这份探索性原生页账，而不是把参考池搬进正式控制包。
 
 先以固定上游和必要CPU依赖准备控制环境，再逐项接入明确硬件替代。影响决策的backend条件、页顺序、dtype和PP/PD约束仍须与目标来源核对；CPU运行只用于执行控制和元数据，目标计算/通信继续由已采模板表达。原生真实模型、设备、网络和目标批次答案不进入纯预测。
 

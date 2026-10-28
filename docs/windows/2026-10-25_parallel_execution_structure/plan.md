@@ -31,7 +31,7 @@
 | 入口 | 负责内容 | 本窗口扩展边界 |
 | --- | --- | --- |
 | [ServingControl](../../../src/markov/controller/control.hpp)、[BatchExpansion](../../../src/markov/templates/batch_expansion.hpp) | 动作/完成端口共同接口，承接单实例、PP 和 PD | 组合拓扑继续消费同一合同，不各复制一套闭环 |
-| [KvPool](../../../src/markov/controller/kv_pool.hpp)、[PD 控制](../../../src/markov/controller/disaggregated.hpp) | 现有页/槽位、P/D 驻留和交接反馈 | 将资源职责从控制器迁入核心共同服务，两个控制后端共用唯一资源状态 |
+| [KvPool](../../../src/markov/resources/kv_pool.hpp)、[PD 控制](../../../src/markov/controller/disaggregated.hpp) | 现有页/槽位、P/D 驻留和交接反馈 | 共同资源独立于控制器；原生接入后两个控制后端共用唯一资源状态 |
 | [Executor](../../../src/markov/execution/executor.cpp) | 就绪后服务、多任务反馈、活跃历史回收 | 联查跨组、跨 stage、跨实例的完成因果，不重建时钟 |
 | [ParallelComposition](../../../src/markov/templates/parallel_composition.cpp)、[PD 装配](../../../src/markov/adapters/frameworks/sglang/disaggregated.hpp) | TP collective、PP P2P、最小 PD 搬运 | EP 不等长交换、组合端口与 KV 布局映射 |
 | [TemplateLibrary](../../../src/markov/templates/library.cpp) | 共享 catalog，角色各有绑定和来源 | 从代表观察生成等价 worker 绑定，保留观察与推导的区别 |
