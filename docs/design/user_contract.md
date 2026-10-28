@@ -75,7 +75,15 @@ projected_compute_dependencies 只计配方内部的数据依赖，尚不包含�
 另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
 回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
 不同参与进程的计算用显式汇合边界衔接，串行请求由预测的计算完成继续，不迁移源绝对时间或设备等待。
-这个组件假设每个参与进程有独立的回载和备份队列，未包含存储、CPU、通信和完整跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
+这个组件假设每个参与进程有独立的回载和备份队列，未包含完整 CPU、通信和跨流依赖；计数与顺利执行不代表完整 DAG 或 HTTP 精度。
+
+cache 内可增加 storage 对象，声明 backend 为 file、initial_state 为 empty，以及 prefetch_stop_policy。
+capacity_pages 可为正整数或 null，分别表示每参与进程的文件页容量或不设该上限；预测不读取真实文件目录。
+prefetch_stop_policy 支持 wait_complete、best_effort、timeout；prefetch_threshold_tokens 可省略，使用当前原生默认值。
+prefetch_timeout 可声明 base_sec、per_ki_token_sec、max_sec，按原生线性预算计算，从操作入队开始计时。
+报告分别列出查询、工作进度、控制端接受、新增主机页、被拒绝发布的复制和最终 worker 状态，不能把它们都叫作命中。
+当前只覆盖对称参与进程下的 I/O 与已有计算子集。查询及准入 CPU 尚未绑定，因此 best_effort 按即时准入停止，
+timeout 也基于这组部分成本；阶段耗时拆分含近似，不能拿这些运行结果当作完整 HTTP 精度。
 
 ## 统一任务入口的职责
 
