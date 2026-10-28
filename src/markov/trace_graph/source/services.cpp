@@ -38,7 +38,8 @@ std::vector<std::optional<planning::CallResources>> call_resources(const Observa
     return result;
 }
 
-std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions) {
+std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions,
+                                       const CpuCosts * costs) {
     // LaneBuilder emits each source resource contiguously, in observed order.
     // Retain only its index range, rather than another per-node timeline.
     std::vector<std::pair<graph::NodeId, graph::NodeId>> lanes(observations.resources.size());
@@ -65,19 +66,26 @@ std::vector<CpuInterval> cpu_intervals(const Observations & observations, const 
             const auto & node = nodes[id];
             const auto duration = std::min(region.end_ns, at->begin_ns + node.duration_ns) - std::max(region.begin_ns, at->begin_ns);
             if (duration <= 0) continue;
+            const auto correction =
+                costs ? costs->interval(region.resource, std::max(region.begin_ns, at->begin_ns), std::min(region.end_ns, at->begin_ns + node.duration_ns))
+                      : CpuCorrection{};
             switch (node.kind) {
             case graph::NodeKind::Service:
                 measured.service_ns += duration;
+                measured.service_correction.add(correction);
                 break;
             case graph::NodeKind::ObservedWait:
                 measured.wait_ns += duration;
+                measured.excluded_correction.add(correction);
                 break;
             case graph::NodeKind::ResidualGap:
             case graph::NodeKind::Delay:
                 measured.residual_ns += duration;
+                measured.residual_correction.add(correction);
                 break;
             case graph::NodeKind::ProfilerOverhead:
                 measured.instrumentation_ns += duration;
+                measured.excluded_correction.add(correction);
                 break;
             case graph::NodeKind::Boundary:
                 break;

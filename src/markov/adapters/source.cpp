@@ -19,7 +19,7 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     std::ifstream stream(path);
     const auto raw = nlohmann::json::parse(stream);
     for (const auto & [name, value] : raw.items()) {
-        if (name != "manifest" && name != "page_sizes_tokens" && name != "models" && name != "cache")
+        if (name != "manifest" && name != "page_sizes_tokens" && name != "models" && name != "cache" && name != "source_cpu_costs")
             throw std::runtime_error("Unknown page-work input field: " + name);
     }
     auto manifest_path = std::filesystem::path(raw.at("manifest").get<std::string>());
@@ -30,6 +30,11 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
         auto models = std::filesystem::path(raw.at("models").get<std::string>());
         if (models.is_relative()) models = path.parent_path() / models;
         result.models_path = std::filesystem::absolute(models).lexically_normal();
+    }
+    if (raw.contains("source_cpu_costs")) {
+        auto costs = std::filesystem::path(raw.at("source_cpu_costs").get<std::string>());
+        if (costs.is_relative()) costs = path.parent_path() / costs;
+        result.cpu_costs_path = std::filesystem::absolute(costs).lexically_normal();
     }
     if (raw.contains("cache")) {
         if (!result.models_path || result.manifest.framework != "sglang")
@@ -47,7 +52,7 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     return result;
 }
 
-PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest) {
+PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path) {
     using namespace trace_graph;
     using Clock = std::chrono::steady_clock;
     const auto begin = Clock::now();
@@ -101,12 +106,15 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest) {
     if (observations.spans.empty()) throw std::runtime_error("No execution spans were observed in the declared source inputs");
     source::SourceContext context(std::move(observations));
     const auto built = Clock::now();
+    auto cpu_costs = cpu_costs_path ? std::optional(read_source_cpu_costs(*cpu_costs_path, manifest, context.observations())) : std::nullopt;
+    const auto finished = Clock::now();
     return { std::move(manifest),
              std::move(context),
              std::move(counts),
              std::move(probes->roles),
-             std::chrono::duration<double>(parsed - begin).count(),
-             std::chrono::duration<double>(built - parsed).count() };
+             std::chrono::duration<double>(parsed - begin + finished - built).count(),
+             std::chrono::duration<double>(built - parsed).count(),
+             std::move(cpu_costs) };
 }
 
 } // namespace markov::adapters

@@ -14,6 +14,14 @@ public:
     virtual void record(std::size_t position, const nlohmann::json & event) = 0;
 };
 
+struct ReadRecords {
+    std::size_t count;
+    nlohmann::json metadata;
+};
+
+// Consume a named root array without retaining its records in the root object.
+ReadRecords read_json_records(const std::filesystem::path & path, const std::string & array_name, RecordConsumer & consumer);
+
 // Stream one Chrome event at a time. The consumer must not retain event views.
 // Accept the two Chrome containers: a traceEvents object or an event array.
 std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer & consumer);

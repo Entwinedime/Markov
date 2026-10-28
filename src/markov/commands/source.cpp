@@ -459,6 +459,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
         {         "device_service_binding",                                                                                          device_service_summary(context) },
         {             "cpu_work_intervals",                                                                                            cpu_interval_summary(context) },
+        {               "source_cpu_costs",                                                                                           source_cpu_cost_report(source) },
         {                 "request_tokens",                                                                                          request_token_summary(captured) },
         {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
         {        "work_observation_counts",                                                                                                   std::move(work_counts) },

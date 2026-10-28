@@ -5,12 +5,13 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace markov::trace_graph::source {
 
-std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer & consumer) {
+ReadRecords read_json_records(const std::filesystem::path & path, const std::string & array_name, RecordConsumer & consumer) {
     std::ifstream stream(path);
-    if (!stream) throw std::runtime_error("Cannot read trace: " + path.string());
+    if (!stream) throw std::runtime_error("Cannot read records: " + path.string());
 
     using Json = nlohmann::json;
     using Event = Json::parse_event_t;
@@ -22,7 +23,7 @@ std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer
     // Discard each completed event from the parser's parent array. Memory is
     // bounded by one record and root metadata, rather than the complete file.
     const auto callback = [&](int depth, Event event, Json & value) {
-        if (event == Event::key && depth == 1) event_key = value == "traceEvents";
+        if (event == Event::key && depth == 1) event_key = value == array_name;
         if (event == Event::array_start && (depth == 0 || (depth == 1 && event_key))) {
             event_array_depth = depth;
             found_events = true;
@@ -35,16 +36,19 @@ std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer
         if (event == Event::array_end && depth == event_array_depth) event_array_depth = -1;
         return true;
     };
+    Json metadata;
     try {
-        (void)Json::parse(stream, callback);
+        metadata = Json::parse(stream, callback);
     }
     catch (const Json::exception & error) {
         throw std::runtime_error(path.string() + ": " + error.what());
     }
-    if (!found_events) throw std::runtime_error("No Chrome traceEvents array: " + path.string());
+    if (!found_events) throw std::runtime_error("No " + array_name + " record array: " + path.string());
 
-    return count;
+    return { count, std::move(metadata) };
 }
+
+std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer & consumer) { return read_json_records(path, "traceEvents", consumer).count; }
 
 namespace {
 

@@ -1,7 +1,9 @@
 #include "markov/adapters/costs.hpp"
+#include "markov/trace_graph/source/chrome_reader.hpp"
 
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -131,7 +133,51 @@ cost::Model model(const Json & raw) {
     return result;
 }
 
+class CpuCostReader final : public source::RecordConsumer {
+public:
+    explicit CpuCostReader(const source::Observations & observations) {
+        for (source::Index id = 0; id < observations.resources.size(); ++id) {
+            const auto & resource = observations.resources[id];
+            if (resource.kind == source::ResourceKind::CpuThread) resources_.emplace(resource.identity, id);
+        }
+    }
+
+    void record(std::size_t, const Json & row) override {
+        fields(row, { "resource", "begin_ns", "end_ns", "cost_ns" });
+        const auto identity = row.at("resource").get<std::string>();
+        const auto resource = resources_.find(identity);
+        if (resource == resources_.end()) throw std::runtime_error("CPU correction resource is absent from source: " + identity);
+        for (const auto * name : { "begin_ns", "end_ns", "cost_ns" }) {
+            const auto & value = row.at(name);
+            if (!value.is_number_integer() || value < 0 || value > std::numeric_limits<source::Time>::max())
+                throw std::runtime_error("CPU correction requires nonnegative integer nanoseconds: " + std::string(name));
+        }
+        intervals[resource->second].push_back({ row.at("begin_ns"), row.at("end_ns"), row.at("cost_ns") });
+    }
+
+    std::map<source::Index, std::vector<source::CpuCostSpan>> intervals;
+
+private:
+    std::map<std::string, source::Index> resources_;
+};
+
 } // namespace
+
+SourceCpuCosts read_source_cpu_costs(const std::filesystem::path & path, const source::ProfileManifest & manifest, const source::Observations & observations) {
+    CpuCostReader reader(observations);
+    auto parsed = source::read_json_records(path, "intervals", reader);
+    const auto & raw = parsed.metadata;
+    fields(raw, { "source_manifest", "basis", "sources", "intervals" });
+    auto captured = std::filesystem::path(raw.at("source_manifest").get<std::string>());
+    if (captured.is_relative()) captured = path.parent_path() / captured;
+    if (std::filesystem::absolute(captured).lexically_normal() != manifest.path)
+        throw std::runtime_error("CPU corrections belong to a different source manifest");
+    const auto basis = raw.at("basis").get<std::string>();
+    const auto sources = raw.at("sources").get<std::vector<std::string>>();
+    if (basis.empty() || sources.empty() || parsed.count == 0 || !raw.at("intervals").is_array() || !raw.at("intervals").empty())
+        throw std::runtime_error("CPU corrections require provenance and interval records");
+    return { path, basis, sources, source::CpuCosts(std::move(reader.intervals)) };
+}
 
 SelectedCosts read_cost_models(const std::filesystem::path & path) {
     const auto raw = read_json(path);

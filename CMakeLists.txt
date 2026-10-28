@@ -24,6 +24,7 @@ add_library(markov_source
     src/markov/trace_graph/source/build.cpp
     src/markov/trace_graph/source/context.cpp
     src/markov/trace_graph/source/services.cpp
+    src/markov/trace_graph/source/cpu_costs.cpp
     src/markov/trace_graph/planning/token_paths.cpp
     src/markov/trace_graph/planning/radix_tree.cpp
     src/markov/trace_graph/planning/cache.cpp
@@ -65,5 +66,11 @@ if(TRACE_GRAPH_DEBUG)
     target_compile_definitions(markov_graph PUBLIC TRACE_GRAPH_DEBUG)
 endif()
 
-add_executable(markov_core src/markov/main.cpp src/markov/commands/source.cpp src/markov/commands/page_work.cpp src/markov/commands/costs.cpp)
+add_executable(markov_core
+    src/markov/main.cpp
+    src/markov/commands/source.cpp
+    src/markov/commands/page_work.cpp
+    src/markov/commands/costs.cpp
+    src/markov/commands/cpu_costs.cpp
+)
 target_link_libraries(markov_core PRIVATE markov_adapters)

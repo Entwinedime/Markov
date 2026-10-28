@@ -2,6 +2,7 @@
 
 #include "markov/trace_graph/planning/native_calls.hpp"
 #include "markov/trace_graph/source/build.hpp"
+#include "markov/trace_graph/source/cpu_costs.hpp"
 #include "markov/trace_graph/source/observations.hpp"
 
 #include <optional>
@@ -28,11 +29,14 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
 
 struct CpuInterval {
     Time service_ns = 0, wait_ns = 0, residual_ns = 0, instrumentation_ns = 0, unobserved_ns = 0;
+    CpuCorrection service_correction, residual_correction, excluded_correction;
 };
 
 // Slice the source's exclusive CPU partition. Parent wall intervals and nested
 // children are never added together; original profiled costs stay uncorrected.
-std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions);
+// Optional estimates record coverage separately and exclude known waits/overhead.
+std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions,
+                                       const CpuCosts * costs = nullptr);
 
 std::vector<std::optional<planning::CallResources>> call_resources(const Observations & observations, std::span<const CpuRegion> regions);
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/adapters/costs.hpp"
 #include "markov/adapters/sglang/cache.hpp"
 #include "markov/trace_graph/source/context.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
@@ -22,6 +23,7 @@ struct PreparedSource {
     std::map<std::string, std::size_t> native_roles;
     double read_and_interpret_sec;
     double build_sec;
+    std::optional<SourceCpuCosts> cpu_costs;
 };
 
 struct PageWorkRequest {
@@ -29,9 +31,10 @@ struct PageWorkRequest {
     std::vector<std::size_t> page_sizes_tokens;
     std::optional<std::filesystem::path> models_path = std::nullopt;
     std::optional<sglang::CacheSettings> cache = std::nullopt;
+    std::optional<std::filesystem::path> cpu_costs_path = std::nullopt;
 };
 
-PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest);
+PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path = std::nullopt);
 PageWorkRequest read_page_work_request(const std::filesystem::path & path);
 
 } // namespace markov::adapters

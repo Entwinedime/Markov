@@ -112,11 +112,12 @@ int main(int argc, char ** argv) {
             std::vector<std::filesystem::path> inputs{ manifest.path };
             if (page_request) inputs.push_back(std::filesystem::absolute(argv[2]).lexically_normal());
             if (selected_costs) inputs.push_back(*page_request->models_path);
+            if (page_request && page_request->cpu_costs_path) inputs.push_back(*page_request->cpu_costs_path);
             if (manifest.capture_origin_manifest) inputs.push_back(*manifest.capture_origin_manifest);
             for (const auto & file : manifest.files) inputs.push_back(file.path);
             prepare_output(output, inputs);
             if (page_request)
-                result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest),
+                result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest, page_request->cpu_costs_path),
                                                             page_request->page_sizes_tokens,
                                                             selected_costs ? &*selected_costs : nullptr,
                                                             page_request->cache ? &*page_request->cache : nullptr);
