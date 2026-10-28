@@ -50,6 +50,7 @@ void NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         for (const auto & launch : call.launches) {
             cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_);
             const auto kernel = append(launch, "device_service", resources.device, device_);
+            steps_[kernel].source_operation = call.source_operation;
             depend(worker_, kernel);
         }
         cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_);
@@ -64,7 +65,7 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
     PlannedMutation result{ owner, {}, {} };
     std::vector<bool> has_input(work_.size(), false);
     for (std::size_t id = 0; id < work_.size(); ++id)
-        result.operations.push_back({ steps_[id].resource, std::cref(work_[id]), std::nullopt, steps_[id].delay });
+        result.operations.push_back({ steps_[id].resource, std::cref(work_[id]), std::nullopt, steps_[id].delay, steps_[id].source_operation });
     for (const auto & edge : edges_) {
         result.dependencies.push_back({ begin + edge.from, begin + edge.to, edge.kind });
         has_input[edge.to] = true;

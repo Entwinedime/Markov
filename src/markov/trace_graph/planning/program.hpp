@@ -22,6 +22,7 @@ struct PlannedOperation {
     std::variant<Boundary, std::reference_wrapper<const Work>> cost;
     std::optional<simulation::Action> completion = std::nullopt;
     bool delay = false; // Readiness latency; it does not occupy a service resource.
+    std::optional<std::size_t> source_operation = std::nullopt;
 };
 
 struct PlannedMutation {

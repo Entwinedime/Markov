@@ -25,6 +25,7 @@ bool ComputeProgram::append_compute(const FrameCompute & frame, std::size_t firs
     const auto & observed = source_.observations();
     for (auto at = first; at < last;) {
         const auto source_call = frame.plan.operations[at].source_operation;
+        const auto unchanged = frame.plan.operations[at].source_work_unchanged;
         const auto & call = observed.work_observations[source_call];
         const auto & description = observed.work_descriptions[call.description];
         if (!description.calls) {
@@ -43,7 +44,14 @@ bool ComputeProgram::append_compute(const FrameCompute & frame, std::size_t firs
             const auto & instance = frame.plan.operations[at++];
             if (instance.work) work.push_back(frame.plan.work[*instance.work]);
         }
-        const auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
+        auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
+
+        // A single unchanged device operation has a source service candidate.
+        // The cost provider checks its exclusive ownership before migration.
+        if (unchanged && work.size() == 1) {
+            for (auto & native : calls)
+                if (native.launches == work) native.source_operation = source_call;
+        }
         segment.plan.extend(calls, resources);
         ++segment.stats.compute_calls;
         segment.stats.compute_services += work.size();

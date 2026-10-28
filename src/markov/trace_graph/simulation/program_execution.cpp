@@ -19,7 +19,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
     std::map<cost::Coverage, std::size_t> coverage;
     for (const auto & operation : mutation.operations) {
         if (const auto * work = std::get_if<std::reference_wrapper<const planning::Work>>(&operation.cost)) {
-            const auto & response = costs_.query(work->get());
+            const auto & response =
+                operation.source_operation ? costs_.query_source(work->get(), *operation.source_operation, operation.resource) : costs_.query(work->get());
             if (!response.duration_ns) {
                 gap_ = CostGap{ work->get(), response };
                 clock_.stop();

@@ -162,7 +162,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {              "e2e_predicted",                                                                          false },
         {              "qualification",
          "Cache I/O, known compute calls and attention metadata share one clock. Native calls share continuous caller/worker/device chains. Idle "
-         "synchronization approximates ready-state service, not wake-up under load. Symmetric participant services and dedicated copy queues are assumed. "
+         "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Query/admission, inter-call and collective CPU and other cross-stream dependencies remain incomplete. All participants share the latest "
          "collective completion, omitting per-rank completion spread. No HTTP latency is reported."                   }
     };
@@ -223,7 +223,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     const auto & observations = source.context.observations();
     const auto & paths = observations.token_paths;
     std::optional<cost::Queries> queries;
-    if (costs) queries.emplace(costs->models);
+    if (costs) queries.emplace(costs->models, &source.context);
     const auto backend = cache ? std::optional(adapters::sglang::cache_backend(source.context)) : std::nullopt;
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
@@ -380,6 +380,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             {             "selected_models",                                                                                                           costs->models.size() },
             {             "logical_queries",                                                                                                            queries->requests() },
             {        "response_evaluations",                                                                                                         queries->evaluations() },
+            {  "source_service_evaluations",                                                                                                  queries->source_evaluations() },
             { "source_deployment_qualified",                                                                                                                          false },
             {               "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
         };

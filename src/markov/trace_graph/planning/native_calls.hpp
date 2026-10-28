@@ -17,6 +17,7 @@ struct NativeCall {
     CallKind kind;
     std::vector<Work> launches;
     std::optional<Work> synchronization = std::nullopt;
+    std::optional<std::size_t> source_operation = std::nullopt;
 };
 
 // Framework rules describe changing work; the common compiler owns the caller,
@@ -47,6 +48,7 @@ private:
     struct Step {
         std::size_t resource;
         bool delay;
+        std::optional<std::size_t> source_operation = std::nullopt;
     };
     std::vector<Work> work_;
     std::vector<Step> steps_;

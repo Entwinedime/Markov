@@ -35,6 +35,7 @@ target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_cost src/markov/trace_graph/cost/models.cpp src/markov/trace_graph/cost/queries.cpp)
 target_include_directories(markov_cost PUBLIC src)
+target_link_libraries(markov_cost PUBLIC markov_source)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_prediction
