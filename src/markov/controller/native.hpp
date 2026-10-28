@@ -3,13 +3,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
+#include "markov/contracts/serving.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/controller/control_peer.hpp"
+#include "markov/controller/native_group.hpp"
 #include "markov/resources/kv_pool.hpp"
 
 namespace markov {
@@ -31,26 +34,14 @@ public:
 private:
     nlohmann::json receive_call();
     void reply(std::size_t call, const nlohmann::json & result);
-    nlohmann::json resource_call(const nlohmann::json & message);
-    Batch resident_batch(const nlohmann::json & requests) const;
-    BatchEffects result_effects(const nlohmann::json & members) const;
 
     std::vector<Request> requests_;
-    KvPool & resources_;
-    std::string group_;
+    NativeGroup group_;
     ControlPeer & peer_;
-    std::optional<Batch> batch_;
-    std::optional<TaskIdentity> running_;
     std::optional<std::size_t> running_call_;
     std::optional<std::size_t> input_call_;
-    std::set<std::size_t> released_requests_;
-    std::vector<std::size_t> released_pages_;
     std::size_t arrived_ = 0;
-    std::size_t completed_ = 0;
-    std::size_t sequence_ = 0;
     std::optional<std::size_t> input_sequence_;
-    std::size_t flow_ = 0;
-    ServingStep next_ = ServingStep::Batch;
 };
 
 } // namespace markov

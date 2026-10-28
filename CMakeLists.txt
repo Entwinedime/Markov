@@ -12,6 +12,7 @@ add_library(markov_core
     src/markov/controller/batch_replay.cpp
     src/markov/controller/disaggregated.cpp
     src/markov/controller/native.cpp
+    src/markov/controller/native_group.cpp
     src/markov/resources/kv_pool.cpp
     src/markov/controller/serving.cpp
     src/markov/execution/protocol.cpp
