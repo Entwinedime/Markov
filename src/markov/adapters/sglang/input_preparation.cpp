@@ -142,7 +142,9 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             { "streams_differ", 1 }
         };
         queued(calls, prefix + "handoff.record", "ascend.event_record", handoff, true, "record_event");
+        calls.back().device_control = DeviceControl::Record;
         queued(calls, prefix + "handoff.wait", "ascend.event_wait", handoff, false, "wait_event");
+        calls.back().device_control = DeviceControl::Wait;
         calls.push_back({
             { { prefix + "handoff.destroy", "torch_npu.event_destroy", "cpu_service" }, handoff },
             CallKind::Queued,

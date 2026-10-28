@@ -38,8 +38,8 @@ private:
     std::map<std::string, trace_graph::source::Index> forward_frames_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;
     struct InputWindow {
-        trace_graph::source::CpuRegion allocator;
-        std::optional<trace_graph::source::CpuRegion> table_write, forward;
+        trace_graph::source::ObservedRegion allocator;
+        std::optional<trace_graph::source::ObservedRegion> table_write, forward;
     };
     std::map<std::string, InputWindow> input_windows_;
     std::map<std::string, std::string> sequence_dtypes_;

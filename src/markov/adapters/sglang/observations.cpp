@@ -140,14 +140,14 @@ void ProbeReader::observe(const ProbeEvent & event) {
         const auto window = input_windows_.find(process);
         if (window != input_windows_.end()) {
             const auto & allocator = window->second.allocator;
-            window->second.table_write = CpuRegion{ allocator.resource, allocator.end_ns, event.end_ns, event.record };
+            window->second.table_write = ObservedRegion{ allocator.resource, allocator.end_ns, event.end_ns, event.record };
         }
     }
     if (name == "runtime.phase.input_buffers" && args.at("status") == "returned") {
         const auto window = input_windows_.find(process);
         if (window != input_windows_.end() && window->second.table_write) {
             const auto & table = *window->second.table_write;
-            window->second.forward = CpuRegion{ table.resource, table.end_ns, event.begin_ns, event.record };
+            window->second.forward = ObservedRegion{ table.resource, table.end_ns, event.begin_ns, event.record };
         }
     }
 

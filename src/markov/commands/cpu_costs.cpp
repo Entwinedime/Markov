@@ -17,7 +17,7 @@ using namespace trace_graph::source;
 using Json = nlohmann::json;
 
 struct Region {
-    CpuRegion source;
+    ObservedRegion source;
     std::size_t role;
 };
 
@@ -73,7 +73,7 @@ Json source_cpu_cost_report(const adapters::PreparedSource & prepared) {
     const auto & observed = context.observations();
     const auto & costs = *prepared.cpu_costs;
     std::vector<std::string> roles{ "compute_calls", "collective_envelopes", "outside_known_calls" };
-    std::vector<CpuRegion> regions;
+    std::vector<ObservedRegion> regions;
     std::vector<std::size_t> owners;
     std::vector<bool> formal;
     auto requests = Json::array();

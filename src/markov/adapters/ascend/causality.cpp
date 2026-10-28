@@ -100,12 +100,21 @@ void RuntimeCausality::connect_events(Observations & observations, const std::ve
 
     for (const auto & binding : bindings) {
         const auto & hook = *binding.hook;
+        std::optional<Index> control;
         // Connection IDs bind the actual command, including zero-duration
         // records whose independent exported flow port is only a sibling.
         if (binding.host && binding.device) {
             observations.dependencies.push_back(
                 { port(observations, *binding.host, false), port(observations, *binding.device, false), DependencyKind::Submission });
             ++observations.counts["ascend.event_submissions"];
+            const auto & submitted = binding.host->span;
+            const auto & command = binding.device->span;
+            control = observations.device_controls.size();
+            observations.device_controls.push_back({
+                hook.kind == Kind::Record ? trace_graph::planning::DeviceControl::Record : trace_graph::planning::DeviceControl::Wait,
+                { observations.canonical_resource(submitted.resource), submitted.begin_ns, submitted.end_ns, submitted.record },
+                {   observations.canonical_resource(command.resource),   command.begin_ns,   command.end_ns,   command.record }
+            });
         }
         if (hook.kind == Kind::Record || hook.kind == Kind::StreamSynchronize) continue;
 
@@ -144,6 +153,7 @@ void RuntimeCausality::connect_events(Observations & observations, const std::ve
         // its completion, not its start; otherwise source replay charges it twice.
         observations.dependencies.push_back(
             { port(observations, *record->device, true), port(observations, *consumer, true), DependencyKind::Synchronization });
+        if (control) observations.device_controls[*control].producer_completed_ns = record->device->span.end_ns;
         ++observations.counts[hook.kind == Kind::EventSynchronize ? "ascend.event_host_synchronizations" : "ascend.event_stream_waits"];
     }
 }

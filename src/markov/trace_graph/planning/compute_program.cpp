@@ -154,7 +154,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = "preparation_device_binding_unavailable";
                     return;
                 }
-                source.bind_native_cpu_sources(input.frame, entry.index, calls.calls);
+                source.bind_native_sources(input.frame, entry.index, calls.calls);
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.

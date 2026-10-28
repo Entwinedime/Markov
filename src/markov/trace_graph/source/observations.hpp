@@ -109,7 +109,7 @@ struct WorkDescription {
     std::unique_ptr<const planning::CallSequence> calls;
 };
 
-struct CpuRegion {
+struct ObservedRegion {
     Index resource;
     Time begin_ns, end_ns;
     RecordRef record;
@@ -117,16 +117,22 @@ struct CpuRegion {
 
 struct NativeQueueCall {
     Index name;
-    CpuRegion submission, execution;
+    ObservedRegion submission, execution;
 };
 
 struct NativeRuntimeCall {
     Index implementation;
-    CpuRegion region;
+    ObservedRegion region;
+};
+
+struct ObservedDeviceControl {
+    planning::DeviceControl kind;
+    ObservedRegion submitted, command;
+    std::optional<Time> producer_completed_ns = std::nullopt;
 };
 
 struct ObservedCallSequence {
-    CpuRegion region;
+    ObservedRegion region;
     std::unique_ptr<const planning::CallSequence> definition;
     std::string role;
 };
@@ -191,6 +197,7 @@ public:
     std::vector<ObservedDependency> dependencies;
     std::vector<NativeQueueCall> native_queue_calls;
     std::vector<NativeRuntimeCall> native_runtime_calls;
+    std::vector<ObservedDeviceControl> device_controls;
     std::map<std::string, std::size_t> flow_audit;
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;

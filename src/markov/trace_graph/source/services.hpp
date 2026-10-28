@@ -38,7 +38,7 @@ struct CpuInterval {
 // Slice the source's exclusive CPU partition. Parent wall intervals and nested
 // children are never added together; original profiled costs stay uncorrected.
 // Optional estimates record coverage separately and exclude known waits/overhead.
-std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions,
+std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const ObservedRegion> regions,
                                        const CpuCosts * costs = nullptr);
 
 struct CallBinding {
@@ -53,12 +53,16 @@ struct NativeSequenceBinding {
     std::vector<planning::NativeCall> definitions;
 };
 
-struct CpuWorkRegion {
+enum class NativeTiming { Cpu, ReadyDispatch, DeviceControl, DeviceService };
+
+struct NativeWorkRegion {
     planning::Work work;
-    CpuRegion region;
+    ObservedRegion region;
     bool stream_wait_generated = false;
+    NativeTiming timing = NativeTiming::Cpu;
+    Time excluded_queue_wait_ns = 0;
 };
 
-std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions);
+std::vector<CallBinding> call_resources(const Observations & observations, std::span<const ObservedRegion> regions);
 
 } // namespace markov::trace_graph::source

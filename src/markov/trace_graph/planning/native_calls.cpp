@@ -47,8 +47,8 @@ void NativePlan::source_cpu_gap(std::size_t interval, std::size_t caller) {
 
 void NativePlan::cpu(const Work & work, const char * service, const char * residual, std::size_t resource, std::optional<graph::NodeId> & tail,
                      std::optional<std::size_t> source) {
-    steps_[append(work, service, resource, tail)].source_cpu_work = source;
-    steps_[append(work, residual, resource, tail)].source_cpu_work = source;
+    steps_[append(work, service, resource, tail)].source_native_work = source;
+    steps_[append(work, residual, resource, tail)].source_native_work = source;
 }
 
 bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations) {
@@ -67,7 +67,7 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
             }
         }
         const auto & caller_work = call.caller_work ? *call.caller_work : call.work;
-        cpu(caller_work, "cpu_service", "residual_interval", resources.caller, caller_, call.source_cpu.caller_before);
+        cpu(caller_work, "cpu_service", "residual_interval", resources.caller, caller_, call.sources.caller_before);
         if (call.kind == CallKind::Cpu) continue;
 
         auto returned = caller_work;
@@ -83,13 +83,14 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
 
         auto dispatch = caller_;
         const auto ready = append(call.work, "dispatch_interval", resources.worker, dispatch, true);
+        steps_[ready].source_native_work = call.sources.dispatch;
 
         // Dispatch samples start after both submission and the previous task.
         depend(worker_, ready);
         worker_ = ready;
         const auto device = call.incoming_stream ? incoming.value() : resources.device;
         if (call.kind == CallKind::HostUpload) {
-            cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.source_cpu.worker_before);
+            cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
             const auto & transfer = call.host_transfer.value();
             const auto copied = append(transfer, transfer.kind.timing_scope.c_str(), resources.worker, worker_);
             depend(device_ ? std::optional(device_->completion) : std::nullopt, copied);
@@ -100,19 +101,20 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         }
         auto device_tail = device_ ? std::optional(device_->completion) : std::nullopt;
         for (const auto & launch : call.launches) {
-            cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.source_cpu.worker_before);
+            cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
             const auto kernel = append(launch, "device_service", device, device_tail);
             device_ = DeviceProducer{ kernel, device };
             steps_[kernel].source_operation = call.source_operation;
+            steps_[kernel].source_native_work = call.sources.device;
             depend(worker_, kernel);
         }
-        cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_, call.source_cpu.worker_after);
+        cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_, call.sources.worker_after);
         if (call.kind == CallKind::HostUpload) {
             const auto & synchronization = call.synchronization.value();
             const auto synchronized = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
             depend(worker_, synchronized);
         }
-        cpu(returned, "cpu_service", "residual_interval", resources.caller, caller_, call.source_cpu.caller_after);
+        cpu(returned, "cpu_service", "residual_interval", resources.caller, caller_, call.sources.caller_after);
     }
     return true;
 }
@@ -127,7 +129,7 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
     std::vector<bool> has_input(steps_.size(), false);
     for (const auto & step : steps_) {
         if (const auto * work = std::get_if<Work>(&step.cost))
-            result.operations.push_back({ step.resource, std::cref(*work), std::nullopt, step.delay, step.source_operation, step.source_cpu_work });
+            result.operations.push_back({ step.resource, std::cref(*work), std::nullopt, step.delay, step.source_operation, step.source_native_work });
         else result.operations.push_back({ step.resource, std::get<SourceCpuGap>(step.cost), std::nullopt, true });
     }
     for (const auto & edge : edges_) {

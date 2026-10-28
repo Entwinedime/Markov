@@ -15,14 +15,16 @@
 namespace markov::trace_graph::planning {
 
 enum class CallKind { Cpu, Queued, Readback, HostUpload };
+enum class DeviceControl { None, Record, Wait };
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;
     bool operator==(const KernelPreparation &) const = default;
 };
 
-struct NativeCpuSources {
+struct NativeSources {
     std::optional<std::size_t> caller_before, caller_after, worker_before, worker_after;
+    std::optional<std::size_t> dispatch, device;
 };
 
 struct NativeCall {
@@ -45,7 +47,8 @@ struct NativeCall {
     // Optional native observation identity, interpreted by the adapter. It is
     // evidence for a source sequence, never a cost key or target branch rule.
     std::string queue_name = {};
-    NativeCpuSources source_cpu = {};
+    NativeSources sources = {};
+    DeviceControl device_control = DeviceControl::None;
 };
 
 struct NativeSequence {
@@ -109,7 +112,7 @@ private:
         std::size_t resource;
         bool delay;
         std::optional<std::size_t> source_operation = std::nullopt;
-        std::optional<std::size_t> source_cpu_work = std::nullopt;
+        std::optional<std::size_t> source_native_work = std::nullopt;
     };
     std::vector<Step> steps_;
     std::vector<graph::Edge> edges_;

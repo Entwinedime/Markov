@@ -474,7 +474,9 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             {    "source_cpu_residual_evaluations",                                                                                            queries->cpu_residual_evaluations() },
             {              "source_cpu_gap_domain",                                                                                   cpu_cost_summary(queries->source_cpu_gaps()) },
             {      "source_native_cpu_evaluations",                                                                                                queries->cpu_work_evaluations() },
-            { "source_native_cpu_candidate_domain",                                                                                   cpu_cost_summary(queries->source_cpu_work()) },
+            {  "source_ready_dispatch_evaluations",                                                                                                queries->dispatch_evaluations() },
+            {   "source_ready_control_evaluations",                                                                                                 queries->control_evaluations() },
+            { "source_native_cpu_candidate_domain",                                                                              cpu_cost_summary(queries->native_cpu_intervals()) },
             {        "source_deployment_qualified",                                                                                                                          false },
             {                      "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
         };

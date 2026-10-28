@@ -30,7 +30,7 @@ SourceContext::SourceContext(Observations && observations)
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
     index_native_sequences();
-    index_native_cpu_work();
+    index_native_work();
     index_compute_queues();
     index_frame_calls();
 
@@ -91,7 +91,7 @@ void SourceContext::index_native_sequences() {
 void SourceContext::index_frame_calls() {
     struct Entry {
         FrameCall call;
-        CpuRegion region;
+        ObservedRegion region;
     };
     frame_calls_.resize(frame_operations_.size());
     frame_cpu_order_supported_.resize(frame_operations_.size(), true);
@@ -153,7 +153,7 @@ void SourceContext::index_frame_calls() {
 }
 
 void SourceContext::index_cpu_intervals() {
-    std::vector<CpuRegion> regions;
+    std::vector<ObservedRegion> regions;
     regions.reserve(observations_.work_observations.size());
     for (const auto & work : observations_.work_observations) regions.push_back({ work.resource, work.begin_ns, work.end_ns, work.record });
     for (const auto & frame : observations_.compute_frames)

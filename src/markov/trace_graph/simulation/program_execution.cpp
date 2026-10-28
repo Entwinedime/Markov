@@ -20,7 +20,7 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
     for (const auto & operation : mutation.operations) {
         if (const auto * work = std::get_if<std::reference_wrapper<const planning::Work>>(&operation.cost)) {
             const cost::Response * selected;
-            if (operation.source_cpu_work) selected = &costs_.query_source_cpu_work(work->get(), *operation.source_cpu_work, operation.resource);
+            if (operation.source_native_work) selected = &costs_.query_source_work(work->get(), *operation.source_native_work, operation.resource);
             else if (operation.source_operation) selected = &costs_.query_source(work->get(), *operation.source_operation, operation.resource);
             else selected = &costs_.query(work->get());
             const auto & response = *selected;

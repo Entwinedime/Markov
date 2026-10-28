@@ -56,7 +56,17 @@ enum class Status {
     UnresolvedSourceWait,
     UnmodeledSourceWork
 };
-enum class Coverage { Measured, NewCombination, Extrapolated, SourceService, SourceResidual, SourceCpuResidual, SourceCpuEstimate };
+enum class Coverage {
+    Measured,
+    NewCombination,
+    Extrapolated,
+    SourceService,
+    SourceResidual,
+    SourceCpuResidual,
+    SourceCpuEstimate,
+    SourceDispatchResidual,
+    SourceControlEstimate
+};
 
 struct Response {
     Status status;

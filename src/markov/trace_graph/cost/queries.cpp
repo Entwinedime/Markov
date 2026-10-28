@@ -13,16 +13,42 @@ Queries::Queries(const Models & models, const source::SourceContext * source, co
     if (source) source_cpu_gaps_ = source::cpu_intervals(source->observations(), source->graph(), source->cpu_gaps(), cpu_costs);
     source_cpu_responses_.resize(source_cpu_gaps_.size());
     if (source) {
-        std::vector<source::CpuRegion> regions;
-        for (const auto & work : source->native_cpu_work()) regions.push_back(work.region);
-        source_cpu_work_ = source::cpu_intervals(source->observations(), source->graph(), regions, cpu_costs);
-        source_cpu_work_responses_.resize(regions.size());
+        std::vector<source::ObservedRegion> regions;
+        native_cpu_indices_.resize(source->native_work().size());
+        for (std::size_t id = 0; id < source->native_work().size(); ++id) {
+            const auto & work = source->native_work()[id];
+            if (work.timing != source::NativeTiming::Cpu) continue;
+            native_cpu_indices_[id] = regions.size();
+            regions.push_back(work.region);
+        }
+        native_cpu_intervals_ = source::cpu_intervals(source->observations(), source->graph(), regions, cpu_costs);
+        source_native_work_responses_.resize(source->native_work().size());
     }
 }
 
-const Response & Queries::query_source_cpu_work(const planning::Work & work, std::size_t interval, std::size_t resource) {
-    if (!source_) throw std::logic_error("Source CPU work requested without source evidence");
-    const auto & original = source_->native_cpu_work()[interval];
+const Response & Queries::query_source_work(const planning::Work & work, std::size_t interval, std::size_t resource) {
+    if (!source_) throw std::logic_error("Source work requested without source evidence");
+    const auto & original = source_->native_work()[interval];
+    if (original.timing != source::NativeTiming::Cpu) {
+        if (original.work != work || original.region.resource != resource) return query(work);
+        ++requests_;
+        auto & response = source_native_work_responses_[interval][0];
+        if (!response) {
+            const bool dispatch = original.timing == source::NativeTiming::ReadyDispatch;
+            const bool service = original.timing == source::NativeTiming::DeviceService;
+            response = Response{ Status::Ready,
+                                 original.region.end_ns - original.region.begin_ns,
+                                 dispatch  ? Coverage::SourceDispatchResidual
+                                 : service ? Coverage::SourceService
+                                           : Coverage::SourceControlEstimate,
+                                 {},
+                                 std::nullopt };
+            if (dispatch) ++source_dispatch_evaluations_;
+            else if (service) ++source_evaluations_;
+            else ++source_control_evaluations_;
+        }
+        return *response;
+    }
     auto expected = original.work;
     const bool residual = work.kind.timing_scope != expected.kind.timing_scope;
     if (residual)
@@ -31,12 +57,12 @@ const Response & Queries::query_source_cpu_work(const planning::Work & work, std
                                          : expected.kind.timing_scope.substr(0, expected.kind.timing_scope.size() - 8) + "_residual_interval";
     if (expected != work || original.region.resource != resource) return query(work);
 
-    const auto & observed = source_cpu_work_[interval];
+    const auto & observed = native_cpu_intervals_[native_cpu_indices_[interval]];
     const auto generated_wait = original.stream_wait_generated ? observed.stream_wait_ns : 0;
     if (observed.unobserved_ns || observed.wait_ns != generated_wait) return query(work);
 
     ++requests_;
-    auto & response = source_cpu_work_responses_[interval][residual ? 1 : 0];
+    auto & response = source_native_work_responses_[interval][residual ? 1 : 0];
     if (!response) {
         const auto raw = residual ? observed.residual_ns : observed.service_ns;
         auto correction = residual ? observed.residual_correction : observed.service_correction;

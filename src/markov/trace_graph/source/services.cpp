@@ -14,7 +14,7 @@ std::optional<planning::CallResources> CallBinding::unique_resources() const {
     return planning::CallResources{ caller, *workers.begin(), *devices.begin() };
 }
 
-std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions) {
+std::vector<CallBinding> call_resources(const Observations & observations, std::span<const ObservedRegion> regions) {
     std::vector<std::vector<Index>> submissions(observations.resources.size());
     for (Index id = 0; id < observations.dependencies.size(); ++id) {
         const auto & edge = observations.dependencies[id];
@@ -41,7 +41,7 @@ std::vector<CallBinding> call_resources(const Observations & observations, std::
     return result;
 }
 
-std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const CpuRegion> regions,
+std::vector<CpuInterval> cpu_intervals(const Observations & observations, const SourceGraph & graph, std::span<const ObservedRegion> regions,
                                        const CpuCosts * costs) {
     // LaneBuilder emits each source resource contiguously, in observed order.
     // Retain only its index range, rather than another per-node timeline.
