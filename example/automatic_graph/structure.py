@@ -310,7 +310,8 @@ class StructureComparison:
             for operation in graph["operations"]
             if graph["regions"][operation["region"]].get("rank") == self.rank
         ]
-        paired = [operation_pairs[operation["id"]] for operation in native if operation["id"] in operation_pairs]
+        paired_native = [operation for operation in native if operation["id"] in operation_pairs]
+        paired = [operation_pairs[operation["id"]] for operation in paired_native]
         paired_ids = {operation["id"] for operation in paired}
         target_ids = {operation["id"] for operation in target}
         complete = len(paired) == len(native) == len(target) and paired_ids == target_ids
@@ -327,20 +328,23 @@ class StructureComparison:
                 "paired_target_operations": len(paired_ids),
             },
         }
-        if not complete:
-            return {**window, "status": "partial", "reason": "matched flows do not cover the entire window"}
+        if not paired:
+            return {**window, "status": "partial", "reason": "no paired operations in the window"}
 
-        # Align logical owners only; dependency and execution checks still use the unchanged target graph.
-        report = self.operations.compare(native, paired)
-        report["execution"] = ExecutionComparison(native, paired, graph["execution"]).compare()
+        # Unpaired work limits coverage, but cannot hide dependencies between paired owners.
+        report = self.operations.compare(paired_native, paired)
+        report["execution"] = ExecutionComparison(paired_native, paired, graph["execution"]).compare()
         report["checks"]["execution_relations"] = report["execution"]["same"]
         checks = report["checks"]
         same_order = [operation["id"] for operation in paired] == [operation["id"] for operation in target]
+        status = "matched" if complete and None not in checks.values() else "partial"
+        if False in checks.values():
+            status = "differences"
         return {
             **window,
             **report,
             "same_operation_order": same_order,
-            "status": "differences" if False in checks.values() else "partial" if None in checks.values() else "matched",
+            "status": status,
         }
 
     def compare(self) -> dict[str, Any]:
@@ -411,10 +415,9 @@ class StructureComparison:
             status = "differences"
         window = self.window(operation_pairs)
 
-        # A fully paired run also has to preserve the whole window's cross-call effects.
-        if not unmatched and not unmatched_target and status != "differences":
-            if window["status"] == "differences" or (status == "matched" and window["status"] == "partial"):
-                status = window["status"]
+        # Coverage gaps do not erase a difference already established between paired calls.
+        if window["status"] == "differences" or (status == "matched" and window["status"] == "partial"):
+            status = window["status"]
         return {
             "scope": (
                 "rank-local matched flows: public geometry/native dependency order, available CPU state, "
