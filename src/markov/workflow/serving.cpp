@@ -45,6 +45,9 @@ nlohmann::json ServingWorkflow::run(bool details) {
     };
     std::map<TaskIdentity, PendingWork> pending;
 
+    // Diagnostics preserve state feedback order even when timestamps are equal.
+    std::size_t state_order = 0;
+
     while (!controller_.done() || !pending.empty()) {
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
             nlohmann::json decision;
@@ -81,6 +84,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
                 };
             executor_.submit(expansion_.graph(), action->task, program);
             controller_.start(*action);
+            if (details) decision["submitted_order"] = state_order++;
 
             // Keep the key before moving the snapshot; function argument evaluation must not move it first.
             const auto identity = action->task;
@@ -124,7 +128,9 @@ nlohmann::json ServingWorkflow::run(bool details) {
         controller_.finish(work.action, work.returned_pages, event.time_ns);
         if (details) {
             work.decision["completed_ns"] = event.time_ns;
+            work.decision["completed_order"] = state_order++;
             work.decision["free_pages_after"] = controller_.free_pages();
+            work.decision["returned_pages"] = work.returned_pages;
         }
         if (details || work.action.commits_requests()) record_completion(result, work.decision, work.action, event.time_ns, details);
         if (details) result["decisions"].push_back(std::move(work.decision));
