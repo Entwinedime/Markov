@@ -88,7 +88,7 @@ bash scripts/markov-control.sh \
 
 默认结果仍为精简JSON，`--details`才输出完整图与执行记录；上述命令的运行日志位于`results/native.logs/core.log`和`native.log`。内部C++接口为`simulate --control native`，其标准流属于协议；直接运行该接口需要连接控制端，通常使用外层脚本。
 
-目前只接基础单worker、完整Prefill、无前缀缓存和无overlap；TP/EP、PP/PD与调度优化的原生接入分别扩展。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。给定输出长度用占位token驱动原生结果处理，不预测自然文本。资源压力下的回退仍未接入，入口可运行不代表完整结构资格或性能精度通过。
+目前只接基础单worker、完整Prefill、无前缀缓存和无overlap；TP/EP、PP/PD与调度优化的原生接入分别扩展。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。原生运行批次的实际筛选作为Select动作交接，撤回通过独立Release归还驻留，原生保留输出历史并决定重新Prefill。给定输出长度用占位token驱动原生结果处理，不预测自然文本；目标释放路径仍须有合格模板，例如混合dtype且含空列表的拼接不能借用同dtype原型。入口可运行不代表完整结构资格或性能精度通过。
 
 ## 来源与区域命令
 

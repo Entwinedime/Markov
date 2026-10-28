@@ -2584,3 +2584,13 @@
 **验证：** 沿用`data/20261028T175036.985082Z_s9-native-shared-execution`，新增三次正式入口运行均完成8请求、恢复32页。两组详细案例的26次读取均等待实际读端口，读取期间不归还资源，输出在读取后；完整图除动作标签外、执行时间线和请求结果均与旧基线相同，默认/明细一致。四项轻量单worker、PP回放及PD默认/回放精简结果与旧基线一致，成功对照的重复文件已删除。Docker Release和控制镜像构建、C++格式、Python3.10语法、Ruff、注释分段及Git空白检查通过；累计processing 540.161037690s/1800s、native 0次、峰值223.37MB、pending为空，保留量低于256MiB，无所属残留容器。证据为results/read-boundary.json、read-retention.json、read-regression.json及read-review.json；两份冻结报告和官方SGLang工作树未变。
 
 **结论与限制：** 结果读取交接取得限定开发证据，尚不授予S9.1完整资格。源码确认资源压力通过原生retract_decode→release_req→release_kv_cache释放，禁用缓存时与已有request_cache_release属于同一释放实现；但控制释放、存活成员筛选以及重新Prefill仍须接入并验证，不能只把当前结果阶段校验放宽。待交付本批后继续该边界，TP/EP及PP/PD原生控制、全量独立验证和性能建设均未前移。
+
+## 2026-10-29 — S9.1：原生撤回、成员顺序与重新Prefill
+
+**范围：** 以已推送`4b0ba04`为起点，沿原生filter_batch/retract_decode、共同资源、Schedule组合、批次列及请求结果核查；复用Qwen3 TP1模板，不进入多worker或独立矩阵。运行材料为`data/20261028T192906.251479Z_s9-native-resource-pressure`，预设native 0次、processing 1800s、临时1GiB/保留256MiB。
+
+**改动：** 原生批次继承真实实现，只上报运行批次的实际筛选；共同Select按请求身份连接列，Release在图完成后归还驻留，不提交请求结束。分配适配归入batches，资源facade保留唯一核心账本。修正原生无模型清理后被误判无工作的交接：仅在实际动作完成或新到达后再次轮询，并清除已空批次视图。业务+202/-67、净增135行；example+10/-4、净增6行，评价从既有输出历史核对重新Prefill，并只在PD拓扑要求五步交接。
+
+**验证：** 六次正式无设备原生调用四成功、两失败，另四项C++轻量/PP/PD回归与旧摘要一致。八请求基线图（除动作标签）、时间线及请求保持不变；两请求/三页案例在首次清理交接失败修正后完成，撤回一次、129 token重新Prefill、3页恢复，默认/明细相同。三请求/八页案例完成15批，实际保留顺序和图内索引均为[1,0]，8页恢复。三请求/五页仍在满池释放时拒绝：selection 12缺混合int32/int64、单非空输入的concatenate执行来源；同dtype原型不能替用。Docker Release/控制镜像构建、Ruff、Python3.10、C++格式、注释分段及Git空白通过；关联代码、文档与数据已审查，冻结报告及官方源码未变。累计processing 232.352991630s、硬件采集0、保留约73.16MB、pending为空，无所属残留容器；失败、镜像和费用均保留，易读入口为results/resource-pressure.md，精确证据为resource-pressure.json、member-order.json、regression.json和review.json。
+
+**结论与限制：** 原生撤回、归还、成员重排和重新Prefill已有完整限定开发链路；满池释放的runtime来源覆盖仍未闭合，S9.1不标完成。下一步先界定混合dtype拼接的有限原型类别及已有事实，再决定必要采集，不放宽物理选择条件、不增加目标专用分支。按业务、评价和文档分层交付本批；单worker完整独立资格、多worker和性能层均未提前授予。
