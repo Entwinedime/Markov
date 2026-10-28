@@ -9,6 +9,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from execution import reachable_links
 from markov_collection.artifacts.json_file import write_json
 from request_state import RequestStateEvidence
 
@@ -50,6 +51,17 @@ class ExecutionEvidence:
         }
         if not checks["timeline_identity"]:
             return {"status": "differences", "checks": checks}
+
+        # Follow each target's actual producer; native batching can carry a different state value.
+        calls = {call["operation"]: call for call in execution["host_calls"] if "operation" in call}
+        required = {
+            (calls[producer]["return"], calls[operation["id"]]["entry"])
+            for operation in graph["operations"]
+            for value in operation["inputs"]
+            if (producer := graph["values"][value]["producer"]) is not None
+        }
+        missing = required - reachable_links(execution, required)
+        checks["value_descriptor_readiness"] = not missing
 
         # A serving window ends at its visible ports; unrelated asynchronous tails can still be in flight.
         checks["nonnegative_intervals"] = all(
@@ -150,6 +162,12 @@ class ExecutionEvidence:
             "controls": len(self.result["controls"]),
             "handoffs": len(flows),
             "request_state": state,
+            "value_production": {
+                "scope": "host descriptor return before consumption; device contents and storage hazards are separate",
+                "required_links": len(required),
+                "missing_count": len(missing),
+                "missing_links": sorted(missing)[:3],
+            },
         }
 
 

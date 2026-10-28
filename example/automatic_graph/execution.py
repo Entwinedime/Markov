@@ -6,6 +6,28 @@ from collections import Counter, defaultdict, deque
 from typing import Any
 
 
+def reachable_links(execution: dict[str, Any], links: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    if not links:
+        return set()
+
+    successors = defaultdict(list)
+    for edge in execution["dependencies"]:
+        successors[edge["source"]].append(edge["target"])
+
+    reached = set()
+    for source, target in links:
+        visited = {source}
+        pending = deque([source])
+        while pending and target not in visited:
+            for child in successors.get(pending.popleft(), ()):
+                if child not in visited:
+                    visited.add(child)
+                    pending.append(child)
+        if target in visited:
+            reached.add((source, target))
+    return reached
+
+
 class ExecutionComparison:
     api_kinds = {
         "copy",
@@ -213,27 +235,6 @@ class ExecutionComparison:
             result[owner].append((kind, name))
         return dict(result)
 
-    def reachable_links(self, links: set[tuple[int, int]]) -> set[tuple[int, int]]:
-        if not links:
-            return set()
-
-        successors = defaultdict(list)
-        for edge in self.execution["dependencies"]:
-            successors[edge["source"]].append(edge["target"])
-
-        reached = set()
-        for source, target in links:
-            visited = {source}
-            pending = deque([source])
-            while pending and target not in visited:
-                for child in successors.get(pending.popleft(), ()):
-                    if child not in visited:
-                        visited.add(child)
-                        pending.append(child)
-            if target in visited:
-                reached.add((source, target))
-        return reached
-
     def stream_frontiers(self) -> dict[str, Any]:
         self.streams: dict[int, list[dict[str, Any]]] = defaultdict(list)
         waits = defaultdict(list)
@@ -409,7 +410,7 @@ class ExecutionComparison:
 
         # A later frontier outside this flow can still complete its local work in the unchanged full graph.
         missing = required - internal
-        transitive = self.reachable_links(missing)
+        transitive = reachable_links(self.execution, missing)
         missing -= transitive
         extra = internal - required
         same = not missing and not extra and not unexpected
