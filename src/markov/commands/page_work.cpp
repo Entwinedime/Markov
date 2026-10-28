@@ -9,6 +9,8 @@
 #include "markov/trace_graph/planning/compute_program.hpp"
 #include "markov/trace_graph/simulation/program_execution.hpp"
 
+#include <algorithm>
+#include <array>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -33,61 +35,61 @@ Json cost_gap_json(const simulation::CostGap & gap) {
 }
 
 struct SubsetExecution {
-    std::size_t completed_frames = 0, executed_nodes = 0, service_operations = 0, queue_dependencies = 0;
+    std::size_t completed_frames = 0, executed_nodes = 0, service_operations = 0;
     std::map<std::string, std::size_t> coverage;
     Json issue = nullptr;
 
-    void evaluate(const source::SourceContext & source, const planning::ComputePlan & plan, cost::Queries & costs, source::Index frame) {
+    planning::ComputeStats compute;
+
+    void evaluate(const source::SourceContext & source, std::vector<planning::FrameCompute> frames, cost::Queries & costs) {
         if (!issue.is_null()) return;
-        if (!plan.missing_row_bindings.empty()) {
+        const auto frame_count = frames.size();
+        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size());
+        if (program.issue()) {
             issue = {
-                {              "kind",    "missing_work_binding" },
-                {             "frame",                     frame },
-                { "source_operations", plan.missing_row_bindings }
+                {   "kind", "compute_structure_unavailable" },
+                { "detail",                *program.issue() }
             };
+            return;
+        }
+        auto result = simulation::ProgramExecution(program, costs, program.resources()).run();
+        executed_nodes += result.execution.executed;
+        std::size_t bound = 0;
+        for (const auto & [kind, count] : result.coverage) {
+            coverage[cost_coverage_name(kind)] += count;
+            bound += count;
+        }
+        const auto & stats = program.stats();
+        compute.add(stats);
+        service_operations += bound - stats.collective_services;
+        if (result.cost_gap) {
+            issue = cost_gap_json(*result.cost_gap);
             return;
         }
 
-        planning::ComputeProgram program(source, plan, frame);
-        const auto unbound = program.unresolved_queues();
-        if (!unbound.empty()) {
-            issue = {
-                {              "kind", "unresolved_resource_order" },
-                {             "frame",                       frame },
-                { "source_operations",               Json::array() }
-            };
-            for (const auto operation : unbound) issue["source_operations"].push_back(operation);
-            return;
-        }
-        auto result = simulation::ProgramExecution(program, costs, source.observations().resources.size()).run();
-        executed_nodes += result.execution.executed;
-        for (const auto & [kind, count] : result.coverage) coverage[cost_coverage_name(kind)] += count;
-        if (result.cost_gap) {
-            issue = cost_gap_json(*result.cost_gap);
-            issue["frame"] = frame;
-            return;
-        }
-        ++completed_frames;
-        for (const auto & operation : plan.operations) service_operations += operation.work.has_value();
-        queue_dependencies += source.frame_queue_order(frame).size();
+        completed_frames += frame_count;
     }
 
     Json report(std::size_t requests, std::size_t evaluations) const {
         return {
-            {               "status",issue.is_null() ? "known_subset_executed" : "stopped"                                     },
-            {     "completed_frames",                                      completed_frames },
-            {       "executed_nodes",                                        executed_nodes },
-            {   "service_operations",                                    service_operations },
-            {   "queue_dependencies",                                    queue_dependencies },
-            {             "coverage",                                              coverage },
-            {      "logical_queries",                                              requests },
-            { "response_evaluations",                                           evaluations },
-            {                "issue",                                                 issue },
-            {        "e2e_predicted",                                                 false },
-            {        "qualification",
-             "Recipe-internal edges and preserved observed stream order only. Placement changes, cross-stream data, cache, CPU and communication dependencies "
-             "are incomplete; no frame or E2E "
-             "latency is reported."                                                        }
+            {                  "status",issue.is_null() ? "known_subset_executed" : "stopped"                                        },
+            {        "completed_frames",                                      completed_frames },
+            {          "executed_nodes",                                        executed_nodes },
+            {      "service_operations",                                    service_operations },
+            {      "queue_dependencies",                            compute.queue_dependencies },
+            {     "collective_services",                           compute.collective_services },
+            {    "participant_arrivals",                          compute.participant_arrivals },
+            {     "participant_wait_ns",                           compute.participant_wait_ns },
+            { "maximum_arrival_span_ns",                       compute.maximum_arrival_span_ns },
+            {                "coverage",                                              coverage },
+            {         "logical_queries",                                              requests },
+            {    "response_evaluations",                                           evaluations },
+            {                   "issue",                                                 issue },
+            {           "e2e_predicted",                                                 false },
+            {           "qualification",
+             "Known compute with blocking collective rendezvous and preserved intra-segment stream order. All participants share the latest collective "
+             "completion; per-rank completion spread is omitted. Placement changes, other cross-stream data, cache and CPU dependencies remain incomplete; "
+             "no frame or E2E latency is reported."                                           }
         };
     }
 };
@@ -159,7 +161,15 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {              "e2e_predicted",                                                                          false },
         {              "qualification",
          "Cache I/O and the known compute subset only. Symmetric participant services and dedicated copy queues are assumed. Query/admission and other CPU, "
-         "communication and complete cross-stream dependencies remain omitted; no HTTP latency is reported."          }
+         "other cross-stream dependencies remain omitted; blocking collective inputs are joined explicitly. All participants share the latest collective "
+         "completion, omitting per-rank completion spread. No HTTP latency is reported."                              }
+    };
+    const auto & compute = program.compute_stats();
+    report["collective_execution"] = {
+        {                "services",     compute.collective_services },
+        {    "participant_arrivals",    compute.participant_arrivals },
+        {     "participant_wait_ns",     compute.participant_wait_ns },
+        { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
     };
     if (const auto * storage = program.storage()) {
         const auto & stats = storage->stats();
@@ -248,6 +258,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
 
             const auto frames = source.context.request_frames(request.identity);
             missing_projection_inputs += frames.empty();
+            std::array<std::vector<planning::FrameCompute>, 2> phases;
             for (const auto frame_id : frames) {
                 const auto & frame = observations.compute_frames[frame_id];
                 if (frame.requests.size() != 1 || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) {
@@ -261,9 +272,9 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 }
                 const auto query = frame.phase == planning::Phase::Prefill ? paths.length(prompt) - prior_pages * size : frame.query_tokens->front();
                 const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
-                const auto plan = planning::project_compute(source.context, frame_id, { query, query, context, 1, static_cast<double>(size) });
+                const planning::AttentionInput variables{ query, query, context, 1, static_cast<double>(size) };
+                auto plan = planning::project_compute(source.context, frame_id, variables);
                 missing_row_bindings += plan.missing_row_bindings.size();
-                if (queries && !cache) execution.evaluate(source.context, plan, *queries, frame_id);
                 dependencies += plan.dependencies.size();
                 for (const auto & operation : plan.operations) {
                     if (!operation.work) {
@@ -275,6 +286,11 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                     counts.source_work_unchanged += operation.source_work_unchanged;
                     counts.source_service_bound += operation.source_work_unchanged && source.context.device_service(operation.source_operation).available();
                 }
+                if (queries && !cache) phases[frame.phase == planning::Phase::Prefill ? 0 : 1].push_back({ frame_id, variables, std::move(plan) });
+            }
+            if (queries && !cache) {
+                for (auto & phase : phases)
+                    if (!phase.empty()) execution.evaluate(source.context, std::move(phase), *queries);
             }
             requests.push_back({
                 {                        "request",                                  request.identity },

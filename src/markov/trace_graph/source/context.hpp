@@ -38,6 +38,7 @@ public:
     const DeviceService & device_service(Index work) const { return device_services_[work]; }
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
+    std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
 
 private:
     void index_compute_queues();
@@ -50,6 +51,7 @@ private:
     std::vector<DeviceService> device_services_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;
     std::vector<std::vector<Index>> frame_queue_issues_;
+    std::vector<std::vector<Index>> frame_collectives_;
 };
 
 } // namespace markov::trace_graph::source

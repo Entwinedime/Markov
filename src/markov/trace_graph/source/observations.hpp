@@ -114,6 +114,19 @@ struct ComputeFrame {
     RecordRef record;
 };
 
+struct CollectiveGroup {
+    std::string identity;
+    std::vector<Index> members;
+};
+
+struct ObservedCollective {
+    Index group, rank, sequence, frame, resource;
+    Time begin_ns, end_ns;
+    RecordRef record;
+    planning::Work work;
+    planning::RowBinding rows;
+};
+
 enum class TokenRole { LookupInput, Prompt, Committed };
 
 struct TokenObservation {
@@ -156,6 +169,8 @@ public:
     std::vector<WorkDescription> work_descriptions;
     std::vector<ObservedWork> work_observations;
     std::vector<ComputeFrame> compute_frames;
+    std::vector<CollectiveGroup> collective_groups;
+    std::vector<ObservedCollective> collectives;
     planning::TokenPaths token_paths;
     std::map<std::string, RequestTokens> request_tokens;
     std::map<std::string, std::size_t> counts;

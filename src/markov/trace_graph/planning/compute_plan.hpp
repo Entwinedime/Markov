@@ -24,6 +24,7 @@ struct ComputePlan {
 
     // Local operation indices; enclosing frame/layer dependencies are separate.
     std::vector<graph::Edge> dependencies;
+    std::vector<graph::Edge> queue_dependencies;
     std::vector<source::Index> missing_row_bindings;
 };
 

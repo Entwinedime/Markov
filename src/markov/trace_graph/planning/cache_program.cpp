@@ -4,7 +4,6 @@
 #include "markov/trace_graph/planning/compute_program.hpp"
 
 #include <functional>
-#include <iterator>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -31,6 +30,12 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
 bool CacheProgram::make_host_room(std::size_t pages) {
     host_evictions_ += cache_.reclaim_host(pages);
     return cache_.available_pages(Tier::Host) >= pages;
+}
+
+ComputeStats CacheProgram::compute_stats() const {
+    auto stats = compute_stats_;
+    if (compute_) stats.add(compute_->stats());
+    return stats;
 }
 
 bool CacheProgram::submit(ProgramRuntime & runtime, PlannedMutation mutation) {
@@ -165,11 +170,8 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         return;
     }
     const auto & tokens = observed.request_tokens.at(request.identity);
-    std::vector<ComputePlan> plans;
+    std::vector<FrameCompute> plans;
     plans.reserve(frames.size());
-    const auto begin = runtime.next_node();
-    PlannedMutation mutation{ 0, {}, {} };
-    std::vector<graph::NodeId> completions;
     for (const auto frame_id : frames) {
         const auto & frame = observed.compute_frames[frame_id];
         if (frame.phase != phase) continue;
@@ -179,28 +181,21 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         }
         const double query = phase == Phase::Prefill ? requests_[request_].prefill_tokens : frame.query_tokens->front();
         const double context = phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
-        plans.push_back(project_compute(source_, frame_id, { query, query, context, 1, static_cast<double>(page_tokens_) }));
-        const auto & plan = plans.back();
-        if (!plan.missing_row_bindings.empty() || !source_.frame_queue_issues(frame_id).empty()) {
-            issue_ = "unresolved_compute_work_or_queue";
-            return;
-        }
-        auto frame_work = compute_mutation(source_, plan, frame_id, begin + mutation.operations.size(), 0, std::nullopt);
-        mutation.operations.insert(mutation.operations.end(),
-                                   std::make_move_iterator(frame_work.operations.begin()),
-                                   std::make_move_iterator(frame_work.operations.end()));
-        mutation.dependencies.insert(mutation.dependencies.end(), frame_work.dependencies.begin(), frame_work.dependencies.end());
-        completions.push_back(begin + mutation.operations.size() - 1);
+        const AttentionInput variables{ query, query, context, 1, static_cast<double>(page_tokens_) };
+        plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
-    if (completions.empty()) {
+
+    if (plans.empty()) {
         if (phase == Phase::Prefill) issue_ = "missing_prefill_frame";
         else commit(runtime);
         return;
     }
-    const auto end = begin + mutation.operations.size();
-    mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::PhaseDone, request_) });
-    for (const auto completion : completions) mutation.dependencies.push_back({ completion, end, graph::EdgeKind::DataDependency });
-    submit(runtime, std::move(mutation));
+    compute_.emplace(source_, std::move(plans), compute_resource_begin());
+    if (compute_->issue()) {
+        issue_ = compute_->issue();
+        return;
+    }
+    compute_->start(runtime, cause_);
 }
 
 void CacheProgram::commit(ProgramRuntime & runtime) {
@@ -233,6 +228,17 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         return;
     }
+    if (event.owner == ComputeProgram::owner) {
+        compute_->on_event(runtime, event);
+        if (compute_->complete()) {
+            compute_stats_.add(compute_->stats());
+            compute_.reset();
+            cause_ = event.identity;
+            if (phase_ == Phase::Prefill) compute(runtime, Phase::Decode);
+            else commit(runtime);
+        }
+        return;
+    }
     cause_ = event.identity;
     if (event.action.kind == std::to_underlying(ActionKind::CopyDone)) {
         const auto transfer = event.action.subject;
@@ -259,10 +265,6 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         pending_evictions_.clear();
         advance(runtime);
-    }
-    else if (!issue_) {
-        if (phase_ == Phase::Prefill) compute(runtime, Phase::Decode);
-        else commit(runtime);
     }
 }
 

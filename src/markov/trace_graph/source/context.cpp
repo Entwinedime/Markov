@@ -19,6 +19,9 @@ SourceContext::SourceContext(Observations && observations)
     for (auto & operations : frame_operations_) {
         std::ranges::stable_sort(operations, {}, [&](Index id) { return observations_.work_observations[id].begin_ns; });
     }
+    frame_collectives_.resize(observations_.compute_frames.size());
+    for (Index id = 0; id < observations_.collectives.size(); ++id) frame_collectives_[observations_.collectives[id].frame].push_back(id);
+    for (auto & calls : frame_collectives_) std::ranges::sort(calls, {}, [&](Index id) { return observations_.collectives[id].begin_ns; });
     for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
         for (const auto request : observations_.compute_frames[frame].requests) request_frames_[observations_.names[request]].push_back(frame);
     }

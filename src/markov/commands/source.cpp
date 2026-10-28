@@ -337,6 +337,14 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
             {     "page_tokens",   frame.page_tokens ? Json(*frame.page_tokens) : Json(nullptr) }
         });
     }
+    auto groups = Json::array();
+    for (const auto & group : captured.collective_groups)
+        groups.push_back({
+            { "identity", group.identity },
+            {  "members",  group.members }
+        });
+    std::map<std::string, std::size_t> collective_calls;
+    for (const auto & call : captured.collectives) ++collective_calls[call.work.kind.operation];
     auto replay_report = replay_summary(captured, built_source, replay, context.origin_ns());
     auto alignment_report = timing_alignment(captured, built_source, replay, context.origin_ns());
     const auto summarized = Clock::now();
@@ -382,6 +390,8 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {              "work_descriptions",                                                                                             std::move(work_descriptions) },
         {         "work_description_scope",                                                                                         "observed_compute_recipe_subset" },
         {                 "compute_frames",                                                                                                        std::move(frames) },
+        {              "collective_groups",                                                                                                        std::move(groups) },
+        {        "collective_observations",                                                                                              std::move(collective_calls) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
         {         "device_service_binding",                                                                                          device_service_summary(context) },
         {                 "request_tokens",                                                                                          request_token_summary(captured) },

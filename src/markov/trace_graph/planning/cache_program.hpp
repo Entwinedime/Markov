@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/planning/cache.hpp"
+#include "markov/trace_graph/planning/compute_program.hpp"
 #include "markov/trace_graph/planning/program.hpp"
 #include "markov/trace_graph/planning/storage.hpp"
 #include "markov/trace_graph/source/context.hpp"
@@ -25,8 +26,8 @@ struct CacheRequestResult {
     bool completed = false;
 };
 
-// Cache/storage and the known compute subset share one clock. CPU,
-// communication and complete cross-stream dependencies remain outside this component.
+// Cache/storage, known compute and blocking collectives share one clock.
+// CPU control and complete cross-stream dependencies remain outside this component.
 class CacheProgram final : public Program {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
@@ -38,7 +39,8 @@ public:
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
     bool complete() const override { return (issue_.has_value() || request_ == requests_.size()) && copies_.empty() && (!storage_ || storage_->idle()); }
 
-    std::size_t resources() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
+    std::size_t resources() const { return compute_resource_begin() + source_.observations().collective_groups.size(); }
+    ComputeStats compute_stats() const;
     const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
     const std::vector<CacheRequestResult> & requests() const { return requests_; }
     const std::optional<std::string> & issue() const { return issue_; }
@@ -50,7 +52,7 @@ public:
     std::size_t peak_host_pages() const { return cache_.peak_pages(Tier::Host); }
 
 private:
-    enum class ActionKind : std::uint32_t { PhaseDone, CopyDone, EvictionDone };
+    enum class ActionKind : std::uint32_t { CopyDone, EvictionDone };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -69,12 +71,15 @@ private:
     bool make_host_room(std::size_t pages);
     bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
+    std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
 
     const source::SourceContext & source_;
     const std::size_t page_tokens_;
     Cache cache_;
     const CacheBackend backend_;
     std::optional<Storage> storage_;
+    std::optional<ComputeProgram> compute_;
+    ComputeStats compute_stats_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;
     std::vector<RadixId> pending_evictions_;

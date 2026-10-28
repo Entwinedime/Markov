@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -123,6 +124,63 @@ void ProbeReader::observe(const ProbeEvent & event) {
         "runtime.phase.logits_output",    "runtime.phase.logits_pruning",    "runtime.phase.greedy_sampling"
     };
     if (std::ranges::find(compute_roles, name) != compute_roles.end()) observe_compute(event);
+    if (name == "runtime.phase.device_collective") observe_collective(event);
+}
+
+void ProbeReader::observe_collective(const ProbeEvent & event) {
+    using namespace trace_graph::planning;
+    const auto & args = event.args;
+    if (args.at("status") != "returned") return;
+    const auto frame = forward_frames_.find(event.process);
+    if (frame == forward_frames_.end()) {
+        ++output_.counts["collective_without_forward_context"];
+        return;
+    }
+
+    const auto implementation = args.at("implementation").get<std::string>();
+    const bool reduction = implementation == "sglang.NpuCommunicator.all_reduce";
+    const bool gather = implementation == "sglang.NpuCommunicator.all_gather";
+    const auto shape = args.at("input_shape").get<std::vector<double>>();
+    const auto stride = args.at("input_stride").get<std::vector<double>>();
+    if ((!reduction && !gather) || shape.size() != 2 || stride.size() != 2 || stride[0] != shape[1] || stride[1] != 1 || args.at("input_device_type") != "npu"
+        || (reduction && args.at("operation") != "sum") || (gather && args.at("gather_dim") != 1 && args.at("gather_dim") != -1)) {
+        ++output_.counts["collective_unsupported_implementation_or_layout"];
+        return;
+    }
+
+    const auto members = args.at("group_members").get<std::vector<Index>>();
+    const auto rank = args.at("global_rank").get<std::int64_t>();
+    const auto sequence = args.at(reduction ? "observed_all_reduce_index" : "observed_all_gather_index").get<std::int64_t>();
+    if (rank < 0 || sequence < 0 || members.empty() || members.size() != args.at("world_size").get<Index>()
+        || std::ranges::count(members, static_cast<Index>(rank)) != 1
+        || std::ranges::any_of(args.at("group_members"), [](const auto & member) { return member.template get<std::int64_t>() < 0; }))
+        throw std::runtime_error("Collective membership or sequence is invalid");
+
+    const auto identity = args.at("group").get<std::string>();
+    const auto [group, inserted] = collective_groups_.try_emplace(std::pair(identity, members), output_.collective_groups.size());
+    if (inserted) output_.collective_groups.push_back({ identity, members });
+    const auto phase = output_.compute_frames[frame->second].phase == Phase::Prefill ? "prefill." : "decode.";
+    const auto operation = reduction ? std::string(phase) + "all_reduce" : "collective.all_gather";
+    const auto bytes = args.at("element_bytes").get<double>();
+    const auto basis = args.value("last_token_projection", false) ? RowBasis::BatchSize : RowBasis::QueryTokens;
+    const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    output_.collectives.push_back({
+        group->second,
+        static_cast<Index>(rank),
+        static_cast<Index>(sequence),
+        frame->second,
+        resource,
+        event.begin_ns,
+        event.end_ns,
+        event.record,
+        { { operation, implementation + ":" + args.at("input_dtype").get<std::string>(), "collective_completion_interval" },
+                 { { "rows", shape[0] },
+                 { "width", shape[1] },
+                 { "element_bytes", bytes },
+                 { "participants", static_cast<double>(members.size()) },
+                 { "logical_tensor_bytes", shape[0] * shape[1] * bytes } }                                                                                                  },
+        {                                                                                                             basis, args.at("rows_per_token").get<double>() }
+    });
 }
 
 trace_graph::planning::PrefixId ProbeReader::token_path(const nlohmann::json & dictionary) {
