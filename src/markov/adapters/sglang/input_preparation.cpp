@@ -123,6 +123,24 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
         else {
             queued(calls, prefix + "request_table.locations", "aten.clone:" + sequence_dtype_, shape, false, "aclnnInplaceCopy");
             queued(calls, prefix + "request_table.write", "aten.index_put_:int32:int64_indices", shape, false, "aclnnIndexPutImpl");
+            auto & call = calls.back();
+            call.work.features = {
+                {    "batch_size", input.batch_size },
+                {      "elements", input.batch_size },
+                {    "table_rows",      table_rows_ },
+                { "table_columns",   table_columns_ }
+            };
+
+            // The supported int32 table/two-int64-index route broadcasts
+            // the write inputs before IndexPutV2; both share one worker call.
+            call.launches = {
+                Work{ { prefix + "request_table.broadcast", "ascend.index_put.broadcast:int32:int64_indices", "device_service" }, call.work.features },
+                Work{         { prefix + "request_table.write", "ascend.index_put.write:int32:int64_indices", "device_service" }, call.work.features }
+            };
+            call.worker_first_use = Work{
+                { "runtime.cann.first_use", call.work.kind.implementation, "worker_blocking_interval" },
+                call.work.features
+            };
         }
     }
     else {

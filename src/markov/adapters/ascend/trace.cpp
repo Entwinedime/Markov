@@ -86,10 +86,15 @@ void TraceReader::record(std::size_t position, const nlohmann::json & event) {
     const auto duration = nanoseconds_from_us(event.at("dur"));
     if (duration > std::numeric_limits<Time>::max() - begin) throw std::runtime_error("Trace end timestamp overflows nanoseconds");
     ObservedSpan span{ begin, begin + duration, resource, name_id, reference };
-    if (!device && file_.channel == Channel::Torch && name.starts_with("AscendCL@"))
+    const bool code_preparation =
+        name == "AscendCL@aclrtBinaryLoadFromData" || name == "Runtime@BinaryGetFunctionByEntry" || name == "Runtime@BinaryGetFunctionByName";
+    const bool device_submission = name == "AscendCL@aclrtLaunchKernelWithHostArgs" || name == "AscendCL@aclrtMemcpyAsync";
+    if (!device && file_.channel == Channel::Torch && (name.starts_with("AscendCL@") || code_preparation))
         output_.native_runtime_calls.push_back({
-            output_.name(name.substr(9)),
-            { resource, begin, begin + duration, reference }
+            output_.name(name.substr(name.starts_with("AscendCL@") ? 9 : 8)),
+            { resource, begin, begin + duration, reference },
+            code_preparation,
+            device_submission
         });
     if ((category == "enqueue" && name.starts_with("Enqueue@")) || (category == "dequeue" && name.starts_with("Dequeue@"))) {
         const auto identity = scalar_identity(args.at("correlation_id"));

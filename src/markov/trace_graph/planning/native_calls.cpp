@@ -12,6 +12,10 @@ KernelUse PreparationCache::use(const KernelPreparation & preparation, std::size
     return loaded_[caller].insert(preparation.first_load).second ? KernelUse::FirstLoad : KernelUse::Load;
 }
 
+bool PreparationCache::first_use(const Work & preparation, std::size_t resource) {
+    return initial_ != KernelCacheInitial::Prepared && prepared_[resource].insert(preparation).second;
+}
+
 std::size_t PreparationCache::specializations() const {
     std::size_t count = 0;
     for (const auto & [caller, keys] : prepared_) count += keys.size();
@@ -88,6 +92,13 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         // Dispatch samples start after both submission and the previous task.
         depend(worker_, ready);
         worker_ = ready;
+        if (call.worker_first_use) {
+            if (!preparations.initial()) return false;
+
+            // shortcut: closed-callback startup precedes its body; split it when intermediate results gain external consumers.
+            if (preparations.first_use(*call.worker_first_use, resources.worker))
+                append(*call.worker_first_use, call.worker_first_use->kind.timing_scope.c_str(), resources.worker, worker_);
+        }
         const auto device = call.incoming_stream ? incoming.value() : resources.device;
         if (call.kind == CallKind::HostUpload) {
             cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
@@ -100,12 +111,14 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
             device_ = DeviceProducer{ copied, device };
         }
         auto device_tail = device_ ? std::optional(device_->completion) : std::nullopt;
-        for (const auto & launch : call.launches) {
-            cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
+        for (std::size_t id = 0; id < call.launches.size(); ++id) {
+            const auto & launch = call.launches[id];
+            const auto sources = call.sources.launches.empty() ? NativeLaunchSources{} : call.sources.launches[id];
+            cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, sources.worker_before);
             const auto kernel = append(launch, "device_service", device, device_tail);
             device_ = DeviceProducer{ kernel, device };
             steps_[kernel].source_operation = call.source_operation;
-            steps_[kernel].source_native_work = call.sources.device;
+            steps_[kernel].source_native_work = sources.device;
             depend(worker_, kernel);
         }
         cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_, call.sources.worker_after);

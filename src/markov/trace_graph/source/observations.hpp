@@ -123,6 +123,8 @@ struct NativeQueueCall {
 struct NativeRuntimeCall {
     Index implementation;
     ObservedRegion region;
+    bool code_preparation = false;
+    bool device_submission = false;
 };
 
 struct ObservedDeviceControl {

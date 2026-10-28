@@ -22,9 +22,14 @@ struct KernelPreparation {
     bool operator==(const KernelPreparation &) const = default;
 };
 
+struct NativeLaunchSources {
+    std::optional<std::size_t> worker_before, device;
+};
+
 struct NativeSources {
     std::optional<std::size_t> caller_before, caller_after, worker_before, worker_after;
-    std::optional<std::size_t> dispatch, device;
+    std::optional<std::size_t> dispatch;
+    std::vector<NativeLaunchSources> launches;
 };
 
 struct NativeCall {
@@ -49,6 +54,7 @@ struct NativeCall {
     std::string queue_name = {};
     NativeSources sources = {};
     DeviceControl device_control = DeviceControl::None;
+    std::optional<Work> worker_first_use = std::nullopt;
 };
 
 struct NativeSequence {
@@ -66,6 +72,7 @@ public:
     explicit PreparationCache(std::optional<KernelCacheInitial> initial) : initial_(initial) {}
     std::optional<KernelCacheInitial> initial() const { return initial_; }
     KernelUse use(const KernelPreparation & preparation, std::size_t caller);
+    bool first_use(const Work & preparation, std::size_t resource);
     bool runtime_initialized(std::size_t caller) const { return initial_ == KernelCacheInitial::Prepared || loaded_.contains(caller); }
     std::size_t specializations() const;
     std::size_t first_loads() const;
