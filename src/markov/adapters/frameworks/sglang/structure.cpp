@@ -202,12 +202,8 @@ BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std
             const auto received = ranks_.at(rank)->message("pipeline_receive_output", batch, payload, false);
             payload = received.region.ports.outputs;
             const auto tokens = ranks_.at(rank)->receive_result(batch, payload.at("next_token_ids"));
-            auto program = ranks_.at(rank)->complete(batch,
-                                                     action.work->effects,
-                                                     action.lane,
-                                                     flow.outputs.at(rank),
-                                                     tokens,
-                                                     action.step == ServingStep::Model ? std::optional(action.flow) : std::nullopt);
+            auto program =
+                ranks_.at(rank)->complete(batch, action.work->effects, action.lane, flow.outputs.at(rank), tokens, action.step == ServingStep::Model);
             if (program.publication) {
                 if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
                 result.publication = program.publication;

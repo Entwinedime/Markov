@@ -59,6 +59,7 @@ class SGLangObservation:
         self.derived_role = False
         self.observe_all_workers = description.get("observe_all_workers", False)
         self.batch_ids: Any = WeakIdKeyDictionary()
+        self.batch_lane = 0
         self.process_groups = None
         if (
             description["pp_size"] > 1
@@ -160,6 +161,7 @@ class SGLangObservation:
                 "id": identity,
                 "phase": phase,
                 "rank": self.parallel["rank"],
+                "lane": self.batch_lane,
                 "members": members,
                 "parameters": {
                     "M": sum(item["new_tokens"] for item in members),
@@ -196,6 +198,12 @@ class SGLangObservation:
             shapes.bind_shape(mapping, (shapes.symbol("R") + 1, mapping.shape[1]))
 
     def schedule(self, original: Any, scheduler: Any) -> Any:
+        if self.pipeline is not None:
+
+            # The native loop installs its running view before this scheduling call can replace it.
+            self.batch_lane = next(
+                index for index, batch in enumerate(scheduler.running_mbs) if batch is scheduler.running_batch
+            )
         pending = list(scheduler.waiting_queue)
         for batch in (scheduler.running_batch, scheduler.last_batch):
             if batch is not None:

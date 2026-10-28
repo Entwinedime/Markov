@@ -107,17 +107,12 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     case ServingStep::Model: {
         const auto inputs = prepare(batch, action.lane);
         const auto output = model(batch, inputs);
-        return complete(batch,
-                        effects,
-                        action.lane,
-                        output.ports.outputs,
-                        output.ports.outputs.at("sampled_tokens"),
-                        action.step == ServingStep::Model ? std::optional(action.flow) : std::nullopt);
+        return complete(batch, effects, action.lane, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), action.step == ServingStep::Model);
     }
     case ServingStep::Reserve:
         return reserve(batch);
     case ServingStep::Accept:
-        return accept(batch, effects, action.flow);
+        return accept(batch, effects, action.lane);
     case ServingStep::Release:
         return release(effects);
     default:
@@ -222,8 +217,7 @@ TargetRegion RankStructure::model(const Batch & batch, const std::map<std::strin
 }
 
 RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
-                                    const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens,
-                                    std::optional<std::size_t> handoff) {
+                                    const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens, bool handoff) {
     const auto begin = shared_.regions.size();
     auto columns = model_columns;
     if (sampled_tokens) columns["model_tokens"] = *sampled_tokens;
@@ -285,19 +279,25 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     }
 
     if (handoff) {
-        const auto & member = batch.members.front();
-        auto call = invocation(batch);
-        call.parameters.insert({
-            {  "request_slot", static_cast<std::int64_t>(member.slot) + 1 },
-            { "metadata_slot",     static_cast<std::int64_t>(member.slot) },
-            {    "handoff_id",    static_cast<std::int64_t>(*handoff) + 1 }
-        });
-        graph_.append("kv_send",
-                      "control",
-                      call,
-                      {
-                          { "request_map", request_map_.value() }
-        });
+
+        // A model batch can contain several independent request handoffs.
+        for (const auto & member : batch.members) {
+            auto call = invocation(batch);
+            call.parameters["M"] = member.context_tokens + member.new_tokens;
+            call.parameters["B"] = 1;
+            call.parameters["max_sequence_tokens"] = member.context_tokens + member.new_tokens;
+            call.parameters.insert({
+                {  "request_slot",    static_cast<std::int64_t>(member.slot) + 1 },
+                { "metadata_slot",        static_cast<std::int64_t>(member.slot) },
+                {    "handoff_id", static_cast<std::int64_t>(member.request) + 1 }
+            });
+            graph_.append("kv_send",
+                          "control",
+                          call,
+                          {
+                              { "request_map", request_map_.value() }
+            });
+        }
     }
 
     // Native publication precedes the Decode group's final page-pool update.
@@ -388,18 +388,22 @@ RankProgram RankStructure::reserve(const Batch & batch) {
     return { std::nullopt, shared_.execution.region_call(reserved.region).returned, {} };
 }
 
-RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effects, std::size_t handoff) {
+RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effects, std::size_t lane) {
     const auto begin = shared_.regions.size();
+    for (const auto & member : batch.members) {
+        auto call = invocation(batch);
+        call.parameters["M"] = member.new_tokens;
+        call.parameters["B"] = 1;
+        call.parameters["max_sequence_tokens"] = member.new_tokens;
+        call.parameters["metadata_slot"] = static_cast<std::int64_t>(member.slot);
+        call.parameters["handoff_id"] = static_cast<std::int64_t>(member.request) + 1;
+        graph_.append("KvReceived", "control", call);
+    }
     auto call = invocation(batch);
-    call.parameters.insert({
-        { "metadata_slot", static_cast<std::int64_t>(batch.members.front().slot) },
-        {    "handoff_id",                static_cast<std::int64_t>(handoff) + 1 }
-    });
-    graph_.append("KvReceived", "control", call);
 
     // The native prebuilt path installs token/state columns without another model forward.
     graph_.begin_composition("Schedule", "control", {}, {});
-    views_.front().accept();
+    views_.at(lane).accept();
     std::map<std::string, std::size_t> state{
         {  "free_pages",  free_pages_.value() },
         { "request_map", request_map_.value() }
@@ -415,7 +419,7 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     token_relay_ = accepted.ports.outputs.at("token_relay");
     graph_.end_composition(accepted.ports.outputs);
     stamp(begin);
-    return complete(batch, effects, 0, accepted.ports.outputs, std::nullopt);
+    return complete(batch, effects, lane, accepted.ports.outputs, std::nullopt);
 }
 
 RankProgram RankStructure::release(const BatchEffects & effects) {

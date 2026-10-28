@@ -135,23 +135,35 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     const auto node_begin = graph_.execution.first_node() + graph_.execution.nodes().size();
     const auto dependency_begin = graph_.execution.dependencies().size();
     const auto region_begin = graph_.regions.size();
-    auto & handoff = handoffs_[action.flow];
     BatchProgram result{ std::nullopt, {}, {} };
 
-    if (action.step == ServingStep::Transfer) transfer(action, handoff);
+    if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.work->batch.members.front().request));
     else {
         auto & instance = action.task.group == groups_.prefill ? prefill_ : decode_;
         const bool consumes_transfer = action.step == ServingStep::Accept || action.step == ServingStep::Release;
-        result = consumes_transfer ? instance.expand(action, handoff.transferred) : instance.expand(action);
+        RankPorts prerequisites;
+        if (consumes_transfer) {
+            for (const auto & member : action.work->batch.members) {
+                for (const auto & [rank, ports] : handoffs_.at(member.request).transferred)
+                    prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
+            }
+        }
+        result = instance.expand(action, prerequisites);
     }
 
     auto drained = graph_.execution.terminal_nodes(node_begin);
-    if (action.step == ServingStep::Reserve || action.step == ServingStep::Model)
-        bind_readiness(action, result, drained, action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared);
-    if (action.step == ServingStep::Accept) handoff.accepted = true;
-    if (action.step == ServingStep::Release) handoff.released = true;
-    if (handoff.accepted && handoff.released) handoffs_.erase(action.flow);
-    else if (action.step == ServingStep::Batch) handoffs_.erase(action.flow);
+    if (action.step != ServingStep::Batch) {
+
+        // Batch membership may change between P computation and D admission; request identity is stable.
+        for (const auto & member : action.work->batch.members) {
+            auto & handoff = handoffs_[member.request];
+            if (action.step == ServingStep::Reserve || action.step == ServingStep::Model)
+                bind_readiness(action, result, drained, action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared);
+            if (action.step == ServingStep::Accept) handoff.accepted = true;
+            if (action.step == ServingStep::Release) handoff.released = true;
+            if (handoff.accepted && handoff.released) handoffs_.erase(member.request);
+        }
+    }
 
     // PD actions commit whole pool/transfer effects after their own submitted work has drained.
     result.completions = std::move(drained);
@@ -221,7 +233,7 @@ nlohmann::json DisaggregatedStructure::summary() const {
          { "kv_bytes", kv_bytes_ },
          { "metadata_bytes", metadata_bytes_ } }                                                          },
         { "qualification",
-         { { "scheduling", "single_prefill_and_prebuilt_admission" },
+         { { "scheduling", "controller_selected_batches" },
          { "initial_state", "prewarmed_drained" },
          { "completion", "action_work_drained" },
          { "transfer", "native_synchronous_sdma_interface" },

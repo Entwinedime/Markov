@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "markov/contracts/serving.hpp"
+#include "markov/controller/batch_replay.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/controller/kv_pool.hpp"
 
@@ -16,7 +17,10 @@ namespace markov {
 // Planning is read-only; start and finish commit allocation and completion effects.
 class ServingController final : public ServingControl {
 public:
-    ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit);
+
+    // Requests are validated in arrival order; replay uses the same request index space.
+    ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit,
+                      BatchReplay * replay = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
 
@@ -67,6 +71,7 @@ private:
     std::int64_t last_event_ns_ = 0;
     std::size_t next_task_ = 0;
     std::size_t next_flow_ = 0;
+    BatchReplay * replay_;
 };
 
 } // namespace markov

@@ -8,14 +8,15 @@
 namespace markov {
 
 DisaggregatedController::DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups,
-                                                 PageReuse reuse)
+                                                 PageReuse reuse, BatchReplay * replay)
     : prefill_settings_(prefill),
       decode_settings_(decode),
       groups_(std::move(groups)),
       prefill_(requests.size(), prefill, reuse),
-      decode_(requests.size(), decode, reuse) {
+      decode_(requests.size(), decode, reuse),
+      replay_(replay) {
     if (prefill.page_size != decode.page_size) throw std::invalid_argument("PD page transfer requires matching page sizes");
-    for (auto & request : Request::ordered(std::move(requests))) {
+    for (auto & request : requests) {
         if (prefill_.pages_for(request.prompt_tokens) > prefill_settings_.max_total_tokens / prefill_settings_.page_size
             || decode_.pages_for(request.prompt_tokens + (request.output_tokens - 1)) > decode_settings_.max_total_tokens / decode_settings_.page_size)
             throw std::invalid_argument("request cannot fit its P/D KV capacity: " + request.id);
@@ -33,9 +34,11 @@ Batch DisaggregatedController::new_batch(const KvPool & pool, const ServingSetti
 
 void DisaggregatedController::append_member(Batch & batch, const KvPool & pool, std::size_t request, std::int64_t tokens) const {
     const auto & resident = pool.residence(request);
-    const auto slot = resident.slot ? *resident.slot : pool.free_slots().front();
+    const auto new_members = std::ranges::count_if(batch.members, [&](const auto & member) { return !pool.residence(member.request).slot; });
+    const auto slot = resident.slot ? *resident.slot : pool.free_slots().at(static_cast<std::size_t>(new_members));
     BatchMember member{ request, slot, resident.tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()), {} };
     const auto pages = pool.pages_for(resident.tokens + tokens) - static_cast<std::int64_t>(resident.pages.size());
+    if (batch.allocated_pages + pages > static_cast<std::int64_t>(pool.free_pages().size())) throw std::invalid_argument("batch exceeds available KV pages");
     for (std::int64_t index = 0; index < pages; ++index)
         member.new_pages.push_back(pool.free_pages().at(static_cast<std::size_t>(batch.allocated_pages + index)));
     batch.allocated_pages += pages;
@@ -57,6 +60,9 @@ ServingAction DisaggregatedController::action(ServingStep step, Batch batch, Bat
                          : step == ServingStep::Transfer                            ? groups_.transfer
                                                                                     : groups_.decode;
     BatchWork work{ std::move(batch), std::move(effects), {} };
+    std::size_t lane = 0;
+    if (replay_ && step == ServingStep::Model) lane = replay_->next("prefill")->lane;
+    if (replay_ && (step == ServingStep::Batch || step == ServingStep::Accept)) lane = replay_->next("decode")->lane;
     if (step == ServingStep::Transfer) {
         const auto request = work.batch.members.front().request;
         const auto & source = prefill_.residence(request).pages;
@@ -65,7 +71,7 @@ ServingAction DisaggregatedController::action(ServingStep step, Batch batch, Bat
     }
     return {
         { group, next_task_ },
-        std::make_shared<const BatchWork>(std::move(work)), now_ns, flow, 0, std::nullopt, step
+        std::make_shared<const BatchWork>(std::move(work)), now_ns, flow, lane, std::nullopt, step
     };
 }
 
@@ -99,7 +105,26 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         }
     }
 
-    if (!decode_busy_) {
+    const auto * recorded_decode = replay_ ? replay_->next("decode") : nullptr;
+    if (!decode_busy_ && recorded_decode && recorded_decode->prebuilt) {
+        auto batch = new_batch(decode_, decode_settings_, Phase::Prefill);
+        bool ready = true;
+        for (const auto & member : recorded_decode->members) {
+            if (requests_[member.request].stage != RequestStage::Transferred) {
+                ready = false;
+                break;
+            }
+            auto installed = view(member.request, decode_, decode_settings_).members.front();
+            installed.new_tokens = installed.context_tokens;
+            installed.context_tokens = 0;
+            batch.members.push_back(std::move(installed));
+        }
+        if (ready) {
+            auto completion = effects(batch, true);
+            return action(ServingStep::Accept, std::move(batch), std::move(completion), now_ns, next_task_);
+        }
+    }
+    if (!decode_busy_ && !replay_) {
         for (const auto request : active_) {
             const auto & state = requests_[request];
             if (state.stage != RequestStage::Transferred) continue;
@@ -118,21 +143,41 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         }
     }
 
-    if (!decode_busy_ && waiting_ < requests_.size() && !decode_.free_slots().empty()) {
+    const auto waiting = next_waiting();
+    if (!decode_busy_ && waiting && !decode_.free_slots().empty()) {
         auto remaining = decode_settings_.max_total_tokens / decode_settings_.page_size;
         for (const auto request : active_) {
             const auto & input = requests_[request].input;
             remaining -= decode_.pages_for(input.prompt_tokens + (input.output_tokens - 1));
         }
-        const auto & next = requests_[waiting_].input;
+        const auto & next = requests_[*waiting].input;
         if (next.arrival_ns <= now_ns && decode_.pages_for(next.prompt_tokens + (next.output_tokens - 1)) <= remaining) {
             auto batch = new_batch(decode_, decode_settings_, Phase::Prefill);
-            append_member(batch, decode_, waiting_, next.prompt_tokens);
+            append_member(batch, decode_, *waiting, next.prompt_tokens);
             return action(ServingStep::Reserve, std::move(batch), {}, now_ns, next_task_);
         }
     }
 
-    if (!prefill_busy_ && !prefill_.free_slots().empty()) {
+    if (!prefill_busy_ && replay_) {
+        const auto * recorded = replay_->next("prefill");
+        if (recorded) {
+            if (recorded->members.size() > static_cast<std::size_t>(prefill_settings_.max_running_requests))
+                throw std::invalid_argument("recorded prefill batch exceeds request capacity");
+            const bool ready = recorded->members.size() <= prefill_.free_slots().size() && std::ranges::all_of(recorded->members, [&](const auto & member) {
+                                   return requests_[member.request].stage == RequestStage::Reserved;
+                               });
+            if (ready) {
+                auto batch = new_batch(prefill_, prefill_settings_, Phase::Prefill);
+                BatchEffects completion;
+                for (const auto & member : recorded->members) {
+                    append_member(batch, prefill_, member.request, member.new_tokens);
+                    completion.members.push_back({ member.request, batch.members.back().slot, 1, member.new_tokens, false, false, {} });
+                }
+                return action(ServingStep::Model, std::move(batch), std::move(completion), now_ns, next_task_);
+            }
+        }
+    }
+    if (!prefill_busy_ && !replay_ && !prefill_.free_slots().empty()) {
         for (const auto request : active_) {
             const auto & state = requests_[request];
             if (state.stage != RequestStage::Reserved
@@ -145,10 +190,19 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         }
     }
 
-    if (!decode_busy_) {
+    if (!decode_busy_ && (!replay_ || (recorded_decode && !recorded_decode->prebuilt))) {
         auto batch = new_batch(decode_, decode_settings_, Phase::Decode);
-        for (const auto request : active_) {
-            if (requests_[request].stage == RequestStage::Active) append_member(batch, decode_, request, 1);
+        if (recorded_decode) {
+            for (const auto & member : recorded_decode->members) {
+                if (requests_[member.request].stage != RequestStage::Active) return std::nullopt;
+                if (decode_.residence(member.request).tokens != member.context_tokens) throw std::invalid_argument("recorded decode context is not ready");
+                append_member(batch, decode_, member.request, member.new_tokens);
+            }
+        }
+        else {
+            for (const auto request : active_) {
+                if (requests_[request].stage == RequestStage::Active) append_member(batch, decode_, request, 1);
+            }
         }
         if (!batch.members.empty()) { return action(ServingStep::Batch, std::move(batch), {}, now_ns, next_task_); }
     }
@@ -176,15 +230,20 @@ void DisaggregatedController::start(const ServingAction & action) {
     const auto & batch = action.work->batch;
     if (action.step == ServingStep::Reserve) {
         decode_.reserve(batch);
-        auto & request = requests_[waiting_];
+        const auto identity = batch.members.front().request;
+        auto & request = requests_[identity];
         request.flow = action.flow;
-        active_.push_back(waiting_++);
+        active_.push_back(identity);
+        ++waiting_;
     }
     else if (action.step == ServingStep::Model) {
         prefill_.reserve(batch);
-        prefill_active_.push_back(batch.members.front().request);
+        for (const auto & member : batch.members) prefill_active_.push_back(member.request);
     }
     else if (action.step == ServingStep::Batch) decode_.reserve(batch);
+
+    if (replay_ && action.step == ServingStep::Model) replay_->advance("prefill");
+    if (replay_ && (action.step == ServingStep::Accept || action.step == ServingStep::Batch)) replay_->advance("decode");
 
     channel(action.step) = action.task;
     last_event_ns_ = action.scheduled_ns;
@@ -205,8 +264,10 @@ void DisaggregatedController::finish(const ServingAction & action, std::span<con
         state.stage = RequestStage::Reserved;
         break;
     case ServingStep::Model:
-        prefill_.advance(request, state.input.prompt_tokens);
-        state.stage = RequestStage::ModelReady;
+        for (const auto & member : action.work->batch.members) {
+            prefill_.advance(member.request, member.new_tokens);
+            requests_[member.request].stage = RequestStage::ModelReady;
+        }
         break;
     case ServingStep::Transfer:
         state.stage = RequestStage::Transferred;
@@ -233,8 +294,21 @@ void DisaggregatedController::finish(const ServingAction & action, std::span<con
     }
 }
 
+std::optional<std::size_t> DisaggregatedController::next_waiting() const {
+    if (!replay_) return waiting_ < requests_.size() ? std::optional(waiting_) : std::nullopt;
+
+    // Reserve the upcoming native batch, even when its request order differs from input order.
+    if (const auto * batch = replay_->next("prefill")) {
+        for (const auto & member : batch->members) {
+            if (requests_[member.request].stage == RequestStage::Waiting) return member.request;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<std::int64_t> DisaggregatedController::next_arrival_ns(std::int64_t now_ns) const {
-    if (waiting_ < requests_.size() && requests_[waiting_].input.arrival_ns > now_ns) return requests_[waiting_].input.arrival_ns;
+    const auto waiting = next_waiting();
+    if (waiting && requests_[*waiting].input.arrival_ns > now_ns) return requests_[*waiting].input.arrival_ns;
     return std::nullopt;
 }
 

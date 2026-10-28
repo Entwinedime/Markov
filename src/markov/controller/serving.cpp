@@ -6,16 +6,18 @@
 
 namespace markov {
 
-ServingController::ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit)
+ServingController::ServingController(ServingSettings settings, std::vector<Request> requests, std::string group, std::size_t stages, std::size_t batch_limit,
+                                     BatchReplay * replay)
     : settings_(settings),
       group_(std::move(group)),
       kv_(requests.size(), settings),
       stages_(stages),
       batch_limit_(batch_limit),
-      lanes_(stages) {
+      lanes_(stages),
+      replay_(replay) {
     if (stages == 0 || batch_limit == 0) throw std::invalid_argument("serving needs stages and a positive microbatch limit");
     const auto capacity = settings.max_total_tokens / settings.page_size;
-    for (auto & request : Request::ordered(std::move(requests))) {
+    for (auto & request : requests) {
 
         // Prefill emits the first output; only later outputs append that previous token to KV.
         const auto peak = kv_.pages_for(request.prompt_tokens + (request.output_tokens - 1));
@@ -68,6 +70,8 @@ std::optional<ServingAction> ServingController::plan(std::int64_t now_ns, const 
 
 std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane, std::int64_t now_ns, const AdmissionConstraints & admission) const {
     const auto & active = lanes_[lane].active;
+    const auto * recorded = replay_ ? replay_->next("model") : nullptr;
+    if (replay_ && (!recorded || lane != recorded->lane)) return {};
 
     // Reserve each active request's peak pages; actual ownership grows only with KV residency.
     auto remaining = settings_.max_total_tokens / settings_.page_size;
@@ -82,7 +86,7 @@ std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane,
     std::vector<std::size_t> admitted;
 
     // Non-chunked admission consumes complete requests until its token budget is exhausted.
-    for (auto index = waiting_; index < requests_.size() && admitted.size() < slots && input_tokens > 0; ++index) {
+    for (auto index = waiting_; !replay_ && index < requests_.size() && admitted.size() < slots && input_tokens > 0; ++index) {
         const auto & state = requests_[index];
         if (state.input.arrival_ns > now_ns || state.peak_pages > remaining) break;
 
@@ -94,11 +98,23 @@ std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane,
         remaining -= state.peak_pages;
         input_tokens = std::max<std::int64_t>(0, input_tokens - budget_tokens);
     }
-    if (admitted.empty() && active.empty()) return {};
+    if (!recorded && admitted.empty() && active.empty()) return {};
 
     // Describe ownership changes without mutating the controller until start().
-    const bool prefill = !admitted.empty();
-    const auto & selected = prefill ? admitted : active;
+    const bool prefill = recorded ? recorded->phase == Phase::Prefill : !admitted.empty();
+    auto selected = prefill ? admitted : active;
+    if (recorded) {
+        selected.clear();
+        for (const auto & member : recorded->members) {
+            const auto & request = requests_[member.request];
+            if (request.input.arrival_ns > now_ns) return {};
+            if (kv_.residence(member.request).tokens != member.context_tokens)
+                throw std::invalid_argument("replay context is not ready for request: " + request.input.id);
+            selected.push_back(member.request);
+        }
+        if (selected.size() > batch_limit_ || (prefill && selected.size() > kv_.free_slots().size()))
+            throw std::invalid_argument("recorded batch exceeds available request slots");
+    }
     Batch batch{ .phase = prefill ? Phase::Prefill : Phase::Decode,
                  .request_capacity = settings_.max_running_requests,
                  .free_pages_before = static_cast<std::int64_t>(kv_.free_pages().size()),
@@ -113,6 +129,8 @@ std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane,
         BatchMember member{ identity, slot, resident.tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()), {} };
 
         const auto required = kv_.pages_for(resident.tokens + tokens) - static_cast<std::int64_t>(resident.pages.size());
+        if (batch.allocated_pages + required > static_cast<std::int64_t>(kv_.free_pages().size()))
+            throw std::invalid_argument("batch exceeds available KV pages");
         for (std::int64_t page = 0; page < required; ++page) {
             member.new_pages.push_back(kv_.free_pages().at(static_cast<std::size_t>(batch.allocated_pages)));
             ++batch.allocated_pages;
@@ -139,6 +157,7 @@ void ServingController::start(const ServingAction & action) {
                 ++waiting_;
             }
         }
+        if (replay_) replay_->advance("model");
 
         lane.flow = Flow{ next_flow_++, action.work, 0, std::nullopt };
     }
@@ -198,6 +217,13 @@ void ServingController::finish(const ServingAction & action, std::span<const std
 }
 
 std::optional<std::int64_t> ServingController::next_arrival_ns(std::int64_t now_ns) const {
+    if (replay_) {
+        const auto * next = replay_->next("model");
+        if (!next) return std::nullopt;
+        auto arrival = now_ns;
+        for (const auto & member : next->members) arrival = std::max(arrival, requests_[member.request].input.arrival_ns);
+        return arrival;
+    }
     if (waiting_ == requests_.size()) return std::nullopt;
 
     // Cleanup may unblock a waiting request that has already arrived.

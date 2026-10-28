@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -16,6 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "markov/adapters/frameworks/sglang/batch_record.hpp"
 #include "markov/adapters/frameworks/sglang/disaggregated.hpp"
 #include "markov/adapters/frameworks/sglang/structure.hpp"
 #include "markov/adapters/frameworks/sglang/topology.hpp"
@@ -110,7 +112,7 @@ nlohmann::json expert_condition(const nlohmann::json & settings, const nlohmann:
     return conditions.at(id);
 }
 
-nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, bool details) {
+nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, bool details) {
     check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
     const bool disaggregated = configuration.contains("pd");
@@ -131,6 +133,10 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                              integer(request.at("prompt_tokens")),
                              integer(request.at("output_tokens")) });
     }
+
+    requests = markov::Request::ordered(std::move(requests));
+    std::optional<markov::BatchReplay> replay;
+    if (!batches.is_null()) replay.emplace(batches, requests, disaggregated);
 
     const markov::GivenDurations durations(input.at("node_durations_ns"));
     std::vector<std::int64_t> devices;
@@ -168,6 +174,9 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                 throw std::invalid_argument("PD target topology differs from its native instance source");
         }
         const auto page_size = integer(configuration.at("page_size"));
+        if (replay
+            && (replay->lanes("prefill") > static_cast<std::size_t>(p.value("pp", 1)) || replay->lanes("decode") > static_cast<std::size_t>(d.value("pp", 1))))
+            throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
         const markov::ServingSettings prefill(integer(p.at("max_running_requests")),
                                               integer(p.at("max_total_tokens")),
                                               page_size,
@@ -182,9 +191,11 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                                          devices,
                                                          expert_condition(p, input, *prefill_source),
                                                          expert_condition(d, input, *decode_source));
-        markov::DisaggregatedController controller(prefill, decode, std::move(requests), groups, expansion.page_reuse());
+        markov::DisaggregatedController controller(prefill, decode, std::move(requests), groups, expansion.page_reuse(), replay ? &*replay : nullptr);
         markov::ServingWorkflow workflow(controller, expansion, durations);
         auto result = workflow.run(details);
+        if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
+        result["control_source"] = replay ? "recorded_batches" : "lightweight_policy";
         result["configuration"] = configuration;
         result["duration_source"] = "given_execution_kind_ns";
         result["pool_free_pages"] = controller.pool_free_pages();
@@ -199,6 +210,7 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                             integer(configuration.at("max_prefill_tokens")) };
     const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
     if (stages <= 0) throw std::invalid_argument("pp must be positive");
+    if (replay && replay->lanes("model") > static_cast<std::size_t>(stages)) throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
     const auto batch_limit =
         configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
     if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
@@ -208,9 +220,16 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     const auto routes = expert_condition(configuration, input, assets.front());
     markov::RegionGraph graph;
     markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
-    markov::ServingController controller(settings, std::move(requests), control_group, static_cast<std::size_t>(stages), static_cast<std::size_t>(batch_limit));
+    markov::ServingController controller(settings,
+                                         std::move(requests),
+                                         control_group,
+                                         static_cast<std::size_t>(stages),
+                                         static_cast<std::size_t>(batch_limit),
+                                         replay ? &*replay : nullptr);
     markov::ServingWorkflow workflow(controller, expansion, durations);
     auto result = workflow.run(details);
+    if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
+    result["control_source"] = replay ? "recorded_batches" : "lightweight_policy";
     result["configuration"] = configuration;
     result["duration_source"] = "given_execution_kind_ns";
     result["structure"] = expansion.summary();
@@ -229,10 +248,46 @@ const markov::TemplateAsset & select_role(std::span<const markov::TemplateAsset>
 
 int main(int argc, char ** argv) {
     try {
+        if (argc >= 2 && std::string(argv[1]) == "record-batches") {
+            std::vector<std::filesystem::path> sources;
+            std::filesystem::path input;
+            std::filesystem::path output;
+            for (int index = 2; index < argc; ++index) {
+                const std::string option = argv[index];
+                if (index + 1 == argc) throw std::invalid_argument("record-batches option has no value");
+                const std::filesystem::path value = argv[++index];
+                if (option == "--source") sources.push_back(value);
+                else if (option == "--input" && input.empty()) input = value;
+                else if (option == "--output" && output.empty()) output = value;
+                else throw std::invalid_argument("unknown or repeated record-batches option: " + option);
+            }
+            if (sources.empty() || input.empty() || output.empty()) throw std::invalid_argument("record-batches requires source, input and output");
+            const auto specification = read_json(input);
+            markov::sglang::BatchRecord record(specification.at("requests"));
+            std::vector<std::filesystem::path> inputs{ input };
+            for (const auto & source : sources) {
+                const auto session = source.parent_path() / "session.json";
+                record.append(read_json(source), read_json(session));
+                inputs.insert(inputs.end(), { source, session });
+            }
+            std::vector<markov::Request> requests;
+            for (const auto & request : specification.at("requests"))
+                requests.push_back({ request.at("id").get<std::string>(),
+                                     integer(request.at("arrival_ns")),
+                                     integer(request.at("prompt_tokens")),
+                                     integer(request.at("output_tokens")) });
+            const markov::BatchReplay checked(record.document(),
+                                              markov::Request::ordered(std::move(requests)),
+                                              specification.at("configuration").contains("pd"));
+            write_json(output, record.document(), inputs, true);
+            std::cout << "native batch records written\n";
+            return 0;
+        }
         if (argc >= 2 && std::string(argv[1]) == "simulate") {
             std::filesystem::path template_path;
             std::filesystem::path input;
             std::filesystem::path output;
+            std::filesystem::path batches;
             bool details = false;
             for (int index = 2; index < argc; ++index) {
                 const std::string option = argv[index];
@@ -245,14 +300,17 @@ int main(int argc, char ** argv) {
                 if (option == "--templates" && template_path.empty()) template_path = value;
                 else if (option == "--input" && input.empty()) input = value;
                 else if (option == "--output" && output.empty()) output = value;
+                else if (option == "--batches" && batches.empty()) batches = value;
                 else throw std::invalid_argument("unknown or repeated simulate option: " + option);
             }
             if (template_path.empty() || input.empty() || output.empty()) throw std::invalid_argument("simulate requires templates, input and output");
             auto document = read_json(template_path);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto assets = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
-            const auto result = simulate(assets, read_json(input), details);
-            write_json(output, result, { template_path, input }, !details);
+            const auto result = simulate(assets, read_json(input), batches.empty() ? nlohmann::json(nullptr) : read_json(batches), details);
+            std::vector<std::filesystem::path> inputs{ template_path, input };
+            if (!batches.empty()) inputs.push_back(batches);
+            write_json(output, result, inputs, !details);
             std::cout << nlohmann::json{
                 {          "scope",                                result.at("scope") },
                 {         "status",                               result.at("status") },
@@ -325,7 +383,8 @@ int main(int argc, char ** argv) {
                          "templates.json\n"
                          "       markov expand --templates templates.json --target target.json --output region.json\n"
                          "       markov compose --templates templates.json --target calls.json --output graph.json\n"
-                         "       markov simulate --templates templates.json --input serving.json --output result.json [--details]\n";
+                         "       markov record-batches --source rank.json [--source peer.json] --input serving.json --output batches.json\n"
+                         "       markov simulate --templates templates.json --input serving.json --output result.json [--batches batches.json] [--details]\n";
             return 2;
         }
 

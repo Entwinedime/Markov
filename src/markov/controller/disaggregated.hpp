@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "markov/controller/batch_replay.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/controller/kv_pool.hpp"
 
@@ -22,7 +23,10 @@ struct DisaggregatedGroups {
 // Request progress is unique; each instance independently owns its slots and KV residence.
 class DisaggregatedController final : public ServingControl {
 public:
-    DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups, PageReuse reuse);
+
+    // Requests are validated in arrival order; replay uses the same request index space.
+    DisaggregatedController(ServingSettings prefill, ServingSettings decode, std::vector<Request> requests, DisaggregatedGroups groups, PageReuse reuse,
+                            BatchReplay * replay = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) const override;
     void start(const ServingAction & action) override;
@@ -51,6 +55,7 @@ private:
     Batch view(std::size_t request, const KvPool & pool, const ServingSettings & settings) const;
     ServingAction action(ServingStep step, Batch batch, BatchEffects effects, std::int64_t now_ns, std::size_t flow) const;
     BatchEffects effects(const Batch & batch, bool first_output) const;
+    std::optional<std::size_t> next_waiting() const;
     std::optional<TaskIdentity> & channel(ServingStep step);
 
     ServingSettings prefill_settings_;
@@ -67,6 +72,7 @@ private:
     std::optional<TaskIdentity> prefill_busy_;
     std::optional<TaskIdentity> decode_busy_;
     std::optional<TaskIdentity> transfer_busy_;
+    BatchReplay * replay_;
 };
 
 } // namespace markov

@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(markov_core
+    src/markov/controller/batch_replay.cpp
     src/markov/controller/disaggregated.cpp
     src/markov/controller/kv_pool.cpp
     src/markov/controller/serving.cpp
@@ -39,6 +40,7 @@ target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion
 
 add_executable(markov src/markov/cli/main.cpp)
 add_library(markov_application
+    src/markov/adapters/frameworks/sglang/batch_record.cpp
     src/markov/adapters/frameworks/sglang/batches.cpp
     src/markov/adapters/frameworks/sglang/expert_routing.cpp
     src/markov/adapters/frameworks/sglang/disaggregated.cpp
