@@ -115,6 +115,11 @@ struct CpuRegion {
     RecordRef record;
 };
 
+struct NativeQueueCall {
+    Index name;
+    CpuRegion submission, execution;
+};
+
 struct ObservedCallSequence {
     CpuRegion region;
     std::unique_ptr<const planning::CallSequence> definition;
@@ -179,6 +184,7 @@ public:
     std::vector<ObservedPoint> points;
     std::vector<ObservedFlow> flows;
     std::vector<ObservedDependency> dependencies;
+    std::vector<NativeQueueCall> native_queue_calls;
     std::map<std::string, std::size_t> flow_audit;
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;

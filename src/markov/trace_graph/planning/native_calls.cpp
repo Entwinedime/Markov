@@ -65,10 +65,11 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
                 append(load, load.kind.timing_scope.c_str(), resources.caller, caller_);
             }
         }
-        cpu(call.work, "cpu_service", "residual_interval", resources.caller, caller_);
+        const auto & caller_work = call.caller_work ? *call.caller_work : call.work;
+        cpu(caller_work, "cpu_service", "residual_interval", resources.caller, caller_);
         if (call.kind == CallKind::Cpu) continue;
 
-        auto returned = call.work;
+        auto returned = caller_work;
         returned.kind.operation += ".return";
         if (call.kind == CallKind::Readback) {
             const auto & synchronization = call.synchronization.value();

@@ -8,6 +8,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace markov::trace_graph::source {
@@ -43,6 +44,11 @@ struct CallBinding {
     Index caller;
     std::set<Index> workers, devices;
     std::optional<planning::CallResources> unique_resources() const;
+};
+
+struct NativeSequenceBinding {
+    std::vector<Index> calls;
+    std::optional<std::string> issue = "native_queue_identity_unavailable";
 };
 
 std::vector<CallBinding> call_resources(const Observations & observations, std::span<const CpuRegion> regions);

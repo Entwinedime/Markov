@@ -49,7 +49,8 @@ Json cpu_interval_summary(const source::SourceContext & source) {
     }
     struct Preparation {
         Summary intervals;
-        std::size_t rules = 0, resources = 0, queues = 0;
+        std::size_t rules = 0, resources = 0, queues = 0, native_sequences = 0, native_calls = 0;
+        std::map<std::string, std::size_t> native_issues;
         std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> contexts;
     };
     std::map<std::string, Preparation> preparations;
@@ -66,6 +67,12 @@ Json cpu_interval_summary(const source::SourceContext & source) {
             const auto resources = bindings[i].unique_resources();
             item.resources += resources.has_value();
             item.queues += bindings[i].workers.size() == 1;
+            const auto & native = source.preparation_native_calls(frame, i);
+            if (native.issue) ++item.native_issues[*native.issue];
+            else {
+                ++item.native_sequences;
+                item.native_calls += native.calls.size();
+            }
             if (resources) {
                 const auto & r = *resources;
                 ++item.contexts[{ r.caller, r.worker, r.device }];
@@ -97,6 +104,9 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         item["rules"] = preparation.rules;
         item["native_resource_bindings"] = preparation.resources;
         item["native_queue_bindings"] = preparation.queues;
+        item["matched_native_sequences"] = preparation.native_sequences;
+        item["matched_native_calls"] = preparation.native_calls;
+        item["native_sequence_issues"] = preparation.native_issues;
         auto contexts = Json::array();
         for (const auto & [context, count] : preparation.contexts) {
             const auto [caller, worker, device] = context;

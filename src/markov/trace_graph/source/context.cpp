@@ -4,6 +4,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -28,11 +29,61 @@ SourceContext::SourceContext(Observations && observations)
     }
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
+    index_native_sequences();
     index_compute_queues();
     index_frame_calls();
 
     // The context is read-only now; keep semantic tables, not parser interning.
     observations_.release_intake_indexes();
+}
+
+void SourceContext::index_native_sequences() {
+    std::vector<std::vector<Index>> lanes(observations_.resources.size());
+    for (Index id = 0; id < observations_.native_queue_calls.size(); ++id) lanes[observations_.native_queue_calls[id].submission.resource].push_back(id);
+    const auto submitted = [&](Index id) { return observations_.native_queue_calls[id].submission.begin_ns; };
+    for (auto & lane : lanes) std::ranges::sort(lane, {}, submitted);
+
+    for (const auto & frame : observations_.compute_frames) {
+        auto & bindings = preparation_native_calls_.emplace_back(frame.preparations.size());
+        if (frame.sequence_tokens.size() != 1 || !frame.query_tokens) continue;
+        const auto query = std::accumulate(frame.query_tokens->begin(), frame.query_tokens->end(), 0.0);
+        const auto context = frame.sequence_tokens.front();
+        const planning::FrameInput input{ query, query, context, 1, frame.page_tokens.value_or(0) };
+        for (Index id = 0; id < frame.preparations.size(); ++id) {
+            const auto & preparation = frame.preparations[id];
+            if (!preparation.definition) continue;
+            const auto sequence = preparation.definition->describe(frame.phase, input);
+            if (sequence.issue || sequence.calls.empty()
+                || std::ranges::any_of(sequence.calls, [](const planning::NativeCall & call) { return call.queue_name.empty(); }))
+                continue;
+
+            auto & binding = bindings[id];
+            const auto & region = preparation.region;
+            const auto & lane = lanes[region.resource];
+            auto at = std::ranges::lower_bound(lane, region.begin_ns, {}, submitted);
+            for (; at != lane.end() && submitted(*at) < region.end_ns; ++at) binding.calls.push_back(*at);
+            if (binding.calls.size() != sequence.calls.size()) {
+                binding.issue = "native_queue_call_count_mismatch";
+                continue;
+            }
+            binding.issue.reset();
+            for (Index call = 0; call < binding.calls.size(); ++call) {
+                const auto & native = observations_.native_queue_calls[binding.calls[call]];
+                if (observations_.names[native.name] != sequence.calls[call].queue_name || native.submission.end_ns > region.end_ns) {
+                    binding.issue = "native_queue_call_identity_mismatch";
+                    break;
+                }
+                if (call) {
+                    const auto & previous = observations_.native_queue_calls[binding.calls[call - 1]];
+                    if (previous.submission.end_ns > native.submission.begin_ns || previous.execution.resource != native.execution.resource
+                        || previous.execution.end_ns > native.execution.begin_ns) {
+                        binding.issue = "native_queue_order_unavailable";
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void SourceContext::index_frame_calls() {

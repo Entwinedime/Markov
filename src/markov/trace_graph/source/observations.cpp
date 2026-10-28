@@ -44,6 +44,10 @@ void Observations::normalize_resources() {
     for (auto & point : points) point.resource = canonical_resource(point.resource);
     for (auto & work : work_observations) work.resource = canonical_resource(work.resource);
     for (auto & call : collectives) call.resource = canonical_resource(call.resource);
+    for (auto & call : native_queue_calls) {
+        call.submission.resource = canonical_resource(call.submission.resource);
+        call.execution.resource = canonical_resource(call.execution.resource);
+    }
     for (auto & frame : compute_frames)
         for (auto & call : frame.preparations) call.region.resource = canonical_resource(call.region.resource);
 }

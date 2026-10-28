@@ -38,6 +38,11 @@ private:
         std::size_t position;
     };
     std::optional<ExportedKernelFlow> kernel_flow_;
+    struct QueuePair {
+        std::optional<trace_graph::source::ObservedSpan> submitted, executed;
+        bool ambiguous = false;
+    };
+    std::map<std::pair<std::string, std::string>, QueuePair> queue_calls_;
 };
 
 } // namespace markov::adapters::ascend

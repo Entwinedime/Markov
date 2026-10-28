@@ -86,11 +86,38 @@ void TraceReader::record(std::size_t position, const nlohmann::json & event) {
     const auto duration = nanoseconds_from_us(event.at("dur"));
     if (duration > std::numeric_limits<Time>::max() - begin) throw std::runtime_error("Trace end timestamp overflows nanoseconds");
     ObservedSpan span{ begin, begin + duration, resource, name_id, reference };
+    if ((category == "enqueue" && name.starts_with("Enqueue@")) || (category == "dequeue" && name.starts_with("Dequeue@"))) {
+        const auto identity = scalar_identity(args.at("correlation_id"));
+        auto & pair = queue_calls_[{ process, identity }];
+        auto & destination = category == "enqueue" ? pair.submitted : pair.executed;
+        if (destination) pair.ambiguous = true;
+        destination = span;
+    }
     causality_.observe(event, span, device, file_.channel == Channel::NativeHook);
     output_.span(span);
 }
 
 void TraceReader::finish() {
+    for (const auto & [identity, pair] : queue_calls_) {
+        if (pair.ambiguous || !pair.submitted || !pair.executed) {
+            ++output_.counts[pair.ambiguous ? "native_queue.ambiguous" : "native_queue.unpaired"];
+            continue;
+        }
+        const auto & submitted = *pair.submitted;
+        const auto & executed = *pair.executed;
+        const auto native_name = output_.names[submitted.name].substr(8);
+        if (native_name != output_.names[executed.name].substr(8) || submitted.begin_ns > executed.begin_ns) {
+            ++output_.counts["native_queue.inconsistent"];
+            continue;
+        }
+        output_.native_queue_calls.push_back({
+            output_.name(native_name),
+            { submitted.resource, submitted.begin_ns, submitted.end_ns, submitted.record },
+            {  executed.resource,  executed.begin_ns,  executed.end_ns,  executed.record }
+        });
+        ++output_.counts["native_queue.paired"];
+    }
+
     // Profiler process IDs are display domains. Merge only a proven single
     // host process; otherwise preserve lanes and expose the ambiguity.
     if (host_processes_.size() == 1) {

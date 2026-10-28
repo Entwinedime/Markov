@@ -134,6 +134,12 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = calls.issue;
                     return;
                 }
+                if (!calls.calls.empty() && std::ranges::all_of(calls.calls, [](const NativeCall & call) { return !call.queue_name.empty(); })) {
+                    if (const auto & issue = source.preparation_native_calls(input.frame, entry.index).issue) {
+                        issue_ = issue;
+                        return;
+                    }
+                }
                 auto placement = binding.unique_resources();
                 if (std::ranges::any_of(calls.calls, [](const NativeCall & call) { return call.incoming_stream; })) {
                     const auto incoming = pending.plan.producer_device();

@@ -32,6 +32,14 @@ struct NativeCall {
     // for its other calls; one source binding cannot collapse both roles.
     bool incoming_stream = false;
     std::optional<Work> host_transfer = std::nullopt;
+
+    // Framework work between native calls belongs to the caller envelope;
+    // it must not change the worker or device work used for cost queries.
+    std::optional<Work> caller_work = std::nullopt;
+
+    // Optional native observation identity, interpreted by the adapter. It is
+    // evidence for a source sequence, never a cost key or target branch rule.
+    std::string queue_name = {};
 };
 
 struct NativeSequence {

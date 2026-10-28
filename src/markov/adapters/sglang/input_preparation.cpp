@@ -18,8 +18,9 @@ enum class Part { RequestTable, ForwardInputs, SamplingPositions };
 
 class InputPreparation final : public CallSequence {
 public:
-    InputPreparation(Part part, double table_columns, std::string sequence_dtype, bool deterministic_sampling = false)
+    InputPreparation(Part part, double table_rows, double table_columns, std::string sequence_dtype, bool deterministic_sampling = false)
         : part_(part),
+          table_rows_(table_rows),
           table_columns_(table_columns),
           sequence_dtype_(std::move(sequence_dtype)),
           deterministic_sampling_(deterministic_sampling) {}
@@ -27,27 +28,38 @@ public:
 
 private:
     Part part_;
+    double table_rows_;
     double table_columns_;
     std::string sequence_dtype_;
     bool deterministic_sampling_;
 };
 
-void cpu(std::vector<NativeCall> & calls, const std::string & name, const Features & shape) {
-    calls.push_back({
-        { { name, "sglang.batch_input_preparation", "cpu_service" }, shape },
-        CallKind::Cpu,
-        {}
-    });
-}
-
-void queued(std::vector<NativeCall> & calls, const std::string & name, const std::string & implementation, Features shape, bool incoming_stream = false) {
-    cpu(calls, name + ".prepare", shape);
+void queued(std::vector<NativeCall> & calls, const std::string & name, const std::string & implementation, Features shape, bool incoming_stream = false,
+            std::string queue_name = {}) {
     Work work{
         { name, implementation, "device_service" },
         std::move(shape)
     };
     calls.push_back({ work, CallKind::Queued, { work } });
     calls.back().incoming_stream = incoming_stream;
+    calls.back().queue_name = std::move(queue_name);
+}
+
+NativeSequence sequence(std::vector<NativeCall> calls, Part part, const Features & context) {
+    const auto role = part == Part::RequestTable ? "request_table" : part == Part::ForwardInputs ? "forward" : "sampling_positions";
+    for (std::size_t id = 0; id < calls.size(); ++id) {
+        auto caller = calls[id].work;
+        caller.kind.implementation = std::string("sglang.batch_input_preparation.") + role;
+        caller.kind.timing_scope = "cpu_service";
+        caller.features.insert(context.begin(), context.end());
+
+        // The first pre-submit interval includes entry; the final return
+        // includes the sequence tail. Neither introduces another queue port.
+        caller.features["sequence_entry"] = id == 0 ? 1 : 0;
+        caller.features["sequence_exit"] = id + 1 == calls.size() ? 1 : 0;
+        calls[id].caller_work = std::move(caller);
+    }
+    return { std::move(calls), std::nullopt };
 }
 
 void upload(std::vector<NativeCall> & calls, const std::string & name, const std::string & dtype, double element_bytes, Features shape,
@@ -56,7 +68,7 @@ void upload(std::vector<NativeCall> & calls, const std::string & name, const std
     shape["host_pinned"] = 0;
     shape["non_blocking"] = 1;
     const auto bytes = shape.at("elements") * element_bytes;
-    queued(calls, name, "aten.to.npu:" + dtype, std::move(shape), incoming_stream);
+    queued(calls, name, "aten.to.npu:" + dtype, std::move(shape), incoming_stream, "acl_memcpy_host_to_device");
     auto & call = calls.back();
     call.kind = CallKind::HostUpload;
     call.work.kind.timing_scope = "cpu_service";
@@ -79,18 +91,17 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
     };
     std::vector<NativeCall> calls;
     if (part_ == Part::SamplingPositions) {
-        queued(calls, "prefill.sampling_positions", "aten.sub:" + sequence_dtype_, shape);
-        return { std::move(calls), std::nullopt };
+        queued(calls, "prefill.sampling_positions", "aten.sub:" + sequence_dtype_, shape, false, "aclnnSubs");
+        return sequence(std::move(calls), part_, shape);
     }
     shape["query_tokens"] = input.query_tokens;
     shape["context_tokens"] = input.context_tokens;
     shape["prefix_tokens"] = input.context_tokens - input.query_tokens;
-    cpu(calls, prefix + (part_ == Part::RequestTable ? "request_table.entry" : "forward.entry"), shape);
     if (part_ == Part::RequestTable) {
         shape["table_columns"] = table_columns_;
         if (phase == Phase::Prefill) {
             upload(calls, prefix + "prefix_pointers", "uint64", 8, shape);
-            queued(calls, prefix + "request_table.write", "triton.ascend.write_req_to_token_pool", shape);
+            queued(calls, prefix + "request_table.write", "triton.ascend.write_req_to_token_pool", shape, false, "write_req_to_token_pool_triton");
             auto & work = calls.back().launches.front();
 
             // The native kernels iterate over blocks of 512 token locations.
@@ -110,9 +121,8 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
                 { { "pointer_int32_arguments", 2 }, { "pointer_int64_arguments", 4 }, { "pointer_uint64_arguments", 1 }, { "constant_arguments", 1 } });
         }
         else {
-            queued(calls, prefix + "request_table.locations", "aten.clone:" + sequence_dtype_, shape);
-            cpu(calls, prefix + "request_table.output_view", shape);
-            queued(calls, prefix + "request_table.write", "aten.index_put_:int32:int64_indices", shape);
+            queued(calls, prefix + "request_table.locations", "aten.clone:" + sequence_dtype_, shape, false, "aclnnInplaceCopy");
+            queued(calls, prefix + "request_table.write", "aten.index_put_:int32:int64_indices", shape, false, "aclnnIndexPutImpl");
         }
     }
     else {
@@ -125,28 +135,27 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             if (deterministic_sampling_) upload(calls, prefix + "sampling_seed", "int64", 8, shape, true);
         }
         else {
-            queued(calls, prefix + "sequence_increment", "aten.add:" + sequence_dtype_, shape, true);
-            cpu(calls, prefix + "host_sequence_increment", shape);
-            queued(calls, prefix + "original_sequence_increment", "aten.add:int32", shape, true);
+            queued(calls, prefix + "sequence_increment", "aten.add:" + sequence_dtype_, shape, true, "aclnnAdds");
+            queued(calls, prefix + "original_sequence_increment", "aten.add:int32", shape, true, "aclnnAdds");
         }
         const Features handoff{
             { "streams_differ", 1 }
         };
-        queued(calls, prefix + "handoff.record", "ascend.event_record", handoff, true);
-        queued(calls, prefix + "handoff.wait", "ascend.event_wait", handoff);
-        cpu(calls, prefix + "handoff.destroy.prepare", handoff);
+        queued(calls, prefix + "handoff.record", "ascend.event_record", handoff, true, "record_event");
+        queued(calls, prefix + "handoff.wait", "ascend.event_wait", handoff, false, "wait_event");
         calls.push_back({
             { { prefix + "handoff.destroy", "torch_npu.event_destroy", "cpu_service" }, handoff },
             CallKind::Queued,
             {}
         });
+        calls.back().queue_name = "destroy_event";
         if (phase == Phase::Prefill) {
             auto tokens = shape;
             tokens["elements"] = input.query_tokens;
             upload(calls, prefix + "token_ids", "int64", 8, tokens);
             upload(calls, prefix + "extend_lengths", "int32", 4, shape);
             upload(calls, prefix + "prefix_lengths", "int32", 4, shape);
-            queued(calls, prefix + "positions", "triton.ascend.compute_position", tokens);
+            queued(calls, prefix + "positions", "triton.ascend.compute_position", tokens, false, "compute_position_kernel");
             calls.back().launches.front().features = {
                 {   "batch_size",                    input.batch_size },
                 { "query_tokens",                  input.query_tokens },
@@ -160,12 +169,16 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
                                                           { { "pointer_int64_arguments", 1 }, { "pointer_int32_arguments", 3 }, { "constant_arguments", 1 } });
         }
         else {
-            queued(calls, prefix + "positions.subtract", "aten.sub:" + sequence_dtype_, shape);
-            queued(calls, prefix + "positions.clamp", "aten.clamp_min:" + sequence_dtype_, shape);
+            // Decode consumes the preceding iteration's sampled token through
+            // the pool-indexed relay before constructing the new positions.
+            auto tokens = shape;
+            tokens["buffer_rows"] = table_rows_;
+            queued(calls, prefix + "token_ids", "aten.index:future_tokens:int64:int64_indices", std::move(tokens), false, "aclnnIndex");
+            queued(calls, prefix + "positions.subtract", "aten.sub:" + sequence_dtype_, shape, false, "aclnnSubs");
+            queued(calls, prefix + "positions.clamp", "aten.clamp_min:" + sequence_dtype_, shape, false, "aclnnClamp");
         }
     }
-    cpu(calls, prefix + (part_ == Part::RequestTable ? "request_table.return" : "forward.return"), shape);
-    return { std::move(calls), std::nullopt };
+    return sequence(std::move(calls), part_, shape);
 }
 
 std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part part, bool deterministic_sampling = false) {
@@ -173,9 +186,10 @@ std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part p
     const auto dtype = metadata.at("sequence_dtype").get<std::string>();
     if (metadata.at("backend_implementation") != "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend" || metadata.at("route") != "eager"
         || metadata.at("batch_size") != 1 || metadata.at("speculative_present") != false || metadata.at("request_table_dtype") != "torch.int32"
-        || metadata.at("request_table_contiguous") != true || shape.size() != 2 || dtype != "torch.int64" || metadata.at("sequence_device_type") != "npu")
+        || metadata.at("request_table_contiguous") != true || shape.size() != 2 || dtype != "torch.int64" || metadata.at("sequence_device_type") != "npu"
+        || metadata.at("request_indices_dtype") != "torch.int64" || metadata.at("request_indices_device_type") != "npu")
         return nullptr;
-    return std::make_unique<InputPreparation>(part, shape.at(1).get<double>(), "int64", deterministic_sampling);
+    return std::make_unique<InputPreparation>(part, shape.at(0).get<double>(), shape.at(1).get<double>(), "int64", deterministic_sampling);
 }
 
 } // namespace
@@ -199,7 +213,7 @@ std::optional<bool> read_deterministic_sampling(const std::optional<std::filesys
 }
 std::unique_ptr<const CallSequence> sampling_positions(const std::string & sequence_dtype) {
     if (sequence_dtype != "torch.int64") return nullptr;
-    return std::make_unique<InputPreparation>(Part::SamplingPositions, 0, "int64");
+    return std::make_unique<InputPreparation>(Part::SamplingPositions, 0, 0, "int64");
 }
 
 } // namespace markov::adapters::sglang
