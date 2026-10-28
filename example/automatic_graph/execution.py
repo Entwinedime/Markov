@@ -213,6 +213,27 @@ class ExecutionComparison:
             result[owner].append((kind, name))
         return dict(result)
 
+    def reachable_links(self, links: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        if not links:
+            return set()
+
+        successors = defaultdict(list)
+        for edge in self.execution["dependencies"]:
+            successors[edge["source"]].append(edge["target"])
+
+        reached = set()
+        for source, target in links:
+            visited = {source}
+            pending = deque([source])
+            while pending and target not in visited:
+                for child in successors.get(pending.popleft(), ()):
+                    if child not in visited:
+                        visited.add(child)
+                        pending.append(child)
+            if target in visited:
+                reached.add((source, target))
+        return reached
+
     def stream_frontiers(self) -> dict[str, Any]:
         self.streams: dict[int, list[dict[str, Any]]] = defaultdict(list)
         waits = defaultdict(list)
@@ -316,6 +337,7 @@ class ExecutionComparison:
 
         required = set()
         initial = set()
+        frontiers = set()
         native_waits = 0
         kinds = Counter()
         if waits.keys() != target_waits.keys():
@@ -351,6 +373,7 @@ class ExecutionComparison:
                             "reason": "stream wait targets a different execution resource",
                             "owner": signature,
                         }
+                    frontiers.add((bindings[stream], node["id"]))
                     visible = [
                         index
                         for index, item in enumerate(self.streams[stream])
@@ -382,19 +405,26 @@ class ExecutionComparison:
         external_ids = {source for source, _ in external}
         resources = {node["id"]: node["resource"] for node in self.execution["nodes"] if node["id"] in external_ids}
         boundary = incoming | {(resources[source], target) for source, target in external}
-        unexpected = boundary - initial
-        same = required == internal and not unexpected
+        unexpected = boundary - frontiers
+
+        # A later frontier outside this flow can still complete its local work in the unchanged full graph.
+        missing = required - internal
+        transitive = self.reachable_links(missing)
+        missing -= transitive
+        extra = internal - required
+        same = not missing and not extra and not unexpected
 
         # A cropped flow cannot certify earlier work or the drained initial state of its streams.
         return {
-            "same": None if same and initial else same,
+            "same": None if same and (initial or boundary) else same,
             "same_stream_order": same_stream_order,
             "streams": len(bindings),
             "native_waits": native_waits,
             "kinds": dict(kinds),
             "completion_links": len(required),
-            "missing": list(sorted(required - internal))[:3],
-            "extra": list(sorted(internal - required))[:3],
+            "missing": list(sorted(missing))[:3],
+            "extra": list(sorted(extra))[:3],
+            "transitive_completion_links": len(transitive),
             "initial_frontiers": len(initial),
             "external_completion_links": len(external),
             "unresolved_initial_frontiers": len(incoming),

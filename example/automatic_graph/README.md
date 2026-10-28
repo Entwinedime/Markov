@@ -173,3 +173,5 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 原生适配器可以在实际控制调用边界声明`control_only`。`controller_scope`单列这些调用及操作数；只有没有跨范围数据依赖、设备/runtime动作和共同通信合同时，比较视图才分开这部分控制工作。声明不成立时保留操作并报告差异；未标记的工作不自动排除。原图、模型通信、准备/释放和等待关系保持原样，状态轮询与不同策略的原生开销不因此获得预测资格。
 
 Stream按每个操作内部的有序工作取得唯一对应，重复API按同一owner内的发生序号绑定真实节点。跨owner的排列由`same_stream_order`单列；必要等待前沿、事件连接和队列排空仍按实际图核对。
+
+局部flow的必要完成关系在完整目标图中检查可达路径，`transitive_completion_links`报告经其他节点完成的关系。范围外前沿必须属于原生实际等待的stream，涉及外部工作时仍为partial；错误stream边界和额外内部完成关系继续报告差异。
