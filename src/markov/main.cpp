@@ -104,14 +104,23 @@ int main(int argc, char ** argv) {
         }
         else {
             const auto page_request = command == "page-work" ? std::optional(markov::adapters::read_page_work_request(argv[2])) : std::nullopt;
+            const auto selected_costs =
+                page_request && page_request->models_path ? std::optional(markov::adapters::read_cost_models(*page_request->models_path)) : std::nullopt;
             const auto manifest = page_request ? page_request->manifest : markov::trace_graph::source::inspect_manifest(argv[2]);
+            if (selected_costs && (selected_costs->deployment.at("framework") != manifest.framework || selected_costs->deployment.at("runtime") != "ascend"))
+                throw std::runtime_error("Page-work source and selected cost framework/runtime differ");
             std::vector<std::filesystem::path> inputs{ manifest.path };
             if (page_request) inputs.push_back(std::filesystem::absolute(argv[2]).lexically_normal());
+            if (selected_costs) inputs.push_back(*page_request->models_path);
             if (manifest.capture_origin_manifest) inputs.push_back(*manifest.capture_origin_manifest);
             for (const auto & file : manifest.files) inputs.push_back(file.path);
             prepare_output(output, inputs);
-            if (page_request) result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest), page_request->page_sizes_tokens);
+            if (page_request)
+                result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest),
+                                                            page_request->page_sizes_tokens,
+                                                            selected_costs ? &*selected_costs : nullptr);
             else result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
+            if (selected_costs) result["models"] = page_request->models_path->string();
         }
         if (output) write_report(result, *output);
         else std::cout << result.dump(2) << '\n';

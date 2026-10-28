@@ -14,6 +14,11 @@
 
 namespace markov::trace_graph::source {
 
+struct WorkOrder {
+    Index before;
+    Index after;
+};
+
 // Own source observations and their graph once. Consumers borrow const views;
 // target state and corrected cost views cannot mutate the original capture.
 class SourceContext {
@@ -31,14 +36,20 @@ public:
     std::span<const Index> frame_operations(Index frame) const { return frame_operations_[frame]; }
     std::span<const Index> request_frames(std::string_view request) const;
     const DeviceService & device_service(Index work) const { return device_services_[work]; }
+    std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
+    std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
 
 private:
+    void index_compute_queues();
+
     Observations observations_;
     SourceGraph graph_;
     Time origin_ns_;
     std::vector<std::vector<Index>> frame_operations_;
     std::map<std::string, std::vector<Index>, std::less<>> request_frames_;
     std::vector<DeviceService> device_services_;
+    std::vector<std::vector<WorkOrder>> frame_queue_order_;
+    std::vector<std::vector<Index>> frame_queue_issues_;
 };
 
 } // namespace markov::trace_graph::source

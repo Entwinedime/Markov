@@ -15,6 +15,7 @@ struct DeviceService {
     // envelope locates submissions; its wall duration is never a device cost.
     std::vector<graph::NodeId> nodes;
     std::optional<ServiceIssue> issue;
+    std::optional<Index> resource;
 
     bool available() const { return !nodes.empty() && !issue; }
 };

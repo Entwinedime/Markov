@@ -7,11 +7,13 @@
 
 namespace markov::adapters {
 struct PreparedSource;
-}
+struct SelectedCosts;
+} // namespace markov::adapters
 
 namespace markov::commands {
 
 nlohmann::json source_report(const adapters::PreparedSource & source);
-nlohmann::json page_work_report(const adapters::PreparedSource & source, std::span<const std::size_t> page_sizes_tokens);
+nlohmann::json page_work_report(const adapters::PreparedSource & source, std::span<const std::size_t> page_sizes_tokens,
+                                const adapters::SelectedCosts * costs = nullptr);
 
 } // namespace markov::commands

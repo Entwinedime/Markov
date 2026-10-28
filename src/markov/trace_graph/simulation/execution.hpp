@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/graph/graph.hpp"
+#include "markov/trace_graph/simulation/events.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -12,22 +13,6 @@
 #include <vector>
 
 namespace markov::trace_graph::simulation {
-
-using Component = std::uint32_t;
-
-struct Action {
-    std::uint32_t kind;
-    std::size_t subject;
-};
-
-enum class EventOrigin { Completion, Timer };
-
-struct Event {
-    Component owner;
-    Action action;
-    EventOrigin origin;
-    std::size_t identity;
-};
 
 class Execution;
 
@@ -47,8 +32,6 @@ struct Mutation {
     std::vector<Operation> operations;
     std::vector<graph::Edge> dependencies;
 };
-
-enum class OperationState : std::uint8_t { Pending, Ready, Queued, Running, Complete, Cancelled };
 
 struct ExecutionResult {
     // Only completed operations have final start/end times. Report unavailable
@@ -73,6 +56,7 @@ public:
     void cancel_timer(std::size_t timer);
     bool cancel(Component owner, graph::NodeId node);
     void run();
+    void stop() { stopped_ = true; }
 
     graph::Time now_ns() const { return now_ns_; }
     const ExecutionResult & result() const { return result_; }
@@ -115,6 +99,7 @@ private:
     std::size_t original_nodes_ = 0;
     EventReceiver * receiver_ = nullptr;
     graph::Time now_ns_ = 0;
+    bool stopped_ = false;
     ExecutionResult result_;
     std::vector<std::size_t> incoming_;
     std::vector<OwnedOperation> owned_;

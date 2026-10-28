@@ -1,0 +1,48 @@
+#pragma once
+
+#include "markov/trace_graph/graph/graph.hpp"
+#include "markov/trace_graph/planning/work.hpp"
+#include "markov/trace_graph/simulation/events.hpp"
+
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <variant>
+#include <vector>
+
+namespace markov::trace_graph::planning {
+
+struct Boundary {};
+
+struct PlannedOperation {
+    std::size_t resource;
+
+    // Work references live through the synchronous submit call. A boundary is
+    // explicitly cost-free; missing work is never represented by a null pointer.
+    std::variant<Boundary, std::reference_wrapper<const Work>> cost;
+    std::optional<simulation::Action> completion = std::nullopt;
+};
+
+struct PlannedMutation {
+    simulation::Component owner;
+    std::vector<PlannedOperation> operations;
+    std::vector<graph::Edge> dependencies;
+};
+
+class ProgramRuntime {
+public:
+    virtual ~ProgramRuntime() = default;
+    virtual graph::NodeId next_node() const = 0;
+    virtual graph::Time now_ns() const = 0;
+    virtual std::optional<graph::NodeId> submit(PlannedMutation mutation) = 0;
+};
+
+class Program {
+public:
+    virtual ~Program() = default;
+    virtual void start(ProgramRuntime & runtime) = 0;
+    virtual void on_event(ProgramRuntime & runtime, const simulation::Event & event) = 0;
+    virtual bool complete() const = 0;
+};
+
+} // namespace markov::trace_graph::planning

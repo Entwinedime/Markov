@@ -1,8 +1,13 @@
 #include "markov/commands/source.hpp"
 
+#include "markov/adapters/costs.hpp"
 #include "markov/adapters/source.hpp"
+#include "markov/commands/costs.hpp"
+#include "markov/trace_graph/cost/queries.hpp"
 #include "markov/trace_graph/planning/cache.hpp"
 #include "markov/trace_graph/planning/compute_plan.hpp"
+#include "markov/trace_graph/planning/compute_program.hpp"
+#include "markov/trace_graph/simulation/program_execution.hpp"
 #include "markov/trace_graph/source/build.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
@@ -11,6 +16,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -30,6 +36,73 @@ Json work_json(const planning::Work & work) {
         {       "features",            work.features }
     };
 }
+
+struct SubsetExecution {
+    std::size_t completed_frames = 0, executed_nodes = 0, service_operations = 0, queue_dependencies = 0;
+    std::map<std::string, std::size_t> coverage;
+    Json issue = nullptr;
+
+    void evaluate(const source::SourceContext & source, const planning::ComputePlan & plan, cost::Queries & costs, source::Index frame) {
+        if (!issue.is_null()) return;
+        if (!plan.missing_row_bindings.empty()) {
+            issue = {
+                {              "kind",    "missing_work_binding" },
+                {             "frame",                     frame },
+                { "source_operations", plan.missing_row_bindings }
+            };
+            return;
+        }
+
+        planning::ComputeProgram program(source, plan, frame);
+        const auto unbound = program.unresolved_queues();
+        if (!unbound.empty()) {
+            issue = {
+                {              "kind", "unresolved_resource_order" },
+                {             "frame",                       frame },
+                { "source_operations",               Json::array() }
+            };
+            for (const auto operation : unbound) issue["source_operations"].push_back(operation);
+            return;
+        }
+        auto result = simulation::ProgramExecution(program, costs, source.observations().resources.size()).run();
+        executed_nodes += result.execution.executed;
+        for (const auto & [kind, count] : result.coverage) coverage[cost_coverage_name(kind)] += count;
+        if (result.cost_gap) {
+            auto work = work_json(result.cost_gap->work);
+            work["status"] = cost_status_name(result.cost_gap->response.status);
+            work["affected_features"] = result.cost_gap->response.affected_features;
+            work["model"] = result.cost_gap->response.model ? Json(*result.cost_gap->response.model) : Json(nullptr);
+            issue = {
+                {  "kind",      "cost_gap" },
+                { "frame",           frame },
+                {  "work", std::move(work) }
+            };
+            return;
+        }
+        ++completed_frames;
+        service_operations += plan.operations.size();
+        queue_dependencies += source.frame_queue_order(frame).size();
+    }
+
+    Json report(std::size_t requests, std::size_t evaluations) const {
+        return {
+            {               "status",issue.is_null() ? "known_subset_executed" : "stopped"                                     },
+            {     "completed_frames",                                      completed_frames },
+            {       "executed_nodes",                                        executed_nodes },
+            {   "service_operations",                                    service_operations },
+            {   "queue_dependencies",                                    queue_dependencies },
+            {             "coverage",                                              coverage },
+            {      "logical_queries",                                              requests },
+            { "response_evaluations",                                           evaluations },
+            {                "issue",                                                 issue },
+            {        "e2e_predicted",                                                 false },
+            {        "qualification",
+             "Recipe-internal edges and preserved observed stream order only. Placement changes, cross-stream data, cache, CPU and communication dependencies "
+             "are incomplete; no frame or E2E "
+             "latency is reported."                                                        }
+        };
+    }
+};
 
 Json device_service_summary(const source::SourceContext & source) {
     struct Summary {
@@ -412,11 +485,17 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
     };
 }
 
-nlohmann::json page_work_report(const adapters::PreparedSource & source, std::span<const std::size_t> page_sizes_tokens) {
+nlohmann::json page_work_report(const adapters::PreparedSource & source, std::span<const std::size_t> page_sizes_tokens,
+                                const adapters::SelectedCosts * costs) {
     const auto & observations = source.context.observations();
     const auto & paths = observations.token_paths;
+    std::optional<cost::Queries> queries;
+    if (costs) queries.emplace(costs->models);
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
+        SubsetExecution execution;
+        const auto query_begin = queries ? queries->requests() : 0;
+        const auto evaluation_begin = queries ? queries->evaluations() : 0;
         struct WorkCounts {
             std::size_t instances = 0, source_work_unchanged = 0, source_service_bound = 0;
         };
@@ -461,12 +540,18 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 const auto & frame = observations.compute_frames[frame_id];
                 if (frame.requests.size() != 1 || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) {
                     ++missing_projection_inputs;
+                    if (queries && execution.issue.is_null())
+                        execution.issue = {
+                            {  "kind", "unsupported_frame_inputs" },
+                            { "frame",                   frame_id }
+                        };
                     continue;
                 }
                 const auto query = frame.phase == planning::Phase::Prefill ? paths.length(prompt) - prior_pages * size : frame.query_tokens->front();
                 const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
                 const auto plan = planning::project_compute(source.context, frame_id, { query, query, context, 1, static_cast<double>(size) });
                 missing_row_bindings += plan.missing_row_bindings.size();
+                if (queries) execution.evaluate(source.context, plan, *queries, frame_id);
                 dependencies += plan.dependencies.size();
                 for (const auto & operation : plan.operations) {
                     auto & counts = projected_work[plan.work[operation.work]];
@@ -506,14 +591,15 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             });
         }
         targets.push_back({
-            {               "page_size_tokens",                                        size },
-            {                       "requests",                         std::move(requests) },
-            {            "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
-            {         "projected_compute_work",                          std::move(compute) },
-            { "projected_compute_dependencies",                                dependencies },
-            {      "missing_projection_inputs",                   missing_projection_inputs },
-            {           "missing_row_bindings",                        missing_row_bindings },
-            {                 "radix_segments",                         std::move(segments) }
+            { "page_size_tokens", size },
+            { "requests", std::move(requests) },
+            { "corpus_device_pages", prefixes.used_pages(planning::Tier::Device) },
+            { "projected_compute_work", std::move(compute) },
+            { "projected_compute_dependencies", dependencies },
+            { "cost_execution", queries ? execution.report(queries->requests() - query_begin, queries->evaluations() - evaluation_begin) : Json(nullptr) },
+            { "missing_projection_inputs", missing_projection_inputs },
+            { "missing_row_bindings", missing_row_bindings },
+            { "radix_segments", std::move(segments) }
         });
     }
     auto barriers = Json::array();
@@ -535,11 +621,21 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         {     "source_graph_nodes", source.context.graph().graph.nodes().size() },
         { "logical_token_prefixes",                                paths.size() },
         {       "target_dag_built",                                       false },
-        {        "costs_evaluated",                                       false },
+        {        "costs_evaluated",         queries && queries->requests() != 0 },
         {          "qualification",
          "Unbounded corpus, unpadded compute subset only. Actual capacity, I/O visibility and runtime branches are not evaluated; this is not a target DAG or "
          "E2E prediction."                                                     }
     };
+    if (costs) {
+        report["cost_catalog"] = {
+            {                  "deployment",                                                                                                              costs->deployment },
+            {             "selected_models",                                                                                                           costs->models.size() },
+            {             "logical_queries",                                                                                                            queries->requests() },
+            {        "response_evaluations",                                                                                                         queries->evaluations() },
+            { "source_deployment_qualified",                                                                                                                          false },
+            {               "qualification", "Framework/runtime and work geometry checked; the legacy source manifest does not establish complete model/platform identity." }
+        };
+    }
     report["source_replay"] = source_report(source);
     return report;
 }

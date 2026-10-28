@@ -19,12 +19,17 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     std::ifstream stream(path);
     const auto raw = nlohmann::json::parse(stream);
     for (const auto & [name, value] : raw.items()) {
-        if (name != "manifest" && name != "page_sizes_tokens") throw std::runtime_error("Unknown page-work input field: " + name);
+        if (name != "manifest" && name != "page_sizes_tokens" && name != "models") throw std::runtime_error("Unknown page-work input field: " + name);
     }
     auto manifest_path = std::filesystem::path(raw.at("manifest").get<std::string>());
     if (manifest_path.is_relative()) manifest_path = path.parent_path() / manifest_path;
 
     PageWorkRequest result{ trace_graph::source::inspect_manifest(manifest_path), {} };
+    if (raw.contains("models")) {
+        auto models = std::filesystem::path(raw.at("models").get<std::string>());
+        if (models.is_relative()) models = path.parent_path() / models;
+        result.models_path = std::filesystem::absolute(models).lexically_normal();
+    }
     const auto & sizes = raw.at("page_sizes_tokens");
     if (!sizes.is_array() || sizes.empty()) throw std::runtime_error("Page-work requires a nonempty page-size array");
     for (const auto & value : sizes) {

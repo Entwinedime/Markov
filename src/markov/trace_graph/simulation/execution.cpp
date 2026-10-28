@@ -180,11 +180,11 @@ void Execution::complete(graph::NodeId id) {
         const auto owner = operation.owner;
         if (action) receiver_->on_event(*this, { owner, *action, EventOrigin::Completion, id });
     }
-    if (service) start_next(resource);
+    if (service && !stopped_) start_next(resource);
 }
 
 void Execution::run() {
-    while (!scheduled_.empty()) {
+    while (!scheduled_.empty() && !stopped_) {
         const auto event = scheduled_.top();
         scheduled_.pop();
         if (event.kind == ScheduledKind::Timer && !timers_[event.identity].active) continue;
@@ -200,6 +200,8 @@ void Execution::run() {
             receiver_->on_event(*this, { owner, action, EventOrigin::Timer, event.identity });
         }
     }
+    if (stopped_) return;
+
     for (const auto phase : result_.states) {
         if (phase != OperationState::Complete && phase != OperationState::Cancelled)
             throw std::runtime_error("Execution has unresolved dependencies or a cycle");

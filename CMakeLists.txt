@@ -33,9 +33,16 @@ add_library(markov_source
 target_link_libraries(markov_source PUBLIC markov_graph nlohmann_json::nlohmann_json)
 target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(markov_cost src/markov/trace_graph/cost/models.cpp)
+add_library(markov_cost src/markov/trace_graph/cost/models.cpp src/markov/trace_graph/cost/queries.cpp)
 target_include_directories(markov_cost PUBLIC src)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(markov_prediction
+    src/markov/trace_graph/planning/compute_program.cpp
+    src/markov/trace_graph/simulation/program_execution.cpp
+)
+target_link_libraries(markov_prediction PUBLIC markov_source markov_cost)
+target_compile_options(markov_prediction PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
     src/markov/adapters/probes.cpp
@@ -45,7 +52,7 @@ add_library(markov_adapters
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/sglang/observations.cpp
 )
-target_link_libraries(markov_adapters PUBLIC markov_source markov_cost)
+target_link_libraries(markov_adapters PUBLIC markov_prediction)
 if(TRACE_GRAPH_DEBUG)
     target_compile_definitions(markov_graph PUBLIC TRACE_GRAPH_DEBUG)
 endif()

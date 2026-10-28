@@ -65,10 +65,12 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
             while (!active.empty() && active.begin()->first <= time) active.erase(active.begin());
             if (active.empty()) continue;
             const auto work = active.begin()->second;
-            if (active.size() != 1 || observations.work_descriptions[observations.work_observations[work].description].observed.size() != 1) {
-                for (const auto & [end, id] : active) result[id].issue = ServiceIssue::SharedProbe;
+            if (active.size() != 1) {
+                for (const auto & [end, id] : active) result[id].issue = ServiceIssue::AmbiguousOwner;
                 continue;
             }
+            if (!result[work].issue && observations.work_descriptions[observations.work_observations[work].description].observed.size() != 1)
+                result[work].issue = ServiceIssue::SharedProbe;
 
             const auto & port = observations.points[link.after];
             const auto & candidates = lanes[port.resource].device_spans;
@@ -101,8 +103,16 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
         const auto & node = graph.graph.nodes()[id];
         if (node.kind == graph::NodeKind::Boundary) continue;
         auto & service = result[span_owner[span]];
-        if (node.kind != graph::NodeKind::Service) service.issue = ServiceIssue::NonServiceDevice;
+        if (node.kind != graph::NodeKind::Service) {
+            if (!service.issue || service.issue == ServiceIssue::SharedProbe) service.issue = ServiceIssue::NonServiceDevice;
+        }
         else service.nodes.push_back(id);
+    }
+    for (auto & service : result) {
+        if (service.nodes.empty() || service.issue == ServiceIssue::AmbiguousOwner || service.issue == ServiceIssue::UnmatchedDevice) continue;
+
+        const auto resource = graph.graph.nodes()[service.nodes.front()].resource;
+        if (std::ranges::all_of(service.nodes, [&](graph::NodeId node) { return graph.graph.nodes()[node].resource == resource; })) service.resource = resource;
     }
     return result;
 }
