@@ -2128,3 +2128,25 @@
 **验证：** 基线及修改后26份结果均完整写出，无运行错误；最终均为3 matched、23 differences，逐批比较及批次排列前后完全一致。TP1及Qwen3 TP2×PP4共9rank完整窗口对应，数据依赖、公开端口、API数量、事件和队列关系通过；PP中rank0–5仍因stream序列不同保留differences。Mistral及P/D共17rank窗口未完整对应，整例原差异保留。rank0/2只读诊断各找到唯一工作清单相同的stream，首个交错为原生下一批batch_filter传输与目标上一批point_to_point事件；rank6保持完整通过。Docker内Python语法、Git diff及结果交接检查通过；全部pending为空，无自有容器残留，两个原冻结报告内容未变。累计native=0，processing 452.908701610s，初次26项导入错误和费用保留，低于原2000s总额。简明结果与复核在本批results/window-causality.md、review.json、stream-difference.json。
 
 **结论与限制：** 关闭的是因扁平序列不同而跳过整窗口检查的证据缺口，没有新增通过项。stream交错是否保持必要等待尚未证明，Mistral/P/D未配对工作仍需归因；完整图继续保留供下一批复用。比较器和说明、窗口状态及主流程已对齐；接着分层提交推送，后续A与新完整B未完成，S8仍未验收。
+
+
+## 2026-10-28 — S8-A：stream身份与必要完成关系分离
+
+**范围：** 起点4302fcc434ec08bb02ea2f9fb3ed3f8774efcc50已推送并核对远端；上一批为实质进展。本批继续同六案例26rank，复用全部观察/预测图，零原生采集。前批简明报告中的处理秒数占位符已改为机器记录的452.908701610s，底层费用不变。
+
+**改动：** 原生event_loop_pp先组下一批，再提交/等待前批通信，且官方流程允许调整交错；不能用整条stream序列定义其身份。比较器改用每个逻辑操作内部的工作有序序列取得唯一stream绑定，再按同owner/API的出现顺序对应真实节点；原预测图及其resource_order不改，跨owner的stream排列另行报告。native等待前沿、事件及队列条件仍严格核对，不因工作清单相同而直接通过。
+
+**验证：** 实现前联查所有ExecutionComparison调用、source排序、PP原生循环、消息/Work.wait观察与核心装配。运行输入固定在data/20261028T014001.630772Z_s8-a-stream-bindings，6任务各processing200s、临时16GiB/保留12GiB，轮总processing1500s、临时128GiB/保留96GiB，native次数和秒数均为0。费用累计，全部26项结束前不改实现；原B及前批输入/图不回写。
+
+**结论与限制：** 当前实现待整批运行证明；不同owner交错能否保持必要完成关系仍未定，不改S8门槛或宣称原生策略等价。其他Mistral/P/D差异继续保留并按原生控制、适配范围及核心状态分别调查，性能层后置。
+
+
+## 2026-10-28 — S8-A：owner绑定与PP完整窗口核对完成
+
+**范围：** 固定六案例26rank全部结束，完成关联审查和数据整理；本批只改变执行比较，模型、模板、预测图及原生框架不变。
+
+**改动：** Stream身份来自每个owner内部的有序工作及唯一资源对应；同owner/API重复工作按发生序号绑定原执行节点，跨owner的排列由same_stream_order报告。静态核对保留了owner内顺序、出现次数、资源一一对应、多producer不确定性、真实resource_order和原有wait/event/queue条件；不使用仅凭Counter相等的绑定，不按模型/配置或rank分支。业务代码无增量，example净增21行，未新增test、CLI或依赖。联查StructureComparison的完整对应/数据可达性及逐批路径、NativeValidation状态消费、原生PP循环、采集Work.wait及核心message/wait_message装配。
+
+**验证：** 原3 matched/23 differences变为9 matched/17 differences，仅PP4的rank0–5新增matched；各有51个native stream等待，必要完成边无缺失/多余，起点外未绑定前沿为0，原rank6/7及TP1基线保持通过。26项逐批检查、未配对批次和批次排列完全不变，Mistral/P/D差异未放宽。累计native=0、processing 169.108643210s，低于1500s轮额度，各任务pending为空、自有容器已释放；Python在modeling Docker语法及Git diff检查通过，两个原独立报告未修改。简明结果及机器复核在本批results/stream-bindings.md、review.json，原图直接复用前批，未重复生成。
+
+**结论与限制：** PP4现有案例的不同交错保持已观察到的必要关系，取得限定开发资格，仍需新的完整独立验证。Mistral存在共享池状态差异；P4/D2原生Prefill为1+7成员两批，轻量控制器按请求执行，另有具名准备块外的root Schedule操作。尚未判断这些差异全部合法或错误，没有新增排除规则；模板入口还包括根role/模型入口，不能只按metadata.entrypoint删图。事实保存在results/remaining-boundaries.json。代码、文档、数据完成维护审查后分层提交推送；其他S8缺口及后续阶段不取消，性能层继续后置。
