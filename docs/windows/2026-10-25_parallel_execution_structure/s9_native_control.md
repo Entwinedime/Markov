@@ -112,10 +112,10 @@ S9资源服务实现所选普通KV语义，S10再接一级设备前缀缓存；�
 
 | 当前实现 | 不适合直接承接的情况 | 计划调整 |
 | --- | --- | --- |
-| [ServingControl::plan/start/finish](../../../src/markov/controller/control.hpp) | `plan const`、构图成功后才 start；原生选批期间已有资源副作用 | 改成有状态地推进至工作/等待边界，返回带身份的工作或等待条件；不克隆整个原生对象来假装无副作用 |
-| [Batch / BatchWork / BatchEffects](../../../src/markov/contracts/serving.hpp) | 一个 batch.phase、预先确定整批结束效果 | 成员自带阶段、逻辑 token 范围和有效 context；模型完成和结果处理效果分开，不重复预测原生下一状态 |
-| [ServingWorkflow](../../../src/markov/workflow/serving.cpp) | 先扩整批，随后统一 finish；idle 只在特定空闲路径推进 | 共同处理资源调用、提交、等待及完成；无模型工作也能形成片段，workflow 不读私有队列 |
-| [KvPool](../../../src/markov/resources/kv_pool.hpp) 与轻量/PD 控制 | 页/槽位已独立为共同对象并由轻量控制借用，原生资源尚未接入 | 原生 facade 访问同一服务，补充实际使用的映射/就绪接口；前缀缓存留S10 |
+| [ServingControl::plan/start/finish](../../../src/markov/controller/control.hpp) | plan可有状态地推进，原生准备期间已能预约资源；显式等待范围仍需扩展 | 返回带身份的工作或等待条件；不克隆整个原生对象来假装无副作用 |
+| [Batch / BatchWork / BatchEffects](../../../src/markov/contracts/serving.hpp) | 一个batch.phase；原生模型提交与结果效果已分开，尚无mixed成员阶段 | 成员自带阶段、逻辑token范围和有效context；按实际机制扩展，不重复预测原生下一状态 |
+| [ServingWorkflow](../../../src/markov/workflow/serving.cpp) | 已处理逐动作完成，idle在空闲路径推进 | 核清需要独立唤醒的等待与无模型片段；workflow不读私有队列 |
+| [KvPool](../../../src/markov/resources/kv_pool.hpp) 与轻量/PD 控制 | 页/槽位为共同对象，原生facade可查询容量、分配和索引，并报告释放 | 核查实际使用的就绪与资源压力边界；前缀缓存留S10 |
 | [SGLangRankStructure](../../../src/markov/adapters/frameworks/sglang/rank_structure.cpp) | 维护空闲池/请求映射的图值，并基于批次效果推导回收 | 图值和存储版本继续保留；数值分配与状态变化绑定资源服务结果，删除独立推测页账/回收的职责 |
 | [Executor](../../../src/markov/execution/executor.hpp) | 已有就绪资源、任务和 Published/Completed | 扩展必要端口和唤醒，不另建时间轴、事件模拟器或全局屏障 |
 | 现有采集会话及 hooks | 关闭chunk/cache/overlap时的普通batch来源不授予新机制资格 | S9核对基础闭环来源；S10取得chunk/mixed/cache来源，观察与控制适配分开 |
@@ -161,6 +161,8 @@ Python框架adapter负责原生对象构造、选批/结果入口、请求及ran
 保持 `workflow → adapters → core` 的依赖方向。资源服务提供共同机制；确有来源依据的框架特殊策略由适配提供并注入，核心不按框架名分支。每轮改动同时检查代码位置和实际调用关系，不能只移目录却继续越层访问。
 
 当前没有现成Python绑定。首条实现建议采用**长期存活的本地控制进程+管道消息**，保留原生调用栈，C++持有资源和图执行。跨语言只传必要资源查询/结果、工作快照和完成条件，不逐节点传图、不每批启动CLI，不同时建设多种桥接方案。框架无关的传输和进程生命周期归workflow；原生类型转换归adapter；`ServingControl`只表达共同推进接口。
+
+正式外层入口为`scripts/markov-control.sh`：启动C++与无设备原生两个隔离容器，输出精简结果及同名logs目录，明细显式开启。模板传来的模型配置和dtype用于构造原生元数据，不挂载权重，不维护第二份模型选择。SGLang适配继承真实Scheduler并运行event_loop_normal，只接管接收端、物理模型与资源服务、结果反馈；原生选批、分发和空闲检查仍执行原方法。
 
 S9.1只启动一个原生控制worker；到TP/EP及PP/PD再增加原生协议实际需要的参与者。原生进程级配置/组状态按需隔离，不提前建设多进程平台。控制参与者等待时只挂起自己，执行器继续推进其他就绪工作；目标设备编号不等同控制进程编号。
 
@@ -281,4 +283,4 @@ S10在这条闭环上增加chunked prefill、混合组批、Decode优先和一�
 
 独立对照分两类证据：相同条件下原生决定/资源轨迹，以及这些决定对应的目标执行结构。原生控制改善了策略一致性，但模拟时延仍会改变到达窗口与组批，不能要求所有给定耗时运行的批次都等于一次真实 wall time trace；需要固定输入条件的局部对照和完整因果/生命周期核对共同支持结论。对照记录只用于验证，不输入正式预测来获得正确答案。
 
-本项目尚未证明完整无设备闭环、共同资源及各并行接管的运行资格。上游Simulator提供可参考的方法，已有导入失败仅说明原镜像的直接导入受阻；按上述顺序取得实际证据后再升级支持声明。
+限定单worker运行不能证明全部等待、资源压力及并行接管的资格。按上述顺序取得实际证据后再升级支持声明；既有导入失败、局部成功和完整独立验收分别保留。

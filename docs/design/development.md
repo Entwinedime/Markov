@@ -18,7 +18,7 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohman
 
 公开脚本固定 Compose project `markov-next-redesign`；`MARKOV_IMAGE_PREFIX` 选择已有镜像前缀，默认 `markov-next`。修改编译器或工具链时使用新的构建目录。
 
-镜像按职责稳定命名，不包含日期、运行时间或实验编号：`markov-next-modeling:ubuntu24.04` 用于核心构建与仿真，`markov-next-sglang-env:ubuntu22.04` 提供基础依赖，`markov-next-sglang:ubuntu22.04` 安装当前框架与采集代码。精确环境以运行记录中的镜像 ID 为准；重新标记已有镜像不代表重建或重新取得运行资格。
+镜像按职责稳定命名，不包含日期、运行时间或实验编号：`markov-next-modeling:ubuntu24.04` 用于核心构建与仿真，`markov-next-sglang-env:ubuntu22.04` 提供基础依赖，`markov-next-sglang:ubuntu22.04` 安装当前框架与采集代码，`markov-next-control:ubuntu22.04` 运行无设备原生控制。control镜像从固定推理栈移除NPU发现及采集插件，安装控制适配，不改上游源码或原推理镜像。精确环境以运行记录中的镜像 ID 为准；重新标记已有镜像不代表重建或重新取得运行资格。
 
 真实采集使用具备匹配 PyTorch/torch_npu/CANN、SGLang 及模型文件的推理镜像。Dockerfile 组合官方框架源码、相应安装适配及 `markov-collection`；Python 基线为 3.10。源码修改后须使运行容器使用本次代码，例如在开发容器中安装：
 
@@ -60,6 +60,8 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 | `src/collection/markov_collection/adapters/runtimes` | 操作、形状、设备观察与环境差异 |
 | `src/collection/markov_collection/artifacts` | 共同文件发布 |
 | `src/collection/adapters` | 原生依赖安装资源及随环境编译的观察代码 |
+| `src/control/markov_control/adapters` | 原生控制、资源协议视图与无设备runtime接管 |
+| `src/control/markov_control/workflow` | 原生控制与核心进程的管道连接、运行时限、日志与清理 |
 | `example/automatic_graph` | 真实输入示例、机制观察及设备清单对照 |
 
 C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
@@ -71,6 +73,22 @@ PD 由 DisaggregatedController 维护一份请求进度，借用两个独立 KvP
 TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
 
 本地 deprecated 源码只供查阅，由 Git 忽略，不作为远端交付内容，也不进入 build、import 或 fallback。验证矩阵、批量编排和窗口判据留在 example，正式业务不导入示例。
+
+## 无设备原生控制入口
+
+```bash
+docker compose -f docker/compose/inference.yml build control
+bash scripts/markov-control.sh \
+  --templates data/YOUR_RUN/assets/templates.json \
+  --input data/YOUR_RUN/inputs/serving.json \
+  --output data/YOUR_RUN/results/native.json
+```
+
+启动端使用Python≥3.10、Docker与已有Release程序，一次启动原生控制和C++执行两个长期进程。双方只通过本地管道交接必要值；不挂载设备、权重或目标观察，不启用网络。原生模型配置及dtype来自模板资产，不另选模型目录。`--timeout-seconds`默认300，使用真实单调时钟限制运行；正常完成、错误、中断或超时均清理本次拥有的容器。原生wall-clock watchdog不另起后台资源查询，运行时限统一由外层负责。
+
+默认结果仍为精简JSON，`--details`才输出完整图与执行记录；上述命令的运行日志位于`results/native.logs/core.log`和`native.log`。内部C++接口为`simulate --control native`，其标准流属于协议；直接运行该接口需要连接控制端，通常使用外层脚本。
+
+目前只接基础单worker、完整Prefill、无前缀缓存和无overlap；TP/EP、PP/PD与调度优化的原生接入分别扩展。给定输出长度用占位token驱动原生结果处理，不预测自然文本。资源压力下的回退及模型返回/CPU读结果的细分等待仍需核清，入口可运行不代表完整结构资格或性能精度通过。
 
 ## 来源与区域命令
 
