@@ -2,7 +2,7 @@
 
 更新日期：2026-10-28。**Goal运行中；存储关联任务已补执行，后续A的三个MoE/PP来源域已完成16项控制展开。PP/P/D跨调用因果及重新独立验证仍未闭合，S8尚未验收，性能建设后置。**
 
-本批起点a29fc6dd54ad39b6797610844370d3702d5e9bf7已推送并核对远端。KV发送修复完成P4/D2开发回归：一次代表来源、四项展开和一次六rank目标观察；42次发送调用的槽位和M关系一致，目标原有28处形状矛盾消失，102次预测状态变化通过。六rank整例仍differences，剩余执行关系、Decode批次过滤/历史状态及新独立验证继续收口；代码/文档/数据已完成本批关联审查，采集修复提交为aba62c1，文档随本批维护提交交付。
+本批起点ba9115c21a76869fdc047b548c91b48ddcb470ca已推送并核对远端，包含KV发送修复。等待因果比较已完成32份固定数据复核：旧26份仍9 matched/17 differences；新P4/D2四个Prefill rank的8条必要关系经完整图间接成立，改为partial，两个Decode rank仍differences。操作/端口/状态及非stream执行报告均不变，没有新增matched或独立资格；下一步核对不同组批前态下的工作对应。
 
 | 文档 | 职责 | 更新方式 |
 | --- | --- | --- |
@@ -21,7 +21,7 @@
 | S5 最小PD | 已交付 | 同机P TP1/D TP1、独立KV池、真实SDMA交接和多成员Decode；多rank扩展由S7补充 |
 | S6 条件EP | 已交付 | 完整Qwen1.5 MoE的EP1/2/4来源及给定路由条件展开；路由和来源分支仍有限制 |
 | S7 组合拓扑与采前复用 | 已交付 | TP/PP/EP及PD限定组合、代表规划和独立绑定、采集/解析分离；部分来源保持partial，扩大独立资格由S8判定 |
-| S8-A 分层修复 | 后续批次推进中 | 三域16/16控制展开及PP4八rank开发核对通过；291项原生条件下的KV局部逻辑一致。六轨迹预测请求/KV守恒及26rank原生请求进度核对通过；整图仍9 matched/17 differences，P/D控制范围取得限定证据；P4/D2发送形状与槽位已获开发证据，跨调用/历史条件比较及新独立资格未关闭 |
+| S8-A 分层修复 | 后续批次推进中 | 三域16/16控制展开及PP4八rank开发核对通过；291项原生条件下的KV局部逻辑一致。六轨迹预测请求/KV守恒及26rank原生请求进度核对通过；整图仍9 matched/17 differences，P/D控制范围取得限定证据；P4/D2发送形状与槽位已获开发证据，完整图等待核对已修正局部误判；组批前态比较及新独立资格未关闭 |
 | S8-B 重新全量独立验证 | 完整调查已汇总，未通过 | 114项均有记录，存储关联来源/目标/条件补执行完成；40项原生观察完成，page256两项下游未执行，中断探针未获资格，详见重验证报告 |
 | S9 调度与一级前缀缓存 | 未开始 | chunked prefill、Decode优先、混合组批、prefix caching |
 | S10 单机整合 | 未开始 | 同一公开入口整合及边界审查 |
@@ -88,6 +88,8 @@ data/20261028T034804.960469Z_s8-a-control-scope通过真实函数边界标记原
 
 data/20261028T041813.701342Z_s8-a-kv-send-geometry将KV发送的完整Prefill切片和当前请求槽位前移到原生调用，复用TensorViewObservation；删除事后形状改写及按batch保存最后槽位的字典，C++和验证器无改动。四项条件展开全部完成并回收KV，来源及目标共42次发送调用的槽位和M关系正确，新的wide预测无detach形状矛盾且102次状态变化自洽。新六rank仍differences：四个Prefill可比flow的操作/端口/状态/计算拷贝一致，仅执行关系未通过；Decode各两处调用序列首先相差batch_filter，另有不同池状态，需核对前态与完整因果，不能删节点求匹配。实采镜像5201fea1a4a0；交付镜像f2b139d2810d仅调整空白排版，经AST相等、包内hash和Python语法核对，原生栈不变。完整新图留作后续因果核对，已消费observer构建及Triton缓存清理约76MiB；简明结果和审查在本批results/kv-send.md及review.json。
 
+data/20261028T050306.809923Z_s8-a-wait-causality只调整example的等待核对：原图可达关系证明必要完成顺序，外部前沿仍核对真实等待stream并保留partial，额外内部边和错误stream不放宽。32份报告的操作/状态及API、event、queue事实均不变；旧26份状态不变，新Prefill四项从differences改为partial，Decode两项差异保留。没有新native、来源/目标图改写或新的matched；材料在本批results/wait-causality.md和review.json，六份新投影保留供历史条件复核。
+
 ### 模型调整与原生限制
 
 | 对象 | 当前决定与事实 | 后续资格边界 |
@@ -121,6 +123,7 @@ data/20261028T041813.701342Z_s8-a-kv-send-geometry将KV发送的完整Prefill切
 | [20261028T032834.521224Z_s8-a-request-state](../../../data/20261028T032834.521224Z_s8-a-request-state) | 六预测状态自洽、26rank原生请求进度核对；新诊断不改变预测，消费后移除完整新图 | native 0次；processing 146.853466270s；轮上限processing4000s、临时128GiB/保留96GiB；所有pending为空 |
 | 20261028T034804.960469Z_s8-a-control-scope | P4/D2原生控制声明、旧26报告回归和形状/因果诊断；新六rank仍differences | native 1次/276.658092160s；processing 655.566174340s，保留约3.218GiB；pending为空 |
 | 20261028T041813.701342Z_s8-a-kv-send-geometry | P4/D2发送几何/槽位回归，4项展开及6rank观察完成；整例仍differences | native 2次/610.101543780s；processing 1057.184147800s；保留约6.648GiB，pending为空 |
+| 20261028T050306.809923Z_s8-a-wait-causality | 32份固定图的等待因果复核；旧26状态不变，新Prefill四项partial、Decode两项differences | native 0次；processing 202.356130460s；保留约61.74MiB，pending为空 |
 
 模型配置位于`/root/models/markov-next/Meta-Llama-3.1-8B-Instruct`，目前仅下载配置，不代表已下载真实权重。本轮B的原生镜像为`sha256:bc4f703df47873e328e9a758db88dcd4ef557adb1cf513c997e5b1d238976a63`；后续A仅在此原生栈上重打包采集器，Phi3补丁不存在，关键依赖保持一致。A阶段更早原生证据使用`46dfd858f96a…`镜像，首轮使用`cf828cd2eb64…`镜像；不同镜像的证据不自动互授资格，完整版本依据保留在各自输入和日志。
 
