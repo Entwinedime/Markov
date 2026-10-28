@@ -141,7 +141,7 @@ NativeSequence DenseCalls::describe(Phase phase, const FrameInput & input, std::
                                                       std::move(specialization),
                                                       {
                                                           { "pointer_bfloat16_arguments",  8 },
-                                                          {         "constant_arguments", 18 }
+                                                          {         "constant_arguments", 17 }
         });
     }
     cpu(calls, operation.kind.operation + ".return", caller_, operation.features);
