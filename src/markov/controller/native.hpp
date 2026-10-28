@@ -29,6 +29,8 @@ public:
     const Request & request(std::size_t identity) const override;
 
 private:
+    nlohmann::json receive_call();
+    void reply(std::size_t call, const nlohmann::json & result);
     nlohmann::json resource_call(const nlohmann::json & message);
     Batch resident_batch(const nlohmann::json & requests) const;
     BatchEffects result_effects(const nlohmann::json & members) const;
@@ -39,6 +41,8 @@ private:
     ControlPeer & peer_;
     std::optional<Batch> batch_;
     std::optional<TaskIdentity> running_;
+    std::optional<std::size_t> running_call_;
+    std::optional<std::size_t> input_call_;
     std::set<std::size_t> released_requests_;
     std::vector<std::size_t> released_pages_;
     std::size_t arrived_ = 0;
