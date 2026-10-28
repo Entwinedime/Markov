@@ -7,6 +7,7 @@ import subprocess
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 
@@ -29,6 +30,8 @@ class NativeExecution:
             raise ValueError("Prediction output must not overwrite an input")
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(exist_ok=True)
+        staging = TemporaryDirectory(prefix=f".{self.output.name}.", dir=self.output.parent)
+        pending = Path(staging.name) / self.output.name
 
         core = [
             "flock",
@@ -43,7 +46,7 @@ class NativeExecution:
                     self.lock: ("/tool/build.lock", "ro"),
                     templates: ("/inputs/templates.json", "ro"),
                     workload: ("/inputs/serving.json", "ro"),
-                    self.output.parent: ("/output", "rw"),
+                    pending.parent: ("/output", "rw"),
                 },
             ),
             "flock",
@@ -57,7 +60,7 @@ class NativeExecution:
             "--input",
             "/inputs/serving.json",
             "--output",
-            f"/output/{self.output.name}",
+            f"/output/{pending.name}",
             "--control",
             "native",
         ]
@@ -71,7 +74,13 @@ class NativeExecution:
             "--kernel-python",
             "/opt/markov/sglang/sgl-kernel/python",
         ]
-        self.connect(core, native)
+        try:
+            self.connect(core, native)
+
+            # Native participants must exit successfully before a completed core graph becomes a result.
+            pending.replace(self.output)
+        finally:
+            staging.cleanup()
         print(f"Prediction saved to {self.output}; logs: {self.logs}")
 
     def container(self, role: str, version: str, mounts: dict[Path, tuple[str, str]]) -> list[str]:
