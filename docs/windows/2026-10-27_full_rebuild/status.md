@@ -19,10 +19,10 @@
 
 ## 基线和资产
 
-- 分支 rebuild；代码检查点 61412ce 统一准备序列并接入 Decode 分配，前一维护基线 31c2840。仍是 B—D 中途结果，不能当作联合阶段交付。A 交付基线 08b6576；旧可运行布局 8668eec、旧文档归档 824b458、筹备基线 c5b1cf2 保留。
-- deprecated 的 586 个本地参考文件保留且不再跟踪，活动代码不调用归档实现。旧自有源码为 88,814 行、546 文件；归档不算瘦身。当前自有源码 86 文件、8,713 行，含空行，尚不能代表完整重构的最终规模。
+- 分支 rebuild；代码检查点 c9628e4 保留目标分配轨迹，前一维护基线 e996275。仍是 B—D 中途结果，不能当作联合阶段交付。A 交付基线 08b6576；旧可运行布局 8668eec、旧文档归档 824b458、筹备基线 c5b1cf2 保留。
+- deprecated 的 586 个本地参考文件保留且不再跟踪，活动代码不调用归档实现。旧自有源码为 88,814 行、546 文件；归档不算瘦身。当前自有源码 86 文件、8,723 行，含空行，尚不能代表完整重构的最终规模。
 - 原有数据位于 data/archive，当前输入与结果使用 data/rebuild；搬迁并非本代理执行。旧搜索保持终止，不恢复其进程或预算。
-- 当前真实公开入口证据为 data/rebuild/allocation_verified/、allocation_verified_geometry/，各含 checks.json、report.json、usage.json；allocation_contexts/ 保留分配和计算的资源差异依据。前批 request_path_*、cpu_cost_final/ 等证据保留，不作为当前精度成绩。
+- 最新公开入口证据 data/rebuild/prefill_state_verified/ 在三种目标中保留分配输入，其余结果与 allocation_verified/ 完全一致。allocation_verified_geometry/、allocation_contexts/ 和前批证据继续保留，各自资格不变，不作为当前精度成绩。
 
 ## 原始 DAG 与来源限制
 
@@ -63,6 +63,10 @@ CPU 观察按原图独占区间分开服务、等待、空白、已标识开销�
 注意力准备与分配现在共用准备序列合同、CPU 区间及资源索引和编排路径，角色只用于报告。分配与计算 caller/worker 相同，设备流不同；目标保留分配流，并在有序生产者链上交接到 forward，不把分配放到计算流。
 单 token Decode 分配按目标长度和页大小生成页内/新页分支，使用已有独立模型；当前限未排序 NPU 页池、int64 序列与 int32 位置。32/64/128 几何各有 94 次新页分配，额外 96-token 几何的 94 次页内分配生成 7,802 个计费操作，均完成全部已知计算。
 96-token 只验证组件几何与工作生成，没有真实部署或完整 HTTP 资格。Prefill 分配、排序/合并池、记录/等待 API 及其余跨流执行仍未接通。
+
+Prefill 前置分析确认需要目标分配轨迹与内核准备状态。缓存所有者现维护设备页自上次非空归还后的累计分配量，并在请求预留前记录；回载、淘汰与尾部释放走原有计数入口，不复制容量状态。
+prefill_state_verified/ 三组各 47 请求，32-token 均为零；64-token 出现 17 与 4，128-token 出现 4。该值不是物理地址，也尚未填入成本查询；除新增观察外，源报告和预测结果与前批逐项一致，最终进程约 119 秒、峰值约 2.36 GiB。
+request_path_source_audit/preparations.json 保留 12 个分配内核准备/加载事件，首次 load 约 19.9 秒，后续约 2 ms；均位于 caller。当前 allocator.preparation 模型来自独立资产的常数响应，first_load 等只限制覆盖，未进入公式。它不足以解释不同初始缓存状态，不能直接用于所有调用或漏掉首次加载。
 
 额外 1-token 几何仍生成 6,912 个视图端口，但在 metadata.entry 的页大小/页表范围外停止；首个连续计算片段未提交，执行节点为零。旧版的“先执行 4 个设备服务再停止”是独立 metadata 片段时期的结果，不能套用于现行原子提交边界。
 
@@ -118,7 +122,7 @@ SGLang 仍为 99e8be732；适配补丁及上游工作树整理归 E。KTransform
 
 ## 下一步恢复起点
 
-1. 外部请求端口与单 token Decode 分配已接通，继续接 Prefill 分配、查询/准入及提交/结果处理的必要 CPU，区分原生批次提交、结果可读、响应返回和后台完成。准备序列已有共同合同，后续沿用；不以逐函数还原为门槛，也不将接收墙钟直接迁移为 CPU 服务。
+1. Prefill 分配继续沿用准备序列：先明确编译缓存初始状态及每目标规格缓存，结合已维护的分配轨迹生成工作；从 data/archive/reproductions/hicache/costs/ 的独立原始样本核对编译与首次加载，现有汇总模型 operator_models/278 有 192 个测量，观测范围约 2.57–23.75 秒，却被归为约 2.65 秒常数。不能改为按 source 编译次数或 target 残差补偿。随后接查询/准入及提交/结果处理的必要 CPU；不以逐函数还原为门槛。
 2. CPU 校正与 caller 独占区间已经对齐，原配对资产在 data/archive/reproductions/hicache/bases/cpu/C1_l1_cliff_wait/cpu_service/1/。从 cpu_cost_final/report.json 的正式请求划分继续定位调用外 CPU，区分原生服务、未知等待、残余及未覆盖采集开销，再按工作不变条件迁移；不能将旧分摊值直接叠加到已有调用成本。核对完整原生批次、存储读写交错及通信的原生行为。
 3. 补关键源因果与真实 KTransformers 来源，再验证 self、跨配置和同源多目标，完成 B—D 联合维护交付。
 4. 恢复 E 的用户准备与性能维护，再做 F 的普通应用、矩阵及资源取舍搜索，最后运行 G。代表输入在 data/archive/rebuild/inputs/representatives.json，旧绝对路径须显式重建。
