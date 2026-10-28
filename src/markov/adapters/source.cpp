@@ -19,7 +19,8 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     std::ifstream stream(path);
     const auto raw = nlohmann::json::parse(stream);
     for (const auto & [name, value] : raw.items()) {
-        if (name != "manifest" && name != "page_sizes_tokens" && name != "models") throw std::runtime_error("Unknown page-work input field: " + name);
+        if (name != "manifest" && name != "page_sizes_tokens" && name != "models" && name != "cache")
+            throw std::runtime_error("Unknown page-work input field: " + name);
     }
     auto manifest_path = std::filesystem::path(raw.at("manifest").get<std::string>());
     if (manifest_path.is_relative()) manifest_path = path.parent_path() / manifest_path;
@@ -29,6 +30,11 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
         auto models = std::filesystem::path(raw.at("models").get<std::string>());
         if (models.is_relative()) models = path.parent_path() / models;
         result.models_path = std::filesystem::absolute(models).lexically_normal();
+    }
+    if (raw.contains("cache")) {
+        if (!result.models_path || result.manifest.framework != "sglang")
+            throw std::runtime_error("Cache execution requires SGLang and selected independent models");
+        result.cache = sglang::read_cache_settings(raw.at("cache"));
     }
     const auto & sizes = raw.at("page_sizes_tokens");
     if (!sizes.is_array() || sizes.empty()) throw std::runtime_error("Page-work requires a nonempty page-size array");

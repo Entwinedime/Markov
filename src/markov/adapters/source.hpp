@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/adapters/sglang/cache.hpp"
 #include "markov/trace_graph/source/context.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
 
@@ -27,6 +28,7 @@ struct PageWorkRequest {
     trace_graph::source::ProfileManifest manifest;
     std::vector<std::size_t> page_sizes_tokens;
     std::optional<std::filesystem::path> models_path = std::nullopt;
+    std::optional<sglang::CacheSettings> cache = std::nullopt;
 };
 
 PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest);

@@ -118,7 +118,8 @@ int main(int argc, char ** argv) {
             if (page_request)
                 result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest),
                                                             page_request->page_sizes_tokens,
-                                                            selected_costs ? &*selected_costs : nullptr);
+                                                            selected_costs ? &*selected_costs : nullptr,
+                                                            page_request->cache ? &*page_request->cache : nullptr);
             else result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
             if (selected_costs) result["models"] = page_request->models_path->string();
         }

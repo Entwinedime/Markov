@@ -7,6 +7,15 @@
 
 namespace markov::commands {
 
+nlohmann::json work_json(const trace_graph::planning::Work & work) {
+    return {
+        {      "operation",      work.kind.operation },
+        { "implementation", work.kind.implementation },
+        {   "timing_scope",   work.kind.timing_scope },
+        {       "features",            work.features }
+    };
+}
+
 const std::string & cost_status_name(trace_graph::cost::Status status) {
     using namespace trace_graph::cost;
     static const std::map<Status, std::string> statuses{

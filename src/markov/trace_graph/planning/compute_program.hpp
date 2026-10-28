@@ -4,9 +4,13 @@
 #include "markov/trace_graph/planning/program.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
+#include <optional>
 #include <span>
 
 namespace markov::trace_graph::planning {
+
+PlannedMutation compute_mutation(const source::SourceContext & source, const ComputePlan & plan, source::Index frame, graph::NodeId begin,
+                                 simulation::Component owner, std::optional<simulation::Action> completion);
 
 // Execute the known recipe subset on its observed service resources. This is
 // not a full frame: cross-stream data, communication and cache dependencies are absent.

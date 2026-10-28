@@ -117,14 +117,19 @@ RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer) {
 RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
     const auto matched = match(pages);
     auto & allocation = buffers_.at(buffer);
-    const auto needed = pages.size() - matched.pages;
+    auto needed = pages.size() - matched.pages;
+    for (const auto id : path(matched.node)) {
+        if (!nodes_[id].host) needed += tree_.nodes()[id].pages.size();
+    }
     if (allocation.tier != Tier::Host || allocation.pages < needed) throw std::runtime_error("Host commit exceeds its reserved buffer");
 
     const auto inserted = tree_.insert(pages);
     apply_split(inserted);
-    if (needed != 0) {
-        nodes_[inserted.node].host = CacheSlot{};
-        allocation.pages -= needed;
+    for (const auto id : path(inserted.node)) {
+        if (!nodes_[id].host) {
+            nodes_[id].host = CacheSlot{};
+            allocation.pages -= tree_.nodes()[id].pages.size();
+        }
     }
     touch(inserted);
     return inserted.node;

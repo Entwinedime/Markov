@@ -38,6 +38,7 @@ target_include_directories(markov_cost PUBLIC src)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_prediction
+    src/markov/trace_graph/planning/cache_program.cpp
     src/markov/trace_graph/planning/compute_program.cpp
     src/markov/trace_graph/simulation/program_execution.cpp
 )
@@ -51,11 +52,12 @@ add_library(markov_adapters
     src/markov/adapters/ascend/causality.cpp
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/sglang/observations.cpp
+    src/markov/adapters/sglang/cache.cpp
 )
 target_link_libraries(markov_adapters PUBLIC markov_prediction)
 if(TRACE_GRAPH_DEBUG)
     target_compile_definitions(markov_graph PUBLIC TRACE_GRAPH_DEBUG)
 endif()
 
-add_executable(markov_core src/markov/main.cpp src/markov/commands/source.cpp src/markov/commands/costs.cpp)
+add_executable(markov_core src/markov/main.cpp src/markov/commands/source.cpp src/markov/commands/page_work.cpp src/markov/commands/costs.cpp)
 target_link_libraries(markov_core PRIVATE markov_adapters)
