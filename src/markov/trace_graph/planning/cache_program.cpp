@@ -10,11 +10,12 @@
 namespace markov::trace_graph::planning {
 
 CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
-                           std::optional<StorageConfig> storage)
+                           std::optional<StorageConfig> storage, std::optional<KernelCacheInitial> kernel_cache_initial)
     : source_(source),
       page_tokens_(page_tokens),
       cache_(config),
       backend_(std::move(backend)),
+      preparations_(kernel_cache_initial),
       requests_(source.observations().requests.size()) {
     if (source.graph().requests.size() != requests_.size()) {
         issue_ = "request_boundaries_unavailable";
@@ -231,7 +232,7 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         }
         const double query = phase == Phase::Prefill ? requests_[request_].prefill_tokens : frame.query_tokens->front();
         const double context = phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
-        const AttentionInput variables{ query, query, context, 1, static_cast<double>(page_tokens_) };
+        const FrameInput variables{ query, query, context, 1, static_cast<double>(page_tokens_), requests_[request_].device_pages_allocated_since_return };
         plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
 
@@ -240,7 +241,7 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         else commit(runtime);
         return;
     }
-    compute_.emplace(source_, std::move(plans), compute_resource_begin());
+    compute_.emplace(source_, std::move(plans), compute_resource_begin(), preparations_);
     if (compute_->issue()) {
         issue_ = compute_->issue();
         return;

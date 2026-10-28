@@ -47,22 +47,31 @@ bool ComputeProgram::append_compute(const FrameCompute & frame, std::size_t firs
             if (instance.work) work.push_back(frame.plan.work[*instance.work]);
         }
         auto calls = description.calls->describe(observed.compute_frames[frame.frame].phase, frame.variables, work);
+        if (calls.issue) {
+            issue_ = calls.issue;
+            return false;
+        }
 
         // A single unchanged device operation has a source service candidate.
         // The cost provider checks its exclusive ownership before migration.
         if (unchanged && work.size() == 1) {
-            for (auto & native : calls)
+            for (auto & native : calls.calls)
                 if (native.launches == work) native.source_operation = source_call;
         }
-        segment.plan.extend(calls, resources);
+        if (!segment.plan.extend(calls.calls, resources, preparations_)) {
+            issue_ = "kernel_cache_initial_state_unavailable";
+            return false;
+        }
         ++segment.stats.compute_calls;
         segment.stats.compute_services += work.size();
     }
     return true;
 }
 
-ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource)
+ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource,
+                               PreparationCache & preparations)
     : source_(source),
+      preparations_(preparations),
       first_resource_(first_resource) {
     const auto & observed = source.observations();
     std::map<std::tuple<source::Index, WorkKind, source::Index>, std::size_t> jobs;
@@ -137,10 +146,17 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             if (fence.preparation) {
                 const auto & preparation = preparations[fence.id];
                 const auto calls = preparation.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
+                if (calls.issue) {
+                    issue_ = calls.issue;
+                    return;
+                }
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.
-                pending.plan.extend(calls, *preparation_resources[fence.id]);
+                if (!pending.plan.extend(calls.calls, *preparation_resources[fence.id], preparations_)) {
+                    issue_ = "kernel_cache_initial_state_unavailable";
+                    return;
+                }
                 auto & stats = pending.stats.preparations[preparation.role];
                 stats.operations += pending.plan.operations() - before;
                 ++stats.sequences;

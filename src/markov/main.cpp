@@ -120,7 +120,8 @@ int main(int argc, char ** argv) {
                 result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest, page_request->cpu_costs_path),
                                                             page_request->page_sizes_tokens,
                                                             selected_costs ? &*selected_costs : nullptr,
-                                                            page_request->cache ? &*page_request->cache : nullptr);
+                                                            page_request->cache ? &*page_request->cache : nullptr,
+                                                            page_request->kernel_cache_initial);
             else result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
             if (selected_costs) result["models"] = page_request->models_path->string();
         }

@@ -15,7 +15,7 @@ ComputeObservation tensor(std::string operation, std::string implementation, dou
                           Features per_request = Features{}) {
     return {
         { std::move(implementation), TensorGeometry{ std::move(operation), std::move(fixed), std::move(per_query), std::move(per_request) } },
-        AttentionInput{ query, query, query, batch, 0 },
+        FrameInput{ query, query, query, batch, 0 },
         std::nullopt
     };
 }

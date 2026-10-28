@@ -31,6 +31,6 @@ struct ComputePlan {
 // Rebind the observed compute subset to execution variables. Cache decisions and the
 // backend's tensor padding rule supply these variables, never cost coefficients.
 // The source remains immutable; missing row semantics do not reuse source rows.
-ComputePlan project_compute(const source::SourceContext & source, source::Index frame, const AttentionInput & variables);
+ComputePlan project_compute(const source::SourceContext & source, source::Index frame, const FrameInput & variables);
 
 } // namespace markov::trace_graph::planning

@@ -19,13 +19,20 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     std::ifstream stream(path);
     const auto raw = nlohmann::json::parse(stream);
     for (const auto & [name, value] : raw.items()) {
-        if (name != "manifest" && name != "page_sizes_tokens" && name != "models" && name != "cache" && name != "source_cpu_costs")
+        if (name != "manifest" && name != "page_sizes_tokens" && name != "models" && name != "cache" && name != "source_cpu_costs"
+            && name != "kernel_cache_initial_state")
             throw std::runtime_error("Unknown page-work input field: " + name);
     }
     auto manifest_path = std::filesystem::path(raw.at("manifest").get<std::string>());
     if (manifest_path.is_relative()) manifest_path = path.parent_path() / manifest_path;
 
     PageWorkRequest result{ trace_graph::source::inspect_manifest(manifest_path), {} };
+    if (raw.contains("kernel_cache_initial_state")) {
+        const auto state = raw.at("kernel_cache_initial_state").get<std::string>();
+        if (state == "empty") result.kernel_cache_initial = trace_graph::planning::KernelCacheInitial::Empty;
+        else if (state == "prepared") result.kernel_cache_initial = trace_graph::planning::KernelCacheInitial::Prepared;
+        else throw std::runtime_error("Kernel cache initial state must be empty or prepared");
+    }
     if (raw.contains("models")) {
         auto models = std::filesystem::path(raw.at("models").get<std::string>());
         if (models.is_relative()) models = path.parent_path() / models;

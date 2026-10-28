@@ -16,7 +16,7 @@ namespace markov::trace_graph::planning {
 
 struct FrameCompute {
     source::Index frame;
-    AttentionInput variables;
+    FrameInput variables;
     ComputePlan plan;
 };
 
@@ -37,7 +37,7 @@ struct ComputeStats {
 class ComputeProgram final : public Program {
 public:
     static constexpr simulation::Component owner = 2;
-    ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource);
+    ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations);
     ComputeProgram(const ComputeProgram &) = delete;
 
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause);
@@ -79,6 +79,7 @@ private:
     void arrive(ProgramRuntime & runtime, std::size_t frame, const simulation::Event & event);
 
     const source::SourceContext & source_;
+    PreparationCache & preparations_;
     std::size_t first_resource_;
     std::vector<Frame> frames_;
     std::vector<Collective> collectives_;

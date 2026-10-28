@@ -13,7 +13,7 @@ bool ComputeOperation::uses_frame_input() const {
 std::vector<Work> ComputeOperation::describe(Phase phase, const ComputeInput & input) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill." : "decode.";
     if (const auto * shape = std::get_if<TensorGeometry>(&geometry)) {
-        const auto & frame = std::get<AttentionInput>(input);
+        const auto & frame = std::get<FrameInput>(input);
         if (shape->single_query_view && frame.query_tokens == 1) return {};
 
         auto features = shape->fixed;
@@ -112,7 +112,7 @@ std::vector<Work> ComputeOperation::describe(Phase phase, const ComputeInput & i
     }
 
     const auto & shape = std::get<AttentionGeometry>(geometry);
-    const auto & attention = std::get<AttentionInput>(input);
+    const auto & attention = std::get<FrameInput>(input);
     const auto q = attention.query_tokens;
 
     // Causal queries attend the retained prefix plus their own growing suffix.

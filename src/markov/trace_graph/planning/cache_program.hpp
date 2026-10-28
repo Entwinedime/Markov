@@ -34,7 +34,7 @@ struct CacheRequestResult {
 class CacheProgram final : public Program {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
-                 std::optional<StorageConfig> storage = std::nullopt);
+                 std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt);
 
     // Storage borrows this cache, so the program must remain at one address.
     CacheProgram(const CacheProgram &) = delete;
@@ -47,6 +47,7 @@ public:
     const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
     const std::vector<CacheRequestResult> & requests() const { return requests_; }
     const std::optional<std::string> & issue() const { return issue_; }
+    const PreparationCache & preparations() const { return preparations_; }
     std::size_t backups() const { return backups_; }
     std::size_t loads() const { return loads_; }
     std::size_t device_evictions() const { return device_evictions_; }
@@ -83,6 +84,7 @@ private:
     const std::size_t page_tokens_;
     Cache cache_;
     const CacheBackend backend_;
+    PreparationCache preparations_;
     std::optional<Storage> storage_;
     std::optional<ComputeProgram> compute_;
     ComputeStats compute_stats_;

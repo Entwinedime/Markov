@@ -32,7 +32,7 @@ std::vector<ComputeObservation> read_compute(const ProbeEvent & event, const Com
         }
         result.push_back({
             *descriptor->operation,
-            AttentionInput{ frame.query_tokens->front(), descriptor->tensor_query_tokens, frame.sequence_tokens.front(), 1, descriptor->page_tokens },
+            FrameInput{ frame.query_tokens->front(), descriptor->tensor_query_tokens, frame.sequence_tokens.front(), 1, descriptor->page_tokens },
             std::nullopt
         });
         return result;
@@ -76,6 +76,18 @@ void ProbeReader::observe(const ProbeEvent & event) {
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
+    if (name == "runtime.hicache.extend_allocator") {
+        const auto frame = forward_frames_.find(process);
+        if (frame == forward_frames_.end()) ++output_.counts["extend_allocator_without_forward_context"];
+        else {
+            const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+            output_.compute_frames[frame->second].preparations.push_back({
+                { resource, event.begin_ns, event.end_ns, event.record },
+                read_extend_allocator(args),
+                "prefill_allocation"
+            });
+        }
+    }
     if (name == "runtime.hicache.decode_allocator") {
         const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
         if (pending_decode_allocations_.contains(process)) ++output_.counts["unbound_decode_allocator"];

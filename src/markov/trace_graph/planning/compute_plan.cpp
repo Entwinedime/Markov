@@ -7,7 +7,7 @@
 
 namespace markov::trace_graph::planning {
 
-ComputePlan project_compute(const source::SourceContext & source, source::Index frame, const AttentionInput & variables) {
+ComputePlan project_compute(const source::SourceContext & source, source::Index frame, const FrameInput & variables) {
     const auto & observed = source.observations();
     const auto phase = observed.compute_frames[frame].phase;
     ComputePlan result;

@@ -4,13 +4,20 @@
 #include "markov/trace_graph/planning/program.hpp"
 
 #include <cstddef>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace markov::trace_graph::planning {
 
 enum class CallKind { Cpu, Queued, Readback };
+
+struct KernelPreparation {
+    Work specialization, compilation, first_load, load;
+};
 
 struct NativeCall {
     Work work;
@@ -18,6 +25,31 @@ struct NativeCall {
     std::vector<Work> launches;
     std::optional<Work> synchronization = std::nullopt;
     std::optional<std::size_t> source_operation = std::nullopt;
+    std::optional<KernelPreparation> preparation = std::nullopt;
+};
+
+struct NativeSequence {
+    std::vector<NativeCall> calls;
+    std::optional<std::string> issue;
+};
+
+enum class KernelCacheInitial { Empty, Prepared };
+enum class KernelUse { Prepared, FirstLoad, Load };
+
+// Planned preparation belongs to one target. A cost failure discards that
+// target; these declarations never mark a real runtime cache as initialized.
+class PreparationCache {
+public:
+    explicit PreparationCache(std::optional<KernelCacheInitial> initial) : initial_(initial) {}
+    std::optional<KernelCacheInitial> initial() const { return initial_; }
+    KernelUse use(const Work & specialization, std::size_t caller);
+    std::size_t specializations() const;
+    std::size_t first_loads() const { return loaded_.size(); }
+
+private:
+    std::optional<KernelCacheInitial> initial_;
+    std::map<std::size_t, std::set<Work>> prepared_;
+    std::set<std::size_t> loaded_;
 };
 
 // Framework rules describe changing work; the common compiler owns the caller,
@@ -25,7 +57,7 @@ struct NativeCall {
 class CallSequence {
 public:
     virtual ~CallSequence() = default;
-    virtual std::vector<NativeCall> describe(Phase phase, const AttentionInput & input, std::span<const Work> work = {}) const = 0;
+    virtual NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work> work = {}) const = 0;
 };
 
 struct CallResources {
@@ -37,7 +69,7 @@ class NativePlan {
 public:
     // Ordered tensor work may change device streams while retaining its
     // producer frontier. Caller/worker ownership remains with the same queues.
-    void extend(std::span<const NativeCall> calls, CallResources resources);
+    bool extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations);
     PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
     std::size_t operations() const { return work_.size(); }
     std::size_t delays() const;

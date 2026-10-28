@@ -8,5 +8,6 @@
 namespace markov::adapters::sglang {
 
 std::unique_ptr<const trace_graph::planning::CallSequence> read_decode_allocator(const nlohmann::json & args);
+std::unique_ptr<const trace_graph::planning::CallSequence> read_extend_allocator(const nlohmann::json & args);
 
 } // namespace markov::adapters::sglang

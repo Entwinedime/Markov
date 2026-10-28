@@ -2,6 +2,7 @@
 
 #include "markov/adapters/costs.hpp"
 #include "markov/adapters/sglang/cache.hpp"
+#include "markov/trace_graph/planning/native_calls.hpp"
 #include "markov/trace_graph/source/context.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
 
@@ -32,6 +33,7 @@ struct PageWorkRequest {
     std::optional<std::filesystem::path> models_path = std::nullopt;
     std::optional<sglang::CacheSettings> cache = std::nullopt;
     std::optional<std::filesystem::path> cpu_costs_path = std::nullopt;
+    std::optional<trace_graph::planning::KernelCacheInitial> kernel_cache_initial = std::nullopt;
 };
 
 PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path = std::nullopt);

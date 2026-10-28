@@ -33,6 +33,14 @@ Json preparation_report(const planning::ComputeStats & stats) {
     return report;
 }
 
+Json kernel_cache_report(const planning::PreparationCache & cache) {
+    return {
+        {           "initial_state", cache.initial() ? Json(*cache.initial() == planning::KernelCacheInitial::Empty ? "empty" : "prepared") : Json(nullptr) },
+        { "planned_specializations",                                                                                                cache.specializations() },
+        {     "planned_first_loads",                                                                                                    cache.first_loads() }
+    };
+}
+
 Json cost_gap_json(const simulation::CostGap & gap) {
     auto work = work_json(gap.work);
     work["status"] = cost_status_name(gap.response.status);
@@ -45,6 +53,8 @@ Json cost_gap_json(const simulation::CostGap & gap) {
 }
 
 struct SubsetExecution {
+    explicit SubsetExecution(std::optional<planning::KernelCacheInitial> initial) : preparations(initial) {}
+    planning::PreparationCache preparations;
     std::size_t completed_frames = 0, executed_nodes = 0, service_operations = 0;
     std::map<std::string, std::size_t> coverage;
     Json issue = nullptr;
@@ -54,7 +64,7 @@ struct SubsetExecution {
     void evaluate(const source::SourceContext & source, std::vector<planning::FrameCompute> frames, cost::Queries & costs) {
         if (!issue.is_null()) return;
         const auto frame_count = frames.size();
-        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size());
+        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size(), preparations);
         if (program.issue()) {
             issue = {
                 {   "kind", "compute_structure_unavailable" },
@@ -88,6 +98,7 @@ struct SubsetExecution {
             {     "participant_wait_ns",                           compute.participant_wait_ns },
             { "maximum_arrival_span_ns",                       compute.maximum_arrival_span_ns },
             {            "preparations",                           preparation_report(compute) },
+            {            "kernel_cache",                     kernel_cache_report(preparations) },
             {       "native_operations",                             compute.native_operations },
             {         "dispatch_delays",                               compute.dispatch_delays },
             {                "coverage",                                              coverage },
@@ -96,8 +107,9 @@ struct SubsetExecution {
             {                   "issue",                                                 issue },
             {           "e2e_predicted",                                                 false },
             {           "qualification",
-             "Known compute calls, attention metadata and one-token Decode allocation share native chains and blocking collective rendezvous. "
-             "Allocation uses its observed device stream and precedes forward inputs. Unsorted pools with int32 locations are supported. Idle synchronization "
+             "Known compute calls, metadata and admitted Prefill/Decode allocation share native chains and blocking collective rendezvous. "
+             "Allocation uses its observed device stream and precedes forward inputs. Unsorted pools use int64 Prefill or int32 one-token Decode locations. "
+             "Idle synchronization "
              "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call and "
              "collective CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
              "reported."                                                                      }
@@ -106,13 +118,14 @@ struct SubsetExecution {
 };
 
 Json cache_execution(const source::SourceContext & source, std::size_t page_tokens, const adapters::sglang::CacheSettings & settings,
-                     const planning::CacheBackend & backend, cost::Queries & queries) {
+                     const planning::CacheBackend & backend, cost::Queries & queries, std::optional<planning::KernelCacheInitial> kernel_cache_initial) {
     const auto query_begin = queries.requests(), evaluation_begin = queries.evaluations();
     planning::CacheProgram program(source,
                                    page_tokens,
                                    { settings.device_pages, settings.host_pages, backend.layers, settings.backup_after_hits },
                                    backend,
-                                   settings.storage);
+                                   settings.storage,
+                                   kernel_cache_initial);
     auto result = simulation::ProgramExecution(program, queries, program.resources()).run();
     const auto time = [&](std::optional<graph::NodeId> node, bool start = false) -> Json {
         if (!node || result.execution.states[*node] != simulation::OperationState::Complete) return nullptr;
@@ -191,8 +204,9 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {       "response_evaluations",                                                                          queries.evaluations() - evaluation_begin },
         {              "e2e_predicted",                                                                                                             false },
         {              "qualification",
-         "Cache I/O, known compute calls, attention metadata and one-token Decode allocation share one clock. Native calls share caller/worker chains "
-         "and ordered device producers, preserving the allocation-to-forward stream handoff. Unsorted pools with int32 locations are supported. Idle "
+         "Cache I/O, known compute calls, metadata and admitted Prefill/Decode allocation share one clock. Native calls share caller/worker chains "
+         "and ordered device producers, preserving the allocation-to-forward stream handoff. Unsorted pools use int64 Prefill or int32 one-token Decode "
+         "locations. Idle "
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
          "Partial request ports exclude query/admission, inter-call and collective CPU, other cross-stream dependencies and client pacing. "
@@ -207,6 +221,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
     };
     report["preparation_execution"] = preparation_report(compute);
+    report["kernel_cache"] = kernel_cache_report(program.preparations());
     report["native_call_execution"] = {
         {    "compute_calls",     compute.compute_calls },
         { "compute_services",  compute.compute_services },
@@ -249,7 +264,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
 } // namespace
 
 nlohmann::json page_work_report(const adapters::PreparedSource & source, std::span<const std::size_t> page_sizes_tokens, const adapters::SelectedCosts * costs,
-                                const adapters::sglang::CacheSettings * cache) {
+                                const adapters::sglang::CacheSettings * cache, std::optional<planning::KernelCacheInitial> kernel_cache_initial) {
     const auto & observations = source.context.observations();
     const auto & paths = observations.token_paths;
     std::optional<cost::Queries> queries;
@@ -257,7 +272,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
     const auto backend = cache ? std::optional(adapters::sglang::cache_backend(source.context)) : std::nullopt;
     auto targets = Json::array();
     for (const auto size : page_sizes_tokens) {
-        SubsetExecution execution;
+        SubsetExecution execution(kernel_cache_initial);
         const auto query_begin = queries ? queries->requests() : 0;
         const auto evaluation_begin = queries ? queries->evaluations() : 0;
         struct WorkCounts {
@@ -265,7 +280,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
         };
         std::size_t corpus_pages = 0;
         for (const auto & [identity, tokens] : observations.request_tokens) {
-            if (tokens.committed) corpus_pages += paths.length(tokens.committed->path) / size;
+            if (tokens.committed) corpus_pages += (paths.length(tokens.committed->path) + size - 1) / size;
         }
 
         // This diagnostic retains the complete corpus as one logical layer.
@@ -293,7 +308,9 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
             prefixes.pin_device(prior_commit.device);
 
             const auto existing = prefixes.match(committed_pages);
-            const auto buffer = prefixes.reserve(planning::Tier::Device, committed_pages.size() - prefixes.page_count(existing.device)).value();
+            const auto allocation_offset = prefixes.device_pages_allocated_since_return();
+            const auto active_pages = (paths.length(committed) + size - 1) / size;
+            const auto buffer = prefixes.reserve(planning::Tier::Device, active_pages - prefixes.page_count(existing.device)).value();
             prefixes.commit_device(committed_pages, buffer);
             prefixes.release(buffer);
             prefixes.unpin_device(prior_commit.device);
@@ -314,7 +331,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 }
                 const auto query = frame.phase == planning::Phase::Prefill ? paths.length(prompt) - prior_pages * size : frame.query_tokens->front();
                 const auto context = frame.phase == planning::Phase::Prefill ? paths.length(prompt) : frame.sequence_tokens.front();
-                const planning::AttentionInput variables{ query, query, context, 1, static_cast<double>(size) };
+                const planning::FrameInput variables{ query, query, context, 1, static_cast<double>(size), allocation_offset };
                 auto plan = planning::project_compute(source.context, frame_id, variables);
                 missing_row_bindings += plan.missing_row_bindings.size();
                 dependencies += plan.dependencies.size();
@@ -364,7 +381,7 @@ nlohmann::json page_work_report(const adapters::PreparedSource & source, std::sp
                 {      "pages", node.pages.size() }
             });
         }
-        auto cache_result = cache ? cache_execution(source.context, size, *cache, *backend, *queries) : Json(nullptr);
+        auto cache_result = cache ? cache_execution(source.context, size, *cache, *backend, *queries, kernel_cache_initial) : Json(nullptr);
         targets.push_back({
             { "page_size_tokens", size },
             { "requests", std::move(requests) },

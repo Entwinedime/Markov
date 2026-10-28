@@ -1,5 +1,6 @@
 #include "markov/adapters/sglang/dense.hpp"
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -14,7 +15,7 @@ enum class Kind { Simple, Normalization, Attention, InputBuffers, EmbeddingMask,
 class DenseCalls final : public CallSequence {
 public:
     DenseCalls(Kind kind, std::string caller, Features parameters) : kind_(kind), caller_(std::move(caller)), parameters_(std::move(parameters)) {}
-    std::vector<NativeCall> describe(Phase phase, const AttentionInput & input, std::span<const Work> work) const override;
+    NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work> work) const override;
 
 private:
     Kind kind_;
@@ -32,7 +33,7 @@ void cpu(std::vector<NativeCall> & calls, const std::string & operation, const s
 
 void queued(std::vector<NativeCall> & calls, const Work & work) { calls.push_back({ work, CallKind::Queued, { work } }); }
 
-std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput & input, std::span<const Work> work) const {
+NativeSequence DenseCalls::describe(Phase phase, const FrameInput & input, std::span<const Work> work) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill." : "decode.";
     std::vector<NativeCall> calls;
     if (kind_ == Kind::Reshape && work.empty()) {
@@ -43,7 +44,7 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
         features["rows"] = rows;
         features["elements"] *= rows;
         cpu(calls, prefix + "qk_reshape.view", caller_, std::move(features));
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::InputBuffers) {
         auto shape = parameters_;
@@ -53,7 +54,7 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
             queued(calls, work[i]);
         }
         cpu(calls, prefix + "input_buffers.return", caller_, shape);
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::Normalization && work.size() == 2) {
         const auto & shape = work.back().features;
@@ -62,7 +63,7 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
         cpu(calls, prefix + "split_add_rms_norm.norm_prepare", caller_, shape);
         queued(calls, work.back());
         cpu(calls, prefix + "split_add_rms_norm.return", caller_, shape);
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::Sampling) {
         auto parent = work.front();
@@ -73,7 +74,7 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
             CallKind::Queued,
             { work.begin(), work.end() }
         });
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::Pruning) {
         const auto & shape = work.back().features;
@@ -91,7 +92,7 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
         cpu(calls, prefix + "logits_pruning.prepare_selection", caller_, shape);
         queued(calls, work[3]);
         cpu(calls, prefix + "logits_pruning.return", caller_, shape);
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::EmbeddingMask || kind_ == Kind::RotaryTable || kind_ == Kind::Attention) {
         for (std::size_t i = 0; i < work.size(); ++i) {
@@ -122,18 +123,18 @@ std::vector<NativeCall> DenseCalls::describe(Phase phase, const AttentionInput &
         const auto shape = kind_ == Kind::Attention ? Features{ { "batch_size", input.batch_size }, { "tensor_query_tokens", input.tensor_query_tokens } }
                                                    : work.back().features;
         cpu(calls, prefix + tail, caller_, shape);
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
     if (kind_ == Kind::Inner) {
         queued(calls, work.front());
-        return calls;
+        return { std::move(calls), std::nullopt };
     }
 
     const auto & operation = work.front();
     cpu(calls, operation.kind.operation + ".entry", caller_, operation.features);
     queued(calls, operation);
     cpu(calls, operation.kind.operation + ".return", caller_, operation.features);
-    return calls;
+    return { std::move(calls), std::nullopt };
 }
 
 } // namespace

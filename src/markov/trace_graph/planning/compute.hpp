@@ -4,6 +4,7 @@
 
 #include <array>
 #include <compare>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <variant>
@@ -79,14 +80,15 @@ struct RowInput {
     double rows;
 };
 
-struct AttentionInput {
+struct FrameInput {
     // One serial request. Grouped attention needs per-sequence lengths and is
     // outside the current adapter contract, rather than inferred from totals.
     // Context includes the query suffix; tensor_query_tokens retains padding.
     double query_tokens, tensor_query_tokens, context_tokens, batch_size, page_tokens;
+    std::optional<std::size_t> device_pages_allocated_since_return = std::nullopt;
 };
 
-using ComputeInput = std::variant<RowInput, AttentionInput>;
+using ComputeInput = std::variant<RowInput, FrameInput>;
 
 // Fixed implementation/geometry and changing execution variables stay separate.
 // Shapes describe work only: no measurements, cost coefficients or native JSON.

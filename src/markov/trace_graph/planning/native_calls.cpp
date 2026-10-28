@@ -6,6 +6,19 @@
 
 namespace markov::trace_graph::planning {
 
+KernelUse PreparationCache::use(const Work & specialization, std::size_t caller) {
+    if (initial_ == KernelCacheInitial::Prepared || !prepared_[caller].insert(specialization).second) return KernelUse::Prepared;
+
+    // shortcut: one launcher ABI per caller; separate ABI loading when another family is modeled.
+    return loaded_.insert(caller).second ? KernelUse::FirstLoad : KernelUse::Load;
+}
+
+std::size_t PreparationCache::specializations() const {
+    std::size_t count = 0;
+    for (const auto & [caller, keys] : prepared_) count += keys.size();
+    return count;
+}
+
 void NativePlan::depend(std::optional<graph::NodeId> before, graph::NodeId after) {
     if (before) edges_.push_back({ *before, after, graph::EdgeKind::DataDependency });
 }
@@ -25,8 +38,18 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
     append(work, residual, resource, tail);
 }
 
-void NativePlan::extend(std::span<const NativeCall> calls, CallResources resources) {
+bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations) {
     for (const auto & call : calls) {
+        if (call.preparation) {
+            if (!preparations.initial()) return false;
+            const auto & preparation = *call.preparation;
+            const auto use = preparations.use(preparation.specialization, resources.caller);
+            if (use != KernelUse::Prepared) {
+                append(preparation.compilation, preparation.compilation.kind.timing_scope.c_str(), resources.caller, caller_);
+                const auto & load = use == KernelUse::FirstLoad ? preparation.first_load : preparation.load;
+                append(load, load.kind.timing_scope.c_str(), resources.caller, caller_);
+            }
+        }
         cpu(call.work, "cpu_service", "residual_interval", resources.caller, caller_);
         if (call.kind == CallKind::Cpu) continue;
 
@@ -56,6 +79,7 @@ void NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_);
         cpu(returned, "cpu_service", "residual_interval", resources.caller, caller_);
     }
+    return true;
 }
 
 std::size_t NativePlan::delays() const { return std::ranges::count(steps_, true, &Step::delay); }
