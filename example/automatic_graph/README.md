@@ -159,9 +159,12 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 | [operations.py](operations.py) | 共用操作、端口及数据依赖核对，独立于serving配对和调度 |
 | [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿 |
 | [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
+| [request_state.py](request_state.py) | 根据实际提交/完成记录核对请求进度、槽位与KV页所有权；由evidence调用 |
 | [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |
 
 这些入口读取公共结果和原生事实，不回流修改被验预测。物理工作有归属不等于全部依赖已恢复；不完整参数或关联保留 partial，不能按最近时间强配。结构来源 profiler 耗时不直接成为 CPU、设备、通信成本，dummy 权重也不提供数值或内容相关行为的正确性结论。
+
+预测状态核对消费当前程序的`--details`产物，以实际提交/完成序号处理同时间戳事件，并核对模板实际返回的页与请求释放效果。检查器只记录已经发生的分配、交接和释放，不选择组批或复写页池算法；中间PP动作携带的计划效果不提前提交。当前判据限于冷KV、完整prefill、无前缀缓存和抢占，不能直接套用未来的缓存驻留或分块行为。该项自洽不代表与原生调度策略等价。
 
 单个flow的完成关系比较只证明所选操作范围内的边。等待若涉及起点之前或上一flow的工作，会分别报告外部完成边及未绑定前沿，保持partial；完整窗口及控制交接另行核对。范围内缺边、多余边或外部资源连接错误仍判为差异。
 

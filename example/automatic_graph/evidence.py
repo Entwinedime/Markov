@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.artifacts.json_file import write_json
+from request_state import RequestStateEvidence
 
 
 class ExecutionEvidence:
@@ -138,6 +139,8 @@ class ExecutionEvidence:
                 ("transfer", "release"),
             )
         )
+        state = RequestStateEvidence(self.result).check()
+        checks["request_state"] = state["status"] == "matched"
         return {
             "status": "matched" if all(checks.values()) else "differences",
             "checks": checks,
@@ -146,6 +149,7 @@ class ExecutionEvidence:
             "actions": len(decisions),
             "controls": len(self.result["controls"]),
             "handoffs": len(flows),
+            "request_state": state,
         }
 
 
