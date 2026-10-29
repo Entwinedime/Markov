@@ -144,7 +144,7 @@ cache_execution.native_call_execution.frames 给出进入、caller 提交、结�
 工作汇合包括 caller、worker 与设备，不是单独的设备完成。
 同一 frames 报告另列 modeled_result_callers_started_ns、modeled_result_callers_completed_ns 和 modeled_send_ns，分别表示已建模结果整理的开始、完成及发送端口。
 modeled_result_work_completed_ns 单列结果处理的原生工作汇合；CPU 返回不强制等待未同步的设备尾部，后台程序仍须保留它。
-结果序列包含纯 CPU 整理、空/非空释放、初始索引复制、插入索引克隆及匹配/页表回写；查询分裂、备份控制及其余外围尚缺。插入、匹配、回写和释放工作量来自执行时的目标缓存状态；序列等待自己的输出和所需的下一帧提交，后续调度再等待上一轮 CPU 整理完成，发送后的片段仍执行。
+结果序列包含纯 CPU 整理、空/非空释放、初始索引复制、插入索引克隆、匹配/页表回写和备份响应；请求查询另生成分裂复制与索引拼接，查询外围与其余请求控制仍缺。插入、匹配、回写和释放工作量来自执行时的目标缓存状态；序列等待自己的输出和所需的下一帧提交，后续调度再等待上一轮 CPU 整理完成，发送后的片段仍执行。
 Prefill 内结束请求的重复页和尾部也立即释放，Decode 的重复页及尾部索引先收集再分组释放；当前只支持未排序页池。请求报告另给出 released_device_pages 与 device_pages_released_ns，空间归还等待全部参与者的已建模页池更新。
 准入只预留预算，cache_execution 在每轮进入输入准备时才推进实际分配；其 native_call_execution.frames 中 allocator_view_offset_pages 给出该轮分配前的索引数组偏移。未发生归还时偏移会保留到下一请求，不能每轮重置为零。已验证范围仍为串行、同步 TP 逻辑请求，未覆盖任意并发调度或 allocator 分支。
 未结束的 Prefill 在各参与者输出可读后发布页对齐的 prompt 前缀；重叠调度另等待下一帧 caller 提交，写策略据此决定是否提前备份。
@@ -164,6 +164,7 @@ source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独�
 页大小仍由 page_sizes_tokens 逐项给出。原 requests 和 projected_compute_work 保留完整前缀语料的上限统计，
 另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
 回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
+cache_execution.copy_ports 逐逻辑复制列出页数、各参与者的 cache_control_returned_ns、completion_observed_ns 与 published_ns。控制返回包含后续主机索引克隆；发布等待两个端口的全部参与者。completion_basis 区分 modeled_observation_upper_interval 和 device_service，前者包含同步观察开销，不能当作精确设备完成。淘汰或缺少结果观察的旧路径仍使用设备传输口径，不能据此认为其外围 CPU 已覆盖。
 不同参与进程的计算用显式汇合边界衔接，串行请求依赖前一响应完成；实验响应端口仍只覆盖部分路径，入口和尾部沿用同请求/前端的源残余近似。
 partial_request_ports 区分 start_ns、arrived_ns、received_ns 与响应开始/完成；received_ns 为首次取得参与 caller 的准入端口，准入等待不计作 CPU 服务。
 有同次最终发送观察时，响应从 modeled_send_ns 接出；缺少该事实则保留全部所选工作完成的屏障。

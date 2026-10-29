@@ -85,7 +85,10 @@ target 正常时间、trace、评分、配置名和 workload 身份不能作为�
 独立 HiCache 控制测量入口为 `python -m markov.adapters.sglang.cache_io --recipe … --output …`，在兼容 NPU 推理环境运行。
 配方声明 device、geometry（layers/kv_heads/head_dim）、warmup、repeats，以及包含 page_tokens/pages 的 cases；目前使用 BF16、kernel_ascend/page_first_direct，实际框架管理页池和复制。
 测量不加载权重、不启用 profiler/probe，不读取 target；初始化、清空及物理 K/V 核对在计时外，预热记录保留。输出索引读回、controller 返回、完成同步返回、空闲同步与主机索引克隆响应。
-完成同步返回包含观察 API，只提供完成的观测上界；不能直接替代裸设备服务或独占资源时间。范围目前限初始化后的空闲单设备、就绪页池，不授予并发竞争、CPU/NUMA 绑定或正常完整 HTTP 精度资格。
+完成同步返回包含观察 API，是设备完成的观测上界；模型对该区间的估计不保证仍为严格上界，不能直接替代裸设备服务或独占资源时间。范围目前限初始化后的空闲单设备、就绪页池，不授予并发竞争、CPU/NUMA 绑定或正常完整 HTTP 精度资格。
+
+结果控制点的备份分别查询 `cache.backup.caller` 的 `caller_blocking_interval` 与 `cache.backup.completion` 的 `completion_observation_upper_interval`。两项都从同一主机调用入口起计：前者占 caller，后者在独立备份队列上表示粗粒度完成，不能再叠加裸 DMA。随后单独计主机索引克隆，发布等待各参与者的返回和完成端口。内部 CPU 准备与 DMA 的重叠被封闭在响应里；共享资源交错尚未细化，淘汰触发路径的外围控制仍缺。
+每项响应采用固定项加页数乘每页系数，系数按已测 page_bytes 插值；layers 和 bytes_per_token 限定几何。模型声明允许页数外推时保留其外推身份，不把外推工作量当作新实测。参数来自独立正常控制器运行，留出采集不参加重拟合；主机克隆使用自己的元素数响应，不按 target 增加专用参数。
 
 ## 一项工作怎样查询
 
