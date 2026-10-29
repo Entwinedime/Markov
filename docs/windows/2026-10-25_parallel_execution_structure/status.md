@@ -174,6 +174,8 @@ TP1、TP2、Qwen1.5 MoE的EP2/4各完成8请求、13模型批次；详细图的�
 
 正式接入须将这两个探针替身改为共同KvPool和执行完成状态，按请求连接预约/传输/接收/释放，并保留原生非阻塞poll；指导文档已细化位置与顺序。当前尚未接通核心PD，不授予目标图、Ascend传输或独立验证资格；累计processing80.574867650s，采集0，失败和探针版本保留。
 
+共同PD路径已将Receive与Accept分开：前者逐请求执行已有KvReceived模板，后者按实际批次接入并处理首个输出；轻量及回放使用同一实现。`data/20261029T000949.675595Z_s9-pd-receive-admission`的五组开发检查与原生PP3回归通过；多成员回放因七次接收前移，使request-0的末次输出/提交推迟13377ns，批次成员、图节点数及整例完成时间不变。此差异已定位，不记作逐字段全等。本批代码/文档/数据已审查整理，原生PD的实例输入、批次外预约、传输查询与完成反馈仍待正式接入。
+
 ## 3. 模型与环境边界
 
 本轮七模型为Qwen3-8B、Mistral-7B-v0.3、Qwen1.5-MoE-A2.7B、Qwen3-30B-A3B、Meta Llama-3.1-8B-Instruct、AllenAI OLMoE-1B-7B-0924、GLM-4-9B-Chat。固定官方完整架构及revision，运行dummy权重；不裁层/专家，不宣称真实文本或自然路由精度。
@@ -205,6 +207,7 @@ TP1、TP2、Qwen1.5 MoE的EP2/4各完成8请求、13模型批次；详细图的�
 | `20261028T221351.468056Z_s9-native-resource-groups` | 参与组资源/工作归属分离、双组状态交错及正式TP/EP回归 |
 | `20261028T223107.700515Z_s9-native-pipeline-integration` | 原生PP3/TP2×PP3逐段闭环、三lane、资源/事件检查与收尾修正；原生PD待做 |
 | `20261028T234514.887407Z_s9-native-pd-boundaries` | 原生PD批次外预约、传输等待、prebuilt与释放观察；使用CPU池/给定完成门控，未接核心 |
+| `20261029T000949.675595Z_s9-pd-receive-admission` | 共同PD接收/准入拆分、五组开发检查及原生PP3回归；保留回放时间变化解释，未接原生PD |
 | `20261028T215356.466419Z_s9-native-call-dispatch` | 原生调用独立应答、时钟推进边界和既有TP/EP完整回归；PP组尚未接入 |
 | `20261028T212241.268714Z_s9-deferred-communication` | 跨动作消息、两端到达顺序、回收及六项入口回归；不是正式原生PP闭环 |
 | `20261028T205623.041370Z_s9-native-pipeline-boundaries` | 原生PP3控制探索、跨lane结果序列及完整入口回归；不是核心PP闭环 |

@@ -68,7 +68,7 @@ C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架
 
 ServingWorkflow 依赖 ServingControl 与 BatchExpansion，CLI 组合具体控制器并保持借用对象的生命周期。动作带目标组和组内任务序号，事件按相同身份交回；控制器拥有请求进度，独立 KvPool 持有槽位/页状态；CLI 保持资源池比控制器存活更久，workflow 仅保留在途动作、页归还结果及可选报告。执行器注册端口通知，按依赖就绪和资源空闲推进唯一时钟；图回收后未完成工作仍由执行器持有，装配侧保留活跃状态绑定。ParallelTopology 提供逻辑 rank、位置及组角色的绑定，ParallelComposition 按相应参与组和任务调用身份连接通信，不默认使用全部 rank，也不按构图顺序预占共享通信资源。
 
-PD 由 DisaggregatedController 维护一份请求进度，借用两个独立 KvPool；页组件同时支持即时归还与待合并后排序，决策不复制页所有权。SGLang 的 DisaggregatedStructure 组合两个 RankStructure，绑定预约、无模型接入、搬运和释放；原生 sorted allocator 的两个缓冲区保持独立，只有分配需要时展开合并模板。框架观察、声明和双服务生命周期分开维护，memfabric 接口事实留在 Ascend runtime adapter。详细结果保留动作完成时刻、页复制对应和展开入口名；默认结果保留请求、两池终态和来源资格。
+PD 由 DisaggregatedController 维护一份请求进度，借用两个独立 KvPool；页组件同时支持即时归还与待合并后排序，决策不复制页所有权。SGLang 的 DisaggregatedStructure 组合两个 ServingStructure，按请求连接预约、搬运、接收、无模型接入和源释放。接收消费已到达的元数据，接入再按批次处理首个输出；源释放只等待搬运完成，接收本身不生成输出或归还资源。原生 sorted allocator 的两个缓冲区保持独立，只有分配需要时展开合并模板。框架观察、声明和双服务生命周期分开维护，memfabric 接口事实留在 Ascend runtime adapter。详细结果保留动作完成时刻、页复制对应和展开入口名；默认结果保留请求、两池终态和来源资格。
 
 TemplateLibrary 逐个消费角色来源，共用一份规范化目录并在发布时移交结果；编译中的来源和中间调用不复制进正式共享定义。CLI 持有类型化 TemplateCatalog，各 TemplateAsset 仅持有本角色的调用/资源绑定并借用该目录，整个展开期间保持目录和角色资产存活。
 
