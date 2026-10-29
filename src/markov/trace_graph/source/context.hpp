@@ -29,6 +29,16 @@ struct FrameCall {
     std::optional<Index> gap_before = std::nullopt;
 };
 
+struct SourceSequence {
+    Index frame;
+    bool result_processing;
+    // Observations are finalized before indexing; their storage outlives these views.
+    const ObservedCallSequence & observation;
+    CpuInterval cpu;
+    CallBinding resources;
+    NativeSequenceBinding native;
+};
+
 // Own source observations and their graph once. Consumers borrow const views;
 // target state and corrected cost views cannot mutate the original capture.
 class SourceContext {
@@ -49,11 +59,11 @@ public:
     const DeviceService & device_service(Index work) const { return device_services_[work]; }
     const CpuInterval & cpu_work_interval(Index work) const { return cpu_work_intervals_[work]; }
     const std::optional<planning::CallResources> & compute_resources(Index work) const { return compute_resources_[work]; }
-    std::span<const CpuInterval> preparation_intervals(Index frame) const { return preparation_intervals_[frame]; }
-    std::span<const CallBinding> preparation_bindings(Index frame) const { return preparation_bindings_[frame]; }
-    const NativeSequenceBinding & preparation_native_calls(Index frame, Index preparation) const { return preparation_native_calls_[frame][preparation]; }
+    const SourceSequence & sequence(Index id) const { return sequences_[id]; }
+    std::span<const Index> frame_sequences(Index frame) const { return frame_sequences_[frame]; }
+    std::span<const Index> result_sequences(Index frame) const { return result_sequences_[frame]; }
     std::span<const NativeWorkRegion> native_work() const { return native_work_; }
-    void bind_native_sources(Index frame, Index preparation, std::span<planning::NativeCall> calls) const;
+    void bind_native_sources(Index sequence, std::span<planning::NativeCall> calls) const;
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
     std::span<const Index> frame_queue_issues(Index frame) const { return frame_queue_issues_[frame]; }
     std::span<const Index> frame_collectives(Index frame) const { return frame_collectives_[frame]; }
@@ -68,7 +78,7 @@ private:
     void index_frame_calls();
     void index_native_sequences();
     void index_native_work();
-    Index retain_native_work(planning::Work work, const char * scope, ObservedRegion region, bool stream_wait_generated = false,
+    Index retain_native_work(planning::Work work, const char * scope, ObservedRegion region, HostWait generated_wait = HostWait::None,
                              NativeTiming timing = NativeTiming::Cpu, Time excluded_queue_wait_ns = 0, std::vector<ObservedRegion> excluded = {});
 
     Observations observations_;
@@ -80,9 +90,9 @@ private:
     std::vector<DeviceService> device_services_;
     std::vector<CpuInterval> cpu_work_intervals_;
     std::vector<std::optional<planning::CallResources>> compute_resources_;
-    std::vector<std::vector<CpuInterval>> preparation_intervals_;
-    std::vector<std::vector<CallBinding>> preparation_bindings_;
-    std::vector<std::vector<NativeSequenceBinding>> preparation_native_calls_;
+    std::vector<SourceSequence> sequences_;
+    std::vector<std::vector<Index>> frame_sequences_;
+    std::vector<std::vector<Index>> result_sequences_;
     std::vector<NativeWorkRegion> native_work_;
     std::map<std::pair<Index, planning::Work>, Index> control_sources_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;

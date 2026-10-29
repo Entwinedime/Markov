@@ -57,17 +57,16 @@ Json cpu_interval_summary(const source::SourceContext & source) {
     std::size_t unsupported_frames = 0;
     for (source::Index frame = 0; frame < observed.compute_frames.size(); ++frame) {
         unsupported_frames += !source.frame_cpu_order_supported(frame);
-        const auto & regions = observed.compute_frames[frame].preparations;
-        const auto intervals = source.preparation_intervals(frame);
-        const auto bindings = source.preparation_bindings(frame);
-        for (std::size_t i = 0; i < regions.size(); ++i) {
-            auto & item = preparations[regions[i].role];
-            item.intervals.include(intervals[i], regions[i].region.end_ns - regions[i].region.begin_ns);
-            item.rules += regions[i].definition != nullptr;
-            const auto resources = bindings[i].unique_resources();
+        for (const auto id : source.frame_sequences(frame)) {
+            const auto & site = source.sequence(id);
+            const auto & region = site.observation;
+            auto & item = preparations[region.role];
+            item.intervals.include(site.cpu, region.region.end_ns - region.region.begin_ns);
+            item.rules += region.definition != nullptr;
+            const auto resources = site.resources.unique_resources();
             item.resources += resources.has_value();
-            item.queues += bindings[i].workers.size() == 1;
-            const auto & native = source.preparation_native_calls(frame, i);
+            item.queues += site.resources.workers.size() == 1;
+            const auto & native = site.native;
             if (native.issue) ++item.native_issues[*native.issue];
             else {
                 ++item.native_sequences;
@@ -126,7 +125,7 @@ Json cpu_interval_summary(const source::SourceContext & source) {
         for (const auto & entry : source.frame_calls(frame)) {
             if (!entry.gap_before || !source.cpu_gap_has_unmodeled_work(*entry.gap_before)) continue;
             ++unmodeled_gap_work;
-            if (entry.kind == source::FrameCallKind::Preparation) ++gap_followers[observed.compute_frames[frame].preparations[entry.index].role];
+            if (entry.kind == source::FrameCallKind::Preparation) ++gap_followers[source.sequence(entry.index).observation.role];
             else if (entry.kind == source::FrameCallKind::Collective) ++gap_followers[observed.collectives[entry.index].work.kind.operation];
             else {
                 const auto & description = observed.work_descriptions[observed.work_observations[entry.index].description];

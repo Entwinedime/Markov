@@ -46,6 +46,7 @@ bool same_caller_step(const planning::NativeCall & before, const planning::Nativ
 }
 
 bool sources_complete(const planning::NativeCall & call) {
+    if (call.kind == planning::CallKind::Cpu) return call.sources.caller_before.has_value();
     if (!call.sources.caller_before || !call.sources.caller_after || !call.sources.dispatch || !call.sources.worker_after) return false;
     if (call.kind == planning::CallKind::HostUpload) return call.sources.worker_before.has_value();
     return std::ranges::all_of(call.sources.launches, [](const planning::NativeLaunchSources & sources) { return sources.worker_before.has_value(); });
@@ -73,12 +74,13 @@ struct CallerEnvelope {
 
 } // namespace
 
-void SourceContext::bind_native_sources(Index frame, Index preparation, std::span<planning::NativeCall> calls) const {
+void SourceContext::bind_native_sources(Index sequence, std::span<planning::NativeCall> calls) const {
     for (auto & call : calls) {
         call.sources = {};
         call.sources.launches.resize(call.launches.size());
     }
-    const auto & binding = preparation_native_calls_[frame][preparation];
+    const auto & selected = sequences_[sequence];
+    const auto & binding = selected.native;
     if (binding.issue) return;
     if (std::ranges::equal(binding.definitions, calls, same_work)) {
         for (Index id = 0; id < calls.size(); ++id) calls[id].sources = binding.definitions[id].sources;
@@ -107,52 +109,57 @@ void SourceContext::bind_native_sources(Index frame, Index preparation, std::spa
 
     // Another invocation can supply ordinary work missing from this callback;
     // caller recipes and worker bodies retain separate matching conditions.
-    const auto & original = observations_.compute_frames[frame].preparations[preparation];
+    const auto & original = selected.observation;
+    for (auto & call : calls) {
+        call.sources.caller_preparations.resize(call.caller_preparations.size());
+        for (Index id = 0; id < call.caller_preparations.size(); ++id) {
+            const auto found = control_sources_.find({ original.region.resource, call.caller_preparations[id].work });
+            if (found != control_sources_.end()) call.sources.caller_preparations[id] = found->second;
+        }
+    }
     for (auto & call : calls) {
         if (call.device_control == planning::DeviceControl::None || call.launches.size() != 1) continue;
         const auto found = control_sources_.find({ original.region.resource, call.launches.front() });
         if (found != control_sources_.end()) call.sources.launches.front().device = found->second;
     }
-    for (Index other_frame = 0; other_frame < preparation_native_calls_.size(); ++other_frame) {
+    for (const auto & site : sequences_) {
         if (std::ranges::all_of(calls, sources_complete)) break;
-        for (Index id = 0; id < preparation_native_calls_[other_frame].size(); ++id) {
-            const auto & candidate = preparation_native_calls_[other_frame][id];
-            const auto & owner = observations_.compute_frames[other_frame].preparations[id];
-            if (candidate.issue || owner.region.resource != original.region.resource || owner.role != original.role) continue;
+        const auto & candidate = site.native;
+        const auto & owner = site.observation;
+        if (candidate.issue || owner.region.resource != original.region.resource || owner.role != original.role) continue;
 
-            // A fragment can remain unchanged when another step in the same
-            // ordered caller recipe changes its work.
-            if (std::ranges::equal(candidate.definitions, calls, same_caller_step)) {
-                for (Index call = 0; call < calls.size(); ++call) {
-                    if (calls[call].caller_work != candidate.definitions[call].caller_work) continue;
-                    auto & sources = calls[call].sources;
-                    if (!sources.caller_before) sources.caller_before = candidate.definitions[call].sources.caller_before;
-                    if (!sources.caller_after) sources.caller_after = candidate.definitions[call].sources.caller_after;
-                }
+        // A fragment can remain unchanged when another step in the same
+        // ordered caller recipe changes its work.
+        if (std::ranges::equal(candidate.definitions, calls, same_caller_step)) {
+            for (Index call = 0; call < calls.size(); ++call) {
+                if (calls[call].caller_work != candidate.definitions[call].caller_work) continue;
+                auto & sources = calls[call].sources;
+                if (!sources.caller_before) sources.caller_before = candidate.definitions[call].sources.caller_before;
+                if (!sources.caller_after) sources.caller_after = candidate.definitions[call].sources.caller_after;
             }
-            for (auto & call : calls) {
-                for (const auto & source : candidate.definitions) {
-                    if (!same_worker_work(source, call)) continue;
-                    if (!call.sources.dispatch) call.sources.dispatch = source.sources.dispatch;
-                    if (!call.sources.worker_before) call.sources.worker_before = source.sources.worker_before;
-                    for (Index launch = 0; launch < call.launches.size(); ++launch) {
-                        if (!call.sources.launches[launch].worker_before)
-                            call.sources.launches[launch].worker_before = source.sources.launches[launch].worker_before;
-                        if (!call.sources.launches[launch].device && call.launches[launch] == source.launches[launch])
-                            call.sources.launches[launch].device = source.sources.launches[launch].device;
-                    }
-                    if (!call.sources.worker_after) call.sources.worker_after = source.sources.worker_after;
+        }
+        for (auto & call : calls) {
+            for (const auto & source : candidate.definitions) {
+                if (!same_worker_work(source, call)) continue;
+                if (!call.sources.dispatch) call.sources.dispatch = source.sources.dispatch;
+                if (!call.sources.worker_before) call.sources.worker_before = source.sources.worker_before;
+                for (Index launch = 0; launch < call.launches.size(); ++launch) {
+                    if (!call.sources.launches[launch].worker_before)
+                        call.sources.launches[launch].worker_before = source.sources.launches[launch].worker_before;
+                    if (!call.sources.launches[launch].device && call.launches[launch] == source.launches[launch])
+                        call.sources.launches[launch].device = source.sources.launches[launch].device;
                 }
+                if (!call.sources.worker_after) call.sources.worker_after = source.sources.worker_after;
             }
         }
     }
 }
 
-Index SourceContext::retain_native_work(planning::Work work, const char * scope, ObservedRegion region, bool stream_wait_generated, NativeTiming timing,
+Index SourceContext::retain_native_work(planning::Work work, const char * scope, ObservedRegion region, HostWait generated_wait, NativeTiming timing,
                                         Time excluded_queue_wait_ns, std::vector<ObservedRegion> excluded) {
     work.kind.timing_scope = scope;
     const auto id = native_work_.size();
-    native_work_.push_back({ std::move(work), region, stream_wait_generated, timing, excluded_queue_wait_ns, std::move(excluded) });
+    native_work_.push_back({ std::move(work), region, generated_wait, timing, excluded_queue_wait_ns, std::move(excluded) });
     return id;
 }
 
@@ -163,17 +170,16 @@ void SourceContext::index_native_work() {
     // shortcut: source specialization caches stay live; record invalidation before supporting cache resets.
     std::map<std::pair<Index, planning::Work>, Time> first_prepared;
     std::set<std::string> caller_preparation_names;
-    for (const auto & frame : preparation_native_calls_) {
-        for (const auto & binding : frame) {
-            for (Index id = 0; id < binding.definitions.size(); ++id) {
-                for (const auto & preparation : binding.definitions[id].caller_preparations) caller_preparation_names.insert(preparation.observation_name);
-                const auto & preparation = binding.definitions[id].preparation;
-                if (!preparation) continue;
-                const auto & call = queues[binding.calls[id]];
-                const auto key = std::pair(call.submission.resource, preparation->specialization);
-                const auto [at, inserted] = first_prepared.try_emplace(key, call.submission.begin_ns);
-                if (!inserted) at->second = std::min(at->second, call.submission.begin_ns);
-            }
+    for (const auto & site : sequences_) {
+        const auto & binding = site.native;
+        for (Index id = 0; id < binding.definitions.size(); ++id) {
+            for (const auto & preparation : binding.definitions[id].caller_preparations) caller_preparation_names.insert(preparation.observation_name);
+            const auto & preparation = binding.definitions[id].preparation;
+            if (!preparation) continue;
+            const auto & call = queues[binding.calls[id]];
+            const auto key = std::pair(call.submission.resource, preparation->specialization);
+            const auto [at, inserted] = first_prepared.try_emplace(key, call.submission.begin_ns);
+            if (!inserted) at->second = std::min(at->second, call.submission.begin_ns);
         }
     }
     std::vector<std::vector<Index>> caller_queues(observed.resources.size()), worker_queues(observed.resources.size()),
@@ -238,195 +244,227 @@ void SourceContext::index_native_work() {
         if (!inserted) at->second.reset();
     }
 
-    for (Index frame = 0; frame < preparation_native_calls_.size(); ++frame) {
-        for (Index preparation = 0; preparation < preparation_native_calls_[frame].size(); ++preparation) {
-            auto & binding = preparation_native_calls_[frame][preparation];
-            if (binding.issue) continue;
-            const auto & region = observed.compute_frames[frame].preparations[preparation].region;
-            auto cursor = region.begin_ns;
-            bool caller_partition = true;
-            for (const auto id : binding.calls) {
-                const auto & parent = parents[id];
-                if (!parent.exact || parent.region->begin_ns < cursor || parent.region->end_ns > region.end_ns) {
-                    caller_partition = false;
-                    break;
+    for (auto & site : sequences_) {
+        auto & binding = site.native;
+        if (binding.issue) continue;
+        const auto & region = site.observation.region;
+        if (binding.definitions.size() == 1 && binding.definitions.front().kind == planning::CallKind::Cpu) {
+            auto & definition = binding.definitions.front();
+            const auto * result = frame_result(site.frame);
+            const bool consumes_result = site.result_processing && result && result->processed && region.begin_ns == result->processed->region.begin_ns;
+            definition.sources.caller_before =
+                retain_native_work(definition.work, "cpu_service", region, consumes_result ? HostWait::ResultEvent : HostWait::None);
+            if (consumes_result) {
+                std::optional<Time> producer;
+                for (const auto id : frame_sequences_[site.frame]) {
+                    const auto & candidate = sequences_[id].native;
+                    if (candidate.issue || candidate.result_ready != planning::NativeProducer::Device || candidate.definitions.empty()) continue;
+                    const auto & tail = candidate.definitions.back().sources.launches;
+                    if (!tail.empty() && tail.back().device) producer = native_work_[*tail.back().device].region.end_ns;
                 }
-                cursor = parent.region->end_ns;
+                for (const auto & preparation : definition.caller_preparations) {
+                    if (!producer) continue;
+                    const auto & lane = caller_preparation_spans[region.resource];
+                    for (auto at = std::ranges::lower_bound(lane, region.begin_ns, {}, preparation_begin);
+                         at != lane.end() && preparation_begin(*at) < region.end_ns;
+                         ++at) {
+                        const auto & span = observed.spans[*at];
+                        if (span.resource != region.resource || span.begin_ns < region.begin_ns || region.end_ns < span.end_ns
+                            || observed.names[span.name] != preparation.observation_name || span.role != SpanRole::EventWait || *producer > span.begin_ns)
+                            continue;
+                        const auto id = retain_native_work(preparation.work,
+                                                           preparation.work.kind.timing_scope.c_str(),
+                                                           { span.resource, span.begin_ns, span.end_ns, span.record },
+                                                           HostWait::None,
+                                                           NativeTiming::DeviceControl);
+                        control_sources_.try_emplace(std::pair(region.resource, preparation.work), id);
+                    }
+                }
             }
-            cursor = region.begin_ns;
-            for (Index id = 0; id < binding.calls.size(); ++id) {
-                auto & definition = binding.definitions[id];
-                auto & sources = definition.sources;
-                sources.launches.resize(definition.launches.size());
-                const auto & call = queues[binding.calls[id]];
-                if (previous_worker_end[binding.calls[id]]) {
-                    const auto ready = std::max(call.submission.begin_ns, *previous_worker_end[binding.calls[id]]);
-                    sources.dispatch = retain_native_work(definition.worker_work(definition.work),
-                                                          "dispatch_interval",
-                                                          { call.execution.resource, ready, call.execution.begin_ns, call.execution.record },
-                                                          false,
-                                                          NativeTiming::ReadyDispatch,
-                                                          ready - call.submission.begin_ns);
-                }
-                if (caller_partition) {
-                    const auto & parent = *parents[binding.calls[id]].region;
-                    auto work = definition.caller_work ? *definition.caller_work : definition.work;
+            continue;
+        }
+        auto cursor = region.begin_ns;
+        bool caller_partition = true;
+        for (const auto id : binding.calls) {
+            const auto & parent = parents[id];
+            if (!parent.exact || parent.region->begin_ns < cursor || parent.region->end_ns > region.end_ns) {
+                caller_partition = false;
+                break;
+            }
+            cursor = parent.region->end_ns;
+        }
+        cursor = region.begin_ns;
+        for (Index id = 0; id < binding.calls.size(); ++id) {
+            auto & definition = binding.definitions[id];
+            auto & sources = definition.sources;
+            sources.launches.resize(definition.launches.size());
+            const auto & call = queues[binding.calls[id]];
+            if (previous_worker_end[binding.calls[id]]) {
+                const auto ready = std::max(call.submission.begin_ns, *previous_worker_end[binding.calls[id]]);
+                sources.dispatch = retain_native_work(definition.worker_work(definition.work),
+                                                      "dispatch_interval",
+                                                      { call.execution.resource, ready, call.execution.begin_ns, call.execution.record },
+                                                      HostWait::None,
+                                                      NativeTiming::ReadyDispatch,
+                                                      ready - call.submission.begin_ns);
+            }
+            if (caller_partition) {
+                const auto & parent = *parents[binding.calls[id]].region;
+                auto work = definition.caller_work ? *definition.caller_work : definition.work;
 
-                    // A prior submission proves the declared specialization is
-                    // prepared. The first opaque compile/load prelude stays out.
-                    const auto prepared = !definition.preparation || first_prepared.at({ region.resource, definition.preparation->specialization }) < cursor;
-                    std::vector<ObservedRegion> excluded;
-                    bool preparation_complete = true;
-                    if (!definition.caller_preparations.empty()) {
-                        const auto & lane = caller_preparation_spans[region.resource];
-                        for (auto at = std::ranges::lower_bound(lane, cursor, {}, preparation_begin);
-                             at != lane.end() && preparation_begin(*at) < call.submission.begin_ns;
-                             ++at) {
-                            const auto & span = observed.spans[*at];
-                            if (span.record.file != parent.record.file) continue;
-                            if (excluded.size() == definition.caller_preparations.size() || span.end_ns > call.submission.begin_ns
-                                || (!excluded.empty() && span.begin_ns < excluded.back().end_ns)
-                                || observed.names[span.name] != definition.caller_preparations[excluded.size()].observation_name) {
-                                preparation_complete = false;
-                                break;
-                            }
-                            excluded.push_back({ span.resource, span.begin_ns, span.end_ns, span.record });
+                // A prior submission proves the declared specialization is
+                // prepared. The first opaque compile/load prelude stays out.
+                const auto prepared = !definition.preparation || first_prepared.at({ region.resource, definition.preparation->specialization }) < cursor;
+                std::vector<ObservedRegion> excluded;
+                bool preparation_complete = true;
+                if (!definition.caller_preparations.empty()) {
+                    const auto & lane = caller_preparation_spans[region.resource];
+                    for (auto at = std::ranges::lower_bound(lane, cursor, {}, preparation_begin);
+                         at != lane.end() && preparation_begin(*at) < call.submission.begin_ns;
+                         ++at) {
+                        const auto & span = observed.spans[*at];
+                        if (span.record.file != parent.record.file) continue;
+                        if (excluded.size() == definition.caller_preparations.size() || span.end_ns > call.submission.begin_ns
+                            || (!excluded.empty() && span.begin_ns < excluded.back().end_ns)
+                            || observed.names[span.name] != definition.caller_preparations[excluded.size()].observation_name) {
+                            preparation_complete = false;
+                            break;
                         }
-                        preparation_complete = preparation_complete && excluded.size() == definition.caller_preparations.size();
+                        excluded.push_back({ span.resource, span.begin_ns, span.end_ns, span.record });
                     }
-                    if (prepared && preparation_complete)
-                        sources.caller_before = retain_native_work(work,
-                                                                   "cpu_service",
-                                                                   { region.resource, cursor, call.submission.begin_ns, parent.record },
-                                                                   false,
-                                                                   NativeTiming::Cpu,
-                                                                   0,
-                                                                   std::move(excluded));
-                    work.kind.operation += ".return";
-                    const auto end = id + 1 == binding.calls.size() ? region.end_ns : parent.end_ns;
-                    sources.caller_after = retain_native_work(std::move(work),
-                                                              "cpu_service",
-                                                              { region.resource, call.submission.begin_ns, end, parent.record },
-                                                              definition.kind == planning::CallKind::HostUpload && definition.synchronization.has_value());
-                    cursor = parent.end_ns;
+                    preparation_complete = preparation_complete && excluded.size() == definition.caller_preparations.size();
                 }
+                if (prepared && preparation_complete)
+                    sources.caller_before = retain_native_work(work,
+                                                               "cpu_service",
+                                                               { region.resource, cursor, call.submission.begin_ns, parent.record },
+                                                               HostWait::None,
+                                                               NativeTiming::Cpu,
+                                                               0,
+                                                               std::move(excluded));
+                work.kind.operation += ".return";
+                const auto end = id + 1 == binding.calls.size() ? region.end_ns : parent.end_ns;
+                sources.caller_after = retain_native_work(
+                    std::move(work),
+                    "cpu_service",
+                    { region.resource, call.submission.begin_ns, end, parent.record },
+                    definition.kind == planning::CallKind::HostUpload && definition.synchronization.has_value() ? HostWait::Stream : HostWait::None);
+                cursor = parent.end_ns;
+            }
 
-                const auto & execution = call.execution;
-                if (definition.device_control != planning::DeviceControl::None && definition.launches.size() == 1) {
-                    const auto & lane = controls[execution.resource];
-                    const ObservedDeviceControl * command = nullptr;
-                    bool ambiguous = false;
-                    for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, control_begin);
-                         at != lane.end() && control_begin(*at) < execution.end_ns;
-                         ++at) {
-                        const auto & control = observed.device_controls[*at];
-                        if (control.kind != definition.device_control || control.submitted.end_ns > execution.end_ns
-                            || control.submitted.record.file != execution.record.file)
-                            continue;
-                        if (command) ambiguous = true;
-                        command = &control;
-                    }
-                    const bool ready = command
-                                       && (command->kind == planning::DeviceControl::Record
-                                           || (command->producer_completed_ns && *command->producer_completed_ns <= command->command.begin_ns));
-                    if (ready && !ambiguous) {
-                        sources.launches.front().device =
-                            retain_native_work(definition.launches.front(), "device_service", command->command, false, NativeTiming::DeviceControl);
-                        control_sources_.try_emplace({ region.resource, definition.launches.front() }, *sources.launches.front().device);
-                    }
+            const auto & execution = call.execution;
+            if (definition.device_control != planning::DeviceControl::None && definition.launches.size() == 1) {
+                const auto & lane = controls[execution.resource];
+                const ObservedDeviceControl * command = nullptr;
+                bool ambiguous = false;
+                for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, control_begin); at != lane.end() && control_begin(*at) < execution.end_ns;
+                     ++at) {
+                    const auto & control = observed.device_controls[*at];
+                    if (control.kind != definition.device_control || control.submitted.end_ns > execution.end_ns
+                        || control.submitted.record.file != execution.record.file)
+                        continue;
+                    if (command) ambiguous = true;
+                    command = &control;
                 }
-                if (definition.kind == planning::CallKind::HostUpload) {
-                    const auto & lane = runtime_calls[execution.resource];
-                    std::optional<ObservedRegion> copy;
-                    bool ambiguous = false;
-                    for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, runtime_begin);
-                         at != lane.end() && runtime_begin(*at) < execution.end_ns;
-                         ++at) {
-                        const auto & runtime = observed.native_runtime_calls[*at];
-                        if (runtime.region.record.file != execution.record.file || runtime.region.end_ns > execution.end_ns
-                            || runtime.region.begin_ns == runtime.region.end_ns
-                            || observed.names[runtime.implementation] != definition.host_transfer->kind.implementation)
-                            continue;
-                        if (copy) ambiguous = true;
-                        copy = runtime.region;
+                const bool ready = command
+                                   && (command->kind == planning::DeviceControl::Record
+                                       || (command->producer_completed_ns && *command->producer_completed_ns <= command->command.begin_ns));
+                if (ready && !ambiguous) {
+                    sources.launches.front().device =
+                        retain_native_work(definition.launches.front(), "device_service", command->command, HostWait::None, NativeTiming::DeviceControl);
+                    control_sources_.try_emplace({ region.resource, definition.launches.front() }, *sources.launches.front().device);
+                }
+            }
+            if (definition.kind == planning::CallKind::HostUpload) {
+                const auto & lane = runtime_calls[execution.resource];
+                std::optional<ObservedRegion> copy;
+                bool ambiguous = false;
+                for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, runtime_begin); at != lane.end() && runtime_begin(*at) < execution.end_ns;
+                     ++at) {
+                    const auto & runtime = observed.native_runtime_calls[*at];
+                    if (runtime.region.record.file != execution.record.file || runtime.region.end_ns > execution.end_ns
+                        || runtime.region.begin_ns == runtime.region.end_ns
+                        || observed.names[runtime.implementation] != definition.host_transfer->kind.implementation)
+                        continue;
+                    if (copy) ambiguous = true;
+                    copy = runtime.region;
+                }
+                if (!copy || ambiguous) continue;
+                sources.worker_before = retain_native_work(definition.worker_work(definition.work),
+                                                           "worker_launch_service",
+                                                           { execution.resource, execution.begin_ns, copy->begin_ns, execution.record });
+                sources.worker_after = retain_native_work(definition.worker_work(definition.work),
+                                                          "worker_return_service",
+                                                          { execution.resource, copy->end_ns, execution.end_ns, execution.record });
+            }
+            else if (definition.launches.empty())
+                sources.worker_after = retain_native_work(definition.worker_work(definition.work), "worker_return_service", execution);
+            else {
+                const auto & lane = submissions[execution.resource];
+                std::map<std::pair<Time, Index>, std::set<Index>> ports;
+                std::set<std::pair<Time, Index>> unresolved;
+                for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, submitted_device);
+                     at != lane.end() && submitted_device(*at) <= execution.end_ns;
+                     ++at) {
+                    const auto & edge = observed.dependencies[*at];
+                    const auto & target = observed.points[edge.after];
+                    const auto key = std::pair(submitted_device(*at), target.resource);
+                    auto & launched = ports[key];
+                    const auto span = device_spans.find({ target.resource, target.time_ns });
+                    if (span == device_spans.end() || !span->second || submitted_device(*at) == execution.end_ns) unresolved.insert(key);
+                    else launched.insert(*span->second);
+                }
+                if (ports.size() != definition.launches.size()) continue;
+
+                // An exported Node@launch port may precede binary lookup.
+                // Unique native APIs in this worker provide ordered entry ports.
+                const auto & runtime_lane = runtime_calls[execution.resource];
+                std::vector<Time> api_ports;
+                bool code_preparation = false;
+                for (auto at = std::ranges::lower_bound(runtime_lane, execution.begin_ns, {}, runtime_begin);
+                     at != runtime_lane.end() && runtime_begin(*at) < execution.end_ns;
+                     ++at) {
+                    const auto & runtime = observed.native_runtime_calls[*at];
+                    if (runtime.region.record.file != execution.record.file || runtime.region.end_ns > execution.end_ns) continue;
+                    if (runtime.device_submission) api_ports.push_back(runtime.region.begin_ns);
+                    code_preparation = code_preparation || runtime.code_preparation;
+                }
+                const bool first_use = definition.worker_first_use.has_value();
+                if (first_use && api_ports.size() != ports.size()) continue;
+
+                // A loading callback is not ordinary worker evidence,
+                // including its unseparated initialization outside the APIs.
+                const bool ordinary_worker = !first_use || !code_preparation;
+                auto cursor = execution.begin_ns;
+                Index launch = 0;
+                for (const auto & [port, spans] : ports) {
+                    const auto & work = definition.launches[launch];
+                    auto & source = sources.launches[launch];
+                    const auto submitted = api_ports.size() == ports.size() ? api_ports[launch] : port.first;
+                    if (ordinary_worker)
+                        source.worker_before = retain_native_work(definition.worker_work(work),
+                                                                  "worker_launch_service",
+                                                                  { execution.resource, cursor, submitted, execution.record });
+
+                    // A parent envelope or unresolved task cannot supply
+                    // a complete exclusive device service.
+                    if (definition.device_control == planning::DeviceControl::None && !unresolved.contains(port) && spans.size() == 1) {
+                        const auto id = *spans.begin();
+                        const auto & span = observed.spans[id];
+                        if (exclusive_service[id] == span.end_ns - span.begin_ns)
+                            source.device = retain_native_work(work,
+                                                               "device_service",
+                                                               { span.resource, span.begin_ns, span.end_ns, span.record },
+                                                               HostWait::None,
+                                                               NativeTiming::DeviceService);
                     }
-                    if (!copy || ambiguous) continue;
-                    sources.worker_before = retain_native_work(definition.worker_work(definition.work),
-                                                               "worker_launch_service",
-                                                               { execution.resource, execution.begin_ns, copy->begin_ns, execution.record });
+                    cursor = submitted;
+                    ++launch;
+                }
+                if (ordinary_worker)
                     sources.worker_after = retain_native_work(definition.worker_work(definition.work),
                                                               "worker_return_service",
-                                                              { execution.resource, copy->end_ns, execution.end_ns, execution.record });
-                }
-                else if (definition.launches.empty())
-                    sources.worker_after = retain_native_work(definition.worker_work(definition.work), "worker_return_service", execution);
-                else {
-                    const auto & lane = submissions[execution.resource];
-                    std::map<std::pair<Time, Index>, std::set<Index>> ports;
-                    std::set<std::pair<Time, Index>> unresolved;
-                    for (auto at = std::ranges::lower_bound(lane, execution.begin_ns, {}, submitted_device);
-                         at != lane.end() && submitted_device(*at) <= execution.end_ns;
-                         ++at) {
-                        const auto & edge = observed.dependencies[*at];
-                        const auto & target = observed.points[edge.after];
-                        const auto key = std::pair(submitted_device(*at), target.resource);
-                        auto & launched = ports[key];
-                        const auto span = device_spans.find({ target.resource, target.time_ns });
-                        if (span == device_spans.end() || !span->second || submitted_device(*at) == execution.end_ns) unresolved.insert(key);
-                        else launched.insert(*span->second);
-                    }
-                    if (ports.size() != definition.launches.size()) continue;
-
-                    // An exported Node@launch port may precede binary lookup.
-                    // Unique native APIs in this worker provide ordered entry ports.
-                    const auto & runtime_lane = runtime_calls[execution.resource];
-                    std::vector<Time> api_ports;
-                    bool code_preparation = false;
-                    for (auto at = std::ranges::lower_bound(runtime_lane, execution.begin_ns, {}, runtime_begin);
-                         at != runtime_lane.end() && runtime_begin(*at) < execution.end_ns;
-                         ++at) {
-                        const auto & runtime = observed.native_runtime_calls[*at];
-                        if (runtime.region.record.file != execution.record.file || runtime.region.end_ns > execution.end_ns) continue;
-                        if (runtime.device_submission) api_ports.push_back(runtime.region.begin_ns);
-                        code_preparation = code_preparation || runtime.code_preparation;
-                    }
-                    const bool first_use = definition.worker_first_use.has_value();
-                    if (first_use && api_ports.size() != ports.size()) continue;
-
-                    // A loading callback is not ordinary worker evidence,
-                    // including its unseparated initialization outside the APIs.
-                    const bool ordinary_worker = !first_use || !code_preparation;
-                    auto cursor = execution.begin_ns;
-                    Index launch = 0;
-                    for (const auto & [port, spans] : ports) {
-                        const auto & work = definition.launches[launch];
-                        auto & source = sources.launches[launch];
-                        const auto submitted = api_ports.size() == ports.size() ? api_ports[launch] : port.first;
-                        if (ordinary_worker)
-                            source.worker_before = retain_native_work(definition.worker_work(work),
-                                                                      "worker_launch_service",
-                                                                      { execution.resource, cursor, submitted, execution.record });
-
-                        // A parent envelope or unresolved task cannot supply
-                        // a complete exclusive device service.
-                        if (definition.device_control == planning::DeviceControl::None && !unresolved.contains(port) && spans.size() == 1) {
-                            const auto id = *spans.begin();
-                            const auto & span = observed.spans[id];
-                            if (exclusive_service[id] == span.end_ns - span.begin_ns)
-                                source.device = retain_native_work(work,
-                                                                   "device_service",
-                                                                   { span.resource, span.begin_ns, span.end_ns, span.record },
-                                                                   false,
-                                                                   NativeTiming::DeviceService);
-                        }
-                        cursor = submitted;
-                        ++launch;
-                    }
-                    if (ordinary_worker)
-                        sources.worker_after = retain_native_work(definition.worker_work(definition.work),
-                                                                  "worker_return_service",
-                                                                  { execution.resource, cursor, execution.end_ns, execution.record });
-                }
+                                                              { execution.resource, cursor, execution.end_ns, execution.record });
             }
         }
     }

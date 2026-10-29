@@ -37,11 +37,14 @@ Json frame_ports_report(const planning::ComputeStats & stats, const simulation::
     auto report = Json::array();
     for (const auto & frame : stats.frames) {
         report.push_back({
-            {              "source_frame",                                                                       frame.source_frame },
-            {                "entered_ns",                    frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
-            {       "caller_submitted_ns",       frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
-            {           "result_ready_ns", frame.result_ready ? Json(execution.completions_ns[*frame.result_ready]) : Json(nullptr) },
-            { "modeled_work_completed_ns",       frame.completed ? Json(execution.completions_ns[*frame.completed]) : Json(nullptr) }
+            {                        "source_frame",                                                                                 frame.source_frame },
+            {                          "entered_ns",                              frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
+            {                 "caller_submitted_ns",                 frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
+            {                     "result_ready_ns",           frame.result_ready ? Json(execution.completions_ns[*frame.result_ready]) : Json(nullptr) },
+            {   "modeled_result_callers_started_ns",              frame.callers_entry ? Json(execution.starts_ns[*frame.callers_entry]) : Json(nullptr) },
+            { "modeled_result_callers_completed_ns", frame.callers_completed ? Json(execution.completions_ns[*frame.callers_completed]) : Json(nullptr) },
+            {                     "modeled_send_ns",                           frame.sent ? Json(execution.completions_ns[*frame.sent]) : Json(nullptr) },
+            {           "modeled_work_completed_ns",                 frame.completed ? Json(execution.completions_ns[*frame.completed]) : Json(nullptr) }
         });
     }
     return report;
@@ -258,8 +261,9 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
          "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
          "An unfinished Prefill publishes its page-aligned prompt after participant results are readable and overlap caller submission is available; "
-         "write policy can start background backup before Decode completes. CPU cache-update latency remains outside this subset. "
-         "Response still follows all selected work; CPU result processing and final-send handoff remain unmodeled. "
+         "write policy can start background backup before Decode completes. Pure result callers wait for their own copy and scheduler submission, "
+         "then gate later caller iterations. The send port precedes modeled caller cleanup. CPU cache/release native control remains outside this subset. "
+         "Response still follows all selected work; the complete final-send handoff remains unmodeled. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
     const auto & compute = program.compute_stats();

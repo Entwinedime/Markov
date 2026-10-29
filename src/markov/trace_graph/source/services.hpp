@@ -31,7 +31,7 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
 
 struct CpuInterval {
     Time service_ns = 0, wait_ns = 0, residual_ns = 0, instrumentation_ns = 0, unobserved_ns = 0;
-    Time stream_wait_ns = 0;
+    Time stream_wait_ns = 0, event_wait_ns = 0;
     CpuCorrection service_correction, residual_correction, excluded_correction;
     void add(const CpuInterval & other);
 };
@@ -52,14 +52,16 @@ struct NativeSequenceBinding {
     std::vector<Index> calls;
     std::optional<std::string> issue = "native_queue_identity_unavailable";
     std::vector<planning::NativeCall> definitions;
+    std::optional<planning::NativeProducer> result_ready;
 };
 
 enum class NativeTiming { Cpu, ReadyDispatch, DeviceControl, DeviceService };
+enum class HostWait { None, Stream, ResultEvent };
 
 struct NativeWorkRegion {
     planning::Work work;
     ObservedRegion region;
-    bool stream_wait_generated = false;
+    HostWait generated_wait = HostWait::None;
     NativeTiming timing = NativeTiming::Cpu;
     Time excluded_queue_wait_ns = 0;
     std::vector<ObservedRegion> excluded = {};

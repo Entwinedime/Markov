@@ -34,6 +34,35 @@ SourceContext::SourceContext(Observations && observations)
         if (result) throw std::runtime_error("Multiple batch results refer to one compute frame");
         result = id;
     }
+    frame_sequences_.resize(observations_.compute_frames.size());
+    for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
+        for (const auto & sequence : observations_.compute_frames[frame].preparations) {
+            frame_sequences_[frame].push_back(sequences_.size());
+            sequences_.push_back({
+                frame,
+                false,
+                sequence,
+                {},
+                { sequence.region.resource, {}, {} },
+                {}
+            });
+        }
+    }
+    result_sequences_.resize(observations_.compute_frames.size());
+    for (const auto & result : observations_.batch_results) {
+        if (!result.processed) continue;
+        for (const auto & sequence : result.processed->callers) {
+            result_sequences_[result.frame].push_back(sequences_.size());
+            sequences_.push_back({
+                result.frame,
+                true,
+                sequence,
+                {},
+                { sequence.region.resource, {}, {} },
+                {}
+            });
+        }
+    }
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
     index_native_sequences();
@@ -51,47 +80,51 @@ void SourceContext::index_native_sequences() {
     const auto submitted = [&](Index id) { return observations_.native_queue_calls[id].submission.begin_ns; };
     for (auto & lane : lanes) std::ranges::sort(lane, {}, submitted);
 
-    for (const auto & frame : observations_.compute_frames) {
-        auto & bindings = preparation_native_calls_.emplace_back(frame.preparations.size());
+    for (auto & site : sequences_) {
+        const auto & frame = observations_.compute_frames[site.frame];
         if (frame.sequence_tokens.size() != 1 || !frame.query_tokens) continue;
         const auto query = std::accumulate(frame.query_tokens->begin(), frame.query_tokens->end(), 0.0);
         const auto context = frame.sequence_tokens.front();
         const planning::FrameInput input{ query, query, context, 1, frame.page_tokens.value_or(0) };
-        for (Index id = 0; id < frame.preparations.size(); ++id) {
-            const auto & preparation = frame.preparations[id];
-            if (!preparation.definition) continue;
-            auto sequence = preparation.definition->describe(frame.phase, input);
-            if (sequence.issue || sequence.calls.empty()
-                || std::ranges::any_of(sequence.calls, [](const planning::NativeCall & call) { return call.queue_name.empty(); }))
-                continue;
+        const auto & preparation = site.observation;
+        if (!preparation.definition) continue;
+        auto sequence = preparation.definition->describe(frame.phase, input);
+        site.native.result_ready = sequence.result_ready;
+        if (!sequence.issue && sequence.calls.size() == 1 && sequence.calls.front().kind == planning::CallKind::Cpu) {
+            site.native.definitions = std::move(sequence.calls);
+            site.native.issue.reset();
+            continue;
+        }
+        if (sequence.issue || sequence.calls.empty()
+            || std::ranges::any_of(sequence.calls, [](const planning::NativeCall & call) { return call.queue_name.empty(); }))
+            continue;
 
-            auto & binding = bindings[id];
-            const auto & region = preparation.region;
-            const auto & lane = lanes[region.resource];
-            auto at = std::ranges::lower_bound(lane, region.begin_ns, {}, submitted);
-            for (; at != lane.end() && submitted(*at) < region.end_ns; ++at) binding.calls.push_back(*at);
-            if (binding.calls.size() != sequence.calls.size()) {
-                binding.issue = "native_queue_call_count_mismatch";
-                continue;
+        auto & binding = site.native;
+        const auto & region = preparation.region;
+        const auto & lane = lanes[region.resource];
+        auto at = std::ranges::lower_bound(lane, region.begin_ns, {}, submitted);
+        for (; at != lane.end() && submitted(*at) < region.end_ns; ++at) binding.calls.push_back(*at);
+        if (binding.calls.size() != sequence.calls.size()) {
+            binding.issue = "native_queue_call_count_mismatch";
+            continue;
+        }
+        binding.issue.reset();
+        for (Index call = 0; call < binding.calls.size(); ++call) {
+            const auto & native = observations_.native_queue_calls[binding.calls[call]];
+            if (observations_.names[native.name] != sequence.calls[call].queue_name || native.submission.end_ns > region.end_ns) {
+                binding.issue = "native_queue_call_identity_mismatch";
+                break;
             }
-            binding.issue.reset();
-            for (Index call = 0; call < binding.calls.size(); ++call) {
-                const auto & native = observations_.native_queue_calls[binding.calls[call]];
-                if (observations_.names[native.name] != sequence.calls[call].queue_name || native.submission.end_ns > region.end_ns) {
-                    binding.issue = "native_queue_call_identity_mismatch";
+            if (call) {
+                const auto & previous = observations_.native_queue_calls[binding.calls[call - 1]];
+                if (previous.submission.end_ns > native.submission.begin_ns || previous.execution.resource != native.execution.resource
+                    || previous.execution.end_ns > native.execution.begin_ns) {
+                    binding.issue = "native_queue_order_unavailable";
                     break;
                 }
-                if (call) {
-                    const auto & previous = observations_.native_queue_calls[binding.calls[call - 1]];
-                    if (previous.submission.end_ns > native.submission.begin_ns || previous.execution.resource != native.execution.resource
-                        || previous.execution.end_ns > native.execution.begin_ns) {
-                        binding.issue = "native_queue_order_unavailable";
-                        break;
-                    }
-                }
             }
-            if (!binding.issue) binding.definitions = std::move(sequence.calls);
         }
+        if (!binding.issue) binding.definitions = std::move(sequence.calls);
     }
 }
 
@@ -111,11 +144,10 @@ void SourceContext::index_frame_calls() {
                 { call.resource, call.begin_ns, call.end_ns, call.record }
             });
         }
-        const auto & preparations = observations_.compute_frames[frame].preparations;
-        for (Index id = 0; id < preparations.size(); ++id)
+        for (const auto id : frame_sequences_[frame])
             entries.push_back({
                 { FrameCallKind::Preparation, id },
-                preparations[id].region
+                sequences_[id].observation.region
             });
         for (const auto id : frame_collectives_[frame]) {
             const auto & call = observations_.collectives[id];
@@ -163,17 +195,14 @@ void SourceContext::index_cpu_intervals() {
     std::vector<ObservedRegion> regions;
     regions.reserve(observations_.work_observations.size());
     for (const auto & work : observations_.work_observations) regions.push_back({ work.resource, work.begin_ns, work.end_ns, work.record });
-    for (const auto & frame : observations_.compute_frames)
-        for (const auto & call : frame.preparations) regions.push_back(call.region);
+    for (const auto & site : sequences_) regions.push_back(site.observation.region);
 
     auto intervals = cpu_intervals(observations_, graph_, regions);
     auto at = observations_.work_observations.size();
     auto resources = call_resources(observations_, regions);
-    for (const auto & frame : observations_.compute_frames) {
-        preparation_intervals_.emplace_back(intervals.begin() + at, intervals.begin() + at + frame.preparations.size());
-        preparation_bindings_.emplace_back(std::make_move_iterator(resources.begin() + at),
-                                           std::make_move_iterator(resources.begin() + at + frame.preparations.size()));
-        at += frame.preparations.size();
+    for (auto & site : sequences_) {
+        site.cpu = intervals[at];
+        site.resources = std::move(resources[at++]);
     }
     compute_resources_.reserve(observations_.work_observations.size());
     for (Index id = 0; id < observations_.work_observations.size(); ++id) compute_resources_.push_back(resources[id].unique_resources());

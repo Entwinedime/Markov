@@ -45,6 +45,8 @@ struct Summary {
             { "service", estimate(observed.service_ns, observed.service_correction) },
             { "residual", estimate(observed.residual_ns, observed.residual_correction) },
             { "wait_ns", observed.wait_ns },
+            { "stream_wait_ns", observed.stream_wait_ns },
+            { "event_wait_ns", observed.event_wait_ns },
             { "instrumentation_ns", observed.instrumentation_ns },
             { "unobserved_ns", observed.unobserved_ns },
             { "excluded_correction", { { "covered_ns", observed.excluded_correction.covered_ns }, { "cost_ns", observed.excluded_correction.cost_ns } } }

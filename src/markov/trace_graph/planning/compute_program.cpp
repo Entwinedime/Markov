@@ -98,25 +98,26 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         }
         const auto id = frames_.size();
         const auto [tail, inserted] = tails.try_emplace(participant, id);
+        std::optional<std::size_t> previous;
         if (inserted) roots_.push_back(id);
         else {
-            frames_[tail->second].next = id;
+            previous = tail->second;
+            frames_[*previous].next = id;
             tail->second = id;
         }
         frames_.push_back({});
         auto & frame = frames_.back();
+        frame.previous = previous;
         const auto * result = source.frame_result(input.frame);
         // shortcut: targets inherit source scheduling; require a target policy before supporting mode changes.
         frame.overlap = result && result->overlap;
         frame.publishes_prefill_prefix = observed.compute_frames[input.frame].phase == Phase::Prefill && result && result->processed
                                          && result->processed->finished_after.size() == 1 && !result->processed->finished_after.front();
-        stats_.frames.push_back({ input.frame, {}, {}, {}, {} });
+        stats_.frames.push_back({ input.frame, {}, {}, {}, {}, {}, {}, {} });
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
             return;
         }
-        const auto & preparations = observed.compute_frames[input.frame].preparations;
-        const auto preparation_bindings = source.preparation_bindings(input.frame);
         std::size_t first = 0;
         Segment pending;
         for (const auto & entry : source.frame_calls(input.frame)) {
@@ -129,8 +130,9 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 continue;
             }
             if (entry.kind == source::FrameCallKind::Preparation) {
-                const auto & preparation = preparations[entry.index];
-                const auto & binding = preparation_bindings[entry.index];
+                const auto & site = source.sequence(entry.index);
+                const auto & preparation = site.observation;
+                const auto & binding = site.resources;
                 if (!preparation.definition || binding.caller != resources->caller || binding.workers.size() != 1
                     || *binding.workers.begin() != resources->worker) {
                     issue_ = "preparation_rule_or_queues_unavailable";
@@ -142,7 +144,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     return;
                 }
                 if (!calls.calls.empty() && std::ranges::all_of(calls.calls, [](const NativeCall & call) { return !call.queue_name.empty(); })) {
-                    if (const auto & issue = source.preparation_native_calls(input.frame, entry.index).issue) {
+                    if (const auto & issue = site.native.issue) {
                         issue_ = issue;
                         return;
                     }
@@ -161,7 +163,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     issue_ = "preparation_device_binding_unavailable";
                     return;
                 }
-                source.bind_native_sources(input.frame, entry.index, calls.calls);
+                source.bind_native_sources(entry.index, calls.calls);
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.
@@ -199,6 +201,28 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             pending = Segment{};
         }
         frame.segments.push_back(std::move(pending));
+        frame.callers_modeled = frame.segments.back().plan.publishes_result() && !source.result_sequences(input.frame).empty();
+        if (frame.callers_modeled) {
+            for (const auto sequence : source.result_sequences(input.frame)) {
+                const auto & site = source.sequence(sequence);
+                const auto & call = site.observation;
+                if (!call.definition || site.resources.caller != resources->caller || !site.resources.workers.empty() || !site.resources.devices.empty()) {
+                    issue_ = "result_caller_recipe_or_resource_unavailable";
+                    return;
+                }
+                auto calls = call.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
+                if (calls.issue || std::ranges::any_of(calls.calls, [](const NativeCall & value) { return value.kind != CallKind::Cpu; })) {
+                    issue_ = "result_caller_requires_native_control_rule";
+                    return;
+                }
+                source.bind_native_sources(sequence, calls.calls);
+                const auto before = frame.result_callers.operations();
+                frame.result_callers.extend(calls, *resources, preparations_);
+                auto & stats = frame.caller_stats.preparations[call.role];
+                ++stats.sequences;
+                stats.operations += frame.result_callers.operations() - before;
+            }
+        }
     }
     for (const auto & collective : collectives_) {
         if (std::ranges::any_of(collective.peers, [](const auto & peer) { return !peer; })) {
@@ -235,14 +259,8 @@ void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simu
     const auto & range = frame.segments[frame.at];
     if (!range.collective) {
         stats_.frames[id].completed = event.identity;
-        if (!frame.overlap && frame.next) segment(runtime, *frame.next, event.identity);
-        completed_.push_back(event.identity);
-        if (completed_.size() == frames_.size()) {
-            const auto end = runtime.next_node();
-            PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
-            for (const auto node : completed_) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
-            runtime.submit(std::move(mutation));
-        }
+        if (!frame.overlap) start_next(runtime, id);
+        finish_frame(runtime, id);
         return;
     }
 
@@ -272,19 +290,72 @@ void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simu
     }
 }
 
+void ComputeProgram::start_next(ProgramRuntime & runtime, std::size_t id) {
+    auto & frame = frames_[id];
+    if (!frame.next || frame.next_started) return;
+    const auto & ports = stats_.frames[id];
+    if (frame.overlap) {
+        if (!ports.submitted) return;
+        if (frame.previous && frames_[*frame.previous].callers_modeled && !stats_.frames[*frame.previous].callers_completed) return;
+    }
+    else if (!ports.completed || (frame.callers_modeled && !ports.callers_completed)) return;
+    frame.next_started = true;
+    segment(runtime, *frame.next, frame.overlap ? ports.submitted : ports.callers_completed ? ports.callers_completed : ports.completed);
+}
+
+void ComputeProgram::process_result(ProgramRuntime & runtime, std::size_t id) {
+    auto & frame = frames_[id];
+    const auto & ports = stats_.frames[id];
+    if (!frame.callers_modeled || frame.callers_started || !ports.result_ready || !ports.submitted) return;
+    if (frame.previous && frames_[*frame.previous].callers_modeled && !stats_.frames[*frame.previous].callers_completed) return;
+    if (frame.overlap && frame.next && !stats_.frames[*frame.next].submitted) return;
+
+    const auto begin = runtime.next_node();
+    NativeEvents events{ action(ActionKind::CallersDone, id) };
+    if (frame.result_callers.publishes_result()) events.produced = action(ActionKind::Sent, id);
+    auto mutation = frame.result_callers.mutation(owner, begin, events, ports.result_ready, frontier_);
+    mutation.dependencies.push_back({ *ports.submitted, begin, graph::EdgeKind::ResourceOrder });
+    if (frame.overlap && frame.next) mutation.dependencies.push_back({ *stats_.frames[*frame.next].submitted, begin, graph::EdgeKind::ResourceOrder });
+    if (frame.previous && stats_.frames[*frame.previous].callers_completed)
+        mutation.dependencies.push_back({ *stats_.frames[*frame.previous].callers_completed, begin, graph::EdgeKind::ResourceOrder });
+    if (!runtime.submit(std::move(mutation))) return;
+    frame.callers_started = true;
+    stats_.frames[id].callers_entry = begin;
+    for (const auto & [resource, node] : frame.result_callers.frontier(begin)) frontier_[resource] = node;
+    stats_.add(frame.caller_stats);
+    stats_.native_operations += frame.result_callers.operations();
+}
+
+void ComputeProgram::finish_frame(ProgramRuntime & runtime, std::size_t id) {
+    auto & frame = frames_[id];
+    const auto & ports = stats_.frames[id];
+    if (frame.finished || !ports.completed || (frame.callers_modeled && !ports.callers_completed)) return;
+    frame.finished = true;
+    completed_.push_back(*ports.completed);
+    if (ports.callers_completed) completed_.push_back(*ports.callers_completed);
+    if (++finished_frames_ != frames_.size()) return;
+
+    const auto end = runtime.next_node();
+    PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
+    for (const auto node : completed_) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
+    runtime.submit(std::move(mutation));
+}
+
 void ComputeProgram::join_prefill_results(ProgramRuntime & runtime) {
     if (prefill_join_submitted_) return;
 
     for (const auto root : roots_) {
         const auto & frame = frames_[root];
         if (!frame.publishes_prefill_prefix || !stats_.frames[root].result_ready) return;
+        if (frame.callers_modeled && !stats_.frames[root].callers_completed) return;
         if (frame.overlap && frame.next && !stats_.frames[*frame.next].submitted) return;
     }
     const auto begin = runtime.next_node();
     PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::PrefillReady, 0) } }, {} };
     for (const auto root : roots_) {
         const auto & frame = frames_[root];
-        mutation.dependencies.push_back({ *stats_.frames[root].result_ready, begin, graph::EdgeKind::DataDependency });
+        mutation.dependencies.push_back(
+            { stats_.frames[root].callers_completed.value_or(*stats_.frames[root].result_ready), begin, graph::EdgeKind::DataDependency });
         if (frame.overlap && frame.next) mutation.dependencies.push_back({ *stats_.frames[*frame.next].submitted, begin, graph::EdgeKind::ResourceOrder });
     }
     prefill_join_submitted_ = runtime.submit(std::move(mutation)).has_value();
@@ -301,13 +372,28 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
     else if (event.action.kind == std::to_underlying(ActionKind::FrameSubmitted)) {
         const auto id = event.action.subject;
         stats_.frames[id].submitted = event.identity;
-        if (frames_[id].overlap && frames_[id].next) segment(runtime, *frames_[id].next, event.identity);
+        if (frames_[id].overlap) start_next(runtime, id);
+        if (frames_[id].previous) process_result(runtime, *frames_[id].previous);
+        process_result(runtime, id);
         join_prefill_results(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ResultReady)) {
         stats_.frames[event.action.subject].result_ready = event.identity;
+        process_result(runtime, event.action.subject);
         join_prefill_results(runtime);
     }
+    else if (event.action.kind == std::to_underlying(ActionKind::CallersDone)) {
+        const auto id = event.action.subject;
+        stats_.frames[id].callers_completed = event.identity;
+        if (frames_[id].overlap && frames_[id].next) {
+            start_next(runtime, *frames_[id].next);
+            process_result(runtime, *frames_[id].next);
+        }
+        else start_next(runtime, id);
+        finish_frame(runtime, id);
+        join_prefill_results(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::Sent)) stats_.frames[event.action.subject].sent = event.identity;
     else if (event.action.kind == std::to_underlying(ActionKind::PrefillReady)) prefill_result_ready_ = event.identity;
     else if (event.action.kind == std::to_underlying(ActionKind::Complete)) complete_ = true;
 }

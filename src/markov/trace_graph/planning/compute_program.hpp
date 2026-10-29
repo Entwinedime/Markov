@@ -26,7 +26,7 @@ struct ComputeStats {
     };
     struct FramePorts {
         source::Index source_frame;
-        std::optional<graph::NodeId> entry, submitted, result_ready, completed;
+        std::optional<graph::NodeId> entry, submitted, result_ready, completed, callers_entry, callers_completed, sent;
     };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
@@ -56,7 +56,7 @@ public:
     std::optional<graph::NodeId> prefill_result_ready() const { return prefill_result_ready_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, ResultReady, PrefillReady, Complete };
+    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, ResultReady, CallersDone, Sent, PrefillReady, Complete };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {
@@ -67,10 +67,13 @@ private:
     };
     struct Frame {
         std::vector<Segment> segments;
+        NativePlan result_callers;
+        ComputeStats caller_stats;
         std::size_t at = 0;
-        std::optional<std::size_t> next;
+        std::optional<std::size_t> previous, next;
         bool overlap = false;
         bool publishes_prefill_prefix = false;
+        bool callers_modeled = false, callers_started = false, next_started = false, finished = false;
     };
     struct Arrival {
         graph::Time time_ns;
@@ -87,6 +90,9 @@ private:
     bool append_compute(const FrameCompute & frame, source::Index source_call, std::size_t & at, CallResources resources, Segment & segment);
     void arrive(ProgramRuntime & runtime, std::size_t frame, const simulation::Event & event);
     void join_prefill_results(ProgramRuntime & runtime);
+    void start_next(ProgramRuntime & runtime, std::size_t frame);
+    void process_result(ProgramRuntime & runtime, std::size_t frame);
+    void finish_frame(ProgramRuntime & runtime, std::size_t frame);
 
     const source::SourceContext & source_;
     PreparationCache & preparations_;
@@ -95,6 +101,7 @@ private:
     std::vector<Collective> collectives_;
     std::vector<std::size_t> roots_;
     std::vector<graph::NodeId> completed_;
+    std::size_t finished_frames_ = 0;
     NativeFrontier frontier_;
     std::optional<std::string> issue_;
     ComputeStats stats_;

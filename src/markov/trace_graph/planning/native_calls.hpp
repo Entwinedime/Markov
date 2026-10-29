@@ -32,6 +32,7 @@ struct NativeSources {
     std::optional<std::size_t> caller_before, caller_after, worker_before, worker_after;
     std::optional<std::size_t> dispatch;
     std::vector<NativeLaunchSources> launches;
+    std::vector<std::optional<std::size_t>> caller_preparations;
 };
 
 struct CallerPreparation {

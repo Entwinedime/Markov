@@ -315,6 +315,11 @@ void ProbeReader::finish() {
     }
     pending_inputs_.clear();
     schedule_inputs_.clear();
+    for (auto & result : output_.batch_results) {
+        if (!result.processed) continue;
+        result.processed->callers = read_result_callers(output_, result);
+        ++output_.counts[result.processed->callers.empty() ? "result_callers_unavailable" : "result_callers_supported"];
+    }
 }
 
 void ProbeReader::observe_result(const ProbeEvent & event) {

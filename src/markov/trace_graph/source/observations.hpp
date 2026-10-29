@@ -34,7 +34,7 @@ struct RecordRef {
     Index position;
 };
 
-enum class SpanRole { Service, Wait, ProfilerOverhead, StreamWait };
+enum class SpanRole { Service, Wait, ProfilerOverhead, StreamWait, EventWait };
 
 struct ObservedSpan {
     Time begin_ns;
@@ -175,6 +175,7 @@ struct ProcessedResult {
     std::vector<Index> output_tokens_before, output_tokens_after;
     std::vector<bool> finished_before, finished_after;
     std::vector<Index> controls = {};
+    std::vector<ObservedCallSequence> callers = {};
 };
 
 struct HostControl {

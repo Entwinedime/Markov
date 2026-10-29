@@ -16,6 +16,7 @@ void CpuInterval::add(const CpuInterval & other) {
     instrumentation_ns += other.instrumentation_ns;
     unobserved_ns += other.unobserved_ns;
     stream_wait_ns += other.stream_wait_ns;
+    event_wait_ns += other.event_wait_ns;
     service_correction.add(other.service_correction);
     residual_correction.add(other.residual_correction);
     excluded_correction.add(other.excluded_correction);
@@ -92,6 +93,7 @@ std::vector<CpuInterval> cpu_intervals(const Observations & observations, const 
             case graph::NodeKind::ObservedWait:
                 measured.wait_ns += duration;
                 if (observations.spans[at->span].role == SpanRole::StreamWait) measured.stream_wait_ns += duration;
+                if (observations.spans[at->span].role == SpanRole::EventWait) measured.event_wait_ns += duration;
                 measured.excluded_correction.add(correction);
                 break;
             case graph::NodeKind::ResidualGap:

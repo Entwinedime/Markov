@@ -68,8 +68,11 @@ bool NativePlan::extend(const NativeSequence & sequence, CallResources resources
     for (const auto & call : sequence.calls) {
 
         // shortcut: caller prerequisites share one submission port; split the prelude if intermediate results gain external consumers.
-        for (const auto & preparation : call.caller_preparations)
-            append(preparation.work, preparation.work.kind.timing_scope.c_str(), resources.caller, caller_);
+        for (std::size_t id = 0; id < call.caller_preparations.size(); ++id) {
+            const auto & preparation = call.caller_preparations[id];
+            const auto node = append(preparation.work, preparation.work.kind.timing_scope.c_str(), resources.caller, caller_);
+            if (!call.sources.caller_preparations.empty()) steps_[node].source_native_work = call.sources.caller_preparations[id];
+        }
         if (call.preparation) {
             if (!preparations.initial()) return false;
             const auto & preparation = *call.preparation;

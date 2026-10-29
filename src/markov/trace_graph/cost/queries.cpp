@@ -71,7 +71,9 @@ const Response & Queries::query_source_work(const planning::Work & work, std::si
     if (expected != work || original.region.resource != resource) return query(work);
 
     const auto & observed = native_cpu_intervals_[native_cpu_indices_[interval]];
-    const auto generated_wait = original.stream_wait_generated ? observed.stream_wait_ns : 0;
+    const auto generated_wait = original.generated_wait == source::HostWait::Stream        ? observed.stream_wait_ns
+                                : original.generated_wait == source::HostWait::ResultEvent ? observed.event_wait_ns
+                                                                                           : 0;
     if (observed.unobserved_ns || observed.wait_ns != generated_wait) return query(work);
 
     ++requests_;
