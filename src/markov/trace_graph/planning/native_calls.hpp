@@ -16,8 +16,8 @@
 
 namespace markov::trace_graph::planning {
 
-// Scalar readback retains pre/post-sync costs; HostResponse is a closed synchronous host operation.
-enum class CallKind { Cpu, Queued, Readback, HostResponse, HostUpload };
+// HostCall pays one complete API response; scalar readback retains its pre/post-sync costs.
+enum class CallKind { Cpu, HostCall, Queued, Readback, HostResponse, HostUpload };
 enum class DeviceControl { None, Record, Wait };
 enum class NativeProducer { Caller, Device };
 enum class ResultControl {

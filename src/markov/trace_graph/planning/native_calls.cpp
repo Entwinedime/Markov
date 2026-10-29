@@ -99,6 +99,11 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
 bool NativePlan::extend(const NativeSequence & sequence, CallResources resources, PreparationCache & preparations) {
     const auto incoming = producer_device();
     for (const auto & call : sequence.calls) {
+        // Closed host API responses already include their own return; do not split or charge them again.
+        if (call.kind == CallKind::HostCall) {
+            append(call.work, call.work.kind.timing_scope.c_str(), resources.caller, caller_);
+            continue;
+        }
 
         // shortcut: caller prerequisites share one submission port; split the prelude if intermediate results gain external consumers.
         for (std::size_t id = 0; id < call.caller_preparations.size(); ++id) {

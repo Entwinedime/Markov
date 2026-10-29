@@ -15,10 +15,10 @@ public:
         for (const auto & copy : work) {
             const bool host = copy.features.at("host") != 0;
             Work clone{
-                {                                           "cache.index_clone", host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64", host ? "cpu_service" : "device_service" },
-                { { "elements", copy.features.at("pages") * input.page_tokens },                                 { "element_bytes", 8 },                    { "tensor_rank", 1 } }
+                {                                           "cache.index_clone", host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64", host ? "caller_blocking_interval" : "device_service" },
+                { { "elements", copy.features.at("pages") * input.page_tokens },                                 { "element_bytes", 8 },                                 { "tensor_rank", 1 } }
             };
-            NativeCall call{ clone, host ? CallKind::Cpu : CallKind::Queued, host ? std::vector<Work>{} : std::vector<Work>{ clone } };
+            NativeCall call{ clone, host ? CallKind::HostCall : CallKind::Queued, host ? std::vector<Work>{} : std::vector<Work>{ clone } };
             if (!host) {
                 call.queue_name = "aclnnInplaceCopy";
                 call.worker_features = {
