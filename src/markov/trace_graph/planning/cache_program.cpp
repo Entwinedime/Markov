@@ -133,6 +133,24 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
     return false;
 }
 
+void CacheProgram::finish_compute(ProgramRuntime & runtime, std::size_t request) {
+    auto & running = running_[request];
+    if (!running.compute || !running.compute->complete()) return;
+    for (const auto & [iteration, group] : running.release_groups)
+        if (!release_groups_[group].completed) return;
+    if (!requests_[request].response) commit(runtime, request);
+    if (running.final_publication && (!running.final_insertion || running.final_insertion->completed)) publish_result(runtime, request);
+
+    // A response does not release storage still used by in-flight work.
+    cache_.release(*running.buffer);
+    running.buffer.reset();
+    cache_.unpin_device(*running.pin);
+    running.pin.reset();
+    requests_[request].work_completed = cause_;
+    compute_stats_.add(running.compute->stats());
+    running.compute.reset();
+}
+
 void CacheProgram::start(ProgramRuntime & runtime) { advance(runtime); }
 
 void CacheProgram::begin_request(ProgramRuntime & runtime, bool drain) {
@@ -309,8 +327,51 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     compute->start(runtime, ready, 0);
 }
 
-std::vector<Work> CacheProgram::begin_result_control(std::size_t request, ResultControl control) {
+std::size_t CacheProgram::release_group(std::size_t request, std::size_t frame) {
+    // TP participants share one logical iteration, not one source frame ID.
+    const auto iteration = static_cast<std::size_t>(source_.observations().compute_frames[frame].sequence_tokens.front());
+    auto & groups = running_[request].release_groups;
+    const auto [at, inserted] = groups.try_emplace(iteration, release_groups_.size());
+    if (inserted) release_groups_.push_back({ request, {}, std::nullopt, {}, std::nullopt });
+    return at->second;
+}
+
+std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::size_t frame, ResultControl control) {
     auto & running = running_[request];
+    switch (control) {
+    case ResultControl::UpdateDuplicates:
+    case ResultControl::CommitDuplicates:
+    case ResultControl::ReleaseTail: {
+        const auto & observed = source_.observations();
+        const auto committed = observed.token_paths.length(observed.request_tokens.at(observed.requests[request].identity).committed.value().path);
+        const auto tokens = control == ResultControl::ReleaseTail        ? committed % page_tokens_
+                            : control == ResultControl::UpdateDuplicates ? running.prefix_insertion->duplicate_pages * page_tokens_
+                                                                         : running.final_insertion->duplicate_pages * page_tokens_;
+        auto & group = release_groups_[release_group(request, frame)];
+        group.indices.try_emplace(control, tokens);
+        return {
+            { { "allocator.release_indices", {}, {} }, { { "released_tokens", tokens } } }
+        };
+    }
+    case ResultControl::ReleaseGroup:
+    case ResultControl::ConvertReleasedIndices:
+    case ResultControl::PublishReleasedPages: {
+        auto & group = release_groups_[release_group(request, frame)];
+        if (!group.free_pages) group.free_pages = cache_.available_pages(Tier::Device);
+        std::size_t tokens = 0, pages = 0, tensors = 0;
+        for (const auto & [point, count] : group.indices) {
+            tokens += count;
+            pages += (count + page_tokens_ - 1) / page_tokens_;
+            if (count) ++tensors;
+        }
+        return {
+            { { "allocator.release_group", {}, {} },
+             { { "released_tokens", tokens }, { "released_pages", pages }, { "input_tensors", tensors }, { "free_pages", *group.free_pages } } }
+        };
+    }
+    default:
+        break;
+    }
     if (control == ResultControl::MatchPrefix) {
         if (running.prefix_match) return *running.prefix_match;
         const auto leaf = running.prefix_insertion->leaf;
@@ -332,7 +393,9 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, Result
     const auto pages = observed.token_paths.pages(path, page_tokens_);
     const auto publication = cache_.begin_device_publication();
     auto committed = cache_.commit_device(pages, *running.buffer, publication);
-    insertion = RunningRequest::Insertion{ committed.node, {}, {}, std::nullopt };
+    const auto protected_pages = control == ResultControl::UpdatePrefix || !running.prefix_insertion ? requests_[request].device_hit_pages
+                                                                                                     : cache_.page_count(running.prefix_insertion->leaf);
+    insertion = RunningRequest::Insertion{ committed.node, pages.size() - protected_pages - committed.allocated_pages, {}, {}, std::nullopt };
     if (control == ResultControl::UpdatePrefix) running.prefix_publication = publication;
     for (const auto & copy : committed.index_copies)
         insertion->work.push_back({
@@ -349,8 +412,19 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, Result
     return insertion->work;
 }
 
-void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) {
-    if (control == ResultControl::MatchPrefix) return;
+void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) {
+    if (control == ResultControl::PublishReleasedPages) {
+        const auto group_id = release_group(request, frame);
+        auto & group = release_groups_[group_id];
+        group.completions.push_back(completion);
+        if (group.completions.size() != backend_.participants) return;
+        const auto end = runtime.next_node();
+        PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::ReleasedPages, group_id) } }, {} };
+        for (const auto node : group.completions) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
+        runtime.submit(std::move(mutation));
+        return;
+    }
+    if (control != ResultControl::UpdatePrefix && control != ResultControl::CommitPrefix) return;
     auto & running = running_[request];
     auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
     insertion->completions.push_back(completion);
@@ -475,16 +549,7 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         if (running.compute->complete()) {
             cause_ = event.identity;
-            if (!requests_[request].response) commit(runtime, request);
-            if (running.final_publication && (!running.final_insertion || running.final_insertion->completed)) publish_result(runtime, request);
-            // A response does not release storage still used by in-flight work.
-            cache_.release(*running.buffer);
-            running.buffer.reset();
-            cache_.unpin_device(*running.pin);
-            running.pin.reset();
-            requests_[request].work_completed = event.identity;
-            compute_stats_.add(running.compute->stats());
-            running.compute.reset();
+            finish_compute(runtime, request);
             if (waiting_) advance(runtime);
         }
         return;
@@ -502,6 +567,20 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         running.final_publication.reset();
         requests_[request].kv_published = event.identity;
         backup_prefix(runtime, *running.committed);
+        if (waiting_) advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::ReleasedPages)) {
+        auto & group = release_groups_[event.action.subject];
+        group.completed = event.identity;
+        auto & running = running_[group.request];
+        std::size_t pages = 0;
+        for (const auto & [point, count] : group.indices) pages += (count + page_tokens_ - 1) / page_tokens_;
+        cache_.trim(*running.buffer, cache_.reserved_pages(*running.buffer) - pages);
+        if (pages) {
+            requests_[group.request].released_device_pages += pages;
+            requests_[group.request].pages_released = event.identity;
+        }
+        finish_compute(runtime, group.request);
         if (waiting_) advance(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::Received)) {

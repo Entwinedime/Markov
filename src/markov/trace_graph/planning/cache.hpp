@@ -58,6 +58,7 @@ struct CacheMatch {
 struct DeviceCommit {
     RadixId node;
     std::vector<IndexCopy> index_copies;
+    std::size_t allocated_pages;
 };
 
 enum class CopyKind { Backup, Load };
@@ -92,6 +93,7 @@ public:
     // Prefetch callers commit only the accepted prefix and retain any in-flight
     // remainder until the worker has actually returned.
     std::optional<BufferId> reserve(Tier tier, std::size_t pages);
+    std::size_t reserved_pages(BufferId buffer) const { return buffers_.at(buffer).pages; }
     PublicationId begin_device_publication();
     std::size_t publication_pages(PublicationId publication) const;
     DeviceCommit commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer = std::nullopt);

@@ -16,10 +16,21 @@
 
 namespace markov::trace_graph::planning {
 
+// Readback is a synchronous host response after its input queues are ready.
 enum class CallKind { Cpu, Queued, Readback, HostUpload };
 enum class DeviceControl { None, Record, Wait };
 enum class NativeProducer { Caller, Device };
-enum class ResultControl { UpdatePrefix, CommitPrefix, MatchPrefix };
+enum class ResultControl {
+    UpdatePrefix,
+    CommitPrefix,
+    MatchPrefix,
+    UpdateDuplicates,
+    CommitDuplicates,
+    ReleaseTail,
+    ReleaseGroup,
+    ConvertReleasedIndices,
+    PublishReleasedPages
+};
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;

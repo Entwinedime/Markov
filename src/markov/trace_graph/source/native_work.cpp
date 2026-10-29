@@ -46,7 +46,7 @@ bool same_caller_step(const planning::NativeCall & before, const planning::Nativ
 }
 
 bool sources_complete(const planning::NativeCall & call) {
-    if (call.kind == planning::CallKind::Cpu) return call.sources.caller_before.has_value();
+    if (call.kind == planning::CallKind::Cpu || call.kind == planning::CallKind::Readback) return call.sources.caller_before.has_value();
     if (!call.sources.caller_before || !call.sources.caller_after || !call.sources.dispatch || !call.sources.worker_after) return false;
     if (call.kind == planning::CallKind::HostUpload) return call.sources.worker_before.has_value();
     return std::ranges::all_of(call.sources.launches, [](const planning::NativeLaunchSources & sources) { return sources.worker_before.has_value(); });
@@ -248,12 +248,17 @@ void SourceContext::index_native_work() {
         auto & binding = site.native;
         if (binding.issue) continue;
         const auto & region = site.observation.region;
-        if (binding.definitions.size() == 1 && binding.definitions.front().kind == planning::CallKind::Cpu) {
+        if (binding.definitions.size() == 1
+            && (binding.definitions.front().kind == planning::CallKind::Cpu || binding.definitions.front().kind == planning::CallKind::Readback)) {
             auto & definition = binding.definitions.front();
             const auto * result = frame_result(site.frame);
             const bool consumes_result = site.result_processing && result && result->processed && region.begin_ns == result->processed->region.begin_ns;
-            definition.sources.caller_before =
-                retain_native_work(definition.work, "cpu_service", region, consumes_result ? HostWait::ResultEvent : HostWait::None);
+            definition.sources.caller_before = retain_native_work(definition.work,
+                                                                  "cpu_service",
+                                                                  region,
+                                                                  definition.kind == planning::CallKind::Readback ? HostWait::Stream
+                                                                  : consumes_result                               ? HostWait::ResultEvent
+                                                                                                                  : HostWait::None);
             if (consumes_result) {
                 std::optional<Time> producer;
                 for (const auto id : frame_sequences_[site.frame]) {

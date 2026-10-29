@@ -26,8 +26,8 @@ class ResultControls {
 public:
     virtual ~ResultControls() = default;
     // Adapters expand logical cache effects before the runtime queries costs.
-    virtual std::vector<Work> begin_result_control(std::size_t request, ResultControl control) = 0;
-    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) = 0;
+    virtual std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControl control) = 0;
+    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) = 0;
 };
 
 struct ComputeStats {

@@ -136,7 +136,7 @@ DeviceCommit Cache::commit_device(std::span<const PrefixId> pages, BufferId buff
         if (config_.backup_after_hits && (present || new_suffix)) ++nodes_[id].hits;
     }
     touch(inserted);
-    return { inserted.node, std::move(matched.index_copies) };
+    return { inserted.node, std::move(matched.index_copies), needed };
 }
 
 RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {

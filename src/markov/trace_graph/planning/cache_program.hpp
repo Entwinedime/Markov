@@ -26,9 +26,10 @@ struct CacheBackend {
 struct CacheRequestResult {
     std::size_t device_hit_pages = 0, loaded_pages = 0, prefill_tokens = 0;
     std::size_t deferred_kv_pages = 0;
+    std::size_t released_device_pages = 0;
     std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
-    std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, work_completed;
+    std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, pages_released, work_completed;
 };
 
 // Cache/storage, known compute and interpreted native controls share one clock.
@@ -67,7 +68,8 @@ private:
         ResponseDone,
         PrefixInserted,
         FinalInserted,
-        FinalPublished
+        FinalPublished,
+        ReleasedPages
     };
     enum class RequestStage { BeforeStart, Ingress, Waiting, Admitting, Active, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
@@ -83,6 +85,7 @@ private:
     struct RunningRequest {
         struct Insertion {
             RadixId leaf;
+            std::size_t duplicate_pages;
             std::vector<Work> work;
             std::vector<graph::NodeId> completions;
             std::optional<graph::NodeId> completed;
@@ -95,12 +98,22 @@ private:
         std::vector<graph::NodeId> admission;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
+        std::map<std::size_t, std::size_t> release_groups;
         std::optional<graph::NodeId> outputs_ready;
         bool publication_scheduled = false;
     };
 
-    std::vector<Work> begin_result_control(std::size_t request, ResultControl control) override;
-    void end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) override;
+    struct ReleaseGroup {
+        std::size_t request;
+        std::map<ResultControl, std::size_t> indices;
+        std::optional<std::size_t> free_pages;
+        std::vector<graph::NodeId> completions;
+        std::optional<graph::NodeId> completed;
+    };
+    std::size_t release_group(std::size_t request, std::size_t frame);
+    std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControl control) override;
+    void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) override;
+    void finish_compute(ProgramRuntime & runtime, std::size_t request);
     void complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control);
     void advance(ProgramRuntime & runtime);
     void begin_request(ProgramRuntime & runtime, bool drain);
@@ -125,6 +138,7 @@ private:
     std::optional<Storage> storage_;
     ExecutionQueues queues_;
     std::vector<RunningRequest> running_;
+    std::vector<ReleaseGroup> release_groups_;
     ComputeStats compute_stats_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;

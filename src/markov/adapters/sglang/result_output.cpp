@@ -1,8 +1,10 @@
 #include "markov/adapters/sglang/result_output.hpp"
+#include "markov/adapters/sglang/result_release.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -67,19 +69,6 @@ public:
 private:
     Features features_;
     bool send_;
-};
-
-class EmptyRelease final : public CallSequence {
-public:
-    explicit EmptyRelease(const trace_graph::source::HostControl & control) : work_(control.work) {
-        // Empty returns never inspect page geometry or the free-page arrays.
-        work_.kind.timing_scope = "cpu_service";
-        work_.features = {};
-    }
-    NativeSequence describe(Phase, const FrameInput &, std::span<const Work>) const override { return { { { work_, CallKind::Cpu, {} } }, std::nullopt }; }
-
-private:
-    Work work_;
 };
 
 class CacheIndexValues final : public CallSequence {
@@ -245,12 +234,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                 && (!owner || control.region.end_ns - control.region.begin_ns < owner->region.end_ns - owner->region.begin_ns))
                 owner = &control;
         }
-        if (owner) {
-            const auto & work = owner->work;
-            const bool empty_free = work.kind.operation == "allocator.release_pages" && work.features.at("released_tokens") == 0;
-            const bool empty_group = work.kind.operation == "allocator.finish_release_group" && work.features.at("grouped_tensors") == 0;
-            if (!empty_free && !empty_group) continue;
-        }
+        if (owner) continue;
 
         // A source caller fragment cannot conceal a missing native lifecycle.
         for (const auto & call : observed.native_queue_calls)
@@ -258,14 +242,6 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
         for (const auto & call : observed.native_runtime_calls)
             if (call.device_submission && call.region.resource == parent.resource && call.region.begin_ns < end && begin < call.region.end_ns) return {};
 
-        if (owner) {
-            callers.push_back({
-                { parent.resource, begin, end, parent.record },
-                std::make_unique<EmptyRelease>(*owner),
-                "result_empty_release"
-            });
-            continue;
-        }
         const bool send = std::ranges::any_of(result.final_sends, [&](const ResultSend & value) {
             return value.region.resource == parent.resource && value.region.begin_ns <= begin && end <= value.region.end_ns;
         });
@@ -288,6 +264,8 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
     if (input_metadata && input_metadata->value("request_table_contiguous", false)) {
         const auto dtype = input_metadata->at("request_table_dtype").get<std::string>();
         if (dtype == "torch.int32" || dtype == "torch.int64") {
+            auto releases = read_result_releases(observed, result, dtype == "torch.int32" ? 4 : 8);
+            callers.insert(callers.end(), std::make_move_iterator(releases.begin()), std::make_move_iterator(releases.end()));
             for (const auto id : processed.controls) {
                 const auto & control = observed.host_controls[id];
                 const auto & operation = control.work.kind.operation;
@@ -398,7 +376,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
             }
         }
     }
-    std::ranges::sort(callers, {}, [](const ObservedCallSequence & value) { return value.region.begin_ns; });
+    std::ranges::stable_sort(callers, {}, [](const ObservedCallSequence & value) { return std::pair(value.region.begin_ns, value.region.end_ns); });
     for (Index id = 1; id < callers.size(); ++id)
         if (callers[id - 1].region.end_ns > callers[id].region.begin_ns) return {};
     return callers;

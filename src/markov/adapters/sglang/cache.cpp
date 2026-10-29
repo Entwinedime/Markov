@@ -90,6 +90,8 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
             throw std::runtime_error("Cache execution currently requires unchunked Prefill");
         if (control.work.kind.operation == "cache.commit_prefix" && control.work.features.at("insert_requested") == 0)
             throw std::runtime_error("Cache execution does not yet support disabling finished-prefix insertion");
+        if (control.work.kind.operation == "allocator.finish_release_group" && control.work.features.at("need_sort") != 0)
+            throw std::runtime_error("Cache execution currently requires an unsorted free-page pool");
     }
     std::optional<planning::AttentionGeometry> geometry;
     std::map<source::Index, std::set<source::Index>> layers;

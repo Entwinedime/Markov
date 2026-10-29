@@ -237,12 +237,13 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 }
                 if (!placement) {
                     const bool native = call.control || std::ranges::any_of(calls.calls, [](const NativeCall & value) { return value.kind != CallKind::Cpu; });
-                    if (!site.resources.workers.empty() || !site.resources.devices.empty() || (native && !result_resources)) {
+                    if (!site.resources.workers.empty() || !site.resources.devices.empty()) {
                         issue_ = "result_control_queues_unavailable:" + call.role + ":workers=" + std::to_string(site.resources.workers.size())
                                  + ":devices=" + std::to_string(site.resources.devices.size());
                         return;
                     }
-                    placement = native ? result_resources : resources;
+                    // A native branch absent from a CPU-only callback uses the frame's current queues.
+                    placement = native && result_resources ? result_resources : resources;
                 }
                 const auto step = result_steps_.size();
                 frame.results.push_back(step);
@@ -361,7 +362,7 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
     const auto & site = source_.sequence(step.sequence);
     const auto & call = site.observation;
     if (call.control) {
-        auto work = controls_->begin_result_control(request_, *call.control);
+        auto work = controls_->begin_result_control(request_, stats_.frames[id].source_frame, *call.control);
         auto calls = call.definition->describe(frame.phase, frame.input, work);
         if (calls.issue) {
             issue_ = calls.issue;
@@ -408,7 +409,7 @@ void ComputeProgram::result_step_submitted(ProgramRuntime & runtime, const simul
 void ComputeProgram::result_step_done(ProgramRuntime & runtime, const simulation::Event & event) {
     const auto & step = result_steps_[event.action.subject];
     const auto & call = source_.sequence(step.sequence).observation;
-    if (call.control) controls_->end_result_control(runtime, request_, *call.control, event.identity);
+    if (call.control) controls_->end_result_control(runtime, request_, stats_.frames[step.frame].source_frame, *call.control, event.identity);
     auto & frame = frames_[step.frame];
     frame.result_completions.push_back(event.identity);
     if (frame.result_completions.size() != frame.results.size()) return;
