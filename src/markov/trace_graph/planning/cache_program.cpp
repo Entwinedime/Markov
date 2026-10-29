@@ -311,6 +311,19 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
 
 std::vector<Work> CacheProgram::begin_result_control(std::size_t request, ResultControl control) {
     auto & running = running_[request];
+    if (control == ResultControl::MatchPrefix) {
+        if (running.prefix_match) return *running.prefix_match;
+        const auto leaf = running.prefix_insertion->leaf;
+        std::size_t tensors = 0;
+        for (auto node = leaf; node != 0; node = cache_.tree().nodes()[node].parent)
+            if (cache_.node(node).device) ++tensors;
+        const auto pages = cache_.page_count(leaf);
+        running.prefix_match = std::vector<Work>{
+            {         { "cache.index_match", {}, {} },         { { "pages", pages }, { "input_tensors", tensors } } },
+            { { "cache.request_table_write", {}, {} }, { { "pages", pages - requests_[request].device_hit_pages } } }
+        };
+        return *running.prefix_match;
+    }
     auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
     if (insertion) return insertion->work;
     const auto & observed = source_.observations();
@@ -337,6 +350,7 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, Result
 }
 
 void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) {
+    if (control == ResultControl::MatchPrefix) return;
     auto & running = running_[request];
     auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
     insertion->completions.push_back(completion);

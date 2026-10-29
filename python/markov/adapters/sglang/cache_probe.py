@@ -54,6 +54,19 @@ class CacheProbe:
             fields["protected_tokens_after"] = req.cache_protected_len
             return result
 
+    def match_segments(self, original, cache, node, key):
+        fields = {"cache_implementation": implementation(cache)}
+        with self.writer.span("runtime.hicache.match_segments", fields):
+            values, last_node = original(cache, node, key)
+            fields.update(
+                input_tensors=len(values),
+                elements=sum(value.numel() for value in values),
+                element_bytes=values[0].element_size() if values else 0,
+                tensor_rank=values[0].dim() if values else 1,
+                device_type=values[0].device.type if values else "none",
+            )
+            return values, last_node
+
     def install(self):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -62,6 +75,11 @@ class CacheProbe:
             "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.match_prefix",
         ):
             HookRegistry.register(target, self.lookup, HookType.AROUND)
+        for target in (
+            "sglang.srt.mem_cache.radix_cache.RadixCache._match_prefix_helper",
+            "sglang.srt.mem_cache.hiradix_cache.HiRadixCache._match_prefix_helper",
+        ):
+            HookRegistry.register(target, self.match_segments, HookType.AROUND)
         HookRegistry.register(
             "sglang.srt.mem_cache.radix_cache.RadixCache.cache_finished_req", self.commit, HookType.AROUND
         )

@@ -31,8 +31,8 @@ struct CacheRequestResult {
     std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, work_completed;
 };
 
-// Cache/storage, known compute and blocking collectives share one clock.
-// Native cache/release control and complete cross-stream dependencies remain outside this component.
+// Cache/storage, known compute and interpreted native controls share one clock.
+// Component completion does not qualify the full request or all cross-stream dependencies.
 class CacheProgram final : public Program, public ResultControls {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
@@ -94,6 +94,7 @@ private:
         std::vector<std::size_t> callers;
         std::vector<graph::NodeId> admission;
         std::optional<Insertion> prefix_insertion, final_insertion;
+        std::optional<std::vector<Work>> prefix_match;
         std::optional<graph::NodeId> outputs_ready;
         bool publication_scheduled = false;
     };

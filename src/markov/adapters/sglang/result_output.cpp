@@ -141,6 +141,36 @@ public:
     }
 };
 
+class CacheIndexMatch final : public CallSequence {
+public:
+    explicit CacheIndexMatch(double table_element_bytes) : table_element_bytes_(table_element_bytes) {}
+    NativeSequence describe(Phase, const FrameInput & input, std::span<const Work> work) const override {
+        std::vector<NativeCall> calls;
+        for (const auto & operation : work) {
+            const bool concatenate = operation.kind.operation == "cache.index_match";
+            auto features = operation.features;
+            features["elements"] = features.at("pages") * input.page_tokens;
+            features.erase("pages");
+            features["element_bytes"] = concatenate ? 8 : table_element_bytes_;
+            features["tensor_rank"] = 1;
+            if (!concatenate) features["source_element_bytes"] = 8;
+            Work physical{
+                { operation.kind.operation, concatenate ? "aten.cat:npu:int64" : "aten.copy_:npu:int64_to_request_table", "device_service" },
+                std::move(features)
+            };
+            if (concatenate && physical.features.at("elements") == 0) continue;
+            const bool queued = physical.features.at("elements") != 0;
+            NativeCall call{ physical, queued ? CallKind::Queued : CallKind::Cpu, queued ? std::vector<Work>{ physical } : std::vector<Work>{} };
+            if (queued) call.queue_name = concatenate ? "aclnnCat" : "aclnnInplaceCopy";
+            calls.push_back(std::move(call));
+        }
+        return { std::move(calls), std::nullopt };
+    }
+
+private:
+    double table_element_bytes_;
+};
+
 NativeSequence ResultOutput::describe(Phase phase, const FrameInput & input, std::span<const Work>) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill.output." : "decode.output.";
     const Features tensor{
@@ -324,6 +354,47 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                                     "cache_index_insertion",
                                     operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix,
                                     std::move(source_work) });
+                if (operation != "cache.update_prefix") continue;
+                const ObservedSpan * concatenation = nullptr;
+                const ObservedSpan * table_write = nullptr;
+                for (const auto & span : observed.spans) {
+                    if (span.resource != parent.resource || span.begin_ns < insertion_end || control.region.end_ns < span.end_ns) continue;
+                    if (observed.names[span.name] == "aten::cat") {
+                        if (concatenation) return {};
+                        concatenation = &span;
+                    }
+                }
+                if (!concatenation) continue;
+                for (const auto & span : observed.spans) {
+                    if (span.resource != parent.resource || span.begin_ns < concatenation->end_ns || control.region.end_ns < span.end_ns
+                        || observed.names[span.name] != "aten::copy_")
+                        continue;
+                    if (table_write) return {};
+                    table_write = &span;
+                }
+                if (!table_write) continue;
+                std::vector<Work> matched_work{
+                    {         { "cache.index_match", {}, {} },                           { { "pages", std::floor(tokens / page) } } },
+                    { { "cache.request_table_write", {}, {} }, { { "pages", std::floor(tokens / page) - protected_tokens / page } } }
+                };
+
+                // Unobserved list arity cannot authorize source-cost migration.
+                for (const auto nested : processed.controls) {
+                    const auto & match = observed.host_controls[nested];
+                    const auto & variables = match.work.features;
+                    if (match.work.kind.operation == "cache.match_segments" && insertion_end <= match.region.begin_ns
+                        && match.region.end_ns <= concatenation->begin_ns && variables.at("elements") == std::floor(tokens / page) * page
+                        && variables.at("input_tensors") > 0 && variables.at("element_bytes") == 8 && variables.at("tensor_rank") == 1
+                        && variables.at("device_npu") == 1)
+                        matched_work.front().features["input_tensors"] = variables.at("input_tensors");
+                }
+                callers.push_back({
+                    { parent.resource, concatenation->begin_ns, table_write->end_ns, concatenation->record },
+                    std::make_unique<CacheIndexMatch>(dtype == "torch.int32" ? 4 : 8),
+                    "cache_index_match",
+                    ResultControl::MatchPrefix,
+                    std::move(matched_work)
+                });
             }
         }
     }

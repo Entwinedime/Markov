@@ -434,6 +434,11 @@ void ProbeReader::observe_control(const ProbeEvent & event) {
             variables[field] = args.at(field).get<double>();
         variables["chunked"] = args.at("chunked").get<bool>() ? 1 : 0;
     }
+    else if (event.name == "runtime.hicache.match_segments") {
+        operation = "cache.match_segments";
+        for (const auto * field : { "input_tensors", "elements", "element_bytes", "tensor_rank" }) variables[field] = args.at(field).get<double>();
+        variables["device_npu"] = args.at("device_type") == "npu" ? 1 : 0;
+    }
     else if (event.name == "hicache_cache_finished_req_lifecycle_commit_end" && args.contains("page_size_tokens") && args.contains("thread_cpu_ns")) {
         operation = "cache.commit_prefix";
         variables["page_size_tokens"] = args.at("page_size_tokens").get<double>();
