@@ -26,7 +26,7 @@ struct ComputeStats {
     };
     struct FramePorts {
         source::Index source_frame;
-        std::optional<graph::NodeId> entry, submitted, result_ready, completed, callers_entry, callers_completed, sent;
+        std::optional<graph::NodeId> entry, submitted, result_ready, completed, callers_entry, callers_completed, result_work_completed, sent;
     };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
@@ -67,6 +67,7 @@ private:
         FrameSubmitted,
         ResultReady,
         CallersDone,
+        ResultWorkDone,
         Sent,
         PrefillReady,
         ResultsReady,

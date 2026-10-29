@@ -11,6 +11,7 @@ namespace markov::adapters::sglang {
 
 std::unique_ptr<const trace_graph::planning::CallSequence> read_result_output(const nlohmann::json & metadata, const trace_graph::source::ResultCopy & copy);
 std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const trace_graph::source::Observations & observed,
-                                                                           const trace_graph::source::BatchResult & result);
+                                                                           const trace_graph::source::BatchResult & result,
+                                                                           const nlohmann::json * input_metadata);
 
 } // namespace markov::adapters::sglang

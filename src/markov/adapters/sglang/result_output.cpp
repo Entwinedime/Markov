@@ -1,6 +1,7 @@
 #include "markov/adapters/sglang/result_output.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -68,6 +69,54 @@ private:
     bool send_;
 };
 
+class EmptyRelease final : public CallSequence {
+public:
+    explicit EmptyRelease(const trace_graph::source::HostControl & control) : work_(control.work) {
+        // Empty returns never inspect page geometry or the free-page arrays.
+        work_.kind.timing_scope = "cpu_service";
+        work_.features = {};
+    }
+    NativeSequence describe(Phase, const FrameInput &, std::span<const Work>) const override { return { { { work_, CallKind::Cpu, {} } }, std::nullopt }; }
+
+private:
+    Work work_;
+};
+
+class CacheIndexValues final : public CallSequence {
+public:
+    CacheIndexValues(double tokens, double source_element_bytes) : tokens_(tokens), source_element_bytes_(source_element_bytes) {}
+    NativeSequence describe(Phase, const FrameInput & input, std::span<const Work>) const override {
+        if (input.page_tokens <= 0) return { {}, "cache_index_copy_needs_page_geometry" };
+        const auto elements = std::floor(tokens_ / input.page_tokens) * input.page_tokens;
+        if (elements == 0) return { {}, "empty_cache_index_copy_requires_a_native_rule" };
+
+        Work work{
+            { "cache.index_values", "aten._to_copy:npu:int32_or_int64_to_int64", "device_service" },
+            { { "elements", elements }, { "source_element_bytes", source_element_bytes_ }, { "element_bytes", 8 }, { "tensor_rank", 1 } }
+        };
+        NativeCall call{ work, CallKind::Queued, { work } };
+        call.queue_name = "aclnnInplaceCopy";
+        call.worker_features = {
+            { "source_element_bytes", source_element_bytes_ },
+            {        "element_bytes",                     8 },
+            {          "tensor_rank",                     1 }
+        };
+        call.caller_work = Work{
+            { "cache.index_values", "aten._to_copy:npu:int32_or_int64_to_int64", "cpu_service" },
+            *call.worker_features
+        };
+        call.caller_preparations.push_back({
+            { { "runtime.tensor.allocate", "aten.empty:npu:int32_or_int64", "caller_blocking_interval" },
+             { { "bytes", elements * 8 }, { "element_bytes", 8 }, { "tensor_rank", 1 } } },
+            "aten::empty"
+        });
+        return { { std::move(call) }, std::nullopt };
+    }
+
+private:
+    double tokens_, source_element_bytes_;
+};
+
 NativeSequence ResultOutput::describe(Phase phase, const FrameInput & input, std::span<const Work>) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill.output." : "decode.output.";
     const Features tensor{
@@ -117,7 +166,8 @@ std::unique_ptr<const trace_graph::planning::CallSequence> read_result_output(co
 }
 
 std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const trace_graph::source::Observations & observed,
-                                                                           const trace_graph::source::BatchResult & result) {
+                                                                           const trace_graph::source::BatchResult & result,
+                                                                           const nlohmann::json * input_metadata) {
     using namespace trace_graph::source;
     if (!result.processed || !result.copy || result.copy->additional_outputs || result.copy->token_shape != std::vector<Index>{ 1 }) return {};
     const auto & processed = *result.processed;
@@ -134,11 +184,19 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
     std::vector<ObservedCallSequence> callers;
     for (Index at = 1; at < cuts.size(); ++at) {
         const auto begin = cuts[at - 1], end = cuts[at];
-        if (std::ranges::any_of(processed.controls, [&](Index id) {
-                const auto & control = observed.host_controls[id].region;
-                return control.begin_ns <= begin && end <= control.end_ns;
-            }))
-            continue;
+        const HostControl * owner = nullptr;
+        for (const auto id : processed.controls) {
+            const auto & control = observed.host_controls[id];
+            if (control.region.begin_ns <= begin && end <= control.region.end_ns
+                && (!owner || control.region.end_ns - control.region.begin_ns < owner->region.end_ns - owner->region.begin_ns))
+                owner = &control;
+        }
+        if (owner) {
+            const auto & work = owner->work;
+            const bool empty_free = work.kind.operation == "allocator.release_pages" && work.features.at("released_tokens") == 0;
+            const bool empty_group = work.kind.operation == "allocator.finish_release_group" && work.features.at("grouped_tensors") == 0;
+            if (!empty_free && !empty_group) continue;
+        }
 
         // A source caller fragment cannot conceal a missing native lifecycle.
         for (const auto & call : observed.native_queue_calls)
@@ -146,6 +204,14 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
         for (const auto & call : observed.native_runtime_calls)
             if (call.device_submission && call.region.resource == parent.resource && call.region.begin_ns < end && begin < call.region.end_ns) return {};
 
+        if (owner) {
+            callers.push_back({
+                { parent.resource, begin, end, parent.record },
+                std::make_unique<EmptyRelease>(*owner),
+                "result_empty_release"
+            });
+            continue;
+        }
         const bool send = std::ranges::any_of(result.final_sends, [&](const ResultSend & value) {
             return value.region.resource == parent.resource && value.region.begin_ns <= begin && end <= value.region.end_ns;
         });
@@ -165,6 +231,40 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
             send ? "result_send" : "result_caller"
         });
     }
+    if (input_metadata && input_metadata->value("request_table_contiguous", false)) {
+        const auto dtype = input_metadata->at("request_table_dtype").get<std::string>();
+        if (dtype == "torch.int32" || dtype == "torch.int64") {
+            for (const auto id : processed.controls) {
+                const auto & control = observed.host_controls[id];
+                const auto & operation = control.work.kind.operation;
+                if (operation != "cache.update_prefix" && operation != "cache.commit_prefix") continue;
+                const auto tokens = control.work.features.at(operation == "cache.update_prefix" ? "input_tokens" : "committed_tokens");
+                const NativeQueueCall * first = nullptr;
+                for (const auto & call : observed.native_queue_calls)
+                    if (call.submission.resource == parent.resource && control.region.begin_ns <= call.submission.begin_ns
+                        && call.submission.end_ns <= control.region.end_ns && (!first || call.submission.begin_ns < first->submission.begin_ns))
+                        first = &call;
+                if (!first || observed.names[first->name] != "aclnnInplaceCopy") continue;
+                const ObservedSpan * copy = nullptr;
+                for (const auto & span : observed.spans) {
+                    if (span.resource != parent.resource || observed.names[span.name] != "aten::to" || span.begin_ns < control.region.begin_ns
+                        || control.region.end_ns < span.end_ns || first->submission.begin_ns < span.begin_ns || span.end_ns < first->submission.end_ns)
+                        continue;
+                    if (copy) return {};
+                    copy = &span;
+                }
+                if (!copy) continue;
+                callers.push_back({
+                    { copy->resource, copy->begin_ns, copy->end_ns, copy->record },
+                    std::make_unique<CacheIndexValues>(tokens, dtype == "torch.int32" ? 4 : 8),
+                    "cache_index_values"
+                });
+            }
+        }
+    }
+    std::ranges::sort(callers, {}, [](const ObservedCallSequence & value) { return value.region.begin_ns; });
+    for (Index id = 1; id < callers.size(); ++id)
+        if (callers[id - 1].region.end_ns > callers[id].region.begin_ns) return {};
     return callers;
 }
 

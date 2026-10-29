@@ -116,7 +116,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         frame.overlap = result && result->overlap;
         frame.publishes_prefill_prefix = observed.compute_frames[input.frame].phase == Phase::Prefill && result && result->processed
                                          && result->processed->finished_after.size() == 1 && !result->processed->finished_after.front();
-        stats_.frames.push_back({ input.frame, {}, {}, {}, {}, {}, {}, {} });
+        stats_.frames.push_back({ input.frame, {}, {}, {}, {}, {}, {}, {}, {} });
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
             return;
@@ -209,18 +209,30 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
             for (const auto sequence : source.result_sequences(input.frame)) {
                 const auto & site = source.sequence(sequence);
                 const auto & call = site.observation;
-                if (!call.definition || site.resources.caller != resources->caller || !site.resources.workers.empty() || !site.resources.devices.empty()) {
+                if (!call.definition || site.resources.caller != resources->caller) {
                     issue_ = "result_caller_recipe_or_resource_unavailable";
                     return;
                 }
                 auto calls = call.definition->describe(observed.compute_frames[input.frame].phase, input.variables);
-                if (calls.issue || std::ranges::any_of(calls.calls, [](const NativeCall & value) { return value.kind != CallKind::Cpu; })) {
-                    issue_ = "result_caller_requires_native_control_rule";
+                if (calls.issue) {
+                    issue_ = calls.issue;
                     return;
+                }
+                auto placement = site.resources.unique_resources();
+                if (!placement) {
+                    if (!site.resources.workers.empty() || !site.resources.devices.empty()
+                        || std::ranges::any_of(calls.calls, [](const NativeCall & value) { return value.kind != CallKind::Cpu; })) {
+                        issue_ = "result_control_queues_unavailable";
+                        return;
+                    }
+                    placement = resources;
                 }
                 source.bind_native_sources(sequence, calls.calls);
                 const auto before = frame.result_callers.operations();
-                frame.result_callers.extend(calls, *resources, preparations_);
+                if (!frame.result_callers.extend(calls, *placement, preparations_)) {
+                    issue_ = "kernel_cache_initial_state_unavailable";
+                    return;
+                }
                 auto & stats = frame.caller_stats.preparations[call.role];
                 ++stats.sequences;
                 stats.operations += frame.result_callers.operations() - before;
@@ -329,7 +341,7 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
     auto & frame = frames_[id];
     const auto & ports = stats_.frames[id];
     const auto begin = runtime.next_node();
-    NativeEvents events{ action(ActionKind::CallersDone, id) };
+    NativeEvents events{ action(ActionKind::ResultWorkDone, id), action(ActionKind::CallersDone, id) };
     if (frame.result_callers.publishes_result()) events.produced = action(ActionKind::Sent, id);
     auto mutation = frame.result_callers.mutation(owner_, begin, events, frame.result_producer, queues_.native);
     mutation.dependencies.push_back({ granted, begin, graph::EdgeKind::ResourceOrder });
@@ -347,10 +359,11 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
 void ComputeProgram::finish_frame(ProgramRuntime & runtime, std::size_t id) {
     auto & frame = frames_[id];
     const auto & ports = stats_.frames[id];
-    if (frame.finished || !ports.completed || (frame.callers_modeled && !ports.callers_completed)) return;
+    if (frame.finished || !ports.completed || (frame.callers_modeled && (!ports.callers_completed || !ports.result_work_completed))) return;
     frame.finished = true;
     completed_.push_back(*ports.completed);
     if (ports.callers_completed) completed_.push_back(*ports.callers_completed);
+    if (ports.result_work_completed) completed_.push_back(*ports.result_work_completed);
     if (++finished_frames_ != frames_.size()) return;
 
     const auto end = runtime.next_node();
@@ -427,6 +440,10 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
     else if (event.action.kind == std::to_underlying(ActionKind::Sent)) {
         stats_.frames[event.action.subject].sent = event.identity;
         sent_ = event.identity;
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::ResultWorkDone)) {
+        stats_.frames[event.action.subject].result_work_completed = event.identity;
+        finish_frame(runtime, event.action.subject);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ResultsReady)) results_ready_ = event.identity;
     else if (event.action.kind == std::to_underlying(ActionKind::PrefillReady)) prefill_result_ready_ = event.identity;
