@@ -93,7 +93,7 @@ void SourceContext::index_native_sequences() {
         if (!sequence.issue
             && (sequence.calls.empty()
                 || (sequence.calls.size() == 1
-                    && (sequence.calls.front().kind == planning::CallKind::Cpu || sequence.calls.front().kind == planning::CallKind::Readback)))) {
+                    && (sequence.calls.front().kind == planning::CallKind::Cpu || sequence.calls.front().kind == planning::CallKind::HostResponse)))) {
             const auto & lane = lanes[preparation.region.resource];
             const auto at = std::ranges::lower_bound(lane, preparation.region.begin_ns, {}, submitted);
             if (at != lane.end() && submitted(*at) < preparation.region.end_ns) {

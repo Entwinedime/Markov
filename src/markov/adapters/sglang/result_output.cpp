@@ -330,7 +330,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                 callers.push_back({ region,
                                     std::make_unique<CacheIndexInsertion>(),
                                     "cache_index_insertion",
-                                    operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix,
+                                    ResultControlPoint{ operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix },
                                     std::move(source_work) });
                 if (operation != "cache.update_prefix") continue;
                 const ObservedSpan * concatenation = nullptr;
@@ -370,7 +370,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                     { parent.resource, concatenation->begin_ns, table_write->end_ns, concatenation->record },
                     std::make_unique<CacheIndexMatch>(dtype == "torch.int32" ? 4 : 8),
                     "cache_index_match",
-                    ResultControl::MatchPrefix,
+                    ResultControlPoint{ ResultControl::MatchPrefix },
                     std::move(matched_work)
                 });
             }

@@ -71,7 +71,9 @@ std::size_t Cache::page_count(RadixId node) const {
 
 std::size_t Cache::used_pages(Tier tier) const { return tier == Tier::Device ? used_device_pages_ : used_host_pages_; }
 
-std::size_t Cache::available_pages(Tier tier) const { return (tier == Tier::Device ? config_.device_pages : config_.host_pages) - used_pages(tier); }
+std::size_t Cache::available_pages(Tier tier) const {
+    return tier == Tier::Device ? free_device_pages() - reserved_device_pages_ : config_.host_pages - used_host_pages_;
+}
 
 std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
     const auto & allocation = slot(node, tier);
@@ -81,11 +83,15 @@ std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
 
 bool Cache::take_pages(Tier tier, std::size_t pages) {
     if (pages > available_pages(tier)) return false;
+    occupy_pages(tier, pages);
+    return true;
+}
+
+void Cache::occupy_pages(Tier tier, std::size_t pages) {
     (tier == Tier::Device ? used_device_pages_ : used_host_pages_) += pages;
     if (tier == Tier::Device) device_allocation_run_ += pages;
     auto & peak = tier == Tier::Device ? peak_device_pages_ : peak_host_pages_;
     peak = std::max(peak, used_pages(tier));
-    return true;
 }
 
 void Cache::return_pages(Tier tier, std::size_t pages) {
@@ -99,6 +105,24 @@ std::optional<BufferId> Cache::reserve(Tier tier, std::size_t pages) {
     const auto id = next_identity_++;
     buffers_.emplace(id, Buffer{ tier, pages });
     return id;
+}
+
+std::optional<BufferId> Cache::reserve_request(std::size_t pages) {
+    if (pages > available_pages(Tier::Device)) return std::nullopt;
+    const auto id = next_identity_++;
+    reserved_device_pages_ += pages;
+    buffers_.emplace(id, Buffer{ Tier::Device, 0, pages });
+    return id;
+}
+
+void Cache::allocate_reserved(BufferId buffer, std::size_t pages) {
+    auto & allocation = buffers_.at(buffer);
+    if (allocation.tier != Tier::Device || pages > allocation.unallocated_pages)
+        throw std::runtime_error("Native allocation exceeds its admitted request reservation");
+    allocation.unallocated_pages -= pages;
+    reserved_device_pages_ -= pages;
+    allocation.pages += pages;
+    occupy_pages(Tier::Device, pages);
 }
 
 PublicationId Cache::begin_device_publication() {
@@ -160,6 +184,7 @@ RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
 
 void Cache::release(BufferId buffer) {
     const auto allocation = buffers_.at(buffer);
+    if (allocation.tier == Tier::Device) reserved_device_pages_ -= allocation.unallocated_pages;
     return_pages(allocation.tier, allocation.pages);
     buffers_.erase(buffer);
 }

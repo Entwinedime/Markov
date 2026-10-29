@@ -34,7 +34,7 @@ struct CacheRequestResult {
 
 // Cache/storage, known compute and interpreted native controls share one clock.
 // Component completion does not qualify the full request or all cross-stream dependencies.
-class CacheProgram final : public Program, public ResultControls {
+class CacheProgram final : public Program, public RequestControls {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
                  std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt);
@@ -98,7 +98,8 @@ private:
         std::vector<graph::NodeId> admission;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
-        std::map<std::size_t, std::size_t> release_groups;
+        std::map<std::pair<std::size_t, ResultControl>, std::size_t> release_groups;
+        std::map<std::size_t, std::size_t> allocation_views;
         std::optional<graph::NodeId> outputs_ready;
         bool publication_scheduled = false;
     };
@@ -110,9 +111,10 @@ private:
         std::vector<graph::NodeId> completions;
         std::optional<graph::NodeId> completed;
     };
-    std::size_t release_group(std::size_t request, std::size_t frame);
-    std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControl control) override;
-    void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) override;
+    std::size_t release_group(std::size_t request, std::size_t frame, ResultControl group);
+    FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) override;
+    std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) override;
+    void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint control, graph::NodeId completion) override;
     void finish_compute(ProgramRuntime & runtime, std::size_t request);
     void complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control);
     void advance(ProgramRuntime & runtime);

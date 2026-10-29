@@ -271,8 +271,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
         wait_for_progress(runtime);
         return;
     }
-    requests_[request_].device_pages_allocated_since_return = cache_.device_pages_allocated_since_return();
-    running_[request_].buffer = cache_.reserve(Tier::Device, active_pages - device_pages).value();
+    running_[request_].buffer = cache_.reserve_request(active_pages - device_pages).value();
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
@@ -302,7 +301,7 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
         }
         const double query = frame.phase == Phase::Prefill ? requests_[request_].prefill_tokens : frame.query_tokens->front();
         const double context = frame.phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
-        const FrameInput variables{ query, query, context, 1, static_cast<double>(page_tokens_), requests_[request_].device_pages_allocated_since_return };
+        const FrameInput variables{ query, query, context, 1, static_cast<double>(page_tokens_) };
         plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
 
@@ -327,16 +326,34 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     compute->start(runtime, ready, 0);
 }
 
-std::size_t CacheProgram::release_group(std::size_t request, std::size_t frame) {
+FrameInput CacheProgram::begin_frame(std::size_t request, std::size_t frame, FrameInput input) {
+    auto & running = running_[request];
+    const auto context = static_cast<std::size_t>(input.context_tokens);
+    auto & views = running.allocation_views;
+    auto at = views.find(context);
+    if (at == views.end()) {
+        const auto previous = views.empty() ? requests_[request].device_hit_pages * page_tokens_ : views.rbegin()->first;
+        const auto pages = (context + page_tokens_ - 1) / page_tokens_ - (previous + page_tokens_ - 1) / page_tokens_;
+        const auto offset = cache_.device_pages_allocated_since_return();
+        cache_.allocate_reserved(*running.buffer, pages);
+        at = views.emplace(context, offset).first;
+    }
+    input.device_pages_allocated_since_return = at->second;
+    if (source_.observations().compute_frames[frame].phase == Phase::Prefill) requests_[request].device_pages_allocated_since_return = at->second;
+    return input;
+}
+
+std::size_t CacheProgram::release_group(std::size_t request, std::size_t frame, ResultControl group) {
     // TP participants share one logical iteration, not one source frame ID.
     const auto iteration = static_cast<std::size_t>(source_.observations().compute_frames[frame].sequence_tokens.front());
     auto & groups = running_[request].release_groups;
-    const auto [at, inserted] = groups.try_emplace(iteration, release_groups_.size());
+    const auto [at, inserted] = groups.try_emplace(std::pair(iteration, group), release_groups_.size());
     if (inserted) release_groups_.push_back({ request, {}, std::nullopt, {}, std::nullopt });
     return at->second;
 }
 
-std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::size_t frame, ResultControl control) {
+std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint point) {
+    const auto control = point.operation;
     auto & running = running_[request];
     switch (control) {
     case ResultControl::UpdateDuplicates:
@@ -347,7 +364,7 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::s
         const auto tokens = control == ResultControl::ReleaseTail        ? committed % page_tokens_
                             : control == ResultControl::UpdateDuplicates ? running.prefix_insertion->duplicate_pages * page_tokens_
                                                                          : running.final_insertion->duplicate_pages * page_tokens_;
-        auto & group = release_groups_[release_group(request, frame)];
+        auto & group = release_groups_[release_group(request, frame, point.release_group)];
         group.indices.try_emplace(control, tokens);
         return {
             { { "allocator.release_indices", {}, {} }, { { "released_tokens", tokens } } }
@@ -356,8 +373,8 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::s
     case ResultControl::ReleaseGroup:
     case ResultControl::ConvertReleasedIndices:
     case ResultControl::PublishReleasedPages: {
-        auto & group = release_groups_[release_group(request, frame)];
-        if (!group.free_pages) group.free_pages = cache_.available_pages(Tier::Device);
+        auto & group = release_groups_[release_group(request, frame, point.release_group)];
+        if (!group.free_pages) group.free_pages = cache_.free_device_pages();
         std::size_t tokens = 0, pages = 0, tensors = 0;
         for (const auto & [point, count] : group.indices) {
             tokens += count;
@@ -412,9 +429,10 @@ std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::s
     return insertion->work;
 }
 
-void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) {
+void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint point, graph::NodeId completion) {
+    const auto control = point.operation;
     if (control == ResultControl::PublishReleasedPages) {
-        const auto group_id = release_group(request, frame);
+        const auto group_id = release_group(request, frame, point.release_group);
         auto & group = release_groups_[group_id];
         group.completions.push_back(completion);
         if (group.completions.size() != backend_.participants) return;
@@ -534,6 +552,10 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         const auto request = event.owner - ComputeProgram::first_owner;
         auto & running = running_.at(request);
         running.compute->on_event(runtime, event);
+        if (running.compute->issue()) {
+            issue_ = running.compute->issue();
+            return;
+        }
         running.outputs_ready = running.compute->results_ready();
         if (!running.prefix_insertion && !requests_[request].prefill_prefix_published && running.compute->prefill_result_ready()) {
             cause_ = running.compute->prefill_result_ready();
@@ -575,7 +597,7 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         auto & running = running_[group.request];
         std::size_t pages = 0;
         for (const auto & [point, count] : group.indices) pages += (count + page_tokens_ - 1) / page_tokens_;
-        cache_.trim(*running.buffer, cache_.reserved_pages(*running.buffer) - pages);
+        cache_.trim(*running.buffer, cache_.buffer_pages(*running.buffer) - pages);
         if (pages) {
             requests_[group.request].released_device_pages += pages;
             requests_[group.request].pages_released = event.identity;

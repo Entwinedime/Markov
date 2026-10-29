@@ -16,8 +16,8 @@
 
 namespace markov::trace_graph::planning {
 
-// Readback is a synchronous host response after its input queues are ready.
-enum class CallKind { Cpu, Queued, Readback, HostUpload };
+// Scalar readback retains pre/post-sync costs; HostResponse is a closed synchronous host operation.
+enum class CallKind { Cpu, Queued, Readback, HostResponse, HostUpload };
 enum class DeviceControl { None, Record, Wait };
 enum class NativeProducer { Caller, Device };
 enum class ResultControl {
@@ -30,6 +30,12 @@ enum class ResultControl {
     ReleaseGroup,
     ConvertReleasedIndices,
     PublishReleasedPages
+};
+
+struct ResultControlPoint {
+    ResultControl operation;
+    // Immediate releases own a group; deferred releases share the batch group.
+    ResultControl release_group = ResultControl::ReleaseGroup;
 };
 
 struct KernelPreparation {

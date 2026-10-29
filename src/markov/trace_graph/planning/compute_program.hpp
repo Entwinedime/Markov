@@ -22,12 +22,13 @@ struct FrameCompute {
 
 enum class ComputeScope { Compute, Request };
 
-class ResultControls {
+class RequestControls {
 public:
-    virtual ~ResultControls() = default;
+    virtual ~RequestControls() = default;
+    virtual FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) = 0;
     // Adapters expand logical cache effects before the runtime queries costs.
-    virtual std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControl control) = 0;
-    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControl control, graph::NodeId completion) = 0;
+    virtual std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) = 0;
+    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint control, graph::NodeId completion) = 0;
 };
 
 struct ComputeStats {
@@ -37,6 +38,7 @@ struct ComputeStats {
     struct FramePorts {
         source::Index source_frame;
         std::optional<graph::NodeId> entry, submitted, result_ready, completed, callers_entry, callers_completed, result_work_completed, sent;
+        std::optional<std::size_t> allocator_view_offset_pages;
     };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
@@ -55,7 +57,7 @@ public:
     static constexpr simulation::Component first_owner = 2;
     ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations,
                    ExecutionQueues & queues, ComputeScope scope = ComputeScope::Compute, simulation::Component owner = first_owner,
-                   ResultControls * controls = nullptr, std::size_t request = 0);
+                   RequestControls * controls = nullptr, std::size_t request = 0);
     ComputeProgram(const ComputeProgram &) = delete;
 
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt);
@@ -95,13 +97,14 @@ private:
     };
     struct Frame {
         std::vector<Segment> segments;
+        ComputePlan projection;
         FrameInput input{};
+        CallResources resources{};
         Phase phase = Phase::Prefill;
         std::vector<std::size_t> results;
         std::vector<graph::NodeId> result_completions;
         std::size_t result_at = 0;
         std::size_t at = 0;
-        std::size_t caller = 0;
         std::optional<graph::NodeId> result_producer;
         std::optional<std::size_t> previous, next;
         bool overlap = false;
@@ -126,7 +129,8 @@ private:
     };
 
     void segment(ProgramRuntime & runtime, std::size_t frame, std::optional<graph::NodeId> cause);
-    bool append_compute(const FrameCompute & frame, source::Index source_call, std::size_t & at, CallResources resources, Segment & segment);
+    void compile_frame(std::size_t frame);
+    bool append_compute(const Frame & frame, source::Index source_call, std::size_t & at, Segment & segment);
     void arrive(ProgramRuntime & runtime, std::size_t frame, const simulation::Event & event);
     void join_prefill_results(ProgramRuntime & runtime);
     void start_next(ProgramRuntime & runtime, std::size_t frame);
@@ -142,7 +146,7 @@ private:
     PreparationCache & preparations_;
     ExecutionQueues & queues_;
     simulation::Component owner_;
-    ResultControls * controls_;
+    RequestControls * controls_;
     std::size_t request_;
     std::size_t first_resource_;
     std::vector<Frame> frames_;

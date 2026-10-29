@@ -38,6 +38,7 @@ Json frame_ports_report(const planning::ComputeStats & stats, const simulation::
     for (const auto & frame : stats.frames) {
         report.push_back({
             {                        "source_frame",                                                                                         frame.source_frame },
+            {         "allocator_view_offset_pages",               frame.allocator_view_offset_pages ? Json(*frame.allocator_view_offset_pages) : Json(nullptr) },
             {                          "entered_ns",                                      frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
             {                 "caller_submitted_ns",                         frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
             {                     "result_ready_ns",                   frame.result_ready ? Json(execution.completions_ns[*frame.result_ready]) : Json(nullptr) },

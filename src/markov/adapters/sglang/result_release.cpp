@@ -15,7 +15,7 @@ using namespace trace_graph::source;
 
 class ReleaseCall final : public CallSequence {
 public:
-    ReleaseCall(ResultControl point, std::string implementation, double element_bytes)
+    ReleaseCall(ResultControlPoint point, std::string implementation, double element_bytes)
         : point_(point),
           implementation_(std::move(implementation)),
           element_bytes_(element_bytes) {}
@@ -23,9 +23,10 @@ public:
     NativeSequence describe(Phase, const FrameInput & input, std::span<const Work> work) const override {
         const auto & features = work.front().features;
         const auto tokens = features.at("released_tokens");
-        const bool append = point_ == ResultControl::UpdateDuplicates || point_ == ResultControl::CommitDuplicates || point_ == ResultControl::ReleaseTail;
-        if (point_ == ResultControl::UpdateDuplicates && tokens != 0) return { {}, std::nullopt };
-        if (append || (tokens == 0 && point_ == ResultControl::ReleaseGroup)) {
+        const bool append = point_.operation == ResultControl::UpdateDuplicates || point_.operation == ResultControl::CommitDuplicates
+                            || point_.operation == ResultControl::ReleaseTail;
+        if (append && point_.release_group != ResultControl::ReleaseGroup && tokens != 0) return { {}, std::nullopt };
+        if (append || (tokens == 0 && point_.operation == ResultControl::ReleaseGroup)) {
             Work cpu{
                 { append ? "allocator.release_pages" : "allocator.finish_release_group", implementation_, "cpu_service" },
                 { { "nonempty", tokens > 0 ? 1 : 0 } }
@@ -33,12 +34,12 @@ public:
             return { { { std::move(cpu), CallKind::Cpu, {} } }, std::nullopt };
         }
         if (tokens == 0) return { {}, std::nullopt };
-        if (point_ == ResultControl::ConvertReleasedIndices) {
+        if (point_.operation == ResultControl::ConvertReleasedIndices) {
             Work conversion{
                 { "allocator.release_indices_to_pages",               "aten.cpu_floor_divide_unique_to_npu",                       "cpu_service" },
                 {               { "elements", tokens }, { "released_pages", features.at("released_pages") }, { "element_bytes", element_bytes_ } }
             };
-            NativeCall call{ std::move(conversion), CallKind::Readback, {} };
+            NativeCall call{ std::move(conversion), CallKind::HostResponse, {} };
             call.synchronization = Work{
                 { "runtime.stream_sync", "ascend.runtime", "idle_stream_sync_interval" },
                 { { "previous_work_completed", 1 } }
@@ -47,7 +48,7 @@ public:
             call.caller_preparations.push_back({ *call.synchronization, "AscendCL@aclrtSynchronizeStream" });
             return { { std::move(call) }, std::nullopt };
         }
-        Work concatenate = point_ == ResultControl::ReleaseGroup
+        Work concatenate = point_.operation == ResultControl::ReleaseGroup
             ? Work{ { "allocator.release_group_concatenate", "aten.cat:npu:request_indices", "device_service" },
                     { { "elements", tokens }, { "input_tensors", features.at("input_tensors") }, { "element_bytes", element_bytes_ }, { "tensor_rank", 1 } } }
             : Work{ { "release.concatenate", "ascend.paged_immediate.regular", "device_service" },
@@ -58,13 +59,14 @@ public:
     }
 
 private:
-    ResultControl point_;
+    ResultControlPoint point_;
     std::string implementation_;
     double element_bytes_;
 };
 
 void release_steps(std::vector<ObservedCallSequence> & sequences, const Observations & observed, const HostControl & control, double index_element_bytes,
-                   bool immediate) {
+                   ResultControl entry) {
+    const bool immediate = entry != ResultControl::ReleaseGroup;
     const auto & features = control.work.features;
     const auto tokens = features.at(immediate ? "released_tokens" : "grouped_tokens");
     std::vector<const ObservedSpan *> cats;
@@ -84,26 +86,28 @@ void release_steps(std::vector<ObservedCallSequence> & sequences, const Observat
     };
     const auto first_end = !nonempty ? control.region.end_ns : immediate ? control.region.begin_ns : cats.front()->end_ns;
     const auto last_begin = nonempty ? cats.back()->begin_ns : control.region.end_ns;
-    const auto entry = immediate ? ResultControl::UpdateDuplicates : ResultControl::ReleaseGroup;
+    const ResultControlPoint start{ entry, entry };
+    const ResultControlPoint conversion{ ResultControl::ConvertReleasedIndices, entry };
+    const ResultControlPoint publication{ ResultControl::PublishReleasedPages, entry };
     sequences.push_back({
         { control.region.resource, control.region.begin_ns, first_end, control.region.record },
-        std::make_unique<ReleaseCall>(entry, control.work.kind.implementation, index_element_bytes),
+        std::make_unique<ReleaseCall>(start, control.work.kind.implementation, index_element_bytes),
         immediate ? "result_release_append" : "result_release_group",
-        entry,
+        start,
         source_work
     });
     sequences.push_back({
         { control.region.resource, first_end, last_begin, control.region.record },
-        std::make_unique<ReleaseCall>(ResultControl::ConvertReleasedIndices, control.work.kind.implementation, index_element_bytes),
+        std::make_unique<ReleaseCall>(conversion, control.work.kind.implementation, index_element_bytes),
         "result_release_conversion",
-        ResultControl::ConvertReleasedIndices,
+        conversion,
         source_work
     });
     sequences.push_back({
         { control.region.resource, last_begin, control.region.end_ns, control.region.record },
-        std::make_unique<ReleaseCall>(ResultControl::PublishReleasedPages, control.work.kind.implementation, index_element_bytes),
+        std::make_unique<ReleaseCall>(publication, control.work.kind.implementation, index_element_bytes),
         "result_release_publish",
-        ResultControl::PublishReleasedPages,
+        publication,
         source_work
     });
 }
@@ -124,29 +128,29 @@ std::vector<ObservedCallSequence> read_result_releases(const Observations & obse
                     parent = &candidate;
             }
             if (!parent) continue;
-            if (parent->work.kind.operation == "cache.update_prefix" && features.at("grouped") == 0) {
-                release_steps(sequences, observed, control, index_element_bytes, true);
-                continue;
-            }
-            if (features.at("grouped") != 1) continue;
             auto point = ResultControl::UpdateDuplicates;
             if (parent->work.kind.operation == "cache.commit_prefix") {
                 const bool earlier_release = std::ranges::any_of(result.processed->controls, [&](Index other) {
                     const auto & previous = observed.host_controls[other];
-                    return previous.work.kind.operation == "allocator.release_pages" && previous.work.features.at("grouped") == 1
+                    return previous.work.kind.operation == "allocator.release_pages" && previous.work.features.at("grouped") == features.at("grouped")
                            && parent->region.begin_ns <= previous.region.begin_ns && previous.region.end_ns <= control.region.begin_ns;
                 });
                 point = earlier_release ? ResultControl::ReleaseTail : ResultControl::CommitDuplicates;
             }
+            if (features.at("grouped") == 0) {
+                release_steps(sequences, observed, control, index_element_bytes, point);
+                continue;
+            }
+            const ResultControlPoint site{ point };
             sequences.push_back({ control.region,
-                                  std::make_unique<ReleaseCall>(point, control.work.kind.implementation, index_element_bytes),
+                                  std::make_unique<ReleaseCall>(site, control.work.kind.implementation, index_element_bytes),
                                   "result_release_append",
-                                  point,
+                                  site,
                                   { { { "allocator.release_indices", {}, {} }, { { "released_tokens", features.at("released_tokens") } } } } });
         }
         if (control.work.kind.operation != "allocator.finish_release_group") continue;
         if (features.at("need_sort") != 0) continue;
-        release_steps(sequences, observed, control, index_element_bytes, false);
+        release_steps(sequences, observed, control, index_element_bytes, ResultControl::ReleaseGroup);
     }
     return sequences;
 }

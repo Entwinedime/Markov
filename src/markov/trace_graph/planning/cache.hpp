@@ -86,6 +86,7 @@ public:
     std::size_t used_pages(Tier tier) const;
     std::size_t peak_pages(Tier tier) const { return tier == Tier::Device ? peak_device_pages_ : peak_host_pages_; }
     std::size_t available_pages(Tier tier) const;
+    std::size_t free_device_pages() const { return config_.device_pages - used_device_pages_; }
     std::size_t device_pages_allocated_since_return() const { return device_allocation_run_; }
     std::size_t ready_layers(RadixId node, Tier tier) const;
 
@@ -93,7 +94,9 @@ public:
     // Prefetch callers commit only the accepted prefix and retain any in-flight
     // remainder until the worker has actually returned.
     std::optional<BufferId> reserve(Tier tier, std::size_t pages);
-    std::size_t reserved_pages(BufferId buffer) const { return buffers_.at(buffer).pages; }
+    std::optional<BufferId> reserve_request(std::size_t pages);
+    void allocate_reserved(BufferId buffer, std::size_t pages);
+    std::size_t buffer_pages(BufferId buffer) const { return buffers_.at(buffer).pages; }
     PublicationId begin_device_publication();
     std::size_t publication_pages(PublicationId publication) const;
     DeviceCommit commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer = std::nullopt);
@@ -124,6 +127,7 @@ private:
     struct Buffer {
         Tier tier;
         std::size_t pages;
+        std::size_t unallocated_pages = 0;
     };
     struct Copy {
         CopyKind kind;
@@ -142,6 +146,7 @@ private:
     void apply_split(const RadixMatch & change, std::vector<IndexCopy> & copies);
     void touch(const RadixMatch & change);
     bool take_pages(Tier tier, std::size_t pages);
+    void occupy_pages(Tier tier, std::size_t pages);
     void return_pages(Tier tier, std::size_t pages);
     void detach_empty_leaf(RadixId node);
 
@@ -152,6 +157,7 @@ private:
         CacheNode{ CacheSlot{}, CacheSlot{} }
     };
     std::size_t used_device_pages_ = 0;
+    std::size_t reserved_device_pages_ = 0;
     std::size_t device_allocation_run_ = 0;
     std::size_t used_host_pages_ = 0;
     std::size_t peak_device_pages_ = 0, peak_host_pages_ = 0;

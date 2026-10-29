@@ -105,7 +105,7 @@ bool NativePlan::extend(const NativeSequence & sequence, CallResources resources
             const auto & preparation = call.caller_preparations[id];
             const auto node = append(preparation.work, preparation.work.kind.timing_scope.c_str(), resources.caller, caller_);
             if (!call.sources.caller_preparations.empty()) steps_[node].source_native_work = call.sources.caller_preparations[id];
-            if (call.kind == CallKind::Readback) {
+            if (call.kind == CallKind::HostResponse) {
                 depend(device_ ? std::optional(device_->completion) : std::nullopt, node);
                 depend(worker_, node);
                 preceding_waits_.emplace_back(node, resources.worker);
@@ -124,7 +124,7 @@ bool NativePlan::extend(const NativeSequence & sequence, CallResources resources
                 append(load, load.kind.timing_scope.c_str(), resources.caller, caller_);
             }
         }
-        if (call.kind == CallKind::Readback) {
+        if (call.kind == CallKind::HostResponse) {
             const auto & synchronization = call.synchronization.value();
             const auto ready = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
             depend(device_ ? std::optional(device_->completion) : std::nullopt, ready);
@@ -134,10 +134,20 @@ bool NativePlan::extend(const NativeSequence & sequence, CallResources resources
         }
         const auto & caller_work = call.caller_work ? *call.caller_work : call.work;
         cpu(caller_work, "cpu_service", "residual_interval", resources.caller, caller_, call.sources.caller_before);
-        if (call.kind == CallKind::Cpu || call.kind == CallKind::Readback) continue;
+        if (call.kind == CallKind::Cpu || call.kind == CallKind::HostResponse) continue;
 
         auto returned = caller_work;
         returned.kind.operation += ".return";
+        if (call.kind == CallKind::Readback) {
+            const auto & synchronization = call.synchronization.value();
+            const auto ready = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
+            depend(device_ ? std::optional(device_->completion) : std::nullopt, ready);
+            depend(worker_, ready);
+            preceding_waits_.emplace_back(ready, resources.worker);
+            preceding_waits_.emplace_back(ready, resources.device);
+            append(returned, "post_sync_readback_interval", resources.caller, caller_);
+            continue;
+        }
         auto dispatch = caller_;
         const auto worker_work = call.worker_work(call.work);
         const auto ready = append(worker_work, "dispatch_interval", resources.worker, dispatch, true);
