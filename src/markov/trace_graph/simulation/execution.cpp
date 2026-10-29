@@ -73,7 +73,10 @@ graph::NodeId Execution::submit(Mutation mutation) {
     result_.completions_ns.resize(end, 0);
     incoming_.insert(incoming_.end(), incoming.begin(), incoming.end());
     result_.states.resize(end, OperationState::Pending);
-    for (auto & operation : mutation.operations) owned_.push_back({ std::move(operation), mutation.owner, {} });
+    for (auto & operation : mutation.operations) {
+        const auto owner = operation.owner.value_or(mutation.owner);
+        owned_.push_back({ std::move(operation), owner, {} });
+    }
     for (const auto & edge : mutation.dependencies) record_edge(edge);
     for (auto id = begin; id < end; ++id) {
         if (incoming_[id] == 0) ready(id);

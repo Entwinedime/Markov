@@ -37,6 +37,7 @@ struct PlannedOperation {
     bool delay = false; // Readiness latency; it does not occupy a service resource.
     std::optional<std::size_t> source_operation = std::nullopt;
     std::optional<std::size_t> source_native_work = std::nullopt;
+    std::optional<simulation::Component> owner = std::nullopt;
 };
 
 struct PlannedMutation {

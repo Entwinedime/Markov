@@ -132,6 +132,8 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
         10,
         { "cache.load", "kernel_ascend.page_first_direct", "device_service" },
         { "cache.backup", "kernel_ascend.page_first_direct", "device_service" },
+        { "cache.backup.caller", "sglang.HiCacheController.write:kernel_ascend.page_first_direct", "caller_blocking_interval" },
+        { "cache.backup.completion", "sglang.HiCacheController.write:kernel_ascend.page_first_direct", "completion_observation_upper_interval" },
         { 128,
           { "cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service" },
           { "cache.prefetch.read_page", "file.generic_page_get", "storage_worker_service" },

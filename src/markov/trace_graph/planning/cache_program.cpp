@@ -90,11 +90,15 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
     for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
         const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
         mutation.operations.push_back({ resource, std::cref(work) });
+        const auto previous = queues_.native.find(resource);
+        if (previous != queues_.native.end()) mutation.dependencies.push_back({ previous->second, begin + rank, graph::EdgeKind::ResourceOrder });
         mutation.dependencies.push_back({ begin + rank, begin + backend_.participants, graph::EdgeKind::DataDependency });
     }
     mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::CopyDone, transfer) });
     const auto submitted = submit(runtime, std::move(mutation));
     if (submitted) {
+        for (std::size_t rank = 0; rank < backend_.participants; ++rank)
+            queues_.native[source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1)] = begin + rank;
         kind == CopyKind::Load ? ++loads_ : ++backups_;
         copy_frontier_[kind == CopyKind::Load ? 0 : 1] = begin + backend_.participants;
     }
@@ -113,7 +117,7 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
             if (started.status == CopyStatus::Started) {
                 if (!copy(runtime, *started.transfer, node, CopyKind::Backup, started.pages, true)) return false;
                 reclaiming += started.pages;
-                backups.push_back(copies_.at(*started.transfer).completion);
+                backups.push_back(copies_.at(*started.transfer).completion.value());
             }
         }
     }
@@ -395,153 +399,6 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     compute->start(runtime, ready, 0);
 }
 
-FrameInput CacheProgram::begin_frame(std::size_t request, std::size_t frame, FrameInput input) {
-    auto & running = running_[request];
-    const auto context = static_cast<std::size_t>(input.context_tokens);
-    auto & views = running.allocation_views;
-    auto at = views.find(context);
-    if (at == views.end()) {
-        const auto previous = views.empty() ? requests_[request].device_hit_pages * page_tokens_ : views.rbegin()->first;
-        const auto pages = (context + page_tokens_ - 1) / page_tokens_ - (previous + page_tokens_ - 1) / page_tokens_;
-        const auto offset = cache_.device_pages_allocated_since_return();
-        cache_.allocate_reserved(*running.buffer, pages);
-        at = views.emplace(context, offset).first;
-    }
-    input.device_pages_allocated_since_return = at->second;
-    if (source_.observations().compute_frames[frame].phase == Phase::Prefill) requests_[request].device_pages_allocated_since_return = at->second;
-    return input;
-}
-
-std::size_t CacheProgram::release_group(std::size_t request, std::size_t frame, ResultControl group) {
-    // TP participants share one logical iteration, not one source frame ID.
-    const auto iteration = static_cast<std::size_t>(source_.observations().compute_frames[frame].sequence_tokens.front());
-    auto & groups = running_[request].release_groups;
-    const auto [at, inserted] = groups.try_emplace(std::pair(iteration, group), release_groups_.size());
-    if (inserted) release_groups_.push_back({ request, {}, std::nullopt, {}, std::nullopt });
-    return at->second;
-}
-
-std::vector<Work> CacheProgram::begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint point) {
-    const auto control = point.operation;
-    auto & running = running_[request];
-    switch (control) {
-    case ResultControl::UpdateDuplicates:
-    case ResultControl::CommitDuplicates:
-    case ResultControl::ReleaseTail: {
-        const auto & observed = source_.observations();
-        const auto committed = observed.token_paths.length(observed.request_tokens.at(observed.requests[request].identity).committed.value().path);
-        const auto tokens = control == ResultControl::ReleaseTail        ? committed % page_tokens_
-                            : control == ResultControl::UpdateDuplicates ? running.prefix_insertion->duplicate_pages * page_tokens_
-                                                                         : running.final_insertion->duplicate_pages * page_tokens_;
-        auto & group = release_groups_[release_group(request, frame, point.release_group)];
-        group.indices.try_emplace(control, tokens);
-        return {
-            { { "allocator.release_indices", {}, {} }, { { "released_tokens", tokens } } }
-        };
-    }
-    case ResultControl::ReleaseGroup:
-    case ResultControl::ConvertReleasedIndices:
-    case ResultControl::PublishReleasedPages: {
-        auto & group = release_groups_[release_group(request, frame, point.release_group)];
-        if (!group.free_pages) group.free_pages = cache_.free_device_pages();
-        std::size_t tokens = 0, pages = 0, tensors = 0;
-        for (const auto & [point, count] : group.indices) {
-            tokens += count;
-            pages += (count + page_tokens_ - 1) / page_tokens_;
-            if (count) ++tensors;
-        }
-        return {
-            { { "allocator.release_group", {}, {} },
-             { { "released_tokens", tokens }, { "released_pages", pages }, { "input_tensors", tensors }, { "free_pages", *group.free_pages } } }
-        };
-    }
-    default:
-        break;
-    }
-    if (control == ResultControl::MatchPrefix) {
-        if (running.prefix_match) return *running.prefix_match;
-        const auto leaf = running.prefix_insertion->leaf;
-        std::size_t tensors = 0;
-        for (auto node = leaf; node != 0; node = cache_.tree().nodes()[node].parent)
-            if (cache_.node(node).device) ++tensors;
-        const auto pages = cache_.page_count(leaf);
-        running.prefix_match = std::vector<Work>{
-            {         { "cache.index_match", {}, {} },         { { "pages", pages }, { "input_tensors", tensors } } },
-            { { "cache.request_table_write", {}, {} }, { { "pages", pages - requests_[request].device_hit_pages } } }
-        };
-        return *running.prefix_match;
-    }
-    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
-    if (insertion) return insertion->work;
-    const auto & observed = source_.observations();
-    const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
-    const auto path = control == ResultControl::UpdatePrefix ? tokens.prompt.value().path : tokens.committed.value().path;
-    const auto pages = observed.token_paths.pages(path, page_tokens_);
-    const auto publication = cache_.begin_device_publication();
-    auto committed = cache_.commit_device(pages, *running.buffer, publication);
-    const auto protected_pages = control == ResultControl::UpdatePrefix || !running.prefix_insertion ? requests_[request].device_hit_pages
-                                                                                                     : cache_.page_count(running.prefix_insertion->leaf);
-    insertion = RunningRequest::Insertion{ committed.node, pages.size() - protected_pages - committed.allocated_pages, {}, {}, std::nullopt };
-    if (control == ResultControl::UpdatePrefix) running.prefix_publication = publication;
-    for (const auto & copy : committed.index_copies)
-        insertion->work.push_back({
-            { "cache.index_clone", {}, {} },
-            { { "pages", copy.pages }, { "host", copy.tier == Tier::Host ? 1 : 0 } }
-        });
-    cache_.unpin_device(*running.pin);
-    running.pin = committed.node;
-    cache_.pin_device(*running.pin);
-    if (control == ResultControl::CommitPrefix) {
-        running.committed = committed.node;
-        running.final_publication = publication;
-    }
-    return insertion->work;
-}
-
-void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint point, graph::NodeId completion) {
-    const auto control = point.operation;
-    if (control == ResultControl::PublishReleasedPages) {
-        const auto group_id = release_group(request, frame, point.release_group);
-        auto & group = release_groups_[group_id];
-        group.completions.push_back(completion);
-        if (group.completions.size() != backend_.participants) return;
-        const auto end = runtime.next_node();
-        PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::ReleasedPages, group_id) } }, {} };
-        for (const auto node : group.completions) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
-        runtime.submit(std::move(mutation));
-        return;
-    }
-    if (control != ResultControl::UpdatePrefix && control != ResultControl::CommitPrefix) return;
-    auto & running = running_[request];
-    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
-    insertion->completions.push_back(completion);
-    if (insertion->completions.size() != backend_.participants) return;
-    const auto end = runtime.next_node();
-    PlannedMutation mutation{
-        0,
-        { { 0, Boundary{}, action(control == ResultControl::UpdatePrefix ? ActionKind::PrefixInserted : ActionKind::FinalInserted, request) } },
-        {}
-    };
-    for (const auto node : insertion->completions) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
-    runtime.submit(std::move(mutation));
-}
-
-void CacheProgram::complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control) {
-    auto & running = running_[request];
-    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
-    insertion->completed = cause_;
-    if (control == ResultControl::CommitPrefix) {
-        if (running.outputs_ready && running.final_publication) publish_result(runtime, request);
-        return;
-    }
-    cache_.publish_all(*running.prefix_publication);
-    cache_.acknowledge(*running.prefix_publication);
-    running.prefix_publication.reset();
-    requests_[request].prefill_prefix_published = cause_;
-    backup_prefix(runtime, insertion->leaf);
-    if (waiting_) advance(runtime);
-}
-
 void CacheProgram::publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request) {
     const auto & observed = source_.observations();
     const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
@@ -657,7 +514,11 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         cache_.acknowledge(*running.final_publication);
         running.final_publication.reset();
         requests_[request].kv_published = event.identity;
-        backup_prefix(runtime, *running.committed);
+        if (running.final_insertion) {
+            running.compute->resume_controls(runtime, event.identity);
+            if (running.compute->issue()) issue_ = running.compute->issue();
+        }
+        else backup_prefix(runtime, *running.committed);
         if (waiting_) advance(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ReleasedPages)) {
@@ -711,13 +572,18 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         request_stage_ = RequestStage::BeforeStart;
         advance(runtime);
     }
+    else if (event.action.kind == std::to_underlying(ActionKind::CopyParticipantDone)) {
+        copies_.at(event.action.subject).copy_completions.push_back(event.identity);
+        join_copy(runtime, event.action.subject);
+    }
     else if (event.action.kind == std::to_underlying(ActionKind::CopyDone)) {
         const auto transfer = event.action.subject;
         auto pending = std::move(copies_.at(transfer));
-        // This backend copies every layer in one DMA; publish once after all
-        // participating copies, then acknowledge and release their pins.
+        // Publish the all-layer batch after every participant and retained caller
+        // has completed; then acknowledge and release the source pins.
         cache_.publish_all(transfer);
         cache_.acknowledge(transfer);
+        completed_copies_.push_back({ pending.kind, pending.pages, std::move(pending.caller_returns), std::move(pending.copy_completions), event.identity });
         if (storage_ && pending.kind == CopyKind::Backup) storage_->enqueue_write(runtime, pending.node, std::move(pending.storage_pages), event.identity);
         copies_.erase(transfer);
         if (pending.kind == CopyKind::Load) requests_[request_].loaded_pages += pending.pages;

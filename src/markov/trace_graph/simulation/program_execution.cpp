@@ -31,7 +31,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             ++coverage[*response.coverage];
             bound.operations.push_back({
                 { *response.duration_ns, operation.resource, operation.delay ? graph::NodeKind::Delay : graph::NodeKind::Service },
-                operation.completion
+                operation.completion,
+                operation.owner
             });
         }
         else if (const auto * delay = std::get_if<planning::SourceDelay>(&operation.cost)) {
@@ -39,7 +40,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             ++coverage[*response.coverage];
             bound.operations.push_back({
                 { *response.duration_ns, operation.resource, graph::NodeKind::Delay },
-                operation.completion
+                operation.completion,
+                operation.owner
             });
         }
         else if (const auto * interval = std::get_if<planning::SourceCpuGap>(&operation.cost)) {
@@ -51,13 +53,15 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             ++coverage[*response.coverage];
             bound.operations.push_back({
                 { *response.duration_ns, operation.resource, graph::NodeKind::Delay },
-                operation.completion
+                operation.completion,
+                operation.owner
             });
         }
         else
             bound.operations.push_back({
                 { 0, operation.resource, graph::NodeKind::Boundary },
-                operation.completion
+                operation.completion,
+                operation.owner
             });
     }
     if (!gaps_.empty()) {

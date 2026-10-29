@@ -121,7 +121,8 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         frame.overlap = result && result->overlap;
         frame.publishes_prefill_prefix = frame.phase == Phase::Prefill && result && result->processed && result->processed->finished_after.size() == 1
                                          && !result->processed->finished_after.front();
-        stats_.frames.push_back({ input.frame });
+        stats_.frames.emplace_back();
+        stats_.frames.back().source_frame = input.frame;
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
             return;
@@ -170,14 +171,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                     return;
                 }
                 auto placement = site.resources.unique_resources();
-                if (!placement) {
-                    if (!site.resources.workers.empty() || !site.resources.devices.empty()) {
-                        issue_ = "result_control_queues_unavailable:" + call.role + ":workers=" + std::to_string(site.resources.workers.size())
-                                 + ":devices=" + std::to_string(site.resources.devices.size());
-                        return;
-                    }
-                    placement = result_resources.value_or(*resources);
-                }
+                if (!placement) { placement = result_resources.value_or(*resources); }
                 frame.results.push_back(result_steps_.size());
                 result_steps_.push_back({ id, sequence, *placement, {} });
             }
@@ -360,12 +354,21 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
     auto & step = result_steps_[step_id];
     const auto & site = source_.sequence(step.sequence);
     const auto & call = site.observation;
-    const auto work = call.control ? controls_->begin_result_control(request_, stats_.frames[id].source_frame, *call.control) : std::vector<Work>{};
-    auto calls = call.definition->describe(frame.phase, frame.input, work);
+    const auto work = call.control ? controls_->begin_result_control(request_, stats_.frames[id].source_frame, *call.control) : std::optional(ControlWork{});
+    frame.control_pending = !work;
+    if (!work) return;
+    auto calls = call.definition->describe(frame.phase, frame.input, work->work);
     if (calls.issue) {
         issue_ = calls.issue;
         return;
     }
+    if (!site.resources.unique_resources() && (!site.resources.workers.empty() || !site.resources.devices.empty())
+        && std::ranges::any_of(calls.calls, [](const NativeCall & native) { return native.kind != CallKind::Cpu && native.kind != CallKind::HostCall; })) {
+        issue_ = "result_control_queues_unavailable:" + call.role;
+        return;
+    }
+    for (auto & native : calls.calls)
+        if (native.async_work) native.async_completion = work->completions.at(*native.async_work);
     source_.bind_native_sources(step.sequence, calls.calls);
     if (!step.plan.extend(calls, step.resources, preparations_)) {
         issue_ = "kernel_cache_initial_state_unavailable";
@@ -383,6 +386,11 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
     ++counts.sequences;
     counts.operations += step.plan.operations();
     stats_.native_operations += step.plan.operations();
+}
+
+void ComputeProgram::resume_controls(ProgramRuntime & runtime, graph::NodeId cause) {
+    for (std::size_t id = 0; id < frames_.size(); ++id)
+        if (frames_[id].control_pending) run_result(runtime, id, cause);
 }
 
 void ComputeProgram::result_step_submitted(ProgramRuntime & runtime, const simulation::Event & event) {

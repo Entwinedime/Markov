@@ -25,6 +25,7 @@ public:
 struct Operation {
     graph::Node node;
     std::optional<Action> completion = std::nullopt;
+    std::optional<Component> owner = std::nullopt;
 };
 
 struct Mutation {

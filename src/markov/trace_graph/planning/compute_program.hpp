@@ -22,12 +22,17 @@ struct FrameCompute {
 
 enum class ComputeScope { Compute, Request };
 
+struct ControlWork {
+    std::vector<Work> work;
+    std::vector<AsyncCompletion> completions = {};
+};
+
 class RequestControls {
 public:
     virtual ~RequestControls() = default;
     virtual FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) = 0;
-    // Adapters expand logical cache effects before the runtime queries costs.
-    virtual std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) = 0;
+    // No value means the control awaits a state event; an empty vector is a completed no-op.
+    virtual std::optional<ControlWork> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) = 0;
     virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint control, graph::NodeId completion) = 0;
 };
 
@@ -60,6 +65,7 @@ public:
                    RequestControls * controls = nullptr, std::size_t request = 0);
     ComputeProgram(const ComputeProgram &) = delete;
 
+    void resume_controls(ProgramRuntime & runtime, graph::NodeId cause);
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt);
     void start(ProgramRuntime & runtime) override { start(runtime, std::nullopt); }
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
@@ -110,6 +116,7 @@ private:
         bool overlap = false;
         bool publishes_prefill_prefix = false;
         bool callers_modeled = false, callers_requested = false, next_started = false, finished = false;
+        bool control_pending = false;
     };
     struct ResultStep {
         std::size_t frame;

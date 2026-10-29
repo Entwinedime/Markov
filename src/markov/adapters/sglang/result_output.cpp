@@ -72,6 +72,25 @@ private:
     bool send_;
 };
 
+class CacheBackup final : public CallSequence {
+public:
+    NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work> work) const override {
+        NativeSequence result{ {}, std::nullopt };
+        const auto clone = cache_index_copies();
+        for (std::size_t id = 0; id < work.size(); ++id) {
+            const auto & operation = work[id];
+            result.calls.push_back({ operation, CallKind::HostCall, {} });
+            result.calls.back().async_work = id;
+            const std::vector<Work> indices{
+                { { "cache.index_clone", {}, {} }, { { "pages", operation.features.at("pages") }, { "host", 1 } } }
+            };
+            auto copies = clone->describe(phase, input, indices);
+            result.calls.insert(result.calls.end(), std::make_move_iterator(copies.calls.begin()), std::make_move_iterator(copies.calls.end()));
+        }
+        return result;
+    }
+};
+
 class CacheIndexValues final : public CallSequence {
 public:
     CacheIndexValues(double tokens, double source_element_bytes) : tokens_(tokens), source_element_bytes_(source_element_bytes) {}
@@ -279,6 +298,21 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                                     "cache_index_insertion",
                                     ResultControlPoint{ operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix },
                                     std::move(source_work) });
+                auto backup_region = ObservedRegion{ parent.resource, region.end_ns, region.end_ns, region.record };
+                for (const auto & span : observed.spans)
+                    if (span.resource == parent.resource && observed.names[span.name] == "npu::transfer_kv_dim_exchange" && region.end_ns <= span.begin_ns
+                        && span.end_ns <= control.region.end_ns) {
+                        backup_region.end_ns = span.end_ns;
+                        for (const auto & tail : observed.spans)
+                            if (tail.resource == parent.resource && observed.names[tail.name] == "aten::clone" && span.end_ns <= tail.begin_ns
+                                && tail.end_ns <= control.region.end_ns)
+                                backup_region.end_ns = std::max(backup_region.end_ns, tail.end_ns);
+                    }
+                callers.push_back(
+                    { backup_region,
+                      std::make_unique<CacheBackup>(),
+                      "cache_backup_response",
+                      ResultControlPoint{ operation == "cache.update_prefix" ? ResultControl::BackupUpdatedPrefix : ResultControl::BackupCommittedPrefix } });
                 if (operation != "cache.update_prefix") continue;
                 const ObservedSpan * concatenation = nullptr;
                 const ObservedSpan * table_write = nullptr;

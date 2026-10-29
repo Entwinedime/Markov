@@ -24,6 +24,8 @@ enum class ResultControl {
     UpdatePrefix,
     CommitPrefix,
     MatchPrefix,
+    BackupUpdatedPrefix,
+    BackupCommittedPrefix,
     UpdateDuplicates,
     CommitDuplicates,
     ReleaseTail,
@@ -60,6 +62,13 @@ struct CallerPreparation {
     bool operator==(const CallerPreparation &) const = default;
 };
 
+struct AsyncCompletion {
+    Work work;
+    std::size_t resource;
+    simulation::Action completed;
+    simulation::Component owner;
+};
+
 struct NativeCall {
     Work work;
     CallKind kind;
@@ -88,6 +97,8 @@ struct NativeCall {
     std::optional<Features> worker_features = std::nullopt;
     Work worker_work(const Work & operation) const;
     std::vector<CallerPreparation> caller_preparations = {};
+    std::optional<std::size_t> async_work = std::nullopt;
+    std::optional<AsyncCompletion> async_completion = std::nullopt;
 };
 
 struct NativeSequence {
@@ -195,8 +206,11 @@ private:
         bool delay;
         std::optional<std::size_t> source_operation = std::nullopt;
         std::optional<std::size_t> source_native_work = std::nullopt;
+        std::optional<simulation::Action> completion = std::nullopt;
+        std::optional<simulation::Component> owner = std::nullopt;
     };
     std::vector<Step> steps_;
+    NativeFrontier async_frontier_;
     std::vector<graph::Edge> edges_;
     std::vector<std::pair<graph::NodeId, std::size_t>> preceding_waits_;
     std::optional<graph::NodeId> caller_, worker_;

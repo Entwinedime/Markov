@@ -101,7 +101,18 @@ bool NativePlan::extend(const NativeSequence & sequence, CallResources resources
     for (const auto & call : sequence.calls) {
         // Closed host API responses already include their own return; do not split or charge them again.
         if (call.kind == CallKind::HostCall) {
+            const auto entry = caller_;
             append(call.work, call.work.kind.timing_scope.c_str(), resources.caller, caller_);
+            if (call.async_completion) {
+                const auto & response = *call.async_completion;
+                auto [tail, inserted] = async_frontier_.try_emplace(response.resource, 0);
+                std::optional<graph::NodeId> previous = inserted ? std::nullopt : std::optional(tail->second);
+                const auto ready = append(response.work, response.work.kind.timing_scope.c_str(), response.resource, previous);
+                depend(entry, ready);
+                tail->second = ready;
+                steps_[ready].completion = response.completed;
+                steps_[ready].owner = response.owner;
+            }
             continue;
         }
 
@@ -230,7 +241,8 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
                 result.dependencies.push_back({ previous->second, begin + result.operations.size(), graph::EdgeKind::ResourceOrder });
         }
         if (const auto * work = std::get_if<Work>(&step.cost))
-            result.operations.push_back({ step.resource, std::cref(*work), std::nullopt, step.delay, step.source_operation, step.source_native_work });
+            result.operations.push_back(
+                { step.resource, std::cref(*work), step.completion, step.delay, step.source_operation, step.source_native_work, step.owner });
         else result.operations.push_back({ step.resource, std::get<SourceCpuGap>(step.cost), std::nullopt, true });
     }
     for (const auto & edge : edges_) {

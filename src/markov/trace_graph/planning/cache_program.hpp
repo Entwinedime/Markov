@@ -7,6 +7,7 @@
 #include "markov/trace_graph/source/context.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -19,7 +20,7 @@ namespace markov::trace_graph::planning {
 
 struct CacheBackend {
     std::size_t layers, bytes_per_token, participants, minimum_load_tokens;
-    WorkKind load, backup;
+    WorkKind load, backup, backup_caller, backup_completion;
     StorageBackend storage;
 };
 
@@ -31,6 +32,13 @@ struct CacheRequestResult {
     std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
     std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, pages_released, work_completed;
+};
+
+struct CacheCopyResult {
+    CopyKind kind;
+    std::size_t pages;
+    std::vector<graph::NodeId> caller_returns, completion_observations;
+    graph::NodeId published;
 };
 
 // Cache/storage, known compute and interpreted native controls share one clock.
@@ -50,6 +58,7 @@ public:
     ComputeStats compute_stats() const;
     const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
     const std::vector<CacheRequestResult> & requests() const { return requests_; }
+    const std::vector<CacheCopyResult> & completed_copies() const { return completed_copies_; }
     const std::optional<std::string> & issue() const { return issue_; }
     const PreparationCache & preparations() const { return preparations_; }
     std::size_t backups() const { return backups_; }
@@ -62,6 +71,7 @@ public:
 private:
     enum class ActionKind : std::uint32_t {
         CopyDone,
+        CopyParticipantDone,
         EvictionDone,
         Received,
         AdmissionGranted,
@@ -82,8 +92,9 @@ private:
         bool evict_after;
         CopyKind kind;
         std::size_t pages;
-        graph::NodeId completion;
+        std::optional<graph::NodeId> completion;
         std::vector<PrefixId> storage_pages;
+        std::vector<graph::NodeId> copy_completions = {}, caller_returns = {};
     };
     struct RunningRequest {
         struct Insertion {
@@ -103,6 +114,7 @@ private:
         bool queried = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
+        std::map<ResultControl, std::vector<TransferId>> backups;
         std::map<std::pair<std::size_t, ResultControl>, std::size_t> release_groups;
         std::map<std::size_t, std::size_t> allocation_views;
         std::optional<graph::NodeId> outputs_ready;
@@ -118,7 +130,9 @@ private:
     };
     std::size_t release_group(std::size_t request, std::size_t frame, ResultControl group);
     FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) override;
-    std::vector<Work> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) override;
+    std::optional<ControlWork> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) override;
+    std::vector<Work> result_control_work(std::size_t request, std::size_t frame, ResultControlPoint control);
+    void join_copy(ProgramRuntime & runtime, TransferId transfer);
     void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint control, graph::NodeId completion) override;
     void finish_compute(ProgramRuntime & runtime, std::size_t request);
     void complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control);
@@ -150,6 +164,7 @@ private:
     ComputeStats compute_stats_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;
+    std::vector<CacheCopyResult> completed_copies_;
     std::array<std::optional<graph::NodeId>, 2> copy_frontier_;
     std::vector<RadixId> pending_evictions_;
     std::optional<RadixId> host_pin_;

@@ -298,6 +298,20 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         { "maximum_arrival_span_ns", compute.maximum_arrival_span_ns }
     };
     report["preparation_execution"] = preparation_report(compute);
+    report["copy_ports"] = Json::array();
+    for (const auto & copy : program.completed_copies()) {
+        auto returned = Json::array(), observed = Json::array();
+        for (const auto node : copy.caller_returns) returned.push_back(time(node));
+        for (const auto node : copy.completion_observations) observed.push_back(time(node));
+        report["copy_ports"].push_back({
+            {                 "direction",         copy.kind == planning::CopyKind::Backup ? "device_to_host" : "host_to_device" },
+            {                     "pages",                                                                            copy.pages },
+            { "cache_control_returned_ns",                                                                   std::move(returned) },
+            {    "completion_observed_ns",                                                                   std::move(observed) },
+            {              "published_ns",                                                                  time(copy.published) },
+            {          "completion_basis", copy.caller_returns.empty() ? "device_service" : "modeled_observation_upper_interval" }
+        });
+    }
     report["kernel_cache"] = kernel_cache_report(program.preparations());
     report["native_call_execution"] = {
         {    "compute_calls",     compute.compute_calls },
