@@ -2,4 +2,6 @@
 !pyproject.toml
 !python
 !python/**
+!src/markov/adapters/ascend/profiling
+!src/markov/adapters/ascend/profiling/**
 python/**/__pycache__

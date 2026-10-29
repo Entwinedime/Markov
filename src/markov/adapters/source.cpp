@@ -96,7 +96,8 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
         }
         else {
             ascend::TraceReader reader(observations, causality, file, file_id);
-            records = source::read_chrome_trace(file.path, reader);
+            records =
+                file.format == source::RecordFormat::JsonLines ? source::read_json_lines(file.path, reader) : source::read_chrome_trace(file.path, reader);
             reader.finish();
         }
         counts.push_back(records);

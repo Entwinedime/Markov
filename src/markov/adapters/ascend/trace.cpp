@@ -103,7 +103,8 @@ void TraceReader::record(std::size_t position, const nlohmann::json & event) {
         if (destination) pair.ambiguous = true;
         destination = span;
     }
-    causality_.observe(event, span, device, file_.channel == Channel::NativeHook);
+    if (file_.channel == Channel::NativeHook && args.contains("return_code") && args.at("return_code") != 0) ++output_.counts["ascend.failed_native_call"];
+    else causality_.observe(event, span, device, file_.channel == Channel::NativeHook);
     output_.span(span);
 }
 

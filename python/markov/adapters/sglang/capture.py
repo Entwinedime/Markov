@@ -47,6 +47,8 @@ def capture_environment():
         "TRITON_ENABLE_TASKQUEUE": "true",
         "ASCEND_USE_FIA": "1",
         "MARKOV_INPUT_FACTS": "/capture/probe",
+        "MARKOV_NATIVE_PROBE": "/capture/native",
+        "LD_PRELOAD": "/opt/markov/lib/libmarkov_runtime_probe.so",
         "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
     }
 
@@ -96,6 +98,9 @@ class Capture:
         return requests
 
     def run(self):
+        (self.directory / "native").mkdir()
+        control = self.directory / "native" / "enabled"
+        control.write_bytes(b"\0")
         requests = self.prepare_inputs()
         (self.directory / "probe").mkdir()
         (self.directory / "trace").mkdir()
@@ -112,7 +117,7 @@ class Capture:
             },
         )
         profiling = False
-        with (self.directory / "server.log").open("w") as log:
+        with control.open("r+b", buffering=0) as gate, (self.directory / "server.log").open("w") as log:
             server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 while True:
@@ -134,11 +139,14 @@ class Capture:
                     },
                 )
                 profiling = True
+                gate.write(b"\1")
                 for ordinal, row in enumerate(requests):
                     self.request(ordinal, row)
                 self.http("/stop_profile", {})
                 profiling = False
             finally:
+                gate.seek(0)
+                gate.write(b"\0")
                 # Export finishes before shutdown on success; failed captures
                 # retain their partial files without publishing a ready manifest.
                 if server.poll() is None:
@@ -199,9 +207,12 @@ class Capture:
 
         traces = sorted((self.directory / "trace").rglob("trace_view.json"))
         probes = sorted((self.directory / "probe").glob("*.jsonl"))
+        native = sorted((self.directory / "native").glob("*.jsonl"))
         ranks = self.plan["deployment"]["tensor_parallel"]
-        if len(traces) != ranks or len(probes) != ranks:
-            raise RuntimeError(f"Expected {ranks} worker traces and probes; received {len(traces)} and {len(probes)}")
+        if len(traces) != ranks or len(probes) != ranks or len(native) != ranks:
+            raise RuntimeError(
+                f"Expected {ranks} worker traces, probes and native observations; received {len(traces)}, {len(probes)}, {len(native)}"
+            )
         required = {
             "runtime.phase.batch_inputs",
             "runtime.phase.batch_input_start",
@@ -236,6 +247,15 @@ class Capture:
         for name, counts in ports.items():
             if counts != Counter({identity: 1 for identity in expected}):
                 raise RuntimeError(f"Request transport ports are incomplete or ambiguous: {name}: {dict(counts)}")
+        for path in native:
+            roles = set()
+            with path.open() as stream:
+                for line in stream:
+                    event = json.loads(line)
+                    if event["args"]["return_code"] == 0:
+                        roles.add(event["name"])
+            if not {"AscendCL@aclrtRecordEvent", "AscendCL@aclrtStreamWaitEvent"} <= roles:
+                raise RuntimeError(f"Native event observations are incomplete in {path.name}")
         files = [
             {"path": str(path.relative_to(self.directory)), "host_clock": trace_clock(path, anchors)} for path in traces
         ]
@@ -248,8 +268,13 @@ class Capture:
                 "status": "completed",
                 "profiling_ready": True,
                 "dry_run": False,
-                "scope": "Raw CPU/device trace and observed eager compute; semantic, dependency and cost coverage require qualification",
-                "trace": {"torch_trace_files": files, "ld_preload_trace_files": []},
+                "scope": "Raw trace, stream/events and eager compute; semantic, dependency and cost coverage require qualification",
+                "trace": {
+                    "torch_trace_files": files,
+                    "ld_preload_trace_files": [
+                        {"path": str(path.relative_to(self.directory)), "format": "jsonl"} for path in native
+                    ],
+                },
                 "sidecar": {
                     "python_probe_files": [
                         {"path": str(path.relative_to(self.directory)), "format": "jsonl"} for path in probes

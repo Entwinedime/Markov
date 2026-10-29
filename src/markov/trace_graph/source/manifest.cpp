@@ -33,7 +33,7 @@ void append_files(ProfileManifest & result, const nlohmann::json & entries, cons
         auto format = RecordFormat::Chrome;
         if (entry.contains("format")) {
             const auto name = entry.at("format").get<std::string>();
-            if (name == "jsonl" && channel == Channel::PythonProbe) format = RecordFormat::JsonLines;
+            if (name == "jsonl" && (channel == Channel::PythonProbe || channel == Channel::NativeHook)) format = RecordFormat::JsonLines;
             else if (name != "chrome") throw std::runtime_error("Unsupported record format for " + channel_name(channel) + ": " + name);
         }
         result.files.push_back({ channel, std::move(path), bytes, offset_ns, recorded, format });

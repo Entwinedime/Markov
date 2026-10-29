@@ -22,6 +22,7 @@ class ComputeProbe:
         self.batch_size = 0
         self.last_token_projection = False
         self.embedding_active = False
+        self.sampling_active = False
         self.collective_indices = {}
         self.attention_index = 0
 
@@ -258,10 +259,15 @@ class ComputeProbe:
             fields.update(tensor_fields("output", result))
             return result
 
+    def sample(self, original, sampler, *args, **kwargs):
+        self.sampling_active = True
+        try:
+            return original(sampler, *args, **kwargs)
+        finally:
+            self.sampling_active = False
+
     def argmax(self, original, x, dim=None, keepdim=False, *, out=None):
-        # shortcut: supported runs use this route only for greedy sampling;
-        # scope it to Sampler before admitting other argmax execution paths.
-        if x.ndim != 2 or dim not in (-1, 1) or keepdim or out is not None:
+        if not self.sampling_active or x.ndim != 2 or dim not in (-1, 1) or keepdim or out is not None:
             return original(x, dim, keepdim, out=out)
         fields = {**tensor_fields("input", x), "implementation": "sglang.Sampler.greedy_argmax"}
         with self.writer.span("runtime.phase.greedy_sampling", fields):
@@ -378,6 +384,7 @@ class ComputeProbe:
             "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head": self.projection,
             "sglang.srt.layers.logits_processor.LogitsProcessor._copy_logits_to_buffer": self.logits_output,
             "torch.argmax": self.argmax,
+            "sglang.srt.layers.sampler.Sampler.forward": self.sample,
             "sglang.srt.distributed.device_communicators.npu_communicator.NpuCommunicator.all_reduce": self.all_reduce,
             "sglang.srt.distributed.device_communicators.npu_communicator.NpuCommunicator.all_gather": self.all_gather,
             "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.forward_extend": self.attention_prefill,
