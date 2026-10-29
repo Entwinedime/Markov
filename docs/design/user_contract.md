@@ -72,6 +72,9 @@ docker build --build-arg SGLANG_RUNTIME_IMAGE="$SGLANG_RUNTIME_IMAGE" \
 在推理进程中设置 MARKOV_INPUT_FACTS，指向预先创建的本次输出目录。框架通过自身插件入口安装观察，
 各 worker 输出 input_facts_<pid>.jsonl；未设置时不开启，也不因加载 Markov 插件导入推理框架。
 观察覆盖 ScheduleBatch 准备、NPU 分配、页表写入、输入 buffer、注意力元数据，以及实际消息接收和最终发送。
+计算批次另与结果异步拷回、CPU 结果处理及最终发送关联，保留处理前后的输出数量与结束状态；
+提前执行但未被消费的结果仍属于实际工作，不能据此增加生成 token 数，也不能默认让最终响应等待它完成。
+这些观察提供执行边界和主机元数据，不额外将父级区间重复计为 CPU 服务。
 计算观察按真实原生调用记录线性层、归一化、激活、embedding、reshape/RoPE、注意力、logits/采样及通信的形状、类型和实际执行分支。
 这些信息供既有工作规则消费；没有受支持的规则或必要事实时明确保留缺口，不从函数包络猜测设备成本。
 
