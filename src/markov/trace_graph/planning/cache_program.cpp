@@ -193,6 +193,7 @@ void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
     // A blocked admission yields the caller so older results can release space.
     for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
     running_[request_].admission.clear();
+    running_[request_].queried = false;
     request_stage_ = RequestStage::Waiting;
 }
 
@@ -228,11 +229,15 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto & request = observed.requests[request_];
     const auto & tokens = observed.request_tokens.at(request.identity);
     const auto lookup = observed.token_paths.pages(tokens.lookup_input.value().path, page_tokens_);
-    if (storage_ && !storage_->prepare(runtime, request_, lookup, cause_)) {
+    const auto matched = cache_.match(lookup);
+    if (!running_[request_].queried) {
+        query(runtime, matched);
+        return;
+    }
+    if (storage_ && !storage_->prepare(runtime, request_, lookup, matched, cause_)) {
         wait_for_progress(runtime);
         return;
     }
-    const auto matched = cache_.match(lookup);
     running_[request_].pin = matched.device;
     cache_.pin_device(*running_[request_].pin);
 
@@ -276,6 +281,70 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
     compute(runtime);
+}
+
+void CacheProgram::query(ProgramRuntime & runtime, const CacheMatch & matched) {
+    const auto & observed = source_.observations();
+    const auto & request = observed.requests[request_];
+    std::vector<Work> copies;
+    for (const auto & copy : matched.index_copies)
+        copies.push_back({
+            { "cache.index_clone", {}, {} },
+            { { "pages", copy.pages }, { "host", copy.tier == Tier::Host ? 1 : 0 } }
+        });
+    std::size_t segments = 0;
+    for (auto node = matched.device; node != 0; node = cache_.tree().nodes()[node].parent)
+        if (cache_.node(node).device) ++segments;
+    const std::vector<Work> match{
+        { { "cache.index_match", {}, {} }, { { "pages", cache_.page_count(matched.device) }, { "input_tensors", segments } } }
+    };
+    auto & running = running_[request_];
+    running.query_submissions.clear();
+    request_stage_ = RequestStage::Querying;
+    requests_[request_].query_index_copies += copies.size();
+    for (const auto frame_id : source_.request_frames(request.identity)) {
+        const auto & frame = observed.compute_frames[frame_id];
+        if (frame.phase != Phase::Prefill) continue;
+        if (frame.requests.size() != 1 || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) {
+            issue_ = "unsupported_compute_frame";
+            return;
+        }
+        const auto sequences = source_.lookup_sequences(frame_id);
+        const auto operations = source_.frame_operations(frame_id);
+        if (sequences.size() != 2 || operations.empty() || !source_.compute_resources(operations.front())) {
+            issue_ = "cache_lookup_recipe_or_queues_unavailable";
+            return;
+        }
+        const FrameInput input{ frame.query_tokens->front(), frame.query_tokens->front(), frame.sequence_tokens.front(), 1, static_cast<double>(page_tokens_) };
+        NativePlan plan;
+        for (std::size_t at = 0; at < sequences.size(); ++at) {
+            const auto & site = source_.sequence(sequences[at]);
+            auto calls = site.observation.definition->describe(Phase::Prefill, input, at == 0 ? copies : match);
+            if (calls.issue) {
+                issue_ = calls.issue;
+                return;
+            }
+            auto placement = site.resources.unique_resources();
+            if (!placement) {
+                if (!site.resources.workers.empty() || !site.resources.devices.empty()) {
+                    issue_ = "cache_lookup_queues_ambiguous";
+                    return;
+                }
+                placement = source_.compute_resources(operations.front());
+            }
+            source_.bind_native_sources(sequences[at], calls.calls);
+            if (!plan.extend(calls, *placement, preparations_)) {
+                issue_ = "kernel_cache_initial_state_unavailable";
+                return;
+            }
+        }
+        const auto begin = runtime.next_node();
+        const NativeEvents events{ action(ActionKind::QueryDone, request_), action(ActionKind::QuerySubmitted, request_) };
+        if (!runtime.submit(plan.mutation(0, begin, events, cause_, queues_.native))) return;
+        for (const auto & [resource, node] : plan.frontier(begin)) queues_.native[resource] = node;
+        requests_[request_].query_operations += plan.operations();
+        ++pending_queries_;
+    }
 }
 
 void CacheProgram::compute(ProgramRuntime & runtime) {
@@ -535,7 +604,7 @@ bool CacheProgram::complete() const {
         return request.final_publication || (request.prefix_insertion && !request.prefix_insertion->completed)
                || (request.final_insertion && !request.final_insertion->completed);
     });
-    if (pending_insertion || (!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
+    if (pending_queries_ || pending_insertion || (!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
     return issue_ || std::ranges::all_of(running_, [](const RunningRequest & request) { return !request.compute; });
 }
 
@@ -604,6 +673,18 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         finish_compute(runtime, group.request);
         if (waiting_) advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::QueryDone)) { --pending_queries_; }
+    else if (event.action.kind == std::to_underlying(ActionKind::QuerySubmitted)) {
+        auto & running = running_[event.action.subject];
+        running.query_submissions.push_back(event.identity);
+        if (running.query_submissions.size() == backend_.participants) {
+            const auto begin = runtime.next_node();
+            PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::Admitted, event.action.subject) } }, {} };
+            for (const auto submitted : running.query_submissions) mutation.dependencies.push_back({ submitted, begin, graph::EdgeKind::ResourceOrder });
+            running.queried = true;
+            runtime.submit(std::move(mutation));
+        }
     }
     else if (event.action.kind == std::to_underlying(ActionKind::Received)) {
         request_stage_ = RequestStage::Waiting;

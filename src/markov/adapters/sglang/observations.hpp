@@ -39,6 +39,11 @@ private:
     std::optional<bool> deterministic_sampling_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
+    struct Lookup {
+        trace_graph::source::Index request;
+        trace_graph::source::ObservedRegion region;
+    };
+    std::vector<Lookup> lookups_;
     using BatchIdentity = std::pair<std::string, trace_graph::source::Index>;
     std::map<BatchIdentity, trace_graph::source::Index> batch_results_;
     std::map<BatchIdentity, trace_graph::source::ResultCopy> result_copies_;

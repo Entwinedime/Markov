@@ -63,6 +63,20 @@ SourceContext::SourceContext(Observations && observations)
             });
         }
     }
+    lookup_sequences_.resize(observations_.compute_frames.size());
+    for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
+        for (const auto & sequence : observations_.compute_frames[frame].lookups) {
+            lookup_sequences_[frame].push_back(sequences_.size());
+            sequences_.push_back({
+                frame,
+                false,
+                sequence,
+                {},
+                { sequence.region.resource, {}, {} },
+                {}
+            });
+        }
+    }
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
     index_native_sequences();

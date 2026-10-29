@@ -150,6 +150,7 @@ struct ComputeFrame {
     std::optional<double> page_tokens;
     RecordRef record;
     std::vector<ObservedCallSequence> preparations;
+    std::vector<ObservedCallSequence> lookups = {};
 };
 
 struct CollectiveGroup {

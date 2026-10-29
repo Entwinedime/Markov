@@ -1,6 +1,7 @@
 #include "markov/adapters/sglang/observations.hpp"
 
 #include "markov/adapters/sglang/allocation.hpp"
+#include "markov/adapters/sglang/cache_indices.hpp"
 #include "markov/adapters/sglang/input_preparation.hpp"
 #include "markov/adapters/sglang/result_output.hpp"
 
@@ -192,6 +193,11 @@ void ProbeReader::observe(const ProbeEvent & event) {
         const auto path = token_path(args.at("token_dictionary"));
         const auto role = name == "hicache_cache_lookup_input_end" ? TokenRole::LookupInput : TokenRole::Committed;
         output_.observe_tokens(args.at("request_id").get<std::string>(), role, path, event.record);
+        if (role == TokenRole::LookupInput)
+            lookups_.push_back({
+                output_.name(args.at("request_id").get<std::string>()),
+                { output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread), event.begin_ns, event.end_ns, event.record }
+            });
     }
     if (name == "hicache_cache_extend_input_start") {
         const auto & dictionaries = args.at("token_dictionaries");
@@ -319,6 +325,19 @@ void ProbeReader::finish() {
         result.processed->callers = read_result_callers(output_, result, input == pending_inputs_.end() ? nullptr : &input->metadata);
         ++output_.counts[result.processed->callers.empty() ? "result_callers_unavailable" : "result_callers_supported"];
     }
+
+    for (const auto & lookup : lookups_) {
+        for (auto & result : output_.batch_results) {
+            auto & frame = output_.compute_frames[result.frame];
+            if (frame.phase != Phase::Prefill || frame.requests != std::vector<Index>{ lookup.request } || result.run.resource != lookup.region.resource
+                || result.run.begin_ns < lookup.region.end_ns)
+                continue;
+            frame.lookups = read_cache_lookup(output_, lookup.region);
+            ++output_.counts[frame.lookups.empty() ? "cache_lookup_recipe_unavailable" : "cache_lookup_recipe_supported"];
+            break;
+        }
+    }
+    lookups_.clear();
     pending_inputs_.clear();
     schedule_inputs_.clear();
 }

@@ -41,11 +41,11 @@ bool Storage::service(ProgramRuntime & runtime, const WorkKind & kind, std::size
     return runtime.submit(std::move(mutation)).has_value();
 }
 
-bool Storage::prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, std::optional<graph::NodeId> cause) {
+bool Storage::prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
+                      std::optional<graph::NodeId> cause) {
     auto & result = results_[request];
     if (result.examined) return result.ready;
     result.examined = true;
-    const auto matched = cache_.match(lookup);
     const auto host_pages = cache_.page_count(matched.host);
     const auto start = std::max(host_pages, cache_.page_count(matched.device));
     const auto requested = lookup.size() - start;

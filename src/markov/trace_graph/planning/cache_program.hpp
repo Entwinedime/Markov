@@ -27,6 +27,7 @@ struct CacheRequestResult {
     std::size_t device_hit_pages = 0, loaded_pages = 0, prefill_tokens = 0;
     std::size_t deferred_kv_pages = 0;
     std::size_t released_device_pages = 0;
+    std::size_t query_index_copies = 0, query_operations = 0;
     std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
     std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, pages_released, work_completed;
@@ -69,9 +70,11 @@ private:
         PrefixInserted,
         FinalInserted,
         FinalPublished,
-        ReleasedPages
+        ReleasedPages,
+        QuerySubmitted,
+        QueryDone
     };
-    enum class RequestStage { BeforeStart, Ingress, Waiting, Admitting, Active, Response };
+    enum class RequestStage { BeforeStart, Ingress, Waiting, Admitting, Active, Querying, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -96,6 +99,8 @@ private:
         std::optional<PublicationId> prefix_publication, final_publication;
         std::vector<std::size_t> callers;
         std::vector<graph::NodeId> admission;
+        std::vector<graph::NodeId> query_submissions;
+        bool queried = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
         std::map<std::pair<std::size_t, ResultControl>, std::size_t> release_groups;
@@ -122,6 +127,7 @@ private:
     void wait_for_progress(ProgramRuntime & runtime);
     void respond(ProgramRuntime & runtime, std::size_t request);
     void compute(ProgramRuntime & runtime);
+    void query(ProgramRuntime & runtime, const CacheMatch & matched);
     void publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request);
     void backup_prefix(ProgramRuntime & runtime, RadixId leaf);
     void commit(ProgramRuntime & runtime, std::size_t request);
@@ -151,6 +157,7 @@ private:
     std::optional<graph::NodeId> cause_;
     std::size_t request_ = 0;
     std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evictions_ = 0;
+    std::size_t pending_queries_ = 0;
     RequestStage request_stage_ = RequestStage::BeforeStart;
     bool waiting_ = false;
     bool eviction_wait_ = false;

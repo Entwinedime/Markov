@@ -24,7 +24,8 @@ public:
     Storage(Cache & cache, const TokenPaths & paths, std::size_t page_tokens, std::size_t bytes_per_token, std::size_t participants, std::size_t resource_begin,
             std::size_t requests, StorageConfig config, StorageBackend backend);
     Storage(const Storage &) = delete;
-    bool prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, std::optional<graph::NodeId> cause);
+    bool prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
+                 std::optional<graph::NodeId> cause);
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
     bool idle() const { return prefetches_.empty() && write_queue_.empty(); }

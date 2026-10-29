@@ -209,6 +209,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         item["kv_published_ns"] = time(request.kv_published);
         item["deferred_kv_pages"] = request.deferred_kv_pages;
         item["released_device_pages"] = request.released_device_pages;
+        item["query_index_copies"] = request.query_index_copies;
+        item["query_operations"] = request.query_operations;
         item["device_pages_released_ns"] = time(request.pages_released);
         item["modeled_work_completed_ns"] = time(request.work_completed);
         if (source.graph().requests.size() == program.requests().size()) {

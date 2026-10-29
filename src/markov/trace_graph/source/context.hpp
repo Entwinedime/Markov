@@ -62,6 +62,7 @@ public:
     const SourceSequence & sequence(Index id) const { return sequences_[id]; }
     std::span<const Index> frame_sequences(Index frame) const { return frame_sequences_[frame]; }
     std::span<const Index> result_sequences(Index frame) const { return result_sequences_[frame]; }
+    std::span<const Index> lookup_sequences(Index frame) const { return lookup_sequences_[frame]; }
     std::span<const NativeWorkRegion> native_work() const { return native_work_; }
     void bind_native_sources(Index sequence, std::span<planning::NativeCall> calls) const;
     std::span<const WorkOrder> frame_queue_order(Index frame) const { return frame_queue_order_[frame]; }
@@ -93,6 +94,7 @@ private:
     std::vector<SourceSequence> sequences_;
     std::vector<std::vector<Index>> frame_sequences_;
     std::vector<std::vector<Index>> result_sequences_;
+    std::vector<std::vector<Index>> lookup_sequences_;
     std::vector<NativeWorkRegion> native_work_;
     std::map<std::pair<Index, planning::Work>, Index> control_sources_;
     std::vector<std::vector<WorkOrder>> frame_queue_order_;

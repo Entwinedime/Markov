@@ -1,4 +1,5 @@
 #include "markov/adapters/sglang/result_output.hpp"
+#include "markov/adapters/sglang/cache_indices.hpp"
 #include "markov/adapters/sglang/result_release.hpp"
 
 #include <algorithm>
@@ -104,60 +105,6 @@ public:
 
 private:
     double tokens_, source_element_bytes_;
-};
-
-class CacheIndexInsertion final : public CallSequence {
-public:
-    NativeSequence describe(Phase, const FrameInput & input, std::span<const Work> work) const override {
-        std::vector<NativeCall> calls;
-        for (const auto & copy : work) {
-            const bool host = copy.features.at("host") != 0;
-            Work clone{
-                {                                           "cache.index_clone", host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64", host ? "cpu_service" : "device_service" },
-                { { "elements", copy.features.at("pages") * input.page_tokens },                                 { "element_bytes", 8 },                    { "tensor_rank", 1 } }
-            };
-            NativeCall call{ clone, host ? CallKind::Cpu : CallKind::Queued, host ? std::vector<Work>{} : std::vector<Work>{ clone } };
-            if (!host) {
-                call.queue_name = "aclnnInplaceCopy";
-                call.worker_features = {
-                    { "element_bytes", 8 },
-                    {   "tensor_rank", 1 }
-                };
-            }
-            calls.push_back(std::move(call));
-        }
-        return { std::move(calls), std::nullopt };
-    }
-};
-
-class CacheIndexMatch final : public CallSequence {
-public:
-    explicit CacheIndexMatch(double table_element_bytes) : table_element_bytes_(table_element_bytes) {}
-    NativeSequence describe(Phase, const FrameInput & input, std::span<const Work> work) const override {
-        std::vector<NativeCall> calls;
-        for (const auto & operation : work) {
-            const bool concatenate = operation.kind.operation == "cache.index_match";
-            auto features = operation.features;
-            features["elements"] = features.at("pages") * input.page_tokens;
-            features.erase("pages");
-            features["element_bytes"] = concatenate ? 8 : table_element_bytes_;
-            features["tensor_rank"] = 1;
-            if (!concatenate) features["source_element_bytes"] = 8;
-            Work physical{
-                { operation.kind.operation, concatenate ? "aten.cat:npu:int64" : "aten.copy_:npu:int64_to_request_table", "device_service" },
-                std::move(features)
-            };
-            if (concatenate && physical.features.at("elements") == 0) continue;
-            const bool queued = physical.features.at("elements") != 0;
-            NativeCall call{ physical, queued ? CallKind::Queued : CallKind::Cpu, queued ? std::vector<Work>{ physical } : std::vector<Work>{} };
-            if (queued) call.queue_name = concatenate ? "aclnnCat" : "aclnnInplaceCopy";
-            calls.push_back(std::move(call));
-        }
-        return { std::move(calls), std::nullopt };
-    }
-
-private:
-    double table_element_bytes_;
 };
 
 NativeSequence ResultOutput::describe(Phase phase, const FrameInput & input, std::span<const Work>) const {
@@ -328,7 +275,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                         { { "pages", new_pages }, { "host", 0 } }
                     });
                 callers.push_back({ region,
-                                    std::make_unique<CacheIndexInsertion>(),
+                                    cache_index_copies(),
                                     "cache_index_insertion",
                                     ResultControlPoint{ operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix },
                                     std::move(source_work) });
@@ -368,7 +315,7 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                 }
                 callers.push_back({
                     { parent.resource, concatenation->begin_ns, table_write->end_ns, concatenation->record },
-                    std::make_unique<CacheIndexMatch>(dtype == "torch.int32" ? 4 : 8),
+                    cache_index_match(dtype == "torch.int32" ? 4 : 8),
                     "cache_index_match",
                     ResultControlPoint{ ResultControl::MatchPrefix },
                     std::move(matched_work)
