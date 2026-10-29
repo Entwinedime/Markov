@@ -35,7 +35,8 @@ scripts/markov.sh capture --request /path/to/request.json
 
 使用同一个预测请求：deployment.model 改为本地模型目录的绝对路径，base.configuration 使用原生 SGLang ServerArgs 字段，
 例如示例中的 page_size、max_total_tokens、hicache_ratio 和 hicache_write_policy。模型、dtype、TP 来自 deployment，
-采集器拥有容器内端口及设备逻辑编号，不能在 configuration 重复声明这些项。当前仅支持 SGLang/Ascend eager；其他组合明确拒绝。
+采集器拥有容器内端口及设备逻辑编号，不能在 configuration 重复声明这些项。当前采集使用 SGLang/Ascend eager、FIA 注意力与 Triton 任务队列；
+对应原生环境随调用输入和 base 配置保存。非 FIA 来源仍可构图，但现有注意力变换与独立成本不授予其支持资格；其他采集组合尚未恢复。
 
 execution.capture 另声明推理镜像 image、独占设备数组 devices、容器 memory_limit_gib/cpus，以及 budget。
 镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令将本项目装入已有推理环境。
@@ -48,14 +49,14 @@ workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_
 文本先用本地 tokenizer 编码并核对预算，再启动模型。预览列出请求数与输出上限；文本未经编码时输入 token 总量为未知。
 客户端时间覆盖实际 HTTP 发送到响应读取，不包括本地 JSON 编解码、写报告或 profiler 导出。
 
-成功返回本次 profile_manifest.json。其文件来自同一次运行：两类原始 trace/轻量观察与客户端报告，另保留 base 配置和时钟锚点。
+成功返回本次 profile_manifest.json。其文件来自同一次运行：原始 trace、轻量观察与客户端报告，另保留 base 配置和时钟锚点。
 探针记录实际接收与最终结果发送端口；导出前检查每个请求恰有一对端口及必要的输入准备观察。
 profiling_ready 只授予这些声明通道的导出资格，不证明全部语义、设备依赖、正常性能或 E2E 预测正确。
 
 输出位于 execution.output/base，包含累计状态及每次 captures 子目录。已成功的任务默认拒绝重采；
 将返回的 manifest 显式填入 base.manifest 可复用，或加 --recapture 重新采集并保留已有额度消耗和文件。
 失败不会把上一份 manifest 当成本次成功返回。进程中断遗留 running 状态时，目前须先核对本任务容器与实际用量，再恢复状态；尚无自动孤儿恢复。
-用户仍需自行提供适用的独立成本；采集入口没有恢复完整 CPU 校正、模型语义观察和数据库准备。
+用户仍需自行提供适用的独立成本；采集入口没有恢复完整 CPU 校正和数据库准备。
 
 ### SGLang 输入分支观察
 
@@ -68,12 +69,18 @@ docker build --build-arg SGLANG_RUNTIME_IMAGE="$SGLANG_RUNTIME_IMAGE" \
 
 在推理进程中设置 MARKOV_INPUT_FACTS，指向预先创建的本次输出目录。框架通过自身插件入口安装观察，
 各 worker 输出 input_facts_<pid>.jsonl；未设置时不开启，也不因加载 Markov 插件导入推理框架。
-观察覆盖 ScheduleBatch 准备、NPU 分配、页表写入、forward 输入边界、注意力元数据，以及实际消息接收和最终发送。
+观察覆盖 ScheduleBatch 准备、NPU 分配、页表写入、输入 buffer、注意力元数据，以及实际消息接收和最终发送。
+计算观察按真实原生调用记录线性层、归一化、激活、embedding、reshape/RoPE、注意力、logits/采样及通信的形状、类型和实际执行分支。
+这些信息供既有工作规则消费；没有受支持的规则或必要事实时明确保留缺口，不从函数包络猜测设备成本。
 
 记录请求标识、输入/查询规模、logprob、额外 embeddings、位置覆盖、multimodal、Mamba、重算及采样分支的标量状态，
 Prefill 另记录主机端 token 前缀以建立跨请求复用关系；张量只取 shape/dtype/layout，不读回设备内容或保存 snapshot。
+缓存查询记录原生 key 的实际 token 上限，结束时记录有效 KV 的未按 base 页大小截齐的前缀；目标可以据此重新分页，
+不将 base 的命中长度、页对齐结果或缓存快照当作目标状态。
 惩罚器状态取自准备完成的调度批次；重叠执行的 forward 副本会移除该对象，不能在那里读取。
 方法的墙钟与线程 CPU 时间只用于观察和定位，不直接作为正常成本。
+活动 profiler 内每个 worker 另读取少量原生计数器/系统时间配对；manifest 记录计数器前后夹住同一次系统时间读取的区间与换算不确定性，
+按实际 rank 关联 trace。它用于统一时钟，不是 CPU 成本校正；profiler 未初始化时不生成伪造锚点。
 
 同一次完整 base 采集的 sidecar.python_probe_files 可声明 `{"path":"input_facts_123.jsonl","format":"jsonl"}`。
 未声明 format 的既有记录仍按 Chrome 容器读取；不按文件名猜格式，未完成的 JSON 行会报错。
