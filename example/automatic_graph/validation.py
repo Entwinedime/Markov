@@ -172,6 +172,8 @@ class NativeValidation:
         )
         request["configuration"] = configuration
         request["requests"] = pairs
+        if self.domain.get("pd"):
+            request["submissions"] = [list(range(len(pairs)))]
         request["serving_input"] = target if "ep_routes" in target else None
         request["observe_all_workers"] = True
         path = self.capture / "capture.json"

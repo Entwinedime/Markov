@@ -9,10 +9,11 @@ class RequestStateEvidence:
         self.result = result
         settings = result["configuration"]
         self.page_size = settings["page_size"]
-        self.pools = settings.get("pd", {"model": settings})
         self.native = result["control_source"] == "native_control"
-        if self.native:
-            self.pools = {action["task"]["group"]: settings for action in result["decisions"]}
+        self.pools = result["resource_capacity"] if self.native else {
+            name: {"slots": pool["max_running_requests"], "pages": pool["max_total_tokens"] // self.page_size}
+            for name, pool in settings.get("pd", {"model": settings}).items()
+        }
         self.requests = {item["id"]: item for item in result["requests"]}
 
         self.generated = Counter()
@@ -33,13 +34,13 @@ class RequestStateEvidence:
 
     def pool(self, action: dict) -> str:
         if self.native:
-            return action["task"]["group"]
+            return "decode" if action["step"] == "transfer" else action["task"]["group"]
         if "model" in self.pools:
             return "model"
         return "prefill" if action["step"] in {"model", "release"} else "decode"
 
     def free_pages(self, pool: str) -> int:
-        return self.pools[pool]["max_total_tokens"] // self.page_size - len(self.pages[pool])
+        return self.pools[pool]["pages"] - len(self.pages[pool])
 
     def start(self, action: dict) -> None:
         if action["stage"] is not None and action["step"] in {"send", "receive", "wait"}:
@@ -61,7 +62,7 @@ class RequestStateEvidence:
             self.require(
                 action["scheduled_ns"] >= self.requests[request]["arrival_ns"], "request_arrival", action, request
             )
-            self.require(0 <= slot < self.pools[pool]["max_running_requests"], "slot_bounds", action, request)
+            self.require(0 <= slot < self.pools[pool]["slots"], "slot_bounds", action, request)
             if allocate:
 
                 # Recomputed Prefill includes the output history retained across a residency release.
@@ -83,7 +84,7 @@ class RequestStateEvidence:
                 for page in member["new_pages"]:
                     self.require(page not in self.pages[pool], "exclusive_page", action, request)
                     self.require(
-                        0 <= page < self.pools[pool]["max_total_tokens"] // self.page_size,
+                        0 <= page < self.pools[pool]["pages"],
                         "page_bounds", action, request,
                     )
                     self.pages[pool][page] = request
@@ -129,7 +130,7 @@ class RequestStateEvidence:
                     "resident_tokens", action, request,
                 )
                 self.require(
-                    member["finished"] == (expected == self.requests[request]["output_tokens"]),
+                    member["finished"] == (pool != "prefill" and expected == self.requests[request]["output_tokens"]),
                     "request_completion", action, request,
                 )
                 self.generated[key] = member["generated_tokens"]
@@ -182,7 +183,8 @@ class RequestStateEvidence:
             (pool, name): request["output_tokens"] for pool in progress_pools
             for name, request in self.requests.items()
         })
-        completed = self.generated == expected
+        progress = Counter({key: count for key, count in self.generated.items() if key[0] in progress_pools})
+        completed = progress == expected
         free = (
             self.result["free_pages"] == sum(self.free_pages(pool) for pool in self.pools)
             if self.native else self.result.get("pool_free_pages", {"model": self.result["free_pages"]})

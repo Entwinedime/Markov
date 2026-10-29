@@ -148,9 +148,12 @@ class ExecutionEvidence:
         required_steps = {"reserve", "model", "transfer", "receive", "accept", "release"}
         handoffs = defaultdict(dict)
         for item in decisions:
-            if "pd" in self.result["configuration"] and item["step"] in required_steps:
+            step = item["step"]
+            if step == "result" and item["task"]["group"] == "prefill":
+                step = "model"
+            if "pd" in self.result["configuration"] and step in required_steps:
                 for member in item["members"]:
-                    handoffs[member["id"]].setdefault(item["step"], []).append(item)
+                    handoffs[member["id"]].setdefault(step, []).append(item)
         complete = {
             request: {step: actions[0] for step, actions in steps.items()}
             for request, steps in handoffs.items()
