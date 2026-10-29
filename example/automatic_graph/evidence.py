@@ -145,7 +145,7 @@ class ExecutionEvidence:
         )
 
         # P and D may regroup members; each request still requires its own complete handoff.
-        required_steps = {"reserve", "model", "transfer", "accept", "release"}
+        required_steps = {"reserve", "model", "transfer", "receive", "accept", "release"}
         handoffs = defaultdict(dict)
         for item in decisions:
             if "pd" in self.result["configuration"] and item["step"] in required_steps:
@@ -172,7 +172,8 @@ class ExecutionEvidence:
             for first, last in (
                 ("reserve", "transfer"),
                 ("model", "transfer"),
-                ("transfer", "accept"),
+                ("transfer", "receive"),
+                ("receive", "accept"),
                 ("transfer", "release"),
             )
         )

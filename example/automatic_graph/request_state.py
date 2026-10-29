@@ -42,7 +42,7 @@ class RequestStateEvidence:
         return self.pools[pool]["max_total_tokens"] // self.page_size - len(self.pages[pool])
 
     def start(self, action: dict) -> None:
-        if action["step"] in {"send", "receive", "wait"}:
+        if action["stage"] is not None and action["step"] in {"send", "receive", "wait"}:
             return
         pool = self.pool(action)
         allocate = action["step"] in {"batch", "reserve", "model", "prepare"} or (
@@ -111,7 +111,7 @@ class RequestStateEvidence:
                 )
 
     def finish(self, action: dict) -> None:
-        if action["step"] in {"send", "receive", "wait"}:
+        if action["stage"] is not None and action["step"] in {"send", "receive", "wait"}:
             return
         pool = self.pool(action)
         returned = []
