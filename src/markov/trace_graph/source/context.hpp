@@ -68,7 +68,7 @@ private:
     void index_native_sequences();
     void index_native_work();
     Index retain_native_work(planning::Work work, const char * scope, ObservedRegion region, bool stream_wait_generated = false,
-                             NativeTiming timing = NativeTiming::Cpu, Time excluded_queue_wait_ns = 0);
+                             NativeTiming timing = NativeTiming::Cpu, Time excluded_queue_wait_ns = 0, std::vector<ObservedRegion> excluded = {});
 
     Observations observations_;
     SourceGraph graph_;

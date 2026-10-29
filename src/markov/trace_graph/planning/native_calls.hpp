@@ -32,6 +32,12 @@ struct NativeSources {
     std::vector<NativeLaunchSources> launches;
 };
 
+struct CallerPreparation {
+    Work work;
+    std::string observation_name;
+    bool operator==(const CallerPreparation &) const = default;
+};
+
 struct NativeCall {
     Work work;
     CallKind kind;
@@ -59,6 +65,7 @@ struct NativeCall {
     // Submission can be unchanged while the device processes a different shape.
     std::optional<Features> worker_features = std::nullopt;
     Work worker_work(const Work & operation) const;
+    std::vector<CallerPreparation> caller_preparations = {};
 };
 
 struct NativeSequence {

@@ -45,12 +45,24 @@ void queued(std::vector<NativeCall> & calls, const std::string & name, const std
     calls.back().queue_name = std::move(queue_name);
 }
 
+CallerPreparation allocation(const std::string & api, double elements, double element_bytes) {
+    return {
+        { { "runtime.tensor.allocate", "aten." + api + ":npu:int32_or_int64", "caller_blocking_interval" },
+         { { "bytes", elements * element_bytes }, { "element_bytes", element_bytes }, { "tensor_rank", 1 } } },
+        "aten::" + api
+    };
+}
+
 NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInput & input) {
     const auto role = part == Part::RequestTable ? "request_table" : part == Part::ForwardInputs ? "forward" : "sampling_positions";
     for (std::size_t id = 0; id < calls.size(); ++id) {
         auto caller = calls[id].work;
         caller.kind.implementation = std::string("sglang.batch_input_preparation.") + role;
         caller.kind.timing_scope = "cpu_service";
+        if (!calls[id].caller_preparations.empty()) {
+            caller.features.erase("elements");
+            caller.features["tensor_rank"] = 1;
+        }
 
         // Forward entry includes framework work outside the native call; retain its
         // length context until that prelude has an independent description.
@@ -190,9 +202,11 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             auto tokens = shape;
             tokens["elements"] = input.query_tokens;
             upload(calls, prefix + "token_ids", "int64", 8, tokens);
+            calls.back().caller_preparations.push_back(allocation("empty_strided", input.query_tokens, 8));
             upload(calls, prefix + "extend_lengths", "int32", 4, shape);
             upload(calls, prefix + "prefix_lengths", "int32", 4, shape);
             queued(calls, prefix + "positions", "triton.ascend.compute_position", tokens, false, "compute_position_kernel");
+            calls.back().caller_preparations = { allocation("empty", input.query_tokens, 8), allocation("empty", input.batch_size, 4) };
             calls.back().worker_features = {
                 { "batch_size", input.batch_size },
                 { "has_prefix",                1 }

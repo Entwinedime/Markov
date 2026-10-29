@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace markov::trace_graph::cost {
 
@@ -14,14 +15,26 @@ Queries::Queries(const Models & models, const source::SourceContext * source, co
     source_cpu_responses_.resize(source_cpu_gaps_.size());
     if (source) {
         std::vector<source::ObservedRegion> regions;
+        std::vector<std::pair<std::size_t, std::size_t>> groups;
         native_cpu_indices_.resize(source->native_work().size());
         for (std::size_t id = 0; id < source->native_work().size(); ++id) {
             const auto & work = source->native_work()[id];
             if (work.timing != source::NativeTiming::Cpu) continue;
-            native_cpu_indices_[id] = regions.size();
-            regions.push_back(work.region);
+            native_cpu_indices_[id] = groups.size();
+            const auto first = regions.size();
+            auto cursor = work.region.begin_ns;
+            for (const auto & excluded : work.excluded) {
+                if (cursor < excluded.begin_ns) regions.push_back({ work.region.resource, cursor, excluded.begin_ns, work.region.record });
+                cursor = excluded.end_ns;
+            }
+            if (cursor < work.region.end_ns) regions.push_back({ work.region.resource, cursor, work.region.end_ns, work.region.record });
+            groups.emplace_back(first, regions.size());
         }
-        native_cpu_intervals_ = source::cpu_intervals(source->observations(), source->graph(), regions, cpu_costs);
+        const auto measured = source::cpu_intervals(source->observations(), source->graph(), regions, cpu_costs);
+        for (const auto & [first, end] : groups) {
+            auto & combined = native_cpu_intervals_.emplace_back();
+            for (auto id = first; id < end; ++id) combined.add(measured[id]);
+        }
         source_native_work_responses_.resize(source->native_work().size());
     }
 }

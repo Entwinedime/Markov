@@ -9,6 +9,18 @@
 
 namespace markov::trace_graph::source {
 
+void CpuInterval::add(const CpuInterval & other) {
+    service_ns += other.service_ns;
+    wait_ns += other.wait_ns;
+    residual_ns += other.residual_ns;
+    instrumentation_ns += other.instrumentation_ns;
+    unobserved_ns += other.unobserved_ns;
+    stream_wait_ns += other.stream_wait_ns;
+    service_correction.add(other.service_correction);
+    residual_correction.add(other.residual_correction);
+    excluded_correction.add(other.excluded_correction);
+}
+
 std::optional<planning::CallResources> CallBinding::unique_resources() const {
     if (workers.size() != 1 || devices.size() != 1) return std::nullopt;
     return planning::CallResources{ caller, *workers.begin(), *devices.begin() };

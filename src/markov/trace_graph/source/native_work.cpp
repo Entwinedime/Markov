@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -31,13 +32,17 @@ bool same_worker_work(const planning::NativeCall & before, const planning::Nativ
 }
 
 bool same_work(const planning::NativeCall & before, const planning::NativeCall & after) {
-    return same_worker_work(before, after) && before.work == after.work && before.launches == after.launches && before.caller_work == after.caller_work;
+    return same_worker_work(before, after) && before.work == after.work && before.launches == after.launches && before.caller_work == after.caller_work
+           && before.caller_preparations == after.caller_preparations;
 }
 
 bool same_caller_step(const planning::NativeCall & before, const planning::NativeCall & after) {
     if (!before.caller_work || !after.caller_work) return same_work(before, after);
     return before.kind == after.kind && before.caller_work->kind == after.caller_work->kind && before.preparation == after.preparation
-           && before.synchronization == after.synchronization && before.queue_name == after.queue_name && before.incoming_stream == after.incoming_stream;
+           && before.synchronization == after.synchronization && before.queue_name == after.queue_name && before.incoming_stream == after.incoming_stream
+           && std::ranges::equal(before.caller_preparations, after.caller_preparations, [](const auto & left, const auto & right) {
+                  return left.work.kind == right.work.kind && left.observation_name == right.observation_name;
+              });
 }
 
 bool sources_complete(const planning::NativeCall & call) {
@@ -144,10 +149,10 @@ void SourceContext::bind_native_sources(Index frame, Index preparation, std::spa
 }
 
 Index SourceContext::retain_native_work(planning::Work work, const char * scope, ObservedRegion region, bool stream_wait_generated, NativeTiming timing,
-                                        Time excluded_queue_wait_ns) {
+                                        Time excluded_queue_wait_ns, std::vector<ObservedRegion> excluded) {
     work.kind.timing_scope = scope;
     const auto id = native_work_.size();
-    native_work_.push_back({ std::move(work), region, stream_wait_generated, timing, excluded_queue_wait_ns });
+    native_work_.push_back({ std::move(work), region, stream_wait_generated, timing, excluded_queue_wait_ns, std::move(excluded) });
     return id;
 }
 
@@ -157,9 +162,11 @@ void SourceContext::index_native_work() {
 
     // shortcut: source specialization caches stay live; record invalidation before supporting cache resets.
     std::map<std::pair<Index, planning::Work>, Time> first_prepared;
+    std::set<std::string> caller_preparation_names;
     for (const auto & frame : preparation_native_calls_) {
         for (const auto & binding : frame) {
             for (Index id = 0; id < binding.definitions.size(); ++id) {
+                for (const auto & preparation : binding.definitions[id].caller_preparations) caller_preparation_names.insert(preparation.observation_name);
                 const auto & preparation = binding.definitions[id].preparation;
                 if (!preparation) continue;
                 const auto & call = queues[binding.calls[id]];
@@ -171,6 +178,7 @@ void SourceContext::index_native_work() {
     }
     std::vector<std::vector<Index>> caller_queues(observed.resources.size()), worker_queues(observed.resources.size()),
         runtime_calls(observed.resources.size()), submissions(observed.resources.size()), controls(observed.resources.size());
+    std::vector<std::vector<Index>> caller_preparation_spans(observed.resources.size());
     for (Index id = 0; id < queues.size(); ++id) {
         caller_queues[queues[id].submission.resource].push_back(id);
         worker_queues[queues[id].execution.resource].push_back(id);
@@ -188,7 +196,9 @@ void SourceContext::index_native_work() {
     const auto submitted = [&](Index id) { return queues[id].submission.begin_ns; };
     for (auto & lane : caller_queues) std::ranges::sort(lane, {}, submitted);
     std::vector<CallerEnvelope> parents(queues.size());
-    for (const auto & span : observed.spans) {
+    for (Index id = 0; id < observed.spans.size(); ++id) {
+        const auto & span = observed.spans[id];
+        if (caller_preparation_names.contains(observed.names[span.name])) caller_preparation_spans[span.resource].push_back(id);
         const auto & lane = caller_queues[span.resource];
         const auto at = std::ranges::lower_bound(lane, span.begin_ns, {}, submitted);
         if (at == lane.end()) continue;
@@ -199,6 +209,8 @@ void SourceContext::index_native_work() {
             continue;
         parents[*at].include(span);
     }
+    const auto preparation_begin = [&](Index id) { return observed.spans[id].begin_ns; };
+    for (auto & lane : caller_preparation_spans) std::ranges::sort(lane, {}, preparation_begin);
     for (Index id = 0; id < observed.native_runtime_calls.size(); ++id) runtime_calls[observed.native_runtime_calls[id].region.resource].push_back(id);
     const auto runtime_begin = [&](Index id) { return observed.native_runtime_calls[id].region.begin_ns; };
     for (auto & lane : runtime_calls) std::ranges::sort(lane, {}, runtime_begin);
@@ -263,8 +275,33 @@ void SourceContext::index_native_work() {
                     // A prior submission proves the declared specialization is
                     // prepared. The first opaque compile/load prelude stays out.
                     const auto prepared = !definition.preparation || first_prepared.at({ region.resource, definition.preparation->specialization }) < cursor;
-                    if (prepared)
-                        sources.caller_before = retain_native_work(work, "cpu_service", { region.resource, cursor, call.submission.begin_ns, parent.record });
+                    std::vector<ObservedRegion> excluded;
+                    bool preparation_complete = true;
+                    if (!definition.caller_preparations.empty()) {
+                        const auto & lane = caller_preparation_spans[region.resource];
+                        for (auto at = std::ranges::lower_bound(lane, cursor, {}, preparation_begin);
+                             at != lane.end() && preparation_begin(*at) < call.submission.begin_ns;
+                             ++at) {
+                            const auto & span = observed.spans[*at];
+                            if (span.record.file != parent.record.file) continue;
+                            if (excluded.size() == definition.caller_preparations.size() || span.end_ns > call.submission.begin_ns
+                                || (!excluded.empty() && span.begin_ns < excluded.back().end_ns)
+                                || observed.names[span.name] != definition.caller_preparations[excluded.size()].observation_name) {
+                                preparation_complete = false;
+                                break;
+                            }
+                            excluded.push_back({ span.resource, span.begin_ns, span.end_ns, span.record });
+                        }
+                        preparation_complete = preparation_complete && excluded.size() == definition.caller_preparations.size();
+                    }
+                    if (prepared && preparation_complete)
+                        sources.caller_before = retain_native_work(work,
+                                                                   "cpu_service",
+                                                                   { region.resource, cursor, call.submission.begin_ns, parent.record },
+                                                                   false,
+                                                                   NativeTiming::Cpu,
+                                                                   0,
+                                                                   std::move(excluded));
                     work.kind.operation += ".return";
                     const auto end = id + 1 == binding.calls.size() ? region.end_ns : parent.end_ns;
                     sources.caller_after = retain_native_work(std::move(work),

@@ -27,14 +27,7 @@ struct Summary {
 
     void add(const CpuInterval & value) {
         ++regions;
-        observed.service_ns += value.service_ns;
-        observed.wait_ns += value.wait_ns;
-        observed.residual_ns += value.residual_ns;
-        observed.instrumentation_ns += value.instrumentation_ns;
-        observed.unobserved_ns += value.unobserved_ns;
-        observed.service_correction.add(value.service_correction);
-        observed.residual_correction.add(value.residual_correction);
-        observed.excluded_correction.add(value.excluded_correction);
+        observed.add(value);
     }
 
     Json report() const {

@@ -64,6 +64,10 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
 bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations) {
     const auto incoming = producer_device();
     for (const auto & call : calls) {
+
+        // shortcut: caller prerequisites share one submission port; split the prelude if intermediate results gain external consumers.
+        for (const auto & preparation : call.caller_preparations)
+            append(preparation.work, preparation.work.kind.timing_scope.c_str(), resources.caller, caller_);
         if (call.preparation) {
             if (!preparations.initial()) return false;
             const auto & preparation = *call.preparation;
