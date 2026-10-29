@@ -209,6 +209,32 @@ timeout 也基于这组部分成本；阶段耗时拆分含近似，不能拿这
 结构或变量未知时先报告事实缺口，不能靠重复采样把它变成成本缺口。
 已授权执行的补采必须有累计预算和停止条件；不建立无界的“预测失败—补点—重跑”循环。
 
+### 已实现的导入与离线训练
+
+```bash
+scripts/markov.sh maintain --request /path/to/maintenance.json
+```
+
+维护请求例如：
+
+```json
+{
+  "deployment": {
+    "platform": "Ascend 910B", "framework": "sglang", "runtime": "ascend",
+    "model": "Qwen/Qwen3-32B", "dtype": "bfloat16", "tensor_parallel": 2
+  },
+  "database": "performance/measurements.sqlite",
+  "imports": [{"adapter": "sglang_cache_io", "capture": "normal_capture/capture.json"}],
+  "training": ["normal_capture/capture.json"],
+  "output": "performance/models.json"
+}
+```
+
+路径相对维护请求解析。当前唯一导入适配器读取真实 cache_io 采样的完成记录及同目录 measurements.jsonl，核对声明案例、重复数、预热和物理校验。它导入备份返回、完成观测及主机克隆三类响应，不加载模型权重、base/target trace 或 SDK。
+只填 imports 可以单独入库；已有数据可省略 imports，只用 training 中的原来源路径离线训练，不再打开原始采样文件。training 必须显式选择，不自动扫描整库，也不能重复选择同一采集。预热及未选择的采集不用于训练，独立留出另经成本查询评价。
+可选 models 指向已有选定模型文件；训练结果只替换相同操作/实现/口径的响应，并将完整选定包写到 output。输出必须与数据库、请求及原始采集目录分开，完成后原子发布；失败不把半写模型当作成功。
+报告给出新增/复用记录、有效训练响应数、训练模型数和输出位置。单设备数据不按模型名或 TP 声明重采，但平台、实现条件及实际工作几何必须相容；这一入口不提供任意模型/平台的精度保证，也未接入自动设备补采、一般 runtime trace 导入或 CPU 校正。
+
 ### 已实现的独立成本查询
 
 ```bash
