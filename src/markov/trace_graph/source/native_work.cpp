@@ -12,10 +12,16 @@ namespace markov::trace_graph::source {
 namespace {
 
 bool same_worker_work(const planning::NativeCall & before, const planning::NativeCall & after) {
-    if (before.kind != after.kind || before.synchronization != after.synchronization || before.host_transfer != after.host_transfer
+    if (before.kind != after.kind || before.synchronization != after.synchronization || before.host_transfer.has_value() != after.host_transfer.has_value()
         || before.preparation != after.preparation || before.incoming_stream != after.incoming_stream || before.queue_name != after.queue_name
         || before.device_control != after.device_control || before.worker_first_use != after.worker_first_use)
         return false;
+    if (before.host_transfer && before.host_transfer->kind != after.host_transfer->kind) return false;
+
+    // Explicit worker variables exclude the independently priced transfer
+    // payload; default descriptors retain the full transfer condition.
+    if ((!before.worker_features || !after.worker_features) && before.host_transfer != after.host_transfer) return false;
+
     const auto same_submission = [&](const planning::Work & left, const planning::Work & right) {
         const auto & left_features = before.worker_features ? *before.worker_features : left.features;
         const auto & right_features = after.worker_features ? *after.worker_features : right.features;

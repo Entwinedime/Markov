@@ -52,9 +52,9 @@ NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInp
         caller.kind.implementation = std::string("sglang.batch_input_preparation.") + role;
         caller.kind.timing_scope = "cpu_service";
 
-        // Entry includes framework work outside the native call; retain its
+        // Forward entry includes framework work outside the native call; retain its
         // length context until that prelude has an independent description.
-        if (id == 0 && part != Part::SamplingPositions) {
+        if (id == 0 && part == Part::ForwardInputs) {
             caller.features["query_tokens"] = input.query_tokens;
             caller.features["context_tokens"] = input.context_tokens;
             caller.features["prefix_tokens"] = input.context_tokens - input.query_tokens;
@@ -80,6 +80,12 @@ void upload(std::vector<NativeCall> & calls, const std::string & name, const std
     call.kind = CallKind::HostUpload;
     call.work.kind.timing_scope = "cpu_service";
     call.launches.clear();
+
+    // This vector-copy callback passes the byte count to the separately
+    // priced ACL API; its surrounding worker code does not visit elements.
+    call.worker_features = call.work.features;
+    call.worker_features->erase("elements");
+    (*call.worker_features)["tensor_rank"] = 1;
     call.host_transfer = Work{
         {     "runtime.copy",   "aclrtMemcpyAsync",        "host_to_device_interval" },
         { { "bytes", bytes }, { "host_pinned", 0 }, { "previous_work_completed", 1 } }
