@@ -79,6 +79,14 @@ target 正常时间、trace、评分、配置名和 workload 身份不能作为�
 查询和结果更新可复用相同索引操作的物理描述，但 CPU 来源仍受各自 caller 配方约束。
 旧查询没有克隆尺寸或拼接段数观察时，不能仅凭 trace 中出现 clone/cat 推断完整工作并迁移成本；目标树已知的分裂工作仍须生成，再由独立响应承担。
 
+主机上没有外部中间消费者的真实 API 可用一项 `caller_blocking_interval` 表示完整响应，保留正常测量条件，不能再加一份同 API 返回或来源父包络。该口径不宣称等于 CPU 自身服务。
+主机 int64 索引克隆采用这类独立响应，变量为元素数，元素类型及 rank 限定适用域；不要求它来自当前 base，也不因所在缓存操作不同重复建模。
+
+独立 HiCache 控制测量入口为 `python -m markov.adapters.sglang.cache_io --recipe … --output …`，在兼容 NPU 推理环境运行。
+配方声明 device、geometry（layers/kv_heads/head_dim）、warmup、repeats，以及包含 page_tokens/pages 的 cases；目前使用 BF16、kernel_ascend/page_first_direct，实际框架管理页池和复制。
+测量不加载权重、不启用 profiler/probe，不读取 target；初始化、清空及物理 K/V 核对在计时外，预热记录保留。输出索引读回、controller 返回、完成同步返回、空闲同步与主机索引克隆响应。
+完成同步返回包含观察 API，只提供完成的观测上界；不能直接替代裸设备服务或独占资源时间。范围目前限初始化后的空闲单设备、就绪页池，不授予并发竞争、CPU/NUMA 绑定或正常完整 HTTP 精度资格。
+
 ## 一项工作怎样查询
 
 结构侧给出操作、真实实现、计时口径与必要工作变量。部署条件限定模型适用域。
