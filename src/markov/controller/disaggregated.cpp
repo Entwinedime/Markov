@@ -26,7 +26,7 @@ DisaggregatedController::DisaggregatedController(ServingSettings prefill, Servin
 }
 
 bool DisaggregatedController::RequestState::transferred() const {
-    return stage == RequestStage::Transferred || stage == RequestStage::Active || stage == RequestStage::Finished;
+    return stage == RequestStage::Transferred || stage == RequestStage::Received || stage == RequestStage::Active || stage == RequestStage::Finished;
 }
 
 Batch DisaggregatedController::view(std::size_t request, const KvPool & pool) const {
@@ -87,12 +87,25 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         }
     }
 
+    if (!decode_busy_) {
+
+        // Transport installs the first token before native admission selects a prebuilt batch.
+        for (const auto request : active_) {
+            const auto & state = requests_[request];
+            if (state.stage != RequestStage::Transferred) continue;
+            auto batch = view(request, decode_);
+            batch.members.front().new_tokens = batch.members.front().context_tokens;
+            batch.members.front().context_tokens = 0;
+            return action(ServingStep::Receive, std::move(batch), {}, now_ns, state.flow);
+        }
+    }
+
     const auto * recorded_decode = replay_ ? replay_->next("decode") : nullptr;
     if (!decode_busy_ && recorded_decode && recorded_decode->prebuilt) {
         auto batch = decode_.plan(Phase::Prefill);
         bool ready = true;
         for (const auto & member : recorded_decode->members) {
-            if (requests_[member.request].stage != RequestStage::Transferred) {
+            if (requests_[member.request].stage != RequestStage::Received) {
                 ready = false;
                 break;
             }
@@ -109,7 +122,7 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
     if (!decode_busy_ && !replay_) {
         for (const auto request : active_) {
             const auto & state = requests_[request];
-            if (state.stage != RequestStage::Transferred) continue;
+            if (state.stage != RequestStage::Received) continue;
             auto batch = view(request, decode_);
             batch.members.front().new_tokens = batch.members.front().context_tokens;
             batch.members.front().context_tokens = 0;
@@ -205,6 +218,7 @@ std::optional<TaskIdentity> & DisaggregatedController::channel(ServingStep step)
     case ServingStep::Transfer:
         return transfer_busy_;
     case ServingStep::Reserve:
+    case ServingStep::Receive:
     case ServingStep::Accept:
     case ServingStep::Batch:
         return decode_busy_;
@@ -260,6 +274,9 @@ void DisaggregatedController::finish(const ServingAction & action, const BatchPr
         break;
     case ServingStep::Transfer:
         state.stage = RequestStage::Transferred;
+        break;
+    case ServingStep::Receive:
+        state.stage = RequestStage::Received;
         break;
     case ServingStep::Release:
         prefill_.release(request);

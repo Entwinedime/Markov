@@ -113,6 +113,8 @@ RankProgram RankStructure::expand(const ServingAction & action) {
         return select(batch, action.lane);
     case ServingStep::Reserve:
         return reserve(batch);
+    case ServingStep::Receive:
+        return receive_kv(batch);
     case ServingStep::Accept:
         return accept(batch, effects, action.lane);
     case ServingStep::Release:
@@ -442,17 +444,19 @@ RankProgram RankStructure::reserve(const Batch & batch) {
     return { std::nullopt, shared_.execution.region_call(reserved.region).returned, {} };
 }
 
+RankProgram RankStructure::receive_kv(const Batch & batch) {
+    const auto begin = shared_.regions.size();
+    const auto & member = batch.members.front();
+    auto call = invocation(batch);
+    call.parameters["metadata_slot"] = static_cast<std::int64_t>(member.slot);
+    call.parameters["handoff_id"] = static_cast<std::int64_t>(member.request) + 1;
+    const auto received = graph_.append("KvReceived", "control", call);
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(received.region).returned, {} };
+}
+
 RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effects, std::size_t lane) {
     const auto begin = shared_.regions.size();
-    for (const auto & member : batch.members) {
-        auto call = invocation(batch);
-        call.parameters["M"] = member.new_tokens;
-        call.parameters["B"] = 1;
-        call.parameters["max_sequence_tokens"] = member.new_tokens;
-        call.parameters["metadata_slot"] = static_cast<std::int64_t>(member.slot);
-        call.parameters["handoff_id"] = static_cast<std::int64_t>(member.request) + 1;
-        graph_.append("KvReceived", "control", call);
-    }
     auto call = invocation(batch);
 
     // The native prebuilt path installs token/state columns without another model forward.

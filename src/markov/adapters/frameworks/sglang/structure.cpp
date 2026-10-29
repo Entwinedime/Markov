@@ -78,9 +78,9 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     const auto region_begin = graph_.regions.size();
     std::vector<RankWork> work;
     BatchProgram result{ std::nullopt, {}, {} };
-    const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute || action.step == ServingStep::Send
-                       || action.step == ServingStep::Receive || action.step == ServingStep::Wait
-                       || ((action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
+    const bool local =
+        action.step == ServingStep::Prepare || action.step == ServingStep::Compute || action.step == ServingStep::Send || action.step == ServingStep::Wait
+        || ((action.step == ServingStep::Receive || action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
     if (local) {
         for (const auto rank : group.members) {
             auto program = rank_step(action, rank, work);

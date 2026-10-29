@@ -140,12 +140,13 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.work->batch.members.front().request));
     else {
         auto & instance = action.task.group == groups_.prefill ? prefill_ : decode_;
-        const bool consumes_transfer = action.step == ServingStep::Accept || action.step == ServingStep::Release;
+        const bool consumes_transfer = action.step == ServingStep::Receive || action.step == ServingStep::Release;
         RankPorts prerequisites;
-        if (consumes_transfer) {
+        if (consumes_transfer || action.step == ServingStep::Accept) {
             for (const auto & member : action.work->batch.members) {
-                for (const auto & [rank, ports] : handoffs_.at(member.request).transferred)
-                    prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
+                const auto & handoff = handoffs_.at(member.request);
+                const auto & ready = consumes_transfer ? handoff.transferred : handoff.received;
+                for (const auto & [rank, ports] : ready) prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
             }
         }
         result = instance.expand(action, prerequisites);
@@ -159,6 +160,7 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
             auto & handoff = handoffs_[member.request];
             if (action.step == ServingStep::Reserve || action.step == ServingStep::Model)
                 bind_readiness(action, result, drained, action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared);
+            if (action.step == ServingStep::Receive) bind_readiness(action, result, drained, handoff.received);
             if (action.step == ServingStep::Accept) handoff.accepted = true;
             if (action.step == ServingStep::Release) handoff.released = true;
             if (handoff.accepted && handoff.released) handoffs_.erase(member.request);
@@ -206,10 +208,9 @@ std::vector<std::size_t> DisaggregatedStructure::retire() {
 
     // A peer may become ready before the next control action; retain that time across IR compaction.
     for (const auto & [_, handoff] : handoffs_) {
-        for (const auto * ports : { &handoff.reserved, &handoff.prepared }) {
+        for (const auto * ports : { &handoff.reserved, &handoff.prepared, &handoff.transferred, &handoff.received }) {
             for (const auto & [rank, ready] : *ports) nodes.insert(nodes.end(), ready.begin(), ready.end());
         }
-        for (const auto & [rank, ready] : handoff.transferred) nodes.insert(nodes.end(), ready.begin(), ready.end());
     }
     return nodes;
 }

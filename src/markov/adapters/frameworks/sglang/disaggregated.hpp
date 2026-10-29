@@ -36,6 +36,7 @@ private:
         RankPorts reserved;
         RankPorts prepared;
         RankPorts transferred;
+        RankPorts received;
         bool accepted = false;
         bool released = false;
     };

@@ -38,7 +38,7 @@ public:
     std::map<std::string, std::size_t> pool_free_pages() const;
 
 private:
-    enum class RequestStage { Waiting, Reserved, ModelReady, Transferred, Active, Finished };
+    enum class RequestStage { Waiting, Reserved, ModelReady, Transferred, Received, Active, Finished };
 
     struct RequestState {
         Request input;

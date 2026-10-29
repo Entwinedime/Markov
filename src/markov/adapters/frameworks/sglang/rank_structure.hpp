@@ -58,6 +58,7 @@ private:
     void begin_schedule(Phase phase, std::size_t members);
     RankProgram select(const Batch & batch, std::size_t lane);
     RankProgram reserve(const Batch & batch);
+    RankProgram receive_kv(const Batch & batch);
     RankProgram accept(const Batch & batch, const BatchEffects & effects, std::size_t lane);
     RankProgram release(const BatchEffects & effects);
     TargetRegion cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase);
