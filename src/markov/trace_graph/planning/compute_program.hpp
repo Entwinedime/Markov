@@ -42,11 +42,12 @@ struct ComputeStats {
 // Observed overlap releases the next caller while retaining queue dependencies.
 class ComputeProgram final : public Program {
 public:
-    static constexpr simulation::Component owner = 2;
-    ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations);
+    static constexpr simulation::Component first_owner = 2;
+    ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations,
+                   ExecutionQueues & queues, simulation::Component owner = first_owner);
     ComputeProgram(const ComputeProgram &) = delete;
 
-    void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause);
+    void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt);
     void start(ProgramRuntime & runtime) override { start(runtime, std::nullopt); }
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
     bool complete() const override { return complete_ || issue_.has_value(); }
@@ -54,9 +55,23 @@ public:
     const std::optional<std::string> & issue() const { return issue_; }
     const ComputeStats & stats() const { return stats_; }
     std::optional<graph::NodeId> prefill_result_ready() const { return prefill_result_ready_; }
+    std::optional<graph::NodeId> results_ready() const { return results_ready_; }
+    std::optional<graph::NodeId> sent() const { return sent_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, ResultReady, CallersDone, Sent, PrefillReady, Complete };
+    enum class ActionKind : std::uint32_t {
+        ForwardGranted,
+        CallersGranted,
+        SegmentDone,
+        CollectiveDone,
+        FrameSubmitted,
+        ResultReady,
+        CallersDone,
+        Sent,
+        PrefillReady,
+        ResultsReady,
+        Complete
+    };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {
@@ -70,10 +85,12 @@ private:
         NativePlan result_callers;
         ComputeStats caller_stats;
         std::size_t at = 0;
+        std::size_t caller = 0;
+        std::optional<graph::NodeId> result_producer;
         std::optional<std::size_t> previous, next;
         bool overlap = false;
         bool publishes_prefill_prefix = false;
-        bool callers_modeled = false, callers_started = false, next_started = false, finished = false;
+        bool callers_modeled = false, callers_requested = false, next_started = false, finished = false;
     };
     struct Arrival {
         graph::Time time_ns;
@@ -92,21 +109,27 @@ private:
     void join_prefill_results(ProgramRuntime & runtime);
     void start_next(ProgramRuntime & runtime, std::size_t frame);
     void process_result(ProgramRuntime & runtime, std::size_t frame);
+    void run_result(ProgramRuntime & runtime, std::size_t frame, graph::NodeId granted);
+    void launch_frame(ProgramRuntime & runtime, std::size_t frame, std::optional<graph::NodeId> cause);
+    void join_results(ProgramRuntime & runtime);
     void finish_frame(ProgramRuntime & runtime, std::size_t frame);
 
     const source::SourceContext & source_;
     PreparationCache & preparations_;
+    ExecutionQueues & queues_;
+    simulation::Component owner_;
     std::size_t first_resource_;
     std::vector<Frame> frames_;
     std::vector<Collective> collectives_;
     std::vector<std::size_t> roots_;
     std::vector<graph::NodeId> completed_;
     std::size_t finished_frames_ = 0;
-    NativeFrontier frontier_;
     std::optional<std::string> issue_;
     ComputeStats stats_;
     std::optional<graph::NodeId> prefill_result_ready_;
+    std::optional<graph::NodeId> results_ready_, sent_;
     bool prefill_join_submitted_ = false;
+    bool results_join_submitted_ = false;
     bool complete_ = false;
 };
 

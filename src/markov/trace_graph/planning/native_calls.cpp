@@ -8,6 +8,39 @@
 
 namespace markov::trace_graph::planning {
 
+void CallerSchedule::acquire(ProgramRuntime & runtime, std::size_t caller, simulation::Component owner, simulation::Action granted,
+                             std::optional<graph::NodeId> cause) {
+    auto & lane = lanes_[caller];
+    lane.pending.push_back({ owner, granted, cause });
+    dispatch(runtime, caller, lane);
+}
+
+void CallerSchedule::release(ProgramRuntime & runtime, std::size_t caller, simulation::Component owner, graph::NodeId completion) {
+    auto & lane = lanes_.at(caller);
+    if (lane.owner != owner) throw std::logic_error("Caller released by another program");
+    lane.owner.reset();
+    lane.completion = completion;
+    dispatch(runtime, caller, lane);
+}
+
+void CallerSchedule::handoff(ProgramRuntime & runtime, std::size_t caller, simulation::Component previous, simulation::Component next,
+                             simulation::Action granted, graph::NodeId cause) {
+    lanes_.at(caller).pending.push_front({ next, granted, cause });
+    release(runtime, caller, previous, cause);
+}
+
+void CallerSchedule::dispatch(ProgramRuntime & runtime, std::size_t caller, Lane & lane) {
+    if (lane.owner || lane.pending.empty()) return;
+    const auto request = lane.pending.front();
+    const auto begin = runtime.next_node();
+    PlannedMutation mutation{ request.owner, { { caller, Boundary{}, request.granted } }, {} };
+    if (request.cause) mutation.dependencies.push_back({ *request.cause, begin, graph::EdgeKind::DataDependency });
+    if (lane.completion) mutation.dependencies.push_back({ *lane.completion, begin, graph::EdgeKind::ResourceOrder });
+    if (!runtime.submit(std::move(mutation))) return;
+    lane.owner = request.owner;
+    lane.pending.pop_front();
+}
+
 Work NativeCall::worker_work(const Work & operation) const {
     auto result = operation;
     if (worker_features) result.features = *worker_features;

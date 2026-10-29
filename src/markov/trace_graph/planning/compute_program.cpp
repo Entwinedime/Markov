@@ -68,9 +68,11 @@ bool ComputeProgram::append_compute(const FrameCompute & frame, source::Index so
 }
 
 ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource,
-                               PreparationCache & preparations)
+                               PreparationCache & preparations, ExecutionQueues & queues, simulation::Component owner)
     : source_(source),
       preparations_(preparations),
+      queues_(queues),
+      owner_(owner),
       first_resource_(first_resource) {
     const auto & observed = source.observations();
     std::map<std::tuple<source::Index, WorkKind, source::Index>, std::size_t> jobs;
@@ -108,6 +110,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         frames_.push_back({});
         auto & frame = frames_.back();
         frame.previous = previous;
+        frame.caller = resources->caller;
         const auto * result = source.frame_result(input.frame);
         // shortcut: targets inherit source scheduling; require a target policy before supporting mode changes.
         frame.overlap = result && result->overlap;
@@ -233,21 +236,28 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
     if (frames_.empty()) issue_ = "empty_compute_group";
 }
 
-void ComputeProgram::start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause) {
+void ComputeProgram::start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner) {
     if (issue_) return;
-    for (const auto root : roots_) segment(runtime, root, cause);
+    for (const auto root : roots_)
+        if (previous_owner) queues_.callers.handoff(runtime, frames_[root].caller, *previous_owner, owner_, action(ActionKind::ForwardGranted, root), *cause);
+        else launch_frame(runtime, root, cause);
+}
+
+void ComputeProgram::launch_frame(ProgramRuntime & runtime, std::size_t id, std::optional<graph::NodeId> cause) {
+    queues_.callers.acquire(runtime, frames_[id].caller, owner_, action(ActionKind::ForwardGranted, id), cause);
 }
 
 void ComputeProgram::segment(ProgramRuntime & runtime, std::size_t id, std::optional<graph::NodeId> cause) {
-    const auto & frame = frames_[id];
+    auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
     const auto begin = runtime.next_node();
     NativeEvents events{ action(ActionKind::SegmentDone, id) };
     if (!range.collective) events.submitted = action(ActionKind::FrameSubmitted, id);
     if (range.plan.publishes_result()) events.produced = action(ActionKind::ResultReady, id);
-    if (runtime.submit(range.plan.mutation(owner, begin, events, cause, frontier_))) {
+    if (runtime.submit(range.plan.mutation(owner_, begin, events, cause, queues_.native))) {
         if (frame.at == 0) stats_.frames[id].entry = begin;
-        for (const auto & [resource, node] : range.plan.frontier(begin)) frontier_[resource] = node;
+        if (range.plan.publishes_result()) frame.result_producer = range.plan.result_producer(begin);
+        for (const auto & [resource, node] : range.plan.frontier(begin)) queues_.native[resource] = node;
         stats_.add(range.stats);
         stats_.native_operations += range.plan.operations();
         stats_.dispatch_delays += range.plan.delays();
@@ -281,7 +291,7 @@ void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simu
 
     // shortcut: peers share the latest completion; split when per-rank completion evidence is available.
     const auto begin = runtime.next_node();
-    PlannedMutation mutation{ owner, { { first_resource_ + collective.group, std::cref(work), action(ActionKind::CollectiveDone, *range.collective) } }, {} };
+    PlannedMutation mutation{ owner_, { { first_resource_ + collective.group, std::cref(work), action(ActionKind::CollectiveDone, *range.collective) } }, {} };
     for (const auto & arrival : collective.arrivals) mutation.dependencies.push_back({ arrival->node, begin, graph::EdgeKind::Synchronization });
     if (runtime.submit(std::move(mutation))) {
         ++stats_.collective_services;
@@ -300,28 +310,36 @@ void ComputeProgram::start_next(ProgramRuntime & runtime, std::size_t id) {
     }
     else if (!ports.completed || (frame.callers_modeled && !ports.callers_completed)) return;
     frame.next_started = true;
-    segment(runtime, *frame.next, frame.overlap ? ports.submitted : ports.callers_completed ? ports.callers_completed : ports.completed);
+    launch_frame(runtime, *frame.next, frame.overlap ? ports.submitted : ports.callers_completed ? ports.callers_completed : ports.completed);
 }
 
 void ComputeProgram::process_result(ProgramRuntime & runtime, std::size_t id) {
     auto & frame = frames_[id];
     const auto & ports = stats_.frames[id];
-    if (!frame.callers_modeled || frame.callers_started || !ports.result_ready || !ports.submitted) return;
+    if (!frame.callers_modeled || frame.callers_requested || !frame.result_producer || !ports.submitted) return;
     if (frame.previous && frames_[*frame.previous].callers_modeled && !stats_.frames[*frame.previous].callers_completed) return;
     if (frame.overlap && frame.next && !stats_.frames[*frame.next].submitted) return;
 
+    frame.callers_requested = true;
+    const auto cause = frame.overlap && frame.next ? stats_.frames[*frame.next].submitted : ports.submitted;
+    queues_.callers.acquire(runtime, frame.caller, owner_, action(ActionKind::CallersGranted, id), cause);
+}
+
+void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph::NodeId granted) {
+    auto & frame = frames_[id];
+    const auto & ports = stats_.frames[id];
     const auto begin = runtime.next_node();
     NativeEvents events{ action(ActionKind::CallersDone, id) };
     if (frame.result_callers.publishes_result()) events.produced = action(ActionKind::Sent, id);
-    auto mutation = frame.result_callers.mutation(owner, begin, events, ports.result_ready, frontier_);
+    auto mutation = frame.result_callers.mutation(owner_, begin, events, frame.result_producer, queues_.native);
+    mutation.dependencies.push_back({ granted, begin, graph::EdgeKind::ResourceOrder });
     mutation.dependencies.push_back({ *ports.submitted, begin, graph::EdgeKind::ResourceOrder });
     if (frame.overlap && frame.next) mutation.dependencies.push_back({ *stats_.frames[*frame.next].submitted, begin, graph::EdgeKind::ResourceOrder });
     if (frame.previous && stats_.frames[*frame.previous].callers_completed)
         mutation.dependencies.push_back({ *stats_.frames[*frame.previous].callers_completed, begin, graph::EdgeKind::ResourceOrder });
     if (!runtime.submit(std::move(mutation))) return;
-    frame.callers_started = true;
     stats_.frames[id].callers_entry = begin;
-    for (const auto & [resource, node] : frame.result_callers.frontier(begin)) frontier_[resource] = node;
+    for (const auto & [resource, node] : frame.result_callers.frontier(begin)) queues_.native[resource] = node;
     stats_.add(frame.caller_stats);
     stats_.native_operations += frame.result_callers.operations();
 }
@@ -336,7 +354,7 @@ void ComputeProgram::finish_frame(ProgramRuntime & runtime, std::size_t id) {
     if (++finished_frames_ != frames_.size()) return;
 
     const auto end = runtime.next_node();
-    PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
+    PlannedMutation mutation{ owner_, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
     for (const auto node : completed_) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
     runtime.submit(std::move(mutation));
 }
@@ -351,7 +369,7 @@ void ComputeProgram::join_prefill_results(ProgramRuntime & runtime) {
         if (frame.overlap && frame.next && !stats_.frames[*frame.next].submitted) return;
     }
     const auto begin = runtime.next_node();
-    PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::PrefillReady, 0) } }, {} };
+    PlannedMutation mutation{ owner_, { { 0, Boundary{}, action(ActionKind::PrefillReady, 0) } }, {} };
     for (const auto root : roots_) {
         const auto & frame = frames_[root];
         mutation.dependencies.push_back(
@@ -361,8 +379,18 @@ void ComputeProgram::join_prefill_results(ProgramRuntime & runtime) {
     prefill_join_submitted_ = runtime.submit(std::move(mutation)).has_value();
 }
 
+void ComputeProgram::join_results(ProgramRuntime & runtime) {
+    if (results_join_submitted_ || std::ranges::any_of(stats_.frames, [](const ComputeStats::FramePorts & frame) { return !frame.result_ready; })) return;
+    const auto begin = runtime.next_node();
+    PlannedMutation mutation{ owner_, { { 0, Boundary{}, action(ActionKind::ResultsReady, 0) } }, {} };
+    for (const auto & frame : stats_.frames) mutation.dependencies.push_back({ *frame.result_ready, begin, graph::EdgeKind::DataDependency });
+    results_join_submitted_ = runtime.submit(std::move(mutation)).has_value();
+}
+
 void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
-    if (event.action.kind == std::to_underlying(ActionKind::SegmentDone)) arrive(runtime, event.action.subject, event);
+    if (event.action.kind == std::to_underlying(ActionKind::ForwardGranted)) segment(runtime, event.action.subject, event.identity);
+    else if (event.action.kind == std::to_underlying(ActionKind::CallersGranted)) run_result(runtime, event.action.subject, event.identity);
+    else if (event.action.kind == std::to_underlying(ActionKind::SegmentDone)) arrive(runtime, event.action.subject, event);
     else if (event.action.kind == std::to_underlying(ActionKind::CollectiveDone)) {
         for (const auto peer : collectives_[event.action.subject].peers) {
             ++frames_[*peer].at;
@@ -376,11 +404,13 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
         if (frames_[id].previous) process_result(runtime, *frames_[id].previous);
         process_result(runtime, id);
         join_prefill_results(runtime);
+        queues_.callers.release(runtime, frames_[id].caller, owner_, event.identity);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ResultReady)) {
         stats_.frames[event.action.subject].result_ready = event.identity;
         process_result(runtime, event.action.subject);
         join_prefill_results(runtime);
+        join_results(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::CallersDone)) {
         const auto id = event.action.subject;
@@ -392,8 +422,13 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
         else start_next(runtime, id);
         finish_frame(runtime, id);
         join_prefill_results(runtime);
+        queues_.callers.release(runtime, frames_[id].caller, owner_, event.identity);
     }
-    else if (event.action.kind == std::to_underlying(ActionKind::Sent)) stats_.frames[event.action.subject].sent = event.identity;
+    else if (event.action.kind == std::to_underlying(ActionKind::Sent)) {
+        stats_.frames[event.action.subject].sent = event.identity;
+        sent_ = event.identity;
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::ResultsReady)) results_ready_ = event.identity;
     else if (event.action.kind == std::to_underlying(ActionKind::PrefillReady)) prefill_result_ready_ = event.identity;
     else if (event.action.kind == std::to_underlying(ActionKind::Complete)) complete_ = true;
 }

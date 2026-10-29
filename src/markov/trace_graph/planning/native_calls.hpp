@@ -4,6 +4,7 @@
 #include "markov/trace_graph/planning/program.hpp"
 
 #include <cstddef>
+#include <deque>
 #include <map>
 #include <optional>
 #include <set>
@@ -114,6 +115,35 @@ struct CallResources {
 
 using NativeFrontier = std::map<std::size_t, graph::NodeId>;
 
+// A caller turn can span graph mutations and synchronization waits. Grants are
+// causal ports; service durations and resource execution remain in the runtime.
+class CallerSchedule {
+public:
+    void acquire(ProgramRuntime & runtime, std::size_t caller, simulation::Component owner, simulation::Action granted, std::optional<graph::NodeId> cause);
+    void release(ProgramRuntime & runtime, std::size_t caller, simulation::Component owner, graph::NodeId completion);
+    void handoff(ProgramRuntime & runtime, std::size_t caller, simulation::Component previous, simulation::Component next, simulation::Action granted,
+                 graph::NodeId cause);
+
+private:
+    struct Request {
+        simulation::Component owner;
+        simulation::Action granted;
+        std::optional<graph::NodeId> cause;
+    };
+    struct Lane {
+        std::optional<simulation::Component> owner;
+        std::optional<graph::NodeId> completion;
+        std::deque<Request> pending;
+    };
+    void dispatch(ProgramRuntime & runtime, std::size_t caller, Lane & lane);
+    std::map<std::size_t, Lane> lanes_;
+};
+
+struct ExecutionQueues {
+    NativeFrontier native;
+    CallerSchedule callers;
+};
+
 struct NativeEvents {
     simulation::Action complete;
     std::optional<simulation::Action> submitted = std::nullopt;
@@ -133,6 +163,7 @@ public:
     std::size_t delays() const;
     std::optional<std::size_t> producer_device() const { return device_ ? std::optional(device_->device) : std::nullopt; }
     bool publishes_result() const { return result_.has_value(); }
+    std::optional<graph::NodeId> result_producer(graph::NodeId begin) const { return result_ ? std::optional(begin + *result_) : std::nullopt; }
 
 private:
     graph::NodeId append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay = false);

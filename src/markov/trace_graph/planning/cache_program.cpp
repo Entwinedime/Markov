@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -16,10 +17,23 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
       cache_(config),
       backend_(std::move(backend)),
       preparations_(kernel_cache_initial),
+      running_(source.observations().requests.size()),
       requests_(source.observations().requests.size()) {
     if (source.graph().requests.size() != requests_.size()) {
         issue_ = "request_boundaries_unavailable";
         return;
+    }
+    for (std::size_t request = 0; request < requests_.size(); ++request) {
+        std::set<std::size_t> callers;
+        for (const auto frame : source.request_frames(source.observations().requests[request].identity)) {
+            const auto operations = source.frame_operations(frame);
+            if (!operations.empty()) callers.insert(source.observations().work_observations[operations.front()].resource);
+        }
+        if (callers.size() != backend_.participants) {
+            issue_ = "request_caller_resources_unavailable";
+            return;
+        }
+        running_[request].callers.assign(callers.begin(), callers.end());
     }
     if (storage)
         storage_.emplace(cache_,
@@ -40,7 +54,8 @@ bool CacheProgram::make_host_room(std::size_t pages) {
 
 ComputeStats CacheProgram::compute_stats() const {
     auto stats = compute_stats_;
-    if (compute_) stats.add(compute_->stats());
+    for (const auto & running : running_)
+        if (running.compute) stats.add(running.compute->stats());
     return stats;
 }
 
@@ -111,7 +126,8 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
         return false;
     }
     if (cache_.available_pages(Tier::Device) >= pages) return true;
-    if (copies_.empty() && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
+    const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) { return request.compute != nullptr; });
+    if (copies_.empty() && !pending_compute && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
     return false;
 }
 
@@ -138,19 +154,26 @@ void CacheProgram::begin_request(ProgramRuntime & runtime, bool drain) {
     }
     if (!submit(runtime, std::move(mutation))) return;
     requests_[request_].start = begin;
-    requests_[request_].received = begin + 1;
+    requests_[request_].arrived = begin + 1;
     request_stage_ = RequestStage::Ingress;
     waiting_ = false;
 }
 
-void CacheProgram::respond(ProgramRuntime & runtime) {
-    const auto & endpoint = source_.graph().requests[request_];
+void CacheProgram::respond(ProgramRuntime & runtime, std::size_t request) {
+    const auto & endpoint = source_.graph().requests[request];
     const auto resource = source_.graph().graph.nodes()[endpoint.completion].resource;
     const auto response = runtime.next_node();
-    if (!submit(runtime, { 0, { { resource, SourceDelay{ endpoint.completion }, action(ActionKind::ResponseDone, request_) } }, {} })) return;
-    requests_[request_].response = response;
+    if (!submit(runtime, { 0, { { resource, SourceDelay{ endpoint.completion }, action(ActionKind::ResponseDone, request) } }, {} })) return;
+    requests_[request].response = response;
     request_stage_ = RequestStage::Response;
     waiting_ = false;
+}
+
+void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
+    // A blocked admission yields the caller so older results can release space.
+    for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
+    running_[request_].admission.clear();
+    request_stage_ = RequestStage::Waiting;
 }
 
 void CacheProgram::advance(ProgramRuntime & runtime) {
@@ -159,13 +182,21 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     if (request_stage_ == RequestStage::BeforeStart) {
         const auto & barriers = source_.observations().workload_barriers;
         const auto drain = std::ranges::any_of(barriers, [&](const source::WorkloadBarrier & barrier) { return barrier.before_request == request_; });
-        if (drain && (!copies_.empty() || (storage_ && !storage_->idle()))) return;
+        const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) { return request.compute != nullptr; });
+        if (drain && (pending_compute || !copies_.empty() || (storage_ && !storage_->idle()))) return;
         begin_request(runtime, drain);
         return;
     }
-    if (request_pin_) {
-        cache_.unpin_device(*request_pin_);
-        request_pin_.reset();
+    if (request_stage_ == RequestStage::Waiting) {
+        request_stage_ = RequestStage::Admitting;
+        for (const auto caller : running_[request_].callers)
+            queues_.callers.acquire(runtime, caller, 0, action(ActionKind::AdmissionGranted, request_), cause_);
+        return;
+    }
+    if (request_stage_ != RequestStage::Active) return;
+    if (running_[request_].pin) {
+        cache_.unpin_device(*running_[request_].pin);
+        running_[request_].pin.reset();
     }
     if (host_pin_) {
         cache_.unpin_host(*host_pin_);
@@ -175,10 +206,13 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto & request = observed.requests[request_];
     const auto & tokens = observed.request_tokens.at(request.identity);
     const auto lookup = observed.token_paths.pages(tokens.lookup_input.value().path, page_tokens_);
-    if (storage_ && !storage_->prepare(runtime, request_, lookup, cause_)) { return; }
+    if (storage_ && !storage_->prepare(runtime, request_, lookup, cause_)) {
+        wait_for_progress(runtime);
+        return;
+    }
     const auto matched = cache_.match(lookup);
-    request_pin_ = matched.device;
-    cache_.pin_device(*request_pin_);
+    running_[request_].pin = matched.device;
+    cache_.pin_device(*running_[request_].pin);
 
     // A pending host copy is not yet readable. Its completion re-enters this
     // decision; it cannot be converted into a zero-cost host hit.
@@ -188,23 +222,35 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
         // backup and reclaim host pages. The transfer takes over this pin.
         host_pin_ = matched.host;
         cache_.pin_host(*host_pin_);
-        if (cache_.ready_layers(matched.host, Tier::Host) != backend_.layers) return;
-        if (!make_device_room(runtime, host_pages - device_pages)) return;
+        if (cache_.ready_layers(matched.host, Tier::Host) != backend_.layers || !make_device_room(runtime, host_pages - device_pages)) {
+            wait_for_progress(runtime);
+            return;
+        }
         const auto started = cache_.begin_load(matched.host);
-        if (started.status == CopyStatus::SourceNotReady) return;
+        if (started.status == CopyStatus::SourceNotReady) {
+            wait_for_progress(runtime);
+            return;
+        }
         if (started.status == CopyStatus::Started) {
             cache_.unpin_host(*host_pin_);
             host_pin_.reset();
             copy(runtime, *started.transfer, matched.host, CopyKind::Load, started.pages, false);
+            wait_for_progress(runtime);
             return;
         }
     }
-    if (cache_.ready_layers(matched.device, Tier::Device) != backend_.layers) return;
+    if (cache_.ready_layers(matched.device, Tier::Device) != backend_.layers) {
+        wait_for_progress(runtime);
+        return;
+    }
     const auto committed_tokens = observed.token_paths.length(tokens.committed.value().path);
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
-    if (!make_device_room(runtime, active_pages - device_pages)) return;
+    if (!make_device_room(runtime, active_pages - device_pages)) {
+        wait_for_progress(runtime);
+        return;
+    }
     requests_[request_].device_pages_allocated_since_return = cache_.device_pages_allocated_since_return();
-    buffer_ = cache_.reserve(Tier::Device, active_pages - device_pages).value();
+    running_[request_].buffer = cache_.reserve(Tier::Device, active_pages - device_pages).value();
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
@@ -238,23 +284,29 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
         plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
 
-    compute_.emplace(source_, std::move(plans), compute_resource_begin(), preparations_);
-    if (compute_->issue()) {
-        issue_ = compute_->issue();
+    auto & compute = running_[request_].compute;
+    compute =
+        std::make_unique<ComputeProgram>(source_, std::move(plans), compute_resource_begin(), preparations_, queues_, ComputeProgram::first_owner + request_);
+    if (compute->issue()) {
+        issue_ = compute->issue();
+        for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
         return;
     }
-    compute_->start(runtime, cause_);
+    // Admission and a data producer from an older request are separate causes.
+    const auto ready = runtime.next_node();
+    if (!submit(runtime, { 0, { { 0, Boundary{} } }, { { *requests_[request_].received, ready, graph::EdgeKind::ResourceOrder } } })) return;
+    compute->start(runtime, ready, 0);
 }
 
-void CacheProgram::publish_prefill_prefix(ProgramRuntime & runtime) {
+void CacheProgram::publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request) {
     const auto & observed = source_.observations();
-    const auto & tokens = observed.request_tokens.at(observed.requests[request_].identity);
+    const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
     const auto prompt = observed.token_paths.pages(tokens.prompt.value().path, page_tokens_);
-    const auto leaf = cache_.commit_device(prompt, *buffer_);
-    cache_.unpin_device(*request_pin_);
-    request_pin_ = leaf;
+    const auto leaf = cache_.commit_device(prompt, *running_[request].buffer);
+    cache_.unpin_device(*running_[request].pin);
+    running_[request].pin = leaf;
     cache_.pin_device(leaf);
-    requests_[request_].prefill_prefix_published = cause_;
+    requests_[request].prefill_prefix_published = cause_;
     backup_prefix(runtime, leaf);
 }
 
@@ -268,18 +320,41 @@ void CacheProgram::backup_prefix(ProgramRuntime & runtime, RadixId leaf) {
     }
 }
 
-void CacheProgram::commit(ProgramRuntime & runtime) {
+void CacheProgram::commit(ProgramRuntime & runtime, std::size_t request) {
+    auto & running = running_[request];
     const auto & observed = source_.observations();
-    const auto & tokens = observed.request_tokens.at(observed.requests[request_].identity);
+    const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
     const auto committed = observed.token_paths.pages(tokens.committed.value().path, page_tokens_);
-    const auto leaf = cache_.commit_device(committed, *buffer_);
-    cache_.release(*buffer_);
-    buffer_.reset();
-    cache_.unpin_device(*request_pin_);
-    request_pin_.reset();
+    if (!running.compute->results_ready() && !running.compute->complete()) running.publication = cache_.begin_device_publication();
+    running.committed = cache_.commit_device(committed, *running.buffer, running.publication);
+    if (running.publication) requests_[request].deferred_kv_pages = cache_.publication_pages(*running.publication);
+    // Existing ready pages need no dependency on an extra in-flight frame.
+    if (running.publication && requests_[request].deferred_kv_pages == 0) {
+        cache_.publish_all(*running.publication);
+        cache_.acknowledge(*running.publication);
+        running.publication.reset();
+    }
+    cache_.unpin_device(*running.pin);
+    running.pin = running.committed;
+    cache_.pin_device(*running.pin);
+    if (!running.publication) requests_[request].kv_published = cause_;
+    backup_prefix(runtime, *running.committed);
+    respond(runtime, request);
+}
 
-    backup_prefix(runtime, leaf);
-    respond(runtime);
+void CacheProgram::publish_result(ProgramRuntime & runtime, std::size_t request) {
+    auto & running = running_[request];
+    cache_.publish_all(*running.publication);
+    cache_.acknowledge(*running.publication);
+    running.publication.reset();
+    requests_[request].kv_published = cause_;
+    backup_prefix(runtime, *running.committed);
+    if (waiting_) advance(runtime);
+}
+
+bool CacheProgram::complete() const {
+    if ((!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
+    return issue_ || std::ranges::all_of(running_, [](const RunningRequest & request) { return !request.compute; });
 }
 
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
@@ -291,22 +366,56 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         return;
     }
-    if (event.owner == ComputeProgram::owner) {
-        compute_->on_event(runtime, event);
-        if (!requests_[request_].prefill_prefix_published && compute_->prefill_result_ready()) {
-            cause_ = compute_->prefill_result_ready();
-            publish_prefill_prefix(runtime);
+    if (event.owner >= ComputeProgram::first_owner) {
+        const auto request = event.owner - ComputeProgram::first_owner;
+        auto & running = running_.at(request);
+        running.compute->on_event(runtime, event);
+        if (!requests_[request].prefill_prefix_published && running.compute->prefill_result_ready()) {
+            cause_ = running.compute->prefill_result_ready();
+            publish_prefill_prefix(runtime, request);
         }
-        if (compute_->complete()) {
-            compute_stats_.add(compute_->stats());
-            compute_.reset();
+        if (!requests_[request].response && running.compute->sent()) {
+            cause_ = running.compute->sent();
+            commit(runtime, request);
+        }
+        if (running.publication && running.compute->results_ready()) {
+            cause_ = running.compute->results_ready();
+            publish_result(runtime, request);
+        }
+        if (running.compute->complete()) {
             cause_ = event.identity;
-            commit(runtime);
+            if (!requests_[request].response) commit(runtime, request);
+            if (running.publication) publish_result(runtime, request);
+            // A response does not release storage still used by in-flight work.
+            cache_.release(*running.buffer);
+            running.buffer.reset();
+            cache_.unpin_device(*running.pin);
+            running.pin.reset();
+            requests_[request].work_completed = event.identity;
+            compute_stats_.add(running.compute->stats());
+            running.compute.reset();
+            if (waiting_) advance(runtime);
         }
         return;
     }
     cause_ = event.identity;
     if (event.action.kind == std::to_underlying(ActionKind::Received)) {
+        request_stage_ = RequestStage::Waiting;
+        advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::AdmissionGranted)) {
+        auto & running = running_[event.action.subject];
+        running.admission.push_back(event.identity);
+        if (running.admission.size() == running.callers.size()) {
+            const auto begin = runtime.next_node();
+            PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::Admitted, event.action.subject) } }, {} };
+            for (const auto grant : running.admission) mutation.dependencies.push_back({ grant, begin, graph::EdgeKind::ResourceOrder });
+            runtime.submit(std::move(mutation));
+        }
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::Admitted)) {
+        auto & received = requests_[event.action.subject].received;
+        if (!received) received = event.identity;
         request_stage_ = RequestStage::Active;
         advance(runtime);
     }

@@ -13,6 +13,7 @@ namespace markov::trace_graph::planning {
 enum class Tier { Device, Host };
 using BufferId = std::size_t;
 using TransferId = std::size_t;
+using PublicationId = std::size_t;
 
 struct CacheConfig {
     // Page capacities are per participant; the controller reports publication
@@ -27,8 +28,8 @@ struct CacheConfig {
 
 struct CacheSlot {
     // No producer means fully published. In-flight progress belongs only to
-    // its transfer, including when a radix split divides the destination.
-    std::optional<TransferId> producer = std::nullopt;
+    // its publication, including when a radix split divides the destination.
+    std::optional<PublicationId> producer = std::nullopt;
 };
 
 struct CacheNode {
@@ -79,7 +80,9 @@ public:
     // Prefetch callers commit only the accepted prefix and retain any in-flight
     // remainder until the worker has actually returned.
     std::optional<BufferId> reserve(Tier tier, std::size_t pages);
-    RadixId commit_device(std::span<const PrefixId> pages, BufferId buffer);
+    PublicationId begin_device_publication();
+    std::size_t publication_pages(PublicationId publication) const;
+    RadixId commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer = std::nullopt);
     RadixId commit_host(std::span<const PrefixId> pages, BufferId buffer);
     void release(BufferId buffer);
     void trim(BufferId buffer, std::size_t remaining_pages);
@@ -111,8 +114,12 @@ private:
     struct Copy {
         CopyKind kind;
         RadixId source_pin;
+    };
+    struct Publication {
+        Tier destination;
         std::vector<RadixId> nodes;
         std::size_t published_layers = 0;
+        std::optional<Copy> copy;
     };
 
     std::optional<CacheSlot> & slot(RadixId node, Tier tier);
@@ -137,7 +144,7 @@ private:
     std::size_t next_identity_ = 0;
     std::size_t access_sequence_ = 0;
     std::map<BufferId, Buffer> buffers_;
-    std::map<TransferId, Copy> copies_;
+    std::map<PublicationId, Publication> publications_;
 };
 
 } // namespace markov::trace_graph::planning

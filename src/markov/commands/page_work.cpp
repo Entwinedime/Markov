@@ -106,7 +106,8 @@ struct SubsetExecution {
     void evaluate(const source::SourceContext & source, std::vector<planning::FrameCompute> frames, cost::Queries & costs) {
         if (!issue.is_null()) return;
         const auto frame_count = frames.size();
-        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size(), preparations);
+        planning::ExecutionQueues queues;
+        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size(), preparations, queues);
         if (program.issue()) {
             issue = {
                 {   "kind", "compute_structure_unavailable" },
@@ -191,11 +192,15 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             request.device_pages_allocated_since_return ? Json(*request.device_pages_allocated_since_return) : Json(nullptr);
         item["partial_request_ports"] = {
             { "start_ns", time(request.start) },
+            { "arrived_ns", time(request.arrived) },
             { "received_ns", time(request.received) },
             { "response_start_ns", time(request.response, true) },
             { "response_complete_ns", time(request.response) }
         };
         item["prefill_prefix_published_ns"] = time(request.prefill_prefix_published);
+        item["kv_published_ns"] = time(request.kv_published);
+        item["deferred_kv_pages"] = request.deferred_kv_pages;
+        item["modeled_work_completed_ns"] = time(request.work_completed);
         if (source.graph().requests.size() == program.requests().size()) {
             const auto & endpoint = source.graph().requests[i];
             item["source_residuals"] = {
@@ -257,13 +262,17 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
          "Inter-call CPU uses corrected source residual approximations for the same caller recipe; known waits require explicit dependencies. "
-         "Partial request ports exclude query/admission, collective envelope CPU, other cross-stream dependencies and client pacing. "
+         "Partial request ports exclude query/admission CPU work, collective envelope CPU, other cross-stream dependencies and client pacing. "
          "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
          "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
          "An unfinished Prefill publishes its page-aligned prompt after participant results are readable and overlap caller submission is available; "
          "write policy can start background backup before Decode completes. Pure result callers wait for their own copy and scheduler submission, "
          "then gate later caller iterations. The send port precedes modeled caller cleanup. CPU cache/release native control remains outside this subset. "
-         "Response still follows all selected work; the complete final-send handoff remains unmodeled. "
+         "Observed final sends release the client response without deleting later compute or caller work. Missing send observations retain a completion "
+         "fence. "
+         "New KV pages remain unreadable until the selected outputs are ready; this is a conservative whole-compute publication boundary. "
+         "Caller turns, admission and native queue frontiers persist across requests. Ingress retains a source residual, which may already include queue "
+         "delay. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
     const auto & compute = program.compute_stats();

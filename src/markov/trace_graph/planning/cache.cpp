@@ -32,7 +32,7 @@ void Cache::apply_split(const RadixMatch & change) {
     nodes_[prefix].host_refs = 0;
     for (const auto tier : { Tier::Device, Tier::Host }) {
         const auto & allocation = slot(prefix, tier);
-        if (allocation && allocation->producer) copies_.at(*allocation->producer).nodes.push_back(prefix);
+        if (allocation && allocation->producer) publications_.at(*allocation->producer).nodes.push_back(prefix);
     }
 }
 
@@ -71,7 +71,7 @@ std::size_t Cache::available_pages(Tier tier) const { return (tier == Tier::Devi
 std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
     const auto & allocation = slot(node, tier);
     if (!allocation) return 0;
-    return allocation->producer ? copies_.at(*allocation->producer).published_layers : config_.layers;
+    return allocation->producer ? publications_.at(*allocation->producer).published_layers : config_.layers;
 }
 
 bool Cache::take_pages(Tier tier, std::size_t pages) {
@@ -96,7 +96,19 @@ std::optional<BufferId> Cache::reserve(Tier tier, std::size_t pages) {
     return id;
 }
 
-RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer) {
+PublicationId Cache::begin_device_publication() {
+    const auto id = next_identity_++;
+    publications_.emplace(id, Publication{ Tier::Device, {}, 0, std::nullopt });
+    return id;
+}
+
+std::size_t Cache::publication_pages(PublicationId publication) const {
+    std::size_t pages = 0;
+    for (const auto node : publications_.at(publication).nodes) pages += tree_.nodes()[node].pages.size();
+    return pages;
+}
+
+RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer) {
     const auto matched = match(pages);
     auto & allocation = buffers_.at(buffer);
     std::size_t needed = pages.size() - matched.pages;
@@ -110,7 +122,8 @@ RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer) {
     for (const auto id : path(inserted.node)) {
         const bool present = nodes_[id].device.has_value();
         if (!present) {
-            nodes_[id].device = CacheSlot{};
+            nodes_[id].device = CacheSlot{ producer };
+            if (producer) publications_.at(*producer).nodes.push_back(id);
             allocation.pages -= tree_.nodes()[id].pages.size();
         }
         const bool new_suffix = id == inserted.node && inserted.pages < pages.size();
@@ -190,7 +203,13 @@ CopyStart Cache::begin_backup(RadixId node) {
     if (!take_pages(Tier::Host, pages)) return { CopyStatus::InsufficientCapacity, std::nullopt, pages };
 
     const auto id = next_identity_++;
-    copies_.emplace(id, Copy{ CopyKind::Backup, node, { node }, 0 });
+    publications_.emplace(id,
+                          Publication{
+                              Tier::Host,
+                              { node },
+                              0,
+                              Copy{ CopyKind::Backup, node }
+    });
     nodes_[node].host = CacheSlot{ id };
     pin_device(node);
     return { CopyStatus::Started, id, pages };
@@ -211,25 +230,32 @@ CopyStart Cache::begin_load(RadixId node) {
     if (!take_pages(Tier::Device, pages)) return { CopyStatus::InsufficientCapacity, std::nullopt, pages };
 
     const auto id = next_identity_++;
-    copies_.emplace(id, Copy{ CopyKind::Load, node, loading, 0 });
+    publications_.emplace(id,
+                          Publication{
+                              Tier::Device,
+                              loading,
+                              0,
+                              Copy{ CopyKind::Load, node }
+    });
     for (const auto destination : loading) nodes_[destination].device = CacheSlot{ id };
     pin_host(node);
     pin_device(node);
     return { CopyStatus::Started, id, pages };
 }
 
-void Cache::publish_layer(TransferId transfer) { ++copies_.at(transfer).published_layers; }
-void Cache::publish_all(TransferId transfer) { copies_.at(transfer).published_layers = config_.layers; }
+void Cache::publish_layer(TransferId transfer) { ++publications_.at(transfer).published_layers; }
+void Cache::publish_all(TransferId transfer) { publications_.at(transfer).published_layers = config_.layers; }
 
 void Cache::acknowledge(TransferId transfer) {
-    const auto & copy = copies_.at(transfer);
-    if (copy.published_layers != config_.layers) throw std::runtime_error("Cannot acknowledge an unpublished cache transfer");
+    const auto & publication = publications_.at(transfer);
+    if (publication.published_layers != config_.layers) throw std::runtime_error("Cannot acknowledge an unpublished cache producer");
 
-    const auto destination = copy.kind == CopyKind::Backup ? Tier::Host : Tier::Device;
-    for (const auto node : copy.nodes) slot(node, destination)->producer.reset();
-    unpin_device(copy.source_pin);
-    if (copy.kind == CopyKind::Load) unpin_host(copy.source_pin);
-    copies_.erase(transfer);
+    for (const auto node : publication.nodes) slot(node, publication.destination)->producer.reset();
+    if (publication.copy) {
+        unpin_device(publication.copy->source_pin);
+        if (publication.copy->kind == CopyKind::Load) unpin_host(publication.copy->source_pin);
+    }
+    publications_.erase(transfer);
 }
 
 std::vector<RadixId> Cache::eviction_order(Tier tier) const {
@@ -241,7 +267,8 @@ std::vector<RadixId> Cache::eviction_order(Tier tier) const {
     }
     const auto selectable = [&](RadixId id) {
         const auto & state = nodes_[id];
-        return id != 0 && slot(id, tier) && state.device_refs == 0 && (tier == Tier::Device || (!state.device && state.host_refs == 0));
+        return id != 0 && slot(id, tier) && !slot(id, tier)->producer && state.device_refs == 0
+               && (tier == Tier::Device || (!state.device && state.host_refs == 0));
     };
     for (RadixId id = 1; id < nodes_.size(); ++id) {
         if (resident_children[id] == 0 && selectable(id)) eligible.emplace(nodes_[id].access_sequence, id);
@@ -264,7 +291,7 @@ void Cache::detach_empty_leaf(RadixId node) {
 }
 
 Eviction Cache::evict_device(RadixId node) {
-    if (node == 0 || !nodes_[node].device || nodes_[node].device_refs != 0) return Eviction::Blocked;
+    if (node == 0 || !nodes_[node].device || nodes_[node].device->producer || nodes_[node].device_refs != 0) return Eviction::Blocked;
     for (const auto & [key, child] : tree_.nodes()[node].children) {
         if (nodes_[child].device) return Eviction::Blocked;
     }
@@ -278,7 +305,7 @@ Eviction Cache::evict_device(RadixId node) {
 }
 
 bool Cache::evict_host(RadixId node) {
-    if (!nodes_[node].host || nodes_[node].device || nodes_[node].device_refs != 0 || nodes_[node].host_refs != 0) return false;
+    if (!nodes_[node].host || nodes_[node].host->producer || nodes_[node].device || nodes_[node].device_refs != 0 || nodes_[node].host_refs != 0) return false;
     for (const auto & [key, child] : tree_.nodes()[node].children) {
         if (nodes_[child].host) return false;
     }
