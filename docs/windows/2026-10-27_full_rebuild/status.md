@@ -1,7 +1,7 @@
 # 全量重构当前状态
 
 更新日期：2026-10-29。**阶段 0、A 已交付；B—D 联合实施中，完整目标预测尚未接通。**
-整体约 58%；B 约 77%、C 约 88%、D 约 82%、E 约 12%，F/G 尚未实施。这是剩余工作量的粗估，不代表精度。
+整体约 59%；B 约 77%、C 约 89%、D 约 84%、E 约 16%，F/G 尚未实施。这是剩余工作量的粗估，不代表精度。
 计划与判据在 [plan.md](plan.md)，实际行动与历史失败在 [log.md](log.md)；此处只保留当前资格和恢复起点。
 
 ## 阶段进度
@@ -12,31 +12,35 @@
 | A 入口与共同合同 | 完成 | 预览、输入合同、构建与 modeling 环境已交付 |
 | B 原始 DAG | 限定范围验证 | SGLang 来源、配方、CPU 区间及原生资源已核对；关键设备因果与真实 KTransformers 来源未完成 |
 | C 目标结构 | 实施中 | 缓存、计算、通信、分配及输入准备已生成；Decode 页表双任务、逐次发射及首用已接入；结果发布与完整依赖仍缺 |
-| D 成本与执行 | 实施中 | caller、worker、设备各按自身工作判断迁移，独立成本与残余共用时钟；入口及变化数组的 CPU 成本和其他请求路径仍缺；NodeScale 与效率验收未完成 |
-| E 采集与性能维护 | 环境与最小采样 | KTransformers 环境、输入内核及 SDK 回调采样可用；base 采集、数据库、训练与用户准备未恢复 |
+| D 成本与执行 | 实施中 | 变化数组分配使用独立正常响应，剩余 CPU 片段扣除分配后迁移；forward 入口与其他请求路径仍缺；NodeScale 与效率验收未完成 |
+| E 采集与性能维护 | 环境与最小采样 | KTransformers 环境、输入内核、SDK 回调及 ATen 分配采样可用；base 采集、数据库、训练与用户准备未恢复 |
 | F 应用与搜索 | 待做 | 未运行新应用或搜索 |
 | G 整体验收 | 待做 | 新完整 HTTP、60/186 格及 10× 效率未运行 |
 
 ## 基线和资产
 
-- 分支 rebuild；代码检查点 91d30db，分开上传载荷与 worker 包装、核对页表入口工作；前一维护基线为 d61dfd2，已包含按 caller、worker 和设备分别判断迁移。仍是 B—D 中途结果，不能作为联合阶段交付。
+- 分支 rebuild；代码检查点 882d605，新增 caller 前置工作、分配区间扣除及独立 ATen 响应；前一维护基线为 f5064dc，已包含上传与页表 CPU 不变量。仍是 B—D 中途结果，不能作为联合阶段交付。
 - A 交付基线 08b6576；旧可运行布局 8668eec、旧文档归档 824b458、筹备基线 c5b1cf2 保留。deprecated 的 586 个本地参考文件不再跟踪，活动代码不调用归档实现。
-- 旧自有源码 88,814 行、546 文件；当前 93 文件、10,848 行，均含空行。归档不算瘦身，当前规模不代表完整实现。
-- 旧资产位于 data/archive，新输入与结果在 data/rebuild。旧搜索保持终止；本批只复核 base 与推理镜像代码，没有设备采集、target 真值读取、模型改参或数据清理。
+- 旧自有源码 88,814 行、546 文件；当前 95 文件、11,117 行，均含空行。归档不算瘦身，当前规模不代表完整实现。
+- 旧资产位于 data/archive，新输入与结果在 data/rebuild。旧搜索保持终止；本批以五次小型独立会话测量 ATen 分配，没有 target 真值读取、按误差改参或数据清理。
 
 ## 当前验证结论
 
-最新公开入口为 data/rebuild/costs/input_cpu_semantics/verified/，checks.json 核对完整源报告（除运行计时）、原图/回放、CPU 划分、模型与域及既有计算几何不变。默认仍为 empty 初始状态，来源只准备一次，未填零跳过启动成本。
+最新公开入口为 data/rebuild/costs/tensor_allocations/verified/，checks.json 核对完整源报告（除运行计时）、原图/回放及既有计算几何不变；独立模型新增两项，CPU 可迁移视图扣除已单列分配。默认仍为 empty 初始状态，来源只准备一次，未填零跳过启动成本。
 
 | 页大小 | 已执行节点 | 当前组件链路走完的准备请求 | 正式请求完成 | 当前首个缺口 |
 | --- | ---: | ---: | ---: | --- |
-| 32 | 58,842 | 1 | 0 | 32-token Prefill 的 CPU 工作 |
-| 64 | 58,842 | 1 | 0 | 64-token Prefill 的 CPU 工作 |
-| 128 | 2,059,534 | 35 | 0 | 640-token Prefill 的 CPU 工作 |
+| 32 | 58,848 | 1 | 0 | 32-token Prefill 的 forward 入口 |
+| 64 | 58,848 | 1 | 0 | 64-token Prefill 的 forward 入口 |
+| 128 | 2,059,744 | 35 | 0 | 640-token Prefill 的 forward 入口 |
 
-三个目标首个未完成片段各剩 12 个不同工作/计时点，均为 caller：forward 入口、token 上传包装及位置数组分配的前后段，分别列出服务与残余。没有 worker、设备服务或启动成本缺口；这些不是 12 个独立模型。当前组件链路走完不等于完整 HTTP，e2e_predicted 仍为 false。
+三个目标首个未完成片段各剩 4 个不同工作/计时点，均为 forward 入口的 caller 前后服务与残余。token 上传与位置生成的分配已独立定价，不再把整个 caller 按长度区分；入口尚未取得必要分支事实，未放宽条件。当前组件链路走完不等于完整 HTTP，e2e_predicted 仍为 false。
 
-input_cpu_semantics/ 的实际镜像代码确认页表入口仅按请求数构造指针，长度循环在设备；上传量由完整复制 API 支付，未变 worker 包装不重复使用该字节条件。首片段缺口从前批 21 降至 12，没有补采或新增模型。eligibility/ 在 282 个来源变体中核对 94 次上传量改变保留未变 worker，并拒绝 94 次实现不符的上传；6,392 次来源响应均拒绝不符工作或资源，188 个设备工作改变但 worker 不变的发射保持。probe_flags.txt 确认现用 attention metadata 未声明部分可选 forward CPU 分支，入口条件未放宽，位置分配和 caller 实际上传量也未放宽。
+tensor_allocations/source_audit/ 确认 94 段 token 上传前段各有一次 empty_strided，92 段可用的位置前段各有两次 empty。结构侧显式生成这些分配，来源按原生次序扣除整段 API，剩余 CPU 包装按 rank 等实际不变量匹配。accounting/ 逐项验证 9,292 个 CPU 区间与 278 个被扣除分配相加守恒；已知等待、未覆盖服务和残余均保持。扣除的原始服务共 9.333 ms，不能将其视为正常分配耗时。282 个来源变体还核对 188 次不符前置配方拒绝迁移、6,768 次不符工作/资源拒绝，以及 188 次设备变化保留未变 worker。
+
+本批三个进程估计、两个独立进程验证，共 9,200 次正常分配、460 次预热，累计约 170.6 秒、保留约 279 KiB，设备均释放；一次验证门禁未确认空闲，未启动设备，复查后继续。预算上限六次/600 秒/32 MiB，未重置用量。无 profiler、probe 或模型权重；每项扣除空计时器的典型开销，析构与元数据核对在计时外。两项典型响应为 2,690/3,365 ns，独立验证 WAPE 2.68%/1.84%，最大绝对误差 0.160/0.125 微秒，验证后未改参。范围限就绪 runtime 的连续 int32/int64 向量、4..262,144 字节；缓存压力、延迟归还和首次初始化仍未定价，不授予完整 HTTP 精度。
+
+input_cpu_semantics/ 保留前批页表入口与上传包装依据。forward_flags.json 的扩展复核仍未取得必要入口分支；model_input_embedding_present 是模型 embedding 层事实，不能当作请求额外 input_embeds 的开关。
 
 native_multilaunch/source_audit/ 的单卡实际记录确认 235 次 IndexPut 都按广播、索引写入两次发射；callback_checks/ 在完整来源核对 94 个已声明的双任务回调、逐次 CPU/设备引用及不阻塞下一次 CPU 发射的依赖。
 共保留 9,292 个普通 CPU 片段和 1,034 个完整独占设备服务；两个含加载的回调不提供普通 worker 成本，改用同工无加载回调的六个片段。原有 2,350 段就绪派发、374 个就绪标记及 846 段已生成的 stream 等待资格保持，残余和标记仍非精确正常服务。
@@ -57,11 +61,11 @@ cann_first_use/ 新增一项共享 SDK 首用增量：三个新进程各取首�
 - 输入原生工作现有 9,292 个来源 CPU 片段，服务与残余分开校正，846 段已生成的 stream 同步等待不再复制；上传 API 整段留给独立响应，worker 只取两侧。工作或资源不相符时转向独立查询；worker 的逐次发射与整个回调返回分别留有来源。
 - 首次编译/加载包络不迁移；184 段已观察到先前相同声明规格的前段可供匹配工作使用。同一 base 的后续相同调用可补本次首次调用的普通前段，编译/加载仍另计；该范围假设源规格缓存不中途失效。
 
-选定成本响应现共 1,730 项，其中一项来自此前独立 SDK 启动增量，原有参数未按 target 结果调整。此前 11 次独立采集提供 132 个编译/首次加载观察及六项准备响应，闭合 ACL 上传另有正常采样依据。
+选定成本响应现共 1,732 项，本批只新增两项独立分配响应，原有参数未按 target 结果调整。此前 11 次独立采集提供 132 个编译/首次加载观察及六项准备响应，SDK 首用与闭合 ACL 上传另有正常采样依据。
 costs/input_preparation_import/ 保存样本、来源和导入修正。公开独立查询的九个已测准备点可返回中位响应，四个不符运行环境初始上下文的点明确域外。
-input_preparation_expected.json 保留独立源边界，当前缺口在 costs/input_cpu_semantics/cost_needs.json。native_multilaunch/callback_checks/ 核对成本守恒、工作/资源改变后的独立查询、首用状态及两次发射的依赖，source_audit/ 保留原生序列与 QKV 参数依据。
+input_preparation_expected.json 保留独立源边界，当前缺口在 costs/tensor_allocations/cost_needs.json。native_multilaunch/callback_checks/ 核对首用状态与两次发射的依赖，source_audit/ 保留原生序列与 QKV 参数依据；tensor_allocations/accounting/ 核对当前扣除和迁移资格。
 
-本批最终入口约 102.9 秒、峰值约 2.55 GiB，单个 8 GiB/2 CPU 无设备/网络容器。这不是完整预测时间或提速成绩。Release/Debug、格式及实际来源断言通过；前批 SDK C++23 未改动。源 CPU 仍是差额预算估计与未覆盖原值，不是逐操作正常服务真值。
+本批最终入口约 104.6 秒、峰值约 2.56 GiB，单个 8 GiB/2 CPU 无设备/网络容器。这不是完整预测时间或提速成绩。Release/Debug、SDK C++23、Python 检查及实际来源断言通过。源 CPU 剩余片段仍是差额预算估计与未覆盖原值，不是逐操作正常服务真值。
 
 input_preparation_semantics/upload_capture/ 用独立小张量观察未固定主机内存的 NPU 上传：一次启动、5 次预热、30 次有效上传，覆盖四 dtype、五工作点及空闲/已有计算两种条件。
 30 条上传均有 worker 等流、Runtime@MemCopySync 和 caller 同步，没有设备上传任务；同捕获有 180 个计算任务。脚本计时约 6.1 秒（不含导入），保留约 2.51 MiB，设备已释放；profiler 停止状态警告保留，不授予完整捕获或正常 CPU 成本资格。
@@ -110,7 +114,7 @@ Ascend kernel_ascend/page_first_direct 按整批跨层 DMA 发布；查询/准�
 ## 恢复起点
 
 1. 继续核对原生实际派发及同步时钟：最大首次通信已定位到长 launch 包络，但内部提交端口未解释，不能统一将箭头改接调用结束；146 条时序违例及部分同步前沿仍需必要观察。source_device_causality/separated/ 是未改图的分类基线，ports_verified/ 是当前结果，不能用 HTTP 一致代替因果验收。
-2. 从 input_cpu_semantics/cost_needs.json 处理剩余三类 caller 工作：forward 入口、token 上传包装和位置数组分配。入口先补齐实际可选 CPU 分支及边界事实，再为仍无法迁移或合理外推的工作构造有界共享采样；不把 12 个计时点逐条变成模型，也不把包装响应、GPU 等待和自身服务混用。已有页表入口、上传 worker、CANN 启动增量与 QKV 参数描述已接通，不重复补这些项。
+2. 从 tensor_allocations/cost_needs.json 处理剩余 forward 入口：明确输入 logprob、额外 embeddings 等实际分支及独占边界；现有 metadata 没给出这些开关，不能将缺字段或模型 embedding 层存在与否当成请求输入条件。只对仍无法迁移或合理外推的工作做共享采样，不把四个计时点逐条变成参数。已解决的分配、页表入口、上传 worker、CANN 启动及 QKV 描述不重复补。
 3. 补齐必要源事实、常规成本及完整请求控制，验证 Decode/QKV 数值执行与上一轮 token 的实际发布，再核对提交/结果可读/响应/后台完成端口；然后继续 self、跨配置和同源多目标。任意跨流及 KTransformers 真实来源仍缺。
 4. 完成 B—D 联合交付，再推进 E、F、G；E 的最小必要依赖可前移，正式采集与数据库维护不能长期依赖本批一次性导入。代表输入在 data/archive/rebuild/inputs/representatives.json。
 
