@@ -123,7 +123,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 静态确认；实际G组检查先被R2阻断，未单独运行到此错误。
 
-**位置：** [example/automatic_graph/evidence.py:48](../../../example/automatic_graph/evidence.py#L48)；关联 [src/markov/adapters/frameworks/sglang/structure.cpp:244](../../../src/markov/adapters/frameworks/sglang/structure.cpp#L244)、[src/markov/adapters/frameworks/sglang/batches.cpp:65](../../../src/markov/adapters/frameworks/sglang/batches.cpp#L65)、[src/markov/workflow/serving.cpp:94](../../../src/markov/workflow/serving.cpp#L94)、[example/automatic_graph/investigation.py:303](../../../example/automatic_graph/investigation.py#L303)。
+**位置：** [example/automatic_graph/evidence.py:48](../../../example/automatic_graph/evidence.py#L48)；关联 [src/markov/adapters/frameworks/sglang/structure.cpp:244](../../../src/markov/adapters/frameworks/sglang/structure.cpp#L244)、[src/markov/adapters/frameworks/sglang/batches.cpp:65](../../../src/markov/adapters/frameworks/sglang/batches.cpp#L65)、[src/markov/workflow/serving.cpp:94](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/markov/workflow/serving.cpp#L94)、[example/automatic_graph/investigation.py:303](../../../example/automatic_graph/investigation.py#L303)。
 
 **触发与影响：** 错峰请求使控制器在两次到达之间清理已结束批次，并用--details输出该次合法执行。 ServingStructure::idle给新增区域写control身份，不写action；ServingWorkflow把它们记入controls。ExecutionEvidence逐节点直接读取region['action']，因此会在合法的空闲清理区域抛出KeyError。 条件预测本身可能已成功，后置证据检查却失败；该案例被记录为error，无法检查后续依赖/输出不变量。问题位于example验证层，不能据此判定核心展开失败。
 
@@ -137,7 +137,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 运行确认；前期开发与本轮冻结矩阵均实际触发。
 
-**位置：** [example/automatic_graph/evidence.py:29](../../../example/automatic_graph/evidence.py#L29)；关联 [example/automatic_graph/evidence.py:24](../../../example/automatic_graph/evidence.py#L24)、[src/markov/execution/executor.cpp:213](../../../src/markov/execution/executor.cpp#L213)、[src/markov/workflow/serving.cpp:126](../../../src/markov/workflow/serving.cpp#L126)。
+**位置：** [example/automatic_graph/evidence.py:29](../../../example/automatic_graph/evidence.py#L29)；关联 [example/automatic_graph/evidence.py:24](../../../example/automatic_graph/evidence.py#L24)、[src/markov/execution/executor.cpp:213](../../../src/markov/execution/executor.cpp#L213)、[src/markov/workflow/serving.cpp:126](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/markov/workflow/serving.cpp#L126)。
 
 **触发与影响：** 读取已有PP4完整预测：control_status=complete，但最后的设备空闲页拼接仍有一个running和一个waiting节点。 check同时构造all_nodes_completed_once和nonnegative_intervals；尚未检查前者就对全部节点读取started_ns/completed_ns。running节点只有expected_ns，waiting节点没有起止时间，因而直接KeyError，无法输出已准备好的失败判据。 原生对照仍会运行，但案例的执行证据被记录为工具错误。检查器也混淆了控制端口完成与所有异步工作排空，需要先澄清再评价PP结果。
 
@@ -151,7 +151,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 运行确认；已有原型及原生目标均有事实，预测确实无法消费相应分支。
 
-**位置：** [src/markov/templates/library.cpp:802](../../../src/markov/templates/library.cpp#L802)；关联 [src/markov/templates/asset.cpp:543](../../../src/markov/templates/asset.cpp#L543)、[src/collection/markov_collection/adapters/runtimes/ascend/matrices.py:103](../../../src/collection/markov_collection/adapters/runtimes/ascend/matrices.py#L103)。
+**位置：** [src/markov/templates/library.cpp:802](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/markov/templates/library.cpp#L802)；关联 [src/markov/templates/asset.cpp:543](../../../src/markov/templates/asset.cpp#L543)、[src/collection/markov_collection/adapters/runtimes/ascend/matrices.py:103](../../../src/collection/markov_collection/adapters/runtimes/ascend/matrices.py#L103)。
 
 **触发与影响：** 冻结案例qwen3-tp1-pp3/full-micro/boundaries：八成员Prefill合计1044 token、microbatch_requests=8。 此矩阵的SDK条件在matrix_rows>=1024时选择另一算法。PP模型调用的selection2只包含False分支；同一库的selection23已经包含True原型，但因具体stream绑定不同而被分在另一个选择池。 合法配置的条件展开被拒绝，六组合中一例失败。已有来源和算法元数据仍不能统一供PP模型调用消费；不能将其解释为必须补采新shape或用户填写模板。
 
@@ -179,7 +179,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 运行确认；目标的实际设备实现与预测不同。
 
-**位置：** [src/collection/markov_collection/adapters/runtimes/ascend/observation.py:40](../../../src/collection/markov_collection/adapters/runtimes/ascend/observation.py#L40)；关联 [src/collection/markov_collection/adapters/runtimes/ascend/matrices.py:110](../../../src/collection/markov_collection/adapters/runtimes/ascend/matrices.py#L110)、[src/collection/markov_collection/adapters/frameworks/sglang/primitives.py:246](../../../src/collection/markov_collection/adapters/frameworks/sglang/primitives.py#L246)、[src/collection/adapters/runtimes/ascend/matmul_selection.cpp:42](../../../src/collection/adapters/runtimes/ascend/matmul_selection.cpp#L42)。
+**位置：** [src/collection/markov_collection/adapters/runtimes/ascend/observation.py:40](../../../src/collection/markov_collection/adapters/runtimes/ascend/observation.py#L40)；关联 [src/collection/markov_collection/adapters/runtimes/ascend/matrices.py:110](../../../src/collection/markov_collection/adapters/runtimes/ascend/matrices.py#L110)、[src/collection/markov_collection/adapters/frameworks/sglang/primitives.py:246](../../../src/collection/markov_collection/adapters/frameworks/sglang/primitives.py#L246)、[src/collection/adapters/runtimes/ascend/matmul_selection.cpp:42](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/collection/adapters/runtimes/ascend/matmul_selection.cpp#L42)。
 
 **触发与影响：** 冻结qwen15-moe-ep1/wide/varying，Prefill八成员/1044 token，24层QKV投影为aten.addmm.default。 Ascend观察器只为mm/matmul建立dense_matrix及execution_guards，addmm直接走普通形状传播。辅助探针只执行torch.matmul，SDK查询不带bias。addmm在源和目标均没有matrix_selection/guards，于是目标M改变后仍沿用源V2设备模式。 请求完成、公开几何和逻辑操作都可以一致，但24个设备节点错误；不是缺成本、路由注入或单纯控制顺序差异。性能层不能通过调整时延修复错误执行模式。
 
@@ -221,7 +221,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 静态确认；本轮未另行构造“所有预测失败”的单组合任务运行复现。
 
-**位置：** [src/collection/markov_collection/workflow/exploration.py:195](../../../src/collection/markov_collection/workflow/exploration.py#L195)；关联 [example/automatic_graph/validation.py:155](../../../example/automatic_graph/validation.py#L155)、[src/collection/markov_collection/workflow/exploration.py:464](../../../src/collection/markov_collection/workflow/exploration.py#L464)。
+**位置：** [src/collection/markov_collection/workflow/exploration.py:195](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/collection/markov_collection/workflow/exploration.py#L195)；关联 [example/automatic_graph/validation.py:155](../../../example/automatic_graph/validation.py#L155)、[src/collection/markov_collection/workflow/exploration.py:464](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/collection/markov_collection/workflow/exploration.py#L464)。
 
 **触发与影响：** 有效单配置×单workload任务已发布模板，但预测失败；随后按公开validate入口采原生目标。例如只提交本轮已确认失败的PP3 full-micro/boundaries组合。 NativeValidation在任务原有failures仍在时调用task.prepare。prepare将check_workloads的新结果合入历史failures，再以总错误数等于组合数判断无需准备SDK；这个总数也包含C++预测错误，输入合法时同样会提前返回。 正式任务结束已删除work/observer-build，后续原生验证因此缺少必要观察库和selector，可能启动失败或丢失所需观察；破坏“预测失败仍采预选原生事实”的验证边界。
 
@@ -235,7 +235,7 @@ page64 的 PD1→1 来源发布及四个正式预测均完成；独立目标两�
 
 **确认程度：** 运行确认；冻结矩阵的多类错误均有完整日志。
 
-**位置：** [src/collection/markov_collection/workflow/exploration.py:136](../../../src/collection/markov_collection/workflow/exploration.py#L136)；关联 [example/automatic_graph/investigation.py:208](../../../example/automatic_graph/investigation.py#L208)、[example/automatic_graph/investigation.py:43](../../../example/automatic_graph/investigation.py#L43)。
+**位置：** [src/collection/markov_collection/workflow/exploration.py:136](https://github.com/Entwinedime/Markov/blob/d49f57adcb9a7b8388729d390c524ef12a16ad6c/src/collection/markov_collection/workflow/exploration.py#L136)；关联 [example/automatic_graph/investigation.py:208](../../../example/automatic_graph/investigation.py#L208)、[example/automatic_graph/investigation.py:43](../../../example/automatic_graph/investigation.py#L43)。
 
 **触发与影响：** 多行失败日志以空行或次生诊断结束；本轮设备预检及Phi3预热失败已触发。 Exploration.step只读取run.log最后一行。设备占用输出的空末行变成空CommandFailed信息；Phi3原生QKV断言则被随后CUDA coredump提示替代。 精简结果不能准确区分资源预检受阻和原生kernel不兼容，需人工回看完整日志；原始事实与费用仍完整，未将失败写成成功。
 

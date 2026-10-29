@@ -114,7 +114,7 @@ S9资源服务实现所选普通KV语义，S10再接一级设备前缀缓存；�
 | --- | --- | --- |
 | [ServingControl::plan/start/finish](../../../src/markov/controller/control.hpp) | plan可有状态地推进，原生准备期间已能预约资源；显式等待范围仍需扩展 | 返回带身份的工作或等待条件；不克隆整个原生对象来假装无副作用 |
 | [Batch / BatchWork / BatchEffects](../../../src/markov/contracts/serving.hpp) | 一个batch.phase；原生模型提交与结果效果已分开，尚无mixed成员阶段 | 成员自带阶段、逻辑token范围和有效context；按实际机制扩展，不重复预测原生下一状态 |
-| [ServingWorkflow](../../../src/markov/workflow/serving.cpp) | 已处理逐动作完成，idle在空闲路径推进 | 核清需要独立唤醒的等待与无模型片段；workflow不读私有队列 |
+| [ServingWorkflow](../../../src/markov/serving/workflow.cpp) | 已处理逐动作完成，idle在空闲路径推进 | 核清需要独立唤醒的等待与无模型片段；workflow不读私有队列 |
 | [KvPool](../../../src/markov/resources/kv_pool.hpp) 与轻量/PD 控制 | 页/槽位为共同对象，原生facade可查询容量、分配和索引，并报告释放 | 核查实际使用的就绪与资源压力边界；前缀缓存留S10 |
 | [SGLangRankStructure](../../../src/markov/adapters/frameworks/sglang/rank_structure.cpp) | 维护空闲池/请求映射的图值，并基于批次效果推导回收 | 图值和存储版本继续保留；数值分配与状态变化绑定资源服务结果，删除独立推测页账/回收的职责 |
 | [Executor](../../../src/markov/execution/executor.hpp) | 已有就绪资源、任务和 Published/Completed | 扩展必要端口和唤醒，不另建时间轴、事件模拟器或全局屏障 |
@@ -143,7 +143,7 @@ S9返回当前调用所需的有效索引，原生需要的CPU tensor由这些�
 
 ### 5.2 代码放置、跨语言与依赖方向
 
-下表规定实现位置，新增目录随真实消费者出现，不预建空包/父类。C++头文件与源文件同目录，文件移动同时更新调用方、构建、Docker和正式入口。
+下表维护当前源码职责落点；全项目整理的范围与交付条件由[plan.md](plan.md)维护，不把具体路径作为必须保留的约束。新增目录须有实际职责和消费者，不预建空包/父类。C++头文件与源文件同目录，文件移动同时更新调用方、构建、Docker和正式入口。
 
 | 职责 | 放置位置 | 不应混入的内容 |
 | --- | --- | --- |
@@ -154,15 +154,16 @@ S9返回当前调用所需的有效索引，原生需要的CPU tensor由这些�
 | C++侧SGLang语义工作与图绑定 | 现有`src/markov/adapters/frameworks/sglang/` | Python进程管理、通用协议传输和验证编排 |
 | 原生控制适配 | `src/control/markov_control/adapters/frameworks/sglang/` | 通用图/资源算法、采集器、第二份请求或缓存状态机 |
 | 设备/runtime替代 | 同一控制包的`adapters/runtimes/`，仅建立实际需要的实现 | 框架选批规则、按模型名字分支；runtime不反向依赖框架 |
-| 正式运行装配 | C++现有`workflow/`与CLI；Python控制包的`workflow/` | 决策算法、适配私有字段、完整验证矩阵 |
+| 正式运行装配 | `src/markov/application/`与CLI；`src/application/markov_application/`管理外层任务/进程 | 决策算法、适配私有字段、完整验证矩阵 |
+| 共同serving循环 | `src/markov/serving/`，经共同接口交接动作和完成 | 具体框架构造、环境启动和文件入口 |
 | 来源采集与观察 | 现有`src/collection/markov_collection/` | 预测时启动原生控制或执行器；不把控制后端塞进采集会话 |
 | 案例与独立比较 | `example/`；Docker目录仅组装运行环境 | 验证规则进入业务、Docker内维护业务hooks或模型特例 |
 
 Python框架adapter负责原生对象构造、选批/结果入口、请求及rank身份转换和原生通信接口形态；PyTorch/Ascend加载、设备event等差异在runtime适配。框架adapter可组合runtime，通用层不反向识别框架。真正共享的身份/值编码只维护一处，通过明确合同复用；不要为了共享几行代码让采集与控制相互导入。
 
-保持 `workflow → adapters → core` 的依赖方向。资源服务提供共同机制；确有来源依据的框架特殊策略由适配提供并注入，核心不按框架名分支。每轮改动同时检查代码位置和实际调用关系，不能只移目录却继续越层访问。
+保持应用装配 → adapters → 共同核心的依赖方向；serving闭环只使用共同接口。资源服务提供共同机制；确有来源依据的框架特殊策略由适配提供并注入，核心不按框架名分支。每轮改动同时检查代码位置和实际调用关系，不能只移目录却继续越层访问。
 
-当前没有现成Python绑定。首条实现建议采用**长期存活的本地控制进程+管道消息**，保留原生调用栈，C++持有资源和图执行。跨语言只传必要资源查询/结果、工作快照和完成条件，不逐节点传图、不每批启动CLI，不同时建设多种桥接方案。框架无关的传输和进程生命周期归workflow；原生类型转换归adapter；`ServingControl`只表达共同推进接口。
+当前没有现成Python绑定。首条实现建议采用**长期存活的本地控制进程+管道消息**，保留原生调用栈，C++持有资源和图执行。跨语言只传必要资源查询/结果、工作快照和完成条件，不逐节点传图、不每批启动CLI，不同时建设多种桥接方案。框架无关的传输和进程生命周期归应用装配；原生类型转换归adapter；`ServingControl`只表达共同推进接口。
 
 正式外层入口为`scripts/markov-control.sh`：启动C++与无设备原生两个隔离容器，输出精简结果及同名logs目录，明细显式开启。模板传来的模型配置和dtype用于构造原生元数据，不挂载权重，不维护第二份模型选择。SGLang适配继承真实Scheduler并运行event_loop_normal，只接管接收端、物理模型与资源服务、结果反馈；原生选批、分发和空闲检查仍执行原方法。
 

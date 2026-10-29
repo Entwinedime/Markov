@@ -35,13 +35,13 @@
 
 - C++ 头文件和源文件按职责放在同一目录，例如 `src/markov/templates/template.hpp` 与 `src/markov/templates/template.cpp`；不再维护平行的 include/src 目录树。采集侧自有 C++ 代码同样遵循同目录规则。
 - C++ 业务代码以 `src` 为 include 根，使用 `markov/<职责>/<文件>.hpp`；不保留旧路径转发头文件。普通实现放在 `.cpp`，头文件只保留必要声明和模板定义，不因同目录改成全部 header-only。实际交付的文件进入正式 CMake target，不预建空目录或占位类。
-- 依赖向内为 `workflow → adapters → core`；core 不经直接或传递 include 取得具体框架配置或 workflow Project。
+- 依赖向内为应用装配 → adapters → 共同核心；serving闭环只依赖共同控制、展开和执行接口。核心不经直接或传递 include 取得具体框架配置或应用任务对象。
 - 框架、模型、并行和环境差异留在相应 adapters。框架可组合 runtime，runtime 不反向依赖框架；controller/execution/performance 不按框架名、原生函数或 kernel 名增加业务分支。
-- Python 分为 workflow、instrumentation、artifacts、adapters。公共 wrapper 与产物合同不导入具体框架或 runtime，能力通过必要接口传入。
+- Python外围任务、采集观察和原生控制分别维护；共同instrumentation与产物发布不导入具体框架或runtime。任务层调用适配能力，采集/控制不反向导入应用编排。目录表达实际职责，小型公共发布可以是单模块，不强制单文件建包。
 - 环境补丁、依赖固定和原生观察资源随适配器维护；Dockerfile 负责选择组合、复制与直接调用，不增加无行为安装转发层。官方 third_party 工作树保持上游内容。
 - 文件移动同步 include/import、子进程模块路径、源码根定位、CMake、Docker COPY、调用方与说明；跨语言合同同步生产者和消费者。
 
-共享核心维护控制和资源的唯一状态，模板声明读写与端口，不注入框架私有状态机。新公共能力确有必要时修改共同合同及实现，不能把特化回调藏成第二套调度器。
+所选控制实现唯一维护请求逻辑进度；核心资源服务维护槽位、页、驻留与就绪，执行器维护模拟时钟和在途工作。原生adapter提供这些资源的必要视图，不重复实现分配算法。模板声明读写与端口，不注入框架私有状态机。新公共能力确有必要时修改共同合同及实现，不能把特化回调藏成第二套调度器。
 
 ## C++23 与 Python
 

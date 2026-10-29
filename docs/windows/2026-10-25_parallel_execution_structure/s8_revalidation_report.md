@@ -260,7 +260,7 @@ P/D每个P rank仅配对1个流程，尚有1个原生、7个目标流程未配�
 
 ### 已有修复的新增资格：R4
 
-Page1保留历史6个预测错误，恰等于全部组合；相同输入的当前check_workloads返回0个invalid，观察器确实第二次构建，原生目标完成。结合[prepare](../../../src/collection/markov_collection/workflow/exploration.py)约198行，R4从仅静态证据补充为该历史错误场景的限定运行证据。未将它扩大为全部失败/恢复路径均正确，page1业务参数错误仍保留。
+Page1保留历史6个预测错误，恰等于全部组合；相同输入的当前check_workloads返回0个invalid，观察器确实第二次构建，原生目标完成。结合[prepare](https://github.com/Entwinedime/Markov/blob/0daa08f37b9080055820b0f34ee0bcdfb938333b/src/collection/markov_collection/workflow/exploration.py)约198行，R4从仅静态证据补充为该历史错误场景的限定运行证据。未将它扩大为全部失败/恢复路径均正确，page1业务参数错误仍保留。
 
 ## 7. 存储恢复与实际费用
 
