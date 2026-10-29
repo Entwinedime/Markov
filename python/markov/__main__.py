@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 from markov.artifacts.request import PredictionRequest
@@ -19,17 +20,26 @@ def main() -> int:
     capture = commands.add_parser("capture", help="Capture the declared base using its runtime and cumulative budget.")
     capture.add_argument("--request", type=Path, required=True)
     capture.add_argument("--recapture", action="store_true", help="Collect again without resetting prior budget use.")
+    maintenance = commands.add_parser(
+        "maintain", help="Import independent performance data and train selected offline responses."
+    )
+    maintenance.add_argument("--request", type=Path, required=True)
     args = parser.parse_args()
 
     try:
-        request = PredictionRequest.load(args.request)
-        if args.command == "plan":
-            result = plan_prediction(request)
-        else:
-            from markov.workflow.capture import BaseCapture
+        if args.command == "maintain":
+            from markov.workflow.performance import maintain_performance
 
-            result = BaseCapture(request).run(recapture=args.recapture)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+            result = maintain_performance(args.request)
+        else:
+            request = PredictionRequest.load(args.request)
+            if args.command == "plan":
+                result = plan_prediction(request)
+            else:
+                from markov.workflow.capture import BaseCapture
+
+                result = BaseCapture(request).run(recapture=args.recapture)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         print(f"markov: {error}", file=sys.stderr)
         return 2
 
