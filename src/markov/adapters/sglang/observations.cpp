@@ -77,6 +77,19 @@ void ProbeReader::observe(const ProbeEvent & event) {
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
+    if (name == "runtime.phase.batch_inputs" && args.at("status") == "returned") {
+        const auto context = read_input_context(args);
+        std::vector<Index> requests;
+        for (const auto & identity : context.requests) requests.push_back(output_.name(identity));
+        const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + process + ":" + event.thread);
+        schedule_inputs_.emplace(std::move(requests),
+                                 InputFacts{
+                                     { resource, event.begin_ns, event.end_ns, event.record },
+                                     context.phase,
+                                     context.plain
+        });
+        ++output_.counts[std::string("schedule_input_facts.") + (context.plain ? "plain" : "unsupported")];
+    }
     if (name == "runtime.hicache.extend_allocator") {
         const auto frame = forward_frames_.find(process);
         if (frame == forward_frames_.end()) ++output_.counts["extend_allocator_without_forward_context"];
@@ -180,8 +193,8 @@ void ProbeReader::observe(const ProbeEvent & event) {
             const auto window = input_windows_.find(process);
             if (window != input_windows_.end() && window->second.table_write && window->second.forward) {
                 preparations.push_back({ *window->second.table_write, read_request_table_write(args), "request_table_write" });
-                preparations.push_back(
-                    { *window->second.forward, deterministic_sampling_ ? read_forward_inputs(args, *deterministic_sampling_) : nullptr, "forward_inputs" });
+                pending_inputs_.push_back({ frame->second, preparations.size(), args });
+                preparations.push_back({ *window->second.forward, nullptr, "forward_inputs" });
                 input_windows_.erase(window);
             }
             else ++output_.counts["input_preparation_boundaries_unavailable"];
@@ -233,6 +246,33 @@ void ProbeReader::observe(const ProbeEvent & event) {
     }
     if (std::ranges::find(compute_roles, name) != compute_roles.end()) observe_compute(event);
     if (name == "runtime.phase.device_collective") observe_collective(event);
+}
+
+void ProbeReader::finish() {
+    // Sidecars may follow the main probe file; qualify after every input is read.
+    for (const auto & pending : pending_inputs_) {
+        auto & frame = output_.compute_frames[pending.frame];
+        auto & preparation = frame.preparations[pending.preparation];
+        const auto & region = preparation.region;
+        std::vector<const InputFacts *> matching;
+        const auto [begin, end] = schedule_inputs_.equal_range(frame.requests);
+        for (auto at = begin; at != end; ++at) {
+            const auto & fact = at->second;
+            const auto & observed = fact.region;
+            if (fact.phase == frame.phase && observed.resource == region.resource && observed.begin_ns <= region.begin_ns && region.begin_ns < observed.end_ns
+                && observed.end_ns <= region.end_ns)
+                matching.push_back(&fact);
+        }
+        auto context = InputContextStatus::Unobserved;
+        if (!matching.empty()) {
+            const bool plain = matching.size() == 1 && matching.front()->plain;
+            context = plain ? InputContextStatus::PlainText : InputContextStatus::Unsupported;
+            ++output_.counts[plain ? "forward_entry_context_supported" : "forward_entry_context_unsupported_or_incomplete"];
+        }
+        if (deterministic_sampling_) preparation.definition = read_forward_inputs(pending.metadata, *deterministic_sampling_, context);
+    }
+    pending_inputs_.clear();
+    schedule_inputs_.clear();
 }
 
 void ProbeReader::observe_collective(const ProbeEvent & event) {

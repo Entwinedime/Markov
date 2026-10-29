@@ -18,12 +18,14 @@ enum class Part { RequestTable, ForwardInputs, SamplingPositions };
 
 class InputPreparation final : public CallSequence {
 public:
-    InputPreparation(Part part, double table_rows, double table_columns, std::string sequence_dtype, bool deterministic_sampling = false)
+    InputPreparation(Part part, double table_rows, double table_columns, std::string sequence_dtype, bool deterministic_sampling = false,
+                     bool fixed_entry_work = false)
         : part_(part),
           table_rows_(table_rows),
           table_columns_(table_columns),
           sequence_dtype_(std::move(sequence_dtype)),
-          deterministic_sampling_(deterministic_sampling) {}
+          deterministic_sampling_(deterministic_sampling),
+          fixed_entry_work_(fixed_entry_work) {}
     NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work>) const override;
 
 private:
@@ -32,6 +34,7 @@ private:
     double table_columns_;
     std::string sequence_dtype_;
     bool deterministic_sampling_;
+    bool fixed_entry_work_;
 };
 
 void queued(std::vector<NativeCall> & calls, const std::string & name, const std::string & implementation, Features shape, bool incoming_stream = false,
@@ -53,7 +56,7 @@ CallerPreparation allocation(const std::string & api, double elements, double el
     };
 }
 
-NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInput & input) {
+NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInput & input, bool fixed_entry_work = false) {
     const auto role = part == Part::RequestTable ? "request_table" : part == Part::ForwardInputs ? "forward" : "sampling_positions";
     for (std::size_t id = 0; id < calls.size(); ++id) {
         auto caller = calls[id].work;
@@ -64,9 +67,9 @@ NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInp
             caller.features["tensor_rank"] = 1;
         }
 
-        // Forward entry includes framework work outside the native call; retain its
-        // length context until that prelude has an independent description.
-        if (id == 0 && part == Part::ForwardInputs) {
+        // Unknown entry branches retain their length guard. Proven plain-text
+        // entry visits requests, while payload and allocation keep their sizes.
+        if (id == 0 && part == Part::ForwardInputs && !fixed_entry_work) {
             caller.features["query_tokens"] = input.query_tokens;
             caller.features["context_tokens"] = input.context_tokens;
             caller.features["prefix_tokens"] = input.context_tokens - input.query_tokens;
@@ -233,10 +236,10 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             queued(calls, prefix + "positions.clamp", "aten.clamp_min:" + sequence_dtype_, shape, false, "aclnnClamp");
         }
     }
-    return sequence(std::move(calls), part_, input);
+    return sequence(std::move(calls), part_, input, fixed_entry_work_);
 }
 
-std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part part, bool deterministic_sampling = false) {
+std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part part, bool deterministic_sampling = false, bool fixed_entry_work = false) {
     const auto & shape = metadata.at("request_table_shape");
     const auto dtype = metadata.at("sequence_dtype").get<std::string>();
     if (metadata.at("backend_implementation") != "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend" || metadata.at("route") != "eager"
@@ -244,14 +247,36 @@ std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part p
         || metadata.at("request_table_contiguous") != true || shape.size() != 2 || dtype != "torch.int64" || metadata.at("sequence_device_type") != "npu"
         || metadata.at("request_indices_dtype") != "torch.int64" || metadata.at("request_indices_device_type") != "npu")
         return nullptr;
-    return std::make_unique<InputPreparation>(part, shape.at(0).get<double>(), shape.at(1).get<double>(), "int64", deterministic_sampling);
+    return std::make_unique<InputPreparation>(part, shape.at(0).get<double>(), shape.at(1).get<double>(), "int64", deterministic_sampling, fixed_entry_work);
 }
 
 } // namespace
 
+InputContext read_input_context(const nlohmann::json & fields) {
+    auto requests = fields.at("request_ids").get<std::vector<std::string>>();
+    if (fields.at("batch_size").get<std::size_t>() != requests.size()) throw std::runtime_error("Input facts have inconsistent request count");
+    const auto phase = fields.at("phase").get<std::string>();
+    if (phase != "prefill" && phase != "decode") throw std::runtime_error("Input facts have unsupported phase: " + phase);
+
+    bool plain = true;
+    for (const auto * flag : { "return_logprob", "input_embeds_present", "speculative", "dllm_present" }) plain = !fields.at(flag).get<bool>() && plain;
+    for (const auto * flag : { "position_overrides_present",
+                               "multimodal_present",
+                               "mamba_pool_present",
+                               "encoder_decoder",
+                               "mamba_extra_buffer",
+                               "custom_logit_processor",
+                               "penalties_required",
+                               "logit_bias_present" })
+        plain = !fields.at(flag).get<bool>() && plain;
+    plain = fields.at("retracted_requests") == 0 && (phase == "decode" || fields.at("cache_breakdown_pending").get<std::size_t>() == requests.size()) && plain;
+    return { std::move(requests), phase == "prefill" ? Phase::Prefill : Phase::Decode, plain };
+}
+
 std::unique_ptr<const CallSequence> read_request_table_write(const nlohmann::json & metadata) { return read(metadata, Part::RequestTable); }
-std::unique_ptr<const CallSequence> read_forward_inputs(const nlohmann::json & metadata, bool deterministic_sampling) {
-    return read(metadata, Part::ForwardInputs, deterministic_sampling);
+std::unique_ptr<const CallSequence> read_forward_inputs(const nlohmann::json & metadata, bool deterministic_sampling, InputContextStatus context) {
+    if (context == InputContextStatus::Unsupported) return nullptr;
+    return read(metadata, Part::ForwardInputs, deterministic_sampling, context == InputContextStatus::PlainText);
 }
 
 std::optional<bool> read_deterministic_sampling(const std::optional<std::filesystem::path> & configuration) {

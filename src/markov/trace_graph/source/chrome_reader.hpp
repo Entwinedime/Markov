@@ -25,6 +25,7 @@ ReadRecords read_json_records(const std::filesystem::path & path, const std::str
 // Stream one Chrome event at a time. The consumer must not retain event views.
 // Accept the two Chrome containers: a traceEvents object or an event array.
 std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer & consumer);
+std::size_t read_json_lines(const std::filesystem::path & path, RecordConsumer & consumer);
 
 // Chrome durations and timestamps are microseconds; strings retain fractional
 // precision. Reject non-finite, negative or overflowing external measurements.

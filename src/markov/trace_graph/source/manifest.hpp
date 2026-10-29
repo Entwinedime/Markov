@@ -9,6 +9,7 @@
 namespace markov::trace_graph::source {
 
 enum class Channel { Torch, NativeHook, PythonProbe, Client };
+enum class RecordFormat { Chrome, JsonLines };
 
 struct ProfileFile {
     Channel channel;
@@ -16,6 +17,7 @@ struct ProfileFile {
     std::uintmax_t bytes;
     std::int64_t clock_offset_ns = 0;
     bool clock_recorded = true;
+    RecordFormat format = RecordFormat::Chrome;
 };
 
 struct ProfileManifest {

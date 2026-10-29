@@ -30,6 +30,7 @@ public:
 
 private:
     void observe(const ProbeEvent & event) override;
+    void finish() override;
     trace_graph::planning::PrefixId token_path(const nlohmann::json & dictionary);
     void observe_compute(const ProbeEvent & event);
     void observe_collective(const ProbeEvent & event);
@@ -42,6 +43,17 @@ private:
         std::optional<trace_graph::source::ObservedRegion> table_write, forward;
     };
     std::map<std::string, InputWindow> input_windows_;
+    struct InputFacts {
+        trace_graph::source::ObservedRegion region;
+        trace_graph::planning::Phase phase;
+        bool plain;
+    };
+    std::multimap<std::vector<trace_graph::source::Index>, InputFacts> schedule_inputs_;
+    struct PendingInput {
+        trace_graph::source::Index frame, preparation;
+        nlohmann::json metadata;
+    };
+    std::vector<PendingInput> pending_inputs_;
     std::map<std::string, std::string> sequence_dtypes_;
     std::map<std::string, trace_graph::source::Time> logits_output_ends_;
     struct EmbeddingWindow {

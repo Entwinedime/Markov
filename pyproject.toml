@@ -5,6 +5,16 @@ description = "Trace-driven profiling, DAG modeling, and what-if simulation for 
 requires-python = ">=3.10"
 dependencies = []
 
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[project.entry-points."sglang.srt.plugins"]
+markov_input_facts = "markov.adapters.sglang.input_facts:install"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120

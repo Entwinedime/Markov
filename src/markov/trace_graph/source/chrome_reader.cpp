@@ -50,6 +50,25 @@ ReadRecords read_json_records(const std::filesystem::path & path, const std::str
 
 std::size_t read_chrome_trace(const std::filesystem::path & path, RecordConsumer & consumer) { return read_json_records(path, "traceEvents", consumer).count; }
 
+std::size_t read_json_lines(const std::filesystem::path & path, RecordConsumer & consumer) {
+    std::ifstream stream(path);
+    if (!stream) throw std::runtime_error("Cannot read records: " + path.string());
+
+    std::size_t count = 0;
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (stream.eof()) throw std::runtime_error("Unterminated JSON line: " + path.string());
+        try {
+            consumer.record(count++, nlohmann::json::parse(line));
+        }
+        catch (const nlohmann::json::exception & error) {
+            throw std::runtime_error(path.string() + ": " + error.what());
+        }
+    }
+    if (!stream.eof()) throw std::runtime_error("Cannot finish reading records: " + path.string());
+    return count;
+}
+
 namespace {
 
 std::int64_t read_time(const nlohmann::json & value, long double scale_ns) {

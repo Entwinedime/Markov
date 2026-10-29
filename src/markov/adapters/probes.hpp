@@ -33,6 +33,7 @@ public:
     explicit ProbeReader(trace_graph::source::Observations & output) : output_(output) {}
     void set_file(std::size_t file) { file_id_ = file; }
     void record(std::size_t position, const nlohmann::json & event) final;
+    virtual void finish() {}
 
     std::map<std::string, RequestPorts> requests;
     std::map<std::string, std::size_t> roles;

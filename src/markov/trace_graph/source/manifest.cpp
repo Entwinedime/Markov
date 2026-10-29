@@ -30,7 +30,13 @@ void append_files(ProfileManifest & result, const nlohmann::json & entries, cons
             const auto & clock = entry.at("host_clock");
             offset_ns = clock.at("unix_origin_ns").get<std::int64_t>() - clock.at("origin_ns").get<std::int64_t>();
         }
-        result.files.push_back({ channel, std::move(path), bytes, offset_ns, recorded });
+        auto format = RecordFormat::Chrome;
+        if (entry.contains("format")) {
+            const auto name = entry.at("format").get<std::string>();
+            if (name == "jsonl" && channel == Channel::PythonProbe) format = RecordFormat::JsonLines;
+            else if (name != "chrome") throw std::runtime_error("Unsupported record format for " + channel_name(channel) + ": " + name);
+        }
+        result.files.push_back({ channel, std::move(path), bytes, offset_ns, recorded, format });
     }
 }
 

@@ -91,7 +91,8 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
         }
         else if (file.channel == source::Channel::PythonProbe) {
             probes->set_file(file_id);
-            records = source::read_chrome_trace(file.path, *probes);
+            records =
+                file.format == source::RecordFormat::JsonLines ? source::read_json_lines(file.path, *probes) : source::read_chrome_trace(file.path, *probes);
         }
         else {
             ascend::TraceReader reader(observations, causality, file, file_id);
@@ -111,6 +112,7 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
         }
     }
 
+    probes->finish();
     const auto parsed = Clock::now();
     if (observations.spans.empty()) throw std::runtime_error("No execution spans were observed in the declared source inputs");
     source::SourceContext context(std::move(observations));
