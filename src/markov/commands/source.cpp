@@ -595,6 +595,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {                 "compute_frames",                                                                                                        std::move(frames) },
         {                  "batch_results",                                                                                                       std::move(results) },
         {                  "host_controls",                                                                                                      std::move(controls) },
+        {          "result_processing_cpu",                                                                                         source_result_cpu_report(source) },
         {     "host_control_qualification",
          "Observed cache/allocator envelopes can nest and are not additive CPU services. Thread CPU and shape counters are raw source observations; "
          "result-processing membership uses the same caller and complete temporal containment. These controls are not yet executed in target prediction."           },
