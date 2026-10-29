@@ -47,6 +47,7 @@ private:
         trace_graph::source::ObservedRegion region;
         trace_graph::planning::Phase phase;
         bool plain;
+        bool deterministic_sampling;
     };
     std::multimap<std::vector<trace_graph::source::Index>, InputFacts> schedule_inputs_;
     struct PendingInput {

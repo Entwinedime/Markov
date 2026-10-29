@@ -6,11 +6,12 @@ from dataclasses import asdict
 from typing import Any
 
 from markov.artifacts.request import PredictionRequest
+from markov.artifacts.workload import Workload
 
 
 def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
     """Describe known inputs; dynamic work and model coverage remain unexamined."""
-    request.workload.stat()
+    workload = Workload.load(request.workload)
     if request.base.manifest is not None:
         request.base.manifest.stat()
     if request.models is not None:
@@ -30,6 +31,15 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
             "requires_capture": request.base.manifest is None,
         },
         "workload": str(request.workload),
+        "workload_size": {
+            "requests": len(workload.requests),
+            "formal_requests": len(workload.requests) - workload.formal_begin_index,
+            "output_token_limit": sum(row.max_new_tokens for row in workload.requests),
+            "input_tokens": sum(len(row.input_ids) for row in workload.requests)
+            if all(row.input_ids is not None for row in workload.requests)
+            else None,
+        },
+        "capture": asdict(request.execution.capture) if request.execution.capture is not None else None,
         "targets": [item.name for item in request.targets],
         "models": str(request.models) if request.models is not None else None,
         "preparation": preparation,

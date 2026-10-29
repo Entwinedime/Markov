@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 
 
 class EventWriter:
@@ -37,3 +38,23 @@ class EventWriter:
     @staticmethod
     def microseconds(nanoseconds: int) -> str:
         return f"{nanoseconds // 1000}.{nanoseconds % 1000:03d}"
+
+    def span(self, name: str, fields: dict):
+        return EventSpan(self, name, fields)
+
+
+class EventSpan:
+    def __init__(self, writer: EventWriter, name: str, fields: dict):
+        self.writer, self.name, self.fields = writer, name, fields
+
+    def __enter__(self):
+        self.begin = time.time_ns()
+        self.cpu = time.thread_time_ns()
+        return self.fields
+
+    def __exit__(self, kind, error, traceback):
+        end = time.time_ns()
+        self.fields.update(
+            status="returned" if kind is None else "raised", thread_cpu_ns=time.thread_time_ns() - self.cpu
+        )
+        self.writer.write(self.name, self.begin, end, self.fields)

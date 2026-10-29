@@ -86,9 +86,31 @@ void ProbeReader::observe(const ProbeEvent & event) {
                                  InputFacts{
                                      { resource, event.begin_ns, event.end_ns, event.record },
                                      context.phase,
-                                     context.plain
+                                     context.plain,
+                                     context.deterministic_sampling
         });
         ++output_.counts[std::string("schedule_input_facts.") + (context.plain ? "plain" : "unsupported")];
+    }
+    if (name == "runtime.phase.batch_input_start") {
+        ComputeFrame frame{ Phase::Prefill,
+                            {},
+                            args.at("sequence_tokens").get<std::vector<double>>(),
+                            args.at("query_tokens").get<std::vector<double>>(),
+                            args.at("page_size_tokens").get<double>(),
+                            event.record,
+                            {} };
+        const auto & requests = args.at("request_ids");
+        const auto & prompts = args.at("prompt_token_ids");
+        if (requests.size() != prompts.size() || requests.size() != frame.sequence_tokens.size() || requests.size() != frame.query_tokens->size())
+            throw std::runtime_error("Batch input dimensions do not match its requests");
+        for (Index i = 0; i < requests.size(); ++i) {
+            const auto identity = requests.at(i).get<std::string>();
+            const auto tokens = prompts.at(i).get<std::vector<std::int64_t>>();
+            output_.observe_tokens(identity, TokenRole::Prompt, output_.token_paths.intern(tokens), event.record);
+            frame.requests.push_back(output_.name(identity));
+        }
+        forward_frames_[process] = output_.compute_frames.size();
+        output_.compute_frames.push_back(std::move(frame));
     }
     if (name == "runtime.hicache.extend_allocator") {
         const auto frame = forward_frames_.find(process);
@@ -156,7 +178,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
             window->second.table_write = ObservedRegion{ allocator.resource, allocator.end_ns, event.end_ns, event.record };
         }
     }
-    if (name == "runtime.phase.input_buffers" && args.at("status") == "returned") {
+    if ((name == "runtime.phase.input_buffers" && args.at("status") == "returned") || name == "runtime.phase.forward_input_boundary") {
         const auto window = input_windows_.find(process);
         if (window != input_windows_.end() && window->second.table_write) {
             const auto & table = *window->second.table_write;
@@ -269,7 +291,8 @@ void ProbeReader::finish() {
             context = plain ? InputContextStatus::PlainText : InputContextStatus::Unsupported;
             ++output_.counts[plain ? "forward_entry_context_supported" : "forward_entry_context_unsupported_or_incomplete"];
         }
-        if (deterministic_sampling_) preparation.definition = read_forward_inputs(pending.metadata, *deterministic_sampling_, context);
+        const auto sampling = matching.size() == 1 ? std::optional(matching.front()->deterministic_sampling) : deterministic_sampling_;
+        if (sampling) preparation.definition = read_forward_inputs(pending.metadata, *sampling, context);
     }
     pending_inputs_.clear();
     schedule_inputs_.clear();

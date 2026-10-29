@@ -5,6 +5,8 @@ from pathlib import Path
 import time
 
 from markov.instrumentation.events import EventWriter
+from markov.adapters.sglang.preparation_probe import PreparationProbe
+from markov.adapters.sglang.request_probe import RequestProbe
 
 
 class InputFactsProbe:
@@ -31,6 +33,7 @@ class InputFactsProbe:
             if phase == "prefill"
             else len(requests),
             "return_logprob": batch.return_logprob,
+            "deterministic_sampling": server.enable_deterministic_inference,
             "input_embeds_present": any(request.input_embeds is not None for request in requests),
             "position_overrides_present": any(request.positional_embed_overrides is not None for request in requests),
             "multimodal_present": any(request.multimodal_inputs is not None for request in requests),
@@ -45,6 +48,19 @@ class InputFactsProbe:
             "logit_bias_present": any(request.sampling_params.logit_bias is not None for request in requests),
         }
         begin = time.time_ns()
+        if phase == "prefill":
+            self.writer.write(
+                "runtime.phase.batch_input_start",
+                begin,
+                begin,
+                {
+                    "request_ids": fields["request_ids"],
+                    "page_size_tokens": batch.tree_cache.page_size,
+                    "query_tokens": [request.extend_input_len for request in requests],
+                    "sequence_tokens": [request.fill_len for request in requests],
+                    "prompt_token_ids": [list(request.get_fill_ids()) for request in requests],
+                },
+            )
         cpu = time.thread_time_ns()
         try:
             result = original(batch)
@@ -75,10 +91,13 @@ def install() -> None:
     if not directory.is_dir():
         raise NotADirectoryError(directory)
 
-    probe = InputFactsProbe(EventWriter(directory))
+    writer = EventWriter(directory)
+    probe = InputFactsProbe(writer)
     HookRegistry.register(
         "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend", probe.extend, HookType.AROUND
     )
     HookRegistry.register(
         "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_decode", probe.decode, HookType.AROUND
     )
+    PreparationProbe(writer).install()
+    RequestProbe(writer).install()

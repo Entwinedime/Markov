@@ -15,6 +15,7 @@ struct InputContext {
     std::vector<std::string> requests;
     trace_graph::planning::Phase phase;
     bool plain;
+    bool deterministic_sampling;
 };
 
 enum class InputContextStatus { Unobserved, PlainText, Unsupported };

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from markov.artifacts.capture import CaptureSettings
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -106,10 +110,13 @@ class Execution:
     output: Path
     jobs: int
     memory_limit_gib: int | None
+    capture: CaptureSettings | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any], directory: Path) -> Execution:
-        reject_unknown(raw, {"output", "jobs", "memory_limit_gib"}, "execution")
+        from markov.artifacts.capture import CaptureSettings
+
+        reject_unknown(raw, {"output", "jobs", "memory_limit_gib", "capture"}, "execution")
         memory_limit = raw.get("memory_limit_gib")
         if memory_limit is not None:
             memory_limit = positive_integer(memory_limit, "memory_limit_gib")
@@ -118,6 +125,7 @@ class Execution:
             resolve_path(directory, raw["output"]),
             positive_integer(raw.get("jobs", 1), "jobs"),
             memory_limit,
+            CaptureSettings.parse(raw["capture"]) if "capture" in raw else None,
         )
 
 

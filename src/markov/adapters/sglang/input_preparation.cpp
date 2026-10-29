@@ -270,7 +270,7 @@ InputContext read_input_context(const nlohmann::json & fields) {
                                "logit_bias_present" })
         plain = !fields.at(flag).get<bool>() && plain;
     plain = fields.at("retracted_requests") == 0 && (phase == "decode" || fields.at("cache_breakdown_pending").get<std::size_t>() == requests.size()) && plain;
-    return { std::move(requests), phase == "prefill" ? Phase::Prefill : Phase::Decode, plain };
+    return { std::move(requests), phase == "prefill" ? Phase::Prefill : Phase::Decode, plain, fields.at("deterministic_sampling").get<bool>() };
 }
 
 std::unique_ptr<const CallSequence> read_request_table_write(const nlohmann::json & metadata) { return read(metadata, Part::RequestTable); }
