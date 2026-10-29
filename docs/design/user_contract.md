@@ -143,7 +143,8 @@ projected_compute_dependencies 只计配方内部的数据依赖，尚不包含�
 cache_execution.native_call_execution.frames 给出进入、caller 提交、结果可读和已建模工作汇合时间；result_ready_ns 来自异步拷回的完成标记，不等待无关尾部。
 工作汇合包括 caller、worker 与设备，不是单独的设备完成。
 同一 frames 报告另列 modeled_result_callers_started_ns、modeled_result_callers_completed_ns 和 modeled_send_ns，分别表示已建模结果整理的开始、完成及发送端口。
-这些整理片段不含缓存/释放原生工作；它们等待自己的输出和所需的下一帧提交，后续调度再等待上一轮整理完成，发送后的片段仍执行。
+modeled_result_work_completed_ns 单列结果处理的原生工作汇合；CPU 返回不强制等待未同步的设备尾部，后台程序仍须保留它。
+结果序列包含纯 CPU 整理、空释放与缓存索引值的初始复制；其余插入、拼接、非空释放及控制外围尚缺。序列等待自己的输出和所需的下一帧提交，后续调度再等待上一轮 CPU 整理完成，发送后的片段仍执行。
 未结束的 Prefill 在各参与者输出可读后发布页对齐的 prompt 前缀；重叠调度另等待下一帧 caller 提交，写策略据此决定是否提前备份。
 请求报告中的 prefill_prefix_published_ns 给出该状态发布端口，预留 buffer 只消耗已提交页，剩余空间留给后续生成；最终提交保留生成部分。
 发布还等待已建模的结果整理；这个组件端口尚未支付缓存更新及其原生控制成本，不能当作完整 CPU 处理时间或 HTTP 完成。
