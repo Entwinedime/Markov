@@ -57,6 +57,7 @@ void Observations::normalize_resources() {
         if (result.processed) result.processed->region.resource = canonical_resource(result.processed->region.resource);
         for (auto & send : result.final_sends) send.region.resource = canonical_resource(send.region.resource);
     }
+    for (auto & control : host_controls) control.region.resource = canonical_resource(control.region.resource);
 }
 
 Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe, std::string caller,

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <functional>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -62,9 +63,9 @@ void NativePlan::cpu(const Work & work, const char * service, const char * resid
     steps_[append(work, residual, resource, tail)].source_native_work = source;
 }
 
-bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations) {
+bool NativePlan::extend(const NativeSequence & sequence, CallResources resources, PreparationCache & preparations) {
     const auto incoming = producer_device();
-    for (const auto & call : calls) {
+    for (const auto & call : sequence.calls) {
 
         // shortcut: caller prerequisites share one submission port; split the prelude if intermediate results gain external consumers.
         for (const auto & preparation : call.caller_preparations)
@@ -144,6 +145,11 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         }
         cpu(returned, "cpu_service", "residual_interval", resources.caller, caller_, call.sources.caller_after);
     }
+    if (sequence.result_ready) {
+        if (*sequence.result_ready == NativeProducer::Caller) result_ = caller_;
+        else result_ = device_ ? std::optional(device_->completion) : std::nullopt;
+        if (!result_) throw std::logic_error("Native sequence declares a result without its producer");
+    }
     return true;
 }
 
@@ -157,8 +163,8 @@ NativeFrontier NativePlan::frontier(graph::NodeId begin) const {
     return result;
 }
 
-PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause,
-                                     const NativeFrontier & preceding, std::optional<simulation::Action> submitted) const {
+PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, NativeEvents events, std::optional<graph::NodeId> cause,
+                                     const NativeFrontier & preceding) const {
     PlannedMutation result{ owner, {}, {} };
     std::vector<bool> has_input(steps_.size(), false);
     std::set<std::size_t> linked;
@@ -187,14 +193,15 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
         if (cause && !has_input[id]) result.dependencies.push_back({ *cause, begin + id, graph::EdgeKind::DataDependency });
 
     std::optional<graph::NodeId> caller_submitted;
-    if (submitted) {
+    if (events.produced) result.operations.at(result_.value()).completion = events.produced;
+    if (events.submitted) {
         caller_submitted = begin + result.operations.size();
-        result.operations.push_back({ caller_ ? steps_[*caller_].resource : 0, Boundary{}, *submitted });
+        result.operations.push_back({ caller_ ? steps_[*caller_].resource : 0, Boundary{}, *events.submitted });
         if (caller_) result.dependencies.push_back({ begin + *caller_, *caller_submitted, graph::EdgeKind::DataDependency });
         else if (cause) result.dependencies.push_back({ *cause, *caller_submitted, graph::EdgeKind::DataDependency });
     }
     const auto end = begin + result.operations.size();
-    result.operations.push_back({ 0, Boundary{}, completion });
+    result.operations.push_back({ 0, Boundary{}, events.complete });
     for (const auto tail : { caller_, worker_, device_ ? std::optional(device_->completion) : std::nullopt })
         if (tail) result.dependencies.push_back({ begin + *tail, end, graph::EdgeKind::DataDependency });
     if (steps_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });

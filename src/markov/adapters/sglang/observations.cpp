@@ -271,6 +271,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
     }
     if (std::ranges::find(compute_roles, name) != compute_roles.end()) observe_compute(event);
     if (name == "runtime.phase.device_collective") observe_collective(event);
+    observe_control(event);
 }
 
 void ProbeReader::finish() {
@@ -401,12 +402,62 @@ void ProbeReader::observe_result(const ProbeEvent & event) {
         if (output_.names[requests[id]] != identities[id] || result.output_tokens_after[id] < result.output_tokens_before[id])
             throw std::runtime_error("Processed result changed request order or removed output tokens");
 
+    auto & controls = pending_controls_[resource];
+    for (const auto id : controls) {
+        const auto & control = output_.host_controls[id].region;
+        if (region.begin_ns <= control.begin_ns && control.end_ns <= region.end_ns) result.controls.push_back(id);
+    }
+    std::erase_if(controls, [&](Index id) { return output_.host_controls[id].region.end_ns <= region.end_ns; });
+
     value.processed = std::move(result);
     const auto final_send = result_sends_.find(identity);
     if (final_send != result_sends_.end()) {
         value.final_sends = std::move(final_send->second);
         result_sends_.erase(final_send);
     }
+}
+
+void ProbeReader::observe_control(const ProbeEvent & event) {
+    const auto & args = event.args;
+    if (args.value("status", "returned") != "returned") return;
+    trace_graph::planning::Features variables;
+    std::string operation;
+    if (event.name == "runtime.hicache.cache_unfinished") {
+        operation = "cache.update_prefix";
+        for (const auto * field : { "page_size_tokens", "input_tokens", "protected_tokens_before", "protected_tokens_after" })
+            variables[field] = args.at(field).get<double>();
+        variables["chunked"] = args.at("chunked").get<bool>() ? 1 : 0;
+    }
+    else if (event.name == "hicache_cache_finished_req_lifecycle_commit_end" && args.contains("page_size_tokens") && args.contains("thread_cpu_ns")) {
+        operation = "cache.commit_prefix";
+        variables["page_size_tokens"] = args.at("page_size_tokens").get<double>();
+        variables["insert_requested"] = args.at("insert_requested").get<bool>() ? 1 : 0;
+        variables["committed_tokens"] = output_.token_paths.length(output_.request_tokens.at(args.at("request_id").get<std::string>()).committed.value().path);
+    }
+    else if (event.name == "runtime.hicache.page_release" || event.name == "runtime.hicache.release_group") {
+        operation = event.name == "runtime.hicache.page_release" ? "allocator.release_pages" : "allocator.finish_release_group";
+        for (const auto * field : { "page_size_tokens", "free_pages", "release_pages", "free_pages_after", "release_pages_after" })
+            variables[field] = args.at(field).get<double>();
+        variables["need_sort"] = args.at("allocator_need_sort").get<bool>() ? 1 : 0;
+        variables["grouped"] = args.at("grouped").get<bool>() ? 1 : 0;
+        if (event.name == "runtime.hicache.page_release") variables["released_tokens"] = args.at("released_tokens").get<double>();
+        else {
+            variables["grouped_tokens"] = args.at("grouped_tokens").get<double>();
+            variables["grouped_tensors"] = args.at("grouped_tensors").get<double>();
+        }
+    }
+    else return;
+
+    const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    pending_controls_[resource].push_back(output_.host_controls.size());
+    const auto implementation =
+        args.contains("allocator_implementation") ? args.at("allocator_implementation").get<std::string>() : args.at("cache_implementation").get<std::string>();
+    output_.host_controls.push_back({
+        { resource, event.begin_ns, event.end_ns, event.record },
+        { { operation, implementation, "observed_control_envelope" }, std::move(variables) },
+        args.at("thread_cpu_ns").get<Time>(),
+        args.contains("request_id") ? std::optional(output_.name(args.at("request_id").get<std::string>())) : std::nullopt
+    });
 }
 
 void ProbeReader::observe_collective(const ProbeEvent & event) {

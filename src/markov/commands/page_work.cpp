@@ -37,10 +37,11 @@ Json frame_ports_report(const planning::ComputeStats & stats, const simulation::
     auto report = Json::array();
     for (const auto & frame : stats.frames) {
         report.push_back({
-            {              "source_frame",                                                                 frame.source_frame },
-            {                "entered_ns",              frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
-            {       "caller_submitted_ns", frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
-            { "modeled_work_completed_ns", frame.completed ? Json(execution.completions_ns[*frame.completed]) : Json(nullptr) }
+            {              "source_frame",                                                                       frame.source_frame },
+            {                "entered_ns",                    frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
+            {       "caller_submitted_ns",       frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
+            {           "result_ready_ns", frame.result_ready ? Json(execution.completions_ns[*frame.result_ready]) : Json(nullptr) },
+            { "modeled_work_completed_ns",       frame.completed ? Json(execution.completions_ns[*frame.completed]) : Json(nullptr) }
         });
     }
     return report;

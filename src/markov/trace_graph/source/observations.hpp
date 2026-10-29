@@ -174,6 +174,14 @@ struct ProcessedResult {
     ObservedRegion region;
     std::vector<Index> output_tokens_before, output_tokens_after;
     std::vector<bool> finished_before, finished_after;
+    std::vector<Index> controls = {};
+};
+
+struct HostControl {
+    ObservedRegion region;
+    planning::Work work;
+    Time thread_cpu_ns;
+    std::optional<Index> request;
 };
 
 struct ResultSend {
@@ -238,6 +246,7 @@ public:
     std::vector<CollectiveGroup> collective_groups;
     std::vector<ObservedCollective> collectives;
     std::vector<BatchResult> batch_results;
+    std::vector<HostControl> host_controls;
     planning::TokenPaths token_paths;
     std::map<std::string, RequestTokens> request_tokens;
     std::map<std::string, std::size_t> counts;

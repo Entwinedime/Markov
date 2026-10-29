@@ -2,6 +2,7 @@
 
 import os
 
+from markov.adapters.sglang.preparation_probe import implementation
 from markov.instrumentation.events import EventWriter
 
 
@@ -34,8 +35,24 @@ class CacheProbe:
         tokens = (request.origin_input_ids + request.output_ids)[:count]
         fields = self.fields(request, tokens)
         fields["insert_requested"] = is_insert and not cache.disable and not cache.disable_finished_insert
+        fields["page_size_tokens"] = cache.page_size
+        fields["cache_implementation"] = implementation(cache)
         with self.writer.span("hicache_cache_finished_req_lifecycle_commit_end", fields):
             return original(cache, request, is_insert)
+
+    def unfinished(self, original, cache, req, chunked=False):
+        fields = {
+            "request_id": req.rid,
+            "cache_implementation": implementation(cache),
+            "page_size_tokens": cache.page_size,
+            "input_tokens": len(req.get_fill_ids()),
+            "protected_tokens_before": req.cache_protected_len,
+            "chunked": chunked,
+        }
+        with self.writer.span("runtime.hicache.cache_unfinished", fields):
+            result = original(cache, req, chunked)
+            fields["protected_tokens_after"] = req.cache_protected_len
+            return result
 
     def install(self):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -47,4 +64,7 @@ class CacheProbe:
             HookRegistry.register(target, self.lookup, HookType.AROUND)
         HookRegistry.register(
             "sglang.srt.mem_cache.radix_cache.RadixCache.cache_finished_req", self.commit, HookType.AROUND
+        )
+        HookRegistry.register(
+            "sglang.srt.mem_cache.radix_cache.RadixCache.cache_unfinished_req", self.unfinished, HookType.AROUND
         )

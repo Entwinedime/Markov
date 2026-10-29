@@ -58,7 +58,7 @@ bool ComputeProgram::append_compute(const FrameCompute & frame, source::Index so
         for (auto & native : calls.calls)
             if (native.launches == work) native.source_operation = source_call;
     }
-    if (!segment.plan.extend(calls.calls, resources, preparations_)) {
+    if (!segment.plan.extend(calls, resources, preparations_)) {
         issue_ = "kernel_cache_initial_state_unavailable";
         return false;
     }
@@ -108,7 +108,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         const auto * result = source.frame_result(input.frame);
         // shortcut: targets inherit source scheduling; require a target policy before supporting mode changes.
         frame.overlap = result && result->overlap;
-        stats_.frames.push_back({ input.frame, {}, {}, {} });
+        stats_.frames.push_back({ input.frame, {}, {}, {}, {} });
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
             return;
@@ -163,7 +163,7 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
                 const auto before = pending.plan.operations();
                 // Preparation may produce inputs on another device stream.
                 // NativePlan retains that producer before subsequent forward work.
-                if (!pending.plan.extend(calls.calls, *placement, preparations_)) {
+                if (!pending.plan.extend(calls, *placement, preparations_)) {
                     issue_ = "kernel_cache_initial_state_unavailable";
                     return;
                 }
@@ -216,8 +216,10 @@ void ComputeProgram::segment(ProgramRuntime & runtime, std::size_t id, std::opti
     const auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
     const auto begin = runtime.next_node();
-    const auto submitted = !range.collective ? std::optional(action(ActionKind::FrameSubmitted, id)) : std::nullopt;
-    if (runtime.submit(range.plan.mutation(owner, begin, action(ActionKind::SegmentDone, id), cause, frontier_, submitted))) {
+    NativeEvents events{ action(ActionKind::SegmentDone, id) };
+    if (!range.collective) events.submitted = action(ActionKind::FrameSubmitted, id);
+    if (range.plan.publishes_result()) events.produced = action(ActionKind::ResultReady, id);
+    if (runtime.submit(range.plan.mutation(owner, begin, events, cause, frontier_))) {
         if (frame.at == 0) stats_.frames[id].entry = begin;
         for (const auto & [resource, node] : range.plan.frontier(begin)) frontier_[resource] = node;
         stats_.add(range.stats);
@@ -281,6 +283,7 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
         stats_.frames[id].submitted = event.identity;
         if (frames_[id].overlap && frames_[id].next) segment(runtime, *frames_[id].next, event.identity);
     }
+    else if (event.action.kind == std::to_underlying(ActionKind::ResultReady)) stats_.frames[event.action.subject].result_ready = event.identity;
     else complete_ = true;
 }
 

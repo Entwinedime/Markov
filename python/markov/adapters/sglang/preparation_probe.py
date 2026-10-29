@@ -74,6 +74,38 @@ class PreparationProbe:
             fields["allocated"] = result is not None
             return result
 
+    @staticmethod
+    def release_fields(allocator):
+        return {
+            "allocator_implementation": implementation(allocator),
+            "page_size_tokens": allocator.page_size,
+            "allocator_need_sort": allocator.need_sort,
+            "free_pages": allocator.free_pages.numel(),
+            "release_pages": allocator.release_pages.numel(),
+            "grouped": not allocator.is_not_in_free_group,
+        }
+
+    def release(self, original, allocator, free_index):
+        fields = self.release_fields(allocator)
+        fields.update(released_tokens=free_index.numel(), indices_dtype=str(free_index.dtype))
+        with self.writer.span("runtime.hicache.page_release", fields):
+            result = original(allocator, free_index)
+            fields["free_pages_after"] = allocator.free_pages.numel()
+            fields["release_pages_after"] = allocator.release_pages.numel()
+            return result
+
+    def release_group(self, original, allocator):
+        fields = self.release_fields(allocator)
+        fields.update(
+            grouped_tensors=len(allocator.free_group),
+            grouped_tokens=sum(indices.numel() for indices in allocator.free_group),
+        )
+        with self.writer.span("runtime.hicache.release_group", fields):
+            result = original(allocator)
+            fields["free_pages_after"] = allocator.free_pages.numel()
+            fields["release_pages_after"] = allocator.release_pages.numel()
+            return result
+
     def extend_table(self, original, batch):
         with self.writer.span("runtime.hicache.extend_allocation", {}):
             return original(batch)
@@ -132,6 +164,8 @@ class PreparationProbe:
         bindings = {
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_extend": self.extend,
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_decode": self.decode,
+            "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free": self.release,
+            "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free_group_end": self.release_group,
             "sglang.srt.managers.schedule_batch.alloc_for_extend": self.extend_table,
             "sglang.srt.managers.schedule_batch.alloc_for_decode": self.decode_table,
             "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.init_forward_metadata": self.metadata,

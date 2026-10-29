@@ -26,7 +26,7 @@ struct ComputeStats {
     };
     struct FramePorts {
         source::Index source_frame;
-        std::optional<graph::NodeId> entry, submitted, completed;
+        std::optional<graph::NodeId> entry, submitted, result_ready, completed;
     };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
@@ -55,7 +55,7 @@ public:
     const ComputeStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, Complete };
+    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, ResultReady, Complete };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {

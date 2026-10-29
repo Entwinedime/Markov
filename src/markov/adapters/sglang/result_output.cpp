@@ -75,7 +75,7 @@ NativeSequence ResultOutput::describe(Phase phase, const FrameInput & input, std
         caller.features["sequence_exit"] = id + 1 == calls.size() ? 1 : 0;
         calls[id].caller_work = std::move(caller);
     }
-    return { std::move(calls), std::nullopt };
+    return { std::move(calls), std::nullopt, NativeProducer::Device };
 }
 
 } // namespace

@@ -35,6 +35,7 @@ private:
     void observe_compute(const ProbeEvent & event);
     void observe_collective(const ProbeEvent & event);
     void observe_result(const ProbeEvent & event);
+    void observe_control(const ProbeEvent & event);
     std::optional<bool> deterministic_sampling_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
@@ -42,6 +43,7 @@ private:
     std::map<BatchIdentity, trace_graph::source::Index> batch_results_;
     std::map<BatchIdentity, trace_graph::source::ResultCopy> result_copies_;
     std::map<BatchIdentity, std::vector<trace_graph::source::ResultSend>> result_sends_;
+    std::map<trace_graph::source::Index, std::vector<trace_graph::source::Index>> pending_controls_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;
     struct InputWindow {
         trace_graph::source::ObservedRegion allocator;

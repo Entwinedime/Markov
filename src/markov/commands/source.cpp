@@ -516,7 +516,8 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
                 { "output_tokens_before", processed.output_tokens_before },
                 {  "output_tokens_after",  processed.output_tokens_after },
                 {      "finished_before",      processed.finished_before },
-                {       "finished_after",       processed.finished_after }
+                {       "finished_after",       processed.finished_after },
+                {             "controls",             processed.controls }
             };
         }
         for (const auto & send : result.final_sends) {
@@ -528,6 +529,15 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
             });
         }
         results.push_back(std::move(value));
+    }
+    auto controls = Json::array();
+    for (const auto & control : captured.host_controls) {
+        controls.push_back({
+            {        "region",                                              region_json(control.region) },
+            {          "work",                                                  work_json(control.work) },
+            { "thread_cpu_ns",                                                    control.thread_cpu_ns },
+            {       "request", control.request ? Json(captured.names[*control.request]) : Json(nullptr) }
+        });
     }
     auto groups = Json::array();
     for (const auto & group : captured.collective_groups)
@@ -584,6 +594,10 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {         "work_description_scope",                                                                                         "observed_compute_recipe_subset" },
         {                 "compute_frames",                                                                                                        std::move(frames) },
         {                  "batch_results",                                                                                                       std::move(results) },
+        {                  "host_controls",                                                                                                      std::move(controls) },
+        {     "host_control_qualification",
+         "Observed cache/allocator envelopes can nest and are not additive CPU services. Thread CPU and shape counters are raw source observations; "
+         "result-processing membership uses the same caller and complete temporal containment. These controls are not yet executed in target prediction."           },
         {              "collective_groups",                                                                                                        std::move(groups) },
         {        "collective_observations",                                                                                              std::move(collective_calls) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },

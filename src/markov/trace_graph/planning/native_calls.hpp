@@ -17,6 +17,7 @@ namespace markov::trace_graph::planning {
 
 enum class CallKind { Cpu, Queued, Readback, HostUpload };
 enum class DeviceControl { None, Record, Wait };
+enum class NativeProducer { Caller, Device };
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;
@@ -72,6 +73,7 @@ struct NativeCall {
 struct NativeSequence {
     std::vector<NativeCall> calls;
     std::optional<std::string> issue;
+    std::optional<NativeProducer> result_ready = std::nullopt;
 };
 
 enum class KernelCacheInitial { Empty, Prepared };
@@ -111,18 +113,25 @@ struct CallResources {
 
 using NativeFrontier = std::map<std::size_t, graph::NodeId>;
 
+struct NativeEvents {
+    simulation::Action complete;
+    std::optional<simulation::Action> submitted = std::nullopt;
+    std::optional<simulation::Action> produced = std::nullopt;
+};
+
 class NativePlan {
 public:
     // Ordered tensor work may change device streams while retaining its
     // producer frontier. Caller/worker ownership remains with the same queues.
-    bool extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations);
+    bool extend(const NativeSequence & sequence, CallResources resources, PreparationCache & preparations);
     void source_cpu_gap(std::size_t interval, std::size_t caller);
-    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause,
-                             const NativeFrontier & preceding, std::optional<simulation::Action> submitted = std::nullopt) const;
+    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, NativeEvents events, std::optional<graph::NodeId> cause,
+                             const NativeFrontier & preceding) const;
     NativeFrontier frontier(graph::NodeId begin) const;
     std::size_t operations() const { return steps_.size(); }
     std::size_t delays() const;
     std::optional<std::size_t> producer_device() const { return device_ ? std::optional(device_->device) : std::nullopt; }
+    bool publishes_result() const { return result_.has_value(); }
 
 private:
     graph::NodeId append(const Work & work, const char * scope, std::size_t resource, std::optional<graph::NodeId> & tail, bool delay = false);
@@ -146,6 +155,7 @@ private:
         std::size_t device;
     };
     std::optional<DeviceProducer> device_;
+    std::optional<graph::NodeId> result_;
 };
 
 } // namespace markov::trace_graph::planning
