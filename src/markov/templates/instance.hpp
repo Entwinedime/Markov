@@ -54,6 +54,11 @@ private:
                        const ParameterGroups & sequences, const ScopedParameters & scopes);
     std::size_t expand_call(const std::string & role, const Invocation & invocation, const Parameters & parameters, std::size_t parent,
                             const ValuePorts & ports, const ParameterGroups & sequences, const ScopedParameters & scopes);
+    struct CallContext;
+    void expand_operation(std::size_t operation, const TemplateDefinition & definition, const CallContext & context,
+                          const std::vector<std::size_t> & own_values, const std::vector<std::size_t> & own_resources);
+    void expand_child(const CallStep & call, std::size_t child, const CallContext & context, const std::vector<std::size_t> & values,
+                      const std::vector<std::size_t> & resources);
     void require_value(std::size_t value, const nlohmann::json & specification);
     void bind_inputs(const TargetInputs & inputs);
 

@@ -33,9 +33,9 @@ ExpertRoutes::ExpertRoutes(const nlohmann::json & source, std::span<const Reques
     const auto & assignments = source.at("assignments");
     if (!assignments.is_array()) throw std::invalid_argument("route assignments must be an array");
 
-    // Match the controller's stable arrival order without retaining a second request-progress state.
+    // Request parsing establishes the shared identity order before routing and control are assembled.
     std::map<std::string, std::pair<std::size_t, std::int64_t>> identities;
-    for (const auto & request : Request::ordered(std::vector<Request>(requests.begin(), requests.end()))) {
+    for (const auto & request : requests) {
         identities.emplace(request.id, std::pair{ requests_.size(), request.prompt_tokens + (request.output_tokens - 1) });
         requests_.emplace_back();
     }

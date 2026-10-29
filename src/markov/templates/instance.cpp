@@ -13,6 +13,18 @@
 namespace markov {
 namespace {
 
+void bind_type(nlohmann::json & type, const nlohmann::json & required, const std::string & context) {
+    for (const auto & key : { "dtype", "device", "shape" }) {
+        if (type.contains(key) && required.contains(key) && type.at(key) != required.at(key))
+            throw LayoutMismatch(context + " has conflicting " + key + ": " + type.at(key).dump() + " versus " + required.at(key).dump());
+    }
+
+    // An opaque declaration constrains a tensor without erasing its known geometry or identity.
+    const bool tensor = type.at("kind") == "tensor";
+    type.update(required);
+    if (tensor) type["kind"] = "tensor";
+}
+
 Parameters read_parameters(const nlohmann::json & source) {
     if (!source.is_object()) throw std::invalid_argument("parameters must be an object");
 
@@ -73,6 +85,17 @@ bool bind_input_parameters(const TemplateLayout & layout, const TemplateDefiniti
 }
 
 } // namespace
+
+// Borrow only the active call's bindings; recursive expansion cannot outlive these stack values.
+struct TemplateInstance::CallContext {
+    std::size_t region;
+    const FixedBindings & bindings;
+    Invocation & invocation;
+    const Parameters & parameters;
+    const GroupValues & groups;
+    const ParameterGroups & sequences;
+    const ScopedParameters & scopes;
+};
 
 Invocation Invocation::read(const nlohmann::json & source) {
     Invocation result;
@@ -170,15 +193,7 @@ void TemplateInstance::bind_inputs(const TargetInputs & inputs) {
         resource = storage;
 
         auto & type = bound_inputs_.types.try_emplace(target, inputs.graph.types.at(target)).first->second;
-        const auto & required = graph_.types.at(local);
-        for (const auto & key : { "dtype", "device", "shape" }) {
-            if (type.contains(key) && required.contains(key) && type.at(key) != required.at(key))
-                throw LayoutMismatch(role_ + " input " + std::to_string(local) + " has conflicting " + key + ": " + type.at(key).dump() + " versus "
-                                     + required.at(key).dump());
-        }
-        const auto kind = type.at("kind");
-        type.update(required);
-        if (kind == "tensor") type["kind"] = kind;
+        bind_type(type, graph_.types.at(local), role_ + " input " + std::to_string(local));
     }
 }
 
@@ -256,16 +271,7 @@ std::size_t TemplateInstance::expand_call(const std::string & role, const Invoca
 }
 
 void TemplateInstance::require_value(std::size_t identity, const nlohmann::json & specification) {
-    auto & type = graph_.types.at(identity);
-    for (const auto & key : { "dtype", "device", "shape" }) {
-        if (type.contains(key) && specification.contains(key) && type.at(key) != specification.at(key))
-            throw LayoutMismatch("value " + std::to_string(identity) + " has conflicting " + key + ": " + type.at(key).dump() + " versus "
-                                 + specification.at(key).dump());
-    }
-
-    const auto kind = type.at("kind");
-    type.update(specification);
-    if (kind == "tensor") type["kind"] = kind;
+    bind_type(graph_.types.at(identity), specification, "value " + std::to_string(identity));
 }
 
 std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings & bindings, Invocation invocation, Parameters parameters,
@@ -290,7 +296,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
     }
 
     // Collection aggregates belong to this call, even when its caller uses the same parameter names.
-    for (const auto & [_, group] : definition.input_groups) {
+    for (const auto & [group_name, group] : definition.input_groups) {
         parameters.erase(group.count);
         for (const auto & [name, _] : group.sums) parameters.erase(name);
     }
@@ -471,191 +477,14 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
         return region;
     }
 
+    const CallContext context{ region, bindings, invocation, parameters, input_groups, sequences, scopes };
     std::size_t child_index = 0;
     for (const auto & step : layout.body) {
 
         // shortcut: caller overhead for closed producer groups precedes generation; refine when iteration issue cadence matters.
         if (bindings.host_resource) graph_.execution.append_host(region, *bindings.host_resource);
-        if (const auto * own = std::get_if<OperationStep>(&step)) {
-            const auto & prototype = definition.operations.at(own->operation);
-            auto operation = prototype.access;
-            operation.region = region;
-            operation.inputs = remap(operation.inputs, own_values);
-            for (const auto & name : prototype.input_groups) {
-                const auto & members = input_groups.at(name);
-                operation.inputs.insert(operation.inputs.end(), members.begin(), members.end());
-            }
-            operation.outputs = remap(operation.outputs, own_values);
-            operation.writes = remap(operation.writes, own_resources);
-
-            // Existing input geometry is authoritative; only untyped slots need a shape evaluation.
-            for (const auto source : prototype.access.inputs) {
-                const auto value = own_values.at(source);
-                const auto & spec = definition.values.at(source);
-                if (graph_.values[value].storage != own_resources.at(spec.storage)) throw std::invalid_argument("input storage binding mismatch");
-                if (graph_.types[value].contains("shape")) {
-                    require_value(value,
-                                  {
-                                      {   "kind",  "resource" },
-                                      {  "dtype",  spec.dtype },
-                                      { "device", spec.device }
-                    });
-                    continue;
-                }
-
-                nlohmann::json type{
-                    {   "kind", spec.kind == ValueKind::Tensor ? "tensor" : "resource" },
-                    {  "dtype",                                             spec.dtype },
-                    { "device",                                            spec.device }
-                };
-                if (spec.kind == ValueKind::Tensor) type["shape"] = evaluate_shape(spec.shape, parameters);
-                require_value(value, type);
-            }
-
-            for (const auto source : prototype.access.outputs) {
-                const auto value = own_values.at(source);
-                const auto & spec = definition.values.at(source);
-                if (graph_.values[value].storage != own_resources.at(spec.storage)) throw std::invalid_argument("output storage binding mismatch");
-
-                nlohmann::json type{
-                    {   "kind", spec.kind == ValueKind::Tensor ? "tensor" : "resource" },
-                    {  "dtype",                                             spec.dtype },
-                    { "device",                                            spec.device }
-                };
-                if (spec.kind == ValueKind::Tensor) type["shape"] = evaluate_shape(spec.shape, parameters);
-                require_value(value, type);
-                if (std::ranges::find(operation.inputs, value) == operation.inputs.end()) {
-                    if (graph_.values[value].producer) throw std::invalid_argument("multiple producers for one target value");
-                    graph_.values[value].producer = graph_.operations.size();
-                }
-            }
-
-            auto work = prototype.properties;
-            work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
-            work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
-            if (prototype.communication) work["communication"] = prototype.communication->instantiate(own_values, parameters, input_groups, bindings.literals);
-            if (const auto found = bindings.execution.find(own->operation); found != bindings.execution.end()) {
-                const auto & execution = asset_.execution_binding(found->second, parameters);
-                const auto & pattern = asset_.execution_pattern(execution.pattern);
-                if (execution.reduction) {
-                    const auto & group = execution.reduction->group();
-                    auto plan = execution.reduction->instantiate(pattern, definition.input_groups.at(group), parameters, invocation.input_groups.at(group));
-                    graph_.execution.append(plan.pattern, execution.resources, graph_.operations.size(), region);
-                    work["execution_parts"] = std::move(plan.parts);
-                }
-                else graph_.execution.append(pattern, execution.resources, graph_.operations.size(), region);
-                work["execution_pattern"] = execution.pattern;
-            }
-
-            graph_.operations.push_back(std::move(operation));
-            graph_.work.push_back(std::move(work));
-            continue;
-        }
-
-        // Child calls share boundary values while allocating their private slots recursively.
-        const auto & call = std::get<CallStep>(step);
-        const auto & child = asset_.layout(call.layout);
-        std::vector<std::optional<std::size_t>> child_values(child.storages.size());
-        for (const auto * ports : { &call.inputs, &call.outputs }) {
-            const auto & target = ports == &call.inputs ? child.inputs : child.outputs;
-            for (std::size_t port = 0; port < target.size(); ++port) {
-                auto & bound = child_values.at(target[port]);
-                const auto value = values.at(ports->at(port));
-                if (bound && *bound != value) throw std::invalid_argument("one child port has conflicting value bindings");
-                bound = value;
-            }
-        }
-
-        const auto found = invocation.calls.find(child_index);
-        auto child_invocation = found == invocation.calls.end() ? Invocation{} : std::move(found->second);
-
-        // Scalar arguments are evaluated in the caller, then bound to the callee's local names.
-        for (const auto & [name, expression] : call.parameters) {
-            if (child_invocation.parameters.contains(name) || child_invocation.bindings.contains(name))
-                throw std::invalid_argument("bound parameter is supplied by its parent: " + name);
-            child_invocation.parameters.emplace(name, expression.evaluate(parameters));
-        }
-
-        GroupValues child_groups;
-        for (const auto & [name, binding] : call.input_groups) {
-            if (child_invocation.input_groups.contains(name)) throw std::invalid_argument("bound input group is supplied by its parent: " + name);
-            if (const auto * group = std::get_if<std::string>(&binding)) {
-                child_groups.emplace(name, input_groups.at(*group));
-                child_invocation.input_groups.emplace(name, invocation.input_groups.at(*group));
-            }
-            else if (const auto * fixed = std::get_if<std::vector<std::size_t>>(&binding)) child_groups.emplace(name, remap(*fixed, values));
-            else {
-                const auto & generated = std::get<GeneratedGroup>(binding);
-                const auto count = generated.count.evaluate(parameters);
-                if (count < 0) throw std::invalid_argument("group generation needs a nonnegative count");
-
-                auto & members = child_groups[name];
-                members.reserve(static_cast<std::size_t>(count));
-                if (const auto * reused = std::get_if<ReusedGroupValue>(&generated.element))
-                    members.assign(static_cast<std::size_t>(count), values.at(reused->value));
-                else {
-                    const auto producer = std::get<GroupProducer>(generated.element).layout;
-                    const auto & prototype = asset_.layout(producer);
-                    for (std::int64_t index = 0; index < count; ++index) {
-                        std::vector<std::size_t> producer_resources(prototype.resources);
-                        std::iota(producer_resources.begin(), producer_resources.end(), graph_.resource_count);
-                        graph_.resource_count += prototype.resources;
-
-                        const auto produced = expand(producer,
-                                                     bindings.children.at(child_index).producers.at(name),
-                                                     {},
-                                                     parameters,
-                                                     region,
-                                                     producer_resources,
-                                                     std::vector<std::optional<std::size_t>>(prototype.storages.size()),
-                                                     {},
-                                                     sequences,
-                                                     scopes);
-                        members.push_back(graph_.regions.at(produced).at("outputs").at(0).get<std::size_t>());
-                    }
-                }
-            }
-        }
-
-        if (call.family) {
-
-            // A reusable implementation keeps the caller's role identity, such as its layer and expert shard.
-            for (const auto & [name, value] : bindings.children.at(child_index).values) child_invocation.bindings.try_emplace(name, value);
-
-            for (const auto & contract : child.input_shapes) {
-                if (!child_values.at(contract.value)) continue;
-                bool known = true;
-                for (const auto & dimension : contract.shape) {
-                    for (const auto & name : dimension.variables()) known = known && parameters.contains(name);
-                }
-                if (!known) continue;
-
-                // The caller supplies fixed geometry even when the callee uses its own local axis names.
-                require_value(*child_values[contract.value],
-                              {
-                                  { "kind", "tensor" },
-                                  { "dtype", contract.dtype },
-                                  { "device", contract.device },
-                                  { "shape", evaluate_shape(contract.shape, parameters) }
-                });
-            }
-            ValuePorts bound;
-            for (const auto & [name, value] : child.ports.inputs) bound.inputs.emplace(name, child_values.at(value).value());
-            for (const auto & [name, value] : child.ports.outputs) bound.outputs.emplace(name, child_values.at(value).value());
-            expand_call(*call.family, child_invocation, parameters, region, bound, sequences, scopes);
-        }
-        else
-            expand(call.layout,
-                   bindings.children.at(child_index),
-                   std::move(child_invocation),
-                   parameters,
-                   region,
-                   remap(call.resources, resources),
-                   std::move(child_values),
-                   std::move(child_groups),
-                   sequences,
-                   scopes);
-        ++child_index;
+        if (const auto * own = std::get_if<OperationStep>(&step)) expand_operation(own->operation, definition, context, own_values, own_resources);
+        else expand_child(std::get<CallStep>(step), child_index++, context, values, resources);
     }
 
     if (!invocation.calls.empty() && invocation.calls.rbegin()->first >= child_index)
@@ -663,6 +492,185 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
     if (bindings.host_resource) graph_.execution.append_host(region, *bindings.host_resource);
 
     return region;
+}
+
+void TemplateInstance::expand_operation(std::size_t identity, const TemplateDefinition & definition, const CallContext & context,
+                                        const std::vector<std::size_t> & own_values, const std::vector<std::size_t> & own_resources) {
+    const auto & bindings = context.bindings;
+    const auto & invocation = context.invocation;
+    const auto & parameters = context.parameters;
+    const auto & input_groups = context.groups;
+    const auto region = context.region;
+
+    const auto & prototype = definition.operations.at(identity);
+    auto operation = prototype.access;
+    operation.region = region;
+    operation.inputs = remap(operation.inputs, own_values);
+    for (const auto & name : prototype.input_groups) {
+        const auto & members = input_groups.at(name);
+        operation.inputs.insert(operation.inputs.end(), members.begin(), members.end());
+    }
+    operation.outputs = remap(operation.outputs, own_values);
+    operation.writes = remap(operation.writes, own_resources);
+
+    for (const bool output : { false, true }) {
+        const auto & sources = output ? prototype.access.outputs : prototype.access.inputs;
+        for (const auto source : sources) {
+            const auto value = own_values.at(source);
+            const auto & spec = definition.values.at(source);
+            if (graph_.values[value].storage != own_resources.at(spec.storage))
+                throw std::invalid_argument(output ? "output storage binding mismatch" : "input storage binding mismatch");
+
+            // Inputs retain producer geometry; outputs establish the operation's declared shape.
+            const bool infer_shape = spec.kind == ValueKind::Tensor && (output || !graph_.types[value].contains("shape"));
+            nlohmann::json type{
+                {   "kind", infer_shape ? "tensor" : "resource" },
+                {  "dtype",                          spec.dtype },
+                { "device",                         spec.device }
+            };
+            if (infer_shape) type["shape"] = evaluate_shape(spec.shape, parameters);
+            require_value(value, type);
+
+            if (output && std::ranges::find(operation.inputs, value) == operation.inputs.end()) {
+                if (graph_.values[value].producer) throw std::invalid_argument("multiple producers for one target value");
+                graph_.values[value].producer = graph_.operations.size();
+            }
+        }
+    }
+
+    auto work = prototype.properties;
+    work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
+    work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
+    if (prototype.communication) work["communication"] = prototype.communication->instantiate(own_values, parameters, input_groups, bindings.literals);
+    if (const auto found = bindings.execution.find(identity); found != bindings.execution.end()) {
+        const auto & execution = asset_.execution_binding(found->second, parameters);
+        const auto & pattern = asset_.execution_pattern(execution.pattern);
+        if (execution.reduction) {
+            const auto & group = execution.reduction->group();
+            auto plan = execution.reduction->instantiate(pattern, definition.input_groups.at(group), parameters, invocation.input_groups.at(group));
+            graph_.execution.append(plan.pattern, execution.resources, graph_.operations.size(), region);
+            work["execution_parts"] = std::move(plan.parts);
+        }
+        else graph_.execution.append(pattern, execution.resources, graph_.operations.size(), region);
+        work["execution_pattern"] = execution.pattern;
+    }
+
+    graph_.operations.push_back(std::move(operation));
+    graph_.work.push_back(std::move(work));
+}
+
+void TemplateInstance::expand_child(const CallStep & call, std::size_t child_index, const CallContext & context, const std::vector<std::size_t> & values,
+                                    const std::vector<std::size_t> & resources) {
+    const auto & bindings = context.bindings;
+    auto & invocation = context.invocation;
+    const auto & parameters = context.parameters;
+    const auto & input_groups = context.groups;
+    const auto & sequences = context.sequences;
+    const auto & scopes = context.scopes;
+    const auto region = context.region;
+
+    // Child calls share boundary values while allocating their private slots recursively.
+    const auto & child = asset_.layout(call.layout);
+    std::vector<std::optional<std::size_t>> child_values(child.storages.size());
+    for (const auto * ports : { &call.inputs, &call.outputs }) {
+        const auto & target = ports == &call.inputs ? child.inputs : child.outputs;
+        for (std::size_t port = 0; port < target.size(); ++port) {
+            auto & bound = child_values.at(target[port]);
+            const auto value = values.at(ports->at(port));
+            if (bound && *bound != value) throw std::invalid_argument("one child port has conflicting value bindings");
+            bound = value;
+        }
+    }
+
+    const auto found = invocation.calls.find(child_index);
+    auto child_invocation = found == invocation.calls.end() ? Invocation{} : std::move(found->second);
+
+    // Scalar arguments are evaluated in the caller, then bound to the callee's local names.
+    for (const auto & [name, expression] : call.parameters) {
+        if (child_invocation.parameters.contains(name) || child_invocation.bindings.contains(name))
+            throw std::invalid_argument("bound parameter is supplied by its parent: " + name);
+        child_invocation.parameters.emplace(name, expression.evaluate(parameters));
+    }
+
+    GroupValues child_groups;
+    for (const auto & [name, binding] : call.input_groups) {
+        if (child_invocation.input_groups.contains(name)) throw std::invalid_argument("bound input group is supplied by its parent: " + name);
+        if (const auto * group = std::get_if<std::string>(&binding)) {
+            child_groups.emplace(name, input_groups.at(*group));
+            child_invocation.input_groups.emplace(name, invocation.input_groups.at(*group));
+        }
+        else if (const auto * fixed = std::get_if<std::vector<std::size_t>>(&binding)) child_groups.emplace(name, remap(*fixed, values));
+        else {
+            const auto & generated = std::get<GeneratedGroup>(binding);
+            const auto count = generated.count.evaluate(parameters);
+            if (count < 0) throw std::invalid_argument("group generation needs a nonnegative count");
+
+            auto & members = child_groups[name];
+            members.reserve(static_cast<std::size_t>(count));
+            if (const auto * reused = std::get_if<ReusedGroupValue>(&generated.element))
+                members.assign(static_cast<std::size_t>(count), values.at(reused->value));
+            else {
+                const auto producer = std::get<GroupProducer>(generated.element).layout;
+                const auto & prototype = asset_.layout(producer);
+                for (std::int64_t index = 0; index < count; ++index) {
+                    std::vector<std::size_t> producer_resources(prototype.resources);
+                    std::iota(producer_resources.begin(), producer_resources.end(), graph_.resource_count);
+                    graph_.resource_count += prototype.resources;
+
+                    const auto produced = expand(producer,
+                                                 bindings.children.at(child_index).producers.at(name),
+                                                 {},
+                                                 parameters,
+                                                 region,
+                                                 producer_resources,
+                                                 std::vector<std::optional<std::size_t>>(prototype.storages.size()),
+                                                 {},
+                                                 sequences,
+                                                 scopes);
+                    members.push_back(graph_.regions.at(produced).at("outputs").at(0).get<std::size_t>());
+                }
+            }
+        }
+    }
+
+    if (call.family) {
+
+        // A reusable implementation keeps the caller's role identity, such as its layer and expert shard.
+        for (const auto & [name, value] : bindings.children.at(child_index).values) child_invocation.bindings.try_emplace(name, value);
+
+        for (const auto & contract : child.input_shapes) {
+            if (!child_values.at(contract.value)) continue;
+            bool known = true;
+            for (const auto & dimension : contract.shape) {
+                for (const auto & name : dimension.variables()) known = known && parameters.contains(name);
+            }
+            if (!known) continue;
+
+            // The caller supplies fixed geometry even when the callee uses its own local axis names.
+            require_value(*child_values[contract.value],
+                          {
+                              { "kind", "tensor" },
+                              { "dtype", contract.dtype },
+                              { "device", contract.device },
+                              { "shape", evaluate_shape(contract.shape, parameters) }
+            });
+        }
+        ValuePorts bound;
+        for (const auto & [name, value] : child.ports.inputs) bound.inputs.emplace(name, child_values.at(value).value());
+        for (const auto & [name, value] : child.ports.outputs) bound.outputs.emplace(name, child_values.at(value).value());
+        expand_call(*call.family, child_invocation, parameters, region, bound, sequences, scopes);
+    }
+    else
+        expand(call.layout,
+               bindings.children.at(child_index),
+               std::move(child_invocation),
+               parameters,
+               region,
+               remap(call.resources, resources),
+               std::move(child_values),
+               std::move(child_groups),
+               sequences,
+               scopes);
 }
 
 const std::vector<StateChange> & TemplateInstance::state_changes() const { return graph_.state_changes; }

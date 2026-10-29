@@ -4,7 +4,7 @@
 
 namespace markov {
 
-// Workflow owns transport; the control adapter exchanges only resource and work values.
+// Application assembly owns transport; control exchanges only resource and work values.
 class ControlPeer {
 public:
     virtual ~ControlPeer() = default;

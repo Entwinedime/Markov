@@ -22,7 +22,7 @@ struct Request {
     std::int64_t prompt_tokens;
     std::int64_t output_tokens;
 
-    static std::vector<Request> ordered(std::vector<Request> requests);
+    static std::vector<Request> read(const nlohmann::json & source);
 };
 
 struct ServingSettings {

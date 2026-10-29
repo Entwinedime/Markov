@@ -5,6 +5,8 @@
 #include <span>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 #include "markov/contracts/topology.hpp"
 #include "markov/templates/asset.hpp"
 
@@ -20,6 +22,7 @@ public:
     const RankGroup & stage(const std::string & name, std::size_t index) const;
     std::size_t stage_count(const std::string & name) const;
     std::size_t tensor_parallel_size(const std::string & name) const;
+    nlohmann::json control_source(const TemplateAsset & asset, const std::string & name) const;
 
 private:
     static ParallelTopology build(std::span<const TemplateAsset> assets, std::span<const std::int64_t> devices);

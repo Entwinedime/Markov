@@ -1,4 +1,4 @@
-#include "markov/workflow/serving.hpp"
+#include "markov/serving/workflow.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -50,44 +50,12 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
     while (!controller_.done() || !pending.empty()) {
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
-            nlohmann::json decision;
-            if (details) {
-                decision = describe_batch(action->work->batch);
-                decision["scheduled_ns"] = action->scheduled_ns;
-                decision["flow"] = action->flow;
-                decision["lane"] = action->lane;
-                decision["stage"] = action->stage ? nlohmann::json(*action->stage) : nlohmann::json(nullptr);
-                decision["step"] = action->step_name();
-                if (!action->channel.empty()) decision["channel"] = action->channel;
-                if (action->transfer)
-                    decision["transfer"] = {
-                        {      "source",      action->transfer->source },
-                        { "destination", action->transfer->destination }
-                    };
-                decision["commits_requests"] = action->commits_requests();
-                decision["task"] = {
-                    {    "group",    action->task.group },
-                    { "sequence", action->task.sequence }
-                };
-                if (!action->work->transferred_pages.empty()) {
-                    decision["page_copies"] = nlohmann::json::array();
-                    for (const auto & page : action->work->transferred_pages)
-                        decision["page_copies"].push_back({
-                            {      "source",      page.source },
-                            { "destination", page.destination }
-                        });
-                }
-            }
 
             // Resolve graph work before execution acceptance; a control backend may already hold its reservations.
             auto program = expansion_.expand(*action);
             const bool publishes = action->commits_requests() && std::ranges::any_of(action->work->effects.members, &RequestCompletion::emits_output);
             if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");
-            if (details)
-                decision["execution_ports"] = {
-                    { "publication", program.publication ? nlohmann::json(*program.publication) : nlohmann::json(nullptr) },
-                    { "completions",                                                                  program.completions }
-                };
+            auto decision = details ? describe_action(*action, program) : nlohmann::json{};
             executor_.submit(expansion_.graph(), action->task, program);
             controller_.start(*action);
             if (details) decision["submitted_order"] = state_order++;
@@ -157,16 +125,26 @@ nlohmann::json ServingWorkflow::run(bool details) {
     return result;
 }
 
-nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
+nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, const BatchProgram & program) const {
+    const auto & batch = action.work->batch;
     nlohmann::json decision{
-        {                 "phase", batch.phase == Phase::Prefill ? "prefill" : "decode" },
-        {                     "M",                                   batch.new_tokens() },
-        {                     "B",                                 batch.members.size() },
-        {                     "R",                               batch.request_capacity },
-        {     "free_pages_before",                              batch.free_pages_before },
-        { "deferred_pages_before",                          batch.deferred_pages_before },
-        {       "allocated_pages",                                batch.allocated_pages },
-        {               "members",                              nlohmann::json::array() }
+        {                 "phase",                                    batch.phase == Phase::Prefill ? "prefill" : "decode"                                  },
+        {                     "M",                                                                                                        batch.new_tokens() },
+        {                     "B",                                                                                                      batch.members.size() },
+        {                     "R",                                                                                                    batch.request_capacity },
+        {     "free_pages_before",                                                                                                   batch.free_pages_before },
+        { "deferred_pages_before",                                                                                               batch.deferred_pages_before },
+        {       "allocated_pages",                                                                                                     batch.allocated_pages },
+        {               "members",                                                                                                   nlohmann::json::array() },
+        {          "scheduled_ns",                                                                                                       action.scheduled_ns },
+        {                  "flow",                                                                                                               action.flow },
+        {                  "lane",                                                                                                               action.lane },
+        {                 "stage",                                                    action.stage ? nlohmann::json(*action.stage) : nlohmann::json(nullptr) },
+        {                  "step",                                                                                                        action.step_name() },
+        {      "commits_requests",                                                                                                 action.commits_requests() },
+        {                  "task",                                                  { { "group", action.task.group }, { "sequence", action.task.sequence } } },
+        {       "execution_ports",
+         { { "publication", program.publication ? nlohmann::json(*program.publication) : nlohmann::json(nullptr) }, { "completions", program.completions } } }
     };
     for (const auto & member : batch.members) {
         decision["members"].push_back({
@@ -177,6 +155,21 @@ nlohmann::json ServingWorkflow::describe_batch(const Batch & batch) const {
             {  "previous_page", member.previous_page ? nlohmann::json(*member.previous_page) : nlohmann::json(nullptr) },
             {      "new_pages",                                                                       member.new_pages }
         });
+    }
+
+    if (!action.channel.empty()) decision["channel"] = action.channel;
+    if (action.transfer)
+        decision["transfer"] = {
+            {      "source",      action.transfer->source },
+            { "destination", action.transfer->destination }
+        };
+    if (!action.work->transferred_pages.empty()) {
+        decision["page_copies"] = nlohmann::json::array();
+        for (const auto & page : action.work->transferred_pages)
+            decision["page_copies"].push_back({
+                {      "source",      page.source },
+                { "destination", page.destination }
+            });
     }
 
     return decision;

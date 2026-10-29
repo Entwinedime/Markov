@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(markov_core
+    src/markov/serving/workflow.cpp
     src/markov/controller/batch_replay.cpp
     src/markov/controller/disaggregated.cpp
     src/markov/controller/native.cpp
@@ -30,8 +31,10 @@ add_library(markov_core
     src/markov/graph/source_graph.cpp
     src/markov/production/source_projection.cpp
     src/markov/production/execution_source.cpp
-    src/markov/templates/library.cpp
+    src/markov/production/execution_pattern.cpp
+    src/markov/production/template_library.cpp
     src/markov/templates/group_execution.cpp
+    src/markov/templates/catalog.cpp
     src/markov/templates/asset.cpp
     src/markov/templates/instance.cpp
     src/markov/templates/target_graph.cpp
@@ -51,8 +54,8 @@ add_library(markov_application
     src/markov/adapters/frameworks/sglang/topology.cpp
     src/markov/adapters/frameworks/sglang/structure.cpp
     src/markov/adapters/frameworks/sglang/rank_structure.cpp
-    src/markov/workflow/serving.cpp
-    src/markov/workflow/control_stream.cpp
+    src/markov/application/simulation.cpp
+    src/markov/application/control_stream.cpp
 )
 target_link_libraries(markov_application PUBLIC markov_core)
 target_compile_options(markov_application PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

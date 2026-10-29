@@ -1,4 +1,4 @@
-#include "markov/workflow/control_stream.hpp"
+#include "markov/application/control_stream.hpp"
 
 #include <stdexcept>
 #include <string>

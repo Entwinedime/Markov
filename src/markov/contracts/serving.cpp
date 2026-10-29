@@ -1,13 +1,31 @@
 #include "markov/contracts/serving.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <set>
 #include <stdexcept>
 
 namespace markov {
 
-std::vector<Request> Request::ordered(std::vector<Request> requests) {
+std::vector<Request> Request::read(const nlohmann::json & source) {
+    if (!source.is_array() || source.empty()) throw std::invalid_argument("serving needs a nonempty request array");
+    constexpr std::array fields{ "id", "arrival_ns", "prompt_tokens", "output_tokens" };
+    std::vector<Request> requests;
+    for (const auto & request : source) {
+        for (const auto & [name, _] : request.items()) {
+            if (std::ranges::find(fields, name) == fields.end()) throw std::invalid_argument("request has unsupported field: " + name);
+        }
+        for (const auto * field : { "arrival_ns", "prompt_tokens", "output_tokens" }) {
+            if (!request.at(field).is_number_integer()) throw std::invalid_argument("serving fields must be integers");
+        }
+        requests.push_back({ request.at("id").get<std::string>(),
+                             request.at("arrival_ns").get<std::int64_t>(),
+                             request.at("prompt_tokens").get<std::int64_t>(),
+                             request.at("output_tokens").get<std::int64_t>() });
+    }
+
+    // Stable arrival order gives both simulation and recorded batches the same request identities.
     std::stable_sort(requests.begin(), requests.end(), [](const Request & left, const Request & right) { return left.arrival_ns < right.arrival_ns; });
     std::set<std::string> identities;
     for (const auto & request : requests) {

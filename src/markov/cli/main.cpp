@@ -1,40 +1,27 @@
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <initializer_list>
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <memory>
-#include <optional>
-#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "markov/adapters/frameworks/sglang/batch_record.hpp"
-#include "markov/adapters/frameworks/sglang/disaggregated.hpp"
-#include "markov/adapters/frameworks/sglang/structure.hpp"
-#include "markov/adapters/frameworks/sglang/topology.hpp"
-#include "markov/controller/disaggregated.hpp"
-#include "markov/controller/native.hpp"
-#include "markov/controller/serving.hpp"
-#include "markov/execution/durations.hpp"
+#include "markov/application/control_stream.hpp"
+#include "markov/application/simulation.hpp"
+#include "markov/controller/batch_replay.hpp"
 #include "markov/graph/source_graph.hpp"
 #include "markov/production/source_projection.hpp"
-#include "markov/resources/kv_pool.hpp"
+#include "markov/production/template_library.hpp"
 #include "markov/templates/instance.hpp"
-#include "markov/templates/library.hpp"
 #include "markov/templates/target_graph.hpp"
-#include "markov/workflow/control_stream.hpp"
-#include "markov/workflow/serving.hpp"
 
 namespace {
 
@@ -92,243 +79,9 @@ nlohmann::json compose(const markov::TemplateAsset & asset, const nlohmann::json
     return graph.document();
 }
 
-std::int64_t integer(const nlohmann::json & source) {
-    if (!source.is_number_integer()) throw std::invalid_argument("serving fields must be integers");
-    return source.get<std::int64_t>();
-}
-
-void check_fields(const nlohmann::json & source, std::initializer_list<std::string_view> fields, std::string_view context) {
-    for (const auto & [name, _] : source.items()) {
-        if (std::ranges::find(fields, std::string_view(name)) == fields.end())
-            throw std::invalid_argument(std::string(context) + " has unsupported field: " + name);
-    }
-}
-
-nlohmann::json expert_condition(const nlohmann::json & settings, const nlohmann::json & input, const markov::TemplateAsset & source) {
-    if (!settings.contains("ep")) return nullptr;
-    const auto & ep = settings.at("ep");
-    check_fields(ep, { "id", "size" }, "ep");
-    const auto id = ep.at("id").get<std::string>();
-    const auto size = integer(ep.at("size"));
-    if (id.empty() || size <= 0 || size != source.environment().at("logical_ep").get<std::int64_t>())
-        throw std::invalid_argument("EP topology does not match the native source");
-    const auto & conditions = input.at("ep_routes");
-    if (!conditions.is_object() || !conditions.contains(id)) throw std::invalid_argument("workload has no route condition for EP topology: " + id);
-    return conditions.at(id);
-}
-
-nlohmann::json resource_capacity(const markov::KvPool & resources) {
-    const auto & capacity = resources.capacity();
-    return {
-        { "slots", capacity.slots },
-        { "pages", capacity.pages }
-    };
-}
-
-nlohmann::json native_source(const markov::TemplateAsset & asset, const std::string & id, const markov::sglang::ServingTopology & topology) {
-    const auto & environment = asset.environment();
-    const auto & implementation = environment.at("implementation");
-    return {
-        {           "id",                                       id },
-        {        "ranks",            topology.instance(id).members },
-        { "model_config",        implementation.at("model_config") },
-        {        "dtype",               implementation.at("dtype") },
-        {         "mode", implementation.at("disaggregation_mode") },
-        {           "tp",             environment.at("logical_tp") },
-        {           "ep",             environment.at("logical_ep") },
-        {           "pp",             environment.at("logical_pp") }
-    };
-}
-
-nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, bool details,
-                        bool native) {
-    check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
-    const auto & configuration = input.at("configuration");
-    const bool disaggregated = configuration.contains("pd");
-    if (native && !batches.is_null()) throw std::invalid_argument("native control does not consume batch replay");
-    if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
-    else
-        check_fields(configuration,
-                     { "max_running_requests", "max_total_tokens", "page_size", "max_prefill_tokens", "pp", "microbatch_requests", "placement", "ep" },
-                     "configuration");
-    if (input.contains("ep_routes") && !configuration.contains("ep") && !disaggregated)
-        throw std::invalid_argument("workload routes require a configured EP topology");
-
-    std::vector<markov::Request> requests;
-    if (!input.at("requests").is_array() || input.at("requests").empty()) throw std::invalid_argument("serving needs a nonempty request array");
-    for (const auto & request : input.at("requests")) {
-        check_fields(request, { "id", "arrival_ns", "prompt_tokens", "output_tokens" }, "request");
-        requests.push_back({ request.at("id").get<std::string>(),
-                             integer(request.at("arrival_ns")),
-                             integer(request.at("prompt_tokens")),
-                             integer(request.at("output_tokens")) });
-    }
-
-    requests = markov::Request::ordered(std::move(requests));
-    std::optional<markov::BatchReplay> replay;
-    if (!batches.is_null()) replay.emplace(batches, requests, disaggregated);
-
-    const markov::GivenDurations durations(input.at("node_durations_ns"));
-    std::vector<std::int64_t> devices;
-    if (configuration.contains("placement")) {
-        const auto & placement = configuration.at("placement");
-        check_fields(placement, { "devices" }, "placement");
-        if (!placement.at("devices").is_array() || placement.at("devices").size() != assets.size())
-            throw std::invalid_argument("placement needs one device per logical rank");
-        for (const auto & device : placement.at("devices")) devices.push_back(integer(device));
-    }
-    if (disaggregated) {
-        const auto & pd = configuration.at("pd");
-        check_fields(pd, { "prefill", "decode" }, "pd");
-        const auto & p = pd.at("prefill");
-        const auto & d = pd.at("decode");
-        check_fields(p, { "tp", "pp", "ep", "max_running_requests", "max_total_tokens", "max_prefill_tokens" }, "pd.prefill");
-        check_fields(d, { "tp", "pp", "ep", "max_running_requests", "max_total_tokens" }, "pd.decode");
-        if (input.contains("ep_routes") && !p.contains("ep") && !d.contains("ep"))
-            throw std::invalid_argument("workload routes require a configured EP topology");
-        const markov::TemplateAsset * prefill_source = nullptr;
-        const markov::TemplateAsset * decode_source = nullptr;
-        for (const auto & asset : assets) {
-            const auto & mode = asset.environment().at("implementation").at("disaggregation_mode");
-            if (mode == "prefill") prefill_source = &asset;
-            if (mode == "decode") decode_source = &asset;
-        }
-        if (prefill_source == nullptr || decode_source == nullptr) throw std::invalid_argument("PD requires prefill and decode sources");
-        for (const auto & [pool, source] : {
-                 std::pair{ &p, prefill_source },
-                 { &d,  decode_source }
-        }) {
-            const auto tp = integer(pool->at("tp"));
-            const auto pp = pool->contains("pp") ? integer(pool->at("pp")) : 1;
-            if (tp <= 0 || pp <= 0 || tp != source->environment().at("logical_tp") || pp != source->environment().at("logical_pp"))
-                throw std::invalid_argument("PD target topology differs from its native instance source");
-        }
-        const auto page_size = integer(configuration.at("page_size"));
-        if (replay
-            && (replay->lanes("prefill") > static_cast<std::size_t>(p.value("pp", 1)) || replay->lanes("decode") > static_cast<std::size_t>(d.value("pp", 1))))
-            throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
-        const markov::ServingSettings prefill(integer(p.at("max_running_requests")),
-                                              integer(p.at("max_total_tokens")),
-                                              page_size,
-                                              integer(p.at("max_prefill_tokens")));
-        const markov::ServingSettings decode(integer(d.at("max_running_requests")), integer(d.at("max_total_tokens")), page_size, 1);
-        const markov::DisaggregatedGroups groups{ "prefill", "decode", "kv" };
-        markov::sglang::DisaggregatedStructure expansion(assets,
-                                                         prefill,
-                                                         decode,
-                                                         requests,
-                                                         groups,
-                                                         devices,
-                                                         expert_condition(p, input, *prefill_source),
-                                                         expert_condition(d, input, *decode_source));
-        std::map<std::string, markov::KvPool> resources;
-        std::array instances{
-            markov::NativeInstance{ groups.prefill, markov::NativeRole::Prefill, prefill, 0, {} },
-            markov::NativeInstance{  groups.decode,  markov::NativeRole::Decode,  decode, 0, {} }
-        };
-        for (auto & instance : instances) {
-            const auto stages = native ? expansion.topology().stage_count(instance.id) : 1;
-            instance.batch_limit = (static_cast<std::size_t>(instance.settings.max_running_requests) - 1) / stages + 1;
-            for (std::size_t stage = 0; stage < stages; ++stage) {
-                const auto & name = stages == 1 ? instance.id : expansion.topology().stage(instance.id, stage).id;
-                auto [pool, _] = resources.try_emplace(name, requests.size(), instance.settings, expansion.page_reuse());
-                instance.participants.push_back({ name, stage, pool->second });
-            }
-        }
-        markov::ControlStream peer(std::cin, std::cout);
-        std::unique_ptr<markov::ServingControl> controller;
-        if (native) {
-            peer.send({
-                {      "kind",                                                                               "source"                              },
-                { "instances",
-                 { native_source(*prefill_source, "prefill", expansion.topology()), native_source(*decode_source, "decode", expansion.topology()) } }
-            });
-            std::vector<markov::NativeTransferRoute> transfers;
-            for (const auto & binding : expansion.transfer_bindings())
-                transfers.push_back({ binding, resources.at(binding.source), resources.at(binding.destination) });
-            controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer, transfers);
-        }
-        else
-            controller = std::make_unique<markov::DisaggregatedController>(prefill,
-                                                                           decode,
-                                                                           std::move(requests),
-                                                                           groups,
-                                                                           resources.at(groups.prefill),
-                                                                           resources.at(groups.decode),
-                                                                           replay ? &*replay : nullptr);
-        markov::ServingWorkflow workflow(*controller, expansion, durations);
-        auto result = workflow.run(details);
-        if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
-        result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
-        result["configuration"] = configuration;
-        result["duration_source"] = "given_execution_kind_ns";
-        for (const auto & [name, pool] : resources) {
-            result["pool_free_pages"][name] = pool.free_pages().size();
-            if (native) result["resource_capacity"][name] = resource_capacity(pool);
-        }
-        result["structure"] = expansion.summary();
-        if (details) result["graph"] = expansion.document();
-        return result;
-    }
-
-    const markov::ServingSettings settings{ integer(configuration.at("max_running_requests")),
-                                            integer(configuration.at("max_total_tokens")),
-                                            integer(configuration.at("page_size")),
-                                            integer(configuration.at("max_prefill_tokens")) };
-    const auto stages = configuration.contains("pp") ? integer(configuration.at("pp")) : 1;
-    if (stages <= 0) throw std::invalid_argument("pp must be positive");
-    if (replay && replay->lanes("model") > static_cast<std::size_t>(stages)) throw std::invalid_argument("recorded batch lane exceeds the target pipeline");
-    const auto batch_limit =
-        configuration.contains("microbatch_requests") ? integer(configuration.at("microbatch_requests")) : (settings.max_running_requests - 1) / stages + 1;
-    if (batch_limit <= 0 || batch_limit > settings.max_running_requests) throw std::invalid_argument("microbatch_requests must fit the request capacity");
-    const markov::sglang::ServingTopology topology(assets, devices);
-    if (static_cast<std::size_t>(stages) != topology.stage_count("model")) throw std::invalid_argument("target PP differs from its source topology");
-    const auto control_group = topology.parallel().groups().front().id;
-    const auto routes = expert_condition(configuration, input, assets.front());
-    markov::RegionGraph graph;
-    markov::sglang::ServingStructure expansion(graph, assets, settings, requests, topology, "model", routes);
-    std::vector<markov::KvPool> resources;
-    resources.reserve(static_cast<std::size_t>(stages));
-    for (std::int64_t stage = 0; stage < (native ? stages : 1); ++stage) resources.emplace_back(requests.size(), settings, expansion.page_reuse());
-    markov::ControlStream peer(std::cin, std::cout);
-    std::unique_ptr<markov::ServingControl> controller;
-    if (native) {
-        peer.send({
-            {      "kind",                                             "source" },
-            { "instances", { native_source(assets.front(), "model", topology) } }
-        });
-        std::vector<markov::NativeParticipant> participants;
-        for (std::size_t stage = 0; stage < resources.size(); ++stage) participants.push_back({ topology.stage("model", stage).id, stage, resources[stage] });
-        const std::array instances{
-            markov::NativeInstance{ "model", markov::NativeRole::Model, settings, static_cast<std::size_t>(batch_limit), std::move(participants) }
-        };
-        controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer);
-    }
-    else
-        controller = std::make_unique<markov::ServingController>(settings,
-                                                                 std::move(requests),
-                                                                 resources.front(),
-                                                                 control_group,
-                                                                 static_cast<std::size_t>(stages),
-                                                                 static_cast<std::size_t>(batch_limit),
-                                                                 replay ? &*replay : nullptr);
-    markov::ServingWorkflow workflow(*controller, expansion, durations);
-    auto result = workflow.run(details);
-    if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
-    result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
-    result["configuration"] = configuration;
-    result["duration_source"] = "given_execution_kind_ns";
-    if (native) {
-        for (std::size_t stage = 0; stage < resources.size(); ++stage)
-            result["resource_capacity"][topology.stage("model", stage).id] = resource_capacity(resources[stage]);
-    }
-    result["structure"] = expansion.summary();
-    if (details) result["graph"] = expansion.document();
-    return result;
-}
-
 const markov::TemplateAsset & select_role(std::span<const markov::TemplateAsset> roles, const nlohmann::json & target) {
-    const auto rank = target.contains("source_rank") ? integer(target.at("source_rank")) : 0;
+    if (target.contains("source_rank") && !target.at("source_rank").is_number_integer()) throw std::invalid_argument("source_rank must be an integer");
+    const auto rank = target.value("source_rank", std::int64_t{ 0 });
     const auto selected = std::ranges::find_if(roles, [rank](const auto & role) { return role.environment().at("rank") == rank; });
     if (selected == roles.end()) throw std::invalid_argument("template catalog has no selected source rank");
     return *selected;
@@ -360,14 +113,8 @@ int main(int argc, char ** argv) {
                 record.append(read_json(source), read_json(session));
                 inputs.insert(inputs.end(), { source, session });
             }
-            std::vector<markov::Request> requests;
-            for (const auto & request : specification.at("requests"))
-                requests.push_back({ request.at("id").get<std::string>(),
-                                     integer(request.at("arrival_ns")),
-                                     integer(request.at("prompt_tokens")),
-                                     integer(request.at("output_tokens")) });
             const markov::BatchReplay checked(record.document(),
-                                              markov::Request::ordered(std::move(requests)),
+                                              markov::Request::read(specification.at("requests")),
                                               specification.at("configuration").contains("pd"));
             write_json(output, record.document(), inputs, true);
             std::cout << "native batch records written\n";
@@ -400,8 +147,11 @@ int main(int argc, char ** argv) {
             auto document = read_json(template_path);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto assets = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
-            const auto result =
-                simulate(assets, read_json(input), batches.empty() ? nlohmann::json(nullptr) : read_json(batches), details, control == "native");
+            const auto specification = read_json(input);
+            const auto recorded = batches.empty() ? nlohmann::json(nullptr) : read_json(batches);
+            markov::ControlStream peer(std::cin, std::cout);
+            markov::ServingSimulation simulation(assets, specification, recorded, control == "native" ? &peer : nullptr);
+            const auto result = simulation.run(details);
             std::vector<std::filesystem::path> inputs{ template_path, input };
             if (!batches.empty()) inputs.push_back(batches);
             write_json(output, result, inputs, !details);

@@ -26,7 +26,7 @@ struct RecordedBatch {
     std::vector<RecordedMember> members;
 };
 
-// Records select work; the existing controller remains the sole owner of progress and KV state.
+// Records select work; the controller owns progress and the shared resource pool owns KV state.
 class BatchReplay {
 public:
     BatchReplay(const nlohmann::json & document, std::span<const Request> requests, bool disaggregated);

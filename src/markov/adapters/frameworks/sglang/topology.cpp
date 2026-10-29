@@ -90,4 +90,21 @@ std::size_t ServingTopology::tensor_parallel_size(const std::string & name) cons
 }
 std::size_t ServingTopology::stage_count(const std::string & name) const { return instance(name).members.size() / tensor_parallel_size(name); }
 
+nlohmann::json ServingTopology::control_source(const TemplateAsset & asset, const std::string & name) const {
+    const auto & environment = asset.environment();
+    const auto & implementation = environment.at("implementation");
+
+    // Native worker metadata comes from the same source and rank binding used for graph expansion.
+    return {
+        {           "id",                                     name },
+        {        "ranks",                   instance(name).members },
+        { "model_config",        implementation.at("model_config") },
+        {        "dtype",               implementation.at("dtype") },
+        {         "mode", implementation.at("disaggregation_mode") },
+        {           "tp",             environment.at("logical_tp") },
+        {           "ep",             environment.at("logical_ep") },
+        {           "pp",             environment.at("logical_pp") }
+    };
+}
+
 } // namespace markov::sglang

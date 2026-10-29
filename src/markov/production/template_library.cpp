@@ -1,8 +1,7 @@
-#include "markov/templates/library.hpp"
+#include "markov/production/template_library.hpp"
 
 #include "markov/contracts/input_group.hpp"
 #include "markov/production/execution_source.hpp"
-#include "markov/templates/group_execution.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -24,84 +23,14 @@ void append_once(std::vector<std::size_t> & values, std::size_t value) {
     if (std::ranges::find(values, value) == values.end()) values.push_back(value);
 }
 
-void canonicalize_expression(nlohmann::json & expression) {
-    if (!expression.is_array()) return;
-    for (auto argument = std::next(expression.begin()); argument != expression.end(); ++argument) canonicalize_expression(*argument);
+nlohmann::json take_table(std::map<nlohmann::json, std::size_t> & table) {
+    nlohmann::json result = std::vector<nlohmann::json>(table.size());
 
-    static const std::set<std::string> commutative{ "add", "mul", "min", "max", "eq", "and", "or" };
-    if (commutative.contains(expression.at(0).get<std::string>())) std::sort(std::next(expression.begin()), expression.end());
-}
-
-nlohmann::json execution_signature(const nlohmann::json & frame) {
-    nlohmann::json result{
-        { "host_resource", frame.at("host_resource") },
-        { "operations", frame.value("execution", nlohmann::json::array()) }
-    };
-
-    std::map<std::pair<std::int64_t, std::int64_t>, std::size_t> queue_items;
-    std::map<std::pair<std::string, std::int64_t>, std::map<std::size_t, std::vector<nlohmann::json *>>> orders;
-    for (auto & operation : result["operations"]) {
-        operation.erase("candidate");
-        auto & host = operation.at("observation").at("host_scope");
-        if (!host.is_null()) {
-            host.erase("source_event");
-            host.erase("identity");
-            for (const auto * field : { "order", "completion_order" }) {
-                auto & order = host.at(field);
-                orders[{ "thread", host.at("thread").get<std::int64_t>() }][order.get<std::size_t>()].push_back(&order);
-            }
-        }
-
-        for (const auto * kind : { "device_work", "runtime_actions" }) {
-            for (auto & effect : operation.at("observation").at(kind)) {
-
-                // Compare observed behavior and resource identity, not capture-local record numbers.
-                for (const auto * key : { "source_event", "operation", "region", "baseline", "observer", "auxiliary" }) effect.erase(key);
-
-                auto & submission = effect.at("submission");
-                if (!submission.is_null()) {
-                    const auto thread = submission.at("thread").get<std::int64_t>();
-                    auto & order = submission.at("order");
-                    orders[{ "thread", thread }][order.get<std::size_t>()].push_back(&order);
-                    auto & completion = submission.at("completion_order");
-                    orders[{ "thread", thread }][completion.get<std::size_t>()].push_back(&completion);
-                    submission.erase("source_event");
-
-                    auto & queue = submission.at("queue");
-                    if (!queue.is_null()) {
-                        const auto key = std::pair{ queue.at("process").get<std::int64_t>(), queue.at("correlation").get<std::int64_t>() };
-                        queue["correlation"] = queue_items.try_emplace(key, queue_items.size()).first->second;
-
-                        auto & enqueue_order = queue.at("enqueue_order");
-                        auto & dequeue_order = queue.at("dequeue_order");
-                        auto & completion_order = queue.at("dequeue_completion_order");
-                        orders[{ "thread", queue.at("producer_thread").get<std::int64_t>() }][enqueue_order.get<std::size_t>()].push_back(&enqueue_order);
-                        orders[{ "thread", thread }][dequeue_order.get<std::size_t>()].push_back(&dequeue_order);
-                        orders[{ "thread", thread }][completion_order.get<std::size_t>()].push_back(&completion_order);
-
-                        queue.erase("enqueue_event");
-                        queue.erase("dequeue_event");
-                    }
-                }
-
-                if (effect.contains("order")) {
-                    auto & order = effect.at("order");
-                    orders[{ "stream", effect.at("stream").get<std::int64_t>() }][order.get<std::size_t>()].push_back(&order);
-                }
-                if (effect.contains("native_call") && !effect.at("native_call").is_null()) effect["native_call"].erase("source");
-            }
-        }
+    // Publication consumes the index; extracting keys avoids copying the complete shared library.
+    while (!table.empty()) {
+        auto entry = table.extract(table.begin());
+        result[entry.mapped()] = std::move(entry.key());
     }
-
-    // Ordering is meaningful within a serial resource; elapsed gaps and cross-resource timing are not edges.
-    for (const auto & [_, positions] : orders) {
-        std::size_t order = 0;
-        for (const auto & [source_order, records] : positions) {
-            for (auto * record : records) *record = order;
-            ++order;
-        }
-    }
-
     return result;
 }
 
@@ -244,8 +173,6 @@ private:
 
     void index();
     void compile(std::size_t region);
-    std::pair<nlohmann::json, std::vector<std::size_t>> execution_selections() const;
-    static void publish_selections(nlohmann::json & frame, std::span<const std::size_t> groups);
     std::optional<std::size_t> host_resource(std::size_t region, const std::vector<Item> & items);
     std::map<std::size_t, std::map<std::string, Repetition>> repetitions(const std::vector<Item> & items) const;
 
@@ -263,15 +190,13 @@ private:
     std::map<std::string, const nlohmann::json *> modules_;
     std::vector<Region> regions_;
     std::vector<std::size_t> roots_;
-
-    std::vector<nlohmann::json> execution_candidates_;
-    std::set<std::size_t> external_events_;
 };
 
 
 SourceTemplates::SourceTemplates(const nlohmann::json & source, TemplateLibrary & library)
     : source_(source),
       library_(library),
+      execution_(library.execution_patterns_),
       external_resources_(source.at("external_resources").get<std::set<std::size_t>>()),
       regions_(source.at("regions").size()) {
     index();
@@ -420,7 +345,7 @@ std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> Source
                             || region.frame.value("bindings", nlohmann::json::object()) != prototype.frame.value("bindings", nlohmann::json::object())
                             || region.frame.at("literals") != prototype.frame.at("literals"))
                             throw std::invalid_argument("group element producers do not share one template and fixed bindings");
-                        if (execution_signature(region.frame) != execution_signature(prototype.frame))
+                        if (!ExecutionSource::equivalent(region.frame, prototype.frame))
                             throw std::invalid_argument("group element producers have different observed execution effects");
                     }
 
@@ -641,28 +566,7 @@ void SourceTemplates::compile(std::size_t identity) {
             const auto & operation = source_.at("operations")[item.identity];
             nlohmann::json work;
             if (operation.contains("execution_observation")) {
-                auto prototype = execution_.compile(operation.at("execution_observation"));
-                std::optional<GroupExecution> reduction;
-                if (operation.contains("execution_reduction")) {
-                    const auto & declaration = operation.at("execution_reduction");
-                    const auto & group = operation.at("input_groups").at(declaration.at("group").get<std::string>());
-                    std::vector<Parameters> members;
-                    for (const auto & member : group.at("members")) members.push_back(member.at("parameters").get<Parameters>());
-                    reduction = GroupExecution::compile(declaration, prototype.pattern, members);
-                }
-                for (const auto & requirement : prototype.pattern.at("requirements")) {
-                    if (requirement.at("kind") == "event_wait") external_events_.insert(prototype.resources.at(requirement.at("resource").get<std::size_t>()));
-                }
-                const auto pattern = library_.execution_patterns_.try_emplace(std::move(prototype.pattern), library_.execution_patterns_.size()).first->second;
-                if (!region.frame.contains("execution")) region.frame["execution"] = nlohmann::json::array();
-                region.frame["execution"].push_back({
-                    {   "operation",          definition.at("body").size() },
-                    {     "pattern",                               pattern },
-                    {   "resources",        std::move(prototype.resources) },
-                    { "observation", operation.at("execution_observation") }
-                });
-                if (operation.contains("execution_guards")) region.frame["execution"].back()["guards"] = operation.at("execution_guards");
-                if (reduction) region.frame["execution"].back()["reduction"] = reduction->document();
+                region.frame["execution"].push_back(execution_.observe(operation, definition.at("body").size()));
             }
 
             for (const auto & key : { "opaque_inputs", "opaque_outputs" }) {
@@ -763,136 +667,16 @@ void SourceTemplates::compile(std::size_t identity) {
 
     const auto definition_id = library_.definitions_.try_emplace(std::move(definition), library_.definitions_.size()).first->second;
     layout["definition"] = definition_id;
-    if (region.frame.contains("execution")) {
-        for (auto & binding : region.frame["execution"]) {
-            if (!binding.contains("guards")) continue;
-            binding["candidate"] = execution_candidates_.size();
-            execution_candidates_.push_back({
-                { "definition",               definition_id },
-                {   "literals", region.frame.at("literals") },
-                {  "operation",     binding.at("operation") },
-                {     "guards",        binding.at("guards") },
-                {    "pattern",       binding.at("pattern") },
-                {  "resources",     binding.at("resources") }
-            });
-            if (binding.contains("reduction")) execution_candidates_.back()["reduction"] = binding.at("reduction");
-        }
-    }
+    execution_.bind(region.frame, definition_id);
     region.layout = library_.layouts_.try_emplace(std::move(layout), library_.layouts_.size()).first->second;
 }
 
-std::pair<nlohmann::json, std::vector<std::size_t>> SourceTemplates::execution_selections() const {
-    auto groups = nlohmann::json::array();
-    std::vector<std::size_t> selected;
-    std::map<nlohmann::json, std::size_t> identities;
-    std::vector<std::set<nlohmann::json>> alternatives;
-    std::vector<const nlohmann::json *> patterns(library_.execution_patterns_.size());
-    for (const auto & [pattern, identity] : library_.execution_patterns_) patterns[identity] = &pattern;
-
-    std::vector<std::tuple<nlohmann::json, nlohmann::json, nlohmann::json>> signatures;
-    std::map<nlohmann::json, std::set<nlohmann::json>> contexts;
-    for (const auto & candidate : execution_candidates_) {
-        const auto & pattern = *patterns[candidate.at("pattern").get<std::size_t>()];
-        const auto & resources = candidate.at("resources");
-        std::set<std::size_t> context;
-        auto binding_signature = nlohmann::json::array();
-        for (const auto & value : resources) {
-            const auto resource = value.get<std::size_t>();
-
-            // Only events confined to one operation may change identities between equivalent prototypes.
-            const bool private_event = execution_.resources().at(resource) == "event" && !external_events_.contains(resource);
-            binding_signature.push_back(private_event ? nlohmann::json(nullptr) : value);
-            if (!private_event) context.insert(resource);
-        }
-        auto guards = candidate.at("guards");
-        auto conditions = nlohmann::json::array();
-
-        // Compare semantic keys after naming symbols; executable guards keep their original evaluation order.
-        for (auto & guard : guards) {
-            canonicalize_expression(guard.at("condition"));
-            conditions.push_back(guard.at("condition"));
-        }
-        const auto & call = pattern.at("host_call");
-        const auto caller = call.is_null() ? nlohmann::json(nullptr)
-                                           : resources.at(pattern.at("nodes").at(call.at("entry").get<std::size_t>()).at("resource").get<std::size_t>());
-        nlohmann::json key{
-            { "definition", candidate.at("definition") },
-            {   "literals",   candidate.at("literals") },
-            {  "operation",  candidate.at("operation") },
-            { "conditions",                 conditions },
-            {     "caller",                     caller }
-        };
-        if (context.size() > 1) contexts[key].insert(context);
-        key["context"] = context;
-        signatures.emplace_back(std::move(key), std::move(binding_signature), std::move(guards));
-    }
-
-    for (std::size_t index = 0; index < execution_candidates_.size(); ++index) {
-        const auto & candidate = execution_candidates_[index];
-        const auto & resources = candidate.at("resources");
-        auto [key, binding_signature, guards] = std::move(signatures[index]);
-
-        // An empty implementation has no device context; share it only with one observed calling context.
-        if (key.at("context").size() == 1 && key.at("context").at(0) == key.at("caller")) {
-            auto contract = key;
-            contract.erase("context");
-            const auto found = contexts.find(contract);
-            if (found != contexts.end() && found->second.size() == 1) key["context"] = *found->second.begin();
-        }
-        const auto [position, added] = identities.try_emplace(key, identities.size());
-        const auto identity = position->second;
-        if (added) {
-
-            // Fixed operands distinguish calling contexts without copying them into the published selection.
-            key.erase("literals");
-            key["choices"] = nlohmann::json::array();
-            groups.push_back(std::move(key));
-            alternatives.emplace_back();
-        }
-        selected.push_back(identity);
-        nlohmann::json signature{
-            {    "guards",       std::move(guards) },
-            {   "pattern", candidate.at("pattern") },
-            { "resources",       binding_signature }
-        };
-        if (candidate.contains("reduction")) signature["reduction"] = candidate.at("reduction");
-        if (alternatives[identity].insert(signature).second) {
-            groups[identity]["choices"].push_back({
-                {    "guards",  candidate.at("guards") },
-                {   "pattern", candidate.at("pattern") },
-                { "resources",               resources }
-            });
-            if (candidate.contains("reduction")) groups[identity]["choices"].back()["reduction"] = candidate.at("reduction");
-        }
-    }
-    return { std::move(groups), std::move(selected) };
-}
-
-void SourceTemplates::publish_selections(nlohmann::json & frame, std::span<const std::size_t> groups) {
-    if (frame.contains("execution")) {
-        for (auto & binding : frame["execution"]) {
-
-            // Native observations are compilation inputs, retained once in the source capture.
-            binding.erase("observation");
-            if (!binding.contains("candidate")) continue;
-            binding["variants"] = groups[binding.at("candidate").get<std::size_t>()];
-            for (const auto * key : { "candidate", "guards", "pattern", "resources", "reduction" }) binding.erase(key);
-        }
-    }
-    for (auto & child : frame["children"]) publish_selections(child, groups);
-    if (frame.contains("producers")) {
-        for (auto & [_, producer] : frame["producers"].items()) publish_selections(producer, groups);
-    }
-}
-
 nlohmann::json SourceTemplates::document() {
-    auto [variants, groups] = execution_selections();
     nlohmann::json result{
         {         "environment",       source_.at("environment") },
         {   "physical_coverage", source_.at("physical_coverage") },
         {    "runtime_coverage",  source_.at("runtime_coverage") },
         { "execution_resources",          execution_.resources() },
-        {  "execution_variants",             std::move(variants) },
         {             "entries",         nlohmann::json::array() },
         {         "entrypoints",         nlohmann::json::array() },
         {              "inputs",         nlohmann::json::array() }
@@ -902,7 +686,6 @@ nlohmann::json SourceTemplates::document() {
     for (const auto root : roots_) {
         auto & region = regions_[root];
         auto entry = std::move(region.frame);
-        publish_selections(entry, groups);
         entry.update({
             { "source_region",             root },
             {        "layout",    region.layout },
@@ -919,6 +702,7 @@ nlohmann::json SourceTemplates::document() {
         result["entries"].push_back(std::move(entry));
         inputs.insert(region.inputs.begin(), region.inputs.end());
     }
+    result["execution_variants"] = execution_.finalize(result["entries"]);
     for (const auto input : inputs) result["inputs"].push_back(*values_.at(input));
 
     // Entrypoints retain a call path into the shared layout instead of duplicating nested templates.
@@ -972,19 +756,11 @@ void TemplateLibrary::add_instances(const nlohmann::json & instances) {
 }
 
 nlohmann::json TemplateLibrary::document() && {
-    nlohmann::json catalog{
-        {        "definitions",        std::vector<nlohmann::json>(definitions_.size()) },
-        {            "layouts",            std::vector<nlohmann::json>(layouts_.size()) },
-        { "execution_patterns", std::vector<nlohmann::json>(execution_patterns_.size()) }
-    };
-    for (const auto & [definition, identity] : definitions_) catalog["definitions"][identity] = definition;
-    for (const auto & [layout, identity] : layouts_) catalog["layouts"][identity] = layout;
-    for (const auto & [pattern, identity] : execution_patterns_) catalog["execution_patterns"][identity] = pattern;
-
     return {
-        {   "scope", "hierarchical_source_templates" },
-        { "catalog",              std::move(catalog) },
-        {   "roles",               std::move(roles_) }
+        {   "scope",                                                                                 "hierarchical_source_templates"                    },
+        { "catalog",
+         { { "definitions", take_table(definitions_) }, { "layouts", take_table(layouts_) }, { "execution_patterns", take_table(execution_patterns_) } } },
+        {   "roles",                                                                                                                   std::move(roles_) }
     };
 }
 
