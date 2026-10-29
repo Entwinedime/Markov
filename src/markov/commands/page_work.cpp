@@ -33,6 +33,19 @@ Json preparation_report(const planning::ComputeStats & stats) {
     return report;
 }
 
+Json frame_ports_report(const planning::ComputeStats & stats, const simulation::ExecutionResult & execution) {
+    auto report = Json::array();
+    for (const auto & frame : stats.frames) {
+        report.push_back({
+            {              "source_frame",                                                                 frame.source_frame },
+            {                "entered_ns",              frame.entry ? Json(execution.starts_ns[*frame.entry]) : Json(nullptr) },
+            {       "caller_submitted_ns", frame.submitted ? Json(execution.completions_ns[*frame.submitted]) : Json(nullptr) },
+            { "modeled_work_completed_ns", frame.completed ? Json(execution.completions_ns[*frame.completed]) : Json(nullptr) }
+        });
+    }
+    return report;
+}
+
 Json kernel_cache_report(const planning::PreparationCache & cache) {
     return {
         {                   "initial_state", cache.initial() ? Json(*cache.initial() == planning::KernelCacheInitial::Empty ? "empty" : "prepared") : Json(nullptr) },
@@ -238,7 +251,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
          "Inter-call CPU uses corrected source residual approximations for the same caller recipe; known waits require explicit dependencies. "
          "Partial request ports exclude query/admission, collective envelope CPU, other cross-stream dependencies and client pacing. "
-         "Response currently follows selected compute completion; native overlap/result handoff is not implemented. "
+         "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
+         "Response still follows all selected compute completion; result-copy and result-processing handoff remains unmodeled. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
     const auto & compute = program.compute_stats();
@@ -257,6 +271,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {  "dispatch_delays",   compute.dispatch_delays },
         {  "source_cpu_gaps",   compute.source_cpu_gaps }
     };
+    report["native_call_execution"]["frames"] = frame_ports_report(compute, result.execution);
     if (const auto * storage = program.storage()) {
         const auto & stats = storage->stats();
         const auto & config = *settings.storage;

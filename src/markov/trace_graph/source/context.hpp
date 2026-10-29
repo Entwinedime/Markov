@@ -45,6 +45,7 @@ public:
     simulation::ExecutionResult replay() const;
     std::span<const Index> frame_operations(Index frame) const { return frame_operations_[frame]; }
     std::span<const Index> request_frames(std::string_view request) const;
+    const BatchResult * frame_result(Index frame) const;
     const DeviceService & device_service(Index work) const { return device_services_[work]; }
     const CpuInterval & cpu_work_interval(Index work) const { return cpu_work_intervals_[work]; }
     const std::optional<planning::CallResources> & compute_resources(Index work) const { return compute_resources_[work]; }
@@ -75,6 +76,7 @@ private:
     Time origin_ns_;
     std::vector<std::vector<Index>> frame_operations_;
     std::map<std::string, std::vector<Index>, std::less<>> request_frames_;
+    std::vector<std::optional<Index>> frame_results_;
     std::vector<DeviceService> device_services_;
     std::vector<CpuInterval> cpu_work_intervals_;
     std::vector<std::optional<planning::CallResources>> compute_resources_;

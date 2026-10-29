@@ -5,6 +5,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,12 @@ SourceContext::SourceContext(Observations && observations)
     for (auto & calls : frame_collectives_) std::ranges::sort(calls, {}, [&](Index id) { return observations_.collectives[id].begin_ns; });
     for (Index frame = 0; frame < observations_.compute_frames.size(); ++frame) {
         for (const auto request : observations_.compute_frames[frame].requests) request_frames_[observations_.names[request]].push_back(frame);
+    }
+    frame_results_.resize(observations_.compute_frames.size());
+    for (Index id = 0; id < observations_.batch_results.size(); ++id) {
+        auto & result = frame_results_.at(observations_.batch_results[id].frame);
+        if (result) throw std::runtime_error("Multiple batch results refer to one compute frame");
+        result = id;
     }
     device_services_ = bind_device_services(observations_, graph_);
     index_cpu_intervals();
@@ -177,6 +184,11 @@ void SourceContext::index_cpu_intervals() {
 std::span<const Index> SourceContext::request_frames(std::string_view request) const {
     const auto found = request_frames_.find(request);
     return found == request_frames_.end() ? std::span<const Index>{} : found->second;
+}
+
+const BatchResult * SourceContext::frame_result(Index frame) const {
+    const auto result = frame_results_[frame];
+    return result ? &observations_.batch_results[*result] : nullptr;
 }
 
 void SourceContext::index_compute_queues() {

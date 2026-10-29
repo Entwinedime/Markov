@@ -208,11 +208,10 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
-    compute(runtime, Phase::Prefill);
+    compute(runtime);
 }
 
-void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
-    phase_ = phase;
+void CacheProgram::compute(ProgramRuntime & runtime) {
     const auto & observed = source_.observations();
     const auto & request = observed.requests[request_];
     const auto frames = source_.request_frames(request.identity);
@@ -220,27 +219,25 @@ void CacheProgram::compute(ProgramRuntime & runtime, Phase phase) {
         issue_ = "missing_compute_frames";
         return;
     }
+    if (std::ranges::none_of(frames, [&](source::Index frame) { return observed.compute_frames[frame].phase == Phase::Prefill; })) {
+        issue_ = "missing_prefill_frame";
+        return;
+    }
     const auto & tokens = observed.request_tokens.at(request.identity);
     std::vector<FrameCompute> plans;
     plans.reserve(frames.size());
     for (const auto frame_id : frames) {
         const auto & frame = observed.compute_frames[frame_id];
-        if (frame.phase != phase) continue;
         if (frame.requests.size() != 1 || frame.sequence_tokens.size() != 1 || !frame.query_tokens || frame.query_tokens->size() != 1) {
             issue_ = "unsupported_compute_frame";
             return;
         }
-        const double query = phase == Phase::Prefill ? requests_[request_].prefill_tokens : frame.query_tokens->front();
-        const double context = phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
+        const double query = frame.phase == Phase::Prefill ? requests_[request_].prefill_tokens : frame.query_tokens->front();
+        const double context = frame.phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
         const FrameInput variables{ query, query, context, 1, static_cast<double>(page_tokens_), requests_[request_].device_pages_allocated_since_return };
         plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
 
-    if (plans.empty()) {
-        if (phase == Phase::Prefill) issue_ = "missing_prefill_frame";
-        else commit(runtime);
-        return;
-    }
     compute_.emplace(source_, std::move(plans), compute_resource_begin(), preparations_);
     if (compute_->issue()) {
         issue_ = compute_->issue();
@@ -284,8 +281,7 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
             compute_stats_.add(compute_->stats());
             compute_.reset();
             cause_ = event.identity;
-            if (phase_ == Phase::Prefill) compute(runtime, Phase::Decode);
-            else commit(runtime);
+            commit(runtime);
         }
         return;
     }

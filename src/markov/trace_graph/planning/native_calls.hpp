@@ -9,6 +9,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -108,13 +109,17 @@ struct CallResources {
     bool operator==(const CallResources &) const = default;
 };
 
+using NativeFrontier = std::map<std::size_t, graph::NodeId>;
+
 class NativePlan {
 public:
     // Ordered tensor work may change device streams while retaining its
     // producer frontier. Caller/worker ownership remains with the same queues.
     bool extend(std::span<const NativeCall> calls, CallResources resources, PreparationCache & preparations);
     void source_cpu_gap(std::size_t interval, std::size_t caller);
-    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause) const;
+    PlannedMutation mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause,
+                             const NativeFrontier & preceding, std::optional<simulation::Action> submitted = std::nullopt) const;
+    NativeFrontier frontier(graph::NodeId begin) const;
     std::size_t operations() const { return steps_.size(); }
     std::size_t delays() const;
     std::optional<std::size_t> producer_device() const { return device_ ? std::optional(device_->device) : std::nullopt; }
@@ -134,6 +139,7 @@ private:
     };
     std::vector<Step> steps_;
     std::vector<graph::Edge> edges_;
+    std::vector<std::pair<graph::NodeId, std::size_t>> preceding_waits_;
     std::optional<graph::NodeId> caller_, worker_;
     struct DeviceProducer {
         graph::NodeId completion;

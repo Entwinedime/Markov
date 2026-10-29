@@ -72,7 +72,7 @@ private:
     void advance(ProgramRuntime & runtime);
     void begin_request(ProgramRuntime & runtime, bool drain);
     void respond(ProgramRuntime & runtime);
-    void compute(ProgramRuntime & runtime, Phase phase);
+    void compute(ProgramRuntime & runtime);
     void commit(ProgramRuntime & runtime);
     bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
     bool make_host_room(std::size_t pages);
@@ -99,7 +99,6 @@ private:
     std::optional<graph::NodeId> cause_;
     std::size_t request_ = 0;
     std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evictions_ = 0;
-    Phase phase_ = Phase::Prefill;
     RequestStage request_stage_ = RequestStage::BeforeStart;
     bool waiting_ = false;
     bool eviction_wait_ = false;

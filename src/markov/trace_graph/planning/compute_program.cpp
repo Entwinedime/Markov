@@ -20,6 +20,7 @@ void ComputeStats::add(const ComputeStats & other) {
     native_operations += other.native_operations;
     dispatch_delays += other.dispatch_delays;
     source_cpu_gaps += other.source_cpu_gaps;
+    frames.insert(frames.end(), other.frames.begin(), other.frames.end());
     participant_wait_ns += other.participant_wait_ns;
     maximum_arrival_span_ns = std::max(maximum_arrival_span_ns, other.maximum_arrival_span_ns);
 }
@@ -104,6 +105,10 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         }
         frames_.push_back({});
         auto & frame = frames_.back();
+        const auto * result = source.frame_result(input.frame);
+        // shortcut: targets inherit source scheduling; require a target policy before supporting mode changes.
+        frame.overlap = result && result->overlap;
+        stats_.frames.push_back({ input.frame, {}, {}, {} });
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
             return;
@@ -210,7 +215,11 @@ void ComputeProgram::start(ProgramRuntime & runtime, std::optional<graph::NodeId
 void ComputeProgram::segment(ProgramRuntime & runtime, std::size_t id, std::optional<graph::NodeId> cause) {
     const auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
-    if (runtime.submit(range.plan.mutation(owner, runtime.next_node(), action(ActionKind::SegmentDone, id), cause))) {
+    const auto begin = runtime.next_node();
+    const auto submitted = !range.collective ? std::optional(action(ActionKind::FrameSubmitted, id)) : std::nullopt;
+    if (runtime.submit(range.plan.mutation(owner, begin, action(ActionKind::SegmentDone, id), cause, frontier_, submitted))) {
+        if (frame.at == 0) stats_.frames[id].entry = begin;
+        for (const auto & [resource, node] : range.plan.frontier(begin)) frontier_[resource] = node;
         stats_.add(range.stats);
         stats_.native_operations += range.plan.operations();
         stats_.dispatch_delays += range.plan.delays();
@@ -221,15 +230,14 @@ void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simu
     auto & frame = frames_[id];
     const auto & range = frame.segments[frame.at];
     if (!range.collective) {
-        if (frame.next) segment(runtime, *frame.next, event.identity);
-        else {
-            completed_.push_back(event.identity);
-            if (completed_.size() == roots_.size()) {
-                const auto end = runtime.next_node();
-                PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
-                for (const auto node : completed_) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
-                runtime.submit(std::move(mutation));
-            }
+        stats_.frames[id].completed = event.identity;
+        if (!frame.overlap && frame.next) segment(runtime, *frame.next, event.identity);
+        completed_.push_back(event.identity);
+        if (completed_.size() == frames_.size()) {
+            const auto end = runtime.next_node();
+            PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Complete, 0) } }, {} };
+            for (const auto node : completed_) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
+            runtime.submit(std::move(mutation));
         }
         return;
     }
@@ -267,6 +275,11 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
             ++frames_[*peer].at;
             segment(runtime, *peer, event.identity);
         }
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::FrameSubmitted)) {
+        const auto id = event.action.subject;
+        stats_.frames[id].submitted = event.identity;
+        if (frames_[id].overlap && frames_[id].next) segment(runtime, *frames_[id].next, event.identity);
     }
     else complete_ = true;
 }

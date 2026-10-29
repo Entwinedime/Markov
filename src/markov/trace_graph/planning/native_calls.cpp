@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -91,6 +92,8 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
             const auto ready = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);
             depend(device_ ? std::optional(device_->completion) : std::nullopt, ready);
             depend(worker_, ready);
+            preceding_waits_.emplace_back(ready, resources.worker);
+            preceding_waits_.emplace_back(ready, resources.device);
             append(returned, "post_sync_readback_interval", resources.caller, caller_);
             continue;
         }
@@ -116,6 +119,7 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
             const auto & transfer = call.host_transfer.value();
             const auto copied = append(transfer, transfer.kind.timing_scope.c_str(), resources.worker, worker_);
             depend(device_ ? std::optional(device_->completion) : std::nullopt, copied);
+            preceding_waits_.emplace_back(copied, device);
 
             // Synchronous host copies produce device data without issuing a
             // device task. Keep its location separate from the executing CPU.
@@ -147,11 +151,24 @@ std::size_t NativePlan::delays() const {
     return std::ranges::count_if(steps_, [](const Step & step) { return step.delay && std::holds_alternative<Work>(step.cost); });
 }
 
-PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion,
-                                     std::optional<graph::NodeId> cause) const {
+NativeFrontier NativePlan::frontier(graph::NodeId begin) const {
+    NativeFrontier result;
+    for (std::size_t id = 0; id < steps_.size(); ++id) result[steps_[id].resource] = begin + id;
+    return result;
+}
+
+PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId begin, simulation::Action completion, std::optional<graph::NodeId> cause,
+                                     const NativeFrontier & preceding, std::optional<simulation::Action> submitted) const {
     PlannedMutation result{ owner, {}, {} };
     std::vector<bool> has_input(steps_.size(), false);
+    std::set<std::size_t> linked;
     for (const auto & step : steps_) {
+        // Readiness alone does not preserve FIFO while earlier work is blocked.
+        if (linked.insert(step.resource).second) {
+            const auto previous = preceding.find(step.resource);
+            if (previous != preceding.end())
+                result.dependencies.push_back({ previous->second, begin + result.operations.size(), graph::EdgeKind::ResourceOrder });
+        }
         if (const auto * work = std::get_if<Work>(&step.cost))
             result.operations.push_back({ step.resource, std::cref(*work), std::nullopt, step.delay, step.source_operation, step.source_native_work });
         else result.operations.push_back({ step.resource, std::get<SourceCpuGap>(step.cost), std::nullopt, true });
@@ -160,14 +177,28 @@ PlannedMutation NativePlan::mutation(simulation::Component owner, graph::NodeId 
         result.dependencies.push_back({ begin + edge.from, begin + edge.to, edge.kind });
         has_input[edge.to] = true;
     }
+    // A synchronous read can consume the preceding queue before this segment
+    // has submitted any work of its own to that queue.
+    for (const auto & [node, resource] : preceding_waits_) {
+        const auto previous = preceding.find(resource);
+        if (previous != preceding.end()) result.dependencies.push_back({ previous->second, begin + node, graph::EdgeKind::Synchronization });
+    }
     for (std::size_t id = 0; id < has_input.size(); ++id)
         if (cause && !has_input[id]) result.dependencies.push_back({ *cause, begin + id, graph::EdgeKind::DataDependency });
 
-    const auto end = begin + steps_.size();
+    std::optional<graph::NodeId> caller_submitted;
+    if (submitted) {
+        caller_submitted = begin + result.operations.size();
+        result.operations.push_back({ caller_ ? steps_[*caller_].resource : 0, Boundary{}, *submitted });
+        if (caller_) result.dependencies.push_back({ begin + *caller_, *caller_submitted, graph::EdgeKind::DataDependency });
+        else if (cause) result.dependencies.push_back({ *cause, *caller_submitted, graph::EdgeKind::DataDependency });
+    }
+    const auto end = begin + result.operations.size();
     result.operations.push_back({ 0, Boundary{}, completion });
     for (const auto tail : { caller_, worker_, device_ ? std::optional(device_->completion) : std::nullopt })
         if (tail) result.dependencies.push_back({ begin + *tail, end, graph::EdgeKind::DataDependency });
     if (steps_.empty() && cause) result.dependencies.push_back({ *cause, end, graph::EdgeKind::DataDependency });
+    if (caller_submitted) result.dependencies.push_back({ *caller_submitted, end, graph::EdgeKind::DataDependency });
     return result;
 }
 

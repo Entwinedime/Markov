@@ -24,16 +24,22 @@ struct ComputeStats {
     struct Preparation {
         std::size_t sequences = 0, operations = 0;
     };
+    struct FramePorts {
+        source::Index source_frame;
+        std::optional<graph::NodeId> entry, submitted, completed;
+    };
     std::size_t collective_services = 0, participant_arrivals = 0;
     std::size_t compute_calls = 0, compute_services = 0;
     std::size_t native_operations = 0, dispatch_delays = 0, source_cpu_gaps = 0;
     std::map<std::string, Preparation> preparations;
+    std::vector<FramePorts> frames;
     graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
     void add(const ComputeStats & other);
 };
 
 // Native blocking tensor collectives fence the known work on each participant.
 // Arrivals, the shared completion service and subsequent compute use one clock.
+// Observed overlap releases the next caller while retaining queue dependencies.
 class ComputeProgram final : public Program {
 public:
     static constexpr simulation::Component owner = 2;
@@ -49,7 +55,7 @@ public:
     const ComputeStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, Complete };
+    enum class ActionKind : std::uint32_t { SegmentDone, CollectiveDone, FrameSubmitted, Complete };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Segment {
@@ -62,6 +68,7 @@ private:
         std::vector<Segment> segments;
         std::size_t at = 0;
         std::optional<std::size_t> next;
+        bool overlap = false;
     };
     struct Arrival {
         graph::Time time_ns;
@@ -85,6 +92,7 @@ private:
     std::vector<Collective> collectives_;
     std::vector<std::size_t> roots_;
     std::vector<graph::NodeId> completed_;
+    NativeFrontier frontier_;
     std::optional<std::string> issue_;
     ComputeStats stats_;
     bool complete_ = false;
