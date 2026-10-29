@@ -162,6 +162,34 @@ struct ObservedCollective {
     planning::RowBinding rows;
 };
 
+struct ResultCopy {
+    ObservedRegion region;
+    std::vector<Index> token_shape;
+    std::string token_dtype, token_device;
+    Index token_bytes;
+    bool additional_outputs;
+};
+
+struct ProcessedResult {
+    ObservedRegion region;
+    std::vector<Index> output_tokens_before, output_tokens_after;
+    std::vector<bool> finished_before, finished_after;
+};
+
+struct ResultSend {
+    ObservedRegion region;
+    std::vector<Index> requests;
+};
+
+struct BatchResult {
+    Index frame;
+    ObservedRegion run;
+    bool overlap;
+    std::optional<ResultCopy> copy;
+    std::optional<ProcessedResult> processed;
+    std::vector<ResultSend> final_sends;
+};
+
 enum class TokenRole { LookupInput, Prompt, Committed };
 
 struct TokenObservation {
@@ -209,6 +237,7 @@ public:
     std::vector<ComputeFrame> compute_frames;
     std::vector<CollectiveGroup> collective_groups;
     std::vector<ObservedCollective> collectives;
+    std::vector<BatchResult> batch_results;
     planning::TokenPaths token_paths;
     std::map<std::string, RequestTokens> request_tokens;
     std::map<std::string, std::size_t> counts;

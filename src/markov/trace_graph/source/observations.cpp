@@ -51,6 +51,12 @@ void Observations::normalize_resources() {
     for (auto & call : native_runtime_calls) call.region.resource = canonical_resource(call.region.resource);
     for (auto & frame : compute_frames)
         for (auto & call : frame.preparations) call.region.resource = canonical_resource(call.region.resource);
+    for (auto & result : batch_results) {
+        result.run.resource = canonical_resource(result.run.resource);
+        if (result.copy) result.copy->region.resource = canonical_resource(result.copy->region.resource);
+        if (result.processed) result.processed->region.resource = canonical_resource(result.processed->region.resource);
+        for (auto & send : result.final_sends) send.region.resource = canonical_resource(send.region.resource);
+    }
 }
 
 Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe, std::string caller,

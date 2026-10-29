@@ -77,6 +77,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
+    observe_result(event);
     if (name == "runtime.phase.batch_inputs" && args.at("status") == "returned") {
         const auto context = read_input_context(args);
         std::vector<Index> requests;
@@ -271,6 +272,10 @@ void ProbeReader::observe(const ProbeEvent & event) {
 }
 
 void ProbeReader::finish() {
+    output_.counts["result_copy_without_batch_run"] += result_copies_.size();
+    output_.counts["result_send_without_processing"] += result_sends_.size();
+    result_copies_.clear();
+    result_sends_.clear();
     // Sidecars may follow the main probe file; qualify after every input is read.
     for (const auto & pending : pending_inputs_) {
         auto & frame = output_.compute_frames[pending.frame];
@@ -296,6 +301,99 @@ void ProbeReader::finish() {
     }
     pending_inputs_.clear();
     schedule_inputs_.clear();
+}
+
+void ProbeReader::observe_result(const ProbeEvent & event) {
+    const auto & args = event.args;
+    const bool run = event.name == "runtime.request.batch_run";
+    const bool copy = event.name == "runtime.response.copy_to_cpu";
+    const bool processed = event.name == "runtime.response.process_result";
+    const bool sent = event.name == "runtime.response.scheduler_send";
+    if ((!run && !copy && !processed && !sent) || args.value("status", "returned") != "returned") return;
+    if (!args.contains("batch_id") || args.at("batch_id").is_null()) {
+        if (!sent) ++output_.counts["result_without_batch_identity"];
+        return;
+    }
+
+    const BatchIdentity identity{ event.process, args.at("batch_id").get<Index>() };
+    const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    const ObservedRegion region{ resource, event.begin_ns, event.end_ns, event.record };
+    // These are semantic ports, not additional parent CPU service charges.
+    const auto name = output_.name(event.name);
+    output_.point({ event.begin_ns, resource, name, event.record });
+    output_.point({ event.end_ns, resource, name, event.record });
+    if (copy) {
+        ResultCopy value{ region,
+                          args.at("token_shape").get<std::vector<Index>>(),
+                          args.at("token_dtype").get<std::string>(),
+                          args.at("token_device").get<std::string>(),
+                          args.at("token_bytes").get<Index>(),
+                          args.at("return_logprob").get<bool>() || args.at("return_hidden_states").get<bool>() || args.at("additional_outputs").get<bool>() };
+        const auto batch = batch_results_.find(identity);
+        if (batch != batch_results_.end()) {
+            auto & target = output_.batch_results[batch->second].copy;
+            if (target) throw std::runtime_error("Duplicate result copy for one batch");
+            target = std::move(value);
+        }
+        else if (!result_copies_.emplace(identity, std::move(value)).second) throw std::runtime_error("Duplicate result copy for one batch");
+        return;
+    }
+    if (sent) {
+        std::vector<Index> requests;
+        for (const auto & request : args.at("request_ids")) requests.push_back(output_.name(request.get<std::string>()));
+        result_sends_[identity].push_back({ region, std::move(requests) });
+        return;
+    }
+    if (run) {
+        const auto frame = forward_frames_.find(event.process);
+        if (frame == forward_frames_.end() || args.at("phase") == "other") {
+            ++output_.counts["result_without_compute_frame"];
+            return;
+        }
+        const auto & observed = output_.compute_frames[frame->second];
+        const auto requests = args.at("request_ids").get<std::vector<std::string>>();
+        if (observed.requests.size() != requests.size()) throw std::runtime_error("Result batch and compute frame have different requests");
+        for (Index id = 0; id < requests.size(); ++id)
+            if (output_.names[observed.requests[id]] != requests[id]) throw std::runtime_error("Result batch and compute frame identities disagree");
+
+        BatchResult value{ frame->second, region, args.at("overlap").get<bool>(), {}, {}, {} };
+        const auto copied = result_copies_.find(identity);
+        if (copied != result_copies_.end()) {
+            value.copy = std::move(copied->second);
+            result_copies_.erase(copied);
+        }
+        if (!batch_results_.emplace(identity, output_.batch_results.size()).second) throw std::runtime_error("Duplicate result batch identity");
+        output_.batch_results.push_back(std::move(value));
+        return;
+    }
+
+    const auto batch = batch_results_.find(identity);
+    if (batch == batch_results_.end()) {
+        ++output_.counts["processed_result_without_batch_run"];
+        return;
+    }
+    auto & value = output_.batch_results[batch->second];
+    const auto & requests = output_.compute_frames[value.frame].requests;
+    const auto identities = args.at("request_ids").get<std::vector<std::string>>();
+    ProcessedResult result{ region,
+                            args.at("output_tokens_before").get<std::vector<Index>>(),
+                            args.at("output_tokens_after").get<std::vector<Index>>(),
+                            args.at("finished_before").get<std::vector<bool>>(),
+                            args.at("finished_after").get<std::vector<bool>>() };
+    if (value.processed || identities.size() != requests.size() || result.output_tokens_before.size() != requests.size()
+        || result.output_tokens_after.size() != requests.size() || result.finished_before.size() != requests.size()
+        || result.finished_after.size() != requests.size())
+        throw std::runtime_error("Processed result dimensions or identity are invalid");
+    for (Index id = 0; id < requests.size(); ++id)
+        if (output_.names[requests[id]] != identities[id] || result.output_tokens_after[id] < result.output_tokens_before[id])
+            throw std::runtime_error("Processed result changed request order or removed output tokens");
+
+    value.processed = std::move(result);
+    const auto final_send = result_sends_.find(identity);
+    if (final_send != result_sends_.end()) {
+        value.final_sends = std::move(final_send->second);
+        result_sends_.erase(final_send);
+    }
 }
 
 void ProbeReader::observe_collective(const ProbeEvent & event) {

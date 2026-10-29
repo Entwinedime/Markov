@@ -220,6 +220,9 @@ class Capture:
             "runtime.hicache.extend_allocation",
             "runtime.phase.forward_input_boundary",
             "runtime.phase.attention_metadata",
+            "runtime.request.batch_run",
+            "runtime.response.copy_to_cpu",
+            "runtime.response.process_result",
         }
         ports = {name: Counter() for name in ("runtime.request.socket_received", "runtime.response.scheduler_send")}
         expected = {row["logical_request_id"] for row in self.rows}

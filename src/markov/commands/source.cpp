@@ -479,6 +479,56 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
             {     "page_tokens",   frame.page_tokens ? Json(*frame.page_tokens) : Json(nullptr) }
         });
     }
+    const auto region_json = [](const source::ObservedRegion & region) -> Json {
+        return {
+            { "resource",        region.resource },
+            { "begin_ns",        region.begin_ns },
+            {   "end_ns",          region.end_ns },
+            {     "file",     region.record.file },
+            {   "record", region.record.position }
+        };
+    };
+    auto results = Json::array();
+    for (const auto & result : captured.batch_results) {
+        Json value{
+            {       "frame",            result.frame },
+            {         "run", region_json(result.run) },
+            {     "overlap",          result.overlap },
+            {        "copy",                 nullptr },
+            {   "processed",                 nullptr },
+            { "final_sends",           Json::array() }
+        };
+        if (result.copy) {
+            const auto & copy = *result.copy;
+            value["copy"] = {
+                {             "region", region_json(copy.region) },
+                {        "token_shape",         copy.token_shape },
+                {        "token_dtype",         copy.token_dtype },
+                {       "token_device",        copy.token_device },
+                {        "token_bytes",         copy.token_bytes },
+                { "additional_outputs",  copy.additional_outputs }
+            };
+        }
+        if (result.processed) {
+            const auto & processed = *result.processed;
+            value["processed"] = {
+                {               "region",  region_json(processed.region) },
+                { "output_tokens_before", processed.output_tokens_before },
+                {  "output_tokens_after",  processed.output_tokens_after },
+                {      "finished_before",      processed.finished_before },
+                {       "finished_after",       processed.finished_after }
+            };
+        }
+        for (const auto & send : result.final_sends) {
+            auto requests = Json::array();
+            for (const auto request : send.requests) requests.push_back(captured.names[request]);
+            value["final_sends"].push_back({
+                {   "region", region_json(send.region) },
+                { "requests",      std::move(requests) }
+            });
+        }
+        results.push_back(std::move(value));
+    }
     auto groups = Json::array();
     for (const auto & group : captured.collective_groups)
         groups.push_back({
@@ -533,6 +583,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {              "work_descriptions",                                                                                             std::move(work_descriptions) },
         {         "work_description_scope",                                                                                         "observed_compute_recipe_subset" },
         {                 "compute_frames",                                                                                                        std::move(frames) },
+        {                  "batch_results",                                                                                                       std::move(results) },
         {              "collective_groups",                                                                                                        std::move(groups) },
         {        "collective_observations",                                                                                              std::move(collective_calls) },
         {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
