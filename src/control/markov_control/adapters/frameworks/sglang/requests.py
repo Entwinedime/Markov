@@ -10,9 +10,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class RequestInput:
-    def __init__(self, peer: ControlPeer, vocab_size: int) -> None:
+    def __init__(self, peer: ControlPeer, vocab_size: int, bootstrap: tuple[str, int] | None) -> None:
         self.peer = peer
         self.vocab_size = vocab_size
+        self.bootstrap = bootstrap
         self.arrivals = None
 
     def recv_pyobj(self, flags):
@@ -49,6 +50,9 @@ class RequestInput:
             top_logprobs_num=0,
             token_ids_logprob=None,
             stream=True,
+            bootstrap_host=self.bootstrap[0] if self.bootstrap else None,
+            bootstrap_port=self.bootstrap[1] if self.bootstrap else None,
+            bootstrap_room=request["request"] + 1 if self.bootstrap else None,
         )
 
 

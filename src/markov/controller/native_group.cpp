@@ -7,11 +7,12 @@
 
 namespace markov {
 
-NativeGroup::NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage)
+NativeGroup::NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role)
     : requests_(requests),
       resources_(resources),
       group_(std::move(group)),
-      stage_(stage) {}
+      stage_(stage),
+      role_(role) {}
 
 void NativeGroup::begin_iteration(std::size_t flow, std::size_t lane) {
     if (const auto previous = lanes_.find(lane); previous != lanes_.end()) {
@@ -25,10 +26,31 @@ void NativeGroup::begin_iteration(std::size_t flow, std::size_t lane) {
 
 std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, std::int64_t now_ns, std::size_t delivered) {
     const auto kind = message.at("kind").get<std::string>();
-    if (kind == "capacity" || kind == "free_slots" || kind == "slots" || kind == "allocate" || kind == "release_pages" || kind == "release_work")
+    if (kind == "declare_slots" || kind == "capacity" || kind == "free_slots" || kind == "slots" || kind == "allocate" || kind == "reserve_pages"
+        || kind == "prebuilt" || kind == "release_pages" || kind == "release_work")
         return std::nullopt;
     const auto flow = message.at("flow").get<std::size_t>();
     const auto lane = message.at("lane").get<std::size_t>();
+    if (kind == "reserve" || kind == "received") {
+        const auto request = message.at("request").get<std::size_t>();
+        std::shared_ptr<const BatchWork> work;
+        if (kind == "reserve") work = reservations_.at(request);
+        else {
+            const auto slot = message.at("metadata_slot").get<std::int64_t>();
+            if (slot < 0) throw std::invalid_argument("native receive requires an allocated metadata slot");
+            auto batch = resident_batch(nlohmann::json::array({ request }), delivered);
+            batch.phase = Phase::Prefill;
+            batch.members.front().new_tokens = batch.members.front().context_tokens;
+            batch.members.front().context_tokens = 0;
+            auto received = std::make_shared<BatchWork>(std::move(batch), BatchEffects{});
+            received->metadata_slots.emplace(request, static_cast<std::size_t>(slot));
+            work = std::move(received);
+        }
+        return ServingAction{
+            { group_, sequence_ },
+            std::move(work), now_ns, flow, lane, std::nullopt, kind == "reserve" ? ServingStep::Reserve : ServingStep::Receive
+        };
+    }
     const auto frame = frames_.find(flow);
     const bool preparing = frame == frames_.end() || frame->second.next == ServingStep::Prepare;
     if (kind == "select" || (kind == "release_request" && preparing)) {
@@ -51,7 +73,7 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
             now_ns,
             flow,
             lane,
-            stage_,
+            kind == "select" ? std::optional(stage_) : std::nullopt,
             kind == "select" ? ServingStep::Select : ServingStep::Release
         };
     }
@@ -63,7 +85,8 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
         {     "receive",    ServingStep::Receive },
         {        "wait",       ServingStep::Wait },
         { "read_result", ServingStep::ReadResult },
-        {      "result",     ServingStep::Result }
+        {      "result",     ServingStep::Result },
+        {      "accept",     ServingStep::Accept }
     };
     const auto step = steps.at(kind);
     auto & current = frames_.at(flow);
@@ -71,22 +94,42 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
     if (lane != current.lane || (!message_step && step != current.next))
         throw std::invalid_argument("native work does not follow its own preparation/model/read completion");
     auto work = current.work;
-    if (step == ServingStep::Result) work = std::make_shared<BatchWork>(current.work->batch, result_effects(current, message.at("members")));
+    if (step == ServingStep::Result || step == ServingStep::Accept) {
+        auto result = std::make_shared<BatchWork>(current.work->batch, result_effects(current, message.at("members")));
+        if (role_ == NativeRole::Prefill) {
+            for (const auto & member : message.at("members")) {
+                const auto slot = member.at("metadata_slot").get<std::int64_t>();
+                if (slot < 0) throw std::invalid_argument("native handoff requires an allocated metadata slot");
+                result->metadata_slots.emplace(member.at("request").get<std::size_t>(), static_cast<std::size_t>(slot));
+            }
+        }
+        work = std::move(result);
+    }
     return ServingAction{
         { group_, sequence_ },
-        std::move(work), now_ns, flow, lane, stage_, step, message_step ? message.at("channel").get<std::string>() : std::string{}
+        std::move(work),
+        now_ns,
+        flow,
+        lane,
+        step == ServingStep::Accept ? std::nullopt : std::optional(stage_),
+        step,
+        message_step ? message.at("channel").get<std::string>() : std::string{}
     };
 }
 
 nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::size_t delivered) {
     const auto kind = message.at("kind").get<std::string>();
+    if (kind == "declare_slots") {
+        resources_.declare_slots(message.at("slots").get<std::size_t>());
+        return nullptr;
+    }
     if (kind == "free_slots") return resources_.free_slots();
     if (kind == "capacity")
         return {
             { "slots", resources_.free_slots().size() },
             { "pages", resources_.free_pages().size() }
         };
-    if (kind == "slots" || kind == "allocate") {
+    if (kind == "slots" || kind == "allocate" || kind == "reserve_pages") {
         if (kind == "allocate" && frames_.contains(message.at("flow").get<std::size_t>()))
             throw std::invalid_argument("native allocation replaced a live work snapshot");
         std::vector<KvDemand> demands;
@@ -102,6 +145,8 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
         const auto name = kind == "slots" ? "prefill" : message.at("phase").get<std::string>();
         if (name != "prefill" && name != "decode") throw std::invalid_argument("unknown native allocation phase: " + name);
         const auto phase = name == "prefill" ? Phase::Prefill : Phase::Decode;
+        if (kind == "reserve_pages" && (demands.size() != 1 || reservations_.contains(demands.front().request)))
+            throw std::invalid_argument("native reservation requires one new request");
         auto allocation = resources_.plan(phase, demands);
         resources_.reserve(allocation);
         auto bindings = nlohmann::json::array();
@@ -116,7 +161,31 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
             const auto lane = message.at("lane").get<std::size_t>();
             frames_.emplace(flow, Frame{ std::make_shared<BatchWork>(std::move(allocation), BatchEffects{}), lane, ServingStep::Prepare, {}, {}, {} });
         }
+        if (kind == "reserve_pages") {
+            const auto request = allocation.members.front().request;
+            reservations_.emplace(request, std::make_shared<const BatchWork>(std::move(allocation), BatchEffects{}));
+        }
         return bindings;
+    }
+    if (kind == "prebuilt") {
+        auto batch = resident_batch(message.at("requests"), delivered);
+        batch.phase = Phase::Prefill;
+        for (auto & member : batch.members) {
+            member.new_tokens = member.context_tokens;
+            member.context_tokens = 0;
+        }
+        const auto flow = message.at("flow").get<std::size_t>();
+        if (!frames_
+                 .emplace(flow,
+                          Frame{ std::make_shared<BatchWork>(std::move(batch), BatchEffects{}),
+                                 message.at("lane").get<std::size_t>(),
+                                 ServingStep::Accept,
+                                 {},
+                                 {},
+                                 {} })
+                 .second)
+            throw std::invalid_argument("native prebuilt replaced unfinished work");
+        return nullptr;
     }
     const auto found = frames_.find(message.at("flow").get<std::size_t>());
     if (kind == "release_work") {
@@ -125,7 +194,8 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
         if (frame.next == ServingStep::Batch && frame.messages.empty()) frames_.erase(found);
         return nullptr;
     }
-    Frame * result = found != frames_.end() && found->second.next == ServingStep::Result ? &found->second : nullptr;
+    Frame * result =
+        found != frames_.end() && (found->second.next == ServingStep::Result || found->second.next == ServingStep::Accept) ? &found->second : nullptr;
     if (kind == "release_request") {
         const auto identity = message.at("request").get<std::size_t>();
         if (result == nullptr || !resources_.residence(identity).slot || !result->released_requests.insert(identity).second)
@@ -168,7 +238,7 @@ BatchEffects NativeGroup::result_effects(const Frame & frame, const nlohmann::js
         const auto & request = requests_.at(member.request);
         const auto expected = member.context_tokens + member.new_tokens - request.prompt_tokens + 1;
         if (input.at("request") != member.request || generated <= 0 || generated > request.output_tokens || generated != expected
-            || finished != (generated == request.output_tokens) || finished != frame.released_requests.contains(member.request))
+            || finished != (role_ != NativeRole::Prefill && generated == request.output_tokens) || finished != frame.released_requests.contains(member.request))
             throw std::invalid_argument("native result does not match request progress or resource release");
         effects.members.push_back({ member.request,
                                     member.slot,
@@ -193,11 +263,19 @@ void NativeGroup::finish(const ServingAction & action, std::span<const std::size
     if (running_ != action.task) throw std::logic_error("native completion does not belong to the running work");
     running_.reset();
     if (action.step == ServingStep::Select) return;
+    if (action.step == ServingStep::Receive) return;
+    if (action.step == ServingStep::Reserve) {
+        const auto & member = action.work->batch.members.front();
+        resources_.advance(member.request, member.context_tokens + member.new_tokens);
+        reservations_.erase(member.request);
+        return;
+    }
     if (action.step == ServingStep::Release) {
         if (!std::ranges::equal(returned_pages, released_pages_)) throw std::invalid_argument("native retraction differs from release graph effects");
         resources_.release(action.work->batch.members.front().request);
         resources_.return_pages(returned_pages);
         released_pages_.clear();
+        if (role_ == NativeRole::Prefill) ++completed_;
         return;
     }
     auto & frame = frames_.at(action.flow);
@@ -210,7 +288,7 @@ void NativeGroup::finish(const ServingAction & action, std::span<const std::size
     else if (action.step == ServingStep::Wait) {
         if (frame.messages.erase(action.channel) != 1) throw std::invalid_argument("native wait has no matching send");
     }
-    else if (action.step == ServingStep::Result) {
+    else if (action.step == ServingStep::Result || action.step == ServingStep::Accept) {
 
         // Result effects belong to this work, even while another lane has already allocated or submitted.
         if (!std::ranges::equal(returned_pages, frame.released_pages)) throw std::invalid_argument("native releases differ from result graph effects");
@@ -230,7 +308,7 @@ void NativeGroup::finish(const ServingAction & action, std::span<const std::size
 }
 
 bool NativeGroup::done() const { return completed_ == requests_.size() && !running_; }
-bool NativeGroup::settled() const { return done() && frames_.empty(); }
+bool NativeGroup::settled() const { return done() && frames_.empty() && reservations_.empty(); }
 std::size_t NativeGroup::free_pages() const { return resources_.free_pages().size(); }
 
 } // namespace markov

@@ -12,19 +12,15 @@ class DisaggregatedTemplates:
         self.regions = source["regions"]
         self.values = source["values"]
         self.owners: list[int | None] = []
-        self.batches: list[int | None] = []
         for region in self.regions:
             parent = region["parent"]
             owner = self.owners[parent] if parent is not None else None
-            batch = self.batches[parent] if parent is not None else None
             if region["role"] in ("KvReserve", "BatchAccepted", "KvSend", "KvReceived"):
                 owner = region["id"]
             self.owners.append(owner)
-            self.batches.append(region["metadata"].get("batch", batch))
 
         self.operations: dict[int, list[dict[str, Any]]] = {}
         self.children: dict[int, list[dict[str, Any]]] = {}
-        self.request_maps: dict[int, int] = {}
         for operation in source["operations"]:
             owner = self.owners[operation["region"]]
             if owner is not None:
@@ -33,10 +29,6 @@ class DisaggregatedTemplates:
             owner = self.owners[region["id"]]
             if owner is not None:
                 self.children.setdefault(owner, []).append(region)
-            metadata = region["metadata"]
-            if metadata.get("entrypoint") == "request_cache_retain":
-                batch = self.batches[region["id"]]
-                self.request_maps[batch] = metadata["ports"]["inputs"]["request_map"]
 
     @classmethod
     def declare(cls, source: dict[str, Any]) -> None:
@@ -57,8 +49,10 @@ class DisaggregatedTemplates:
                 buffers[value["storage"]] = value
             if region["role"] == "KvReserve":
                 self.reserve(region)
-            elif region["role"] == "BatchAccepted":
-                self.accept(region)
+            elif region["role"] in ("BatchAccepted", "PrebuiltPart", "RequestOutput") and "entrypoint" in metadata:
+
+                # Empty admission polls remain observations, not callable template entries.
+                metadata["entrypoint_phase"] = None
             elif region["role"] in ("KvSend", "KvReceived"):
                 self.metadata_indices(region)
                 if region["role"] == "KvSend":
@@ -66,8 +60,6 @@ class DisaggregatedTemplates:
             elif region["role"] == "PrebuiltResult":
                 metadata.update(entrypoint="prebuilt_result", entrypoint_phase=None, dynamic_calls=True)
                 metadata["parameters"] = {"result_members": len(metadata["effects"])}
-            elif region["role"] == "RequestOutput":
-                metadata["entrypoint_phase"] = None
 
         for value in self.values:
             buffer = buffers.get(value["storage"])
@@ -83,7 +75,7 @@ class DisaggregatedTemplates:
         metadata["parameters"]["request_slot"] = metadata["slot"]
         metadata["guards"] = [
             {"condition": ["lt", 0, "request_slot"], "expected": True},
-            {"condition": ["le", "request_slot", "R"], "expected": True},
+            {"condition": ["le", "request_slot", "slot_capacity"], "expected": True},
         ]
         storage = self.values[metadata["ports"]["inputs"]["request_map"]]["storage"]
         for child in self.children[region["id"]]:
@@ -98,44 +90,6 @@ class DisaggregatedTemplates:
             relation = deepcopy(arguments)
             relation[1] = [{"scalar": "request_slot"}, {"slice": [0, {"scalar": "M"}, None]}]
             declaration["argument_relations"] = relation
-
-    def accept(self, region: dict[str, Any]) -> None:
-        metadata = region["metadata"]
-        batch = self.source["batches"][metadata["batch"]]
-        parameters = {**batch["parameters"], "M": sum(member["context_tokens"] for member in batch["members"])}
-        outputs = metadata["ports"]["outputs"]
-        outputs["request_map"] = self.request_maps[metadata["batch"]]
-        token_storage = self.values[outputs["token_relay"]]["storage"]
-        token_inputs = [
-            value
-            for operation in self.operations[region["id"]]
-            for identity in operation["inputs"]
-            if (value := self.values[identity])["storage"] == token_storage
-            and value["shape"] == self.values[outputs["token_relay"]]["shape"]
-        ]
-        token_input = min(token_inputs, key=lambda value: value["version"])["id"]
-        inputs = {
-            "request_map": outputs["request_map"],
-            "token_relay": token_input,
-            "free_pages": outputs["free_pages"],
-        }
-        parameters["free_pages_before"] = self.values[outputs["free_pages"]]["shape"][0]
-        metadata.update(
-            interface="batch_accept",
-            entrypoint_phase=None,
-            inputs=list(inputs.values()),
-            outputs=list(outputs.values()),
-            writes=[token_storage],
-            parameters=parameters,
-            arguments=[{"scalar": "M"}, {"scalar": "B"}],
-            keywords={"mapping": []},
-            ports={"inputs": inputs, "outputs": outputs},
-            guards=[{"condition": ["eq", "B", len(batch["members"])], "expected": True}],
-            shape_contracts=[{"value": inputs["free_pages"], "shape": ["free_pages_before"]}],
-        )
-        for name, identity in outputs.items():
-            if name not in ("request_map", "free_pages", "token_relay"):
-                self.values[identity]["shape_relation"] = ["B", *self.values[identity]["shape"][1:]]
 
     def metadata_indices(self, region: dict[str, Any]) -> None:
         metadata = region["metadata"]
@@ -181,7 +135,7 @@ class DisaggregatedTemplates:
         metadata["guards"].extend(
             [
                 {"condition": ["lt", 0, "request_slot"], "expected": True},
-                {"condition": ["le", "request_slot", "R"], "expected": True},
+                {"condition": ["le", "request_slot", "slot_capacity"], "expected": True},
             ]
         )
 

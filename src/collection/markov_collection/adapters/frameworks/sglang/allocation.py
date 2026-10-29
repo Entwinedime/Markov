@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import ast
 import inspect
-import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
 from torch.overrides import TorchFunctionMode
 
 from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewCall
+from markov_collection.instrumentation.loops import NativeLoop
 
 
 class AllocationViews(TorchFunctionMode):
@@ -54,89 +53,42 @@ class AllocationViews(TorchFunctionMode):
         )(*args, **kwargs)
 
 
-class AllocationLoop:
+class AllocationLoop(NativeLoop):
     def __init__(
         self, values: Any, original: Any, lengths: tuple[int, ...], contexts: tuple[int, ...], page_size: int
     ) -> None:
+        super().__init__(original)
         self.values = values
         self.recording = values.recording
         self.lengths = lengths
         self.contexts = contexts
         self.page_size = page_size
-        self.code = original.__code__
-        source, start = inspect.getsourcelines(original)
-        loop = next(node for node in ast.walk(ast.parse("".join(source))) if isinstance(node, ast.For))
-        self.header = start + loop.lineno - 1
-        self.end = start + loop.end_lineno - 1
-        self.part: Any = None
-        self.members: Any = None
-        self.error: tuple = (None, None, None)
-        self.frame: Any = None
-        self.views: Any = None
-        self.inputs: dict[str, torch.Tensor] = {}
-        self.buffers: dict[str, torch.Tensor] = {}
 
-    def __enter__(self) -> AllocationLoop:
+    @contextmanager
+    def sequence(self, frame: Any) -> Any:
+        self.buffers = {name: value for name, value in frame.f_locals.items() if isinstance(value, torch.Tensor)}
+        with self.recording.scope(
+            "allocation_members",
+            dynamic_calls=True,
+            call_role="allocation_member",
+            call_count="B",
+            parameters={"B": len(self.lengths)},
+            ports={"inputs": self.values.port_values(self.buffers), "outputs": {}},
+        ) as scope:
+            yield
+            scope.metadata["ports"]["outputs"] = self.values.port_values({"out_indices": frame.f_locals["out_indices"]})
 
-        # Trace only this native helper; its Python statements and device calls remain unchanged.
-        self.previous = sys.gettrace()
-        sys.settrace(self.trace)
-        return self
+    @contextmanager
+    def part(self, kind: str, frame: Any) -> Any:
+        if kind == "suffix":
+            yield
+            return
 
-    def close_part(self, error: tuple = (None, None, None)) -> None:
-        if self.part is not None:
-            if self.views is not None:
-                self.views.__exit__(*error)
-                self.views = None
-            with self.values.metadata():
-                produced = {
-                    name: value
-                    for name, value in self.frame.f_locals.items()
-                    if isinstance(value, torch.Tensor) and name not in self.inputs
-                }
-                if self.part.metadata["entrypoint"] == "allocation_member":
-                    produced = {"out_indices": self.frame.f_locals["out_indices"]}
-                self.part.metadata["ports"]["outputs"] = self.values.port_values(produced)
-            self.part.__exit__(*error)
-            self.part = None
-
-    def __exit__(self, *error: Any) -> None:
-        sys.settrace(self.previous)
-        self.close_part(error)
-        if self.members is not None:
-            self.members.__exit__(*error)
-        self.buffers.clear()
-        self.inputs.clear()
-        self.frame = None
-
-    def trace(self, frame: Any, event: str, result: Any) -> Any:
-        if frame.f_code is not self.code:
-            return None
-        if event == "call":
-            self.frame = frame
-            self.inputs = {name: value for name, value in frame.f_locals.items() if isinstance(value, torch.Tensor)}
-            self.part = self.recording.scope(
-                "AllocationPart",
-                entrypoint="allocation_prefix",
-                ports={"inputs": self.values.port_values(self.inputs), "outputs": {}},
-            )
-            self.part.__enter__()
-        elif event == "line" and frame.f_lineno == self.header:
-            self.close_part()
-            if self.members is None:
-                self.buffers = {
-                    name: value for name, value in frame.f_locals.items() if isinstance(value, torch.Tensor)
-                }
-                self.members = self.recording.scope(
-                    "allocation_members",
-                    dynamic_calls=True,
-                    call_role="allocation_member",
-                    call_count="B",
-                    parameters={"B": len(self.lengths)},
-                    ports={"inputs": self.values.port_values(self.buffers), "outputs": {}},
-                )
-                self.members.__enter__()
-        elif event == "line" and self.part is None and self.header < frame.f_lineno <= self.end:
+        metadata = {"entrypoint": "allocation_" + kind}
+        if kind == "prefix":
+            inputs = {name: value for name, value in frame.f_locals.items() if isinstance(value, torch.Tensor)}
+        else:
+            inputs = self.buffers
             index = frame.f_locals["i"]
             tokens = self.lengths[index]
             parameters = {
@@ -148,37 +100,35 @@ class AllocationLoop:
                 "page_offset": sum((length - 1) // self.page_size + 1 for length in self.lengths[:index]),
                 "token_offset": sum(self.lengths[:index]),
             }
-            guards = [{"condition": ["eq", "context_tokens", 0], "expected": True}] + [
-                {"condition": ["eq", name, 0], "expected": parameters[name] == 0}
-                for name in ("full_pages", "tail_tokens")
-            ]
-            self.part = self.recording.scope(
-                "AllocationPart",
-                entrypoint="allocation_member",
+            metadata.update(
                 parameters=parameters,
                 bindings={"page_size": self.page_size},
                 derived_parameters=[
                     {"name": "full_pages", "expression": ["floor_div", "new_tokens", "page_size"]},
                     {"name": "tail_tokens", "expression": ["mod", "new_tokens", "page_size"]},
                 ],
-                guards=guards,
-                ports={"inputs": self.values.port_values(self.buffers), "outputs": {}},
+                guards=[{"condition": ["eq", "context_tokens", 0], "expected": True}]
+                + [
+                    {"condition": ["eq", name, 0], "expected": parameters[name] == 0}
+                    for name in ("full_pages", "tail_tokens")
+                ],
             )
-            self.part.__enter__()
-            self.views = AllocationViews(self.values, self.buffers)
-            self.views.__enter__()
-        elif event == "return":
-            self.close_part(self.error)
-            if self.members is not None:
-                self.members.metadata["ports"]["outputs"] = self.values.port_values(
+        metadata["ports"] = {"inputs": self.values.port_values(inputs), "outputs": {}}
+        with self.recording.scope("AllocationPart", **metadata) as scope:
+            views = AllocationViews(self.values, self.buffers) if kind == "member" else nullcontext()
+            with views:
+                yield
+            with self.values.metadata():
+                produced = (
                     {"out_indices": frame.f_locals["out_indices"]}
+                    if kind == "member"
+                    else {
+                        name: value
+                        for name, value in frame.f_locals.items()
+                        if isinstance(value, torch.Tensor) and name not in inputs
+                    }
                 )
-                self.members.__exit__(*self.error)
-                self.members = None
-        elif event == "exception":
-            self.error = result
-
-        return self.trace
+                scope.metadata["ports"]["outputs"] = self.values.port_values(produced)
 
 
 class SGLangAllocation:

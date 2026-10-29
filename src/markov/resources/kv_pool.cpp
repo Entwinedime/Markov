@@ -10,9 +10,10 @@ namespace markov {
 KvPool::KvPool(std::size_t request_count, const ServingSettings & settings, PageReuse reuse)
     : request_capacity_(settings.max_running_requests),
       page_size_(settings.page_size),
+      capacity_{ static_cast<std::size_t>(settings.max_running_requests), static_cast<std::size_t>(settings.max_total_tokens / settings.page_size) },
       residences_(request_count),
-      free_slots_(static_cast<std::size_t>(settings.max_running_requests)),
-      free_pages_(static_cast<std::size_t>(settings.max_total_tokens / settings.page_size)),
+      free_slots_(capacity_.slots),
+      free_pages_(capacity_.pages),
       reuse_(reuse),
       ready_pages_(static_cast<std::int64_t>(free_pages_.size())) {
     std::iota(free_slots_.begin(), free_slots_.end(), std::size_t{ 0 });
@@ -24,9 +25,19 @@ const KvResidence & KvPool::residence(std::size_t request) const { return reside
 const std::deque<std::size_t> & KvPool::free_slots() const { return free_slots_; }
 const std::deque<std::size_t> & KvPool::free_pages() const { return free_pages_; }
 std::int64_t KvPool::deferred_pages() const { return static_cast<std::int64_t>(free_pages_.size()) - ready_pages_; }
+const KvCapacity & KvPool::capacity() const { return capacity_; }
+
+void KvPool::declare_slots(std::size_t capacity) {
+    if (capacity < static_cast<std::size_t>(request_capacity_)
+        || std::ranges::any_of(residences_, [](const auto & resident) { return resident.slot.has_value(); }))
+        throw std::invalid_argument("slot capacity must cover running requests and be declared before allocation");
+    free_slots_.resize(capacity);
+    capacity_.slots = capacity;
+    std::iota(free_slots_.begin(), free_slots_.end(), std::size_t{ 0 });
+}
 
 Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
-    Batch batch{ phase, request_capacity_, static_cast<std::int64_t>(free_pages_.size()), 0, {}, deferred_pages() };
+    Batch batch{ phase, request_capacity_, static_cast<std::int64_t>(free_pages_.size()), 0, {}, deferred_pages(), static_cast<std::int64_t>(capacity_.slots) };
     std::size_t new_slots = 0;
     for (const auto & [request, tokens] : demands) {
         const auto & resident = residence(request);

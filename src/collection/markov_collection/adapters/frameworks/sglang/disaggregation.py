@@ -64,12 +64,18 @@ class DisaggregationObservation:
             return original(*args, **kwargs)
 
     @staticmethod
-    def request_metadata(request: Any, capacity: int) -> dict[str, Any]:
+    def request_metadata(request: Any, pool: Any) -> dict[str, Any]:
         prompt = len(request.origin_input_ids)
         return {
             "request": request.rid,
             "room": request.bootstrap_room,
-            "parameters": {"B": 1, "M": prompt, "R": capacity, "max_sequence_tokens": prompt},
+            "parameters": {
+                "B": 1,
+                "M": prompt,
+                "R": pool.size,
+                "slot_capacity": pool.req_to_token.shape[0] - 1,
+                "max_sequence_tokens": prompt,
+            },
         }
 
     def reserve(self, original: Any, queue: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
@@ -78,7 +84,7 @@ class DisaggregationObservation:
 
         self.serving.begin_batch(queue.scheduler)
         with (
-            self.recording.scope("KvReserve", **self.request_metadata(request, queue.req_to_token_pool.size)) as scope,
+            self.recording.scope("KvReserve", **self.request_metadata(request, queue.req_to_token_pool)) as scope,
             self.operators,
         ):
             scope.metadata["ports"] = {
@@ -108,7 +114,7 @@ class DisaggregationObservation:
 
         with (
             self.recording.scope(
-                "KvReceived", **self.request_metadata(request, queue.scheduler.req_to_token_pool.size)
+                "KvReceived", **self.request_metadata(request, queue.scheduler.req_to_token_pool)
             ) as scope,
             self.operators,
         ):
@@ -134,6 +140,7 @@ class DisaggregationObservation:
                 return result
 
             scope.metadata["batch"] = self.serving.record_batch(scheduler, result, "source")
+            scope.metadata.update(dynamic_calls=True, parameters={"accepted_members": len(result.reqs)})
             scope.metadata["ports"] = {
                 "inputs": {},
                 "outputs": self.values.port_values(
@@ -141,10 +148,23 @@ class DisaggregationObservation:
                         **BatchTensors.read(result),
                         "token_relay": scheduler.future_map.output_tokens_buf,
                         "free_pages": scheduler.token_to_kv_pool_allocator.free_pages,
+                        "request_map": scheduler.req_to_token_pool.req_to_token,
                     }
                 ),
             }
             return result
+
+    def prepare_prebuilt(self, original: Any, batch: Any) -> Any:
+        from markov_collection.adapters.frameworks.sglang.prebuilt import PrebuiltCall
+
+        return PrebuiltCall(self.values, original, batch, prepare=True)(batch)
+
+    def process_prebuilt(self, original: Any, batch: Any, server_args: Any, future_map: Any) -> Any:
+        from markov_collection.adapters.frameworks.sglang.prebuilt import PrebuiltCall
+
+        return PrebuiltCall(self.values, original, batch, prepare=False, relay=future_map)(
+            batch, server_args, future_map
+        )
 
     def prebuilt_result(self, original: Any, processor: Any, batch: Any) -> Any:
         identity = self.serving.batch_ids.get(batch)
@@ -172,7 +192,7 @@ class DisaggregationObservation:
 
         from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewObservation
 
-        metadata = self.request_metadata(request, scheduler.req_to_token_pool.size)
+        metadata = self.request_metadata(request, scheduler.req_to_token_pool)
         self.rooms[request.bootstrap_room] = metadata
         with self.recording.scope("KvSend", **metadata) as scope:
             self.bind_metadata(scheduler.disagg_metadata_buffers, scope.metadata)
@@ -182,10 +202,7 @@ class DisaggregationObservation:
                 slot = int(request.req_pool_idx)
                 scope.metadata["parameters"]["request_slot"] = slot
                 scope.metadata["bindings"] = {"request_map_stride": mapping.stride(0)}
-                scope.metadata["ports"] = {
-                    "inputs": self.values.port_values({"request_map": mapping}),
-                    "outputs": {}
-                }
+                scope.metadata["ports"] = {"inputs": self.values.port_values({"request_map": mapping}), "outputs": {}}
 
                 # Declare the complete-prefill slice before CPU materialization and its downstream views.
                 symbols = self.values.shapes
@@ -255,7 +272,7 @@ class DisaggregationObservation:
         if not self.serving.selected:
             return original(cache, request, *args, **kwargs)
         with (
-            self.recording.scope("KvReleased", **self.request_metadata(request, cache.req_to_token_pool.size)),
+            self.recording.scope("KvReleased", **self.request_metadata(request, cache.req_to_token_pool)),
             self.operators,
         ):
             return self.serving.request_cache(original, cache, request, *args, **kwargs)
@@ -279,6 +296,8 @@ class DisaggregationObservation:
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc": self.reserve,
             "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": self.receive,
             "sglang.srt.managers.scheduler.Scheduler.get_new_prebuilt_batch": self.prebuilt,
+            "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_prebuilt": self.prepare_prebuilt,
+            "sglang.srt.managers.schedule_batch.ScheduleBatch.process_prebuilt": self.process_prebuilt,
             (
                 "sglang.srt.managers.scheduler_components.batch_result_processor."
                 "SchedulerBatchResultProcessor.process_batch_result_prebuilt"

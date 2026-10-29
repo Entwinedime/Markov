@@ -223,7 +223,13 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
         break;
     }
     case ServingStep::Result: {
-        const auto program = builder.complete(batch, action.work->effects, action.lane, flow.outputs.at(rank), flow.tokens.at(rank), handoff);
+        const auto program = builder.complete(batch,
+                                              action.work->effects,
+                                              action.lane,
+                                              flow.outputs.at(rank),
+                                              flow.tokens.at(rank),
+                                              action.work->metadata_slots,
+                                              handoff || instance_.id == "prefill");
         result.publication = program.publication;
         result.returned_pages = program.returned_pages;
         result.completions.push_back(program.completion);

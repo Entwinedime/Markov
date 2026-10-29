@@ -22,6 +22,11 @@ struct KvDemand {
     std::int64_t tokens;
 };
 
+struct KvCapacity {
+    std::size_t slots;
+    std::size_t pages;
+};
+
 // Shared resource ownership is independent of control policy and request progress.
 class KvPool {
 public:
@@ -32,9 +37,11 @@ public:
     const std::deque<std::size_t> & free_slots() const;
     const std::deque<std::size_t> & free_pages() const;
     std::int64_t deferred_pages() const;
+    const KvCapacity & capacity() const;
     Batch plan(Phase phase, std::span<const KvDemand> demands = {}) const;
     std::vector<std::int64_t> indices(std::size_t request, std::int64_t begin, std::int64_t end) const;
 
+    void declare_slots(std::size_t capacity);
     void reserve(const Batch & batch);
     void advance(std::size_t request, std::int64_t tokens);
     void release(std::size_t request);
@@ -45,6 +52,7 @@ private:
 
     std::int64_t request_capacity_;
     std::int64_t page_size_;
+    KvCapacity capacity_;
     std::vector<KvResidence> residences_;
     std::deque<std::size_t> free_slots_;
     std::deque<std::size_t> free_pages_;

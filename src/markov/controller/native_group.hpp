@@ -17,10 +17,12 @@
 
 namespace markov {
 
+enum class NativeRole { Model, Prefill, Decode };
+
 // One native participant group owns its work; the borrowed pool is its only resource ledger.
 class NativeGroup {
 public:
-    NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage);
+    NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role);
     NativeGroup(const NativeGroup &) = delete;
     NativeGroup & operator=(const NativeGroup &) = delete;
 
@@ -51,7 +53,9 @@ private:
     KvPool & resources_;
     std::string group_;
     std::size_t stage_;
+    NativeRole role_;
     std::map<std::size_t, Frame> frames_;
+    std::map<std::size_t, std::shared_ptr<const BatchWork>> reservations_;
     std::map<std::size_t, std::size_t> lanes_;
     std::optional<TaskIdentity> running_;
     std::vector<std::size_t> released_pages_;

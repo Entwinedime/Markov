@@ -6,6 +6,12 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 class NativeBatch(ScheduleBatch):
     control_selection = False
 
+    def prepare_for_prebuilt(self):
+        super().prepare_for_prebuilt()
+        peer = self.token_to_kv_pool_allocator.peer
+        self.control_work = dict(peer.context)
+        peer.call("prebuilt", requests=[int(req.rid) for req in self.reqs])
+
     def filter_batch(self, *args, **kwargs):
         result = super().filter_batch(*args, **kwargs)
         if self.control_selection:

@@ -12,6 +12,27 @@ from markov_collection.adapters.runtimes.pytorch.unique import UniqueObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
+class PoolPorts:
+    @staticmethod
+    def declare(regions: list[dict], values: list[dict]) -> None:
+        for region in regions:
+            metadata = region["metadata"]
+
+            # Host compositions delegate pool transitions to their callable child interfaces.
+            if "entrypoint" not in metadata or "ports" not in metadata or metadata.get("dynamic_calls"):
+                continue
+            for name, identity in metadata["ports"]["inputs"].items():
+                if name not in ("free_pages", "release_pages"):
+                    continue
+
+                # A pool's incoming size belongs to this call, not to the previous producer's before/after names.
+                parameter = name + "_before"
+                metadata.setdefault("parameters", {})[parameter] = values[identity]["shape"][0]
+                metadata["shape_contracts"] = [
+                    item for item in metadata.get("shape_contracts", []) if item["value"] != identity
+                ] + [{"value": identity, "shape": [parameter]}]
+
+
 class RequestCacheCall(NativeCall):
     def __init__(self, values: Any, original: Any, cache: Any, request: Any, finished: bool) -> None:
         super().__init__(values.recording, values, original.__qualname__, original, {})
@@ -46,7 +67,7 @@ class RequestCacheCall(NativeCall):
             metadata["bindings"] = {"request_map_stride": mapping.stride(0)}
             metadata["guards"] = [
                 {"condition": ["lt", 0, "request_slot"], "expected": True},
-                {"condition": ["le", "request_slot", "R"], "expected": True},
+                {"condition": ["le", "request_slot", "slot_capacity"], "expected": True},
                 {"condition": ["le", 0, "resident_tokens"], "expected": True},
                 {"condition": ["le", "resident_tokens", "request_map_stride"], "expected": True},
             ]

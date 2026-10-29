@@ -42,6 +42,11 @@ ServingAction DisaggregatedController::action(ServingStep step, Batch batch, Bat
                          : step == ServingStep::Transfer                            ? groups_.transfer
                                                                                     : groups_.decode;
     BatchWork work{ std::move(batch), std::move(effects), {} };
+    if (step == ServingStep::Model || step == ServingStep::Receive) {
+
+        // Lightweight control has one metadata lease per resident request.
+        for (const auto & member : work.batch.members) work.metadata_slots.emplace(member.request, member.slot);
+    }
     std::size_t lane = 0;
     if (replay_ && step == ServingStep::Model) lane = replay_->next("prefill")->lane;
     if (replay_ && (step == ServingStep::Batch || step == ServingStep::Accept)) lane = replay_->next("decode")->lane;
@@ -325,12 +330,5 @@ bool DisaggregatedController::done() const {
 std::size_t DisaggregatedController::free_pages() const { return decode_.free_pages().size(); }
 std::size_t DisaggregatedController::request_count() const { return requests_.size(); }
 const Request & DisaggregatedController::request(std::size_t identity) const { return requests_.at(identity).input; }
-
-std::map<std::string, std::size_t> DisaggregatedController::pool_free_pages() const {
-    return {
-        { groups_.prefill, prefill_.free_pages().size() },
-        {  groups_.decode,  decode_.free_pages().size() }
-    };
-}
 
 } // namespace markov

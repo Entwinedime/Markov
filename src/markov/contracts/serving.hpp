@@ -71,6 +71,7 @@ struct Batch {
     std::int64_t allocated_pages;
     std::vector<BatchMember> members;
     std::int64_t deferred_pages_before = 0;
+    std::int64_t slot_capacity = 0;
 
     std::int64_t new_tokens() const;
 };
@@ -101,6 +102,7 @@ struct BatchWork {
     Batch batch;
     BatchEffects effects;
     std::vector<KvPageCopy> transferred_pages{};
+    std::map<std::size_t, std::size_t> metadata_slots{};
 };
 
 enum class ServingStep { Batch, Select, Stage, Prepare, Compute, Send, Receive, Wait, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };

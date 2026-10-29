@@ -167,6 +167,7 @@ class SGLangObservation:
                     "M": sum(item["new_tokens"] for item in members),
                     "B": len(members),
                     "R": scheduler.req_to_token_pool.size,
+                    "slot_capacity": scheduler.req_to_token_pool.req_to_token.shape[0] - 1,
                     "max_sequence_tokens": max(
                         (item["context_tokens"] + item["new_tokens"] for item in members), default=0
                     ),
@@ -195,7 +196,7 @@ class SGLangObservation:
             shapes = self.operators.values.shapes
 
             # Pool capacity belongs to every value version, before preparation first reads or writes it.
-            shapes.bind_shape(mapping, (shapes.symbol("R") + 1, mapping.shape[1]))
+            shapes.bind_shape(mapping, (shapes.symbol("slot_capacity") + 1, mapping.shape[1]))
 
     def schedule(self, original: Any, scheduler: Any) -> Any:
         if self.pipeline is not None:
@@ -280,7 +281,7 @@ class SGLangObservation:
                 for tensor in BatchTensors.read(batch).values():
                     self.operators.values.bind(tensor, {0: "B"})
                 self.operators.values.bind_shape(
-                    scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("R") + 1,)
+                    scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("slot_capacity") + 1,)
                 )
 
             fields = self.pipeline.fields if self.pipeline is not None and phase == "decode" else BatchTensors.fields
@@ -443,7 +444,7 @@ class SGLangObservation:
 
         # ReqToTokenPool reserves slot zero; FutureMap uses the same padded capacity.
         with values.metadata():
-            values.bind_shape(relay.output_tokens_buf, (values.shapes.symbol("R") + 1,))
+            values.bind_shape(relay.output_tokens_buf, (values.shapes.symbol("slot_capacity") + 1,))
 
         return NativeCall(
             self.recording,

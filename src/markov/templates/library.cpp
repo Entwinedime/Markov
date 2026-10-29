@@ -556,6 +556,14 @@ void SourceTemplates::compile(std::size_t identity) {
     std::map<std::size_t, nlohmann::json> port_shapes;
     std::set<std::size_t> opaque_inputs;
     if (metadata.contains("opaque_inputs")) opaque_inputs = metadata.at("opaque_inputs").get<std::set<std::size_t>>();
+    if (metadata.contains("ports")) {
+        for (const auto & [_, port] : metadata.at("ports").at("inputs").items()) {
+            const auto value = port.get<std::size_t>();
+            if (opaque_inputs.contains(value) || grouped_values.contains(value)) continue;
+            const auto & shape = local.values.at(local.value(value)).at("shape");
+            if (!shape.is_null()) port_shapes.emplace(value, shape);
+        }
+    }
     if (metadata.contains("inputs")) {
         for (const auto & input : metadata.at("inputs")) {
             const auto value = input.get<std::size_t>();

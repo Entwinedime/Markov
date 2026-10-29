@@ -63,11 +63,20 @@ class MetadataRunner(ModelRunner):
 
     def _init_pools(self):
         context = self.model_config.context_len + get_req_to_token_extra_context_len(self.server_args)
-        self.req_to_token_pool = RequestSlots(self.peer, self.max_running_requests, context)
+        extra = (
+            self.server_args.disaggregation_decode_extra_slots
+            if self.server_args.disaggregation_mode == "decode" else 0
+        )
+        self.req_to_token_pool = RequestSlots(self.peer, self.max_running_requests, context, extra)
         self.token_to_kv_pool_allocator = PageAllocator(
             self.peer, self.max_total_num_tokens, self.server_args.page_size
         )
         self.token_to_kv_pool = self.token_to_kv_pool_allocator.storage
+
+    def init_shared_mooncake_transfer_engine(self):
+
+        # The transfer adapter submits graph work; prediction never opens a physical transport engine.
+        self.shared_mooncake_transfer_engine = None
 
     def init_attention_backends(self):
         self.prefill_attention_backend_str = "torch_native"

@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -35,7 +34,6 @@ public:
     std::size_t free_pages() const override;
     std::size_t request_count() const override;
     const Request & request(std::size_t identity) const override;
-    std::map<std::string, std::size_t> pool_free_pages() const;
 
 private:
     enum class RequestStage { Waiting, Reserved, ModelReady, Transferred, Received, Active, Finished };

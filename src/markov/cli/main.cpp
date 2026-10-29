@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -116,13 +117,34 @@ nlohmann::json expert_condition(const nlohmann::json & settings, const nlohmann:
     return conditions.at(id);
 }
 
+nlohmann::json resource_capacity(const markov::KvPool & resources) {
+    const auto & capacity = resources.capacity();
+    return {
+        { "slots", capacity.slots },
+        { "pages", capacity.pages }
+    };
+}
+
+nlohmann::json native_source(const markov::TemplateAsset & asset, const std::string & id) {
+    const auto & environment = asset.environment();
+    const auto & implementation = environment.at("implementation");
+    return {
+        {           "id",                                       id },
+        { "model_config",        implementation.at("model_config") },
+        {        "dtype",               implementation.at("dtype") },
+        {         "mode", implementation.at("disaggregation_mode") },
+        {           "tp",             environment.at("logical_tp") },
+        {           "ep",             environment.at("logical_ep") },
+        {           "pp",             environment.at("logical_pp") }
+    };
+}
+
 nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, bool details,
                         bool native) {
     check_fields(input, { "configuration", "requests", "ep_routes", "node_durations_ns" }, "serving input");
     const auto & configuration = input.at("configuration");
     const bool disaggregated = configuration.contains("pd");
-    if (native && (disaggregated || !batches.is_null()))
-        throw std::invalid_argument("native control currently requires one serving instance and no batch replay");
+    if (native && !batches.is_null()) throw std::invalid_argument("native control does not consume batch replay");
     if (disaggregated) check_fields(configuration, { "pd", "page_size", "placement" }, "configuration");
     else
         check_fields(configuration,
@@ -200,15 +222,49 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                                          expert_condition(d, input, *decode_source));
         markov::KvPool prefill_resources(requests.size(), prefill, expansion.page_reuse());
         markov::KvPool decode_resources(requests.size(), decode, expansion.page_reuse());
-        markov::DisaggregatedController
-            controller(prefill, decode, std::move(requests), groups, prefill_resources, decode_resources, replay ? &*replay : nullptr);
-        markov::ServingWorkflow workflow(controller, expansion, durations);
+        markov::ControlStream peer(std::cin, std::cout);
+        std::unique_ptr<markov::ServingControl> controller;
+        if (native) {
+            if (p.value("pp", 1) != 1 || d.value("pp", 1) != 1) throw std::invalid_argument("native PD pipeline integration is not yet available");
+            peer.send({
+                {      "kind",                                                                               "source" },
+                { "instances", { native_source(*prefill_source, "prefill"), native_source(*decode_source, "decode") } }
+            });
+            const std::array instances{
+                markov::NativeInstance{ "prefill",
+                                       markov::NativeRole::Prefill,
+                                       prefill, static_cast<std::size_t>(prefill.max_running_requests),
+                                       { { groups.prefill, 0, prefill_resources } } },
+                markov::NativeInstance{  "decode",
+                                       markov::NativeRole::Decode,
+                                       decode,  static_cast<std::size_t>(decode.max_running_requests),
+                                       { { groups.decode, 0, decode_resources } }  }
+            };
+            controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer);
+        }
+        else
+            controller = std::make_unique<markov::DisaggregatedController>(prefill,
+                                                                           decode,
+                                                                           std::move(requests),
+                                                                           groups,
+                                                                           prefill_resources,
+                                                                           decode_resources,
+                                                                           replay ? &*replay : nullptr);
+        markov::ServingWorkflow workflow(*controller, expansion, durations);
         auto result = workflow.run(details);
         if (replay && !replay->done()) throw std::logic_error("serving completed with unconsumed batch records");
-        result["control_source"] = replay ? "recorded_batches" : "lightweight_policy";
+        result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
         result["configuration"] = configuration;
         result["duration_source"] = "given_execution_kind_ns";
-        result["pool_free_pages"] = controller.pool_free_pages();
+        result["pool_free_pages"] = {
+            { groups.prefill, prefill_resources.free_pages().size() },
+            {  groups.decode,  decode_resources.free_pages().size() }
+        };
+        if (native)
+            result["resource_capacity"] = {
+                { groups.prefill, resource_capacity(prefill_resources) },
+                {  groups.decode,  resource_capacity(decode_resources) }
+            };
         result["structure"] = expansion.summary();
         if (details) result["graph"] = expansion.document();
         return result;
@@ -236,19 +292,16 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     markov::ControlStream peer(std::cin, std::cout);
     std::unique_ptr<markov::ServingControl> controller;
     if (native) {
-        const auto & environment = assets.front().environment();
-        const auto & implementation = environment.at("implementation");
         peer.send({
-            {         "kind",                          "source" },
-            { "model_config", implementation.at("model_config") },
-            {        "dtype",        implementation.at("dtype") },
-            {           "tp",      environment.at("logical_tp") },
-            {           "ep",      environment.at("logical_ep") },
-            {           "pp",      environment.at("logical_pp") }
+            {      "kind",                                   "source" },
+            { "instances", { native_source(assets.front(), "model") } }
         });
         std::vector<markov::NativeParticipant> participants;
         for (std::size_t stage = 0; stage < resources.size(); ++stage) participants.push_back({ topology.stage("model", stage).id, stage, resources[stage] });
-        controller = std::make_unique<markov::NativeController>(settings, std::move(requests), participants, static_cast<std::size_t>(batch_limit), peer);
+        const std::array instances{
+            markov::NativeInstance{ "model", markov::NativeRole::Model, settings, static_cast<std::size_t>(batch_limit), std::move(participants) }
+        };
+        controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer);
     }
     else
         controller = std::make_unique<markov::ServingController>(settings,
@@ -264,6 +317,10 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
     result["configuration"] = configuration;
     result["duration_source"] = "given_execution_kind_ns";
+    if (native) {
+        for (std::size_t stage = 0; stage < resources.size(); ++stage)
+            result["resource_capacity"][topology.stage("model", stage).id] = resource_capacity(resources[stage]);
+    }
     result["structure"] = expansion.summary();
     if (details) result["graph"] = expansion.document();
     return result;

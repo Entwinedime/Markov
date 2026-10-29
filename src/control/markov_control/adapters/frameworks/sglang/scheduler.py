@@ -27,6 +27,17 @@ class PublishedRequests:
         if self.enabled:
             self.identities.update(output.rids)
 
+    def complete(self, peer, batch, kind):
+        return peer.call(
+            kind,
+            members=[
+                {"request": int(req.rid), "generated_tokens": len(req.output_ids),
+                 "finished": req.finished(), "emits_output": req.rid in self.identities,
+                 "metadata_slot": req.metadata_buffer_index}
+                for req in batch.reqs
+            ],
+        )
+
 
 class ResultReady:
     def __init__(self, peer: ControlPeer, work) -> None:
@@ -69,6 +80,7 @@ class NativeScheduler(Scheduler):
             disable_overlap_schedule=True,
             disable_cuda_graph=True,
             disable_custom_all_reduce=True,
+            disaggregation_mode=source["mode"],
             random_seed=13,
         )
         super().__init__(
@@ -84,8 +96,11 @@ class NativeScheduler(Scheduler):
         )
 
         # Preserve native receive, dispatch, selection, result processing and idle housekeeping.
+        bootstrap = ("markov-prefill", args.disaggregation_bootstrap_port) if source["mode"] != "null" else None
         self.request_receiver = NativeRequestReceiver(
-            replace(self.request_receiver, recv_from_tokenizer=RequestInput(peer, self.model_config.vocab_size))
+            replace(
+                self.request_receiver, recv_from_tokenizer=RequestInput(peer, self.model_config.vocab_size, bootstrap)
+            )
         )
         self.model_worker.forward_batch_generation = self.model_result
         self.published = PublishedRequests(self.ps.pp_rank == 0)
@@ -94,10 +109,13 @@ class NativeScheduler(Scheduler):
     def current_lane(self):
         return 0
 
-    def get_next_batch_to_run(self):
+    def begin_iteration(self):
         self.peer.context = {"flow": self.control_round, "lane": self.current_lane()}
         self.control_round += 1
         self.peer.send({"kind": "begin"})
+
+    def get_next_batch_to_run(self):
+        self.begin_iteration()
         batch = super().get_next_batch_to_run()
         if batch is not None:
             batch.control_work = dict(self.peer.context)
@@ -133,18 +151,7 @@ class NativeScheduler(Scheduler):
         try:
             self.published.identities.clear()
             super().process_batch_result(batch, result)
-            completion = self.peer.call(
-                "result",
-                members=[
-                    {
-                        "request": int(req.rid),
-                        "generated_tokens": len(req.output_ids),
-                        "finished": req.finished(),
-                        "emits_output": req.rid in self.published.identities,
-                    }
-                    for req in batch.reqs
-                ],
-            )
+            completion = self.published.complete(self.peer, batch, "result")
             self.gracefully_exit = completion["done"]
             if self.ps.pp_size == 1:
                 self.peer.call("release_work")

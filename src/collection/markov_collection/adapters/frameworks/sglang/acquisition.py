@@ -197,6 +197,11 @@ class SGLangAcquisition:
             if domain.get("pd")
             else SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
         )
+        if domain.get("pd"):
+
+            # In-flight transfers retain slots; let the fixed representative set reach multi-member admission.
+            for pool in representative.values():
+                pool["max_running_requests"] = max(pool["max_running_requests"], len(requests))
         configurations.append(
             {"page_size": domain["page_size"], "pd": representative} if domain.get("pd") else representative
         )
@@ -219,6 +224,8 @@ class SGLangAcquisition:
                 "limits": limits,
             },
         }
+        if domain.get("pd"):
+            result["submissions"] = NativeDisaggregatedSession.structure_submissions(requests)
         if model_configuration.get("num_experts", 0):
             result["serving_input"] = SGLangAcquisition.source_input(
                 result, model_configuration, specification["node_durations_ns"]
@@ -327,6 +334,7 @@ class SGLangAcquisition:
         from markov_collection.adapters.frameworks.sglang.hooks import SGLangObservation
         from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
         from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
+        from markov_collection.adapters.frameworks.sglang.state import PoolPorts
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
         from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
@@ -354,6 +362,7 @@ class SGLangAcquisition:
         AscendLayouts.declare(source["regions"], source["operations"], source["values"])
         AllReduceGeometry.declare(source["operations"], source["values"])
         DisaggregatedTemplates.declare(source)
+        PoolPorts.declare(source["regions"], source["values"])
         if pp > 1:
             from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
 

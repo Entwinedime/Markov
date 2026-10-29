@@ -107,18 +107,24 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     case ServingStep::Model: {
         const auto inputs = prepare(batch, action.lane);
         const auto output = model(batch, inputs.ports.outputs);
-        return complete(batch, effects, action.lane, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), action.step == ServingStep::Model);
+        return complete(batch,
+                        effects,
+                        action.lane,
+                        output.ports.outputs,
+                        output.ports.outputs.at("sampled_tokens"),
+                        action.work->metadata_slots,
+                        action.step == ServingStep::Model);
     }
     case ServingStep::Select:
         return select(batch, action.lane);
     case ServingStep::Reserve:
         return reserve(batch);
     case ServingStep::Receive:
-        return receive_kv(batch);
+        return receive_kv(batch, action.work->metadata_slots.at(batch.members.front().request));
     case ServingStep::Accept:
         return accept(batch, effects, action.lane);
     case ServingStep::Release:
-        return release(effects);
+        return release(batch, effects);
     default:
         throw std::invalid_argument("rank cannot execute this serving action");
     }
@@ -288,7 +294,8 @@ std::optional<std::size_t> RankStructure::begin_result(const Batch & batch, std:
 }
 
 RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
-                                    const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens, bool handoff) {
+                                    const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens,
+                                    const std::map<std::size_t, std::size_t> & metadata_slots, bool handoff) {
 
     // Native control resumes the caller opened at its read boundary; lightweight control expands it in one step.
     if (!graph_.composition()) begin_result(batch, sampled_tokens);
@@ -312,7 +319,7 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     for (const auto & member : effects.members) {
         if (!member.finished && (!immediate || !sampled_tokens)) continue;
 
-        const auto cache = cache_member(member, immediate, pending_tokens, phase);
+        const auto cache = cache_member(member, immediate, pending_tokens, phase, batch.slot_capacity);
         if (!member.finished) continue;
 
         // These contents come from controller ownership; the view keeps its native map producer and dependencies.
@@ -343,9 +350,9 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
             call.parameters["B"] = 1;
             call.parameters["max_sequence_tokens"] = member.context_tokens + member.new_tokens;
             call.parameters.insert({
-                {  "request_slot",    static_cast<std::int64_t>(member.slot) + 1 },
-                { "metadata_slot",        static_cast<std::int64_t>(member.slot) },
-                {    "handoff_id", static_cast<std::int64_t>(member.request) + 1 }
+                {  "request_slot",                   static_cast<std::int64_t>(member.slot) + 1 },
+                { "metadata_slot", static_cast<std::int64_t>(metadata_slots.at(member.request)) },
+                {    "handoff_id",                static_cast<std::int64_t>(member.request) + 1 }
             });
             graph_.append("kv_send",
                           "control",
@@ -389,10 +396,12 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     return { publication, graph_.graph().execution.region_call(result_region).returned, std::move(returned_pages) };
 }
 
-TargetRegion RankStructure::cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase) {
+TargetRegion RankStructure::cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase,
+                                         std::int64_t slot_capacity) {
     Invocation call;
     call.parameters = {
         {               "R",             settings_.max_running_requests },
+        {   "slot_capacity",                              slot_capacity },
         {    "request_slot", static_cast<std::int64_t>(member.slot) + 1 },
         { "resident_tokens",                     member.resident_tokens }
     };
@@ -444,11 +453,11 @@ RankProgram RankStructure::reserve(const Batch & batch) {
     return { std::nullopt, shared_.execution.region_call(reserved.region).returned, {} };
 }
 
-RankProgram RankStructure::receive_kv(const Batch & batch) {
+RankProgram RankStructure::receive_kv(const Batch & batch, std::size_t metadata_slot) {
     const auto begin = shared_.regions.size();
     const auto & member = batch.members.front();
     auto call = invocation(batch);
-    call.parameters["metadata_slot"] = static_cast<std::int64_t>(member.slot);
+    call.parameters["metadata_slot"] = static_cast<std::int64_t>(metadata_slot);
     call.parameters["handoff_id"] = static_cast<std::int64_t>(member.request) + 1;
     const auto received = graph_.append("KvReceived", "control", call);
     stamp(begin);
@@ -467,23 +476,56 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
         { "request_map", request_map_.value() }
     };
     if (token_relay_) state.emplace("token_relay", *token_relay_);
-    const auto accepted = graph_.append("batch_accept", "control", call, state);
+    graph_.begin_composition("batch_accept",
+                             "control",
+                             {
+                                 { "accepted_members", static_cast<std::int64_t>(batch.members.size()) }
+    },
+                             state);
+
+    // The source supplies one member copy; target requests supply its slot, length and output offset.
+    std::int64_t token_offset = 0;
+    for (const auto & member : batch.members) {
+        graph_.append("prefix_match", "decode", {});
+        call.sequences["prebuilt_members"].push_back({
+            {  "request_slot", static_cast<std::int64_t>(member.slot) + 1 },
+            { "prefix_tokens",                      member.context_tokens },
+            {    "new_tokens",                          member.new_tokens },
+            {  "token_offset",                               token_offset }
+        });
+        call.sequences["prebuilt_cache"].push_back({
+            {    "request_slot", static_cast<std::int64_t>(member.slot) + 1 },
+            { "resident_tokens",  member.context_tokens + member.new_tokens }
+        });
+        token_offset += member.new_tokens;
+    }
+    const auto prepared = graph_.append("prebuilt_prepare",
+                                        "control",
+                                        call,
+                                        {
+                                            { "request_map", *request_map_ }
+    });
+    state.erase("free_pages");
+    state.emplace("request_slots", prepared.ports.outputs.at("request_slots"));
+    const auto processed = graph_.append("prebuilt_process", "control", call, state);
+    auto outputs = prepared.ports.outputs;
+    outputs.insert_or_assign("token_relay", processed.ports.outputs.at("token_relay"));
+    outputs.emplace("free_pages", *free_pages_);
+    outputs.emplace("request_map", *request_map_);
     auto columns = batch_operands(batch, settings_.page_size);
     columns["original_lengths"] = columns.at("sequence_lengths");
-    bind_columns(graph_, accepted.ports.outputs, columns);
-    graph_.bind_integers(accepted.ports.outputs.at("free_pages"), graph_.integers(*free_pages_));
-    free_pages_ = accepted.ports.outputs.at("free_pages");
-    request_map_ = accepted.ports.outputs.at("request_map");
-    token_relay_ = accepted.ports.outputs.at("token_relay");
-    graph_.end_composition(accepted.ports.outputs);
+    bind_columns(graph_, outputs, columns);
+    token_relay_ = outputs.at("token_relay");
+    graph_.end_composition(outputs);
+    graph_.end_composition(outputs);
     stamp(begin);
-    return complete(batch, effects, lane, accepted.ports.outputs, std::nullopt);
+    return complete(batch, effects, lane, outputs, std::nullopt, {});
 }
 
-RankProgram RankStructure::release(const BatchEffects & effects) {
+RankProgram RankStructure::release(const Batch & batch, const BatchEffects & effects) {
     const auto begin = shared_.regions.size();
     const auto & member = effects.members.front();
-    const auto released = cache_member(member, true, 0, "control");
+    const auto released = cache_member(member, true, 0, "control", batch.slot_capacity);
     graph_.bind_integers(released.ports.outputs.at("request_indices"), page_indices(member.released_pages, member.resident_tokens, settings_.page_size));
     auto pages = member.released_pages;
     std::ranges::sort(pages);
@@ -534,6 +576,7 @@ Invocation RankStructure::invocation(const Batch & batch) const {
         {                   "M",                                                             batch.new_tokens()                                },
         {                   "B",                                                                static_cast<std::int64_t>(batch.members.size()) },
         {                   "R",                                                                                 settings_.max_running_requests },
+        {       "slot_capacity",                                                                                            batch.slot_capacity },
         {   "free_pages_before",
          batch.allocated_pages > batch.free_pages_before - batch.deferred_pages_before ? batch.free_pages_before
          : batch.free_pages_before - batch.deferred_pages_before                                                                               },

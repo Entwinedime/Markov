@@ -454,8 +454,11 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                                            { current, last ? named_ports.outputs : std::map<std::string, std::size_t>{} },
                                            sequences,
                                            scopes);
-            for (const auto & [name, value] : graph_.regions.at(child).at("ports").at("outputs").items())
-                current.insert_or_assign(name, value.get<std::size_t>());
+
+            // Only declared loop inputs carry state between members; other child outputs stay private.
+            for (const auto & [name, value] : graph_.regions.at(child).at("ports").at("outputs").items()) {
+                if (last || current.contains(name)) current.insert_or_assign(name, value.get<std::size_t>());
+            }
         }
         for (const auto & [name, value] : named_ports.outputs) {
             if (current.at(name) != value) throw LayoutMismatch("dynamic call sequence did not produce its declared output: " + name);

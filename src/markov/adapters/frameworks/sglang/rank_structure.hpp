@@ -46,7 +46,7 @@ public:
     TargetRegion model(const Batch & batch, const std::map<std::string, std::size_t> & inputs);
     std::optional<std::size_t> begin_result(const Batch & batch, std::optional<std::size_t> sampled_tokens);
     RankProgram complete(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & model_columns,
-                         std::optional<std::size_t> sampled_tokens, bool handoff = false);
+                         std::optional<std::size_t> sampled_tokens, const std::map<std::size_t, std::size_t> & metadata_slots, bool handoff = false);
     RankMessage message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending);
     std::vector<std::size_t> wait_message(const std::string & channel, const Batch & batch, const RankMessage & message);
     std::size_t receive_result(const Batch & batch, std::size_t sampled_tokens);
@@ -58,10 +58,11 @@ private:
     void begin_schedule(Phase phase, std::size_t members);
     RankProgram select(const Batch & batch, std::size_t lane);
     RankProgram reserve(const Batch & batch);
-    RankProgram receive_kv(const Batch & batch);
+    RankProgram receive_kv(const Batch & batch, std::size_t metadata_slot);
     RankProgram accept(const Batch & batch, const BatchEffects & effects, std::size_t lane);
-    RankProgram release(const BatchEffects & effects);
-    TargetRegion cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase);
+    RankProgram release(const Batch & batch, const BatchEffects & effects);
+    TargetRegion cache_member(const RequestCompletion & member, bool immediate, std::int64_t pending_tokens, const std::string & phase,
+                              std::int64_t slot_capacity);
     Invocation invocation(const Batch & batch) const;
     void stamp(std::size_t region_begin);
     void return_pages(std::size_t output, std::span<const std::size_t> pages);

@@ -5,10 +5,12 @@ from markov_control.peer import ControlPeer
 
 
 class RequestSlots:
-    def __init__(self, peer: ControlPeer, size: int, context: int) -> None:
+    def __init__(self, peer: ControlPeer, size: int, context: int, extra: int) -> None:
         self.peer = peer
         self.size = size
-        self._alloc_size = size + 1
+        self.pre_alloc_size = extra
+        self._alloc_size = size + extra + 1
+        peer.call("declare_slots", slots=size + extra)
         self.max_context_len = context
         self.device = "cpu"
 
@@ -37,8 +39,12 @@ class RequestSlots:
 
 
 class KvStorage:
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, page_size: int) -> None:
         self.size = size
+        self.page_size = page_size
+
+    def maybe_get_custom_mem_pool(self):
+        return None
 
 
 class PageAllocator:
@@ -48,11 +54,12 @@ class PageAllocator:
         self.page_size = page_size
         self.device = "cpu"
         self.need_sort = False
-        self.storage = KvStorage(size)
+        self.storage = KvStorage(size, page_size)
         self.batch = None
         self.phase = None
         self.tokens = []
         self.group = None
+        self.reservation = None
 
     def available_size(self):
         return self.peer.call("capacity")["pages"] * self.page_size
@@ -61,11 +68,17 @@ class PageAllocator:
         return self.storage
 
     def allocate(self):
-        members = [
-            {"request": int(req.rid), "tokens": tokens}
-            for req, tokens in zip(self.batch.reqs, self.tokens, strict=True)
-        ]
-        bindings = self.peer.call("allocate", phase=self.phase, members=members)
+        if self.reservation is None:
+            members = [
+                {"request": int(req.rid), "tokens": tokens}
+                for req, tokens in zip(self.batch.reqs, self.tokens, strict=True)
+            ]
+            bindings = self.peer.call("allocate", phase=self.phase, members=members)
+        else:
+            req = self.reservation
+            bindings = self.peer.call("reserve_pages", phase="prefill", members=[
+                {"request": int(req.rid), "tokens": req.kv_allocated_len}
+            ])
 
         # SGLang reserves physical page zero; core identities start at zero.
         indices = [index + self.page_size for binding in bindings for index in binding["indices"]]

@@ -50,25 +50,38 @@ class NativeWorkers:
             raise ValueError("Native control requires template metadata and core configuration first")
 
         with TemporaryDirectory(prefix="markov-control-") as directory, ExitStack() as resources:
+            configurations = {item["id"]: item for item in configuration["instances"]}
+            workers, groups = [], []
+            for instance in source["instances"]:
+                configured = configurations[instance["id"]]
+                model = Path(directory, instance["id"])
+                model.mkdir()
 
-            # Prediction consumes metadata; weights and device work stay in the simulated graph.
-            Path(directory, "config.json").write_text(json.dumps(source["model_config"]))
+                # Each native world reads its own metadata and rendezvous; no model weights are loaded.
+                (model / "config.json").write_text(json.dumps(instance["model_config"]))
+                first = len(workers)
+                for rank in range(instance["tp"] * instance["pp"]):
+                    workers.append((instance, configured["settings"], str(model), rank))
+                for group in configured["groups"]:
+                    begin = first + group["stage"] * instance["tp"]
+                    groups.append({**group, "instance": instance["id"],
+                                   "members": tuple(range(begin, begin + instance["tp"]))})
             connections, children = [], []
-            for _ in range(source["tp"] * source["pp"]):
+            for _ in workers:
                 parent, child = Pipe()
                 connections.append(resources.enter_context(parent))
                 children.append(resources.enter_context(child))
             context = multiprocessing.start_processes(
                 cls.worker,
-                args=(source, configuration["settings"], directory, kernel_python, children),
-                nprocs=source["tp"] * source["pp"],
+                args=(workers, kernel_python, children),
+                nprocs=len(workers),
                 start_method="spawn",
                 join=False,
             )
             for child in children:
                 child.close()
             try:
-                NativeCalls(peer, connections, context, source["tp"], configuration["groups"]).run()
+                NativeCalls(peer, connections, context, groups).run()
             finally:
                 for process in context.processes:
                     if process.is_alive():
@@ -80,28 +93,37 @@ class NativeWorkers:
                         process.join()
 
     @staticmethod
-    def worker(rank, source, settings, directory, kernel_python, connections) -> None:
-        for index, connection in enumerate(connections):
-            if index != rank:
+    def worker(index, workers, kernel_python, connections) -> None:
+        source, settings, directory, rank = workers[index]
+        for position, connection in enumerate(connections):
+            if position != index:
                 connection.close()
         CpuDeclarations.install(kernel_python)
 
         from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler
         from sglang.srt.distributed import parallel_state
 
-        peer = WorkerPeer(connections[rank])
+        peer = WorkerPeer(connections[index])
         try:
             from markov_control.adapters.frameworks.sglang.pipeline import PipelineScheduler
 
-            implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
+            if source["mode"] != "null":
+                from markov_control.adapters.frameworks.sglang.disaggregated import DisaggregatedScheduler
+
+                implementation = DisaggregatedScheduler
+            else:
+                implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
             scheduler = implementation(peer, settings, directory, source, rank)
             peer.send({"kind": "ready"})
-            scheduler.run_event_loop()
+            try:
+                scheduler.run_event_loop()
+            except NativeStopped:
+                pass
             peer.send({"kind": "stopped"})
         finally:
             parallel_state.destroy_model_parallel()
             parallel_state.destroy_distributed_environment()
-            connections[rank].close()
+            connections[index].close()
 
 
 @dataclass
@@ -114,12 +136,12 @@ class WorkerCall:
 class NativeCalls:
     """Keep worker calls suspended independently until their core response arrives."""
 
-    def __init__(self, peer, connections, context, tp, groups) -> None:
+    def __init__(self, peer, connections, context, groups) -> None:
         self.peer = peer
         self.connections = connections
         self.context = context
-        self.tp = tp
         self.groups = groups
+        self.membership = {rank: group for group in groups for rank in group["members"]}
         self.packets = defaultdict(deque)
         self.receivers = {}
         self.closing = False
@@ -131,10 +153,10 @@ class NativeCalls:
         self.polled = False
 
     def receive_worker(self, channel, rank, operation, message) -> None:
-        stage = rank // self.tp
-        members = tuple(self.connections[stage * self.tp : (stage + 1) * self.tp])
+        group = self.membership[rank]
+        members = tuple(self.connections[index] for index in group["members"])
         if operation in ("send_object", "receive_object"):
-            key = (message["source"], message["target"], message["channel"])
+            key = (group["instance"], message["source"], message["target"], message["channel"])
             if operation == "send_object":
                 if key in self.receivers:
                     self.receivers.pop(key).send(message["value"])
@@ -149,14 +171,14 @@ class NativeCalls:
                 self.receivers[key] = channel
             return
         if operation == "receive":
-            if rank != 0:
+            if group["stage"] != 0 or rank != group["members"][0]:
                 raise ValueError("Only the native input rank receives core arrivals")
             if self.closing:
                 channel.send({"kind": "stop"})
             else:
-                self.ready.append(WorkerCall(operation, {"kind": "input"}, (channel,)))
+                self.ready.append(WorkerCall(operation, {"kind": "input", "group": group["id"]}, (channel,)))
             return
-        message = {**message, "group": self.groups[stage]["id"]}
+        message = {**message, "group": group["id"]}
         if message["kind"] in ("capacity", "free_slots"):
             self.ready.append(WorkerCall(operation, message, (channel,)))
             return
@@ -186,7 +208,7 @@ class NativeCalls:
                     call.participants[0].send({"kind": "stop"})
                     del self.awaiting[identity]
             for key, channel in list(self.receivers.items()):
-                if key[2] == "requests":
+                if key[3] == "requests":
                     channel.send([StopInput()])
                     del self.receivers[key]
         else:
@@ -219,11 +241,11 @@ class NativeCalls:
 
             blocked.update(self.receivers.values())
             input_waiters = {call.participants[0] for call in self.awaiting.values() if call.operation == "receive"}
-            input_waiters.update(channel for key, channel in self.receivers.items() if key[2] == "requests")
+            input_waiters.update(channel for key, channel in self.receivers.items() if key[3] == "requests")
 
             # Input rank waits represent only that stage's native TP broadcast, never all PP participants.
-            for stage in range(len(self.groups)):
-                members = self.connections[stage * self.tp : (stage + 1) * self.tp]
+            for group in self.groups:
+                members = [self.connections[index] for index in group["members"]]
                 if members[0] in input_waiters:
                     blocked.update(members)
             if len(blocked) != len(self.connections):

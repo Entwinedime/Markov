@@ -6,35 +6,53 @@
 
 namespace markov {
 
-NativeController::NativeController(ServingSettings settings, std::vector<Request> requests, std::span<const NativeParticipant> participants,
-                                   std::size_t batch_limit, ControlPeer & peer)
+NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer)
     : requests_(std::move(requests)),
-      input_group_(participants.front().group),
       peer_(peer) {
-    auto bindings = nlohmann::json::array();
-    for (const auto & participant : participants) {
-        groups_.emplace(participant.group, std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage));
-        bindings.push_back({
-            {    "id", participant.group },
-            { "stage", participant.stage }
+    auto configuration = nlohmann::json::array();
+    const NativeInstance * source = nullptr;
+    const NativeInstance * destination = nullptr;
+    for (const auto & instance : instances) {
+        inputs_.emplace(instance.id, Input{ instance.participants.front().group, std::nullopt, 0, std::nullopt, 0 });
+        auto bindings = nlohmann::json::array();
+        for (const auto & participant : instance.participants) {
+            groups_.emplace(participant.group,
+                            std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage, instance.role));
+            instances_.emplace(participant.group, instance.id);
+            bindings.push_back({
+                {    "id", participant.group },
+                { "stage", participant.stage }
+            });
+        }
+        const auto & settings = instance.settings;
+        configuration.push_back({
+            {       "id",    instance.id                         },
+            {   "groups",                     std::move(bindings) },
+            { "settings",
+             { { "max_running_requests", settings.max_running_requests },
+             { "max_total_tokens", settings.max_total_tokens },
+             { "page_size", settings.page_size },
+             { "max_prefill_tokens", settings.max_prefill_tokens },
+             { "microbatch_requests", instance.batch_limit } }   }
         });
+        if (instance.role == NativeRole::Prefill) source = &instance;
+        if (instance.role == NativeRole::Decode) destination = &instance;
     }
+    if (source && destination)
+        transfer_ = std::make_unique<NativeTransfer>(source->participants.front().group,
+                                                     destination->participants.front().group,
+                                                     source->participants.front().resources,
+                                                     destination->participants.front().resources);
     peer_.send({
-        {     "kind","configure"                     },
-        {   "groups",            std::move(bindings) },
-        { "settings",
-         { { "max_running_requests", settings.max_running_requests },
-         { "max_total_tokens", settings.max_total_tokens },
-         { "page_size", settings.page_size },
-         { "max_prefill_tokens", settings.max_prefill_tokens },
-         { "microbatch_requests", batch_limit } }   }
+        {      "kind",              "configure" },
+        { "instances", std::move(configuration) }
     });
     for (;;) {
         const auto call = receive_call();
         const auto & message = call.at("message");
         if (message.at("kind") == "ready") break;
         auto & group = *groups_.at(message.at("group").get<std::string>());
-        reply(call.at("id").get<std::size_t>(), group.resource_call(message, arrived_));
+        reply(call.at("id").get<std::size_t>(), group.resource_call(message, 0));
     }
 }
 
@@ -54,38 +72,42 @@ void NativeController::reply(std::size_t call, const nlohmann::json & result) {
 
 std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const GroupAdmission &) {
     while (!done()) {
+        if (transfer_) {
+            if (auto action = transfer_->plan(now_ns)) return action;
+        }
         if (!shutdown_ && (groups_.size() == 1 || idle_.size() == groups_.size())
-            && std::ranges::all_of(groups_, [](const auto & entry) { return entry.second->done(); })) {
+            && std::ranges::all_of(groups_, [](const auto & entry) { return entry.second->done(); }) && (!transfer_ || transfer_->settled())) {
 
-            // Workers leave at native input boundaries, then consume their remaining send handles before stopping.
+            // Workers leave at input boundaries and drain the native handles they still own.
             peer_.send({
                 { "kind", "shutdown" }
             });
-            input_call_.reset();
+            for (auto & [_, input] : inputs_) input.call.reset();
             shutdown_ = true;
         }
-        if (input_call_) {
-            const bool arrived = arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns;
-            const bool drained = groups_.size() > 1 && groups_.at(input_group_)->done() && idle_.contains(input_group_);
-            if (!drained && (!idle_sequence_ || *idle_sequence_ != sequence_ || arrived)) {
+        for (auto & [_, input] : inputs_) {
+            if (!input.call) continue;
+            const bool arrived = input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns;
+            const bool drained = groups_.size() > 1 && groups_.at(input.group)->done() && idle_.contains(input.group);
+            if (!drained && (!input.idle_sequence || *input.idle_sequence != sequence_ || arrived)) {
                 auto arrivals = nlohmann::json::array();
-                while (arrived_ < requests_.size() && requests_[arrived_].arrival_ns <= now_ns) {
-                    const auto & input = requests_[arrived_];
+                while (input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns) {
+                    const auto & request = requests_[input.arrived];
                     arrivals.push_back({
-                        {       "request",          arrived_++ },
-                        { "prompt_tokens", input.prompt_tokens },
-                        { "output_tokens", input.output_tokens }
+                        {       "request",       input.arrived++ },
+                        { "prompt_tokens", request.prompt_tokens },
+                        { "output_tokens", request.output_tokens }
                     });
                 }
-                reply(*input_call_,
+                reply(*input.call,
                       {
                           {     "kind",           "advance" },
                           {   "now_ns",              now_ns },
                           { "arrivals", std::move(arrivals) }
                 });
-                input_call_.reset();
-                idle_sequence_.reset();
-                input_sequence_ = sequence_;
+                input.call.reset();
+                input.idle_sequence.reset();
+                input.sequence = sequence_;
             }
         }
         const auto call = receive_call();
@@ -93,11 +115,12 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
         const auto & message = call.at("message");
         const auto identity = call.at("id").get<std::size_t>();
         const auto kind = message.at("kind").get<std::string>();
+        const auto name = message.at("group").get<std::string>();
+        auto & input = inputs_.at(instances_.at(name));
         if (kind == "input") {
-            input_call_ = identity;
+            input.call = identity;
             continue;
         }
-        const auto name = message.at("group").get<std::string>();
         auto & group = *groups_.at(name);
         if (kind == "stopped") {
             if (!group.settled()) throw std::invalid_argument("native participant stopped with unfinished requests or work");
@@ -111,26 +134,32 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
         }
         if (kind == "idle") {
             idle_.insert(name);
-
-            // A no-model round can still release resources; it must not hide progress since its input poll.
-            if (name == input_group_) idle_sequence_ = input_sequence_;
+            if (name == input.group) input.idle_sequence = input.sequence;
             continue;
         }
-        if (auto action = group.plan(message, now_ns, arrived_)) {
+        if (kind.starts_with("transfer_")) {
+            reply(identity, transfer_->call(message));
+            if (kind != "transfer_poll") ++sequence_;
+            continue;
+        }
+        if (auto action = group.plan(message, now_ns, input.arrived)) {
             running_calls_.emplace(action->task, identity);
             return action;
         }
-        reply(identity, group.resource_call(message, arrived_));
+        reply(identity, group.resource_call(message, input.arrived));
     }
     return std::nullopt;
 }
 
 void NativeController::start(const ServingAction & action) {
-    groups_.at(action.task.group)->start(action);
+    if (action.step != ServingStep::Transfer) groups_.at(action.task.group)->start(action);
     ++sequence_;
 }
 
 void NativeController::finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) {
+    if (transfer_) transfer_->finish(action);
+    ++sequence_;
+    if (action.step == ServingStep::Transfer) return;
     auto & group = *groups_.at(action.task.group);
     group.finish(action, program.returned_pages);
     reply(running_calls_.at(action.task),
@@ -143,8 +172,13 @@ void NativeController::finish(const ServingAction & action, const BatchProgram &
 }
 
 std::optional<std::int64_t> NativeController::next_arrival_ns(std::int64_t now_ns) const {
-    if (arrived_ == requests_.size()) return std::nullopt;
-    return std::max(now_ns, requests_[arrived_].arrival_ns);
+    std::optional<std::int64_t> next;
+    for (const auto & [_, input] : inputs_) {
+        if (input.arrived == requests_.size()) continue;
+        const auto arrival = std::max(now_ns, requests_[input.arrived].arrival_ns);
+        if (!next || arrival < *next) next = arrival;
+    }
+    return next;
 }
 
 bool NativeController::done() const { return stopped_.size() == groups_.size() && running_calls_.empty(); }

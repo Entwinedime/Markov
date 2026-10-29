@@ -73,7 +73,7 @@ class IndexedWritePrototypes:
                         "kind": "primitive",
                         "phase": "primitive",
                         "members": [],
-                        "parameters": {"R": shape[0] - 1, "B": members},
+                        "parameters": {"slot_capacity": shape[0] - 1, "B": members},
                         "observation": "source" if observed else "baseline",
                     }
                 )
@@ -82,7 +82,7 @@ class IndexedWritePrototypes:
                     with self.recording.scope("RuntimePrototype", batch=identity), self.operators:
                         with self.operators.values.metadata():
                             values = self.operators.values
-                            capacity_axis = values.bounded_parameter("R", 1, sys.maxsize)
+                            capacity_axis = values.bounded_parameter("slot_capacity", 1, sys.maxsize)
                             member_axis = values.bounded_parameter("B", 1, sys.maxsize)
                             values.shapes.bind_contiguous(target, (capacity_axis + 1, *shape[1:]))
                             for tensor in values.tensor_leaves(indices):

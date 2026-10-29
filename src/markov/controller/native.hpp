@@ -16,6 +16,7 @@
 #include "markov/controller/control.hpp"
 #include "markov/controller/control_peer.hpp"
 #include "markov/controller/native_group.hpp"
+#include "markov/controller/native_transfer.hpp"
 #include "markov/resources/kv_pool.hpp"
 
 namespace markov {
@@ -26,11 +27,18 @@ struct NativeParticipant {
     KvPool & resources;
 };
 
+struct NativeInstance {
+    std::string id;
+    NativeRole role;
+    ServingSettings settings;
+    std::size_t batch_limit;
+    std::vector<NativeParticipant> participants;
+};
+
 // The peer owns native queues and progress; this endpoint owns delivery and in-flight work only.
 class NativeController final : public ServingControl {
 public:
-    NativeController(ServingSettings settings, std::vector<Request> requests, std::span<const NativeParticipant> participants, std::size_t batch_limit,
-                     ControlPeer & peer);
+    NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer);
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
     void start(const ServingAction & action) override;
@@ -45,17 +53,23 @@ private:
     nlohmann::json receive_call();
     void reply(std::size_t call, const nlohmann::json & result);
 
+    struct Input {
+        std::string group;
+        std::optional<std::size_t> call;
+        std::size_t arrived = 0;
+        std::optional<std::size_t> idle_sequence;
+        std::size_t sequence = 0;
+    };
+
     std::vector<Request> requests_;
     std::map<std::string, std::unique_ptr<NativeGroup>> groups_;
     std::set<std::string> stopped_;
     std::set<std::string> idle_;
-    std::string input_group_;
+    std::map<std::string, Input> inputs_;
+    std::map<std::string, std::string> instances_;
+    std::unique_ptr<NativeTransfer> transfer_;
     ControlPeer & peer_;
     std::map<TaskIdentity, std::size_t> running_calls_;
-    std::optional<std::size_t> input_call_;
-    std::size_t arrived_ = 0;
-    std::optional<std::size_t> idle_sequence_;
-    std::size_t input_sequence_ = 0;
     std::size_t sequence_ = 0;
     bool shutdown_ = false;
 };

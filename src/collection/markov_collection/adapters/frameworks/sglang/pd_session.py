@@ -46,8 +46,23 @@ class NativeDisaggregatedSession:
         requests[-1] = (requests[-1][0], 1)
         return tuple(requests)
 
+    @staticmethod
+    def structure_submissions(requests: Any) -> list[list[int]]:
+
+        # Observe scalar Prefill separately from the multi-request serving path.
+        groups = [[index] for index, (prompt, _) in enumerate(requests) if prompt == 1]
+        bulk = [index for index, (prompt, _) in enumerate(requests) if prompt != 1]
+        if bulk:
+            groups.append(bulk)
+        return groups
+
     def __init__(self, request: dict[str, Any]) -> None:
         self.request = request
+        self.submissions = request["submissions"]
+        if not all(self.submissions) or sorted(index for group in self.submissions for index in group) != list(
+            range(len(request["requests"]))
+        ):
+            raise ValueError("PD submissions must contain every request exactly once")
         source = request.get("serving_input")
         if source is not None and [[item["prompt_tokens"], item["output_tokens"]] for item in source["requests"]] != [
             list(pair) for pair in request["requests"]
@@ -127,8 +142,6 @@ class NativeDisaggregatedSession:
             "--disable-radix-cache",
             "--disable-overlap-schedule",
             "--disable-cuda-graph",
-            "--disaggregation-decode-extra-slots",
-            "0",
             "--mem-fraction-static",
             "0.8",
             "--log-level",
@@ -192,13 +205,13 @@ class NativeDisaggregatedSession:
         while not all(directory.is_dir() for directory in directories):
             time.sleep(0.05)
 
-    def generate(self, device: int, prefix: str, pairs: Any, rooms: list[int]) -> list[Any]:
+    def generate(self, device: int, prefix: str, pairs: Any, rooms: list[int], indices: list[int]) -> list[Any]:
         payload = {
             "input_ids": [[1] * prompt for prompt, _ in pairs],
             "sampling_params": [
                 {"max_new_tokens": output, "temperature": 0, "ignore_eos": True} for _, output in pairs
             ],
-            "rid": [f"{prefix}/{index}" for index in range(len(pairs))],
+            "rid": [f"{prefix}/{index}" for index in indices],
             "bootstrap_host": ["127.0.0.1"] * len(pairs),
             "bootstrap_port": [self.bootstrap_port] * len(pairs),
             "bootstrap_room": rooms,
@@ -223,12 +236,19 @@ class NativeDisaggregatedSession:
                 started_profiles = []
                 profiles.callback(self.stop_profiles, executor, started_profiles)
                 for prefix, pairs in (("warmup", warmup), ("baseline", requests), ("capture", requests)):
-                    rooms = list(range(room, room + len(pairs)))
-                    room += len(pairs)
-                    futures = [executor.submit(self.generate, device, prefix, pairs, rooms) for device in range(2)]
-                    responses = {
-                        role: future.result() for role, future in zip(("prefill", "decode"), futures, strict=True)
-                    }
+                    groups = [list(range(len(pairs)))] if prefix == "warmup" else self.submissions
+                    responses: dict[str, list[Any]] = {"prefill": [], "decode": []}
+                    for indices in groups:
+                        rooms = list(range(room, room + len(indices)))
+                        room += len(indices)
+                        futures = [
+                            executor.submit(
+                                self.generate, device, prefix, [pairs[index] for index in indices], rooms, indices
+                            )
+                            for device in range(2)
+                        ]
+                        for role, future in zip(responses, futures, strict=True):
+                            responses[role].extend(future.result())
                     write_json(self.output / "responses" / f"{prefix}.json", responses, indent=2)
                     for role, rows in responses.items():
                         expected = {
