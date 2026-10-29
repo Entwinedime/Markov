@@ -11,14 +11,27 @@
 namespace markov::trace_graph::source {
 namespace {
 
-bool same_native_work(const planning::NativeCall & before, const planning::NativeCall & after) {
-    return before.kind == after.kind && before.work == after.work && before.launches == after.launches && before.synchronization == after.synchronization
-           && before.host_transfer == after.host_transfer && before.preparation == after.preparation && before.incoming_stream == after.incoming_stream
-           && before.queue_name == after.queue_name && before.device_control == after.device_control && before.worker_first_use == after.worker_first_use;
+bool same_worker_work(const planning::NativeCall & before, const planning::NativeCall & after) {
+    if (before.kind != after.kind || before.synchronization != after.synchronization || before.host_transfer != after.host_transfer
+        || before.preparation != after.preparation || before.incoming_stream != after.incoming_stream || before.queue_name != after.queue_name
+        || before.device_control != after.device_control || before.worker_first_use != after.worker_first_use)
+        return false;
+    const auto same_submission = [&](const planning::Work & left, const planning::Work & right) {
+        const auto & left_features = before.worker_features ? *before.worker_features : left.features;
+        const auto & right_features = after.worker_features ? *after.worker_features : right.features;
+        return left.kind == right.kind && left_features == right_features;
+    };
+    return same_submission(before.work, after.work) && std::ranges::equal(before.launches, after.launches, same_submission);
 }
 
 bool same_work(const planning::NativeCall & before, const planning::NativeCall & after) {
-    return same_native_work(before, after) && before.caller_work == after.caller_work;
+    return same_worker_work(before, after) && before.work == after.work && before.launches == after.launches && before.caller_work == after.caller_work;
+}
+
+bool same_caller_step(const planning::NativeCall & before, const planning::NativeCall & after) {
+    if (!before.caller_work || !after.caller_work) return same_work(before, after);
+    return before.kind == after.kind && before.caller_work->kind == after.caller_work->kind && before.preparation == after.preparation
+           && before.synchronization == after.synchronization && before.queue_name == after.queue_name && before.incoming_stream == after.incoming_stream;
 }
 
 bool sources_complete(const planning::NativeCall & call) {
@@ -66,14 +79,18 @@ void SourceContext::bind_native_sources(Index frame, Index preparation, std::spa
             const planning::NativeCall * match = nullptr;
             bool ambiguous = false;
             for (const auto & original : binding.definitions) {
-                if (!same_native_work(original, call)) continue;
+                if (!same_worker_work(original, call)) continue;
                 if (match) ambiguous = true;
                 match = &original;
             }
             if (!match || ambiguous) continue;
             call.sources.worker_before = match->sources.worker_before;
             call.sources.worker_after = match->sources.worker_after;
-            call.sources.launches = match->sources.launches;
+            call.sources.dispatch = match->sources.dispatch;
+            for (Index id = 0; id < call.launches.size(); ++id) {
+                call.sources.launches[id].worker_before = match->sources.launches[id].worker_before;
+                if (call.launches[id] == match->launches[id]) call.sources.launches[id].device = match->sources.launches[id].device;
+            }
         }
     }
 
@@ -91,21 +108,28 @@ void SourceContext::bind_native_sources(Index frame, Index preparation, std::spa
             const auto & candidate = preparation_native_calls_[other_frame][id];
             const auto & owner = observations_.compute_frames[other_frame].preparations[id];
             if (candidate.issue || owner.region.resource != original.region.resource || owner.role != original.role) continue;
-            if (std::ranges::equal(candidate.definitions, calls, same_work)) {
+
+            // A fragment can remain unchanged when another step in the same
+            // ordered caller recipe changes its work.
+            if (std::ranges::equal(candidate.definitions, calls, same_caller_step)) {
                 for (Index call = 0; call < calls.size(); ++call) {
+                    if (calls[call].caller_work != candidate.definitions[call].caller_work) continue;
                     auto & sources = calls[call].sources;
                     if (!sources.caller_before) sources.caller_before = candidate.definitions[call].sources.caller_before;
                     if (!sources.caller_after) sources.caller_after = candidate.definitions[call].sources.caller_after;
-                    if (!sources.dispatch) sources.dispatch = candidate.definitions[call].sources.dispatch;
                 }
             }
             for (auto & call : calls) {
                 for (const auto & source : candidate.definitions) {
-                    if (!same_native_work(source, call)) continue;
+                    if (!same_worker_work(source, call)) continue;
+                    if (!call.sources.dispatch) call.sources.dispatch = source.sources.dispatch;
                     if (!call.sources.worker_before) call.sources.worker_before = source.sources.worker_before;
-                    for (Index launch = 0; launch < call.launches.size(); ++launch)
+                    for (Index launch = 0; launch < call.launches.size(); ++launch) {
                         if (!call.sources.launches[launch].worker_before)
                             call.sources.launches[launch].worker_before = source.sources.launches[launch].worker_before;
+                        if (!call.sources.launches[launch].device && call.launches[launch] == source.launches[launch])
+                            call.sources.launches[launch].device = source.sources.launches[launch].device;
+                    }
                     if (!call.sources.worker_after) call.sources.worker_after = source.sources.worker_after;
                 }
             }
@@ -219,7 +243,7 @@ void SourceContext::index_native_work() {
                 const auto & call = queues[binding.calls[id]];
                 if (previous_worker_end[binding.calls[id]]) {
                     const auto ready = std::max(call.submission.begin_ns, *previous_worker_end[binding.calls[id]]);
-                    sources.dispatch = retain_native_work(definition.work,
+                    sources.dispatch = retain_native_work(definition.worker_work(definition.work),
                                                           "dispatch_interval",
                                                           { call.execution.resource, ready, call.execution.begin_ns, call.execution.record },
                                                           false,
@@ -284,13 +308,15 @@ void SourceContext::index_native_work() {
                         copy = runtime.region;
                     }
                     if (!copy || ambiguous) continue;
-                    sources.worker_before = retain_native_work(definition.work,
+                    sources.worker_before = retain_native_work(definition.worker_work(definition.work),
                                                                "worker_launch_service",
                                                                { execution.resource, execution.begin_ns, copy->begin_ns, execution.record });
-                    sources.worker_after =
-                        retain_native_work(definition.work, "worker_return_service", { execution.resource, copy->end_ns, execution.end_ns, execution.record });
+                    sources.worker_after = retain_native_work(definition.worker_work(definition.work),
+                                                              "worker_return_service",
+                                                              { execution.resource, copy->end_ns, execution.end_ns, execution.record });
                 }
-                else if (definition.launches.empty()) sources.worker_after = retain_native_work(definition.work, "worker_return_service", execution);
+                else if (definition.launches.empty())
+                    sources.worker_after = retain_native_work(definition.worker_work(definition.work), "worker_return_service", execution);
                 else {
                     const auto & lane = submissions[execution.resource];
                     std::map<std::pair<Time, Index>, std::set<Index>> ports;
@@ -334,8 +360,9 @@ void SourceContext::index_native_work() {
                         auto & source = sources.launches[launch];
                         const auto submitted = api_ports.size() == ports.size() ? api_ports[launch] : port.first;
                         if (ordinary_worker)
-                            source.worker_before =
-                                retain_native_work(work, "worker_launch_service", { execution.resource, cursor, submitted, execution.record });
+                            source.worker_before = retain_native_work(definition.worker_work(work),
+                                                                      "worker_launch_service",
+                                                                      { execution.resource, cursor, submitted, execution.record });
 
                         // A parent envelope or unresolved task cannot supply
                         // a complete exclusive device service.
@@ -353,8 +380,9 @@ void SourceContext::index_native_work() {
                         ++launch;
                     }
                     if (ordinary_worker)
-                        sources.worker_after =
-                            retain_native_work(definition.work, "worker_return_service", { execution.resource, cursor, execution.end_ns, execution.record });
+                        sources.worker_after = retain_native_work(definition.worker_work(definition.work),
+                                                                  "worker_return_service",
+                                                                  { execution.resource, cursor, execution.end_ns, execution.record });
                 }
             }
         }

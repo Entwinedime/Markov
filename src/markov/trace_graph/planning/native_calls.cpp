@@ -6,6 +6,12 @@
 
 namespace markov::trace_graph::planning {
 
+Work NativeCall::worker_work(const Work & operation) const {
+    auto result = operation;
+    if (worker_features) result.features = *worker_features;
+    return result;
+}
+
 KernelUse PreparationCache::use(const KernelPreparation & preparation, std::size_t caller) {
     if (initial_ == KernelCacheInitial::Prepared || !prepared_[caller].insert(preparation.specialization).second) return KernelUse::Prepared;
 
@@ -86,7 +92,8 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         }
 
         auto dispatch = caller_;
-        const auto ready = append(call.work, "dispatch_interval", resources.worker, dispatch, true);
+        const auto worker_work = call.worker_work(call.work);
+        const auto ready = append(worker_work, "dispatch_interval", resources.worker, dispatch, true);
         steps_[ready].source_native_work = call.sources.dispatch;
 
         // Dispatch samples start after both submission and the previous task.
@@ -101,7 +108,7 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         }
         const auto device = call.incoming_stream ? incoming.value() : resources.device;
         if (call.kind == CallKind::HostUpload) {
-            cpu(call.work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
+            cpu(worker_work, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, call.sources.worker_before);
             const auto & transfer = call.host_transfer.value();
             const auto copied = append(transfer, transfer.kind.timing_scope.c_str(), resources.worker, worker_);
             depend(device_ ? std::optional(device_->completion) : std::nullopt, copied);
@@ -114,14 +121,14 @@ bool NativePlan::extend(std::span<const NativeCall> calls, CallResources resourc
         for (std::size_t id = 0; id < call.launches.size(); ++id) {
             const auto & launch = call.launches[id];
             const auto sources = call.sources.launches.empty() ? NativeLaunchSources{} : call.sources.launches[id];
-            cpu(launch, "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, sources.worker_before);
+            cpu(call.worker_work(launch), "worker_launch_service", "worker_launch_residual_interval", resources.worker, worker_, sources.worker_before);
             const auto kernel = append(launch, "device_service", device, device_tail);
             device_ = DeviceProducer{ kernel, device };
             steps_[kernel].source_operation = call.source_operation;
             steps_[kernel].source_native_work = sources.device;
             depend(worker_, kernel);
         }
-        cpu(call.work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_, call.sources.worker_after);
+        cpu(worker_work, "worker_return_service", "worker_return_residual_interval", resources.worker, worker_, call.sources.worker_after);
         if (call.kind == CallKind::HostUpload) {
             const auto & synchronization = call.synchronization.value();
             const auto synchronized = append(synchronization, synchronization.kind.timing_scope.c_str(), resources.caller, caller_);

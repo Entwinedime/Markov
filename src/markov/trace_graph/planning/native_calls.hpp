@@ -55,6 +55,10 @@ struct NativeCall {
     NativeSources sources = {};
     DeviceControl device_control = DeviceControl::None;
     std::optional<Work> worker_first_use = std::nullopt;
+
+    // Submission can be unchanged while the device processes a different shape.
+    std::optional<Features> worker_features = std::nullopt;
+    Work worker_work(const Work & operation) const;
 };
 
 struct NativeSequence {

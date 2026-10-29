@@ -45,13 +45,20 @@ void queued(std::vector<NativeCall> & calls, const std::string & name, const std
     calls.back().queue_name = std::move(queue_name);
 }
 
-NativeSequence sequence(std::vector<NativeCall> calls, Part part, const Features & context) {
+NativeSequence sequence(std::vector<NativeCall> calls, Part part, const FrameInput & input) {
     const auto role = part == Part::RequestTable ? "request_table" : part == Part::ForwardInputs ? "forward" : "sampling_positions";
     for (std::size_t id = 0; id < calls.size(); ++id) {
         auto caller = calls[id].work;
         caller.kind.implementation = std::string("sglang.batch_input_preparation.") + role;
         caller.kind.timing_scope = "cpu_service";
-        caller.features.insert(context.begin(), context.end());
+
+        // Entry includes framework work outside the native call; retain its
+        // length context until that prelude has an independent description.
+        if (id == 0 && part != Part::SamplingPositions) {
+            caller.features["query_tokens"] = input.query_tokens;
+            caller.features["context_tokens"] = input.context_tokens;
+            caller.features["prefix_tokens"] = input.context_tokens - input.query_tokens;
+        }
 
         // The first pre-submit interval includes entry; the final return
         // includes the sequence tail. Neither introduces another queue port.
@@ -92,17 +99,21 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
     std::vector<NativeCall> calls;
     if (part_ == Part::SamplingPositions) {
         queued(calls, "prefill.sampling_positions", "aten.sub:" + sequence_dtype_, shape, false, "aclnnSubs");
-        return sequence(std::move(calls), part_, shape);
+        return sequence(std::move(calls), part_, input);
     }
-    shape["query_tokens"] = input.query_tokens;
-    shape["context_tokens"] = input.context_tokens;
-    shape["prefix_tokens"] = input.context_tokens - input.query_tokens;
     if (part_ == Part::RequestTable) {
         shape["table_columns"] = table_columns_;
         if (phase == Phase::Prefill) {
             upload(calls, prefix + "prefix_pointers", "uint64", 8, shape);
             queued(calls, prefix + "request_table.write", "triton.ascend.write_req_to_token_pool", shape, false, "write_req_to_token_pool_triton");
             auto & work = calls.back().launches.front();
+
+            // Runtime lengths live in device tensors; host launch geometry is
+            // the batch grid and the constexpr table stride.
+            calls.back().worker_features = {
+                {    "batch_size", input.batch_size },
+                { "table_columns",   table_columns_ }
+            };
 
             // The native kernels iterate over blocks of 512 token locations.
             work.features = {
@@ -176,6 +187,10 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             upload(calls, prefix + "extend_lengths", "int32", 4, shape);
             upload(calls, prefix + "prefix_lengths", "int32", 4, shape);
             queued(calls, prefix + "positions", "triton.ascend.compute_position", tokens, false, "compute_position_kernel");
+            calls.back().worker_features = {
+                { "batch_size", input.batch_size },
+                { "has_prefix",                1 }
+            };
             calls.back().launches.front().features = {
                 {   "batch_size",                    input.batch_size },
                 { "query_tokens",                  input.query_tokens },
@@ -198,7 +213,7 @@ NativeSequence InputPreparation::describe(Phase phase, const FrameInput & input,
             queued(calls, prefix + "positions.clamp", "aten.clamp_min:" + sequence_dtype_, shape, false, "aclnnClamp");
         }
     }
-    return sequence(std::move(calls), part_, shape);
+    return sequence(std::move(calls), part_, input);
 }
 
 std::unique_ptr<const CallSequence> read(const nlohmann::json & metadata, Part part, bool deterministic_sampling = false) {
