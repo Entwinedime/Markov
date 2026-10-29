@@ -39,7 +39,7 @@ scripts/markov.sh capture --request /path/to/request.json
 对应原生环境随调用输入和 base 配置保存。非 FIA 来源仍可构图，但现有注意力变换与独立成本不授予其支持资格；其他采集组合尚未恢复。
 
 execution.capture 另声明推理镜像 image、独占设备数组 devices、容器 memory_limit_gib/cpus，以及 budget。
-镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令将本项目装入已有推理环境。
+镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令在已有 SDK 环境中安装项目并构建原生观察库，需有 C++23 工具链、CMake 和 CANN 头文件。
 预算六项均为正整数：starts、wall_sec、requests、input_tokens、output_tokens、retained_mib。它们分别约束累计启动、墙钟秒、
 请求、输入/输出 tokens 和当前保留 MiB；失败消耗不清零，输出失败未取得实际 token 数时按请求上限保守计入。
 采集前检查声明设备空闲，并与同一入口的其他采集任务串行；只挂载所选设备、只读模型与驱动、本任务输出，容器无网络。
@@ -52,6 +52,8 @@ workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_
 成功返回本次 profile_manifest.json。其文件来自同一次运行：原始 trace、轻量观察与客户端报告，另保留 base 配置和时钟锚点。
 探针记录实际接收与最终结果发送端口；导出前检查每个请求恰有一对端口及必要的输入准备观察。
 profiling_ready 只授予这些声明通道的导出资格，不证明全部语义、设备依赖、正常性能或 E2E 预测正确。
+采集期间另观察原生事件记录、流等待、事件/流同步，保留实际句柄和返回码，借 CANN 连接编号关联设备命令；
+事件等待由目标生产者依赖产生，不迁移 source 阻塞时长。原生库只在推理 SDK 构建，纯 modeling 不加载它；采集窗口外关闭记录。
 
 输出位于 execution.output/base，包含累计状态及每次 captures 子目录。已成功的任务默认拒绝重采；
 将返回的 manifest 显式填入 base.manifest 可复用，或加 --recapture 重新采集并保留已有额度消耗和文件。
@@ -83,6 +85,7 @@ Prefill 另记录主机端 token 前缀以建立跨请求复用关系；张量�
 按实际 rank 关联 trace。它用于统一时钟，不是 CPU 成本校正；profiler 未初始化时不生成伪造锚点。
 
 同一次完整 base 采集的 sidecar.python_probe_files 可声明 `{"path":"input_facts_123.jsonl","format":"jsonl"}`。
+trace.ld_preload_trace_files 同样可以显式声明 jsonl，记录原生 API；失败 API 保留原始结果，不作为成功同步依据。
 未声明 format 的既有记录仍按 Chrome 容器读取；不按文件名猜格式，未完成的 JSON 行会报错。
 结构解释按请求、执行阶段、CPU 资源及原始时间区间关联，在所有通道读完后统一处理，不依赖 manifest 文件顺序。
 只有已证明的普通批次入口才取消不相关的 token 长度条件；上传字节、张量分配和设备工作仍使用实际规模。
