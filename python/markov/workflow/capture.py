@@ -85,6 +85,7 @@ class BaseCapture:
         plan = {
             "deployment": asdict(self.request.deployment),
             "server": server,
+            "environment": adapter.capture_environment(),
             "workload": asdict(workload),
             "budget": remaining,
         }
@@ -120,7 +121,7 @@ class BaseCapture:
             "OMP_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
-            **adapter.capture_environment(),
+            **plan["environment"],
         }
         for key, value in environment.items():
             args += ["-e", f"{key}={value}"]

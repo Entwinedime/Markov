@@ -7,11 +7,14 @@ import time
 from markov.instrumentation.events import EventWriter
 from markov.adapters.sglang.preparation_probe import PreparationProbe
 from markov.adapters.sglang.request_probe import RequestProbe
+from markov.adapters.sglang.compute_probe import ComputeProbe
+from markov.adapters.sglang.cache_probe import CacheProbe
 
 
 class InputFactsProbe:
     def __init__(self, writer: EventWriter):
         self.writer = writer
+        self.clock_process = None
 
     def extend(self, original, batch):
         return self.schedule(original, batch, "prefill")
@@ -22,6 +25,14 @@ class InputFactsProbe:
     def schedule(self, original, batch, phase):
         from sglang.srt.server_args import get_global_server_args
 
+        if self.clock_process != os.getpid():
+            from markov.adapters.ascend.clock import sample_clock
+
+            anchor = sample_clock()
+            if anchor is not None:
+                at = anchor["samples"][0]["unix_ns"]
+                self.writer.write("runtime.clock_anchor", at, at, anchor)
+                self.clock_process = os.getpid()
         requests = batch.reqs
         server = get_global_server_args()
         fields = {
@@ -101,3 +112,5 @@ def install() -> None:
     )
     PreparationProbe(writer).install()
     RequestProbe(writer).install()
+    ComputeProbe(writer).install()
+    CacheProbe(writer).install()

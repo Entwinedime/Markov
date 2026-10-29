@@ -1,7 +1,6 @@
 """Observe actual input boundaries and tensor layouts without reading device data."""
 
 import os
-import time
 
 from markov.instrumentation.events import EventWriter
 
@@ -89,11 +88,6 @@ class PreparationProbe:
         with self.writer.span("runtime.hicache.decode_allocation", fields):
             return original(batch, token_per_req)
 
-    def input_boundary(self, original, runner, forward_batch, pp_proxy_tensors=None, **kwargs):
-        begin = time.time_ns()
-        self.writer.write("runtime.phase.forward_input_boundary", begin, begin, {})
-        return original(runner, forward_batch, pp_proxy_tensors, **kwargs)
-
     def metadata(self, original, backend, forward_batch):
         table = backend.req_to_token_pool.req_to_token
         sequence, indices, extend = (
@@ -140,7 +134,6 @@ class PreparationProbe:
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_decode": self.decode,
             "sglang.srt.managers.schedule_batch.alloc_for_extend": self.extend_table,
             "sglang.srt.managers.schedule_batch.alloc_for_decode": self.decode_table,
-            "sglang.srt.model_executor.runner.eager_runner.EagerRunner.load_batch": self.input_boundary,
             "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.init_forward_metadata": self.metadata,
         }
         for target, observer in bindings.items():

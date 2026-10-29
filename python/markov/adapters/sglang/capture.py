@@ -40,10 +40,12 @@ def server_arguments(deployment, configuration):
 
 
 def capture_environment():
+    """Select FIA to match the restored attention rules and independent responses."""
     return {
         "SGLANG_NPU_PROFILER_SERIAL_EXPORT": "1",
         "SGLANG_NPU_PROFILER_LEVEL": "2",
         "TRITON_ENABLE_TASKQUEUE": "true",
+        "ASCEND_USE_FIA": "1",
         "MARKOV_INPUT_FACTS": "/capture/probe",
         "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
     }
@@ -100,7 +102,14 @@ class Capture:
         command = [sys.executable, "-m", "markov.adapters.sglang.capture", "server", "--input", str(self.path)]
         write_json(
             self.directory / "config.json",
-            {"deployment": self.plan["deployment"], "server": {"command": command, "arguments": self.plan["server"]}},
+            {
+                "deployment": self.plan["deployment"],
+                "server": {
+                    "command": command,
+                    "arguments": self.plan["server"],
+                    "environment": self.plan["environment"],
+                },
+            },
         )
         profiling = False
         with (self.directory / "server.log").open("w") as log:
@@ -203,12 +212,18 @@ class Capture:
         }
         ports = {name: Counter() for name in ("runtime.request.socket_received", "runtime.response.scheduler_send")}
         expected = {row["logical_request_id"] for row in self.rows}
+        anchors = {}
         for path in probes:
             roles = set()
             identities = set()
             with path.open() as stream:
                 for line in stream:
                     event = json.loads(line)
+                    if event["name"] == "runtime.clock_anchor":
+                        rank = event["args"]["rank"]
+                        if rank in anchors:
+                            raise RuntimeError(f"Duplicate runtime clock anchor for rank {rank}")
+                        anchors[rank] = event["args"]
                     if event["args"].get("status", "returned") == "returned":
                         roles.add(event["name"])
                         identities.update(event["args"].get("request_ids", []))
@@ -221,7 +236,9 @@ class Capture:
         for name, counts in ports.items():
             if counts != Counter({identity: 1 for identity in expected}):
                 raise RuntimeError(f"Request transport ports are incomplete or ambiguous: {name}: {dict(counts)}")
-        files = [{"path": str(path.relative_to(self.directory)), "host_clock": trace_clock(path)} for path in traces]
+        files = [
+            {"path": str(path.relative_to(self.directory)), "host_clock": trace_clock(path, anchors)} for path in traces
+        ]
         write_json(
             self.directory / "profile_manifest.json",
             {
@@ -231,7 +248,7 @@ class Capture:
                 "status": "completed",
                 "profiling_ready": True,
                 "dry_run": False,
-                "scope": "Raw CPU/device trace and input preparation; remaining semantic and native-hook coverage requires qualification",
+                "scope": "Raw CPU/device trace and observed eager compute; semantic, dependency and cost coverage require qualification",
                 "trace": {"torch_trace_files": files, "ld_preload_trace_files": []},
                 "sidecar": {
                     "python_probe_files": [
