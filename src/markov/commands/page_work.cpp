@@ -192,6 +192,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             { "response_start_ns", time(request.response, true) },
             { "response_complete_ns", time(request.response) }
         };
+        item["prefill_prefix_published_ns"] = time(request.prefill_prefix_published);
         if (source.graph().requests.size() == program.requests().size()) {
             const auto & endpoint = source.graph().requests[i];
             item["source_residuals"] = {
@@ -256,6 +257,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "Partial request ports exclude query/admission, collective envelope CPU, other cross-stream dependencies and client pacing. "
          "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
          "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
+         "An unfinished Prefill publishes its page-aligned prompt after participant results are readable and overlap caller submission is available; "
+         "write policy can start background backup before Decode completes. CPU cache-update latency remains outside this subset. "
          "Response still follows all selected work; CPU result processing and final-send handoff remain unmodeled. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };

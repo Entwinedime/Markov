@@ -246,6 +246,28 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     compute_->start(runtime, cause_);
 }
 
+void CacheProgram::publish_prefill_prefix(ProgramRuntime & runtime) {
+    const auto & observed = source_.observations();
+    const auto & tokens = observed.request_tokens.at(observed.requests[request_].identity);
+    const auto prompt = observed.token_paths.pages(tokens.prompt.value().path, page_tokens_);
+    const auto leaf = cache_.commit_device(prompt, *buffer_);
+    cache_.unpin_device(*request_pin_);
+    request_pin_ = leaf;
+    cache_.pin_device(leaf);
+    requests_[request_].prefill_prefix_published = cause_;
+    backup_prefix(runtime, leaf);
+}
+
+void CacheProgram::backup_prefix(ProgramRuntime & runtime, RadixId leaf) {
+    std::vector<RadixId> path;
+    for (auto node = leaf; node != 0; node = cache_.tree().nodes()[node].parent) path.push_back(node);
+    for (auto at = path.rbegin(); at != path.rend(); ++at) {
+        if (!cache_.backup_required(*at) || !make_host_room(cache_.tree().nodes()[*at].pages.size())) continue;
+        const auto started = cache_.begin_backup(*at);
+        if (started.status == CopyStatus::Started && !copy(runtime, *started.transfer, *at, CopyKind::Backup, started.pages, false)) return;
+    }
+}
+
 void CacheProgram::commit(ProgramRuntime & runtime) {
     const auto & observed = source_.observations();
     const auto & tokens = observed.request_tokens.at(observed.requests[request_].identity);
@@ -256,13 +278,7 @@ void CacheProgram::commit(ProgramRuntime & runtime) {
     cache_.unpin_device(*request_pin_);
     request_pin_.reset();
 
-    std::vector<RadixId> path;
-    for (auto node = leaf; node != 0; node = cache_.tree().nodes()[node].parent) path.push_back(node);
-    for (auto at = path.rbegin(); at != path.rend(); ++at) {
-        if (!cache_.backup_required(*at) || !make_host_room(cache_.tree().nodes()[*at].pages.size())) continue;
-        const auto started = cache_.begin_backup(*at);
-        if (started.status == CopyStatus::Started && !copy(runtime, *started.transfer, *at, CopyKind::Backup, started.pages, false)) return;
-    }
+    backup_prefix(runtime, leaf);
     respond(runtime);
 }
 
@@ -277,6 +293,10 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
     }
     if (event.owner == ComputeProgram::owner) {
         compute_->on_event(runtime, event);
+        if (!requests_[request_].prefill_prefix_published && compute_->prefill_result_ready()) {
+            cause_ = compute_->prefill_result_ready();
+            publish_prefill_prefix(runtime);
+        }
         if (compute_->complete()) {
             compute_stats_.add(compute_->stats());
             compute_.reset();

@@ -108,6 +108,8 @@ ComputeProgram::ComputeProgram(const source::SourceContext & source, std::vector
         const auto * result = source.frame_result(input.frame);
         // shortcut: targets inherit source scheduling; require a target policy before supporting mode changes.
         frame.overlap = result && result->overlap;
+        frame.publishes_prefill_prefix = observed.compute_frames[input.frame].phase == Phase::Prefill && result && result->processed
+                                         && result->processed->finished_after.size() == 1 && !result->processed->finished_after.front();
         stats_.frames.push_back({ input.frame, {}, {}, {}, {} });
         if (!source.frame_cpu_order_supported(input.frame)) {
             issue_ = "overlapping_or_cross_thread_cpu_regions_require_explicit_ports";
@@ -270,6 +272,24 @@ void ComputeProgram::arrive(ProgramRuntime & runtime, std::size_t id, const simu
     }
 }
 
+void ComputeProgram::join_prefill_results(ProgramRuntime & runtime) {
+    if (prefill_join_submitted_) return;
+
+    for (const auto root : roots_) {
+        const auto & frame = frames_[root];
+        if (!frame.publishes_prefill_prefix || !stats_.frames[root].result_ready) return;
+        if (frame.overlap && frame.next && !stats_.frames[*frame.next].submitted) return;
+    }
+    const auto begin = runtime.next_node();
+    PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::PrefillReady, 0) } }, {} };
+    for (const auto root : roots_) {
+        const auto & frame = frames_[root];
+        mutation.dependencies.push_back({ *stats_.frames[root].result_ready, begin, graph::EdgeKind::DataDependency });
+        if (frame.overlap && frame.next) mutation.dependencies.push_back({ *stats_.frames[*frame.next].submitted, begin, graph::EdgeKind::ResourceOrder });
+    }
+    prefill_join_submitted_ = runtime.submit(std::move(mutation)).has_value();
+}
+
 void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
     if (event.action.kind == std::to_underlying(ActionKind::SegmentDone)) arrive(runtime, event.action.subject, event);
     else if (event.action.kind == std::to_underlying(ActionKind::CollectiveDone)) {
@@ -282,9 +302,14 @@ void ComputeProgram::on_event(ProgramRuntime & runtime, const simulation::Event 
         const auto id = event.action.subject;
         stats_.frames[id].submitted = event.identity;
         if (frames_[id].overlap && frames_[id].next) segment(runtime, *frames_[id].next, event.identity);
+        join_prefill_results(runtime);
     }
-    else if (event.action.kind == std::to_underlying(ActionKind::ResultReady)) stats_.frames[event.action.subject].result_ready = event.identity;
-    else complete_ = true;
+    else if (event.action.kind == std::to_underlying(ActionKind::ResultReady)) {
+        stats_.frames[event.action.subject].result_ready = event.identity;
+        join_prefill_results(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::PrefillReady)) prefill_result_ready_ = event.identity;
+    else if (event.action.kind == std::to_underlying(ActionKind::Complete)) complete_ = true;
 }
 
 } // namespace markov::trace_graph::planning
