@@ -364,7 +364,7 @@ class PipelineObservation:
                 with self.values.metadata():
                     self.values.bind(pp_outputs["next_token_ids"], {0: "B"})
                     self.values.bind_shape(
-                        scheduler.future_map.output_tokens_buf, (self.values.shapes.symbol("R") + 1,)
+                        scheduler.future_map.output_tokens_buf, (self.values.shapes.symbol("slot_capacity") + 1,)
                     )
                 metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
                 metadata["ports"]["inputs"] = self.values.port_values(

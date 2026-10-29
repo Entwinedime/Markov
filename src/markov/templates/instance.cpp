@@ -115,6 +115,10 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
             auto bound = invocation;
             if (inputs != nullptr) {
                 const auto & layout = asset.layout(frame.layout);
+
+                // Required values come from their producer; only declared state may remain unbound.
+                if (!std::ranges::all_of(layout.required_inputs, [&](const auto & name) { return inputs->ports.contains(name); }))
+                    throw LayoutMismatch(role + " requires its declared input ports");
                 const auto & definition = asset.definition(layout.definition);
                 auto parameters = bind_parameters({}, frame.bindings.values, bound, bound.parameter_scopes);
                 if (!bind_input_parameters(layout, definition, inputs->ports, inputs->graph, parameters))
@@ -564,6 +568,14 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
 
         const auto found = invocation.calls.find(child_index);
         auto child_invocation = found == invocation.calls.end() ? Invocation{} : std::move(found->second);
+
+        // Scalar arguments are evaluated in the caller, then bound to the callee's local names.
+        for (const auto & [name, expression] : call.parameters) {
+            if (child_invocation.parameters.contains(name) || child_invocation.bindings.contains(name))
+                throw std::invalid_argument("bound parameter is supplied by its parent: " + name);
+            child_invocation.parameters.emplace(name, expression.evaluate(parameters));
+        }
+
         GroupValues child_groups;
         for (const auto & [name, binding] : call.input_groups) {
             if (child_invocation.input_groups.contains(name)) throw std::invalid_argument("bound input group is supplied by its parent: " + name);

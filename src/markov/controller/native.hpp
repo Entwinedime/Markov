@@ -38,7 +38,8 @@ struct NativeInstance {
 // The peer owns native queues and progress; this endpoint owns delivery and in-flight work only.
 class NativeController final : public ServingControl {
 public:
-    NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer);
+    NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
+                     std::span<const NativeTransferRoute> transfers = {});
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
     void start(const ServingAction & action) override;
@@ -54,11 +55,9 @@ private:
     void reply(std::size_t call, const nlohmann::json & result);
 
     struct Input {
-        std::string group;
         std::optional<std::size_t> call;
         std::size_t arrived = 0;
-        std::optional<std::size_t> idle_sequence;
-        std::size_t sequence = 0;
+        std::optional<std::size_t> sequence;
     };
 
     std::vector<Request> requests_;

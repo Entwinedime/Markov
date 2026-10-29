@@ -120,6 +120,7 @@ struct CallStep {
     std::vector<std::size_t> resources;
     std::optional<std::string> family;
     std::map<std::string, std::variant<std::vector<std::size_t>, std::string, GeneratedGroup>> input_groups;
+    std::map<std::string, Expression> parameters;
 };
 
 struct ShapeContract {
@@ -143,6 +144,7 @@ struct TemplateLayout {
 
     std::vector<ShapeContract> input_shapes;
     ValuePorts ports;
+    std::vector<std::string> required_inputs;
 };
 
 struct BoundExecution {

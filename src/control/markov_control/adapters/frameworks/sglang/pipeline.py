@@ -2,7 +2,7 @@
 
 import torch
 from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler, ResultReady
-from markov_control.adapters.frameworks.sglang.workers import NativeStopped
+from markov_control.adapters.frameworks.sglang.workers import NativeStopped, StopInput
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import request_receiver
@@ -44,6 +44,14 @@ class PipelineScheduler(NativeScheduler):
             return []
         return self.peer.exchange("receive_object", message)
 
+    def _pp_recv_pyobj_from_prev_stage(self):
+        message = super()._pp_recv_pyobj_from_prev_stage()
+
+        # Broadcast termination to this stage's TP peers before leaving a control-ring receive.
+        if any(isinstance(item, StopInput) for item in message):
+            raise NativeStopped()
+        return message
+
     def tensor(self, geometry, work, channel):
         dtype = getattr(torch, geometry["dtype"].removeprefix("torch."))
 
@@ -54,7 +62,7 @@ class PipelineScheduler(NativeScheduler):
 
     def model_result(self, batch, **kwargs):
         response = self.peer.call("model")
-        values = response["values"][str(self.control_rank)]
+        values = response["values"][str(self.graph_rank)]
         if self.pp_group.is_last_rank:
             return GenerationBatchResult(
                 logits_output=None,

@@ -29,21 +29,24 @@ class ModelPaddingCall(NativeCall):
             if not any(contract["value"] == source for contract in caller_contracts):
                 caller_contracts.append({"value": source, "shape": shape})
 
-            metadata.setdefault("parameters", {})["input_extent"] = values[source]["shape"][0]
+            metadata["parameters"] = {
+                "input_extent": values[source]["shape"][0],
+                "output_extent": values[output]["shape"][0],
+                "fill_value": metadata["call_parameters"]["fill_value"],
+            }
             contracts = metadata.setdefault("shape_contracts", [])
             contracts[:] = [contract for contract in contracts if contract["value"] not in (source, output)]
             contracts.append({"value": source, "shape": ["input_extent", *shape[1:]]})
             if output != source:
-                contracts.append(
-                    {"value": output, "shape": [metadata["argument_relations"][1]["scalar"], *shape[1:]]}
-                )
+                contracts.append({"value": output, "shape": ["output_extent", *shape[1:]]})
 
-            # Padding has the same local input contract in Prefill and Decode.
+            # The native helper branches on zero fill; empty padding also has distinct device work.
             metadata["guards"] = [
                 {
-                    "condition": ["eq", "input_extent", metadata["argument_relations"][1]["scalar"]],
+                    "condition": ["eq", "input_extent", "output_extent"],
                     "expected": values[source]["shape"][0] == values[output]["shape"][0],
-                }
+                },
+                {"condition": ["eq", "fill_value", 0], "expected": metadata["parameters"]["fill_value"] == 0},
             ]
 
     def completed(
@@ -51,19 +54,24 @@ class ModelPaddingCall(NativeCall):
     ) -> None:
         shapes = self.values.shapes
         before = shapes.tensor(args[0]).shape
-        family = f"padding_{self.axis}"
+
+        # Token and request columns pass different extents to the same native helper.
         metadata.update(
-            entrypoint=family,
+            entrypoint="model_padding",
             entrypoint_phase=None,
-            call_family=family,
+            call_family="model_padding",
+            call_parameters={
+                "output_extent": self.axis,
+                "fill_value": kwargs.get("value", 0),
+            },
             ports={
                 "inputs": self.values.port_values({"tensor": args[0]}),
                 "outputs": self.values.port_values({"tensor": result}),
             },
             argument_relations=[
                 {"value": self.values.value(args[0])},
-                {"scalar": self.axis},
-                kwargs.get("value", args[2] if len(args) > 2 else 0),
+                {"scalar": "output_extent"},
+                {"scalar": "fill_value"},
             ],
             keywords={"mapping": []},
         )

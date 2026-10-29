@@ -545,6 +545,7 @@ void SourceTemplates::compile(std::size_t identity) {
         {  "inputs", nlohmann::json::object() },
         { "outputs", nlohmann::json::object() }
     };
+    if (metadata.contains("required_inputs")) layout["required_inputs"] = metadata.at("required_inputs").get<std::set<std::string>>();
     if (metadata.contains("ports")) {
         for (const auto & [direction, ports] : metadata.at("ports").items()) {
             for (const auto & [name, value] : ports.items()) layout["ports"][direction][name] = local.value(value.get<std::size_t>());
@@ -706,6 +707,7 @@ void SourceTemplates::compile(std::size_t identity) {
             for (const auto resource : child.resources) body["resources"].push_back(local.resource(resource));
             const auto & child_metadata = source_.at("regions")[item.identity].at("metadata");
             if (child_metadata.contains("call_family")) body["family"] = child_metadata.at("call_family");
+            if (child_metadata.contains("call_parameters")) body["parameters"] = child_metadata.at("call_parameters");
 
             if (!child.input_groups.empty()) {
                 body["input_groups"] = nlohmann::json::object();

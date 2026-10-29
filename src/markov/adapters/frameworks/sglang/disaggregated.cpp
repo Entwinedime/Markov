@@ -37,6 +37,18 @@ GroupAdmission DisaggregatedStructure::admission() const {
 }
 
 PageReuse DisaggregatedStructure::page_reuse() const { return prefill_.page_reuse(); }
+const ServingTopology & DisaggregatedStructure::topology() const { return topology_; }
+
+const std::string & DisaggregatedStructure::resource_group(std::size_t rank) const {
+    const auto & instance = topology_.parallel().group(rank, "serving");
+    return topology_.stage_count(instance.id) == 1 ? instance.id : topology_.parallel().group(rank, "tp").id;
+}
+
+std::vector<TransferBinding> DisaggregatedStructure::transfer_bindings() const {
+    std::set<TransferBinding> bindings;
+    for (const auto & route : transfers_.copies()) bindings.insert({ resource_group(route.source), resource_group(route.destination) });
+    return { bindings.begin(), bindings.end() };
+}
 
 void DisaggregatedStructure::require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind) {
     const auto consumers = graph_.execution.initial_nodes(begin);
@@ -78,6 +90,8 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
     }
 
     for (const auto & route : transfers_.copies()) {
+        if (action.transfer && (resource_group(route.source) != action.transfer->source || resource_group(route.destination) != action.transfer->destination))
+            continue;
         auto ready = handoff.prepared.at(route.source);
         const auto & reserved = handoff.reserved.at(route.destination);
         ready.insert(ready.end(), reserved.begin(), reserved.end());
@@ -105,8 +119,8 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
 
 void DisaggregatedStructure::bind_readiness(const ServingAction & action, const BatchProgram & program, std::span<const std::size_t> drained,
                                             RankPorts & ports) {
-    const auto & members = topology_.instance(action.task.group).members;
-    if (members.size() != program.completions.size()) throw std::logic_error("PD readiness must retain one completion per instance rank");
+    const auto & members = topology_.parallel().group(action.task.group).members;
+    if (members.size() != program.completions.size()) throw std::logic_error("PD readiness must retain one completion per participating rank");
     for (std::size_t index = 0; index < members.size(); ++index) ports[members[index]].push_back(program.completions[index]);
 
     // CPU return and device readiness differ; retain local tails and each communication's actual participants.
@@ -136,13 +150,15 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     const auto dependency_begin = graph_.execution.dependencies().size();
     const auto region_begin = graph_.regions.size();
     BatchProgram result{ std::nullopt, {}, {} };
-    const bool source_result = action.step == ServingStep::Model || (action.step == ServingStep::Result && action.task.group == groups_.prefill);
-    const bool received = action.step == ServingStep::Receive && !action.stage;
-    const bool released = action.step == ServingStep::Release && action.task.group == groups_.prefill;
+    const auto & members = topology_.parallel().group(action.task.group).members;
+    const bool source = action.step != ServingStep::Transfer && topology_.parallel().group(members.front(), "serving").id == groups_.prefill;
+    const bool source_result = action.step == ServingStep::Model || (action.step == ServingStep::Result && source);
+    const bool received = action.step == ServingStep::Receive && action.channel.empty();
+    const bool released = action.step == ServingStep::Release && source;
 
     if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.work->batch.members.front().request));
     else {
-        auto & instance = action.task.group == groups_.prefill ? prefill_ : decode_;
+        auto & instance = source ? prefill_ : decode_;
         const bool consumes_transfer = received || released;
         RankPorts prerequisites;
         if (consumes_transfer || action.step == ServingStep::Accept) {
@@ -164,14 +180,17 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
             if (action.step == ServingStep::Reserve || source_result)
                 bind_readiness(action, result, drained, action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared);
             if (received) bind_readiness(action, result, drained, handoff.received);
-            if (action.step == ServingStep::Accept) handoff.accepted = true;
-            if (released) handoff.released = true;
-            if (handoff.accepted && handoff.released) handoffs_.erase(member.request);
+            if (action.step == ServingStep::Accept) handoff.accepted.insert(members.begin(), members.end());
+            if (released) handoff.released.insert(members.begin(), members.end());
+            if (handoff.accepted.size() == topology_.instance(groups_.decode).members.size()
+                && handoff.released.size() == topology_.instance(groups_.prefill).members.size())
+                handoffs_.erase(member.request);
         }
     }
 
-    // PD actions commit whole pool/transfer effects after their own submitted work has drained.
-    if (!action.stage) result.completions = std::move(drained);
+    // Resource effects and transfers commit only after their participating ranks' work has drained.
+    if (!action.stage || received || released || action.step == ServingStep::Reserve || action.step == ServingStep::Accept)
+        result.completions = std::move(drained);
 
     for (auto region = region_begin; region < graph_.regions.size(); ++region) {
         graph_.regions[region]["batch"] = action.flow;

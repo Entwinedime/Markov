@@ -6,7 +6,11 @@ from typing import Any
 
 import torch
 
-from markov_collection.adapters.frameworks.sglang.batches import BatchTensors, BatchTransitionCall
+from markov_collection.adapters.frameworks.sglang.batches import (
+    BatchTensors,
+    BatchTransitionCall,
+    BatchTransitionPrototypes,
+)
 from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall, TokenAllocationCall
 from markov_collection.adapters.runtimes.pytorch.concatenation import CollectionCall, GroupRepetition
 from markov_collection.adapters.runtimes.pytorch.factories import (
@@ -114,6 +118,9 @@ class BatchPreparationCall(TensorGeometryCall):
         }
         metadata["entrypoint"] = "batch_preparation"
         metadata["ports"] = {"inputs": self.input_ports, "outputs": self.values.port_values(self.output_ports)}
+
+        # Batch columns must come from their producer; only persistent pools may be initialized here.
+        metadata["required_inputs"] = sorted(set(self.input_ports) - {"request_map", "free_pages"})
         return None
 
 
@@ -145,10 +152,13 @@ class InputStagingCall(NativeCall):
 
 
 class SGLangPreparation:
-    def __init__(self, values: Any, fields: dict[str, str] = BatchTensors.fields, native_padding: bool = False) -> None:
-        self.values = values
+    def __init__(
+        self, operators: Any, fields: dict[str, str] = BatchTensors.fields, native_padding: bool = False
+    ) -> None:
+        self.values = operators.values
         self.fields = fields
         self.native_padding = native_padding
+        self.transitions = BatchTransitionPrototypes(operators, fields)
 
     def grouped_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return ExtendAllocationCall(
@@ -200,7 +210,9 @@ class SGLangPreparation:
         if self.values.recording.current_scope.get() is None or not batch.reqs:
             return original(batch, *args, **kwargs)
 
-        return BatchTransitionCall(self.values, original, batch, fields=self.fields)(batch, *args, **kwargs)
+        result = BatchTransitionCall(self.values, original, batch, fields=self.fields)(batch, *args, **kwargs)
+        self.transitions.remember(batch)
+        return result
 
     def merge_batch(self, original: Any, batch: Any, other: Any) -> Any:
         if self.values.recording.current_scope.get() is None:

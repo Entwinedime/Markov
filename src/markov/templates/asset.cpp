@@ -207,6 +207,7 @@ TemplateCatalog::TemplateCatalog(nlohmann::json document) {
         layout.own_resources = source.at("own_resources").get<std::vector<std::size_t>>();
         layout.ports.inputs = source.at("ports").at("inputs").get<std::map<std::string, std::size_t>>();
         layout.ports.outputs = source.at("ports").at("outputs").get<std::map<std::string, std::size_t>>();
+        layout.required_inputs = source.value("required_inputs", std::vector<std::string>{});
 
         for (const auto & contract : source.at("input_shapes")) {
             std::vector<Expression> shape;
@@ -226,7 +227,12 @@ TemplateCatalog::TemplateCatalog(nlohmann::json document) {
                                step.at("outputs").get<std::vector<std::size_t>>(),
                                step.at("resources").get<std::vector<std::size_t>>(),
                                step.contains("family") ? std::optional(step.at("family").get<std::string>()) : std::nullopt,
+                               {},
                                {} };
+                if (step.contains("parameters")) {
+                    for (const auto & [name, expression] : step.at("parameters").items()) call.parameters.emplace(name, Expression::read(expression));
+                }
+
                 if (step.contains("input_groups")) {
                     for (const auto & [name, binding] : step.at("input_groups").items()) {
                         if (binding.is_string()) call.input_groups.emplace(name, binding.get<std::string>());
@@ -428,6 +434,9 @@ void TemplateCatalog::validate() const {
         for (const auto & [name, value] : layout.ports.inputs) {
             if (std::ranges::find(layout.inputs, value) == layout.inputs.end()) throw std::invalid_argument("named input port is not an input: " + name);
         }
+        for (const auto & name : layout.required_inputs) {
+            if (!layout.ports.inputs.contains(name)) throw std::invalid_argument("required input has no named port: " + name);
+        }
         for (const auto & [name, value] : layout.ports.outputs) {
             if (std::ranges::find(layout.outputs, value) == layout.outputs.end()) throw std::invalid_argument("named output port is not an output: " + name);
         }
@@ -447,7 +456,12 @@ void TemplateCatalog::validate() const {
             if (call.inputs.size() != child.inputs.size() || call.outputs.size() != child.outputs.size() || call.resources.size() != child.resources)
                 throw std::invalid_argument("child template binding arity mismatch");
 
-            const auto & groups = definitions_.at(child.definition).input_groups;
+            const auto & callee = definitions_.at(child.definition);
+            for (const auto & [name, _] : call.parameters) {
+                if (std::ranges::find(callee.parameters, name) == callee.parameters.end()) throw std::invalid_argument("child has no parameter " + name);
+            }
+
+            const auto & groups = callee.input_groups;
             if (call.input_groups.size() != groups.size()) throw std::invalid_argument("child input group bindings are incomplete");
             for (const auto & [name, binding] : call.input_groups) {
                 if (!groups.contains(name)) throw std::invalid_argument("child has no input group " + name);

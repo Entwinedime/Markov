@@ -54,6 +54,7 @@ class NativeScheduler(Scheduler):
     def __init__(self, peer, settings, model_path: str, source, rank: int) -> None:
         self.peer = peer
         self.control_rank = rank
+        self.graph_rank = source["ranks"][rank]
         self.control_round = 0
         model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri())
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog

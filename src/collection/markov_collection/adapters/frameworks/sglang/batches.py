@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from copy import copy, deepcopy
+from itertools import product
 from typing import Any
+
+import torch
 
 from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
 from markov_collection.instrumentation.calls import NativeCall
@@ -123,6 +127,7 @@ class BatchTransitionCall(NativeCall):
         after_members = len(self.batch.reqs)
         metadata["entrypoint"] = self.interface
         metadata["entrypoint_phase"] = None
+        metadata["required_inputs"] = sorted(self.input_ports)
         metadata["parameters"] = {"before_members": self.before_members, "after_members": after_members}
         metadata["keywords"] = {"mapping": []}
         metadata["argument_relations"] = [
@@ -167,3 +172,93 @@ class BatchTransitionCall(NativeCall):
             {value["storage"] for value in self.recording.values[self.value_begin :]} - inputs
         )
         return None
+
+
+class BatchTransitionPrototypes:
+    def __init__(self, operators: Any, fields: dict[str, str]) -> None:
+        self.operators = operators
+        self.fields = fields
+        self.samples: dict[tuple[str, ...], Any] = {}
+        self.captured = False
+
+    @staticmethod
+    def copy_batch(batch: Any) -> Any:
+        result = copy(batch)
+
+        # Copy tensor storage together to preserve aliases, and detach lists mutated by native merge.
+        tensors = {name: value for name, value in vars(batch).items() if isinstance(value, torch.Tensor)}
+        vars(result).update(deepcopy(tensors))
+        vars(result).update({name: value.copy() for name, value in vars(batch).items() if isinstance(value, list)})
+        result.reqs = [copy(request) for request in batch.reqs]
+        for request in result.reqs:
+            request.output_ids = copy(request.output_ids)
+
+        # Source sampling is unpenalized greedy; the native constructor owns its tensor and weak-reference state.
+        result.sampling_info = type(batch.sampling_info).from_schedule_batch(result, batch.sampling_info.vocab_size)
+        return result
+
+    def remember(self, batch: Any) -> None:
+        if self.captured or not batch.reqs:
+            return
+        signature = tuple(BatchTensors.read(batch, self.fields))
+        if signature not in self.samples:
+            with self.operators.values.auxiliary():
+                self.samples[signature] = self.copy_batch(batch)
+
+    def prepare(self, left: Any, right: Any, selection: str | None) -> tuple[Any, Any]:
+        first, second = self.copy_batch(left), self.copy_batch(right)
+        if selection is not None:
+
+            # Two copies guarantee that a proper subset exists even for a single-member source.
+            first.merge_batch(second)
+        return first, second
+
+    @staticmethod
+    def invoke(first: Any, second: Any, selection: str | None) -> None:
+        if selection is None:
+            first.merge_batch(second)
+        else:
+            rows = {"empty": [], "all": list(range(len(first.reqs))), "subset": [0]}
+            first.filter_batch(keep_indices=rows[selection])
+
+    def capture(self) -> None:
+        if self.captured:
+            return
+        self.captured = True
+        recording = self.operators.recording
+
+        # Cover native filter branches and merge column pairs, independently of arrival timing or batch size.
+        cases = [(left, right, None) for left, right in product(self.samples.values(), repeat=2)]
+        cases += [
+            (batch, batch, selection) for batch in self.samples.values() for selection in ("empty", "all", "subset")
+        ]
+        for left, right, selection in cases:
+            with self.operators.values.auxiliary():
+                first, second = self.prepare(left, right, selection)
+                self.invoke(first, second, selection)
+                torch.npu.synchronize()
+
+            for observed in (False, True):
+                with self.operators.values.auxiliary():
+                    first, second = self.prepare(left, right, selection)
+                identity = len(recording.batches)
+                recording.batches.append(
+                    {
+                        "id": identity,
+                        "kind": "primitive",
+                        "phase": "primitive",
+                        "members": [],
+                        "parameters": {},
+                        "observation": "source" if observed else "baseline",
+                    }
+                )
+                if observed:
+                    self.operators.begin_batch()
+                    with recording.scope("BatchPrototype", batch=identity), self.operators:
+                        self.invoke(first, second, selection)
+                else:
+                    with recording.markers.scope(f"markov.baseline/{identity}"):
+                        self.invoke(first, second, selection)
+                torch.npu.synchronize()
+
+        self.samples.clear()

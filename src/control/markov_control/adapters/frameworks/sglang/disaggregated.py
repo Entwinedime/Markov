@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 from markov_control.adapters.frameworks.sglang.batches import NativeBatch
+from markov_control.adapters.frameworks.sglang.pipeline import PipelineScheduler
 from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler
 from sglang.srt.disaggregation import decode, prefill
 from sglang.srt.disaggregation.base.conn import BaseKVReceiver, BaseKVSender, KVArgs, KVPoll, KVTransferMetric
@@ -184,3 +185,10 @@ class DisaggregatedScheduler(NativeScheduler):
             batch.control_work = dict(self.peer.context)
             self.peer.call("prepare")
         return batch
+
+
+class PipelineDisaggregatedScheduler(DisaggregatedScheduler, PipelineScheduler):
+    def get_new_batch_prefill(self):
+
+        # The PP prefill loop selects here, bypassing the single-stage disaggregated entry point.
+        return self.prepare(super().get_new_batch_prefill())

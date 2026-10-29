@@ -59,6 +59,11 @@ nlohmann::json ServingWorkflow::run(bool details) {
                 decision["stage"] = action->stage ? nlohmann::json(*action->stage) : nlohmann::json(nullptr);
                 decision["step"] = action->step_name();
                 if (!action->channel.empty()) decision["channel"] = action->channel;
+                if (action->transfer)
+                    decision["transfer"] = {
+                        {      "source",      action->transfer->source },
+                        { "destination", action->transfer->destination }
+                    };
                 decision["commits_requests"] = action->commits_requests();
                 decision["task"] = {
                     {    "group",    action->task.group },

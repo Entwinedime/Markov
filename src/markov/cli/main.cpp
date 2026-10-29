@@ -125,11 +125,12 @@ nlohmann::json resource_capacity(const markov::KvPool & resources) {
     };
 }
 
-nlohmann::json native_source(const markov::TemplateAsset & asset, const std::string & id) {
+nlohmann::json native_source(const markov::TemplateAsset & asset, const std::string & id, const markov::sglang::ServingTopology & topology) {
     const auto & environment = asset.environment();
     const auto & implementation = environment.at("implementation");
     return {
         {           "id",                                       id },
+        {        "ranks",            topology.instance(id).members },
         { "model_config",        implementation.at("model_config") },
         {        "dtype",               implementation.at("dtype") },
         {         "mode", implementation.at("disaggregation_mode") },
@@ -220,35 +221,40 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
                                                          devices,
                                                          expert_condition(p, input, *prefill_source),
                                                          expert_condition(d, input, *decode_source));
-        markov::KvPool prefill_resources(requests.size(), prefill, expansion.page_reuse());
-        markov::KvPool decode_resources(requests.size(), decode, expansion.page_reuse());
+        std::map<std::string, markov::KvPool> resources;
+        std::array instances{
+            markov::NativeInstance{ groups.prefill, markov::NativeRole::Prefill, prefill, 0, {} },
+            markov::NativeInstance{  groups.decode,  markov::NativeRole::Decode,  decode, 0, {} }
+        };
+        for (auto & instance : instances) {
+            const auto stages = native ? expansion.topology().stage_count(instance.id) : 1;
+            instance.batch_limit = (static_cast<std::size_t>(instance.settings.max_running_requests) - 1) / stages + 1;
+            for (std::size_t stage = 0; stage < stages; ++stage) {
+                const auto & name = stages == 1 ? instance.id : expansion.topology().stage(instance.id, stage).id;
+                auto [pool, _] = resources.try_emplace(name, requests.size(), instance.settings, expansion.page_reuse());
+                instance.participants.push_back({ name, stage, pool->second });
+            }
+        }
         markov::ControlStream peer(std::cin, std::cout);
         std::unique_ptr<markov::ServingControl> controller;
         if (native) {
-            if (p.value("pp", 1) != 1 || d.value("pp", 1) != 1) throw std::invalid_argument("native PD pipeline integration is not yet available");
             peer.send({
-                {      "kind",                                                                               "source" },
-                { "instances", { native_source(*prefill_source, "prefill"), native_source(*decode_source, "decode") } }
+                {      "kind",                                                                               "source"                              },
+                { "instances",
+                 { native_source(*prefill_source, "prefill", expansion.topology()), native_source(*decode_source, "decode", expansion.topology()) } }
             });
-            const std::array instances{
-                markov::NativeInstance{ "prefill",
-                                       markov::NativeRole::Prefill,
-                                       prefill, static_cast<std::size_t>(prefill.max_running_requests),
-                                       { { groups.prefill, 0, prefill_resources } } },
-                markov::NativeInstance{  "decode",
-                                       markov::NativeRole::Decode,
-                                       decode,  static_cast<std::size_t>(decode.max_running_requests),
-                                       { { groups.decode, 0, decode_resources } }  }
-            };
-            controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer);
+            std::vector<markov::NativeTransferRoute> transfers;
+            for (const auto & binding : expansion.transfer_bindings())
+                transfers.push_back({ binding, resources.at(binding.source), resources.at(binding.destination) });
+            controller = std::make_unique<markov::NativeController>(std::move(requests), instances, peer, transfers);
         }
         else
             controller = std::make_unique<markov::DisaggregatedController>(prefill,
                                                                            decode,
                                                                            std::move(requests),
                                                                            groups,
-                                                                           prefill_resources,
-                                                                           decode_resources,
+                                                                           resources.at(groups.prefill),
+                                                                           resources.at(groups.decode),
                                                                            replay ? &*replay : nullptr);
         markov::ServingWorkflow workflow(*controller, expansion, durations);
         auto result = workflow.run(details);
@@ -256,15 +262,10 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
         result["control_source"] = native ? "native_control" : replay ? "recorded_batches" : "lightweight_policy";
         result["configuration"] = configuration;
         result["duration_source"] = "given_execution_kind_ns";
-        result["pool_free_pages"] = {
-            { groups.prefill, prefill_resources.free_pages().size() },
-            {  groups.decode,  decode_resources.free_pages().size() }
-        };
-        if (native)
-            result["resource_capacity"] = {
-                { groups.prefill, resource_capacity(prefill_resources) },
-                {  groups.decode,  resource_capacity(decode_resources) }
-            };
+        for (const auto & [name, pool] : resources) {
+            result["pool_free_pages"][name] = pool.free_pages().size();
+            if (native) result["resource_capacity"][name] = resource_capacity(pool);
+        }
         result["structure"] = expansion.summary();
         if (details) result["graph"] = expansion.document();
         return result;
@@ -293,8 +294,8 @@ nlohmann::json simulate(std::span<const markov::TemplateAsset> assets, const nlo
     std::unique_ptr<markov::ServingControl> controller;
     if (native) {
         peer.send({
-            {      "kind",                                   "source" },
-            { "instances", { native_source(assets.front(), "model") } }
+            {      "kind",                                             "source" },
+            { "instances", { native_source(assets.front(), "model", topology) } }
         });
         std::vector<markov::NativeParticipant> participants;
         for (std::size_t stage = 0; stage < resources.size(); ++stage) participants.push_back({ topology.stage("model", stage).id, stage, resources[stage] });

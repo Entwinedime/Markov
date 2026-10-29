@@ -318,6 +318,7 @@ class SGLangObservation:
                     scope.metadata["ports"]["inputs"].update(
                         self.operators.values.port_values({f"proxy.{name}": tensor for name, tensor in payload.items()})
                     )
+            scope.metadata["required_inputs"] = sorted(set(scope.metadata["ports"]["inputs"]) - {"token_relay"})
             inputs = {
                 "input_ids": {0: token_axis},
                 "positions": {0: token_axis},
@@ -552,6 +553,7 @@ class SGLangObservation:
                     self.matrices.capture()
                     self.materializations.capture()
                 self.indexed_writes.capture()
+                self.preparation.transitions.capture()
         if result and self.disaggregation is not None and self.derived_role:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
         if result and any(batch["observation"] == "source" for batch in self.recording.batches):
@@ -607,7 +609,8 @@ class SGLangObservation:
         # PP keeps returned tokens in the batch until its next model invocation.
         if self.pipeline is not None:
             fields = self.pipeline.fields
-        SGLangPreparation(self.operators.values, fields, self.ep_size > 1).install()
+        self.preparation = SGLangPreparation(self.operators, fields, self.ep_size > 1)
+        self.preparation.install()
         if self.ep_size > 1:
             from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
 

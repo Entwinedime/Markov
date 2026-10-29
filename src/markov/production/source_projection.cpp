@@ -454,13 +454,36 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
 
     for (const auto & region : source_.at("regions")) {
         nlohmann::json metadata = nlohmann::json::object();
-        for (const auto & key : { "path",          "entrypoint",        "batch",          "no_batch",
-                                  "inputs",        "outputs",           "mutated_values", "input_groups",
-                                  "opaque_inputs", "opaque_outputs",    "parameters",     "derived_parameters",
-                                  "state_effects", "bindings",          "effects",        "source",
-                                  "requests",      "generated_tokens",  "guards",         "shape_contracts",
-                                  "parent_groups", "group_repetitions", "ports",          "entrypoint_phase",
-                                  "dynamic_calls", "call_role",         "call_count",     "call_family" }) {
+        for (const auto & key : { "path",
+                                  "entrypoint",
+                                  "batch",
+                                  "no_batch",
+                                  "inputs",
+                                  "outputs",
+                                  "mutated_values",
+                                  "input_groups",
+                                  "opaque_inputs",
+                                  "opaque_outputs",
+                                  "parameters",
+                                  "derived_parameters",
+                                  "state_effects",
+                                  "bindings",
+                                  "effects",
+                                  "source",
+                                  "requests",
+                                  "generated_tokens",
+                                  "guards",
+                                  "shape_contracts",
+                                  "parent_groups",
+                                  "group_repetitions",
+                                  "ports",
+                                  "entrypoint_phase",
+                                  "dynamic_calls",
+                                  "call_role",
+                                  "call_count",
+                                  "call_family",
+                                  "call_parameters",
+                                  "required_inputs" }) {
             if (region.at("metadata").contains(key)) metadata[key] = region.at("metadata").at(key);
         }
 

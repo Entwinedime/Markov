@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -28,6 +29,8 @@ public:
     nlohmann::json summary() const;
     nlohmann::json document() const;
     PageReuse page_reuse() const;
+    const ServingTopology & topology() const;
+    std::vector<TransferBinding> transfer_bindings() const;
 
 private:
     using RankPorts = std::map<std::size_t, std::vector<std::size_t>>;
@@ -37,8 +40,8 @@ private:
         RankPorts prepared;
         RankPorts transferred;
         RankPorts received;
-        bool accepted = false;
-        bool released = false;
+        std::set<std::size_t> accepted;
+        std::set<std::size_t> released;
     };
 
     void require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind);
@@ -47,6 +50,7 @@ private:
     std::size_t append_transfer(const KvTransfer & route, std::int64_t bytes, std::int64_t segments, std::span<const std::size_t> prerequisites,
                                 const std::string & kind, std::span<const KvSlice> slices);
     void count(std::size_t operation_begin, std::size_t node_begin, std::size_t dependency_begin);
+    const std::string & resource_group(std::size_t rank) const;
 
     RegionGraph graph_;
     ServingTopology topology_;

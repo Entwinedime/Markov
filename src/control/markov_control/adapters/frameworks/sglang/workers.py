@@ -108,9 +108,12 @@ class NativeWorkers:
             from markov_control.adapters.frameworks.sglang.pipeline import PipelineScheduler
 
             if source["mode"] != "null":
-                from markov_control.adapters.frameworks.sglang.disaggregated import DisaggregatedScheduler
+                from markov_control.adapters.frameworks.sglang.disaggregated import (
+                    DisaggregatedScheduler,
+                    PipelineDisaggregatedScheduler,
+                )
 
-                implementation = DisaggregatedScheduler
+                implementation = PipelineDisaggregatedScheduler if source["pp"] > 1 else DisaggregatedScheduler
             else:
                 implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
             scheduler = implementation(peer, settings, directory, source, rank)

@@ -107,6 +107,13 @@ struct BatchWork {
 
 enum class ServingStep { Batch, Select, Stage, Prepare, Compute, Send, Receive, Wait, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };
 
+struct TransferBinding {
+    std::string source;
+    std::string destination;
+
+    auto operator<=>(const TransferBinding &) const = default;
+};
+
 // Task identifies one decision; flow identifies the model iteration crossing its stages.
 struct ServingAction {
     TaskIdentity task;
@@ -117,6 +124,7 @@ struct ServingAction {
     std::optional<std::size_t> stage;
     ServingStep step;
     std::string channel{};
+    std::optional<TransferBinding> transfer{};
 
     bool commits_requests() const { return step == ServingStep::Batch || step == ServingStep::Result || step == ServingStep::Accept; }
     std::string_view step_name() const;

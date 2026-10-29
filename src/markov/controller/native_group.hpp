@@ -31,6 +31,7 @@ public:
     nlohmann::json resource_call(const nlohmann::json & message, std::size_t delivered);
     void start(const ServingAction & action);
     void finish(const ServingAction & action, std::span<const std::size_t> returned_pages);
+    bool caught_up(std::size_t delivered) const;
     bool done() const;
     bool settled() const;
     std::size_t free_pages() const;

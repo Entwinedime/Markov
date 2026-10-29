@@ -48,13 +48,13 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
         }
         return ServingAction{
             { group_, sequence_ },
-            std::move(work), now_ns, flow, lane, std::nullopt, kind == "reserve" ? ServingStep::Reserve : ServingStep::Receive
+            std::move(work), now_ns, flow, lane, stage_, kind == "reserve" ? ServingStep::Reserve : ServingStep::Receive
         };
     }
     const auto frame = frames_.find(flow);
     const bool preparing = frame == frames_.end() || frame->second.next == ServingStep::Prepare;
-    if (kind == "select" || (kind == "release_request" && preparing)) {
-        if (!preparing) throw std::invalid_argument("native selection is outside batch preparation");
+    if (kind == "select" || (kind == "release_request" && (preparing || role_ == NativeRole::Prefill))) {
+        if (kind == "select" && !preparing) throw std::invalid_argument("native selection is outside batch preparation");
         auto batch = resident_batch(kind == "select" ? message.at("requests") : nlohmann::json::array({ message.at("request") }), delivered);
         BatchEffects effects;
         if (kind == "release_request") {
@@ -73,7 +73,7 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
             now_ns,
             flow,
             lane,
-            kind == "select" ? std::optional(stage_) : std::nullopt,
+            stage_,
             kind == "select" ? ServingStep::Select : ServingStep::Release
         };
     }
@@ -107,13 +107,7 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
     }
     return ServingAction{
         { group_, sequence_ },
-        std::move(work),
-        now_ns,
-        flow,
-        lane,
-        step == ServingStep::Accept ? std::nullopt : std::optional(stage_),
-        step,
-        message_step ? message.at("channel").get<std::string>() : std::string{}
+        std::move(work), now_ns, flow, lane, stage_, step, message_step ? message.at("channel").get<std::string>() : std::string{}
     };
 }
 
@@ -194,8 +188,12 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
         if (frame.next == ServingStep::Batch && frame.messages.empty()) frames_.erase(found);
         return nullptr;
     }
+
+    // Prefill handoff release can occur while another lane's model is still in flight.
     Frame * result =
-        found != frames_.end() && (found->second.next == ServingStep::Result || found->second.next == ServingStep::Accept) ? &found->second : nullptr;
+        role_ != NativeRole::Prefill && found != frames_.end() && (found->second.next == ServingStep::Result || found->second.next == ServingStep::Accept)
+            ? &found->second
+            : nullptr;
     if (kind == "release_request") {
         const auto identity = message.at("request").get<std::size_t>();
         if (result == nullptr || !resources_.residence(identity).slot || !result->released_requests.insert(identity).second)
@@ -203,7 +201,7 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
         return nullptr;
     }
     if (kind == "release_pages") {
-        if (found != frames_.end() && result == nullptr && found->second.next != ServingStep::Prepare)
+        if (role_ != NativeRole::Prefill && found != frames_.end() && result == nullptr && found->second.next != ServingStep::Prepare)
             throw std::invalid_argument("native page release is outside preparation or result processing");
         const auto pages = message.at("pages").get<std::vector<std::size_t>>();
         auto & released = result == nullptr ? released_pages_ : result->released_pages;
@@ -307,7 +305,8 @@ void NativeGroup::finish(const ServingAction & action, std::span<const std::size
     if (frame.released && frame.next == ServingStep::Batch && frame.messages.empty()) frames_.erase(action.flow);
 }
 
-bool NativeGroup::done() const { return completed_ == requests_.size() && !running_; }
+bool NativeGroup::caught_up(std::size_t delivered) const { return completed_ == delivered && !running_; }
+bool NativeGroup::done() const { return caught_up(requests_.size()); }
 bool NativeGroup::settled() const { return done() && frames_.empty() && reservations_.empty(); }
 std::size_t NativeGroup::free_pages() const { return resources_.free_pages().size(); }
 

@@ -6,14 +6,13 @@
 
 namespace markov {
 
-NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer)
+NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
+                                   std::span<const NativeTransferRoute> transfers)
     : requests_(std::move(requests)),
       peer_(peer) {
     auto configuration = nlohmann::json::array();
-    const NativeInstance * source = nullptr;
-    const NativeInstance * destination = nullptr;
     for (const auto & instance : instances) {
-        inputs_.emplace(instance.id, Input{ instance.participants.front().group, std::nullopt, 0, std::nullopt, 0 });
+        inputs_.try_emplace(instance.id);
         auto bindings = nlohmann::json::array();
         for (const auto & participant : instance.participants) {
             groups_.emplace(participant.group,
@@ -35,14 +34,8 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
              { "max_prefill_tokens", settings.max_prefill_tokens },
              { "microbatch_requests", instance.batch_limit } }   }
         });
-        if (instance.role == NativeRole::Prefill) source = &instance;
-        if (instance.role == NativeRole::Decode) destination = &instance;
     }
-    if (source && destination)
-        transfer_ = std::make_unique<NativeTransfer>(source->participants.front().group,
-                                                     destination->participants.front().group,
-                                                     source->participants.front().resources,
-                                                     destination->participants.front().resources);
+    if (!transfers.empty()) transfer_ = std::make_unique<NativeTransfer>(transfers);
     peer_.send({
         {      "kind",              "configure" },
         { "instances", std::move(configuration) }
@@ -78,18 +71,23 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
         if (!shutdown_ && (groups_.size() == 1 || idle_.size() == groups_.size())
             && std::ranges::all_of(groups_, [](const auto & entry) { return entry.second->done(); }) && (!transfer_ || transfer_->settled())) {
 
-            // Workers leave at input boundaries and drain the native handles they still own.
+            // Workers leave at control receive boundaries and drain the native handles they still own.
             peer_.send({
                 { "kind", "shutdown" }
             });
             for (auto & [_, input] : inputs_) input.call.reset();
             shutdown_ = true;
         }
-        for (auto & [_, input] : inputs_) {
+        for (auto & [instance, input] : inputs_) {
             if (!input.call) continue;
             const bool arrived = input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns;
-            const bool drained = groups_.size() > 1 && groups_.at(input.group)->done() && idle_.contains(input.group);
-            if (!drained && (!input.idle_sequence || *input.idle_sequence != sequence_ || arrived)) {
+
+            // Empty rounds can carry downstream control messages; only the whole instance can be idle.
+            const bool idle = std::ranges::all_of(groups_, [&](const auto & entry) {
+                return instances_.at(entry.first) != instance || (entry.second->caught_up(input.arrived) && idle_.contains(entry.first));
+            });
+            const bool executing = !running_calls_.empty() || (transfer_ && transfer_->running());
+            if (arrived || (!idle && (!input.sequence || *input.sequence != sequence_ || !executing))) {
                 auto arrivals = nlohmann::json::array();
                 while (input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns) {
                     const auto & request = requests_[input.arrived];
@@ -99,6 +97,11 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
                         { "output_tokens", request.output_tokens }
                     });
                 }
+                if (arrived) {
+                    for (const auto & [group, owner] : instances_) {
+                        if (owner == instance) idle_.erase(group);
+                    }
+                }
                 reply(*input.call,
                       {
                           {     "kind",           "advance" },
@@ -106,7 +109,6 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
                           { "arrivals", std::move(arrivals) }
                 });
                 input.call.reset();
-                input.idle_sequence.reset();
                 input.sequence = sequence_;
             }
         }
@@ -128,13 +130,11 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             continue;
         }
         if (kind == "begin") {
-            idle_.erase(name);
             group.begin_iteration(message.at("flow").get<std::size_t>(), message.at("lane").get<std::size_t>());
             continue;
         }
         if (kind == "idle") {
             idle_.insert(name);
-            if (name == input.group) input.idle_sequence = input.sequence;
             continue;
         }
         if (kind.starts_with("transfer_")) {
@@ -143,6 +143,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             continue;
         }
         if (auto action = group.plan(message, now_ns, input.arrived)) {
+            idle_.erase(name);
             running_calls_.emplace(action->task, identity);
             return action;
         }

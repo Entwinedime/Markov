@@ -2,7 +2,10 @@
 
 #include <map>
 #include <optional>
+#include <set>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -11,33 +14,38 @@
 
 namespace markov {
 
+struct NativeTransferRoute {
+    TransferBinding binding;
+    KvPool & source;
+    KvPool & destination;
+};
+
 // Native calls submit transport intent; graph completion alone makes the payload readable.
 class NativeTransfer {
 public:
-    NativeTransfer(std::string source, std::string destination, KvPool & source_pool, KvPool & destination_pool);
+    explicit NativeTransfer(std::span<const NativeTransferRoute> routes);
 
     nlohmann::json call(const nlohmann::json & message);
     std::optional<ServingAction> plan(std::int64_t now_ns);
     void finish(const ServingAction & action);
+    bool running() const;
     bool settled() const;
 
 private:
-    struct Handoff {
-        bool sender = false;
-        bool receiver = false;
-        bool reserved = false;
-        bool prepared = false;
-        bool submitted = false;
-        bool completed = false;
-        bool received = false;
-        bool released = false;
+    struct Endpoint {
+        bool registered = false;
+        bool ready = false;
+        bool consumed = false;
         nlohmann::json payload;
     };
 
-    std::string source_;
-    std::string destination_;
-    KvPool & source_pool_;
-    KvPool & destination_pool_;
+    struct Handoff {
+        std::map<std::string, Endpoint> endpoints;
+        std::set<TransferBinding> submitted;
+        std::set<TransferBinding> completed;
+    };
+
+    std::vector<NativeTransferRoute> routes_;
     std::map<std::size_t, Handoff> handoffs_;
     std::size_t sequence_ = 0;
 };
