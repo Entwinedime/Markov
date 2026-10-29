@@ -164,7 +164,7 @@ source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独�
 页大小仍由 page_sizes_tokens 逐项给出。原 requests 和 projected_compute_work 保留完整前缀语料的上限统计，
 另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
 回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
-cache_execution.copy_ports 逐逻辑复制列出页数、各参与者的 cache_control_returned_ns、completion_observed_ns 与 published_ns。控制返回包含后续主机索引克隆；发布等待两个端口的全部参与者。completion_basis 区分 modeled_observation_upper_interval 和 device_service，前者包含同步观察开销，不能当作精确设备完成。淘汰或缺少结果观察的旧路径仍使用设备传输口径，不能据此认为其外围 CPU 已覆盖。
+cache_execution.copy_ports 逐逻辑复制列出页数、各参与者的 cache_control_returned_ns、completion_observed_ns 与 published_ns。控制返回包含后续主机索引克隆；发布等待两个端口的全部参与者。completion_basis 区分 modeled_observation_upper_interval 和 device_service，前者包含同步观察开销，不能当作精确设备完成。写回淘汰也使用这组响应并在复制汇合前保留 caller 调用权；淘汰选择、ACK、同步就绪服务和页池归还的外围 CPU 尚未覆盖。缺少结果观察的旧非淘汰备份仍使用设备传输口径。
 不同参与进程的计算用显式汇合边界衔接，串行请求依赖前一响应完成；实验响应端口仍只覆盖部分路径，入口和尾部沿用同请求/前端的源残余近似。
 partial_request_ports 区分 start_ns、arrived_ns、received_ns 与响应开始/完成；received_ns 为首次取得参与 caller 的准入端口，准入等待不计作 CPU 服务。
 有同次最终发送观察时，响应从 modeled_send_ns 接出；缺少该事实则保留全部所选工作完成的屏障。
