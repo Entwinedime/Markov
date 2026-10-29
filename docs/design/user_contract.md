@@ -26,6 +26,29 @@ performance.models 可省略，表示独立模型尚未选定；execution 必须
 manifest 声明 config_path 时，同样解析并检查该 base 配置文件；来源准备只在框架适配器读取所需设置一次，配置文件也受结果覆盖保护。
 当前 SGLang 输入准备据其原生 server.command 判断确定性采样，开启时生成种子上传。缺少配置依据或命令由 shell 包装时不把未知设置当作关闭，也不为该准备序列授予完整规则资格。
 
+### SGLang 输入分支观察
+
+已有兼容的 SGLang 推理环境可安装输入探针；SGLANG_RUNTIME_IMAGE 指向该环境，不是纯 modeling 镜像：
+
+```bash
+docker build --build-arg SGLANG_RUNTIME_IMAGE="$SGLANG_RUNTIME_IMAGE" \
+  -t markov-sglang:ubuntu22.04 -f docker/sglang/Dockerfile .
+```
+
+在推理进程中设置 MARKOV_INPUT_FACTS，指向预先创建的本次输出目录。框架通过自身插件入口安装观察，
+各 worker 输出 input_facts_<pid>.jsonl；未设置时不开启，也不因加载 Markov 插件导入推理框架。
+本入口只观察实际 ScheduleBatch 准备，尚不代替完整 base 采集流程。
+
+记录请求标识、输入/查询规模、logprob、额外 embeddings、位置覆盖、multimodal、Mamba、重算及采样分支的标量状态，
+不读取张量内容或保存 snapshot。惩罚器状态取自准备完成的调度批次；重叠执行的 forward 副本会移除该对象，不能在那里读取。
+方法的墙钟与线程 CPU 时间只用于观察和定位，不直接作为正常成本。
+
+同一次完整 base 采集的 sidecar.python_probe_files 可声明 `{"path":"input_facts_123.jsonl","format":"jsonl"}`。
+未声明 format 的既有记录仍按 Chrome 容器读取；不按文件名猜格式，未完成的 JSON 行会报错。
+结构解释按请求、执行阶段、CPU 资源及原始时间区间关联，在所有通道读完后统一处理，不依赖 manifest 文件顺序。
+只有已证明的普通批次入口才取消不相关的 token 长度条件；上传字节、张量分配和设备工作仍使用实际规模。
+缺事实保留限制，已知未支持的分支不授予规则资格。其他运行取得的事实不能补写进旧 base，独立分支观察也不等于完整 DAG 或 E2E 验证。
+
 ## 用户提供什么
 
 | 输入 | 含义 |

@@ -79,6 +79,9 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cos
 
 它只读取选定模型和工作描述，不读取 base 或 target trace，不训练模型；结果是操作成本，尚未接入完整目标预测。
 
+SGLang 推理环境另有轻量输入分支观察，启用方式见[用户合同](docs/design/user_contract.md#sglang-输入分支观察)。
+它不采 snapshot，只补充判断 CPU 工作所需的实际状态；尚不代替完整 base 采集，也不提供正常成本。
+
 ## 新文档从哪里读
 
 - [整体架构](docs/design/architecture.md)：三阶段、共同合同、粒度与建议源码职责。
