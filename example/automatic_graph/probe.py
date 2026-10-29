@@ -17,7 +17,7 @@ from markov_collection.adapters.runtimes.pytorch.concatenation import Concatenat
 from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
 from markov_collection.adapters.runtimes.pytorch.modules import ModuleObservation
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation, TorchMarkers
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 from markov_collection.instrumentation.recording import Recording
 
 

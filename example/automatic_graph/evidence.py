@@ -9,8 +9,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from execution import reachable_links
-from markov_collection.artifacts.json_file import write_json
+from execution import DependencyPaths
+from markov_collection.artifacts import write_json
 from request_state import RequestStateEvidence
 
 
@@ -60,7 +60,7 @@ class ExecutionEvidence:
             for value in operation["inputs"]
             if (producer := graph["values"][value]["producer"]) is not None
         }
-        missing = required - reachable_links(execution, required)
+        missing = DependencyPaths(execution).missing(required)
         checks["value_descriptor_readiness"] = not missing
 
         # A serving window ends at its visible ports; unrelated asynchronous tails can still be in flight.

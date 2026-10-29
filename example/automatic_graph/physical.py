@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 
 
 class PhysicalComparison:

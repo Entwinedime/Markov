@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 from markov_collection.instrumentation.recording import Recording
 
 
@@ -236,8 +236,9 @@ class SGLangObservation:
             identity = self.record_batch(scheduler, batch, observation)
             if observation == "source":
                 scope.metadata["batch"] = identity
-            if batch is not None:
-                if observation == "source":
+                if batch is None:
+                    scope.metadata["no_batch"] = True
+                else:
                     scope.metadata["dynamic_calls"] = True
                     scope.metadata["parameters"] = {"scheduled_members": len(batch.reqs)}
                     scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
@@ -248,8 +249,6 @@ class SGLangObservation:
                             "free_pages": scheduler.token_to_kv_pool_allocator.free_pages,
                         }
                     )
-            elif observation == "source":
-                scope.metadata["no_batch"] = True
 
             return batch
 
@@ -478,85 +477,61 @@ class SGLangObservation:
         )
         return call(cache, request, *args, **kwargs)
 
-    @staticmethod
-    def result_interfaces(regions: list[dict[str, Any]]) -> None:
-        for region in regions:
-            metadata = region["metadata"]
-
-            # The target controller supplies members; the source supplies this caller's own CPU service.
-            if region["role"] == "ResultProcessed":
-                metadata["dynamic_calls"] = True
-                metadata["parameters"] = {"result_members": len(metadata["effects"])}
-                continue
-            if region["role"] == "RequestOutput":
-                metadata["entrypoint"] = "request_output"
-                metadata["parameters"] = {"published_requests": len(metadata["requests"])}
-                continue
-            if region["role"] != "HostRead" or metadata["path"] != "tolist":
-                continue
-
-            # Only the read of this result's sampled tokens is a result-stage entrypoint.
-            parent = region["parent"]
-            while parent is not None:
-                caller = regions[parent]
-                if caller["role"] == "ResultProcessed":
-                    if metadata["source"] == caller["metadata"]["ports"]["inputs"]["sampled_tokens"]:
-                        metadata["entrypoint"] = "result_tokens"
-                        metadata["ports"] = {"inputs": {"tensor": metadata["source"]}, "outputs": {}}
-                    break
-                parent = caller["parent"]
-
     def flush(self, original: Any, scheduler: Any, empty_cache: bool = True) -> Any:
 
         # Reset logical pools without discarding the allocator state established by uniform warmup.
         result = original(scheduler, empty_cache=False)
-        if result:
-            import torch
+        if not result:
+            return result
 
-            from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
-            from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
-            from markov_collection.adapters.runtimes.ascend.materialization import AscendMaterializations
+        import torch
 
-            if self.allocation is None:
-                pool = scheduler.token_to_kv_pool_allocator
-                self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device), pool.need_sort)
-                self.indexed_writes.request_map(scheduler.req_to_token_pool.req_to_token)
-                self.materializations = AscendMaterializations(
-                    self.operators,
-                    pool.page_size,
-                    scheduler.req_to_token_pool.req_to_token.dtype,
-                    ("B", "max_sequence_tokens"),
+        from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
+        from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
+        from markov_collection.adapters.runtimes.ascend.materialization import AscendMaterializations
 
-                    # Prefill members remain unpadded; Decode follows native MLP token alignment.
-                    (1, self.ep_size),
-                )
-                with torch.npu.stream(self.model_stream):
-                    self.matrices.prepare()
-                self.workspace_policy = self.workspaces.reserve(
-                    self.matrices.description["cube_cores"],
-                    SGLangPrimitives.attention_geometries(self.model),
-                    [torch.npu.current_stream().npu_stream, self.model_stream.npu_stream],
-                )
-            self.concatenation.warmup()
-            self.allocation.warmup()
+        if self.allocation is None:
+            pool = scheduler.token_to_kv_pool_allocator
+            self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device), pool.need_sort)
+            self.indexed_writes.request_map(scheduler.req_to_token_pool.req_to_token)
+            self.materializations = AscendMaterializations(
+                self.operators,
+                pool.page_size,
+                scheduler.req_to_token_pool.req_to_token.dtype,
+                ("B", "max_sequence_tokens"),
+
+                # Prefill members remain unpadded; Decode follows native MLP token alignment.
+                (1, self.ep_size),
+            )
             with torch.npu.stream(self.model_stream):
-                self.materializations.warmup()
-            self.indexed_writes.warmup()
+                self.matrices.prepare()
+            self.workspace_policy = self.workspaces.reserve(
+                self.matrices.description["cube_cores"],
+                SGLangPrimitives.attention_geometries(self.model),
+                [torch.npu.current_stream().npu_stream, self.model_stream.npu_stream],
+            )
+        self.concatenation.warmup()
+        self.allocation.warmup()
+        with torch.npu.stream(self.model_stream):
+            self.materializations.warmup()
+        self.indexed_writes.warmup()
 
-            boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
-            self.workspace_states[boundary] = self.workspaces.snapshot()
+        boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
+        self.workspace_states[boundary] = self.workspaces.snapshot()
 
-            if any(batch["observation"] == "source" for batch in self.recording.batches):
-                self.concatenation.capture()
-                self.allocation.capture()
-                with torch.npu.stream(self.model_stream):
-                    self.matrices.capture()
-                    self.materializations.capture()
-                self.indexed_writes.capture()
-                self.preparation.transitions.capture()
-        if result and self.disaggregation is not None and self.derived_role:
+        has_source = any(batch["observation"] == "source" for batch in self.recording.batches)
+        if has_source:
+            self.concatenation.capture()
+            self.allocation.capture()
+            with torch.npu.stream(self.model_stream):
+                self.matrices.capture()
+                self.materializations.capture()
+            self.indexed_writes.capture()
+            self.preparation.transitions.capture()
+
+        if self.disaggregation is not None and self.derived_role:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
-        if result and any(batch["observation"] == "source" for batch in self.recording.batches):
+        if has_source:
             if self.pipeline is None:
                 self.write()
             else:

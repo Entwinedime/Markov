@@ -225,7 +225,6 @@ class BatchTransitionPrototypes:
         if self.captured:
             return
         self.captured = True
-        recording = self.operators.recording
 
         # Cover native filter branches and merge column pairs, independently of arrival timing or batch size.
         cases = [(left, right, None) for left, right in product(self.samples.values(), repeat=2)]
@@ -241,24 +240,8 @@ class BatchTransitionPrototypes:
             for observed in (False, True):
                 with self.operators.values.auxiliary():
                     first, second = self.prepare(left, right, selection)
-                identity = len(recording.batches)
-                recording.batches.append(
-                    {
-                        "id": identity,
-                        "kind": "primitive",
-                        "phase": "primitive",
-                        "members": [],
-                        "parameters": {},
-                        "observation": "source" if observed else "baseline",
-                    }
-                )
-                if observed:
-                    self.operators.begin_batch()
-                    with recording.scope("BatchPrototype", batch=identity), self.operators:
-                        self.invoke(first, second, selection)
-                else:
-                    with recording.markers.scope(f"markov.baseline/{identity}"):
-                        self.invoke(first, second, selection)
+                with self.operators.prototype("BatchPrototype", observed):
+                    self.invoke(first, second, selection)
                 torch.npu.synchronize()
 
         self.samples.clear()

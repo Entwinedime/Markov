@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from itertools import pairwise
 from typing import Any
 
-from execution import reachable_links
+from execution import DependencyPaths
 
 
 class OperationComparison:
@@ -14,11 +14,10 @@ class OperationComparison:
         self.source = source
         self.observed = observed
         self.target_graph = target
-        self.target_successors: dict[int, set[int]] = defaultdict(set)
-        for edge in target["dependencies"]:
-            self.target_successors[edge["source"]].add(edge["target"])
+        self.operation_paths = DependencyPaths(target)
 
         execution = target["execution"]
+        self.execution_paths = DependencyPaths(execution)
         self.target_calls = {call["operation"]: call for call in execution["host_calls"] if "operation" in call}
         entries = {call["entry"] for call in self.target_calls.values()}
         resources = {node["id"]: node["resource"] for node in execution["nodes"] if node["id"] in entries}
@@ -68,7 +67,7 @@ class OperationComparison:
             )
 
         # Matching a sequence does not prove that the target enforces the declared caller/service order.
-        missing = required - reachable_links(self.target_graph["execution"], required)
+        missing = self.execution_paths.missing(required)
         complete = len(paired) == len(native) == len(target)
         return paired, {
             "complete": complete,
@@ -231,27 +230,9 @@ class OperationComparison:
         return result
 
     def missing_orders(self, observed: list[Any], predicted: list[dict[str, Any]]) -> list[tuple[int, int]]:
-        required: dict[int, set[int]] = defaultdict(set)
-        for source, target, _ in observed:
-            required[source].add(target)
-
-        missing = []
-
-        # A local dependency may pass through another rank or flow before reaching its consumer.
-        for source, targets in required.items():
-            pending = {predicted[position]["id"]: position for position in targets}
-            successors = self.target_successors[predicted[source]["id"]]
-            for target in successors:
-                pending.pop(target, None)
-            visited = set()
-            frontier = deque(successors)
-            while frontier and pending:
-                target = frontier.popleft()
-                if target in visited:
-                    continue
-                visited.add(target)
-                pending.pop(target, None)
-                frontier.extend(self.target_successors[target] - visited)
-            missing.extend((source, target) for target in sorted(pending.values()))
-        return missing
+        required = {(predicted[source]["id"], predicted[target]["id"]) for source, target, _ in observed}
+        positions = {operation["id"]: index for index, operation in enumerate(predicted)}
+        return sorted(
+            (positions[source], positions[target]) for source, target in self.operation_paths.missing(required)
+        )
 

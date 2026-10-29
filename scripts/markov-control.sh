@@ -2,6 +2,6 @@
 set -euo pipefail
 
 MARKOV_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="$MARKOV_ROOT/src/control${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$MARKOV_ROOT/src/application${PYTHONPATH:+:$PYTHONPATH}"
 
-exec python3 -m markov_control.workflow "$@"
+exec python3 -m markov_application.native "$@"

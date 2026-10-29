@@ -14,7 +14,7 @@ import torch
 import torch_npu
 from torch_npu.utils import _npu_trace
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 
 
 class SynchronizationObservation:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from execution import ExecutionComparison
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 from operations import OperationComparison
 
 

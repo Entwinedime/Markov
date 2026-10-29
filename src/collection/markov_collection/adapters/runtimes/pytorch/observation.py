@@ -227,6 +227,31 @@ class OperatorObservation(TorchDispatchMode):
         self.values.shapes = ShapeRelations()
         self.functions.reset()
 
+    @contextmanager
+    def prototype(
+        self, role: str, observed: bool, *, phase: str = "primitive", **parameters: int
+    ) -> Iterator[None]:
+        identity = len(self.recording.batches)
+        self.recording.batches.append(
+            {
+                "id": identity,
+                "kind": "primitive",
+                "phase": phase,
+                "members": [],
+                "parameters": parameters,
+                "observation": "source" if observed else "baseline",
+            }
+        )
+
+        # Baselines share sample identity with the profiler but never enter symbolic observation.
+        if observed:
+            self.begin_batch()
+            with self.recording.scope(role, batch=identity), self:
+                yield
+        else:
+            with self.recording.markers.scope(f"markov.baseline/{identity}"):
+                yield
+
     def __torch_dispatch__(self, operation: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
         kwargs = kwargs or {}
         if self.recording.current_scope.get() is None or operation.namespace == "profiler":

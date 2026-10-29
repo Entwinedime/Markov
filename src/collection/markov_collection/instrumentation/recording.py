@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 
 
 class Scope:

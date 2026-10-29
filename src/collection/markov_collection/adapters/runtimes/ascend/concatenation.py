@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+from contextlib import nullcontext
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,6 @@ from typing import Any
 import torch
 
 from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation
-from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
 
 class AscendConcatenation:
@@ -24,7 +24,6 @@ class AscendConcatenation:
 
     def __init__(self, operators: Any) -> None:
         self.operators = operators
-        self.recording = operators.recording
         self.warmed = False
         self.captured = False
         root = Path("/usr/local/Ascend/ascend-toolkit/latest")
@@ -64,24 +63,10 @@ class AscendConcatenation:
             for observed in (False, True):
                 with self.operators.values.auxiliary():
                     tensors = [torch.ones(length, dtype=dtype, device="npu") for dtype, length in point]
-                identity = len(self.recording.batches)
-                self.recording.batches.append(
-                    {
-                        "id": identity,
-                        "kind": "primitive",
-                        "phase": "primitive",
-                        "members": [],
-                        "parameters": {"L": len(point), "concat_extent": sum(length for _, length in point)},
-                        "observation": "source" if observed else "baseline",
-                    }
-                )
-                if observed:
-                    self.operators.begin_batch()
-                    with self.recording.scope("RuntimePrototype", batch=identity), self.operators:
-                        with ConcatenationObservation(self.operators.values):
-                            torch.cat(tensors)
-                else:
-                    with TorchMarkers.scope(f"markov.baseline/{identity}"):
+                with self.operators.prototype(
+                    "RuntimePrototype", observed, L=len(point), concat_extent=sum(length for _, length in point)
+                ):
+                    with ConcatenationObservation(self.operators.values) if observed else nullcontext():
                         torch.cat(tensors)
                 torch.npu.synchronize()
         self.captured = True

@@ -15,8 +15,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
-from markov_collection.workflow.exploration import BudgetExceeded, CommandFailed, Exploration, read_specification
+from markov_application.exploration import BudgetExceeded, CommandFailed, Exploration
+from markov_application.specification import read_specification
+from markov_collection.artifacts import write_json
 from validation import NativeDeviceUnavailable, NativeValidation, analyze, completion_checks
 
 
@@ -155,7 +156,7 @@ class Investigation:
         adapters = [
             "src/markov/adapters",
             "src/collection/markov_collection/adapters",
-            "src/collection/adapters",
+            "src/collection/native",
             "docker/images/base/sglang",
             "docker/images/sglang",
         ]
@@ -361,7 +362,7 @@ class Investigation:
         with output.open("a") as log:
             try:
                 return subprocess.run(
-                    [sys.executable, "-m", "markov_collection.workflow.exploration", *arguments],
+                    [sys.executable, "-m", "markov_application.exploration", *arguments],
                     cwd=self.root,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -393,7 +394,7 @@ class Investigation:
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("a") as log:
             process = subprocess.Popen(
-                [sys.executable, "-m", "markov_collection.workflow.exploration", "--resume", str(directory)],
+                [sys.executable, "-m", "markov_application.exploration", "--resume", str(directory)],
                 cwd=self.root,
                 stdout=log,
                 stderr=subprocess.STDOUT,

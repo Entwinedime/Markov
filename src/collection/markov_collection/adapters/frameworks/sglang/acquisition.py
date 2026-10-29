@@ -10,8 +10,6 @@ from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.routes import ExpertRouteConditions
 from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
-from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
-from markov_collection.artifacts.json_file import write_json
 
 
 class SGLangAcquisition:
@@ -48,7 +46,7 @@ class SGLangAcquisition:
             [
                 "cmake",
                 "-S",
-                "/workspace/trace-sim/src/collection/adapters/runtimes/ascend",
+                "/workspace/trace-sim/src/collection/native/runtimes/ascend",
                 "-B",
                 directory,
                 "-G",
@@ -314,74 +312,13 @@ class SGLangAcquisition:
 
     @staticmethod
     def interpret(request: dict[str, Any]) -> None:
-        if request.get("pd"):
-            from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
-
-            NativeDisaggregatedSession.interpret(request)
-            return
+        from markov_collection.adapters.frameworks.sglang.source import SGLangSource
 
         directory = Path(request["output"])
         summary = json.loads((directory / "session-summary.json").read_text())
         for rank in summary["observed_roles"]:
-            SGLangAcquisition.interpret_role(directory, rank, summary["logical_pp"], summary["profile"])
-
-    @staticmethod
-    def interpret_role(directory: Path, rank: int, pp: int, profile: bool) -> None:
-        from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
-        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
-        from markov_collection.adapters.frameworks.sglang.expert_geometry import ModelPaddingCall
-        from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
-        from markov_collection.adapters.frameworks.sglang.hooks import SGLangObservation
-        from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
-        from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
-        from markov_collection.adapters.frameworks.sglang.state import PoolPorts
-        from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
-        from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
-        from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
-        from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
-        from markov_collection.adapters.runtimes.pytorch.collectives import AllReduceGeometry
-        from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
-
-        path = directory / f"rank-{rank}.json"
-        source = json.loads(path.read_text())
-
-        # Interpretation can be repeated from the captured facts without another native session.
-        SGLangObservation.result_interfaces(source["regions"])
-        ExpertObservation.declare(source)
-        BatchTensors.declare_model_inputs(source["regions"], source["values"])
-        AscendConcatenation.declare(source["regions"], source["values"])
-        AscendMatrices.declare(
-            source["regions"], source["operations"], source["values"], source["environment"]["matrix_selection"]
-        )
-        CollectiveCall.bind_transports(source["regions"], source["operations"], source["values"])
-        SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
-        geometries = TensorAssignmentCall.input_geometries(source["regions"])
-        ModelPaddingCall.declare(source["regions"], source["values"], geometries)
-        TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
-        AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
-        AscendLayouts.declare(source["regions"], source["operations"], source["values"])
-        AllReduceGeometry.declare(source["operations"], source["values"])
-        DisaggregatedTemplates.declare(source)
-        PoolPorts.declare(source["regions"], source["values"])
-        if pp > 1:
-            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
-
-            PipelineObservation.declare_waits(source["regions"])
-        write_json(path, source)
-        if not profile:
-            return
-
-        grouped = source["environment"]["source_transport"] != "physical_group_of_one"
-        name = f"physical-rank-{rank}.json" if grouped else "physical.json"
-
-        # Physical mapping belongs to immutable trace identities; declaration fixes can reuse the completed export.
-        if (directory / name).exists():
-            return
-        traces = directory / "native" / f"rank-{rank}" if grouped else directory / "native"
-        trace = AscendTrace.exported_trace(traces)
-        observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
-        physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
-        write_json(directory / name, physical)
+            path = directory / SGLangAcquisition.source_name(request, rank)
+            SGLangSource.interpret(path, summary["profile"])
 
 
 if __name__ == "__main__":

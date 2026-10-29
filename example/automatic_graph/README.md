@@ -41,7 +41,9 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 
-控制基线为 FCFS、分开的 Prefill/Decode、固定输出长度和冷逻辑 KV。统一预热使用与目标序列分开的固定五请求，并按原生 ATB 上界预留 workspace；预热不计入目标服务时间，但计入采集费用。当前 runtime 规则针对 CANN 9.0/Ascend910B 的 dense 路径，workspace 预留限制为相等且不大于 128 的 head 维度。其他缓存、chunk、overlap、speculative 或内容相关路径需要相应能力。
+一键探索使用轻量控制器，基线为 FCFS、分开的 Prefill/Decode、固定输出长度和冷逻辑 KV。已有模板也可通过下文的原生控制入口运行：原生代码决定组批及PP/PD推进，核心管理KV资源和模拟完成反馈。两种控制不保证产生相同批次，当前均未启用chunk、overlap和prefix caching。
+
+统一预热使用与目标序列分开的固定五请求，并按原生 ATB 上界预留 workspace；预热不计入目标服务时间，但计入采集费用。当前 runtime 规则针对 CANN 9.0/Ascend910B 的 dense 路径，workspace 预留限制为相等且不大于 128 的 head 维度。其他缓存、chunk、overlap、speculative 或内容相关路径需要相应能力。
 
 给定耗时改变后，完成事件会改变后续组批。一次运行完成、条件结构可展开、独立原生对照相符和性能精度通过分别判断，不能相互代替。
 
@@ -80,7 +82,7 @@ example/automatic_graph/run.sh --resume data/<UTC时间>_automatic-graph
 
 ```bash
 MARKOV_OBSERVER_BUILD="$PWD/data/YOUR_RUN/work/observer-build"
-cmake -S src/collection/adapters/runtimes/ascend \
+cmake -S src/collection/native/runtimes/ascend \
   -B "$MARKOV_OBSERVER_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DMARKOV_ASCEND_INCLUDE_DIR=/usr/local/Ascend/ascend-toolkit/latest/include
 cmake --build "$MARKOV_OBSERVER_BUILD" -j2
@@ -117,6 +119,18 @@ scripts/markov.sh simulate \
 ```
 
 直接调用脚本前须已有当前核心构建，可用 `scripts/build.sh` 制作。逻辑 TP 在一次 `templates` 中重复 `--source`，每项后接对应的 `--physical`；随后向 `simulate` 传入这一份来源域模板。共享 catalog 只保存一份相同结构，roles 保留各 rank 的独立入口和资源绑定；旧内部资产需从来源重建。只有语义来源时可省略 `--physical` 建立逻辑诊断库，不能据此执行完整物理 serving。
+
+切换为无设备原生控制时，先从当前推理镜像构建控制镜像，再消费同样的模板与目标输入：
+
+```bash
+docker compose -p markov-next-redesign -f docker/compose/inference.yml build control
+bash scripts/markov-control.sh \
+  --templates data/YOUR_RUN/assets/templates.json \
+  --input example/automatic_graph/serving.json \
+  --output data/YOUR_RUN/results/native-serving.json
+```
+
+启动端需要Python≥3.10和Docker；它连接独立的原生控制与C++执行容器，不挂载设备、权重或目标观察。原生模型及拓扑配置取自模板；结果发布前等待全部参与进程成功退出。`--details`保留图和动作明细，`--timeout-seconds`限制本次运行时间。该入口检查已采模板下的闭环，不自动补采，也不代表独立结构对照通过。
 
 `inspect` 报告声明的形状、条件和状态缺口；`produce` 发布公开图。模板分开自身工作定义、子调用组合布局、具体调用绑定与物理执行变体；层号、动态成员和目标实例不自动形成新定义。`simulate` 依据目标状态和完成事件持续展开，CPU 服务、设备工作、等待及输出端口各有边界。
 
@@ -157,7 +171,7 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 | [physical.py](physical.py) | 从保留的 trace/runtime 事实形成物理归属清单 |
 | [structure.py](structure.py) | 比较独立观察与预测的批次、工作、几何、状态及端口 |
 | [operations.py](operations.py) | 共用操作、端口及数据依赖核对，独立于serving配对和调度 |
-| [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿 |
+| [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿；共用依赖路径查询，保持完整图中的跨rank/flow路径 |
 | [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
 | [request_state.py](request_state.py) | 根据实际提交/完成记录核对请求进度、槽位与KV页所有权；由evidence调用 |
 | [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |

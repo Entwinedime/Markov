@@ -16,7 +16,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 
 
 class NativeDisaggregatedSession:
@@ -328,14 +328,3 @@ class NativeDisaggregatedSession:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
-
-    @staticmethod
-    def interpret(request: dict[str, Any]) -> None:
-        from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
-
-        directory = Path(request["output"])
-        summary = json.loads((directory / "session-summary.json").read_text())
-        for instance in NativeDisaggregatedSession.instances(request):
-            for rank in summary["observed_roles"]:
-                if rank in instance["ranks"]:
-                    SGLangAcquisition.interpret_role(directory / instance["role"], rank, instance["pp"], True)

@@ -16,7 +16,6 @@ class IndexedWritePrototypes:
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
 
         self.operators = operators
-        self.recording = operators.recording
         self.warmed = False
         self.captured = False
 
@@ -58,28 +57,14 @@ class IndexedWritePrototypes:
 
         import torch
 
-        from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
-
         if self.captured:
             return
         for shape, members, dtype in self.points:
             for observed in (False, True):
                 with self.operators.values.auxiliary():
                     target, indices, payload = self.tensors(shape, members, dtype)
-                identity = len(self.recording.batches)
-                self.recording.batches.append(
-                    {
-                        "id": identity,
-                        "kind": "primitive",
-                        "phase": "primitive",
-                        "members": [],
-                        "parameters": {"slot_capacity": shape[0] - 1, "B": members},
-                        "observation": "source" if observed else "baseline",
-                    }
-                )
-                if observed:
-                    self.operators.begin_batch()
-                    with self.recording.scope("RuntimePrototype", batch=identity), self.operators:
+                with self.operators.prototype("RuntimePrototype", observed, slot_capacity=shape[0] - 1, B=members):
+                    if observed:
                         with self.operators.values.metadata():
                             values = self.operators.values
                             capacity_axis = values.bounded_parameter("slot_capacity", 1, sys.maxsize)
@@ -88,10 +73,8 @@ class IndexedWritePrototypes:
                             for tensor in values.tensor_leaves(indices):
                                 values.shapes.bind_contiguous(tensor, (member_axis,))
                             values.shapes.bind_contiguous(payload, (member_axis,))
-                        target[indices] = payload
-                else:
-                    with TorchMarkers.scope(f"markov.baseline/{identity}"):
-                        target[indices] = payload
+
+                    target[indices] = payload
                 torch.npu.synchronize()
         self.captured = True
 

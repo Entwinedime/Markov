@@ -173,18 +173,10 @@ class DisaggregatedScheduler(NativeScheduler):
         return super().process_input_requests(requests)
 
     def get_next_disagg_prefill_batch_to_run(self):
-        batch = super().get_next_disagg_prefill_batch_to_run()
-        return self.prepare(batch)
+        return self.prepare(super().get_next_disagg_prefill_batch_to_run())
 
     def get_next_disagg_decode_batch_to_run(self):
-        batch = super().get_next_disagg_decode_batch_to_run()
-        return self.prepare(batch)
-
-    def prepare(self, batch):
-        if batch is not None:
-            batch.control_work = dict(self.peer.context)
-            self.peer.call("prepare")
-        return batch
+        return self.prepare(super().get_next_disagg_decode_batch_to_run())
 
 
 class PipelineDisaggregatedScheduler(DisaggregatedScheduler, PipelineScheduler):

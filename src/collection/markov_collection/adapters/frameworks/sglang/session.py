@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 
 
 class NativeServingSession:
@@ -191,12 +191,13 @@ class NativeServingSession:
             mem_fraction_static=0.8,
             log_level="warning",
         )
-        initialized = time.perf_counter_ns()
-        if self.native_group:
-            plan = json.loads((self.output / "role-plan.json").read_text())
-            self.observed_roles = tuple(plan["observed_roles"])
-        print("markov: native initialization complete", flush=True)
         try:
+            initialized = time.perf_counter_ns()
+            if self.native_group:
+                plan = json.loads((self.output / "role-plan.json").read_text())
+                self.observed_roles = tuple(plan["observed_roles"])
+            print("markov: native initialization complete", flush=True)
+
             self.generate(engine, "warmup/", warmup)
             self.reset(engine)
             warmed = time.perf_counter_ns()

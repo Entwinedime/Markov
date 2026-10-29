@@ -117,7 +117,9 @@ class NativeScheduler(Scheduler):
 
     def get_next_batch_to_run(self):
         self.begin_iteration()
-        batch = super().get_next_batch_to_run()
+        return self.prepare(super().get_next_batch_to_run())
+
+    def prepare(self, batch):
         if batch is not None:
             batch.control_work = dict(self.peer.context)
             self.peer.call("prepare")

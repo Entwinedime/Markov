@@ -13,8 +13,6 @@ import torch
 import torch_npu
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
-
 if TYPE_CHECKING:
     from markov_collection.adapters.runtimes.ascend.observation import AscendOperatorObservation
 
@@ -25,7 +23,6 @@ class AscendMatrices(TorchDispatchMode):
     def __init__(self, operators: AscendOperatorObservation, binary: str, limits: dict[str, int], version: str) -> None:
         super().__init__()
         self.operators = operators
-        self.recording = operators.recording
         self.binary = binary
         self.limits = limits
         self.version = version
@@ -161,27 +158,13 @@ class AscendMatrices(TorchDispatchMode):
             with self.operators.values.auxiliary():
                 left = torch.ones((rows, key[1]), device=right.device, dtype=right.dtype)
             for observed in (False, True):
-                identity = len(self.recording.batches)
-                self.recording.batches.append(
-                    {
-                        "id": identity,
-                        "kind": "primitive",
-                        "phase": "primitive",
-                        "members": [],
-                        "parameters": {"matrix_rows": rows},
-                        "observation": "source" if observed else "baseline",
-                    }
-                )
-                if observed:
-                    self.operators.begin_batch()
-                    with self.recording.scope("RuntimePrototype", batch=identity), self.operators:
+                with self.operators.prototype("RuntimePrototype", observed, matrix_rows=rows):
+                    if observed:
                         with self.operators.values.metadata():
                             self.operators.values.bounded_parameter("matrix_rows", 1, self.selections[key]["max_rows"])
                             self.operators.values.bind(left, {0: "matrix_rows"})
-                        self.invoke(key, left)
-                else:
-                    with TorchMarkers.scope(f"markov.baseline/{identity}"):
-                        self.invoke(key, left)
+
+                    self.invoke(key, left)
                 torch.npu.synchronize()
         self.captured = True
 

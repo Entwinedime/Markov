@@ -10,8 +10,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
-from markov_collection.workflow.exploration import BudgetExceeded, Exploration, read_specification
+from markov_application.exploration import BudgetExceeded, Exploration
+from markov_application.specification import read_specification
+from markov_collection.artifacts import write_json
 from serving import native_configuration
 
 
@@ -34,7 +35,7 @@ def analyze(task: Exploration, script: str, arguments: list[str]) -> None:
             "-v",
             f"{task.root}:{task.root}",
             "-e",
-            f"PYTHONPATH={task.root}/src/collection",
+            f"PYTHONPATH={task.root}/src/application:{task.root}/src/collection",
             task.environment.modeling_image,
             *task.environment.limited(command, task.available("processing")),
         ],

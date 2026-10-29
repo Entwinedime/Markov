@@ -13,7 +13,7 @@ import torch
 import torch_npu
 from markov_collection.adapters.frameworks.sglang.state import PageMergeCall, PageReleaseCall, PageReleaseGroupCall
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation, TorchMarkers
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 from markov_collection.instrumentation.recording import Recording
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 

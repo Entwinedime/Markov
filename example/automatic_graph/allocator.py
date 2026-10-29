@@ -14,7 +14,7 @@ import torch_npu
 from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
 from markov_collection.adapters.runtimes.ascend.synchronization import SynchronizationObservation
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation, TorchMarkers
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts import write_json
 from markov_collection.instrumentation.recording import Recording
 
 

@@ -136,7 +136,6 @@ class SGLangAllocation:
         from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 
         self.operators = operators
-        self.recording = operators.recording
         self.page_size = page_size
         self.device = device
         self.need_sort = need_sort
@@ -157,7 +156,6 @@ class SGLangAllocation:
 
     def execute(self, lengths: tuple[int, ...], observed: bool | None) -> torch.Tensor:
         from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall
-        from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
         values = self.operators.values
         with values.auxiliary():
@@ -175,25 +173,9 @@ class SGLangAllocation:
         if observed is None:
             return self.original(*arguments)
 
-        identity = len(self.recording.batches)
-        self.recording.batches.append(
-            {
-                "id": identity,
-                "kind": "primitive",
-                "phase": "prefill",
-                "members": [],
-                "parameters": {"M": sum(lengths), "B": len(lengths)},
-                "observation": "source" if observed else "baseline",
-            }
-        )
-        if observed:
-            self.operators.begin_batch()
-        scope = (
-            self.recording.scope("AllocationPrototype", batch=identity)
-            if observed
-            else TorchMarkers.scope(f"markov.baseline/{identity}")
-        )
-        with scope, self.operators if observed else nullcontext():
+        with self.operators.prototype(
+            "AllocationPrototype", observed, phase="prefill", M=sum(lengths), B=len(lengths)
+        ):
             if observed:
                 return PageAllocationCall(values, self.original, pool, decode=False)(*arguments)
             return self.original(*arguments)
@@ -228,7 +210,6 @@ class SGLangAllocation:
 
     def merge(self, observed: bool | None) -> tuple[torch.Tensor, torch.Tensor]:
         from markov_collection.adapters.frameworks.sglang.state import PageMergeCall
-        from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
 
         values = self.operators.values
         with values.auxiliary():
@@ -240,25 +221,7 @@ class SGLangAllocation:
             original(pool)
             return pool.free_pages, pool.release_pages
 
-        identity = len(self.recording.batches)
-        self.recording.batches.append(
-            {
-                "id": identity,
-                "kind": "primitive",
-                "phase": "control",
-                "members": [],
-                "parameters": {},
-                "observation": "source" if observed else "baseline",
-            }
-        )
-        if observed:
-            self.operators.begin_batch()
-        scope = (
-            self.recording.scope("AllocationPrototype", batch=identity)
-            if observed
-            else TorchMarkers.scope(f"markov.baseline/{identity}")
-        )
-        with scope, self.operators if observed else nullcontext():
+        with self.operators.prototype("AllocationPrototype", observed, phase="control"):
             if observed:
                 PageMergeCall(values, original, pool)(pool)
             else:

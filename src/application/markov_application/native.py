@@ -1,5 +1,6 @@
-"""Own the two process lifetimes; request decisions and resource state stay inside them."""
+"""Run one native-controlled prediction in isolated, device-free containers."""
 
+import argparse
 import math
 import os
 import signal
@@ -158,3 +159,24 @@ class NativeExecution:
     @staticmethod
     def interrupt(signum, frame) -> None:
         raise SystemExit(128 + signum)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--templates", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=300)
+    parser.add_argument("--details", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.timeout_seconds <= 0:
+        parser.error("--timeout-seconds must be positive")
+
+    root = Path(__file__).resolve().parents[3]
+    NativeExecution(root, arguments.output, arguments.timeout_seconds).run(
+        arguments.templates, arguments.input, arguments.details
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -6,26 +6,31 @@ from collections import Counter, defaultdict, deque
 from typing import Any
 
 
-def reachable_links(execution: dict[str, Any], links: set[tuple[int, int]]) -> set[tuple[int, int]]:
-    if not links:
-        return set()
+class DependencyPaths:
+    def __init__(self, graph: dict[str, Any]) -> None:
+        self.successors: dict[int, set[int]] = defaultdict(set)
+        for edge in graph["dependencies"]:
+            self.successors[edge["source"]].add(edge["target"])
 
-    successors = defaultdict(list)
-    for edge in execution["dependencies"]:
-        successors[edge["source"]].append(edge["target"])
+    def missing(self, links: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        required: dict[int, set[int]] = defaultdict(set)
+        for source, target in links:
+            required[source].add(target)
 
-    reached = set()
-    for source, target in links:
-        visited = {source}
-        pending = deque([source])
-        while pending and target not in visited:
-            for child in successors.get(pending.popleft(), ()):
-                if child not in visited:
-                    visited.add(child)
-                    pending.append(child)
-        if target in visited:
-            reached.add((source, target))
-    return reached
+        missing = set()
+
+        # Search the full graph once per source; paths may cross another rank or flow.
+        for source, targets in required.items():
+            visited = {source}
+            pending = deque([source])
+            targets.discard(source)
+            while pending and targets:
+                children = self.successors.get(pending.popleft(), set()) - visited
+                targets.difference_update(children)
+                visited.update(children)
+                pending.extend(children)
+            missing.update((source, target) for target in targets)
+        return missing
 
 
 class ExecutionComparison:
@@ -410,7 +415,7 @@ class ExecutionComparison:
 
         # A later frontier outside this flow can still complete its local work in the unchanged full graph.
         missing = required - internal
-        transitive = reachable_links(self.execution, missing)
+        transitive = missing - DependencyPaths(self.execution).missing(missing) if missing else set()
         missing -= transitive
         extra = internal - required
         same = not missing and not extra and not unexpected
