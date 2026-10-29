@@ -53,7 +53,6 @@ class PageAllocator:
         self.size = size
         self.page_size = page_size
         self.device = "cpu"
-        self.need_sort = False
         self.storage = KvStorage(size, page_size)
         self.batch = None
         self.phase = None
