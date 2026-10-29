@@ -65,7 +65,7 @@ struct CallerPreparation {
 struct AsyncCompletion {
     Work work;
     std::size_t resource;
-    simulation::Action completed;
+    std::optional<simulation::Action> completed;
     simulation::Component owner;
 };
 
@@ -174,7 +174,7 @@ struct ExecutionQueues {
 };
 
 struct NativeEvents {
-    simulation::Action complete;
+    std::optional<simulation::Action> complete;
     std::optional<simulation::Action> submitted = std::nullopt;
     std::optional<simulation::Action> produced = std::nullopt;
 };

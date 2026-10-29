@@ -6,6 +6,70 @@
 
 namespace markov::trace_graph::planning {
 
+bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages) {
+    const Features features{
+        {           "pages",                                   pages },
+        {      "page_bytes", page_tokens_ * backend_.bytes_per_token },
+        {          "layers",                         backend_.layers },
+        { "bytes_per_token",                backend_.bytes_per_token }
+    };
+    const std::vector<Work> work{
+        { backend_.backup_caller, features }
+    };
+    const FrameInput input{ 0, 0, 0, 1, static_cast<double>(page_tokens_) };
+    std::vector<NativePlan> plans(backend_.participants);
+    for (std::size_t rank = 0; rank < plans.size(); ++rank) {
+        auto calls = backend_.backup_calls->describe(Phase::Prefill, input, work);
+        if (calls.issue) {
+            issue_ = calls.issue;
+            return false;
+        }
+        const auto resource = source_.observations().resources.size() + 2 * rank + 1;
+        for (auto & call : calls.calls)
+            if (call.async_work)
+                call.async_completion = AsyncCompletion{
+                    { backend_.backup_completion, features },
+                    resource,
+                    std::nullopt,
+                    0
+                };
+        const auto caller = running_[request_].callers[rank];
+
+        // This closed host recipe has no separate worker or compute stream.
+        if (!plans[rank].extend(calls, { caller, caller, caller }, preparations_)) {
+            issue_ = "kernel_cache_initial_state_unavailable";
+            return false;
+        }
+    }
+
+    const auto begin = runtime.next_node();
+    PlannedMutation mutation{ 0, {}, {} };
+    PendingCopy pending{ node, true, CopyKind::Backup, pages, std::nullopt, cache_.tree().nodes()[node].pages };
+    NativeFrontier frontier;
+    for (std::size_t rank = 0; rank < plans.size(); ++rank) {
+        const auto base = begin + mutation.operations.size();
+        const auto resource = source_.observations().resources.size() + 2 * rank + 1;
+        const auto ends = plans[rank].frontier(base);
+        auto participant = plans[rank].mutation(0, base, { std::nullopt }, cause_, queues_.native);
+        pending.caller_returns.push_back(base + participant.operations.size() - 1);
+        pending.copy_completions.push_back(ends.at(resource));
+        frontier.insert(ends.begin(), ends.end());
+        mutation.operations.insert(mutation.operations.end(), participant.operations.begin(), participant.operations.end());
+        mutation.dependencies.insert(mutation.dependencies.end(), participant.dependencies.begin(), participant.dependencies.end());
+    }
+    const auto end = begin + mutation.operations.size();
+    mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::CopyDone, transfer) });
+    for (const auto port : pending.caller_returns) mutation.dependencies.push_back({ port, end, graph::EdgeKind::DataDependency });
+    for (const auto port : pending.copy_completions) mutation.dependencies.push_back({ port, end, graph::EdgeKind::DataDependency });
+    pending.completion = end;
+    copies_.emplace(transfer, std::move(pending));
+    if (!runtime.submit(std::move(mutation))) return false;
+    for (const auto & [resource, tail] : frontier) queues_.native[resource] = tail;
+    copy_frontier_[1] = end;
+    ++backups_;
+    return true;
+}
+
 FrameInput CacheProgram::begin_frame(std::size_t request, std::size_t frame, FrameInput input) {
     auto & running = running_[request];
     const auto context = static_cast<std::size_t>(input.context_tokens);

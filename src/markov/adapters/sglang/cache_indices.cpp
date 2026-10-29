@@ -1,6 +1,7 @@
 #include "markov/adapters/sglang/cache_indices.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 
 namespace markov::adapters::sglang {
@@ -64,9 +65,30 @@ private:
     double table_element_bytes_;
 };
 
+class CacheBackup final : public CallSequence {
+public:
+    NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work> work) const override {
+        NativeSequence result{ {}, std::nullopt };
+        const auto clone = cache_index_copies();
+        for (std::size_t id = 0; id < work.size(); ++id) {
+            const auto & operation = work[id];
+            result.calls.push_back({ operation, CallKind::HostCall, {} });
+            result.calls.back().async_work = id;
+            const std::vector<Work> indices{
+                { { "cache.index_clone", {}, {} }, { { "pages", operation.features.at("pages") }, { "host", 1 } } }
+            };
+            auto copies = clone->describe(phase, input, indices);
+            result.calls.insert(result.calls.end(), std::make_move_iterator(copies.calls.begin()), std::make_move_iterator(copies.calls.end()));
+        }
+        return result;
+    }
+};
+
 } // namespace
 
 std::unique_ptr<const trace_graph::planning::CallSequence> cache_index_copies() { return std::make_unique<CacheIndexCopies>(); }
+
+std::unique_ptr<const trace_graph::planning::CallSequence> cache_backup() { return std::make_unique<CacheBackup>(); }
 
 std::unique_ptr<const trace_graph::planning::CallSequence> cache_index_match(double table_element_bytes) {
     return std::make_unique<CacheIndexMatch>(table_element_bytes);

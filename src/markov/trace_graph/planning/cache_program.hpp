@@ -21,6 +21,9 @@ namespace markov::trace_graph::planning {
 struct CacheBackend {
     std::size_t layers, bytes_per_token, participants, minimum_load_tokens;
     WorkKind load, backup, backup_caller, backup_completion;
+
+    // Targets share one immutable native recipe, not mutable cache state.
+    std::shared_ptr<const CallSequence> backup_calls;
     StorageBackend storage;
 };
 
@@ -149,6 +152,7 @@ private:
     bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
     bool make_host_room(std::size_t pages);
     bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after);
+    bool eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
     std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
 

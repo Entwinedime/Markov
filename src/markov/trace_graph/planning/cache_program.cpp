@@ -73,6 +73,7 @@ bool CacheProgram::submit(ProgramRuntime & runtime, PlannedMutation mutation) {
 }
 
 bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after) {
+    if (kind == CopyKind::Backup && evict_after) return eviction_backup(runtime, transfer, node, pages);
     const double page_bytes = page_tokens_ * backend_.bytes_per_token;
     const Work work{
         kind == CopyKind::Load ? backend_.load : backend_.backup,
@@ -194,6 +195,8 @@ void CacheProgram::respond(ProgramRuntime & runtime, std::size_t request) {
 }
 
 void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
+    // Write-back eviction synchronizes its copies inside the caller turn.
+    if (eviction_wait_) return;
     // A blocked admission yields the caller so older results can release space.
     for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
     running_[request_].admission.clear();
