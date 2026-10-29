@@ -88,9 +88,15 @@ void SourceContext::index_native_sequences() {
         const planning::FrameInput input{ query, query, context, 1, frame.page_tokens.value_or(0) };
         const auto & preparation = site.observation;
         if (!preparation.definition) continue;
-        auto sequence = preparation.definition->describe(frame.phase, input);
+        auto sequence = preparation.definition->describe(frame.phase, input, preparation.source_work);
         site.native.result_ready = sequence.result_ready;
-        if (!sequence.issue && sequence.calls.size() == 1 && sequence.calls.front().kind == planning::CallKind::Cpu) {
+        if (!sequence.issue && (sequence.calls.empty() || (sequence.calls.size() == 1 && sequence.calls.front().kind == planning::CallKind::Cpu))) {
+            const auto & lane = lanes[preparation.region.resource];
+            const auto at = std::ranges::lower_bound(lane, preparation.region.begin_ns, {}, submitted);
+            if (at != lane.end() && submitted(*at) < preparation.region.end_ns) {
+                site.native.issue = "cpu_or_empty_recipe_contains_native_submissions";
+                continue;
+            }
             site.native.definitions = std::move(sequence.calls);
             site.native.issue.reset();
             continue;

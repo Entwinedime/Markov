@@ -41,11 +41,23 @@ struct CacheNode {
     std::size_t access_sequence = 0;
 };
 
+struct IndexCopy {
+    // Index-vector lengths use cache pages; these are not KV payload copies.
+    Tier tier;
+    std::size_t pages;
+};
+
 struct CacheMatch {
     RadixId node;
     RadixId device;
     RadixId host;
     std::size_t pages;
+    std::vector<IndexCopy> index_copies = {};
+};
+
+struct DeviceCommit {
+    RadixId node;
+    std::vector<IndexCopy> index_copies;
 };
 
 enum class CopyKind { Backup, Load };
@@ -82,7 +94,7 @@ public:
     std::optional<BufferId> reserve(Tier tier, std::size_t pages);
     PublicationId begin_device_publication();
     std::size_t publication_pages(PublicationId publication) const;
-    RadixId commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer = std::nullopt);
+    DeviceCommit commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer = std::nullopt);
     RadixId commit_host(std::span<const PrefixId> pages, BufferId buffer);
     void release(BufferId buffer);
     void trim(BufferId buffer, std::size_t remaining_pages);
@@ -125,7 +137,7 @@ private:
     std::optional<CacheSlot> & slot(RadixId node, Tier tier);
     const std::optional<CacheSlot> & slot(RadixId node, Tier tier) const;
     std::vector<RadixId> path(RadixId node) const;
-    void apply_split(const RadixMatch & change);
+    void apply_split(const RadixMatch & change, std::vector<IndexCopy> & copies);
     void touch(const RadixMatch & change);
     bool take_pages(Tier tier, std::size_t pages);
     void return_pages(Tier tier, std::size_t pages);

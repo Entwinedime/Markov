@@ -117,6 +117,30 @@ private:
     double tokens_, source_element_bytes_;
 };
 
+class CacheIndexInsertion final : public CallSequence {
+public:
+    NativeSequence describe(Phase, const FrameInput & input, std::span<const Work> work) const override {
+        std::vector<NativeCall> calls;
+        for (const auto & copy : work) {
+            const bool host = copy.features.at("host") != 0;
+            Work clone{
+                {                                           "cache.index_clone", host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64", host ? "cpu_service" : "device_service" },
+                { { "elements", copy.features.at("pages") * input.page_tokens },                                 { "element_bytes", 8 },                    { "tensor_rank", 1 } }
+            };
+            NativeCall call{ clone, host ? CallKind::Cpu : CallKind::Queued, host ? std::vector<Work>{} : std::vector<Work>{ clone } };
+            if (!host) {
+                call.queue_name = "aclnnInplaceCopy";
+                call.worker_features = {
+                    { "element_bytes", 8 },
+                    {   "tensor_rank", 1 }
+                };
+            }
+            calls.push_back(std::move(call));
+        }
+        return { std::move(calls), std::nullopt };
+    }
+};
+
 NativeSequence ResultOutput::describe(Phase phase, const FrameInput & input, std::span<const Work>) const {
     const std::string prefix = phase == Phase::Prefill ? "prefill.output." : "decode.output.";
     const Features tensor{
@@ -259,6 +283,47 @@ std::vector<trace_graph::source::ObservedCallSequence> read_result_callers(const
                     std::make_unique<CacheIndexValues>(tokens, dtype == "torch.int32" ? 4 : 8),
                     "cache_index_values"
                 });
+                auto insertion_end = control.region.end_ns;
+                // Backup switches streams after insertion; later index copies belong to matching/table updates.
+                for (const auto & native : observed.native_queue_calls)
+                    if (native.submission.resource == parent.resource && copy->end_ns <= native.submission.begin_ns
+                        && native.submission.end_ns <= control.region.end_ns && observed.names[native.name] == "record_event")
+                        insertion_end = std::min(insertion_end, native.submission.begin_ns);
+                for (const auto nested : processed.controls) {
+                    const auto & child = observed.host_controls[nested];
+                    if (child.work.kind.operation == "allocator.release_pages" && copy->end_ns <= child.region.begin_ns
+                        && child.region.end_ns <= control.region.end_ns)
+                        insertion_end = std::min(insertion_end, child.region.begin_ns);
+                }
+                std::vector<const ObservedSpan *> clones;
+                for (const auto & span : observed.spans)
+                    if (span.resource == parent.resource && observed.names[span.name] == "aten::clone" && copy->end_ns <= span.begin_ns
+                        && span.end_ns <= insertion_end)
+                        clones.push_back(&span);
+                std::ranges::sort(clones, {}, &ObservedSpan::begin_ns);
+                auto region = ObservedRegion{ parent.resource, copy->end_ns, copy->end_ns, copy->record };
+                if (!clones.empty()) region = { parent.resource, clones.front()->begin_ns, clones.back()->end_ns, clones.front()->record };
+                const auto & frame = observed.compute_frames[result.frame];
+                const auto page = frame.page_tokens.value();
+                double protected_tokens = 0;
+                if (operation == "cache.update_prefix") protected_tokens = control.work.features.at("protected_tokens_before");
+                else if (frame.phase == Phase::Prefill) protected_tokens = frame.sequence_tokens.front() - frame.query_tokens->front();
+                else {
+                    const auto & request = observed.request_tokens.at(observed.names[*control.request]);
+                    protected_tokens = observed.token_paths.length(request.prompt.value().path);
+                }
+                std::vector<Work> source_work;
+                const auto new_pages = std::floor(tokens / page) - std::floor(protected_tokens / page);
+                if (clones.size() == 1 && new_pages > 0)
+                    source_work.push_back({
+                        { "cache.index_clone", {}, {} },
+                        { { "pages", new_pages }, { "host", 0 } }
+                    });
+                callers.push_back({ region,
+                                    std::make_unique<CacheIndexInsertion>(),
+                                    "cache_index_insertion",
+                                    operation == "cache.update_prefix" ? ResultControl::UpdatePrefix : ResultControl::CommitPrefix,
+                                    std::move(source_work) });
             }
         }
     }

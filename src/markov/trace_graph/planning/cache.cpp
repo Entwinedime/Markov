@@ -22,7 +22,7 @@ std::vector<RadixId> Cache::path(RadixId node) const {
     return result;
 }
 
-void Cache::apply_split(const RadixMatch & change) {
+void Cache::apply_split(const RadixMatch & change, std::vector<IndexCopy> & copies) {
     nodes_.resize(tree_.nodes().size());
     if (!change.split_child) return;
 
@@ -32,6 +32,10 @@ void Cache::apply_split(const RadixMatch & change) {
     nodes_[prefix].host_refs = 0;
     for (const auto tier : { Tier::Device, Tier::Host }) {
         const auto & allocation = slot(prefix, tier);
+        if (allocation) {
+            copies.push_back({ tier, tree_.nodes()[prefix].pages.size() });
+            copies.push_back({ tier, tree_.nodes()[child].pages.size() });
+        }
         if (allocation && allocation->producer) publications_.at(*allocation->producer).nodes.push_back(prefix);
     }
 }
@@ -46,13 +50,14 @@ void Cache::touch(const RadixMatch & change) {
 
 CacheMatch Cache::match(std::span<const PrefixId> pages) {
     const auto result = tree_.match(pages);
-    apply_split(result);
+    std::vector<IndexCopy> copies;
+    apply_split(result, copies);
     touch(result);
 
     auto device = result.node, host = result.node;
     while (device != 0 && !nodes_[device].device) device = tree_.nodes()[device].parent;
     while (host != 0 && !nodes_[host].host) host = tree_.nodes()[host].parent;
-    return { result.node, device, host, result.pages };
+    return { result.node, device, host, result.pages, std::move(copies) };
 }
 
 std::size_t Cache::page_count(RadixId node) const {
@@ -108,8 +113,8 @@ std::size_t Cache::publication_pages(PublicationId publication) const {
     return pages;
 }
 
-RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer) {
-    const auto matched = match(pages);
+DeviceCommit Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer, std::optional<PublicationId> producer) {
+    auto matched = match(pages);
     auto & allocation = buffers_.at(buffer);
     std::size_t needed = pages.size() - matched.pages;
     for (const auto id : path(matched.node)) {
@@ -118,10 +123,11 @@ RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer, s
     if (allocation.tier != Tier::Device || allocation.pages < needed) throw std::runtime_error("Device commit exceeds its reserved buffer");
 
     const auto inserted = tree_.insert(pages);
-    apply_split(inserted);
+    apply_split(inserted, matched.index_copies);
     for (const auto id : path(inserted.node)) {
         const bool present = nodes_[id].device.has_value();
         if (!present) {
+            matched.index_copies.push_back({ Tier::Device, tree_.nodes()[id].pages.size() });
             nodes_[id].device = CacheSlot{ producer };
             if (producer) publications_.at(*producer).nodes.push_back(id);
             allocation.pages -= tree_.nodes()[id].pages.size();
@@ -130,7 +136,7 @@ RadixId Cache::commit_device(std::span<const PrefixId> pages, BufferId buffer, s
         if (config_.backup_after_hits && (present || new_suffix)) ++nodes_[id].hits;
     }
     touch(inserted);
-    return inserted.node;
+    return { inserted.node, std::move(matched.index_copies) };
 }
 
 RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
@@ -140,7 +146,8 @@ RadixId Cache::commit_host(std::span<const PrefixId> pages, BufferId buffer) {
     if (allocation.tier != Tier::Host || allocation.pages < needed) throw std::runtime_error("Host commit exceeds its reserved buffer");
 
     const auto inserted = tree_.insert(pages);
-    apply_split(inserted);
+    std::vector<IndexCopy> copies;
+    apply_split(inserted, copies);
     // Native host insertion discards any already-present radix prefix, even
     // when that prefix is device-only; only a new suffix gets host allocation.
     if (needed != 0) {

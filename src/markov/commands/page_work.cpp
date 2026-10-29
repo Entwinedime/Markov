@@ -108,7 +108,12 @@ struct SubsetExecution {
         if (!issue.is_null()) return;
         const auto frame_count = frames.size();
         planning::ExecutionQueues queues;
-        planning::ComputeProgram program(source, std::move(frames), source.observations().resources.size(), preparations, queues);
+        planning::ComputeProgram program(source,
+                                         std::move(frames),
+                                         source.observations().resources.size(),
+                                         preparations,
+                                         queues,
+                                         planning::ComputeScope::Compute);
         if (program.issue()) {
             issue = {
                 {   "kind", "compute_structure_unavailable" },
@@ -158,6 +163,7 @@ struct SubsetExecution {
              "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call CPU uses source "
              "residual approximations for the same caller recipe. "
              "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
+             "This compute-only diagnostic excludes result processing and stateful cache controls; request execution evaluates them separately. "
              "Collective envelope CPU, result processing, request control, placement changes and other cross-stream dependencies remain incomplete; no frame "
              "or E2E latency is "
              "reported."                                                                      }
@@ -268,8 +274,10 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
          "An unfinished Prefill publishes its page-aligned prompt after participant results are readable and overlap caller submission is available; "
          "write policy can start background backup before Decode completes. Pure result callers wait for their own copy and scheduler submission, "
-         "then gate later caller iterations. Initial cache index-value copies and empty release calls are included; other cache/release control remains "
-         "outside this subset. Result caller return and all native work completion are separate ports. The send port precedes modeled caller cleanup. "
+         "then gate later caller iterations. Cache insertion clones follow target state at result control points; initial index-value copies and empty "
+         "release calls are included. Query splitting, matching/table updates and nonempty release control remain outside this subset. "
+         "Publication joins participant index work and required KV outputs. Result caller return and native completion are separate ports. "
+         "The send port precedes modeled caller cleanup. "
          "Observed final sends release the client response without deleting later compute or caller work. Missing send observations retain a completion "
          "fence. "
          "New KV pages remain unreadable until the selected outputs are ready; this is a conservative whole-compute publication boundary. "

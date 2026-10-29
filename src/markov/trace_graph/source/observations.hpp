@@ -137,6 +137,9 @@ struct ObservedCallSequence {
     ObservedRegion region;
     std::unique_ptr<const planning::CallSequence> definition;
     std::string role;
+    std::optional<planning::ResultControl> control = std::nullopt;
+    // Source geometry binds observations; target controls use current state.
+    std::vector<planning::Work> source_work = {};
 };
 
 struct ComputeFrame {

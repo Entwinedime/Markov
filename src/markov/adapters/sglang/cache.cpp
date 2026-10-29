@@ -85,6 +85,12 @@ CacheSettings read_cache_settings(const nlohmann::json & raw) {
 
 trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::SourceContext & source) {
     using namespace trace_graph;
+    for (const auto & control : source.observations().host_controls) {
+        if (control.work.kind.operation == "cache.update_prefix" && control.work.features.at("chunked") != 0)
+            throw std::runtime_error("Cache execution currently requires unchunked Prefill");
+        if (control.work.kind.operation == "cache.commit_prefix" && control.work.features.at("insert_requested") == 0)
+            throw std::runtime_error("Cache execution does not yet support disabling finished-prefix insertion");
+    }
     std::optional<planning::AttentionGeometry> geometry;
     std::map<source::Index, std::set<source::Index>> layers;
     std::set<source::Index> participants;

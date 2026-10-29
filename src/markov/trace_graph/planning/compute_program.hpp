@@ -20,6 +20,16 @@ struct FrameCompute {
     ComputePlan plan;
 };
 
+enum class ComputeScope { Compute, Request };
+
+class ResultControls {
+public:
+    virtual ~ResultControls() = default;
+    // Adapters expand logical cache effects before the runtime queries costs.
+    virtual std::vector<Work> begin_result_control(std::size_t request, ResultControl control) = 0;
+    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) = 0;
+};
+
 struct ComputeStats {
     struct Preparation {
         std::size_t sequences = 0, operations = 0;
@@ -44,7 +54,8 @@ class ComputeProgram final : public Program {
 public:
     static constexpr simulation::Component first_owner = 2;
     ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations,
-                   ExecutionQueues & queues, simulation::Component owner = first_owner);
+                   ExecutionQueues & queues, ComputeScope scope = ComputeScope::Compute, simulation::Component owner = first_owner,
+                   ResultControls * controls = nullptr, std::size_t request = 0);
     ComputeProgram(const ComputeProgram &) = delete;
 
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt);
@@ -66,7 +77,8 @@ private:
         CollectiveDone,
         FrameSubmitted,
         ResultReady,
-        CallersDone,
+        ResultStepSubmitted,
+        ResultStepDone,
         ResultWorkDone,
         Sent,
         PrefillReady,
@@ -83,8 +95,11 @@ private:
     };
     struct Frame {
         std::vector<Segment> segments;
-        NativePlan result_callers;
-        ComputeStats caller_stats;
+        FrameInput input{};
+        Phase phase = Phase::Prefill;
+        std::vector<std::size_t> results;
+        std::vector<graph::NodeId> result_completions;
+        std::size_t result_at = 0;
         std::size_t at = 0;
         std::size_t caller = 0;
         std::optional<graph::NodeId> result_producer;
@@ -92,6 +107,12 @@ private:
         bool overlap = false;
         bool publishes_prefill_prefix = false;
         bool callers_modeled = false, callers_requested = false, next_started = false, finished = false;
+    };
+    struct ResultStep {
+        std::size_t frame;
+        source::Index sequence;
+        CallResources resources;
+        NativePlan plan;
     };
     struct Arrival {
         graph::Time time_ns;
@@ -111,6 +132,8 @@ private:
     void start_next(ProgramRuntime & runtime, std::size_t frame);
     void process_result(ProgramRuntime & runtime, std::size_t frame);
     void run_result(ProgramRuntime & runtime, std::size_t frame, graph::NodeId granted);
+    void result_step_submitted(ProgramRuntime & runtime, const simulation::Event & event);
+    void result_step_done(ProgramRuntime & runtime, const simulation::Event & event);
     void launch_frame(ProgramRuntime & runtime, std::size_t frame, std::optional<graph::NodeId> cause);
     void join_results(ProgramRuntime & runtime);
     void finish_frame(ProgramRuntime & runtime, std::size_t frame);
@@ -119,8 +142,11 @@ private:
     PreparationCache & preparations_;
     ExecutionQueues & queues_;
     simulation::Component owner_;
+    ResultControls * controls_;
+    std::size_t request_;
     std::size_t first_resource_;
     std::vector<Frame> frames_;
+    std::vector<ResultStep> result_steps_;
     std::vector<Collective> collectives_;
     std::vector<std::size_t> roots_;
     std::vector<graph::NodeId> completed_;

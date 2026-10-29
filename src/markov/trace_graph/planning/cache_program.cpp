@@ -126,7 +126,9 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
         return false;
     }
     if (cache_.available_pages(Tier::Device) >= pages) return true;
-    const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) { return request.compute != nullptr; });
+    const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
+        return request.compute || request.final_publication || request.prefix_publication;
+    });
     if (copies_.empty() && !pending_compute && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
     return false;
 }
@@ -182,7 +184,9 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     if (request_stage_ == RequestStage::BeforeStart) {
         const auto & barriers = source_.observations().workload_barriers;
         const auto drain = std::ranges::any_of(barriers, [&](const source::WorkloadBarrier & barrier) { return barrier.before_request == request_; });
-        const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) { return request.compute != nullptr; });
+        const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
+            return request.compute || request.final_publication || request.prefix_publication;
+        });
         if (drain && (pending_compute || !copies_.empty() || (storage_ && !storage_->idle()))) return;
         begin_request(runtime, drain);
         return;
@@ -285,8 +289,15 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     }
 
     auto & compute = running_[request_].compute;
-    compute =
-        std::make_unique<ComputeProgram>(source_, std::move(plans), compute_resource_begin(), preparations_, queues_, ComputeProgram::first_owner + request_);
+    compute = std::make_unique<ComputeProgram>(source_,
+                                               std::move(plans),
+                                               compute_resource_begin(),
+                                               preparations_,
+                                               queues_,
+                                               ComputeScope::Request,
+                                               ComputeProgram::first_owner + request_,
+                                               this,
+                                               request_);
     if (compute->issue()) {
         issue_ = compute->issue();
         for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
@@ -298,11 +309,69 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     compute->start(runtime, ready, 0);
 }
 
+std::vector<Work> CacheProgram::begin_result_control(std::size_t request, ResultControl control) {
+    auto & running = running_[request];
+    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
+    if (insertion) return insertion->work;
+    const auto & observed = source_.observations();
+    const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
+    const auto path = control == ResultControl::UpdatePrefix ? tokens.prompt.value().path : tokens.committed.value().path;
+    const auto pages = observed.token_paths.pages(path, page_tokens_);
+    const auto publication = cache_.begin_device_publication();
+    auto committed = cache_.commit_device(pages, *running.buffer, publication);
+    insertion = RunningRequest::Insertion{ committed.node, {}, {}, std::nullopt };
+    if (control == ResultControl::UpdatePrefix) running.prefix_publication = publication;
+    for (const auto & copy : committed.index_copies)
+        insertion->work.push_back({
+            { "cache.index_clone", {}, {} },
+            { { "pages", copy.pages }, { "host", copy.tier == Tier::Host ? 1 : 0 } }
+        });
+    cache_.unpin_device(*running.pin);
+    running.pin = committed.node;
+    cache_.pin_device(*running.pin);
+    if (control == ResultControl::CommitPrefix) {
+        running.committed = committed.node;
+        running.final_publication = publication;
+    }
+    return insertion->work;
+}
+
+void CacheProgram::end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) {
+    auto & running = running_[request];
+    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
+    insertion->completions.push_back(completion);
+    if (insertion->completions.size() != backend_.participants) return;
+    const auto end = runtime.next_node();
+    PlannedMutation mutation{
+        0,
+        { { 0, Boundary{}, action(control == ResultControl::UpdatePrefix ? ActionKind::PrefixInserted : ActionKind::FinalInserted, request) } },
+        {}
+    };
+    for (const auto node : insertion->completions) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
+    runtime.submit(std::move(mutation));
+}
+
+void CacheProgram::complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control) {
+    auto & running = running_[request];
+    auto & insertion = control == ResultControl::UpdatePrefix ? running.prefix_insertion : running.final_insertion;
+    insertion->completed = cause_;
+    if (control == ResultControl::CommitPrefix) {
+        if (running.outputs_ready && running.final_publication) publish_result(runtime, request);
+        return;
+    }
+    cache_.publish_all(*running.prefix_publication);
+    cache_.acknowledge(*running.prefix_publication);
+    running.prefix_publication.reset();
+    requests_[request].prefill_prefix_published = cause_;
+    backup_prefix(runtime, insertion->leaf);
+    if (waiting_) advance(runtime);
+}
+
 void CacheProgram::publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request) {
     const auto & observed = source_.observations();
     const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
     const auto prompt = observed.token_paths.pages(tokens.prompt.value().path, page_tokens_);
-    const auto leaf = cache_.commit_device(prompt, *running_[request].buffer);
+    const auto leaf = cache_.commit_device(prompt, *running_[request].buffer).node;
     cache_.unpin_device(*running_[request].pin);
     running_[request].pin = leaf;
     cache_.pin_device(leaf);
@@ -325,35 +394,42 @@ void CacheProgram::commit(ProgramRuntime & runtime, std::size_t request) {
     const auto & observed = source_.observations();
     const auto & tokens = observed.request_tokens.at(observed.requests[request].identity);
     const auto committed = observed.token_paths.pages(tokens.committed.value().path, page_tokens_);
-    if (!running.compute->results_ready() && !running.compute->complete()) running.publication = cache_.begin_device_publication();
-    running.committed = cache_.commit_device(committed, *running.buffer, running.publication);
-    if (running.publication) requests_[request].deferred_kv_pages = cache_.publication_pages(*running.publication);
+    if (!running.final_insertion) {
+        if (!running.outputs_ready && !running.compute->complete()) running.final_publication = cache_.begin_device_publication();
+        running.committed = cache_.commit_device(committed, *running.buffer, running.final_publication).node;
+    }
+    if (running.final_publication) requests_[request].deferred_kv_pages = cache_.publication_pages(*running.final_publication);
     // Existing ready pages need no dependency on an extra in-flight frame.
-    if (running.publication && requests_[request].deferred_kv_pages == 0) {
-        cache_.publish_all(*running.publication);
-        cache_.acknowledge(*running.publication);
-        running.publication.reset();
+    if (running.final_publication && requests_[request].deferred_kv_pages == 0 && !running.final_insertion) {
+        cache_.publish_all(*running.final_publication);
+        cache_.acknowledge(*running.final_publication);
+        running.final_publication.reset();
     }
     cache_.unpin_device(*running.pin);
     running.pin = running.committed;
     cache_.pin_device(*running.pin);
-    if (!running.publication) requests_[request].kv_published = cause_;
-    backup_prefix(runtime, *running.committed);
+    if (!running.final_publication && !requests_[request].kv_published) requests_[request].kv_published = cause_;
+    if (!running.final_insertion) backup_prefix(runtime, *running.committed);
     respond(runtime, request);
 }
 
 void CacheProgram::publish_result(ProgramRuntime & runtime, std::size_t request) {
     auto & running = running_[request];
-    cache_.publish_all(*running.publication);
-    cache_.acknowledge(*running.publication);
-    running.publication.reset();
-    requests_[request].kv_published = cause_;
-    backup_prefix(runtime, *running.committed);
-    if (waiting_) advance(runtime);
+    if (running.publication_scheduled) return;
+    const auto end = runtime.next_node();
+    PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::FinalPublished, request) } }, {} };
+    if (running.outputs_ready) mutation.dependencies.push_back({ *running.outputs_ready, end, graph::EdgeKind::DataDependency });
+    if (running.final_insertion && running.final_insertion->completed)
+        mutation.dependencies.push_back({ *running.final_insertion->completed, end, graph::EdgeKind::DataDependency });
+    running.publication_scheduled = submit(runtime, std::move(mutation));
 }
 
 bool CacheProgram::complete() const {
-    if ((!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
+    const bool pending_insertion = std::ranges::any_of(running_, [](const RunningRequest & request) {
+        return request.final_publication || (request.prefix_insertion && !request.prefix_insertion->completed)
+               || (request.final_insertion && !request.final_insertion->completed);
+    });
+    if (pending_insertion || (!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
     return issue_ || std::ranges::all_of(running_, [](const RunningRequest & request) { return !request.compute; });
 }
 
@@ -370,7 +446,8 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         const auto request = event.owner - ComputeProgram::first_owner;
         auto & running = running_.at(request);
         running.compute->on_event(runtime, event);
-        if (!requests_[request].prefill_prefix_published && running.compute->prefill_result_ready()) {
+        running.outputs_ready = running.compute->results_ready();
+        if (!running.prefix_insertion && !requests_[request].prefill_prefix_published && running.compute->prefill_result_ready()) {
             cause_ = running.compute->prefill_result_ready();
             publish_prefill_prefix(runtime, request);
         }
@@ -378,14 +455,14 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
             cause_ = running.compute->sent();
             commit(runtime, request);
         }
-        if (running.publication && running.compute->results_ready()) {
+        if (running.final_publication && running.outputs_ready && (!running.final_insertion || running.final_insertion->completed)) {
             cause_ = running.compute->results_ready();
             publish_result(runtime, request);
         }
         if (running.compute->complete()) {
             cause_ = event.identity;
             if (!requests_[request].response) commit(runtime, request);
-            if (running.publication) publish_result(runtime, request);
+            if (running.final_publication && (!running.final_insertion || running.final_insertion->completed)) publish_result(runtime, request);
             // A response does not release storage still used by in-flight work.
             cache_.release(*running.buffer);
             running.buffer.reset();
@@ -399,7 +476,21 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         return;
     }
     cause_ = event.identity;
-    if (event.action.kind == std::to_underlying(ActionKind::Received)) {
+    if (event.action.kind == std::to_underlying(ActionKind::PrefixInserted)) { complete_insertion(runtime, event.action.subject, ResultControl::UpdatePrefix); }
+    else if (event.action.kind == std::to_underlying(ActionKind::FinalInserted)) {
+        complete_insertion(runtime, event.action.subject, ResultControl::CommitPrefix);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::FinalPublished)) {
+        const auto request = event.action.subject;
+        auto & running = running_[request];
+        cache_.publish_all(*running.final_publication);
+        cache_.acknowledge(*running.final_publication);
+        running.final_publication.reset();
+        requests_[request].kv_published = event.identity;
+        backup_prefix(runtime, *running.committed);
+        if (waiting_) advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::Received)) {
         request_stage_ = RequestStage::Waiting;
         advance(runtime);
     }

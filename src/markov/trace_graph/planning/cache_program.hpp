@@ -33,7 +33,7 @@ struct CacheRequestResult {
 
 // Cache/storage, known compute and blocking collectives share one clock.
 // Native cache/release control and complete cross-stream dependencies remain outside this component.
-class CacheProgram final : public Program {
+class CacheProgram final : public Program, public ResultControls {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
                  std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt);
@@ -58,7 +58,17 @@ public:
     std::size_t peak_host_pages() const { return cache_.peak_pages(Tier::Host); }
 
 private:
-    enum class ActionKind : std::uint32_t { CopyDone, EvictionDone, Received, AdmissionGranted, Admitted, ResponseDone };
+    enum class ActionKind : std::uint32_t {
+        CopyDone,
+        EvictionDone,
+        Received,
+        AdmissionGranted,
+        Admitted,
+        ResponseDone,
+        PrefixInserted,
+        FinalInserted,
+        FinalPublished
+    };
     enum class RequestStage { BeforeStart, Ingress, Waiting, Admitting, Active, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
@@ -71,14 +81,26 @@ private:
         std::vector<PrefixId> storage_pages;
     };
     struct RunningRequest {
+        struct Insertion {
+            RadixId leaf;
+            std::vector<Work> work;
+            std::vector<graph::NodeId> completions;
+            std::optional<graph::NodeId> completed;
+        };
         std::unique_ptr<ComputeProgram> compute;
         std::optional<BufferId> buffer;
         std::optional<RadixId> pin, committed;
-        std::optional<PublicationId> publication;
+        std::optional<PublicationId> prefix_publication, final_publication;
         std::vector<std::size_t> callers;
         std::vector<graph::NodeId> admission;
+        std::optional<Insertion> prefix_insertion, final_insertion;
+        std::optional<graph::NodeId> outputs_ready;
+        bool publication_scheduled = false;
     };
 
+    std::vector<Work> begin_result_control(std::size_t request, ResultControl control) override;
+    void end_result_control(ProgramRuntime & runtime, std::size_t request, ResultControl control, graph::NodeId completion) override;
+    void complete_insertion(ProgramRuntime & runtime, std::size_t request, ResultControl control);
     void advance(ProgramRuntime & runtime);
     void begin_request(ProgramRuntime & runtime, bool drain);
     void wait_for_progress(ProgramRuntime & runtime);

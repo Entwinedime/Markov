@@ -19,6 +19,7 @@ namespace markov::trace_graph::planning {
 enum class CallKind { Cpu, Queued, Readback, HostUpload };
 enum class DeviceControl { None, Record, Wait };
 enum class NativeProducer { Caller, Device };
+enum class ResultControl { UpdatePrefix, CommitPrefix };
 
 struct KernelPreparation {
     Work specialization, compilation, first_load, load;
