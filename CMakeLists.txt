@@ -64,6 +64,7 @@ add_library(markov_adapters
     src/markov/adapters/sglang/allocation.cpp
     src/markov/adapters/sglang/kernel_preparation.cpp
     src/markov/adapters/sglang/input_preparation.cpp
+    src/markov/adapters/sglang/result_output.cpp
 )
 target_link_libraries(markov_adapters PUBLIC markov_prediction)
 if(TRACE_GRAPH_DEBUG)

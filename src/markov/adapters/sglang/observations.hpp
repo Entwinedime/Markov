@@ -62,6 +62,7 @@ private:
     std::vector<PendingInput> pending_inputs_;
     std::map<std::string, std::string> sequence_dtypes_;
     std::map<std::string, trace_graph::source::Time> logits_output_ends_;
+    std::map<trace_graph::source::Index, trace_graph::source::Time> sampling_ends_;
     struct EmbeddingWindow {
         trace_graph::source::Time lookup_end, reduction_begin;
     };

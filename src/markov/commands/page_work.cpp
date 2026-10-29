@@ -151,7 +151,9 @@ struct SubsetExecution {
              "Idle synchronization "
              "approximates ready-state service, not wake-up under load. All participants share the latest collective completion. Inter-call CPU uses source "
              "residual approximations for the same caller recipe. "
-             "Collective envelope CPU, request control, placement changes and other cross-stream dependencies remain incomplete; no frame or E2E latency is "
+             "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
+             "Collective envelope CPU, result processing, request control, placement changes and other cross-stream dependencies remain incomplete; no frame "
+             "or E2E latency is "
              "reported."                                                                      }
         };
     }
@@ -252,7 +254,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "Inter-call CPU uses corrected source residual approximations for the same caller recipe; known waits require explicit dependencies. "
          "Partial request ports exclude query/admission, collective envelope CPU, other cross-stream dependencies and client pacing. "
          "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
-         "Response still follows all selected compute completion; result-copy and result-processing handoff remains unmodeled. "
+         "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
+         "Response still follows all selected work; CPU result processing and final-send handoff remain unmodeled. "
          "All participants share the latest collective completion, omitting per-rank completion spread. No complete HTTP latency is reported."           }
     };
     const auto & compute = program.compute_stats();

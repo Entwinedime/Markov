@@ -2,6 +2,7 @@
 
 #include "markov/adapters/sglang/allocation.hpp"
 #include "markov/adapters/sglang/input_preparation.hpp"
+#include "markov/adapters/sglang/result_output.hpp"
 
 #include "markov/adapters/sglang/dense.hpp"
 #include "markov/adapters/sglang/metadata.hpp"
@@ -254,6 +255,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
     if (name == "runtime.phase.logits_output" && args.at("status") == "returned") logits_output_ends_[process] = event.end_ns;
     if (name == "runtime.phase.greedy_sampling" && args.at("status") == "returned") {
         const auto frame = forward_frames_.find(process);
+        if (frame != forward_frames_.end()) sampling_ends_[frame->second] = event.end_ns;
         if (frame != forward_frames_.end() && output_.compute_frames[frame->second].phase == trace_graph::planning::Phase::Prefill) {
             const auto before = logits_output_ends_.find(process);
             if (before != logits_output_ends_.end()) {
@@ -277,6 +279,8 @@ void ProbeReader::finish() {
     result_copies_.clear();
     result_sends_.clear();
     // Sidecars may follow the main probe file; qualify after every input is read.
+    std::vector<const BatchResult *> results(output_.compute_frames.size(), nullptr);
+    for (const auto & result : output_.batch_results) results.at(result.frame) = &result;
     for (const auto & pending : pending_inputs_) {
         auto & frame = output_.compute_frames[pending.frame];
         auto & preparation = frame.preparations[pending.preparation];
@@ -298,6 +302,15 @@ void ProbeReader::finish() {
         }
         const auto sampling = matching.size() == 1 ? std::optional(matching.front()->deterministic_sampling) : deterministic_sampling_;
         if (sampling) preparation.definition = read_forward_inputs(pending.metadata, *sampling, context);
+        const auto result = results[pending.frame];
+        const auto sampled = sampling_ends_.find(pending.frame);
+        if (result && result->copy && sampled != sampling_ends_.end() && sampled->second <= result->run.end_ns) {
+            frame.preparations.push_back({
+                { result->run.resource, sampled->second, result->run.end_ns, result->run.record },
+                read_result_output(pending.metadata, *result->copy),
+                "result_output"
+            });
+        }
     }
     pending_inputs_.clear();
     schedule_inputs_.clear();
