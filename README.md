@@ -71,6 +71,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 同次观察到重叠调度时，已建模调用在 CPU 提交后允许下一帧准备，worker/设备队列分别保留前沿，Prefill 与 Decode 连续执行。
 串行 int64 输出已生成长度更新、token 中继、异步拷回与完成标记；帧内 CPU 间隔仍是来源残余近似。
 结果可读端口由拷回完成标记产生，单列于 caller 提交和全部已建模工作汇合；后者不能替代结果就绪。
+未结束的 Prefill 在各参与者结果可读、必要的后续提交已到达后发布 prompt 页前缀，写策略可在后续 Decode 期间启动备份。
 通信包络、查询/准入、CPU 结果处理和最终发送及完整跨流依赖尚缺，不输出完整 HTTP 预测。
 
 可选 source_cpu_costs 指向与该 manifest 对应的 CPU 校正文件。报告按原始图区间区分服务、等待和空白，

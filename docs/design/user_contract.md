@@ -142,6 +142,9 @@ projected_compute_dependencies 只计配方内部的数据依赖，尚不包含�
 同工同资源的成本可沿用源片段；其他输出类型、额外返回值和不同初始化状态尚未验证，正常 CPU 与 CANN 首次加载成本仍待校正。
 cache_execution.native_call_execution.frames 给出进入、caller 提交、结果可读和已建模工作汇合时间；result_ready_ns 来自异步拷回的完成标记，不等待无关尾部。
 工作汇合包括 caller、worker 与设备，不是单独的设备完成；这些端口均未覆盖 CPU 结果处理和最终发送。
+未结束的 Prefill 在各参与者输出可读后发布页对齐的 prompt 前缀；重叠调度另等待下一帧 caller 提交，写策略据此决定是否提前备份。
+请求报告中的 prefill_prefix_published_ns 给出该状态发布端口，预留 buffer 只消耗已提交页，剩余空间留给后续生成；最终提交保留生成部分。
+这个组件端口尚未支付 CPU 缓存更新及其原生控制成本，不能当作完整 CPU 处理时间或 HTTP 完成。
 当前目标沿用来源的调度模式；缺少该事实时组件保留完成屏障，不授予完整执行资格，也不支持变更调度模式的预测。
 source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独立覆盖类别，不归入派发延迟或设备服务。
 可选 source_cpu_costs 为这些区间提供与 manifest 绑定的校正值，未覆盖部分仍保留原值；报告分别列覆盖、未校正量和估计值。
