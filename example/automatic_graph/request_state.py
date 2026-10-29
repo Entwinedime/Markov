@@ -14,6 +14,11 @@ class RequestStateEvidence:
             name: {"slots": pool["max_running_requests"], "pages": pool["max_total_tokens"] // self.page_size}
             for name, pool in settings.get("pd", {"model": settings}).items()
         }
+        groups = {group["id"]: group for group in result["structure"]["topology"]["groups"]}
+        serving = {
+            rank: group["id"] for group in groups.values() if group["role"] == "serving" for rank in group["members"]
+        }
+        self.instances = {name: serving[groups[name]["members"][0]] for name in self.pools}
         self.requests = {item["id"]: item for item in result["requests"]}
 
         self.generated = Counter()
@@ -34,7 +39,7 @@ class RequestStateEvidence:
 
     def pool(self, action: dict) -> str:
         if self.native:
-            return "decode" if action["step"] == "transfer" else action["task"]["group"]
+            return action["transfer"]["destination"] if action["step"] == "transfer" else action["task"]["group"]
         if "model" in self.pools:
             return "model"
         return "prefill" if action["step"] in {"model", "release"} else "decode"
@@ -43,7 +48,7 @@ class RequestStateEvidence:
         return self.pools[pool]["pages"] - len(self.pages[pool])
 
     def start(self, action: dict) -> None:
-        if action["stage"] is not None and action["step"] in {"send", "receive", "wait"}:
+        if action.get("channel") and action["step"] in {"send", "receive", "wait"}:
             return
         pool = self.pool(action)
         allocate = action["step"] in {"batch", "reserve", "model", "prepare"} or (
@@ -105,14 +110,15 @@ class RequestStateEvidence:
         if action["step"] == "transfer":
             request = action["members"][0]["id"]
             copies = action["page_copies"]
-            for role, field in (("prefill", "source"), ("decode", "destination")):
+            binding = action["transfer"] if self.native else {"source": "prefill", "destination": "decode"}
+            for field, role in binding.items():
                 self.require(
                     [item[field] for item in copies] == self.resident[(role, request)]["pages"],
                     "transfer_ownership", action, request,
                 )
 
     def finish(self, action: dict) -> None:
-        if action["stage"] is not None and action["step"] in {"send", "receive", "wait"}:
+        if action.get("channel") and action["step"] in {"send", "receive", "wait"}:
             return
         pool = self.pool(action)
         returned = []
@@ -130,7 +136,9 @@ class RequestStateEvidence:
                     "resident_tokens", action, request,
                 )
                 self.require(
-                    member["finished"] == (pool != "prefill" and expected == self.requests[request]["output_tokens"]),
+                    member["finished"] == (
+                        self.instances[pool] != "prefill" and expected == self.requests[request]["output_tokens"]
+                    ),
                     "request_completion", action, request,
                 )
                 self.generated[key] = member["generated_tokens"]
@@ -178,7 +186,7 @@ class RequestStateEvidence:
             else:
                 self.finish(actions[index])
 
-        progress_pools = ("decode",) if "decode" in self.pools else self.pools
+        progress_pools = {name for name, instance in self.instances.items() if instance != "prefill"}
         expected = Counter({
             (pool, name): request["output_tokens"] for pool in progress_pools
             for name, request in self.requests.items()

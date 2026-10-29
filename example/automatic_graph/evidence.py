@@ -144,43 +144,11 @@ class ExecutionEvidence:
             for request in self.result["requests"]
         )
 
-        # P and D may regroup members; each request still requires its own complete handoff.
-        required_steps = {"reserve", "model", "transfer", "receive", "accept", "release"}
-        handoffs = defaultdict(dict)
-        for item in decisions:
-            step = item["step"]
-            if step == "result" and item["task"]["group"] == "prefill":
-                step = "model"
-            if "pd" in self.result["configuration"] and step in required_steps:
-                for member in item["members"]:
-                    handoffs[member["id"]].setdefault(step, []).append(item)
-        complete = {
-            request: {step: actions[0] for step, actions in steps.items()}
-            for request, steps in handoffs.items()
-            if set(steps) == required_steps and all(len(actions) == 1 for actions in steps.values())
-        }
-        expected = (
-            {request["id"] for request in self.result["requests"]}
-            if "pd" in self.result["configuration"] else set()
-        )
+        ownership = RequestStateEvidence(self.result)
         cross = {(owner[edge["source"]], owner[edge["target"]]) for edge in execution["dependencies"]}
-        checks["handoff_steps"] = set(complete) == set(handoffs) == expected
-        checks["handoff_readiness"] = all(
-            steps[first]["completed_ns"] <= steps[last]["scheduled_ns"]
-            and (
-                ("action", steps[first]["task"]["group"], steps[first]["task"]["sequence"]),
-                ("action", steps[last]["task"]["group"], steps[last]["task"]["sequence"]),
-            ) in cross
-            for steps in complete.values()
-            for first, last in (
-                ("reserve", "transfer"),
-                ("model", "transfer"),
-                ("transfer", "receive"),
-                ("receive", "accept"),
-                ("transfer", "release"),
-            )
-        )
-        state = RequestStateEvidence(self.result).check()
+        handoffs = self.handoffs(ownership, cross)
+        checks.update(handoffs["checks"])
+        state = ownership.check()
         checks["request_state"] = state["status"] == "matched"
         return {
             "status": "matched" if all(checks.values()) else "differences",
@@ -189,7 +157,7 @@ class ExecutionEvidence:
             "node_states": dict(Counter(item["status"] for item in timeline.values())),
             "actions": len(decisions),
             "controls": len(self.result["controls"]),
-            "handoffs": len(handoffs),
+            "handoffs": handoffs["requests"],
             "request_state": state,
             "value_production": {
                 "scope": "host descriptor return before consumption; device contents and storage hazards are separate",
@@ -197,6 +165,64 @@ class ExecutionEvidence:
                 "missing_count": len(missing),
                 "missing_links": sorted(missing)[:3],
             },
+        }
+
+    def handoffs(self, ownership: RequestStateEvidence, cross: set) -> dict:
+        if "pd" not in self.result["configuration"]:
+            return {"requests": 0, "checks": {"handoff_steps": True, "handoff_readiness": True}}
+        requests = set(ownership.requests)
+        sources = {name for name, role in ownership.instances.items() if role == "prefill"}
+        destinations = {name for name, role in ownership.instances.items() if role == "decode"}
+        expected = {
+            (request, group, step) for request in requests for group in sources for step in ("model", "release")
+        }
+        expected.update(
+            (request, group, step) for request in requests
+            for group in destinations for step in ("reserve", "receive", "accept")
+        )
+        actions, transfers = defaultdict(list), defaultdict(list)
+        for action in self.result["decisions"]:
+            if action.get("channel"):
+                continue
+            step = action["step"]
+            if step == "transfer":
+                binding = action["transfer"] if ownership.native else {"source": "prefill", "destination": "decode"}
+                request = action["members"][0]["id"]
+                transfers[request, binding["source"], binding["destination"]].append(action)
+                continue
+            group = ownership.pool(action)
+            if step == "result" and group in sources:
+                step = "model"
+            if step not in ("model", "release", "reserve", "receive", "accept"):
+                continue
+            for member in action["members"]:
+                actions[member["id"], group, step].append(action)
+
+        complete = set(actions) == expected and all(len(rows) == 1 for rows in actions.values())
+        complete &= all(len(rows) == 1 for rows in transfers.values())
+        complete &= {key[0] for key in transfers} == requests
+        for request in requests:
+            complete &= {source for rid, source, _ in transfers if rid == request} == sources
+            complete &= {target for rid, _, target in transfers if rid == request} == destinations
+
+        ready = complete
+        if complete:
+            for (request, source, target), rows in transfers.items():
+                transfer = rows[0]
+                model = actions[request, source, "model"][0]
+                reserve = actions[request, target, "reserve"][0]
+                receive = actions[request, target, "receive"][0]
+                accept = actions[request, target, "accept"][0]
+                release = actions[request, source, "release"][0]
+                for first, last in (
+                    (model, transfer), (reserve, transfer), (transfer, receive), (receive, accept), (transfer, release)
+                ):
+                    before = ("action", first["task"]["group"], first["task"]["sequence"])
+                    after = ("action", last["task"]["group"], last["task"]["sequence"])
+                    ready &= first["completed_ns"] <= last["scheduled_ns"] and (before, after) in cross
+        return {
+            "requests": len({key[0] for key in actions}),
+            "checks": {"handoff_steps": complete, "handoff_readiness": ready},
         }
 
 
