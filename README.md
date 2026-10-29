@@ -1,7 +1,7 @@
 # Markov
 
 项目正在全量重构。旧实现、配置、环境和文档在本地 deprecated 中保留，并已保存到历史提交。
-当前提供输入预览、采集 manifest 检查与 modeling 构建，原始 DAG 回放已进入真实输入验证；正式预测、采集和搜索正在按阶段恢复。
+当前提供输入预览、SGLang/Ascend base 采集、manifest 检查与 modeling 构建；原始 DAG 回放已进入真实输入验证，完整目标预测和搜索仍在恢复。
 
 项目继续使用三阶段路线：base trace 构建原始 DAG，配置与执行规则生成目标工作和依赖，
 独立成本模型与未变工作的源成本填入后执行，预测完整 HTTP。实验与资源成本搜索在上层共用这一预测器。
@@ -15,6 +15,15 @@ scripts/markov.sh plan --request configs/prediction.json
 预览只核对声明输入并列出准备动作，不启动容器或设备，也不创建预测结果。
 请求中的相对路径以请求文件目录为起点；示例 base 需要采集且未提供独立模型，输出会明确这些缺口。
 源语义、目标结构和成本覆盖必须由后续正式阶段分析，预览成功不表示能够预测。
+
+声明本地模型、兼容推理镜像、设备及累计预算后，可用同一请求采集 base：
+
+```bash
+scripts/markov.sh capture --request /path/to/request.json
+```
+
+采集串行执行 workload，导出 trace、轻量语义观察和客户端时间，并返回 manifest；具体输入见用户合同。
+采集成功只表示所需文件和观察已导出，尚不表示完整源因果、正常成本或目标预测已验收。
 
 构建和检查已有采集输入：
 
@@ -34,7 +43,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
   build/modeling/Release/markov_core source /path/to/profile_manifest.json /path/to/source_report.json
 ```
 
-目前只验证过一份 SGLang 来源；报告保留源等待与 gap，分别列出请求回放，以及服务、等待和零时长边界的时间差异，不能当作正常运行预测精度。
+目前只验证 SGLang 来源；报告保留源等待与 gap，分别列出请求回放，以及服务、等待和零时长边界的时间差异，不能当作正常运行预测精度。
 设备依赖与 KTransformers 尚未完成验收。此命令严格读取 manifest 声明的文件，不自动修复不完整采集。
 
 HiCache 页几何的实验诊断入口：
@@ -80,7 +89,7 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cos
 它只读取选定模型和工作描述，不读取 base 或 target trace，不训练模型；结果是操作成本，尚未接入完整目标预测。
 
 SGLang 推理环境另有轻量输入分支观察，启用方式见[用户合同](docs/design/user_contract.md#sglang-输入分支观察)。
-它不采 snapshot，只补充判断 CPU 工作所需的实际状态；尚不代替完整 base 采集，也不提供正常成本。
+它不采 snapshot，提供请求边界、实际输入分支及准备工作；集成在 base 采集中，不直接提供正常成本。
 
 ## 新文档从哪里读
 

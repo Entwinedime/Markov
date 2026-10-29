@@ -25,6 +25,37 @@ performance.models 可省略，表示独立模型尚未选定；execution 必须
 这不扫描目录、猜测相似文件或自动兼容历史字段。采集外的独立绝对来源仍使用其明确路径。
 manifest 声明 config_path 时，同样解析并检查该 base 配置文件；来源准备只在框架适配器读取所需设置一次，配置文件也受结果覆盖保护。
 当前 SGLang 输入准备据其原生 server.command 判断确定性采样，开启时生成种子上传。缺少配置依据或命令由 shell 包装时不把未知设置当作关闭，也不为该准备序列授予完整规则资格。
+同次批次观察明确记录该设置时，输入准备使用实际运行值；缺少观察时仍只采用可解释的原生启动参数。
+
+### SGLang/Ascend base 采集
+
+```bash
+scripts/markov.sh capture --request /path/to/request.json
+```
+
+使用同一个预测请求：deployment.model 改为本地模型目录的绝对路径，base.configuration 使用原生 SGLang ServerArgs 字段，
+例如示例中的 page_size、max_total_tokens、hicache_ratio 和 hicache_write_policy。模型、dtype、TP 来自 deployment，
+采集器拥有容器内端口及设备逻辑编号，不能在 configuration 重复声明这些项。当前仅支持 SGLang/Ascend eager；其他组合明确拒绝。
+
+execution.capture 另声明推理镜像 image、独占设备数组 devices、容器 memory_limit_gib/cpus，以及 budget。
+镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令将本项目装入已有推理环境。
+预算六项均为正整数：starts、wall_sec、requests、input_tokens、output_tokens、retained_mib。它们分别约束累计启动、墙钟秒、
+请求、输入/输出 tokens 和当前保留 MiB；失败消耗不清零，输出失败未取得实际 token 数时按请求上限保守计入。
+采集前检查声明设备空闲，并与同一入口的其他采集任务串行；只挂载所选设备、只读模型与驱动、本任务输出，容器无网络。
+
+workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_ids 二选一，以及 max_new_tokens；
+可选 ignore_eos、return_logprob 是布尔值。formal_begin_index 之前的请求用于准备，仍连续采集；其后为正式请求。
+文本先用本地 tokenizer 编码并核对预算，再启动模型。预览列出请求数与输出上限；文本未经编码时输入 token 总量为未知。
+客户端时间覆盖实际 HTTP 发送到响应读取，不包括本地 JSON 编解码、写报告或 profiler 导出。
+
+成功返回本次 profile_manifest.json。其文件来自同一次运行：两类原始 trace/轻量观察与客户端报告，另保留 base 配置和时钟锚点。
+探针记录实际接收与最终结果发送端口；导出前检查每个请求恰有一对端口及必要的输入准备观察。
+profiling_ready 只授予这些声明通道的导出资格，不证明全部语义、设备依赖、正常性能或 E2E 预测正确。
+
+输出位于 execution.output/base，包含累计状态及每次 captures 子目录。已成功的任务默认拒绝重采；
+将返回的 manifest 显式填入 base.manifest 可复用，或加 --recapture 重新采集并保留已有额度消耗和文件。
+失败不会把上一份 manifest 当成本次成功返回。进程中断遗留 running 状态时，目前须先核对本任务容器与实际用量，再恢复状态；尚无自动孤儿恢复。
+用户仍需自行提供适用的独立成本；采集入口没有恢复完整 CPU 校正、模型语义观察和数据库准备。
 
 ### SGLang 输入分支观察
 
@@ -37,10 +68,11 @@ docker build --build-arg SGLANG_RUNTIME_IMAGE="$SGLANG_RUNTIME_IMAGE" \
 
 在推理进程中设置 MARKOV_INPUT_FACTS，指向预先创建的本次输出目录。框架通过自身插件入口安装观察，
 各 worker 输出 input_facts_<pid>.jsonl；未设置时不开启，也不因加载 Markov 插件导入推理框架。
-本入口只观察实际 ScheduleBatch 准备，尚不代替完整 base 采集流程。
+观察覆盖 ScheduleBatch 准备、NPU 分配、页表写入、forward 输入边界、注意力元数据，以及实际消息接收和最终发送。
 
 记录请求标识、输入/查询规模、logprob、额外 embeddings、位置覆盖、multimodal、Mamba、重算及采样分支的标量状态，
-不读取张量内容或保存 snapshot。惩罚器状态取自准备完成的调度批次；重叠执行的 forward 副本会移除该对象，不能在那里读取。
+Prefill 另记录主机端 token 前缀以建立跨请求复用关系；张量只取 shape/dtype/layout，不读回设备内容或保存 snapshot。
+惩罚器状态取自准备完成的调度批次；重叠执行的 forward 副本会移除该对象，不能在那里读取。
 方法的墙钟与线程 CPU 时间只用于观察和定位，不直接作为正常成本。
 
 同一次完整 base 采集的 sidecar.python_probe_files 可声明 `{"path":"input_facts_123.jsonl","format":"jsonl"}`。
