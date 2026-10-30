@@ -892,3 +892,11 @@ modeling Release/Debug、格式及文档/数据检查通过。prefill_verified/ 
 **验证：** 新 target 严格串行采集：K chunk=16 为 48.666 秒/136.29 MB/3 请求，SGLang file/wait_complete 为 233.050 秒/1.169 GB/4 请求，累计上限分别为 2 启动/300 秒/6 请求/256 输入/18 输出/1,024 MiB 和 2 启动/600 秒/8 请求/3,592 输入/32 输出/4,096 MiB。Docker Release/Debug、46 个 Python 文件及 27 个 C++ 修改文件的必要静态检查完成，初次独立链接暴露的工作库依赖问题已修正；源回放及七个既有预测保持一致。K 替换 29/29 个非边界成本，oracle 1.395294 秒对 profiled HTTP 1.396865 秒，差额恰为 1.57028 ms 客户端间隔；SGLang 替换 292/518，保留 226，partial oracle 11.431933 秒对 11.037899 秒。两项 Release/Debug 报告逐项一致，13/126 条可观察顺序无违例；错配置、输出混入预测/采集目录、目标数据误作校准及旧成功报告残留分别验证。证据为 data/r3/oracle_targets/{capture_summary,prediction_regression,evaluation_checks}.json、oracle_evaluation 与 data/r3/ktransformers/oracle_evaluation。
 
 **结论与限制：** 已有真实成本对应及回放，不再以倍率或手动节点编号代替 oracle；正常精度未重测，模型未改。SGLang 的 120 个混合残余和 106 个 I/O 节点尚未可靠对应，CPU 顺序检查不认证全部设备/缓存因果，固定路径不重新选分支；客户端记账间隔继续计入真实 HTTP，不以扣除它制造通过。源码、文档和资产按本批关联范围审查，交付分观测/核心与独立评价两层，原有运行数据、失败及预算均保留，R3 继续。
+
+## 2026-10-31 — R3：文件 worker 按 rank 独立推进
+
+**改动：** 原生读写线程各自推进，旧模型却在每页后汇合；现按 rank 维护 FIFO、文件和 LRU，共同发布前缀只供控制端接受，缓冲区与备份保护等所有使用者完成才释放。页计数改为明确的 rank 累计量，与请求逻辑页分开；关联审查去掉重复完成标志及写序号，业务源码净增 70 行，仍为 183 文件/23,133 行。
+
+**验证：** Docker Release/Debug、五个 C++ 文件格式及 diff 检查通过；七个既有预测 HTTP 和请求时序不变，图回放逐操作零差，Release/Debug 一致。给两个 rank 的不同页各 12 ms，旧图累计 24 ms，新图并行 12 ms，公开静态回放与图计算相同；这是给定成本的结构反例。缺页发布成本返回 incomplete、HTTP=null、无完整图。证据在 data/r3/rank_workers；没有新增设备运行、校准或正常对照。
+
+**限制：** 本批修正结构，没有改善或重新授予正常精度、真实 I/O oracle、原生轮询及竞争资格。R3 继续，下一批补文件 worker 的原生分段与数据身份，不按残差调系数；另两个项目及原始资产未修改。

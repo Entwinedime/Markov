@@ -177,17 +177,18 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             const auto & stats = storage->stats();
             cells.back()["host_evicted_pages"] = program.host_evicted_pages();
             cells.back()["storage"] = {
-                {         "queries",               stats.queries                                    },
-                {      "prefetches",                                                stats.prefetches },
-                {      "read_pages",                                                stats.read_pages },
-                {    "copied_pages",                                              stats.copied_pages },
-                { "rejected_copies",                                           stats.rejected_copies },
-                {  "write_enqueues",                                                    stats.writes },
-                {       "new_pages",                                                 stats.new_pages },
-                {  "existing_pages",                                            stats.existing_pages },
-                {            "idle",                                                 storage->idle() },
-                {   "qualification",
-                 "Buffered file worker costs. Enqueue/check are separate; pre-admission control reuses the source residual. Hash queries and earliest "
+                {              "queries",     stats.queries                                         },
+                {           "prefetches",                                           stats.prefetches },
+                {      "rank_read_pages",                                      stats.rank_read_pages },
+                {    "rank_copied_pages",                                    stats.rank_copied_pages },
+                { "rank_rejected_copies",                                 stats.rank_rejected_copies },
+                {       "write_enqueues",                                               stats.writes },
+                {       "rank_new_pages",                                       stats.rank_new_pages },
+                {  "rank_existing_pages",                                  stats.rank_existing_pages },
+                {                 "idle",                                            storage->idle() },
+                {        "qualification",
+                 "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control reuses the source "
+                 "residual. Hash queries and earliest "
                  "event-driven checks omit measured scheduler polling and changed control service." }
             };
         }

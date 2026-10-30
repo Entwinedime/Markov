@@ -32,9 +32,10 @@ struct PrefetchResult {
 };
 
 struct StorageStats {
-    std::size_t queries = 0, prefetches = 0, read_pages = 0, copied_pages = 0, rejected_copies = 0;
-    std::size_t writes = 0, new_pages = 0, existing_pages = 0, disk_evictions = 0, host_evicted_pages = 0;
-    std::size_t peak_reserved_pages = 0, peak_stored_pages = 0;
+    // Rank-prefixed counters sum physical services; capacity peaks are per rank.
+    std::size_t queries = 0, prefetches = 0, rank_read_pages = 0, rank_copied_pages = 0, rank_rejected_copies = 0;
+    std::size_t writes = 0, rank_new_pages = 0, rank_existing_pages = 0, rank_disk_evictions = 0, host_evicted_pages = 0;
+    std::size_t peak_reserved_pages = 0, peak_rank_stored_pages = 0;
 };
 
 } // namespace markov::trace_graph::planning

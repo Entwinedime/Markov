@@ -345,25 +345,25 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             {    planning::PrefetchPolicy::Timeout,       "timeout" }
         };
         report["storage"] = {
-            {        "initial_state",                         "empty"                                     },
-            {       "capacity_pages", config.capacity_pages ? Json(*config.capacity_pages) : Json(nullptr) },
-            { "prefetch_stop_policy",                                           policies.at(config.policy) },
-            {              "queries",                                                        stats.queries },
-            {           "prefetches",                                                     stats.prefetches },
-            {           "read_pages",                                                     stats.read_pages },
-            {         "copied_pages",                                                   stats.copied_pages },
-            {      "rejected_copies",                                                stats.rejected_copies },
-            {       "write_enqueues",                                                         stats.writes },
-            {            "new_pages",                                                      stats.new_pages },
-            {       "existing_pages",                                                 stats.existing_pages },
-            {       "disk_evictions",                                                 stats.disk_evictions },
-            {  "peak_reserved_pages",                                            stats.peak_reserved_pages },
-            {    "peak_stored_pages",                                              stats.peak_stored_pages },
-            {                 "idle",                                                      storage->idle() },
-            {        "qualification",
+            {          "initial_state",                       "empty"                                       },
+            {         "capacity_pages", config.capacity_pages ? Json(*config.capacity_pages) : Json(nullptr) },
+            {   "prefetch_stop_policy",                                           policies.at(config.policy) },
+            {                "queries",                                                        stats.queries },
+            {             "prefetches",                                                     stats.prefetches },
+            {        "rank_read_pages",                                                stats.rank_read_pages },
+            {      "rank_copied_pages",                                              stats.rank_copied_pages },
+            {   "rank_rejected_copies",                                           stats.rank_rejected_copies },
+            {         "write_enqueues",                                                         stats.writes },
+            {         "rank_new_pages",                                                 stats.rank_new_pages },
+            {    "rank_existing_pages",                                            stats.rank_existing_pages },
+            {    "rank_disk_evictions",                                            stats.rank_disk_evictions },
+            {    "peak_reserved_pages",                                            stats.peak_reserved_pages },
+            { "peak_rank_stored_pages",                                         stats.peak_rank_stored_pages },
+            {                   "idle",                                                      storage->idle() },
+            {          "qualification",
              "Native service order with independent stage costs. This component has no request-enqueue/control region, so checks remain logical. "
              "Timeouts use earliest checks, not measured scheduler polling. Write materialization and batch bookkeeping are charged for all pages; "
-             "existing/new native set branches have separate responses."                                  }
+             "existing/new native set branches have separate responses."                                    }
         };
     }
     return report;

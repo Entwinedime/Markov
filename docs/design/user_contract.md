@@ -46,6 +46,9 @@ best_effort 在首次准入检查时停止，timeout 从发起计时，截止到
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
 cache_capacity_pages 按参与进程报告 device/host 页容量；文件目标另报 host_evicted_pages，是实际回收页数而非淘汰次数。
 逐请求 prefetch 区分申请、查询命中、发布和最终接受页数，storage 汇总实际读写工作，不能只用接受页数代表 I/O 量。
+storage 中的 rank_read_pages、rank_copied_pages、rank_rejected_copies、rank_new_pages、rank_existing_pages
+累计所有 rank 的文件 worker 工作量；请求级页数仍表示逻辑 KV 页。例如 TP2 的同一逻辑页读两份，计为两个 rank_read_pages。
+page-work 的 rank_disk_evictions 同样累计各 rank，peak_rank_stored_pages 则是单 rank 文件驻留的峰值。
 issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一仿真时钟的发起、首次检查、接受与后台返回；
 相应操作未发生时为 null。后台读完并不自动插入缓存，接受仍依赖请求端检查及已发布的前缀。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
