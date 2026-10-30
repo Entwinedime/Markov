@@ -7,6 +7,7 @@
 #include "markov/trace_graph/core/dag_mutation.hpp"
 
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <unordered_map>
 
@@ -55,6 +56,13 @@ inline void decrement_effect_edge(EffectEdgeCounts & counts, size_t src, size_t 
     if (found->second <= 1) counts.erase(found);
     else --found->second;
 }
+
+struct PreparedDagMutation {
+    DagTopologyValidationReport topology;
+    std::shared_ptr<const DagTopologicalOrder> order;
+};
+
+PreparedDagMutation prepare_dag_mutation(const DagGraph & graph, const DagMutationPlan & plan);
 
 [[nodiscard]] std::string failure_message(const DagTopologyValidationReport & report);
 

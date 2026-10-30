@@ -24,6 +24,7 @@
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
+#include "modules/hicache/runtime/source_preparation.hpp"
 #include <algorithm>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -41,10 +42,11 @@ namespace {
  * reference, so no second resource or execution state is maintained. */
 class HiCacheExecution {
 public:
-    HiCacheExecution(core::DagGraph & graph, const core::DagGraph & source_graph, const frontend::HiCacheConfig & config, std::string_view source_policy,
+    HiCacheExecution(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, const frontend::HiCacheConfig & config, std::string_view source_policy,
                      const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us, const simulation::NodeCostAtStart & final_cost_transform)
         : graph_(graph),
-          source_graph_(source_graph),
+          source_graph_(prepared.index.graph()),
+          prepared_(prepared),
           config_(config),
           source_policy_(source_policy),
           chain_(chain),
@@ -52,7 +54,9 @@ public:
           end_us_(end_us),
           final_cost_transform_(final_cost_transform),
           io_completion_(runtime::io_completion_provider(config.io_cost)),
-          replay_(source_graph, config, io_completion_, config.io_cost.storage_batch_pages, config.io_cost.resource_lanes, true),
+          replay_(source_graph_, config, io_completion_, config.io_cost.storage_batch_pages, config.io_cost.resource_lanes, true, {}, prepared.input),
+          source_calls_(prepared.phase_calls),
+          preparation_source_(prepared.allocator),
           operator_provider_(config.operator_models),
           loads_(stream_insertions_, config, compute_resources_.schedule, operator_provider_, io_completion_),
           layer_calls_(stream_insertions_, operator_provider_),
@@ -68,7 +72,7 @@ public:
 
 private:
     void prepare_source();
-    void replace_source_regions();
+    nlohmann::json replace_source_regions();
     void admit_fact_work(const model::HiCacheReplayFact & input);
     void bind_phase_migrations(std::map<size_t, structure::CostMigration> operations);
     uint64_t estimate_node_cost(size_t node, uint64_t start_us, uint64_t duration);
@@ -77,6 +81,7 @@ private:
 
     core::DagGraph & graph_;
     const core::DagGraph & source_graph_;
+    const HiCacheSourcePreparation & prepared_;
     const frontend::HiCacheConfig & config_;
     std::string_view source_policy_;
     const core::ClientRequestChain & chain_;
@@ -85,8 +90,8 @@ private:
     HiCacheWindowResult output_;
     structure::hicache::IoCompletionProvider io_completion_;
     model::HiCacheModelReplay replay_;
-    adapters::sglang::PhaseCallAudit source_calls_;
-    adapters::sglang::AllocatorPreparationObservation preparation_source_;
+    const adapters::sglang::PhaseCallAudit & source_calls_;
+    const adapters::sglang::AllocatorPreparationObservation & preparation_source_;
     std::map<size_t, std::vector<size_t>> facts_at_;
     HiCachePrefetchQueries queries_;
     HiCachePrefetchWaits waiting_;
@@ -115,7 +120,7 @@ HiCacheWindowResult HiCacheExecution::run() {
     prepare_source();
     metrics.checkpoint("source_observations_and_binding");
 
-    replace_source_regions();
+    auto replacement_phases = replace_source_regions();
     metrics.checkpoint("source_region_replacement");
 
     output_.simulation = simulation::run_topological_simulation(
@@ -127,17 +132,13 @@ HiCacheWindowResult HiCacheExecution::run() {
     finish();
     metrics.checkpoint("execution_accounting");
     output_.performance = metrics.report();
+    output_.performance["source_replacement_phases"] = std::move(replacement_phases);
     output_.performance["operator_queries_nested"] = operator_provider_.performance();
     return std::move(output_);
 }
 
 void HiCacheExecution::prepare_source() {
-    replay_.prepare_decode_allocations(source_graph_, begin_us_, end_us_);
-    source_calls_ = [this] {
-        const source_dag::SourceDagIndex source(source_graph_);
-        const auto queues = simulation::detail::discover_cpu_task_queues(source_graph_);
-        return adapters::sglang::observe_phase_calls(source, queues, replay_.source_phases());
-    }();
+    replay_.prepare_decode_allocations();
     output_.phase_observation_issues = source_calls_.issues();
     if (!output_.phase_observation_issues.empty())
         throw structure::MissingWork("Phase replacement needs complete per-call source observations", output_.phase_observation_issues);
@@ -157,7 +158,8 @@ void HiCacheExecution::prepare_source() {
     for (const auto & item : replay_.facts()) facts_at_[bound.fact_nodes.at(item.fact.source_node_id)].push_back(item.fact.source_node_id);
 }
 
-void HiCacheExecution::replace_source_regions() {
+nlohmann::json HiCacheExecution::replace_source_regions() {
+    core::ExecutionMetrics metrics;
     stream_insertions_.bind_synchronizations(graph_);
     compute_resources_ = adapters::sglang::observe_scheduler_compute_resources(adapters::sglang::HiCacheSourceIndex(graph_));
     queries_.bind(graph_, replay_, operator_provider_, facts_at_, io_completion_);
@@ -167,10 +169,12 @@ void HiCacheExecution::replace_source_regions() {
     waiting_.bind(graph_, replay_, source_policy_, config_.prefetch_policy, chain_, operator_provider_, confirmation_work);
     for (const auto & [node, ids] : facts_at_)
         if (!ids.empty() && !graph_.node(node).active) throw std::runtime_error("Wait replacement removed a state fact boundary");
+    metrics.checkpoint("prefetch_queries_and_waits");
     loads_.bind(graph_, replay_, begin_us_, end_us_);
     layer_calls_.bind(graph_, begin_us_, end_us_);
     lifecycles_.bind(graph_, replay_, begin_us_, end_us_, chain_.requests.front().start);
     for (auto & [node, ids] : facts_at_) std::erase_if(ids, [this](size_t id) { return lifecycles_.owns(id); });
+    metrics.checkpoint("loads_layers_and_lifecycles");
     write_confirmations_.prepare(graph_, begin_us_, end_us_, waiting_.replaced_intervals(), chain_.hicache_idle_since_us);
     // Confirmation tails can synchronize source write Records even after the
     // nonblocking readiness check succeeds. Replace those consumers before
@@ -180,10 +184,12 @@ void HiCacheExecution::replace_source_regions() {
     writes_.bind(graph_, begin_us_, end_us_, chain_.requests.front().start);
     for (const auto & [node, ids] : facts_at_)
         if (!ids.empty() && !graph_.node(node).active) throw std::runtime_error("Eviction replacement removed a state input boundary");
+    metrics.checkpoint("write_submissions_and_tails");
     confirmations_.bind(graph_, replay_, begin_us_, end_us_, waiting_.replaced_intervals(), confirmation_work, chain_.hicache_idle_since_us);
     confirmations_.replace_load_tails(graph_);
     writes_.replace_active_load_branches(graph_);
     loads_.replace_source_submissions(graph_);
+    metrics.checkpoint("load_submissions_and_confirmations");
     {
         const adapters::sglang::HiCacheSourceIndex source(graph_);
         core::DagMutationPlan plan{ .component = "cpu_collective" };
@@ -194,10 +200,13 @@ void HiCacheExecution::replace_source_regions() {
         if (!mutation.topology.ok()) throw std::runtime_error("CPU collective topology invalid");
 #endif
     }
-    collective_services_.bind(graph_, source_graph_, source_calls_.collectives.calls, begin_us_, end_us_);
+    metrics.checkpoint("retained_cpu_collectives");
+    collective_services_.bind(graph_, prepared_, source_calls_.collectives.calls, begin_us_, end_us_);
+    metrics.checkpoint("collective_services");
     phase_calls_.bind(graph_, source_graph_, source_calls_.attention.calls, source_calls_.metadata.calls, source_calls_.dense.calls, begin_us_, end_us_);
-    preparation_source_ = adapters::sglang::observe_allocator_preparations(source_graph_);
-    allocator_calls_.bind(graph_, source_graph_, replay_.facts(), compute_resources_.schedule, preparation_source_, begin_us_, end_us_);
+    metrics.checkpoint("phase_call_regions");
+    allocator_calls_.bind(graph_, prepared_, replay_.facts(), compute_resources_.schedule, begin_us_, end_us_);
+    metrics.checkpoint("allocator_call_regions");
     // No source regions are replaced after this point. Every generated host
     // operation binds against the same surviving worker queues.
     {
@@ -210,6 +219,8 @@ void HiCacheExecution::replace_source_regions() {
         writes_.rebind_retained_resources(retained, workers);
         write_confirmations_.rebind_resources(workers);
     }
+    metrics.checkpoint("retained_resource_binding");
+    return metrics.phases();
 }
 
 void HiCacheExecution::admit_fact_work(const model::HiCacheReplayFact & input) {
@@ -421,13 +432,13 @@ void HiCacheExecution::finish() {
 
 } // namespace
 
-HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::DagGraph & source_graph, const frontend::HiCacheConfig & config,
+HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, const frontend::HiCacheConfig & config,
                                            std::string_view source_policy, const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us,
                                            const simulation::NodeCostAtStart & final_cost_transform) {
     if (chain.status != "connected" || chain.requests.empty() || end_us <= begin_us)
         throw std::invalid_argument("HiCache execution requires a connected serial HTTP window");
 
-    return HiCacheExecution(graph, source_graph, config, source_policy, chain, begin_us, end_us, final_cost_transform).run();
+    return HiCacheExecution(graph, prepared, config, source_policy, chain, begin_us, end_us, final_cost_transform).run();
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

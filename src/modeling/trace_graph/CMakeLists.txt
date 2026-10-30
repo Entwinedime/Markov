@@ -32,6 +32,7 @@ target_sources(trace_graph_core
         include/markov/trace_graph/json_scan.hpp
         src/core/trace_event.cpp
         src/core/dag_graph.cpp
+        src/core/dag_index.cpp
         src/core/cpu_gap_observation.cpp
         src/core/client_requests.cpp
         src/core/dag_mutation.cpp
@@ -217,6 +218,8 @@ add_library(trace_graph_hicache STATIC
     src/modules/hicache/patch/attribution.cpp
     src/modules/hicache/model/apply_model.cpp
     src/modules/hicache/model/replay.cpp
+    src/modules/hicache/model/source_input.cpp
+    src/modules/hicache/runtime/source_preparation.cpp
     src/modules/hicache/execution_boundaries.cpp
     src/modules/hicache/control_points.cpp
     src/modules/hicache/runtime/prefetch_queries.cpp

@@ -2,6 +2,7 @@
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
+#include "modules/hicache/runtime/source_preparation.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
@@ -17,9 +18,10 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const model::HiCacheReplayFact> facts,
-                                 const structure::hicache::SchedulerComputeResources & resources,
-                                 const adapters::sglang::AllocatorPreparationObservation & preparation, uint64_t begin_us, uint64_t end_us) {
+void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const model::HiCacheReplayFact> facts,
+                                 const structure::hicache::SchedulerComputeResources & resources, uint64_t begin_us, uint64_t end_us) {
+    const auto & original = prepared.index.graph();
+    const auto & preparation = prepared.allocator;
     using Lane = std::pair<std::string, std::string>;
     std::map<Lane, std::vector<const HiCacheFact *>> outer_calls;
     std::map<size_t, const HiCacheFact *> extend_facts;
@@ -37,9 +39,9 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const core::DagGraph & 
     }
     for (auto & [lane, calls] : outer_calls) std::ranges::sort(calls, {}, [](const auto * fact) { return fact->source_ts; });
 
-    const adapters::sglang::HiCacheSourceIndex original_index(original);
-    const auto original_queues = simulation::detail::discover_cpu_task_queues(original);
-    const auto regions = adapters::sglang::observe_allocator_regions(original_index, original_queues);
+    const auto & original_index = prepared.index;
+    const auto & original_queues = prepared.queues;
+    const auto & regions = prepared.allocator_regions;
     struct Selection {
         const HiCacheFact * fact;
         const adapters::sglang::AllocatorRegion * region;

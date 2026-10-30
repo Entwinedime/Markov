@@ -270,7 +270,7 @@ void add_unrecorded_stream_waits(DagGraph & graph, DagBuildIndex & index) {
         return std::tie(a.lane, a.position, a.start_ns, a.host) < std::tie(b.lane, b.position, b.start_ns, b.host);
     });
     graph.reserve({ .nodes = graph.node_count() + pending.size(), .edges = graph.edges().size() + 4 * pending.size() });
-    graph.mutable_events().reserve(graph.events().size() + pending.size());
+    graph.reserve_events(graph.event_count() + pending.size());
     for (size_t begin = 0; begin < pending.size();) {
         size_t stop = begin + 1;
         while (stop < pending.size() && pending[stop].lane == pending[begin].lane) ++stop;

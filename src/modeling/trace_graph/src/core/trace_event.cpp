@@ -164,6 +164,11 @@ bool lookup_json_arg(std::string_view raw_args, std::string_view key, std::strin
     const auto current = trim_view(raw_args);
     if (current.empty()) return false;
     if (current.front() == '"') return lookup_encoded_json_arg(current, key, value);
+
+    // Plain absent keys need no JSON walk; escaped keys retain the full lookup.
+    const auto prefix = key.substr(0, key.find('.'));
+    if (current.find(prefix) == std::string_view::npos && current.find('\\') == std::string_view::npos) return false;
+
     std::string_view raw_value;
     if (find_top_level_key_value(current, key, raw_value)) return assign_json_value(raw_value, value);
     return lookup_nested_json_arg(current, key, value);

@@ -107,9 +107,9 @@ def _result_stream(
     for spec in specs:
         sources.setdefault((spec.source.manifest_path, spec.cpu_service_cost), []).append(spec)
 
-    for batch in sources.values():
+    for source_index, batch in enumerate(sources.values()):
         failed = False
-        for result, inflight in _run_source(options, batch):
+        for result, inflight in _run_source(options, batch, options.output_dir / "sources" / str(source_index)):
             if isinstance(result, ModelRunResult):
                 failed |= result.return_code != 0
             yield result, inflight
@@ -118,7 +118,7 @@ def _result_stream(
 
 
 def _run_source(
-    options: WorkflowOptions, specs: list[ModelRunSpec]
+    options: WorkflowOptions, specs: list[ModelRunSpec], source_directory: Path
 ) -> Iterator[tuple[ModelRunResult | ModelRunStarted | SourcePreparation, int]]:
     """Publish live per-target outcomes from one prepared-source process.
 
@@ -171,7 +171,9 @@ def _run_source(
     if not ready:
         return
 
-    plan_path = ready[0].output_dir / "target_plan.json"
+    source_directory.mkdir(parents=True, exist_ok=True)
+    (source_directory / "source_replay_report.json").unlink(missing_ok=True)
+    plan_path = source_directory / "target_plan.json"
     write_json(
         plan_path,
         {
@@ -183,7 +185,7 @@ def _run_source(
             ],
         },
     )
-    batch_log = ready[0].output_dir / "source_preparation.log"
+    batch_log = source_directory / "source_preparation.log"
     completed = set()
     process = None
     return_code = 1

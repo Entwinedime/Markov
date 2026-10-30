@@ -35,6 +35,7 @@ struct CsrAdjacency {
 struct ActiveDagStorage {
     CsrAdjacency outgoing;
     std::vector<size_t> indegree;
+    std::vector<size_t> node_ids, node_slots;
     size_t active_edge_count = 0;
 };
 
@@ -95,26 +96,33 @@ ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph, const de
     ActiveDagStorage storage;
     const auto node_count = graph.node_count();
     const auto & nodes = graph.nodes();
-    storage.indegree.resize(node_count, 0);
-    storage.outgoing.offsets.resize(node_count + 1, 0);
+    storage.node_slots.assign(node_count, kInvalidNode);
+    storage.node_ids.reserve(graph.active_node_count());
+    for (const auto & node : nodes) {
+        if (!node.active) continue;
+        storage.node_slots[node.id] = storage.node_ids.size();
+        storage.node_ids.push_back(node.id);
+    }
+    storage.indegree.resize(storage.node_ids.size(), 0);
+    storage.outgoing.offsets.resize(storage.node_ids.size() + 1, 0);
     for (const auto & edge : graph.edges()) {
         if (!edge.active) continue;
         if (edge.src >= node_count || edge.dst >= node_count) throw std::runtime_error("Invalid active DAG: active edge endpoint is out of range");
         if (!nodes[edge.src].active || !nodes[edge.dst].active) throw std::runtime_error("Invalid active DAG: active edge references a disabled node");
         if (queues.replaces(edge)) continue;
-        storage.outgoing.offsets[edge.src + 1]++;
-        storage.indegree[edge.dst]++;
+        storage.outgoing.offsets[storage.node_slots[edge.src] + 1]++;
+        storage.indegree[storage.node_slots[edge.dst]]++;
         storage.active_edge_count++;
     }
 
-    for (size_t node_id = 0; node_id < node_count; ++node_id) storage.outgoing.offsets[node_id + 1] += storage.outgoing.offsets[node_id];
+    for (size_t node_id = 0; node_id < storage.node_ids.size(); ++node_id) storage.outgoing.offsets[node_id + 1] += storage.outgoing.offsets[node_id];
     storage.outgoing.destinations.resize(storage.active_edge_count);
     storage.outgoing.edge_kinds.resize(storage.active_edge_count, core::DagEdgeKind::Sequential);
     auto cursor = storage.outgoing.offsets;
     for (const auto & edge : graph.edges()) {
         if (!edge.active || queues.replaces(edge)) continue;
-        const auto offset = cursor[edge.src]++;
-        storage.outgoing.destinations[offset] = edge.dst;
+        const auto offset = cursor[storage.node_slots[edge.src]]++;
+        storage.outgoing.destinations[offset] = storage.node_slots[edge.dst];
         storage.outgoing.edge_kinds[offset] = edge.kind;
     }
     return storage;
@@ -128,8 +136,8 @@ public:
           active_node_count_(graph.active_node_count()),
           queues_(mode == ReplayMode::Full ? detail::discover_cpu_task_queues(graph) : detail::CpuTaskQueues{}),
           storage_(build_active_dag_storage(graph, queues_)),
-          start_time_(graph.node_count(), 0),
-          completion_time_(graph.node_count(), 0),
+          start_time_(storage_.node_ids.size(), 0),
+          completion_time_(storage_.node_ids.size(), 0),
           workers_(queues_.queue_count),
           task_ready_(queues_.tasks.size(), false),
           task_order_(queues_.queue_count),
@@ -137,12 +145,12 @@ public:
           control_exclusions_(mode == ReplayMode::ControlOnly ? ControlExclusionIndex(graph) : ControlExclusionIndex{}),
           cost_at_start_(std::move(cost_at_start)),
           expand_at_start_(std::move(expand_at_start)),
-          execution_(graph.node_count(), Execution::Pending),
-          ready_generation_(graph.node_count(), 0),
+          execution_(storage_.node_ids.size(), Execution::Pending),
+          ready_generation_(storage_.node_ids.size(), 0),
           chronological_(!queues_.tasks.empty() || static_cast<bool>(cost_at_start_) || static_cast<bool>(expand_at_start_)) {
         ready_.reserve(active_node_count_);
         for (const auto & node : nodes_) {
-            if (node.active && storage_.indegree[node.id] == 0) make_ready(node.id);
+            if (node.active && storage_.indegree[node_slot(node.id)] == 0) make_ready(node.id);
         }
     }
 
@@ -174,6 +182,14 @@ public:
     }
 
 private:
+    size_t node_slot(size_t id) const {
+        return id < storage_.node_slots.size() ? storage_.node_slots[id] : storage_.node_ids.size() + (id - storage_.node_slots.size());
+    }
+
+    size_t graph_node_id(size_t slot) const {
+        return slot < storage_.node_ids.size() ? storage_.node_ids[slot] : storage_.node_slots.size() + (slot - storage_.node_ids.size());
+    }
+
     enum class Execution : uint8_t { Pending, Running, Done };
     enum class QueueEventKind { Finish, Arrival, Start, DeferredStart };
     using QueueEvent = std::tuple<uint64_t, QueueEventKind, size_t, uint64_t>;
@@ -185,9 +201,12 @@ private:
 
     void launch_task(size_t task_id) {
         const auto & task = queues_.tasks[task_id];
-        const auto ready = std::max(start_time_[task.first], workers_[task.queue].free_us);
+        const auto ready = std::max(start_time_[node_slot(task.first)], workers_[task.queue].free_us);
         const auto delay = mode_ == ReplayMode::Full ? graph_.cpu_service_ready_delay(task.first, task.ready_delay_us) : task.ready_delay_us;
-        events_.emplace(core::checked_add_u64(ready, delay, "queue ready delay overflow"), QueueEventKind::Start, task.first, ready_generation_[task.first]);
+        events_.emplace(core::checked_add_u64(ready, delay, "queue ready delay overflow"),
+                        QueueEventKind::Start,
+                        task.first,
+                        ready_generation_[node_slot(task.first)]);
     }
 
     void admit_task(size_t queue) {
@@ -211,18 +230,19 @@ private:
         }
         else {
             const auto kind = deferred_boundaries_.contains(id) ? QueueEventKind::DeferredStart : QueueEventKind::Start;
-            events_.emplace(core::checked_add_u64(start_time_[id], effective_ready_delay(nodes_[id]), "CPU ready delay overflow"),
+            events_.emplace(core::checked_add_u64(start_time_[node_slot(id)], effective_ready_delay(nodes_[id]), "CPU ready delay overflow"),
                             kind,
                             id,
-                            ready_generation_[id]);
+                            ready_generation_[node_slot(id)]);
         }
     }
 
     void finish_node(size_t id) {
-        execution_[id] = Execution::Done;
-        if (id + 1 < storage_.outgoing.offsets.size())
-            for (size_t offset = storage_.outgoing.offsets[id]; offset < storage_.outgoing.offsets[id + 1]; ++offset)
-                propagate_edge(nodes_[id], storage_.outgoing.destinations[offset], storage_.outgoing.edge_kinds[offset]);
+        execution_[node_slot(id)] = Execution::Done;
+        const auto slot = node_slot(id);
+        if (slot + 1 < storage_.outgoing.offsets.size())
+            for (size_t offset = storage_.outgoing.offsets[slot]; offset < storage_.outgoing.offsets[slot + 1]; ++offset)
+                propagate_edge(nodes_[id], graph_node_id(storage_.outgoing.destinations[offset]), storage_.outgoing.edge_kinds[offset]);
         if (const auto found = added_outgoing_.find(id); found != added_outgoing_.end())
             for (const auto edge_id : found->second) {
                 const auto & edge = graph_.edge(edge_id);
@@ -235,8 +255,9 @@ private:
             const auto [time, kind, id, generation] = events_.top();
             events_.pop();
             if (kind == QueueEventKind::Start || kind == QueueEventKind::DeferredStart) {
-                if (generation != ready_generation_[id] || storage_.indegree[id] != 0 || execution_[id] != Execution::Pending) continue;
-                start_time_[id] = time;
+                if (generation != ready_generation_[node_slot(id)] || storage_.indegree[node_slot(id)] != 0 || execution_[node_slot(id)] != Execution::Pending)
+                    continue;
+                start_time_[node_slot(id)] = time;
                 execute_node(id);
             }
             else if (kind == QueueEventKind::Arrival) {
@@ -263,26 +284,27 @@ private:
 
     void execute_node(size_t node_id) {
         result_.processed_nodes++;
-        execution_[node_id] = Execution::Running;
+        execution_[node_slot(node_id)] = Execution::Running;
         if (!chronological_)
-            start_time_[node_id] = core::checked_add_u64(start_time_[node_id], effective_ready_delay(nodes_[node_id]), "DAG CPU ready-delay overflow");
+            start_time_[node_slot(node_id)] =
+                core::checked_add_u64(start_time_[node_slot(node_id)], effective_ready_delay(nodes_[node_id]), "DAG CPU ready-delay overflow");
         if (expand_at_start_) {
             expanding_node_ = node_id;
-            expand_at_start_(node_id, start_time_[node_id], *this);
+            expand_at_start_(node_id, start_time_[node_slot(node_id)], *this);
             expanding_node_ = kInvalidNode;
         }
         // Expansion can reallocate node storage; acquire this reference afterwards.
         auto & node = graph_.mutable_node(node_id);
         auto duration = effective_node_duration(node);
         if (cost_at_start_) {
-            duration = cost_at_start_(node_id, start_time_[node_id], duration);
+            duration = cost_at_start_(node_id, start_time_[node_slot(node_id)], duration);
             graph_.bind_node_execution_duration(node_id, duration);
         }
         if (deferred_boundaries_.contains(node_id) && node.duration) throw std::logic_error("Deferred observation cannot acquire a service cost");
-        const auto completion_time = core::checked_add_u64(start_time_[node_id], duration, "DAG simulation timestamp overflow");
-        completion_time_[node_id] = completion_time;
+        const auto completion_time = core::checked_add_u64(start_time_[node_slot(node_id)], duration, "DAG simulation timestamp overflow");
+        completion_time_[node_slot(node_id)] = completion_time;
         if (mode_ == ReplayMode::Full) {
-            node.simulation_start = start_time_[node_id];
+            node.simulation_start = start_time_[node_slot(node_id)];
             node.completion_time = completion_time;
         }
         if (node.counts_toward_e2e) {
@@ -295,10 +317,10 @@ private:
 
     void propagate_edge(const core::DagNode & source, size_t dst, core::DagEdgeKind kind) {
         const auto delay = effective_edge_delay(source, kind);
-        const auto candidate = core::checked_add_u64(completion_time_[source.id], delay, "DAG simulation edge-delay overflow");
-        start_time_[dst] = std::max(start_time_[dst], candidate);
-        storage_.indegree[dst]--;
-        if (storage_.indegree[dst] == 0) make_ready(dst);
+        const auto candidate = core::checked_add_u64(completion_time_[node_slot(source.id)], delay, "DAG simulation edge-delay overflow");
+        start_time_[node_slot(dst)] = std::max(start_time_[node_slot(dst)], candidate);
+        storage_.indegree[node_slot(dst)]--;
+        if (storage_.indegree[node_slot(dst)] == 0) make_ready(dst);
     }
 
     size_t append(const core::DagSyntheticNodeSpec & spec, BoundaryOrder order, std::optional<size_t> owner) override {
@@ -313,6 +335,8 @@ private:
         if (order == BoundaryOrder::AfterConcurrentStarts) deferred_boundaries_.insert(id);
         graph_.mutable_node(id).gpu_id = rank;
         graph_.mutable_event_for_node(id).pid = graph_.event_for_node(origin).pid;
+        // Only source work needs an identity map: future nodes append in order.
+        // Runtime arrays omit disabled regions without renumbering graph evidence.
         storage_.indegree.push_back(0);
         start_time_.push_back(0);
         completion_time_.push_back(0);
@@ -327,7 +351,7 @@ private:
 
     size_t append_cpu_task(const core::DagSyntheticNodeSpec & spec, size_t submission, size_t queue_member) override {
         if (expanding_node_ == kInvalidNode || !spec.is_cpu || spec.cpu_gap_after || submission >= nodes_.size() || queue_member >= nodes_.size()
-            || !nodes_[submission].active || !nodes_[submission].is_cpu || execution_[submission] == Execution::Done
+            || !nodes_[submission].active || !nodes_[submission].is_cpu || execution_[node_slot(submission)] == Execution::Done
             || queues_.submitted_task[submission] != kInvalidNode || queues_.node_task[queue_member] == kInvalidNode || !spec.cpu_task_ready_delay_us)
             throw std::invalid_argument("New CPU task requires one unfinished submission and a recognized worker");
         const auto queue = queues_.tasks[queues_.node_task[queue_member]].queue;
@@ -349,8 +373,9 @@ private:
     }
 
     size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & spec, size_t previous) override {
-        if (previous >= nodes_.size() || !nodes_[previous].explicit_cpu_task || execution_[previous] != Execution::Pending || !spec.is_cpu || spec.cpu_gap_after
-            || spec.cpu_task_ready_delay_us || graph_.node_lane_key(previous) != spec.lane_key)
+        if (previous >= nodes_.size() || !nodes_[previous].active || !nodes_[previous].explicit_cpu_task
+            || execution_[node_slot(previous)] != Execution::Pending || !spec.is_cpu || spec.cpu_gap_after || spec.cpu_task_ready_delay_us
+            || graph_.node_lane_key(previous) != spec.lane_key)
             throw std::invalid_argument("CPU task continuation requires an unstarted generated member on the same worker");
         const auto task_id = queues_.node_task[previous];
         if (task_id == kInvalidNode || queues_.tasks[task_id].last != previous)
@@ -373,7 +398,7 @@ private:
 
     void connect(size_t src, size_t dst, core::DagEdgeKind kind) {
         if (expanding_node_ == kInvalidNode || src >= nodes_.size() || dst >= nodes_.size() || !nodes_[src].active || !nodes_[dst].active || src == dst
-            || execution_[dst] != Execution::Pending)
+            || execution_[node_slot(dst)] != Execution::Pending)
             throw std::invalid_argument("Future dependency must target unstarted work without changing native CPU task identity: src=" + std::to_string(src)
                                         + " dst=" + std::to_string(dst) + " callback=" + std::to_string(expanding_node_)
                                         + " src_active=" + std::to_string(src < nodes_.size() && nodes_[src].active)
@@ -381,16 +406,18 @@ private:
                                         + " src_name=" + (src < nodes_.size() ? graph_.event_for_node(src).name : "missing")
                                         + " dst_name=" + (dst < nodes_.size() ? graph_.event_for_node(dst).name : "missing") + " callback_name="
                                         + (expanding_node_ < nodes_.size() ? graph_.event_for_node(expanding_node_).name : "missing") + " dst_state="
-                                        + (dst >= execution_.size()                ? "missing"
-                                           : execution_[dst] == Execution::Pending ? "pending"
-                                           : execution_[dst] == Execution::Running ? "running"
-                                                                                   : "done"));
+                                        + (dst >= nodes_.size()                               ? "missing"
+                                           : !nodes_[dst].active                              ? "inactive"
+                                           : execution_[node_slot(dst)] == Execution::Pending ? "pending"
+                                           : execution_[node_slot(dst)] == Execution::Running ? "running"
+                                                                                              : "done"));
         if (queues_.replaces(core::DagEdge{ src, dst, kind }))
             throw std::invalid_argument("Native worker ordering is owned by its CPU queue, not a new Sequential dependency");
         // Repeated model declarations must not multiply dependencies.
-        if (src + 1 < storage_.outgoing.offsets.size())
-            for (size_t i = storage_.outgoing.offsets[src]; i < storage_.outgoing.offsets[src + 1]; ++i)
-                if (storage_.outgoing.destinations[i] == dst && storage_.outgoing.edge_kinds[i] == kind) return;
+        const auto src_slot = node_slot(src), dst_slot = node_slot(dst);
+        if (src_slot + 1 < storage_.outgoing.offsets.size())
+            for (size_t i = storage_.outgoing.offsets[src_slot]; i < storage_.outgoing.offsets[src_slot + 1]; ++i)
+                if (storage_.outgoing.destinations[i] == dst_slot && storage_.outgoing.edge_kinds[i] == kind) return;
         auto & outgoing = added_outgoing_[src];
         for (const auto id : outgoing) {
             const auto & edge = graph_.edge(id);
@@ -398,11 +425,11 @@ private:
         }
         outgoing.push_back(graph_.add_edge(src, dst, kind));
         ++storage_.active_edge_count;
-        ++storage_.indegree[dst];
-        ++ready_generation_[dst]; // Invalidate any old Start already in the heap.
+        ++storage_.indegree[node_slot(dst)];
+        ++ready_generation_[node_slot(dst)]; // Invalidate any old Start already in the heap.
         const auto task = queues_.node_task[dst];
         if (task != kInvalidNode && queues_.tasks[task].first == dst) task_ready_[task] = false;
-        if (execution_[src] == Execution::Done) propagate_edge(nodes_[src], dst, kind);
+        if (execution_[node_slot(src)] == Execution::Done) propagate_edge(nodes_[src], dst, kind);
     }
 
 
@@ -455,7 +482,7 @@ private:
         log << error << " Processed " << result_.processed_nodes << " out of " << active_node_count_ << " active nodes.";
         if (!cycle_nodes.empty()) {
             log << " Cycle nodes:";
-            std::ranges::for_each(cycle_nodes, [&](auto node_id) { log << " " << node_id; });
+            std::ranges::for_each(cycle_nodes, [&](auto node_id) { log << " " << graph_node_id(node_id); });
         }
         throw std::runtime_error(error);
     }

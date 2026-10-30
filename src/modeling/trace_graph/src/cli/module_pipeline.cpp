@@ -81,13 +81,14 @@ bool ModulePipeline::needs_hicache_observations() const {
     });
 }
 
-void ModulePipeline::apply(core::DagGraph & graph, const core::DagGraph & source_graph, core::Logger & logger, const core::ClientRequestChain & chain,
-                           uint64_t begin_us, uint64_t end_us) {
+void ModulePipeline::apply(core::DagGraph & graph, const modules::hicache::runtime::HiCacheSourcePreparation * prepared, core::Logger & logger,
+                           const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us) {
     for (const auto & module : modules_) {
         logger.info() << "Applying module: " << module->name();
         module->apply(graph);
     }
     if (execution_config_) {
+        if (!prepared) throw std::logic_error("HiCache execution requires prepared source observations");
         logger.info() << "Executing HiCache HTTP window";
         simulation::NodeCostAtStart final_cost;
         if (execution_node_scale_) {
@@ -97,7 +98,7 @@ void ModulePipeline::apply(core::DagGraph & graph, const core::DagGraph & source
         }
 
         execution_result_ = modules::hicache::runtime::execute_hicache_window(graph,
-                                                                              source_graph,
+                                                                              *prepared,
                                                                               *execution_config_,
                                                                               source_prefetch_policy_,
                                                                               chain,

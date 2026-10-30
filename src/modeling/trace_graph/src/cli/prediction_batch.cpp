@@ -57,7 +57,6 @@ std::vector<TargetRun> target_runs(const CliOptions & source_options, const nloh
         options.model_config = item.at("model_config").get<std::string>();
         options.outputs.run_summary = output_path(directory, "run_summary.json");
         options.outputs.graph = output_path(directory, "dag_chrome_trace.json", !source_options.outputs.graph.empty());
-        options.outputs.source_replay_report = output_path(directory, "source_replay_report.json", !source_options.outputs.source_replay_report.empty());
         options.outputs.structure_report = output_path(directory, "structure_report.json", !source_options.outputs.structure_report.empty());
 #ifdef DEBUG
         options.outputs.model_summary = output_path(directory, "model_summary.json", !source_options.outputs.model_summary.empty());
@@ -111,16 +110,15 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
     auto runs = target_runs(options, plan, packages);
     metrics.checkpoint("target_configs_and_costs_load");
     const auto preparation_started = std::chrono::steady_clock::now();
-    auto source = prepare_source(options, true);
+    auto source = prepare_source(options, true, std::ranges::any_of(runs, [](const auto & run) { return run.modules.uses_hicache_execution(); }));
     const auto preparation_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started).count();
     metrics.checkpoint("source_preparation");
     auto performance = metrics.report();
     performance["cost_packages_loaded"] = packages.size();
     std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec }, { "performance", std::move(performance) } }.dump() << '\n' << std::flush;
 
-    // Input loading/build futures have joined. Fork before target work: const
-    // TraceEvent access may populate lazy maps and is not thread-safe.
-    // Copy-on-write isolates caches, graphs, clocks and query statistics.
+    // Source evidence and observations are prepared before fork. Each child
+    // owns its graph changes, execution clock and query statistics.
     Children children;
     children.active.reserve(std::min(static_cast<size_t>(jobs), runs.size()));
     size_t next = 0;

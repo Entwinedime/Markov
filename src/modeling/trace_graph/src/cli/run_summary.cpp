@@ -390,7 +390,7 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
 void write_run_summary(const std::string & filename, const core::DagGraph & graph, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
                        const nlohmann::json & source_io_observations, const modules::hicache::HiCachePhaseObservationAudit & source_phase_observations,
                        const nlohmann::json & client_result, const modules::hicache::runtime::HiCacheWindowResult * execution, bool include_source_observations,
-                       const nlohmann::json & performance) {
+                       const nlohmann::json & performance, const std::string & source_replay_report) {
     core::ExecutionMetrics metrics;
     auto summary = run_summary(graph, modules, source_phase_observations, include_source_observations, execution != nullptr);
     if (include_source_observations) summary["source_io_observations"] = source_io_observations;
@@ -519,6 +519,7 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
             summary[key] = nullptr;
     }
     metrics.checkpoint("summary_construction");
+    if (!source_replay_report.empty()) summary["source_replay_report"] = source_replay_report;
     summary["performance"] = performance;
     summary["performance"]["report_construction"] = metrics.report();
     write_json_file(filename, summary);

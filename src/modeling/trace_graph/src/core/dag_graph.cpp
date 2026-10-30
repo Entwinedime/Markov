@@ -94,9 +94,11 @@ size_t DagGraph::intern_lane(std::string_view lane_key_value) {
 }
 
 size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane_key_value) {
-    if (event_index >= events_.size()) { throw std::out_of_range("event index out of range while adding DAG node"); }
+    if (event_index >= event_count()) { throw std::out_of_range("event index out of range while adding DAG node"); }
+    invalidate_topology();
+    cpu_intervals_.reset();
     size_t node_id = nodes_.size();
-    const auto & event = events_[event_index];
+    const auto & event = this->event(event_index);
     DagNode node;
     node.id = node_id;
     node.event_index = event_index;
@@ -114,7 +116,7 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
 
 size_t DagGraph::add_device_resource(std::string lane_key, int gpu_id) {
     const auto node = add_synthetic_node({ .name = "device resource", .is_cpu = false, .lane_key = std::move(lane_key) });
-    nodes_[node].active = false;
+    disable_node(node);
     nodes_[node].gpu_id = gpu_id;
     return node;
 }
@@ -124,7 +126,7 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     if (spec.cpu_task_ready_delay_us && !spec.is_cpu) throw std::invalid_argument("explicit CPU task must use a CPU node");
     if (spec.cpu_gap_after && (!spec.is_cpu || spec.cpu_task_ready_delay_us)) throw std::invalid_argument("residual gap requires a non-worker CPU boundary");
     TraceEvent event;
-    event.index = events_.size();
+    event.index = event_count();
     event.source_channel = TraceSourceChannel::Synthetic;
     event.event_id = "synthetic_" + std::to_string(nodes_.size());
     event.name = spec.name;
@@ -143,7 +145,7 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     for (const auto & [key, value] : spec.attrs) event.set_arg(key, value);
     events_.push_back(std::move(event));
 
-    const auto node_id = add_node(events_.size() - 1, spec.is_cpu, spec.lane_key);
+    const auto node_id = add_node(event_count() - 1, spec.is_cpu, spec.lane_key);
     auto & node = nodes_[node_id];
     node.kind = DagNodeKind::Synthetic;
     node.counts_toward_e2e = spec.counts_toward_e2e;
@@ -162,6 +164,7 @@ size_t DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_
      * Duplicate dependencies preserve the critical path but inflate indegrees and
      * summary counts, so each edge-producing rule must own deduplication.
      */
+    invalidate_topology();
     const auto edge_index = edges_.size();
     edges_.emplace_back(src, dst, kind, effect_id, reason);
     return edge_index;
@@ -169,24 +172,77 @@ size_t DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_
 
 void DagGraph::disable_edge(size_t edge_index) { mutable_edge(edge_index).active = false; }
 
+void DagGraph::disable_node(size_t node_id) {
+    auto & target = mutable_node(node_id);
+    if (!target.active) return;
+    target.active = false;
+    invalidate_topology();
+    cpu_intervals_.reset();
+}
+
 const DagEdge & DagGraph::edge(size_t edge_index) const {
     if (edge_index >= edges_.size()) throw std::out_of_range("DAG edge index out of range");
     return edges_[edge_index];
 }
 
 DagEdge & DagGraph::mutable_edge(size_t edge_index) {
+    invalidate_topology();
     if (edge_index >= edges_.size()) throw std::out_of_range("DAG edge index out of range");
     return edges_[edge_index];
 }
 
+void DagGraph::share_source_events() {
+    if (source_events_) return;
+    source_events_ = std::make_shared<const std::vector<TraceEvent>>(std::move(events_));
+    events_.clear();
+}
+
+void DagGraph::reserve_events(size_t capacity) {
+    const auto shared = source_events_ ? source_events_->size() : 0;
+    if (capacity > shared) events_.reserve(capacity - shared);
+}
+
+void DagGraph::materialize_events() {
+    if (!source_events_) return;
+    std::vector<TraceEvent> combined;
+    combined.reserve(event_count());
+    for (size_t i = 0; i < source_events_->size(); ++i) combined.push_back(event(i));
+    combined.insert(combined.end(), std::make_move_iterator(events_.begin()), std::make_move_iterator(events_.end()));
+    events_ = std::move(combined);
+    event_overrides_.clear();
+    source_events_.reset();
+}
+
+DagGraph::ObservedTables & DagGraph::own_observations() {
+    if (!observations_.unique()) observations_ = std::make_shared<ObservedTables>(*observations_);
+    return *observations_;
+}
+
+void DagGraph::invalidate_topology() {
+    adjacency_.reset();
+    topological_order_.reset();
+    active_counts_.reset();
+}
+
 const TraceEvent & DagGraph::event(size_t event_index) const {
-    if (event_index >= events_.size()) { throw std::out_of_range("event index out of range"); }
-    return events_[event_index];
+    const auto shared = source_events_ ? source_events_->size() : 0;
+    if (event_index < shared) {
+        if (!event_overrides_.empty())
+            if (const auto found = event_overrides_.find(event_index); found != event_overrides_.end()) return found->second;
+        return (*source_events_)[event_index];
+    }
+    return events_.at(event_index - shared);
 }
 
 TraceEvent & DagGraph::mutable_event(size_t event_index) {
-    if (event_index >= events_.size()) { throw std::out_of_range("event index out of range"); }
-    return events_[event_index];
+    cpu_intervals_.reset();
+    const auto shared = source_events_ ? source_events_->size() : 0;
+    if (event_index < shared) {
+        const auto found = event_overrides_.find(event_index);
+        if (found != event_overrides_.end()) return found->second;
+        return event_overrides_.emplace(event_index, (*source_events_)[event_index]).first->second;
+    }
+    return events_.at(event_index - shared);
 }
 
 const TraceEvent & DagGraph::event_for_node(size_t node_id) const { return event(node(node_id).event_index); }
@@ -340,15 +396,9 @@ std::optional<size_t> DagGraph::find_lane_id(std::string_view lane_key_value) co
     return found->second;
 }
 
-size_t DagGraph::active_node_count() const {
-    return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active; }));
-}
+size_t DagGraph::active_node_count() const { return active_counts().nodes; }
 
-size_t DagGraph::active_edge_count() const {
-    return static_cast<size_t>(std::ranges::count_if(edges_, [&](const auto & edge) {
-        return edge.active && edge.src < nodes_.size() && edge.dst < nodes_.size() && nodes_[edge.src].active && nodes_[edge.dst].active;
-    }));
-}
+size_t DagGraph::active_edge_count() const { return active_counts().edges; }
 
 bool DagGraph::has_active_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) const {
     return std::ranges::any_of(edges_, [&](const auto & edge) {
@@ -380,11 +430,26 @@ DagGraphSummaryStats DagGraph::summary_stats() const {
     return stats;
 }
 
+const DagGraph::ActiveCounts & DagGraph::active_counts() const {
+    if (!active_counts_) {
+        const auto nodes = static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active; }));
+        const auto edges = static_cast<size_t>(std::ranges::count_if(edges_, [&](const auto & edge) {
+            return edge.active && edge.src < nodes_.size() && edge.dst < nodes_.size() && nodes_[edge.src].active && nodes_[edge.dst].active;
+        }));
+        active_counts_ = ActiveCounts{ nodes, edges };
+    }
+    return *active_counts_;
+}
+
 class DagGraph::GraphMerger {
 public:
     explicit GraphMerger(std::vector<DagGraph> graphs) : graphs_(std::move(graphs)), merged_({}, 0), node_offsets_(graphs_.size(), 0) {}
 
     [[nodiscard]] DagGraph run() {
+        for (auto & graph : graphs_) {
+            graph.materialize_events();
+            graph.own_observations();
+        }
         reserve_node_storage();
         merge_nodes_and_events();
         reserve_and_merge_edges();
@@ -420,15 +485,20 @@ private:
         total_edges_ = checked_total([](const auto & graph) { return graph.edges_.size(); }, "edge");
         merged_.events_.reserve(checked_total([](const auto & graph) { return graph.events_.size(); }, "event"));
         merged_.parsed_record_count_ = checked_total([](const auto & graph) { return graph.parsed_record_count_; }, "parsed-record");
-        merged_.hicache_fact_events_.reserve(checked_total([](const auto & graph) { return graph.hicache_fact_events_.size(); }, "HiCache fact"));
-        merged_.runtime_observations_.reserve(checked_total([](const auto & graph) { return graph.runtime_observations_.size(); }, "runtime observation"));
-        merged_.context_events_.reserve(checked_total([](const auto & graph) { return graph.context_events_.size(); }, "context event"));
-        merged_.prelude_context_events_.reserve(
-            checked_total([](const auto & graph) { return graph.prelude_context_events_.size(); }, "prelude context event"));
-        merged_.tail_context_events_.reserve(checked_total([](const auto & graph) { return graph.tail_context_events_.size(); }, "tail context event"));
-        merged_.control_exclusion_intervals_.reserve(
-            checked_total([](const auto & graph) { return graph.control_exclusion_intervals_.size(); }, "control exclusion interval"));
-        merged_.phase_marker_events_.reserve(checked_total([](const auto & graph) { return graph.phase_marker_events_.size(); }, "phase marker event"));
+        merged_.observations_->hicache_fact_events.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->hicache_fact_events.size(); }, "HiCache fact"));
+        merged_.observations_->runtime_observations.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->runtime_observations.size(); }, "runtime observation"));
+        merged_.observations_->context_events.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->context_events.size(); }, "context event"));
+        merged_.observations_->prelude_context_events.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->prelude_context_events.size(); }, "prelude context event"));
+        merged_.observations_->tail_context_events.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->tail_context_events.size(); }, "tail context event"));
+        merged_.observations_->control_exclusion_intervals.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->control_exclusion_intervals.size(); }, "control exclusion interval"));
+        merged_.observations_->phase_marker_events.reserve(
+            checked_total([](const auto & graph) { return graph.observations_->phase_marker_events.size(); }, "phase marker event"));
         merged_.reserve(DagGraphCapacity{ .nodes = total_nodes_, .edges = 0 });
     }
 
@@ -439,21 +509,21 @@ private:
             auto & graph = graphs_[graph_index];
             node_offsets_[graph_index] = node_offset;
             merged_.input_contracts_.insert(merged_.input_contracts_.end(), graph.input_contracts_.begin(), graph.input_contracts_.end());
-            merged_.runtime_observations_.insert(merged_.runtime_observations_.end(),
-                                                 std::make_move_iterator(graph.runtime_observations_.begin()),
-                                                 std::make_move_iterator(graph.runtime_observations_.end()));
-            append_indexed_events(merged_.hicache_fact_events_, graph.hicache_fact_events_);
-            merged_.context_events_.insert(merged_.context_events_.end(),
-                                           std::make_move_iterator(graph.context_events_.begin()),
-                                           std::make_move_iterator(graph.context_events_.end()));
-            append_indexed_events(merged_.prelude_context_events_, graph.prelude_context_events_);
-            append_indexed_events(merged_.tail_context_events_, graph.tail_context_events_);
-            merged_.control_exclusion_intervals_.insert(merged_.control_exclusion_intervals_.end(),
-                                                        std::make_move_iterator(graph.control_exclusion_intervals_.begin()),
-                                                        std::make_move_iterator(graph.control_exclusion_intervals_.end()));
-            merged_.phase_marker_events_.insert(merged_.phase_marker_events_.end(),
-                                                std::make_move_iterator(graph.phase_marker_events_.begin()),
-                                                std::make_move_iterator(graph.phase_marker_events_.end()));
+            merged_.observations_->runtime_observations.insert(merged_.observations_->runtime_observations.end(),
+                                                               std::make_move_iterator(graph.observations_->runtime_observations.begin()),
+                                                               std::make_move_iterator(graph.observations_->runtime_observations.end()));
+            append_indexed_events(merged_.observations_->hicache_fact_events, graph.observations_->hicache_fact_events);
+            merged_.observations_->context_events.insert(merged_.observations_->context_events.end(),
+                                                         std::make_move_iterator(graph.observations_->context_events.begin()),
+                                                         std::make_move_iterator(graph.observations_->context_events.end()));
+            append_indexed_events(merged_.observations_->prelude_context_events, graph.observations_->prelude_context_events);
+            append_indexed_events(merged_.observations_->tail_context_events, graph.observations_->tail_context_events);
+            merged_.observations_->control_exclusion_intervals.insert(merged_.observations_->control_exclusion_intervals.end(),
+                                                                      std::make_move_iterator(graph.observations_->control_exclusion_intervals.begin()),
+                                                                      std::make_move_iterator(graph.observations_->control_exclusion_intervals.end()));
+            merged_.observations_->phase_marker_events.insert(merged_.observations_->phase_marker_events.end(),
+                                                              std::make_move_iterator(graph.observations_->phase_marker_events.begin()),
+                                                              std::make_move_iterator(graph.observations_->phase_marker_events.end()));
             remap_nodes(graph,
                         GraphRelocation{
                             .graph_index = graph_index,

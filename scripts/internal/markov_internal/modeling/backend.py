@@ -63,7 +63,8 @@ def build_trace_graph_command(run: ModelingRunConfig, *, target_plan: Path | Non
     if run.outputs.dag_chrome_trace:
         command.extend(["--graph-output", str(run.output_dir / "dag_chrome_trace.json")])
     if run.outputs.source_replay_report:
-        command.extend(["--source-replay-report", str(run.output_dir / "source_replay_report.json")])
+        source_output = target_plan.parent if target_plan is not None else run.output_dir
+        command.extend(["--source-replay-report", str(source_output / "source_replay_report.json")])
     if run.outputs.structure_report:
         command.extend(["--structure-report", str(run.output_dir / "structure_report.json")])
     if run.outputs.module_summary:

@@ -142,7 +142,7 @@ void insert_cpu_gap_observations(DagGraph & graph, std::span<const TraceEvent> o
 }
 
 std::vector<std::optional<size_t>> insert_cpu_gap_points(DagGraph & graph, std::span<const TraceEvent> observations) {
-    // Callers may select points from graph.events(); insertion can reallocate it.
+    // Callers may select points from graph event storage; insertion can move local events.
     const std::vector<TraceEvent> points(observations.begin(), observations.end());
     std::vector<std::optional<size_t>> result(points.size()), selected(points.size());
     std::vector<bool> ambiguous(points.size(), false);

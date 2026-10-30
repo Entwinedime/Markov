@@ -53,6 +53,9 @@ def build_row(result: ModelRunResult, run_summary: dict[str, Any]) -> dict[str, 
         "workload_id": spec.source.input_id,
         "source_run_id": spec.source.run_id,
         "source_manifest": str(spec.source.manifest_path),
+        "source_replay_report": str(repo_relative_path(run_summary["source_replay_report"]))
+        if run_summary.get("source_replay_report")
+        else None,
         "source_config_id": spec.source.config_id,
         "target_config": spec.target.label,
         "target_hicache": dict(spec.target.fields),

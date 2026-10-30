@@ -504,6 +504,7 @@ def _evaluate(
     rows = []
     source_windows = {}
     source_replays = {}
+    replay_reports = {}
     for directory, prediction, run in predictions:
         key = (prediction["target_config"], prediction["workload_id"])
         source_manifest = prediction["source_manifest"]
@@ -537,8 +538,12 @@ def _evaluate(
                 {"status": "NOT_REQUESTED", "reason": "No target structure profile selected for this cell."},
             )
 
-        source_report_path = model_output / "source_replay_report.json"
-        if directory in experiment_report_directories:
+        source_report_path = (
+            require_repo_path(prediction["source_replay_report"])
+            if prediction.get("source_replay_report")
+            else model_output / "source_replay_report.json"
+        )
+        if directory in experiment_report_directories and source_report_path not in replay_reports:
             source_report = load_json(source_report_path)
             row["source_replay"] = {
                 "status": source_report["status"],
@@ -553,6 +558,9 @@ def _evaluate(
                 "dependency_audit": source_report["dependency_audit"],
                 "dependency_correctness_proven": source_report["dependency_correctness_proven"],
             }
+            replay_reports[source_report_path] = row["source_replay"]
+        if directory in experiment_report_directories:
+            row["source_replay"] = replay_reports[source_report_path]
             source_replays.setdefault(source_manifest, row["source_replay"])
         row["full_e2e"]["measurement_mode"] = "normal_http" if normal_http else "profiled_http"
         write_json(output / "cells" / f"{row['model_run_id']}.json", row)

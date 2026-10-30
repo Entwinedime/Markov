@@ -14,6 +14,8 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
+struct HiCacheSourcePreparation;
+
 /** Replace attributed communication service and its queued CPU tasks.
  * Each rank has an input-ready gate and a service node constrained by every
  * participant's input. Source service durations are never copied. Existing
@@ -28,8 +30,8 @@ namespace markov::trace_graph::modules::hicache::runtime {
  */
 class HiCacheCollectiveServices {
 public:
-    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us,
-              uint64_t end_us);
+    void bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const adapters::sglang::DeviceCollectiveCall> calls,
+              uint64_t begin_us, uint64_t end_us);
     void set_work(const structure::hicache::DeviceCollectivePlan & work);
     /** Null for unrelated nodes. A service reached without admitted target
      * work is an ordering error, not an implicit zero or source fallback. */
@@ -45,8 +47,8 @@ public:
     [[nodiscard]] size_t prepared_callers() const { return caller_segments_.size(); }
 
 private:
-    void bind_callers(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us,
-                      uint64_t end_us);
+    void bind_callers(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const adapters::sglang::DeviceCollectiveCall> calls,
+                      uint64_t begin_us, uint64_t end_us);
 
     std::set<size_t> owned_;
     std::map<size_t, size_t> service_observations_;

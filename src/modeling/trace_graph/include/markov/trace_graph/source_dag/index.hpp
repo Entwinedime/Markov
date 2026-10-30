@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -108,16 +109,8 @@ protected:
 
 private:
     const core::DagGraph & graph_;
-    struct Adjacency {
-        std::vector<size_t> incoming_offsets, incoming_edge_ids;
-        std::vector<size_t> outgoing_offsets, outgoing_edge_ids;
-    };
-    struct CpuIndex {
-        NodeMap nodes;
-        std::unordered_map<std::string, std::vector<uint64_t>, core::TraceArgHash, std::equal_to<>> prefix_end_us;
-    };
-    mutable std::optional<Adjacency> adjacency_;
-    mutable std::optional<CpuIndex> cpu_index_;
+    mutable std::shared_ptr<const core::DagAdjacency> adjacency_;
+    mutable std::shared_ptr<const core::CpuIntervalIndex> cpu_index_;
     mutable std::map<std::pair<int, size_t>, DeviceStreamOrder> device_stream_orders_;
     mutable std::map<std::tuple<int, size_t, std::string, std::string>, std::vector<std::vector<size_t>>> device_submission_anchors_;
 
@@ -129,8 +122,8 @@ private:
     };
     mutable std::map<std::tuple<int, size_t, std::string, std::string>, DeviceSubmissionTimeline> device_submission_timelines_;
 
-    [[nodiscard]] const Adjacency & adjacency() const;
-    [[nodiscard]] const CpuIndex & cpu_index() const;
+    [[nodiscard]] const core::DagAdjacency & adjacency() const;
+    [[nodiscard]] const core::CpuIntervalIndex & cpu_index() const;
     [[nodiscard]] static std::string cpu_lane_key(std::string_view pid, std::string_view tid);
 };
 

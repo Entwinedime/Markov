@@ -224,7 +224,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     graph.set_runtime_observations(std::move(split.runtime_observations));
     graph.set_control_exclusion_intervals(std::move(exclusions));
     graph.set_phase_marker_events(std::move(phase_markers));
-    graph.reserve(DagGraphCapacity{ .nodes = graph.events().size(), .edges = 0 });
+    graph.reserve(DagGraphCapacity{ .nodes = graph.event_count(), .edges = 0 });
 
     auto index = create_node_index(graph);
     graph.reserve(DagGraphCapacity{ .nodes = graph.node_count(), .edges = estimate_edge_capacity(graph, index) });

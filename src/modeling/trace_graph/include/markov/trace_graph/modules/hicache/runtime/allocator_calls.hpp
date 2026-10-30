@@ -19,6 +19,8 @@ class OperatorCostProvider;
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
+struct HiCacheSourcePreparation;
+
 /** Replace the inner allocator, not its outer capacity guard or
  * request-index update. State admission supplies target work after eviction;
  * the inner entry executes that work with independently estimated costs. */
@@ -26,9 +28,8 @@ class HiCacheAllocatorCalls {
 public:
     HiCacheAllocatorCalls(HiCacheWriteStreamInsertions & insertions, cost::OperatorCostProvider & provider) : insertions_(insertions), provider_(provider) {}
 
-    void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const model::HiCacheReplayFact> facts,
-              const structure::hicache::SchedulerComputeResources & resources, const adapters::sglang::AllocatorPreparationObservation & preparation,
-              uint64_t begin_us, uint64_t end_us);
+    void bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const model::HiCacheReplayFact> facts,
+              const structure::hicache::SchedulerComputeResources & resources, uint64_t begin_us, uint64_t end_us);
     void rebind_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers);
     void set_work(const model::HiCacheAllocatorWorkItem & work, const adapters::sglang::AllocatorPreparation & preparation);
     void advance(core::DagGraph & graph, size_t node, simulation::FutureDag & future);

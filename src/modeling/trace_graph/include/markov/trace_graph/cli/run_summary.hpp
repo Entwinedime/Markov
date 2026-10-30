@@ -20,6 +20,6 @@ namespace markov::trace_graph::cli {
 void write_run_summary(const std::string & filename, const core::DagGraph & graph, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
                        const nlohmann::json & source_io_observations, const modules::hicache::HiCachePhaseObservationAudit & source_phase_observations,
                        const nlohmann::json & client_result, const modules::hicache::runtime::HiCacheWindowResult * execution, bool include_source_observations,
-                       const nlohmann::json & performance);
+                       const nlohmann::json & performance, const std::string & source_replay_report);
 
 } // namespace markov::trace_graph::cli

@@ -41,7 +41,7 @@ public:
     }
 
     [[nodiscard]] DagBuildIndex run() {
-        for (const auto event_index : std::views::iota(size_t{ 0 }, graph_.events().size())) add_event(event_index);
+        for (const auto event_index : std::views::iota(size_t{ 0 }, graph_.event_count())) add_event(event_index);
         return std::move(index_);
     }
 

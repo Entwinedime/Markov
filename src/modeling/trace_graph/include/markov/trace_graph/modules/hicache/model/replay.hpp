@@ -2,10 +2,12 @@
 #include "markov/trace_graph/modules/hicache/model/input.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "modules/hicache/model/source_input.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -28,7 +30,7 @@ public:
     // Numerical models and their construction remain outside replay rules.
     HiCacheModelReplay(const core::DagGraph & graph, const frontend::HiCacheRules & config, structure::hicache::IoCompletionProvider completion,
                        uint64_t storage_batch_pages, frontend::HiCacheIoResourceLanesConfig resource_lanes, bool execution_prefetch_control,
-                       const HiCacheFactClock & projected_clock = {});
+                       const HiCacheFactClock & projected_clock = {}, std::shared_ptr<const HiCacheSourceInput> source_input = {});
     [[nodiscard]] const std::vector<HiCacheReplayFact> & facts() const { return facts_; }
     /** Formal identity lookup; borrowed until preparation changes the fact list. */
     [[nodiscard]] const HiCacheReplayFact & fact(size_t id) const { return facts_.at(fact_positions_.at(id)); }
@@ -37,7 +39,7 @@ public:
      * formal fact executes. Missing decode observations are not zero work;
      * source rounds identify opportunities, not target page-allocation outcomes.
      */
-    void prepare_decode_allocations(const core::DagGraph & source_graph, uint64_t begin_us, uint64_t end_us);
+    void prepare_decode_allocations();
     void apply(size_t fact_id, uint64_t timestamp_us, std::optional<size_t> execution_node = std::nullopt,
                HiCacheLifecycleExecution lifecycle = HiCacheLifecycleExecution::Immediate);
     /** Continue a lookup at its registered admission boundary. Loading
@@ -56,7 +58,7 @@ public:
     /** Immutable request/round observations. Detailed operator calls belong
      * to source_dag, not the cache state replay. Borrowed until replay ends.
      */
-    [[nodiscard]] const HiCachePhaseObservationAudit & source_phases() const { return source_phases_; }
+    [[nodiscard]] const HiCachePhaseObservationAudit & source_phases() const { return source_input_->phases; }
     /** Index into source_phases().observations for an admitted request/rank.
      * Missing or ambiguous identities remain input blockers; no nearest match.
      */
@@ -68,7 +70,7 @@ public:
 private:
     HiCacheReplayFact & continue_lifecycle(size_t fact_id, uint64_t timestamp_us, size_t execution_node);
     HiCacheState state_;
-    HiCachePhaseObservationAudit source_phases_;
+    std::shared_ptr<const HiCacheSourceInput> source_input_;
     std::map<std::pair<std::string, std::string>, size_t> source_phase_positions_;
     HiCacheModelResult result_;
     std::vector<HiCacheReplayFact> facts_;

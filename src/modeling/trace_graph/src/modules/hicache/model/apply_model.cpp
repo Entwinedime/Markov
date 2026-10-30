@@ -52,7 +52,7 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
             continue;
         }
 
-        const auto & source = source_phases_.observations[source_position->second];
+        const auto & source = source_input_->phases.observations[source_position->second];
         prefill.logical_input = source.logical_input;
         prefill.common_kernel_nodes = source.prefill_common_kernel_node_ids;
         prefill.prefix_attention_nodes = source.prefill_prefix_attention_node_ids;
@@ -74,7 +74,8 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
         work.decodes.push_back(std::move(decode));
     }
 
-    work.prefill_status = source_phases_.ready() && work.prefills.size() == source_phases_.observations.size() && work.blockers.empty() ? "ready" : "not_ready";
+    work.prefill_status =
+        source_input_->phases.ready() && work.prefills.size() == source_input_->phases.observations.size() && work.blockers.empty() ? "ready" : "not_ready";
     work.decode_status = work.decodes.size() == work.prefills.size() && work.blockers.empty() ? "ready" : "not_ready";
     work.status = work.prefill_status == "ready" && work.decode_status == "ready" ? "ready" : "not_ready";
     return work;

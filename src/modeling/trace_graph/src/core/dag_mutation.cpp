@@ -6,10 +6,13 @@
 
 #include "markov/trace_graph/core/dag_mutation_internal.hpp"
 
+#include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::core {
 
@@ -28,10 +31,10 @@ public:
         result_.journal.component = plan.component;
         result_.journal.active_nodes_before = graph.active_node_count();
         result_.journal.active_edges_before = graph.active_edge_count();
-        active_effect_edges_.reserve(graph.edge_count() + plan.redirect_edges.size() + plan.add_edges.size());
-        for (const auto & edge : graph.edges()) {
-            if (edge.active) increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
-        }
+        initial_edges_ = graph.edge_count();
+        initial_nodes_ = graph.node_count();
+        if (!plan.add_edges.empty() || !plan.redirect_edges.empty() || !plan.disable_nodes.empty()) adjacency_ = graph.adjacency();
+        active_effect_edges_.reserve(plan.redirect_edges.size() + plan.add_edges.size());
     }
 
     [[nodiscard]] DagMutationResult run() {
@@ -52,16 +55,22 @@ private:
     void disable_tracked_edge(size_t edge_index) {
         const auto & edge = graph_.edge(edge_index);
         if (!edge.active) return;
-        decrement_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
+        if (edge_index >= initial_edges_) decrement_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
         graph_.disable_edge(edge_index);
     }
 
     [[nodiscard]] std::optional<size_t> add_tracked_edge(size_t src, size_t dst, DagEdgeKind kind, const std::string & effect_id, const std::string & reason) {
         const auto key = effect_edge_key(src, dst, kind, effect_id);
         if (active_effect_edges_.contains(key)) return std::nullopt;
+        if (src < initial_nodes_)
+            for (const auto id : adjacency_->outgoing(src)) {
+                const auto & existing = graph_.edge(id);
+                if (existing.active && existing.dst == dst && existing.kind == kind && existing.effect_id() == effect_id) return std::nullopt;
+            }
 
         const auto edge_index = graph_.add_edge(src, dst, kind, effect_id, reason);
         increment_effect_edge(active_effect_edges_, src, dst, kind, effect_id);
+        added_edge_ids_.push_back(edge_index);
         return edge_index;
     }
 
@@ -162,15 +171,27 @@ private:
     }
 
     void disable_nodes_and_incident_edges() {
-        for (const auto node_id : plan_.disable_nodes) disable_node(node_id);
         if (plan_.disable_nodes.empty()) return;
-        for (size_t edge_index = 0; edge_index < graph_.edge_count(); ++edge_index) disable_incident_edge(edge_index);
+        std::vector<size_t> incident;
+        for (const auto node : plan_.disable_nodes) {
+            const auto incoming = adjacency_->incoming(node), outgoing = adjacency_->outgoing(node);
+            incident.insert(incident.end(), incoming.begin(), incoming.end());
+            incident.insert(incident.end(), outgoing.begin(), outgoing.end());
+            disable_node(node);
+        }
+        for (const auto id : added_edge_ids_) {
+            const auto & edge = graph_.edge(id);
+            if (!graph_.node(edge.src).active || !graph_.node(edge.dst).active) incident.push_back(id);
+        }
+        std::ranges::sort(incident);
+        incident.erase(std::unique(incident.begin(), incident.end()), incident.end());
+        for (const auto id : incident) disable_incident_edge(id);
     }
 
     void disable_node(size_t node_id) {
         auto & node = graph_.mutable_node(node_id);
         if (!node.active) return;
-        node.active = false;
+        graph_.disable_node(node_id);
         result_.journal.records.push_back(DagMutationRecord{
             .action = DagMutationAction::DisableNode,
             .effect_id = {},
@@ -214,6 +235,9 @@ private:
     const DagMutationPlan & plan_;
     DagMutationResult result_;
     EffectEdgeCounts active_effect_edges_;
+    std::shared_ptr<const DagAdjacency> adjacency_;
+    std::vector<size_t> added_edge_ids_;
+    size_t initial_edges_ = 0, initial_nodes_ = 0;
 };
 
 DagMutationResult empty_mutation_result(const DagGraph & graph, const DagMutationPlan & plan) {
@@ -258,10 +282,14 @@ DagMutationResult apply_dag_mutation_plan(DagGraph & graph, const DagMutationPla
 #endif
         return result;
     }
-    const auto prospective = validate_dag_mutation_plan(graph, plan);
+    const auto prepared = dag_mutation_detail::prepare_dag_mutation(graph, plan);
+    const auto & prospective = prepared.topology;
     if (!prospective.ok()) throw DagMutationValidationError("invalid DAG mutation plan: " + failure_message(prospective), prospective);
 
     auto result = DagMutationApplier(graph, plan).run();
+    if (result.journal.active_nodes_after != prospective.active_node_count || result.journal.active_edges_after != prospective.active_edge_count)
+        throw std::logic_error("DAG mutation application differs from its validated node/edge counts");
+    graph.topological_order_ = prepared.order;
     result.prospective_active_node_count = prospective.active_node_count;
     result.prospective_active_edge_count = prospective.active_edge_count;
 #ifdef DEBUG

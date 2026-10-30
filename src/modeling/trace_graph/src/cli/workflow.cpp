@@ -25,6 +25,7 @@
 
 #include "markov/trace_graph/cli/debug_support.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 #include "markov/trace_graph/io/cpu_service_input.hpp"
@@ -101,7 +102,7 @@ void write_graph_output(const CliOptions & options, const DagGraph & graph) {
 
 } // namespace
 
-PreparedSource prepare_source(const CliOptions & options, bool include_preparation) {
+PreparedSource prepare_source(const CliOptions & options, bool include_preparation, bool prepare_execution) {
     core::ExecutionMetrics metrics;
     const auto client_input = options.trace_input.include_python_probe && (!options.source_observations_only || include_preparation)
                                   ? io::load_client_requests_from_manifest(options.profile_manifest, include_preparation)
@@ -118,7 +119,7 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
     auto graph = source_dag::build(std::move(inputs), trace_input.threads);
     metrics.checkpoint("source_dag_build_and_merge");
 
-    const auto source_execution_event_count = graph.events().size();
+    const auto source_execution_event_count = graph.event_count();
     // Request availability belongs to the observed source as well as target
     // execution. Bind once; the experimental replay must precede cost views
     // and any mutation, including optional NodeScale.
@@ -128,10 +129,10 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
             : core::ClientRequestChain{ client_input.status, {} };
     metrics.checkpoint("client_chain_binding");
 
-    nlohmann::json replay;
     if (!options.outputs.source_replay_report.empty()) {
-        replay = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
+        auto replay = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
         replay["event_coverage"]["input_selection"] = source_input_selection;
+        write_json_file(options.outputs.source_replay_report, replay);
     }
     metrics.checkpoint("optional_source_replay");
 
@@ -144,11 +145,27 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
     if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
 #endif
 
+    graph.share_source_events();
     metrics.checkpoint("cpu_correction_load");
+    if (prepare_execution) {
+        (void)graph.adjacency();
+        (void)graph.cpu_intervals();
+        (void)core::validate_active_dag(graph);
+    }
+    auto migration = prepare_execution ? std::make_unique<const DagGraph>(graph) : nullptr;
+    metrics.checkpoint("source_indexes_and_immutable_view");
+    std::unique_ptr<const modules::hicache::runtime::HiCacheSourcePreparation> hicache;
+    if (prepare_execution) {
+        const auto begin = client_input.requests.empty() ? 0 : client_input.requests.front().start_us;
+        const auto end = client_input.requests.empty() ? 0 : client_input.requests.back().end_us;
+        hicache = std::make_unique<const modules::hicache::runtime::HiCacheSourcePreparation>(*migration, begin, end);
+    }
+    metrics.checkpoint("source_execution_observations");
     auto performance = metrics.report();
     performance["stored_nodes"] = graph.node_count();
     performance["stored_edges"] = graph.edge_count();
-    return { std::move(graph), client_input, client_chain, std::move(replay), {}, std::move(performance) };
+    return { std::move(graph),     client_input,       client_chain,          options.outputs.source_replay_report,
+             std::move(migration), std::move(hicache), std::move(performance) };
 }
 
 int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource & source, core::Logger & logger) {
@@ -162,7 +179,6 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
                                                                 { "formal_request_count", client_input.requests.size() - client_input.formal_begin_index },
                                                                 { "observed_request_start_us", client_input.requests.front().start_us },
                                                                 { "scope", "Structure includes the declared preparation prefix; HTTP measurement excludes it." } };
-    if (!options.outputs.source_replay_report.empty()) write_json_file(options.outputs.source_replay_report, source.replay_report);
 
     if (options.source_observations_only) {
         const auto phases = modules::hicache::observe_hicache_phases(graph);
@@ -227,17 +243,8 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
     // Keep the same anchors throughout modeling, execution and HTTP reporting.
     const auto begin = client_input.status == "ready" ? client_input.requests.front().start_us : 0;
     const auto end = client_input.status == "ready" ? client_input.requests.back().end_us : 0;
-    // A transformation gets one independent working graph. Preserve source
-    // topology, observation coordinates and measured costs for migration; no
-    // target module can overwrite them. Shared trace buffers remain shared.
-    // Plain build/replay has no target mutation and needs no duplicate graph.
-    // Keep both large graphs with the caller: fork workers reclaim them at _exit
-    // without dirtying inherited allocator pages just to free individual events.
-    auto & source_graph = source.migration_graph;
-    if (modules.uses_hicache_execution() || !modules.modules().empty()) source_graph = std::make_unique<const DagGraph>(graph);
-    metrics.checkpoint("migration_graph_copy");
     try {
-        modules.apply(graph, source_graph ? *source_graph : graph, logger, client_chain, begin, end);
+        modules.apply(graph, source.hicache.get(), logger, client_chain, begin, end);
     }
     catch (const structure::MissingWork & error) {
         if (!options.outputs.run_summary.empty())
@@ -287,7 +294,8 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
                       client_result,
                       execution,
                       include_source_observations,
-                      performance);
+                      performance,
+                      source.replay_report_path);
     if (!options.outputs.structure_report.empty()) {
         if (!execution) throw std::invalid_argument("Executed structure report requires HiCache execution prediction");
         auto structure =
@@ -314,7 +322,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     auto modules = ModulePipeline::from_config(options.model_config, packages);
 #endif
     const bool include_preparation = modules.uses_hicache_execution() || (options.source_observations_only && !options.outputs.structure_report.empty());
-    auto source = prepare_source(options, include_preparation);
+    auto source = prepare_source(options, include_preparation, modules.uses_hicache_execution());
     if (!options.prepare_cpu_service.empty()) {
         if (source.client_input.status != "ready") throw std::runtime_error("CPU service preparation needs complete client requests");
         if (source.client_chain.status != "connected") throw std::runtime_error("CPU service preparation could not bind the client chain");

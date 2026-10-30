@@ -7,6 +7,7 @@
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/structure/ascend_event.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
+#include "modules/hicache/runtime/source_preparation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,8 +19,9 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::DeviceCollectiveCall> calls,
-                                     uint64_t begin_us, uint64_t end_us) {
+void HiCacheCollectiveServices::bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared,
+                                     std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us, uint64_t end_us) {
+    const auto & original = prepared.index.graph();
     using Ref = core::DagNodeRef;
     using Kind = core::DagEdgeKind;
     core::DagMutationPlan plan{ .component = "phase_device_collective" };
@@ -37,8 +39,8 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGrap
         std::optional<size_t> device;
     };
     std::map<size_t, WorkerReplacement> worker_replacements;
-    const adapters::sglang::HiCacheSourceIndex source(original);
-    const auto queues = simulation::detail::discover_cpu_task_queues(original);
+    const auto & source = prepared.index;
+    const auto & queues = prepared.queues;
     for (const auto & call : calls) {
         const auto & event = original.runtime_observations().at(call.region.observation);
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
@@ -249,7 +251,7 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const core::DagGrap
             worker_segments_.emplace(mutation.synthetic_node_ids.at(replacement.returned.synthetic_id),
                                      WorkerSegment{ replacement.observation, replacement.kind, WorkerSegment::Part::Return });
     }
-    bind_callers(graph, original, calls, begin_us, end_us);
+    bind_callers(graph, prepared, calls, begin_us, end_us);
 }
 
 void HiCacheCollectiveServices::set_work(const structure::hicache::DeviceCollectivePlan & plan) {

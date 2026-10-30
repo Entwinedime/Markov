@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include "core/dag_index.hpp"
 #include "markov/trace_graph/core/cpu_service_cost.hpp"
 #include "markov/trace_graph/core/trace_event.hpp"
 
@@ -204,6 +205,10 @@ struct DagGraphCapacity {
     size_t edges = 0;
 };
 
+struct DagMutationPlan;
+struct DagMutationResult;
+struct DagTopologyValidationReport;
+
 /**
  * @brief Owns normalized events, compact nodes, hard edges, and simulation state.
  *
@@ -212,6 +217,12 @@ struct DagGraphCapacity {
  * meaning. Node and edge indices stay stable; removals use tombstones.
  */
 class DagGraph {
+    struct ObservedTables {
+        std::vector<TraceEvent> hicache_fact_events, runtime_observations, context_events, prelude_context_events, tail_context_events;
+        std::vector<DagControlExclusionInterval> control_exclusion_intervals;
+        std::vector<DagPhaseMarkerEvent> phase_marker_events;
+    };
+
 public:
     explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0);
 
@@ -234,12 +245,16 @@ public:
 
     /** @brief Tombstones an edge without changing stable edge indices. */
     void disable_edge(size_t edge_index);
+    void disable_node(size_t node_id);
 
-    /** @brief Returns a read-only view of normalized and synthetic events. */
-    [[nodiscard]] const std::vector<TraceEvent> & events() const { return events_; }
+    /** Keep original events shared; target annotations and generated events remain private. */
+    void share_source_events();
+    size_t event_count() const { return (source_events_ ? source_events_->size() : 0) + events_.size(); }
+    void reserve_events(size_t capacity);
 
-    /** @brief Returns mutable events for normalizers and explicit module boundaries. */
-    std::vector<TraceEvent> & mutable_events() { return events_; }
+    std::shared_ptr<const DagAdjacency> adjacency() const;
+    std::shared_ptr<const CpuIntervalIndex> cpu_intervals() const;
+    std::shared_ptr<const DagTopologicalOrder> topological_order() const { return topological_order_; }
 
     /** @brief Returns the stable node array. */
     [[nodiscard]] const std::vector<DagNode> & nodes() const { return nodes_; }
@@ -350,44 +365,46 @@ public:
     [[nodiscard]] bool has_input_contract(std::string_view contract) const;
 
     /** @brief Replaces in-window HiCache facts excluded from executable DAG topology. */
-    void set_hicache_fact_events(std::vector<TraceEvent> events) { hicache_fact_events_ = std::move(events); }
+    void set_hicache_fact_events(std::vector<TraceEvent> events) { own_observations().hicache_fact_events = std::move(events); }
 
     /** @brief Returns in-window HiCache facts retained for semantic modules only. */
-    [[nodiscard]] const std::vector<TraceEvent> & hicache_fact_events() const { return hicache_fact_events_; }
+    [[nodiscard]] const std::vector<TraceEvent> & hicache_fact_events() const { return observations_->hicache_fact_events; }
 
     /** Runtime preparation envelopes explain existing costs; never execution nodes. */
-    void set_runtime_observations(std::vector<TraceEvent> events) { runtime_observations_ = std::move(events); }
-    [[nodiscard]] const std::vector<TraceEvent> & runtime_observations() const { return runtime_observations_; }
+    void set_runtime_observations(std::vector<TraceEvent> events) { own_observations().runtime_observations = std::move(events); }
+    [[nodiscard]] const std::vector<TraceEvent> & runtime_observations() const { return observations_->runtime_observations; }
 
     /** @brief Replaces non-DAG side-table events retained from outside the timing window. */
-    void set_context_events(std::vector<TraceEvent> events) { context_events_ = std::move(events); }
+    void set_context_events(std::vector<TraceEvent> events) { own_observations().context_events = std::move(events); }
 
     /** @brief Returns non-DAG side-table events available to semantic modules. */
-    [[nodiscard]] const std::vector<TraceEvent> & context_events() const { return context_events_; }
+    [[nodiscard]] const std::vector<TraceEvent> & context_events() const { return observations_->context_events; }
 
     /** @brief Replaces pre-window semantic facts used only to reconstruct model state. */
-    void set_prelude_context_events(std::vector<TraceEvent> events) { prelude_context_events_ = std::move(events); }
+    void set_prelude_context_events(std::vector<TraceEvent> events) { own_observations().prelude_context_events = std::move(events); }
 
     /** @brief Returns pre-window semantic facts excluded from topology and simulation. */
-    [[nodiscard]] const std::vector<TraceEvent> & prelude_context_events() const { return prelude_context_events_; }
+    [[nodiscard]] const std::vector<TraceEvent> & prelude_context_events() const { return observations_->prelude_context_events; }
 
     /** @brief Replaces post-window facts used only to prove causal-tail closure. */
-    void set_tail_context_events(std::vector<TraceEvent> events) { tail_context_events_ = std::move(events); }
+    void set_tail_context_events(std::vector<TraceEvent> events) { own_observations().tail_context_events = std::move(events); }
 
     /** @brief Returns post-window facts excluded from topology and E2E simulation. */
-    [[nodiscard]] const std::vector<TraceEvent> & tail_context_events() const { return tail_context_events_; }
+    [[nodiscard]] const std::vector<TraceEvent> & tail_context_events() const { return observations_->tail_context_events; }
 
     /** @brief Replaces source-derived intervals contracted by control-only replay. */
-    void set_control_exclusion_intervals(std::vector<DagControlExclusionInterval> intervals) { control_exclusion_intervals_ = std::move(intervals); }
+    void set_control_exclusion_intervals(std::vector<DagControlExclusionInterval> intervals) {
+        own_observations().control_exclusion_intervals = std::move(intervals);
+    }
 
     /** @brief Returns source-only timing intervals excluded from the control metric. */
-    [[nodiscard]] const std::vector<DagControlExclusionInterval> & control_exclusion_intervals() const { return control_exclusion_intervals_; }
+    [[nodiscard]] const std::vector<DagControlExclusionInterval> & control_exclusion_intervals() const { return observations_->control_exclusion_intervals; }
 
     /** @brief Replaces source Torch phase markers removed by CPU-leaf normalization. */
-    void set_phase_marker_events(std::vector<DagPhaseMarkerEvent> events) { phase_marker_events_ = std::move(events); }
+    void set_phase_marker_events(std::vector<DagPhaseMarkerEvent> events) { own_observations().phase_marker_events = std::move(events); }
 
     /** @brief Returns semantic phase markers retained independently of executable leaves. */
-    [[nodiscard]] const std::vector<DagPhaseMarkerEvent> & phase_marker_events() const { return phase_marker_events_; }
+    [[nodiscard]] const std::vector<DagPhaseMarkerEvent> & phase_marker_events() const { return observations_->phase_marker_events; }
 
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
@@ -465,24 +482,24 @@ private:
     /** @brief Small manifest-level contract set; never stores event or fact rows. */
     std::vector<std::string> input_contracts_;
 
-    /** @brief In-window semantic probe facts excluded from topology and E2E simulation. */
-    std::vector<TraceEvent> hicache_fact_events_;
-    std::vector<TraceEvent> runtime_observations_;
+    std::shared_ptr<ObservedTables> observations_ = std::make_shared<ObservedTables>();
+    ObservedTables & own_observations();
+    void materialize_events();
+    void invalidate_topology();
+    struct ActiveCounts {
+        size_t nodes, edges;
+    };
+    const ActiveCounts & active_counts() const;
 
-    /** @brief Side-table definitions excluded from DAG topology and E2E simulation. */
-    std::vector<TraceEvent> context_events_;
+    std::shared_ptr<const std::vector<TraceEvent>> source_events_;
+    std::unordered_map<size_t, TraceEvent> event_overrides_;
+    mutable std::shared_ptr<const DagAdjacency> adjacency_;
+    mutable std::shared_ptr<const CpuIntervalIndex> cpu_intervals_;
+    mutable std::shared_ptr<const DagTopologicalOrder> topological_order_;
+    mutable std::optional<ActiveCounts> active_counts_;
+    friend DagMutationResult apply_dag_mutation_plan(DagGraph &, const DagMutationPlan &);
+    friend DagTopologyValidationReport validate_active_dag(const DagGraph &);
 
-    /** @brief Pre-window semantic facts excluded from DAG topology and patch opportunities. */
-    std::vector<TraceEvent> prelude_context_events_;
-
-    /** @brief Post-window causal closure facts excluded from DAG topology and simulation. */
-    std::vector<TraceEvent> tail_context_events_;
-
-    /** @brief Absolute source intervals contracted only by control-only replay. */
-    std::vector<DagControlExclusionInterval> control_exclusion_intervals_;
-
-    /** @brief Small source phase side table retained after nested CPU parents are removed. */
-    std::vector<DagPhaseMarkerEvent> phase_marker_events_;
     CpuServiceCost cpu_service_cost_;
     std::unordered_map<size_t, CpuGapRanges> retained_cpu_gap_ranges_;
 };

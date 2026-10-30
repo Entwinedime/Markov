@@ -16,6 +16,8 @@ namespace markov::trace_graph::modules::hicache::runtime {
 /** Executed-node accounting, not critical-path or HTTP time. Delays remain
  * separate from node duration; worker duration may include modeled residual.
  */
+struct HiCacheSourcePreparation;
+
 struct ExecutedCostTotals {
     size_t nodes = 0;
     double node_duration_us = 0;
@@ -72,8 +74,9 @@ struct HiCacheWindowResult {
  * it must be pure and change duration only, never topology or another node's
  * cost. It may also be queried to compare a later binding to executed work.
  */
-[[nodiscard]] HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::DagGraph & source_graph, const frontend::HiCacheConfig & config,
-                                                         std::string_view source_policy, const core::ClientRequestChain & chain, uint64_t begin_us,
-                                                         uint64_t end_us, const simulation::NodeCostAtStart & final_cost_transform = {});
+[[nodiscard]] HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const HiCacheSourcePreparation & prepared,
+                                                         const frontend::HiCacheConfig & config, std::string_view source_policy,
+                                                         const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us,
+                                                         const simulation::NodeCostAtStart & final_cost_transform = {});
 
 } // namespace markov::trace_graph::modules::hicache::runtime

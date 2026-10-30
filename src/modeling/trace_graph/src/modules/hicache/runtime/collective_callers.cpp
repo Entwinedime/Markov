@@ -5,6 +5,7 @@
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/collective_services.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
+#include "modules/hicache/runtime/source_preparation.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -12,8 +13,9 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const core::DagGraph & original,
+void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCacheSourcePreparation & prepared,
                                              std::span<const adapters::sglang::DeviceCollectiveCall> calls, uint64_t begin_us, uint64_t end_us) {
+    const auto & original = prepared.index.graph();
     using Ref = core::DagNodeRef;
     using Kind = core::DagEdgeKind;
     struct Selected {
@@ -22,8 +24,8 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const core:
     };
     std::vector<Selected> selected;
     std::vector<core::TraceEvent> points;
-    const adapters::sglang::HiCacheSourceIndex original_index(original);
-    const auto queues = simulation::detail::discover_cpu_task_queues(original);
+    const auto & original_index = prepared.index;
+    const auto & queues = prepared.queues;
     for (const auto & call : calls) {
         const auto & event = original.runtime_observations().at(call.region.observation);
         const auto end = core::checked_add_u64(event.ts, event.dur, "Collective caller end overflow");

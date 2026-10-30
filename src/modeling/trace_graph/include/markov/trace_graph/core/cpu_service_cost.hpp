@@ -6,6 +6,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -24,7 +25,7 @@ public:
 
     void add(Lane lane, Span span) {
         if (span.end_us <= span.begin_us) throw std::invalid_argument("CPU service span is empty");
-        auto & spans = lanes_[std::move(lane)];
+        auto & spans = own_lanes()[std::move(lane)];
         const auto at = std::lower_bound(spans.begin(), spans.end(), span.begin_us, [](const Span & s, uint64_t begin) { return s.begin_us < begin; });
         if ((at != spans.end() && at->begin_us < span.end_us) || (at != spans.begin() && std::prev(at)->end_us > span.begin_us))
             throw std::invalid_argument("CPU service spans overlap");
@@ -36,24 +37,26 @@ public:
      * sorting changes insertion order only, never coordinates or costs. */
     void add_spans(Lane lane, std::vector<Span> spans) {
         const auto by_begin = [](const Span & left, const Span & right) { return left.begin_us < right.begin_us; };
-        std::ranges::sort(spans, by_begin);
-
-        auto & current = lanes_[std::move(lane)];
-        std::vector<Span> merged;
-        merged.reserve(current.size() + spans.size());
-        std::merge(current.begin(), current.end(), spans.begin(), spans.end(), std::back_inserter(merged), by_begin);
-
-        for (size_t index = 0; index < merged.size(); ++index) {
-            if (merged[index].end_us <= merged[index].begin_us) throw std::invalid_argument("CPU service span is empty");
-            if (index && merged[index - 1].end_us > merged[index].begin_us) throw std::invalid_argument("CPU service spans overlap");
+        if (!std::ranges::is_sorted(spans, by_begin)) std::ranges::sort(spans, by_begin);
+        auto & current = own_lanes()[std::move(lane)];
+        if (!current.empty()) {
+            std::vector<Span> merged;
+            merged.reserve(current.size() + spans.size());
+            std::merge(current.begin(), current.end(), spans.begin(), spans.end(), std::back_inserter(merged), by_begin);
+            spans = std::move(merged);
         }
-        current = std::move(merged);
+
+        for (size_t index = 0; index < spans.size(); ++index) {
+            if (spans[index].end_us <= spans[index].begin_us) throw std::invalid_argument("CPU service span is empty");
+            if (index && spans[index - 1].end_us > spans[index].begin_us) throw std::invalid_argument("CPU service spans overlap");
+        }
+        current = std::move(spans);
     }
 
     [[nodiscard]] uint64_t duration(const Lane & lane, uint64_t begin, uint64_t end) const {
         if (end < begin) throw std::invalid_argument("CPU service interval is reversed");
-        const auto found = lanes_.find(lane);
-        if (found == lanes_.end()) return end - begin;
+        const auto found = lanes_->find(lane);
+        if (found == lanes_->end()) return end - begin;
         const auto & spans = found->second;
         auto at = std::lower_bound(spans.begin(), spans.end(), begin, [](const Span & s, uint64_t value) { return s.end_us <= value; });
         __int128 result = end - begin;
@@ -66,11 +69,16 @@ public:
         return static_cast<uint64_t>(result);
     }
 
-    [[nodiscard]] bool empty() const { return lanes_.empty(); }
-    [[nodiscard]] const auto & lanes() const { return lanes_; }
+    [[nodiscard]] bool empty() const { return lanes_->empty(); }
+    [[nodiscard]] const auto & lanes() const { return *lanes_; }
 
 private:
-    std::map<Lane, std::vector<Span>> lanes_;
+    using Lanes = std::map<Lane, std::vector<Span>>;
+    Lanes & own_lanes() {
+        if (!lanes_.unique()) lanes_ = std::make_shared<Lanes>(*lanes_);
+        return *lanes_;
+    }
+    std::shared_ptr<Lanes> lanes_ = std::make_shared<Lanes>();
 };
 
 } // namespace markov::trace_graph::core

@@ -21,74 +21,14 @@ uint64_t saturated_add(uint64_t start, uint64_t duration) {
 
 SourceDagIndex::SourceDagIndex(const core::DagGraph & graph) : graph_(graph) {}
 
-const SourceDagIndex::Adjacency & SourceDagIndex::adjacency() const {
-    if (adjacency_) return *adjacency_;
-
-    Adjacency index;
-    index.incoming_offsets.assign(graph_.node_count() + 1, 0);
-    index.outgoing_offsets.assign(graph_.node_count() + 1, 0);
-
-    for (const auto & edge : graph_.edges()) {
-        if (!edge.active) continue;
-        if (edge.src >= graph_.node_count() || edge.dst >= graph_.node_count())
-            throw std::logic_error("Source DAG index found an edge with an invalid endpoint");
-        if (!graph_.node(edge.src).active || !graph_.node(edge.dst).active)
-            throw std::logic_error("Source DAG index found an active edge attached to an inactive node");
-        ++index.outgoing_offsets[edge.src + 1];
-        ++index.incoming_offsets[edge.dst + 1];
-    }
-    for (size_t node_id = 0; node_id < graph_.node_count(); ++node_id) {
-        index.outgoing_offsets[node_id + 1] += index.outgoing_offsets[node_id];
-        index.incoming_offsets[node_id + 1] += index.incoming_offsets[node_id];
-    }
-    index.outgoing_edge_ids.resize(index.outgoing_offsets.back());
-    index.incoming_edge_ids.resize(index.incoming_offsets.back());
-    auto outgoing_cursor = index.outgoing_offsets;
-    auto incoming_cursor = index.incoming_offsets;
-    for (size_t edge_index = 0; edge_index < graph_.edge_count(); ++edge_index) {
-        const auto & edge = graph_.edge(edge_index);
-        if (!edge.active) continue;
-        index.outgoing_edge_ids[outgoing_cursor[edge.src]++] = edge_index;
-        index.incoming_edge_ids[incoming_cursor[edge.dst]++] = edge_index;
-    }
-
-    return adjacency_.emplace(std::move(index));
+const core::DagAdjacency & SourceDagIndex::adjacency() const {
+    if (!adjacency_) adjacency_ = graph_.adjacency();
+    return *adjacency_;
 }
 
-const SourceDagIndex::CpuIndex & SourceDagIndex::cpu_index() const {
-    if (cpu_index_) return *cpu_index_;
-
-    CpuIndex index;
-    for (const auto & node : graph_.nodes()) {
-        if (!node.active || !node.is_cpu) continue;
-
-        const auto & event = graph_.event_for_node(node.id);
-        index.nodes[cpu_lane_key(event.pid, event.tid)].push_back(node.id);
-    }
-
-    for (auto & [lane_key, nodes] : index.nodes) {
-        // Sort compact coordinates instead of repeatedly visiting large trace
-        // storage. Entry points still precede nonempty leaves at the same tick.
-        std::vector<std::tuple<uint64_t, bool, size_t>> order;
-        order.reserve(nodes.size());
-        for (const auto id : nodes) {
-            const auto & event = graph_.event_for_node(id);
-            order.emplace_back(event.ts, event.dur != 0, id);
-        }
-        std::ranges::sort(order);
-        for (size_t i = 0; i < nodes.size(); ++i) nodes[i] = std::get<2>(order[i]);
-
-        auto & prefix_ends = index.prefix_end_us[lane_key];
-        prefix_ends.reserve(nodes.size());
-        uint64_t frontier_end = 0;
-        for (size_t node_id : nodes) {
-            const auto & event = graph_.event_for_node(node_id);
-            frontier_end = std::max(frontier_end, index_detail::saturated_add(event.ts, event.dur));
-            prefix_ends.push_back(frontier_end);
-        }
-    }
-
-    return cpu_index_.emplace(std::move(index));
+const core::CpuIntervalIndex & SourceDagIndex::cpu_index() const {
+    if (!cpu_index_) cpu_index_ = graph_.cpu_intervals();
+    return *cpu_index_;
 }
 
 std::span<const size_t> SourceDagIndex::incoming_edge_ids(size_t node_id) const {
@@ -126,7 +66,7 @@ std::span<const size_t> SourceDagIndex::cpu_interval_candidates(std::string_view
     return nodes.subspan(first, last - first);
 }
 
-std::string SourceDagIndex::cpu_lane_key(std::string_view pid, std::string_view tid) { return std::string(pid) + "\x1f" + std::string(tid); }
+std::string SourceDagIndex::cpu_lane_key(std::string_view pid, std::string_view tid) { return core::CpuIntervalIndex::lane_key(pid, tid); }
 
 std::optional<size_t> SourceDagIndex::cpu_node_starting_at(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const {
     const auto nodes = cpu_nodes_on_lane(pid, tid);

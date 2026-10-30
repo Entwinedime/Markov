@@ -7,9 +7,11 @@
 #include "markov/trace_graph/core/client_requests.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
+#include "modules/hicache/runtime/source_preparation.hpp"
 
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <string>
 
 namespace markov::trace_graph::core {
 class Logger;
@@ -27,12 +29,13 @@ struct PreparedSource {
     core::DagGraph graph;
     io::ManifestClientInput client_input;
     core::ClientRequestChain client_chain;
-    nlohmann::json replay_report;
+    std::string replay_report_path;
     std::unique_ptr<const core::DagGraph> migration_graph{};
+    std::unique_ptr<const modules::hicache::runtime::HiCacheSourcePreparation> hicache;
     nlohmann::json performance;
 };
 
-[[nodiscard]] PreparedSource prepare_source(const CliOptions & options, bool include_preparation = false);
+[[nodiscard]] PreparedSource prepare_source(const CliOptions & options, bool include_preparation = false, bool prepare_execution = false);
 
 /** Mutate one private source in place; its caller owns both graph lifetimes. */
 int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource & source, core::Logger & logger);

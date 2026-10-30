@@ -13,6 +13,7 @@ class ExecutionMetrics {
 public:
     void checkpoint(std::string_view phase);
     nlohmann::json report() const;
+    const nlohmann::json & phases() const { return phases_; }
 
 private:
     using Clock = std::chrono::steady_clock;
