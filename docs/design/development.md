@@ -170,6 +170,8 @@ modeling 容器默认内存及内存加交换区上限为 320 GiB，可用 `TRAC
 
 `performance` 保存真实程序的阶段墙钟、CPU 及内存，不是模拟成本。嵌套阶段不能相加，PSS/私有页是快照，进程 RSS 峰值不能直接相加当整组峰值；整组峰值取独立容器的 cgroup 记录。默认只记录轻量阶段计时、进程峰值和容器峰值；`TRACE_GRAPH_MEMORY_METRICS=1` 才读取详细 PSS/私有页快照，效率对比须使用相同观察开关。排查成本查询时可用 `TRACE_GRAPH_QUERY_METRICS=1 scripts/model.sh predict ...`，额外记录查询计时和逐模型明细，默认关闭。默认摘要仍保存查询、缓存命中、域外和未见组合总数；省略明细不表示没有查询或已具备完整成本覆盖。
 
+紧凑执行默认开启：保留资源与状态端点，合并私有串行CPU步骤和连续K/V拷贝提交。需要对照时使用 `TRACE_GRAPH_FINE_PROGRAMS=1 scripts/model.sh predict ...`；NodeScale也使用完整展开。`performance.hicache_runtime_nested` 中的 `executed_nodes` 与 `expansion_callbacks` 分别统计执行节点和实际规则分发次数；这两项均不代表模拟成本或独立精度成绩。
+
 ## 实验、搜索与评分
 
 配置例子为 [accuracy_example.json](../../configs/modeling/accuracy_example.json) 和 [search_example.json](../../configs/modeling/search_example.json)。实验支持 `--predict-only` / `--score-only`，搜索支持 `--dry-run` / `--resume`：
