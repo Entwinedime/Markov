@@ -11,9 +11,10 @@ from markov.artifacts.performance import PerformanceData, encoded
 from markov.artifacts.request import Deployment, read_json, reject_unknown, resolve_path
 from markov.artifacts.writing import write_json
 from markov.adapters.sglang import cache_measurements
+from markov.adapters.ascend import tensor_measurements
 
 
-ADAPTERS = {"sglang_cache_io": cache_measurements}
+ADAPTERS = {"sglang_cache_io": cache_measurements, "ascend_tensor": tensor_measurements}
 
 
 def affine(points, feature):
@@ -118,22 +119,24 @@ def maintain_performance(path: Path):
                 )
             )
 
-        grouped, recipes = {}, {}
-        conditions = None
+        grouped, recipes, sources = {}, {}, {}
+        conditions = {}
         sample_count = 0
         for source in training:
             adapter_name, current, metadata, samples = store.samples(source)
             if current != ADAPTERS[adapter_name].context(metadata, deployment):
                 raise ValueError(f"Training capture belongs to different measurement conditions: {source}")
-            if conditions is not None and current != conditions:
-                raise ValueError("Training selection mixes runtime or implementation conditions")
-            conditions = current
-            recipes.update(ADAPTERS[adapter_name].recipes())
+            recipes.update(ADAPTERS[adapter_name].recipes(metadata))
             for operation, implementation, scope, features, duration in samples:
-                grouped.setdefault((operation, implementation, scope), []).append((features, duration))
+                kind = (operation, implementation, scope)
+                if kind in conditions and conditions[kind] != current:
+                    raise ValueError(f"Training selection mixes measurement conditions for {operation}/{scope}")
+                conditions[kind] = current
+                grouped.setdefault(kind, []).append((features, duration))
+                sources.setdefault(kind, set()).add(str(source))
             sample_count += len(samples)
         trained = [
-            train_response(kind, recipe, grouped.get(kind, []), [str(p) for p in training])
+            train_response(kind, recipe, grouped.get(kind, []), sorted(sources.get(kind, set())))
             for kind, recipe in recipes.items()
         ]
     finally:

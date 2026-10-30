@@ -10,11 +10,12 @@ from markov.artifacts.request import positive_integer, read_json
 IMPLEMENTATION = "sglang.HiCacheController.write:kernel_ascend.page_first_direct"
 
 
-def recipes():
+def recipes(captured):
     limits = [
         "Independent initialized idle single-device response; no competing I/O or CPU load. "
         "The declared deployment is supplied by the maintainer, not inferred from a capture's device index."
     ]
+    limits.append(captured["limitations"])
     return {
         ("cache.backup.caller", IMPLEMENTATION, "caller_blocking_interval"): {
             "feature": "pages",
