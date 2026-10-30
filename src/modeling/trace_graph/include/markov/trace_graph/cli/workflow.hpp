@@ -29,6 +29,7 @@ struct PreparedSource {
     core::ClientRequestChain client_chain;
     nlohmann::json replay_report;
     std::unique_ptr<const core::DagGraph> migration_graph{};
+    nlohmann::json performance;
 };
 
 [[nodiscard]] PreparedSource prepare_source(const CliOptions & options, bool include_preparation = false);

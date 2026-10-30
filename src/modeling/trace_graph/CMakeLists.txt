@@ -19,6 +19,7 @@ target_compile_features(trace_graph_options INTERFACE cxx_std_23)
 target_include_directories(trace_graph_options
     INTERFACE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(trace_graph_options INTERFACE nlohmann_json::nlohmann_json)
 if(TRACE_GRAPH_DEBUG)
@@ -42,6 +43,7 @@ target_sources(trace_graph_core
         src/core/dag_builder_ordering.cpp
         src/core/dag_builder_sync.cpp
         src/core/logger.cpp
+        src/core/execution_metrics.cpp
 )
 target_link_libraries(trace_graph_core PUBLIC trace_graph_options)
 

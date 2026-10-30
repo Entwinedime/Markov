@@ -1,4 +1,5 @@
 #pragma once
+
 #include "markov/trace_graph/core/client_requests.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/cost/source_migration.hpp"
@@ -8,6 +9,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
+#include <nlohmann/json.hpp>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -57,6 +59,7 @@ struct HiCacheWindowResult {
     size_t changed_operators = 0;
     uint64_t http_us = 0;
     bool final_cost_transform_enabled = false;
+    nlohmann::json performance;
 };
 
 /** Execute a serial HTTP window with one live cache state and one DAG clock.

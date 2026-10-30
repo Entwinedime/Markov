@@ -1,4 +1,5 @@
 /** Same-source preparation with process-private target execution. */
+#include "core/execution_metrics.hpp"
 #include "markov/trace_graph/cli/workflow.hpp"
 
 #include "markov/trace_graph/cli/module_pipeline.hpp"
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,11 +104,14 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
     const auto jobs = plan.at("jobs").get<int64_t>();
     if (jobs <= 0 || plan.at("runs").empty()) throw CliUsageError("target plan requires positive jobs and at least one run");
     const bool continue_on_error = plan.at("continue_on_error").get<bool>();
+    core::ExecutionMetrics metrics;
     auto runs = target_runs(options, plan);
+    metrics.checkpoint("target_configs_and_costs_load");
     const auto preparation_started = std::chrono::steady_clock::now();
     auto source = prepare_source(options, true);
     const auto preparation_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started).count();
-    std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec } }.dump() << '\n' << std::flush;
+    metrics.checkpoint("source_preparation");
+    std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec }, { "performance", metrics.report() } }.dump() << '\n' << std::flush;
 
     // Input loading/build futures have joined. Fork before target work: const
     // TraceEvent access may populate lazy maps and is not thread-safe.
@@ -137,15 +142,22 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
         }
 
         int status = 0;
+        rusage usage{};
         pid_t completed;
-        do { completed = waitpid(-1, &status, 0); } while (completed < 0 && errno == EINTR);
+        do { completed = wait4(-1, &status, 0, &usage); } while (completed < 0 && errno == EINTR);
         if (completed < 0) throw std::system_error(errno, std::generic_category(), "wait for target execution");
         const auto child = std::ranges::find_if(children.active, [&](const auto & entry) { return entry.first == completed; });
         const auto index = child->second;
         children.active.erase(child);
         const auto code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
         failed |= code != 0;
-        publish_result(index, code, children.active.size());
+        std::cout << nlohmann::json{
+            { "index", index }, { "return_code", code }, { "inflight", children.active.size() }, { "skip_reason", "" },
+            { "performance", {
+                { "target_cpu_seconds", usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 + usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6 },
+                { "target_process_peak_rss_bytes", static_cast<uint64_t>(usage.ru_maxrss) * 1'024 }
+            } }
+        }.dump() << '\n' << std::flush;
     }
 
     for (; next < runs.size(); ++next) publish_result(next, 0, 0, "not_started_after_failure");

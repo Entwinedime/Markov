@@ -69,6 +69,7 @@ def build_row(result: ModelRunResult, run_summary: dict[str, Any]) -> dict[str, 
         "approximations": execution.get("remaining_approximations", []),
         "missing_costs": list(result.missing_costs),
         "structure_gaps": list(result.structure_gaps),
+        "performance": {**run_summary.get("performance", {}), **result.performance},
     }
 
 

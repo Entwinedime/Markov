@@ -3,6 +3,7 @@
  * @brief Serializes compact graph, simulation, and module run results.
  */
 #include "markov/trace_graph/cli/run_summary.hpp"
+#include "core/execution_metrics.hpp"
 #include "markov/trace_graph/cli/hicache_observations.hpp"
 
 #include "markov/trace_graph/cli/file_output.hpp"
@@ -365,8 +366,9 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
 
 void write_run_summary(const std::string & filename, const core::DagGraph & graph, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
                        const nlohmann::json & source_io_observations, const modules::hicache::HiCachePhaseObservationAudit & source_phase_observations,
-                       const nlohmann::json & client_result, const modules::hicache::runtime::HiCacheWindowResult * execution,
-                       bool include_source_observations) {
+                       const nlohmann::json & client_result, const modules::hicache::runtime::HiCacheWindowResult * execution, bool include_source_observations,
+                       const nlohmann::json & performance) {
+    core::ExecutionMetrics metrics;
     auto summary = run_summary(graph, modules, source_phase_observations, include_source_observations, execution != nullptr);
     if (include_source_observations) summary["source_io_observations"] = source_io_observations;
     summary["http_client"] = client_result;
@@ -493,6 +495,9 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
                                 "scope_owned_gap_duration_us" })
             summary[key] = nullptr;
     }
+    metrics.checkpoint("summary_construction");
+    summary["performance"] = performance;
+    summary["performance"]["report_construction"] = metrics.report();
     write_json_file(filename, summary);
 }
 

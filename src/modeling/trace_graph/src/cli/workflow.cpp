@@ -7,6 +7,7 @@
  * workflow itself.
  */
 #include "markov/trace_graph/cli/workflow.hpp"
+#include "core/execution_metrics.hpp"
 
 #include "markov/trace_graph/cli/cpu_service_preparation.hpp"
 #include "markov/trace_graph/cli/file_output.hpp"
@@ -100,15 +101,22 @@ void write_graph_output(const CliOptions & options, const DagGraph & graph) {
 } // namespace
 
 PreparedSource prepare_source(const CliOptions & options, bool include_preparation) {
+    core::ExecutionMetrics metrics;
     const auto client_input = options.trace_input.include_python_probe && (!options.source_observations_only || include_preparation)
                                   ? io::load_client_requests_from_manifest(options.profile_manifest, include_preparation)
                                   : io::ManifestClientInput{ "python_probe_channel_disabled", {} };
+    metrics.checkpoint("client_input");
+
     auto trace_input = options.trace_input;
     if (client_input.formal_begin_index) trace_input.window_start_us = client_input.requests.front().start_us;
 
     auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, trace_input);
     const auto source_input_selection = options.outputs.source_replay_report.empty() ? nlohmann::json(nullptr) : source_dag::input_selection_report(inputs);
+    metrics.checkpoint("trace_read_parse_and_join");
+
     auto graph = source_dag::build(std::move(inputs), trace_input.threads);
+    metrics.checkpoint("source_dag_build_and_merge");
+
     const auto source_execution_event_count = graph.events().size();
     // Request availability belongs to the observed source as well as target
     // execution. Bind once; the experimental replay must precede cost views
@@ -117,11 +125,15 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
         client_input.status == "ready" && !options.source_observations_only
             ? core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us, client_input.formal_begin_index)
             : core::ClientRequestChain{ client_input.status, {} };
+    metrics.checkpoint("client_chain_binding");
+
     nlohmann::json replay;
     if (!options.outputs.source_replay_report.empty()) {
         replay = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
         replay["event_coverage"]["input_selection"] = source_input_selection;
     }
+    metrics.checkpoint("optional_source_replay");
+
     if (!options.cpu_service_cost.empty()) {
         std::ifstream input(options.cpu_service_cost);
         if (!input) throw std::runtime_error("Cannot open CPU service cost file: " + options.cpu_service_cost);
@@ -131,10 +143,15 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
     if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
 #endif
 
-    return { std::move(graph), client_input, client_chain, std::move(replay) };
+    metrics.checkpoint("cpu_correction_load");
+    auto performance = metrics.report();
+    performance["stored_nodes"] = graph.node_count();
+    performance["stored_edges"] = graph.edge_count();
+    return { std::move(graph), client_input, client_chain, std::move(replay), {}, std::move(performance) };
 }
 
 int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource & source, core::Logger & logger) {
+    core::ExecutionMetrics metrics;
     auto & graph = source.graph;
     const auto & client_input = source.client_input;
     const auto & client_chain = source.client_chain;
@@ -204,6 +221,7 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
         if (!modules.uses_hicache_execution()) modules::hicache::apply_observed_hicache_scope(graph, source_scope);
         source_phase = std::move(source_scope.phases);
     }
+    metrics.checkpoint("optional_source_observations");
     // Request availability is an input dependency, not a scoring-only adjustment.
     // Keep the same anchors throughout modeling, execution and HTTP reporting.
     const auto begin = client_input.status == "ready" ? client_input.requests.front().start_us : 0;
@@ -216,6 +234,7 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
     // without dirtying inherited allocator pages just to free individual events.
     auto & source_graph = source.migration_graph;
     if (modules.uses_hicache_execution() || !modules.modules().empty()) source_graph = std::make_unique<const DagGraph>(graph);
+    metrics.checkpoint("migration_graph_copy");
     try {
         modules.apply(graph, source_graph ? *source_graph : graph, logger, client_chain, begin, end);
     }
@@ -239,6 +258,7 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
             });
         throw;
     }
+    metrics.checkpoint("modules_including_execution");
     // HiCache has already executed the target DAG. Its component ownership is
     // not available, so stripped-scope replays cannot supply valid metrics.
     const auto * execution = modules.execution_result();
@@ -249,11 +269,24 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
     }
     const auto client_result = client_request_result(graph, client_chain, simulation);
 
+    metrics.checkpoint("client_results_and_optional_replays");
     write_graph_output(options, graph);
 #ifdef DEBUG
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
-    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, source_phase, client_result, execution, include_source_observations);
+    metrics.checkpoint("optional_graph_output");
+    auto performance = metrics.report();
+    performance["source_preparation"] = source.performance;
+    if (execution) performance["hicache_runtime_nested"] = execution->performance;
+    write_run_summary(options.outputs.run_summary,
+                      graph,
+                      modules.modules(),
+                      source_io,
+                      source_phase,
+                      client_result,
+                      execution,
+                      include_source_observations,
+                      performance);
     if (!options.outputs.structure_report.empty()) {
         if (!execution) throw std::invalid_argument("Executed structure report requires HiCache execution prediction");
         auto structure =

@@ -202,7 +202,10 @@ def _run_source(
                 if outcome.get("event") == "source_prepared":
                     yield (
                         SourcePreparation(
-                            ready[0].source.manifest_path, ready[0].cpu_service_cost, outcome["wall_seconds"]
+                            ready[0].source.manifest_path,
+                            ready[0].cpu_service_cost,
+                            outcome["wall_seconds"],
+                            outcome["performance"],
                         ),
                         0,
                     )
@@ -213,7 +216,13 @@ def _run_source(
                     yield ModelRunStarted(ready[index]), 0
                     continue
 
-                result = _finish_result(options, ready[index], outcome["return_code"], outcome["skip_reason"])
+                result = _finish_result(
+                    options,
+                    ready[index],
+                    outcome["return_code"],
+                    outcome["skip_reason"],
+                    outcome.get("performance", {}),
+                )
                 completed.add(index)
                 yield result, outcome["inflight"]
             return_code = process.wait()
@@ -240,7 +249,11 @@ def _run_source(
 
 
 def _finish_result(
-    options: WorkflowOptions, spec: ModelRunSpec, return_code: int, skip_reason: str = ""
+    options: WorkflowOptions,
+    spec: ModelRunSpec,
+    return_code: int,
+    skip_reason: str = "",
+    performance: dict[str, Any] | None = None,
 ) -> ModelRunResult:
     """Read only failed current reports; successful summaries belong to read_row."""
 
@@ -259,7 +272,7 @@ def _finish_result(
     elif not options.diagnostics.keep_debug_artifacts:
         log.unlink(missing_ok=True)
 
-    return ModelRunResult(spec, return_code, skip_reason, missing_costs, structure_gaps)
+    return ModelRunResult(spec, return_code, skip_reason, missing_costs, structure_gaps, performance or {})
 
 
 def truncate_log_tail(path: Path, limit: int) -> None:

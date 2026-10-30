@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/window.hpp"
+#include "core/execution_metrics.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_preparation.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/execution_resources.hpp"
@@ -109,16 +110,24 @@ private:
 };
 
 HiCacheWindowResult HiCacheExecution::run() {
+    core::ExecutionMetrics metrics;
     output_.final_cost_transform_enabled = static_cast<bool>(final_cost_transform_);
     prepare_source();
+    metrics.checkpoint("source_observations_and_binding");
+
     replace_source_regions();
+    metrics.checkpoint("source_region_replacement");
 
     output_.simulation = simulation::run_topological_simulation(
         graph_,
         [this](size_t node, uint64_t start_us, uint64_t duration) { return estimate_node_cost(node, start_us, duration); },
         [this](size_t node, uint64_t elapsed_us, simulation::FutureDag & future) { expand_at_start(node, elapsed_us, future); });
+    metrics.checkpoint("execution_including_dynamic_structure_and_cost_queries");
 
     finish();
+    metrics.checkpoint("execution_accounting");
+    output_.performance = metrics.report();
+    output_.performance["operator_queries_nested"] = operator_provider_.performance();
     return std::move(output_);
 }
 

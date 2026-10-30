@@ -4,7 +4,9 @@
 #include "markov/trace_graph/cost/missing_evidence.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 #include <utility>
@@ -12,7 +14,24 @@
 namespace markov::trace_graph::cost {
 
 OperatorCostProvider::OperatorCostProvider(const std::vector<OperatorModel> & models) {
+    const auto requested = std::getenv("TRACE_GRAPH_QUERY_METRICS");
+    measure_queries_ = requested && std::string_view(requested) == "1";
     for (const auto & model : models) models_.emplace(ModelKey{ model.operation, model.implementation, model.timing_scope }, &model);
+}
+
+nlohmann::json OperatorCostProvider::performance() const {
+    if (!measure_queries_)
+        return {
+            { "detailed_metrics_enabled", false }
+        };
+    return {
+        {   "detailed_metrics_enabled",                                                                                                         true },
+        {         "query_wall_seconds",                                                                                          query_wall_seconds_ },
+        {                "query_count",                                                                                            measured_queries_ },
+        { "distinct_model_work_points",                                                                                      measured_points_.size() },
+        {        "response_cache_hits",                                                                                                            0 },
+        {                      "scope", "successful queries; point-accounting overhead excluded from query time but included in execution wall time" }
+    };
 }
 
 std::vector<OperatorEstimate> OperatorCostProvider::estimate_all(std::span<const structure::OperationWork> work) {
@@ -35,6 +54,7 @@ std::vector<OperatorEstimate> OperatorCostProvider::estimate_all(std::span<const
 }
 
 OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork & work) {
+    const auto started = measure_queries_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto describe = [&] {
         return nlohmann::json{
             {      "operation",      work.operation },
@@ -102,6 +122,11 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
     summary.outside_range_queries += result.outside_measured_range;
     summary.unseen_combination_queries += result.unseen_feature_combination;
     summary.queried_duration_sum_us = core::checked_add_u64(summary.queried_duration_sum_us, result.duration_us, "Operator query summary overflow");
+    if (measure_queries_) {
+        query_wall_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        ++measured_queries_;
+        measured_points_.emplace(found->first, std::move(point));
+    }
     return result;
 }
 

@@ -48,6 +48,8 @@ services:
       context: ../..
       dockerfile: docker/images/modeling/Dockerfile
     image: markov-trace-sim-modeling:ubuntu24.04
+    environment:
+      TRACE_GRAPH_QUERY_METRICS: ${TRACE_GRAPH_QUERY_METRICS:-0}
     volumes:
       - ../..:/workspace/trace-sim
     command: bash

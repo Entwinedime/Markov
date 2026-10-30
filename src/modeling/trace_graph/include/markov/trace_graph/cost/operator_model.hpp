@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <nlohmann/json.hpp>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -65,11 +67,17 @@ public:
      * This does not expand future timing-dependent execution branches. */
     [[nodiscard]] std::vector<OperatorEstimate> estimate_all(std::span<const structure::OperationWork> work);
     [[nodiscard]] const std::map<QueryKey, OperatorQuerySummary> & queries() const { return queries_; }
+    /** Optional host-side query timing/point accounting; never a model input. */
+    nlohmann::json performance() const;
 
 private:
     using ModelKey = std::tuple<std::string_view, std::string_view, std::string_view>;
     std::map<ModelKey, const OperatorModel *> models_;
     std::map<QueryKey, OperatorQuerySummary> queries_;
+    bool measure_queries_ = false;
+    double query_wall_seconds_ = 0;
+    size_t measured_queries_ = 0;
+    std::set<std::pair<ModelKey, std::map<std::string, double>>> measured_points_;
 };
 
 } // namespace markov::trace_graph::cost

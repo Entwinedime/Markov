@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from typing import Any
 
 from markov_internal.common.io import write_json_atomic
@@ -23,6 +25,7 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
     after each completion so interruption never exposes an old successful run.
     """
 
+    started = time.monotonic()
     options.output_dir.mkdir(parents=True, exist_ok=True)
     report_path = options.output_dir / "workflow_summary.json"
     report_path.unlink(missing_ok=True)
@@ -72,6 +75,7 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
                     if result.cpu_service_cost
                     else None,
                     "wall_seconds": result.wall_seconds,
+                    "performance": result.performance,
                 }
             )
         elif isinstance(result, ModelRunStarted):
@@ -84,4 +88,16 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
         summary["prediction"] = summarize(list(rows.values()))
         write_json_atomic(report_path, summary)
 
+    summary["performance"] = {
+        "prediction_wall_seconds": time.monotonic() - started,
+        "scope": "prepared-input prediction including preflight, source preparation, targets and incremental reports; excludes capture/training",
+    }
+    # Modeling Docker mounts its own controller at these roots, including v1
+    # hosts whose /proc membership retains the full host-side scope path.
+    for path in (Path("/sys/fs/cgroup/memory.peak"), Path("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")):
+        if path.is_file():
+            summary["performance"]["container_peak_memory_bytes"] = int(path.read_text())
+            break
+
+    write_json_atomic(report_path, summary)
     return summary

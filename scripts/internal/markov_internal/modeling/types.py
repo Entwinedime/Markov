@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +97,7 @@ class ModelRunResult:
     skip_reason: str = ""
     missing_costs: tuple[dict[str, Any], ...] = ()
     structure_gaps: tuple[dict[str, Any], ...] = ()
+    performance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -112,6 +113,7 @@ class SourcePreparation:
     manifest: Path
     cpu_service_cost: Path | None
     wall_seconds: float
+    performance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
