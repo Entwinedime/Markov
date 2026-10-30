@@ -164,9 +164,11 @@ CPU 参数可省略，source、target 和 CPU 参数可重复传入。直接预�
 
 modeling 容器默认内存及内存加交换区上限为 320 GiB，可用 `TRACE_SIM_MODELING_MEMORY_LIMIT` 按平台配置。宿主还有其他任务时必须预留余量；硬上限不能替代并发预算及进程树回收。设备采集始终串行，不与重型导出或建模争抢同一资源。
 
+每个目标的 `cpp_model_config.json` 只记录共享 `cost_package` 路径和目标策略；同一原生批次仅加载一次成本包。路径按仓库根解析，复现时需同时保留所引用的成本包。旧的逐格内嵌操作模型输入请从公开预测入口重新生成；历史结果不自动改写。
+
 完整 HTTP 读取 `http_client.e2e_us`；`simulated_e2e_us` / `full_graph_e2e_us` 可能含请求后的后台工作，不能混用。默认 `--diagnostics off` 走 Release，保留紧凑摘要、复现输入与失败日志；`--diagnostics full` 走 validation，增加明细和成功日志。实验需要额外源回放与结构报告时使用 `--experiment-reports`。
 
-`performance` 保存真实程序的阶段墙钟、CPU 及内存，不是模拟成本。嵌套阶段不能相加，PSS/私有页是快照，进程 RSS 峰值不能直接相加当整组峰值；整组峰值取独立容器的 cgroup 记录。排查成本查询时可用 `TRACE_GRAPH_QUERY_METRICS=1 scripts/model.sh predict ...`，额外记录查询计时与不同工作点，默认关闭，以免统计本身影响效率比较。
+`performance` 保存真实程序的阶段墙钟、CPU 及内存，不是模拟成本。嵌套阶段不能相加，PSS/私有页是快照，进程 RSS 峰值不能直接相加当整组峰值；整组峰值取独立容器的 cgroup 记录。默认只记录轻量阶段计时、进程峰值和容器峰值；`TRACE_GRAPH_MEMORY_METRICS=1` 才读取详细 PSS/私有页快照，效率对比须使用相同观察开关。排查成本查询时可用 `TRACE_GRAPH_QUERY_METRICS=1 scripts/model.sh predict ...`，额外记录查询计时和逐模型明细，默认关闭。默认摘要仍保存查询、缓存命中、域外和未见组合总数；省略明细不表示没有查询或已具备完整成本覆盖。
 
 ## 实验、搜索与评分
 
