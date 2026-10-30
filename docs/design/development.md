@@ -28,6 +28,8 @@ python -m pip install --no-deps --no-build-isolation -e .
 
 正式镜像安装采集包，由SGLang plugin入口加载观察适配。官方SGLang源码直接复制到镜像内的安装目录，采集包以wheel安装后移除临时源码与构建目录；不叠存仓库副本或已删除模块。官方子模块不保存采集业务修改，安装适配与环境差异随适配器维护。镜像名称不能代替实际依赖和运行资格的核对。
 
+Ascend安装适配固定FA依赖的官方revision，并从源码构建其v3入口；构建所需CANN头文件路径由安装环境提供。推理镜像启用`ASCEND_USE_FA=true`、`ASCEND_USE_FIA=false`，保留原生mixed attention需要的分页KV布局；实际开关进入来源的实现身份。控制镜像继承同一SGLang版本，但移除设备扩展和采集插件。切换框架或attention实现后，使用新运行目录重新采集受影响来源，不能把旧来源的环境身份改写为新环境。
+
 ## 完整任务入口
 
 ```bash
@@ -40,6 +42,8 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 
 任务从保留事实恢复解释和建库，不因后处理失败重复启动 Engine。C++ 二进制复用项目构建缓存；SDK 观察库属于任务私有 work，正式资产发布后释放。纯目标执行只挂载程序、明确输入和资产，不加载模型或设备。
 
+完整仿真明细中的`resource_history`记录资源所有者实际发生的分配、绑定、前缀分裂、引用、淘汰与回收；serving循环标注模拟时间及动作边界。默认输出不生成或保留这份历史。验证工具可以按记录核对中途变化与终态，而不重新选择命中、淘汰对象或分配顺序；这些资源事实不替代设备内容就绪和在途消费者的依赖证明。
+
 共享程序的构建持独占锁，正式任务和 `scripts/markov.sh` 在调用期间持同一文件的共享锁；任务启动端保护挂载，容器内工具持锁直到退出，客户端丢失也不提前释放工作进程的保护。多个读取可以并行，重建等待使用者结束；运行根锁另行保护单个任务的状态与产物，不能代替构建锁。
 
 ## 职责与目录
@@ -50,7 +54,7 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 | `src/markov/production` | 来源投影、编译和共享模板库生产 |
 | `src/markov/templates` | 正式资产合同、目标区域选择、参数绑定与实例化/连接 |
 | `src/markov/controller` | 请求进度和批次决策，借用共同资源 |
-| `src/markov/resources` | 槽位、逻辑页和驻留的唯一状态，按请求需求生成分配结果 |
+| `src/markov/resources` | 槽位、逻辑页、驻留及前缀索引/引用/LRU的唯一状态，按请求需求生成分配结果 |
 | `src/markov/execution` | 节点耗时接口、资源/依赖推进与完成事件 |
 | `src/markov/adapters` | 原生端口、状态编码、并行角色及目标模板绑定 |
 | `src/markov/application` | 具体部件装配、借用生命周期、控制管道与结果收尾 |
@@ -62,10 +66,11 @@ example/automatic_graph/run.sh --resume data/YOUR_RUN
 | `src/collection/markov_collection/artifacts.py` | 共同文件发布 |
 | `src/collection/native` | 原生依赖安装资源及随环境编译的观察代码 |
 | `src/control/markov_control/adapters` | 原生控制、资源协议视图与无设备runtime接管 |
+| `src/workload/markov_workload` | 采集与控制共享的合成内容及条件路由身份，不持有请求或资源状态 |
 | `src/application/markov_application` | 单任务预算/恢复、探索流程，以及原生控制与核心进程的启动、连接和清理 |
 | `example/automatic_graph` | 真实输入示例、机制观察及设备清单对照 |
 
-Python外层应用由正式脚本通过源码路径启动；探索入口使用application与collection两个源码根，纯原生控制启动只需application。采集包仍单独安装到推理镜像，原生控制worker包单独复制到无设备控制镜像；两者不包含外层进程管理，也不相互导入。
+Python外层应用由正式脚本通过源码路径启动；探索入口使用application、collection与workload三个源码根，纯原生控制启动只需application。独立workload包提供采集和控制共用的内容身份规则；采集包安装到推理镜像，原生控制worker包复制到无设备控制镜像，两侧分别安装workload包。采集与控制不包含外层进程管理，也不相互导入。
 
 C++ 头源按职责同目录，以 `src` 为 include 根。核心不导入框架配置，runtime 不反向依赖框架；框架组合 runtime 取得事实和必要接口。真实采集时由原生框架拥有请求、KV 和 worker，观察器不维护第二份原生状态机。
 
@@ -95,7 +100,9 @@ bash scripts/markov-control.sh \
 
 默认结果仍为精简JSON，`--details`才输出完整图与执行记录；上述命令的运行日志位于`results/native.logs/core.log`和`native.log`。内部C++接口为`simulate --control native`，其标准流属于协议；直接运行该接口需要连接控制端，通常使用外层脚本。
 
-当前接基础单worker、单阶段TP/EP、已有来源的PP及P/D组合控制（含异构TP、给定路由的EP和PP×PD），完整Prefill、无前缀缓存和无overlap；调度优化另行扩展。各worker运行真实原生主循环，入口成员沿原生CPU组广播请求；只读容量查询独立处理，同stage的TP成员将一致的资源变更和执行动作只向核心提交一次，返回值形成各rank的本地视图。PP各stage通过独立资源域推进，原生输入/输出环只交换CPU元数据和工作身份；实际发送、接收与work等待由图反馈。分片计算与设备通信仍由已有模板展开，不以控制进程间的CPU通信替代目标设备工作。 P/D各实例分别接收到达序列，原生负责预约、接收与prebuilt准入，核心统一维护页/槽位并以图完成驱动传输状态；运行上限与实际槽位容量分别传递，元数据槽位使用原生编号。PP×PD按stage持有独立池，适配器从层与KV head交集产生传输片段，核心按源/目的资源组的就绪与完成推进；控制rank与目标图rank分别绑定。来源仍须覆盖实际批次结构和设备实现分支，入口可接入不代表这些来源限制已消除。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。原生运行批次的实际筛选作为Select动作交接，撤回通过独立Release归还驻留，原生保留输出历史并决定重新Prefill。给定输出长度用占位token驱动原生结果处理，不预测自然文本；目标释放路径仍须有合格模板，例如混合dtype且含空列表的拼接不能借用同dtype原型。入口可运行不代表完整结构资格或性能精度通过。
+当前接基础单worker、单阶段TP/EP、已有来源的PP及P/D组合控制（含异构TP、给定路由的EP和PP×PD），完整或分块Prefill及无overlap；mixed仍须合格原生来源。自动探索及低层预测以`prefix_cache`选择一级缓存，要求原生控制和相同机制的来源；代表采集在一次会话中分组覆盖必要缓存操作。MoE缓存键由共享内容模块结合token与逐位置专家条件编码，adapter将其交给原生键接口；不同条件的请求仍可复用分歧之前的前缀，具体组合需要对应来源。
+
+各worker运行真实原生主循环，入口成员沿原生CPU组广播请求；只读容量查询独立处理，同stage的TP成员将一致的资源变更和执行动作只向核心提交一次，返回值形成各rank的本地视图。PP各stage通过独立资源域推进，原生输入/输出环只交换CPU元数据和工作身份；实际发送、接收与work等待由图反馈。分片计算与设备通信仍由已有模板展开，不以控制进程间的CPU通信替代目标设备工作。 P/D各实例分别接收到达序列，原生负责预约、接收与prebuilt准入，核心统一维护页/槽位并以图完成驱动传输状态；运行上限与实际槽位容量分别传递，元数据槽位使用原生编号。PP×PD按stage持有独立池，适配器从层与KV head交集产生传输片段，核心按源/目的资源组的就绪与完成推进；控制rank与目标图rank分别绑定。来源仍须覆盖实际批次结构和设备实现分支，入口可接入不代表这些来源限制已消除。原生结果处理通过copy_done等待已有结果读取子图，模型host返回不直接授权CPU消费token；随后沿同一结果调用展开释放和输出。原生运行批次的实际筛选作为Select动作交接，撤回通过独立Release归还驻留，原生保留输出历史并决定重新Prefill。给定输出长度用与采集一致的合成token驱动原生结果处理，PP输出环保留这些值，不预测自然文本；目标释放路径仍须有合格模板，例如混合dtype且含空列表的拼接不能借用同dtype原型。入口可运行不代表完整结构资格或性能精度通过。
 
 ## 来源与区域命令
 
