@@ -168,15 +168,21 @@ scripts/model.sh predict \
 
 CPU 参数可省略，source、target 和 CPU 参数可重复传入。直接预测默认失败后不启动新目标，已启动任务收尾；`--continue-on-error` 继续其他目标。组准备则执行整组以汇总共享缺口，不使用这个开关。
 
-`--trace-threads` 控制源读取/构图，`--trace-file-threads` 控制文件解析，默认各为 1；`--model-run-jobs` 独立控制目标并发。同源目标共享一次源准备，每个目标仍持有大型可变图，不能按源图大小估算整个运行峰值。
+`--trace-threads` 控制源读取/构图，`--trace-file-threads` 控制文件解析，默认各为 1；`--model-run-jobs` 独立控制目标并发。同源目标在活动会话内共享一次源准备，每个目标仍持有大型可变图，不能按源图大小估算整个运行峰值。
 
 modeling 容器默认内存及内存加交换区上限为 320 GiB，可用 `TRACE_SIM_MODELING_MEMORY_LIMIT` 按平台配置。宿主还有其他任务时必须预留余量；硬上限不能替代并发预算及进程树回收。设备采集始终串行，不与重型导出或建模争抢同一资源。
 
-每个目标的 `cpp_model_config.json` 只记录共享 `cost_package` 路径和目标策略；同一原生批次仅加载一次成本包。路径按仓库根解析，复现时需同时保留所引用的成本包。旧的逐格内嵌操作模型输入请从公开预测入口重新生成；历史结果不自动改写。
+原生预测预留容器/主机较小上限的10%，至少512 MiB；目标批次按当前可用内存和并发数分配虚拟地址增长预算，另留一份准备余量。这不是目标RSS的预测值。源准备和目标分配均有地址空间限制，父进程还监测内存压力；预算不足输出缺失预测及失败原因，不填零。modeling容器使用Docker init回收异常退出后的孤儿进程；源会话关闭时也清理自己的原生进程组。降低目标并发或增加可用内存后，在新的运行输出中重试。
+
+上层应用需要连续提交候选时使用 `modeling.invoke.PredictionClient`，一次性调用仍用 `invoke_prediction`，两者接受相同的已准备 `PredictionInputs`。客户端用上下文管理器关闭，每次 `predict(inputs, targets, output_dir, max_wall_sec=...)` 使用独立输出目录；超时包含启动、提交和等待，随后另需进程回收时间。它只管理本地子进程，不启动采集、训练或网络服务。相同输入复用审查和源图，输入或成本包变更会释放旧会话；同路径文件不得在会话中原地修改。成功的默认日志关闭后移除，失败日志按诊断级别保留。
+
+每个目标的 `cpp_model_config.json` 只记录共享 `cost_package` 路径和目标策略；每个活动原生源进程仅加载一次成本包。路径按仓库根解析，复现时需同时保留所引用的成本包。旧的逐格内嵌操作模型输入请从公开预测入口重新生成；历史结果不自动改写。
 
 完整 HTTP 读取 `http_client.e2e_us`；`simulated_e2e_us` / `full_graph_e2e_us` 可能含请求后的后台工作，不能混用。默认 `--diagnostics off` 走 Release，保留紧凑摘要、复现输入与失败日志；`--diagnostics full` 走 validation，增加明细和成功日志。实验需要额外源回放与结构报告时使用 `--experiment-reports`。批量预测使用 `sources/<序号>/` 保存 target 计划、可选源回放及需要保留的源准备日志，每个目标摘要的 `source_replay_report` 引用同源报告；独立评分按引用读取，单格底层运行仍可指定自己的报告位置。
 
 `performance` 保存真实程序的阶段墙钟、CPU 及内存，不是模拟成本。嵌套阶段不能相加，PSS/私有页是快照，进程 RSS 峰值不能直接相加当整组峰值；整组峰值取独立容器的 cgroup 记录。默认只记录轻量阶段计时、进程峰值和容器峰值；`TRACE_GRAPH_MEMORY_METRICS=1` 才读取详细 PSS/私有页快照，效率对比须使用相同观察开关。排查成本查询时可用 `TRACE_GRAPH_QUERY_METRICS=1 scripts/model.sh predict ...`，额外记录查询计时和逐模型明细，默认关闭。默认摘要仍保存查询、缓存命中、域外和未见组合总数；省略明细不表示没有查询或已具备完整成本覆盖。
+
+`source_preparations` 记录本次真正准备的源，`source_reuses` 记录仍然驻留的源，`performance.preflight_reused` 标明输入审查是否复用。会话批次时间不含最终关闭；直接CLI另列含关闭的一次性时间，宿主一次性调用及搜索累计墙钟包含所属会话关闭。首次读取与构图、后续目标时间分别报告，不能用均摊准备时间宣称单目标已比真机快10倍。
 
 紧凑执行默认开启：保留资源与状态端点，合并私有串行CPU步骤和连续K/V拷贝提交。需要对照时使用 `TRACE_GRAPH_FINE_PROGRAMS=1 scripts/model.sh predict ...`；NodeScale也使用完整展开。`performance.hicache_runtime_nested` 中的 `executed_nodes` 与 `expansion_callbacks` 分别统计执行节点和实际规则分发次数；这两项均不代表模拟成本或独立精度成绩。
 
@@ -197,6 +203,8 @@ scripts/model.sh evaluate \
 搜索 `scenario` 引用同一套源准备声明，`target_template` 固定不搜索字段，`space` 列出有限取值。`enumerate` 遍历空间，`stratified_random` 先覆盖机制分支，`random` 为均匀随机参照；`local` 在已有预测上探索联合邻域，`coordinate` 只改一个坐标。除枚举外均声明整数种子；这些方法不读取真值或在线拟合成本。资源变化时声明同资源参照，不能把增加容量的收益全归为策略改进。
 
 `--resume` 仅在代码、输入和成本依据不变时补未完成项，累计预算不重置。搜索期间不更新成本包；真实正常确认默认关闭，是独立步骤。特定研究案例的并发数、watchdog 阈值和时限不作为通用推荐。
+
+同一次搜索把候选分成不超过目标并发数的批次，连续批次及后续搜索轮复用活动源。切换workload释放前一个源，切回来需要重新准备；不为节省准备时间无限保留多份源图。重新启动命令时只恢复结果与账本，不恢复已经结束的内存会话。
 
 评分也可用重复的 `--target-profile-manifest` 精确指定正常输入，需同时覆盖 base 与 targets。正式窗口重复样本取算术平均，保留样本数、范围和失败；选中格未完成时不先打开真值。`--retry-prediction-dir` 只替换相同身份的未完成格，不能挑选更好的一次成功预测。
 
