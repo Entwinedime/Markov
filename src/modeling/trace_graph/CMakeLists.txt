@@ -228,6 +228,7 @@ add_library(trace_graph_hicache STATIC
     src/modules/hicache/runtime/write_confirmations.cpp
     src/modules/hicache/runtime/loads.cpp
     src/modules/hicache/runtime/host_program.cpp
+    src/modules/hicache/runtime/host_compaction.cpp
     src/modules/hicache/runtime/host_cost_binding.cpp
     src/modules/hicache/runtime/tensor_program.cpp
     src/modules/hicache/runtime/allocator_calls.cpp

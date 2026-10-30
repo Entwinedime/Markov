@@ -140,6 +140,7 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
         event.tid = spec.observed_point->tid;
         event.ts = spec.observed_point->timestamp_us;
     }
+    if (spec.shared_attrs) event.share_args(spec.shared_attrs);
     event.set_arg("node_kind", "synthetic");
     event.set_arg("counts_toward_e2e", spec.counts_toward_e2e ? "true" : "false");
     for (const auto & [key, value] : spec.attrs) event.set_arg(key, value);
@@ -167,15 +168,22 @@ size_t DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_
     invalidate_topology();
     const auto edge_index = edges_.size();
     edges_.emplace_back(src, dst, kind, effect_id, reason);
+    if (topological_order_) edited_edges_.push_back(edge_index);
     return edge_index;
 }
 
-void DagGraph::disable_edge(size_t edge_index) { mutable_edge(edge_index).active = false; }
+void DagGraph::disable_edge(size_t edge_index) {
+    auto & edge = edges_.at(edge_index);
+    if (!edge.active) return;
+    invalidate_topology();
+    edge.active = false;
+}
 
 void DagGraph::disable_node(size_t node_id) {
     auto & target = mutable_node(node_id);
     if (!target.active) return;
     target.active = false;
+    release_topological_order();
     invalidate_topology();
     cpu_intervals_.reset();
 }
@@ -185,10 +193,12 @@ const DagEdge & DagGraph::edge(size_t edge_index) const {
     return edges_[edge_index];
 }
 
-DagEdge & DagGraph::mutable_edge(size_t edge_index) {
+void DagGraph::redirect_edge_target(size_t edge_index, size_t target) {
+    if (target >= node_count()) throw std::out_of_range("DAG edge target is out of range");
+    auto & edge = edges_.at(edge_index);
     invalidate_topology();
-    if (edge_index >= edges_.size()) throw std::out_of_range("DAG edge index out of range");
-    return edges_[edge_index];
+    edge.dst = target;
+    if (topological_order_) edited_edges_.push_back(edge_index);
 }
 
 void DagGraph::share_source_events() {
@@ -220,8 +230,12 @@ DagGraph::ObservedTables & DagGraph::own_observations() {
 
 void DagGraph::invalidate_topology() {
     adjacency_.reset();
-    topological_order_.reset();
     active_counts_.reset();
+}
+
+void DagGraph::release_topological_order() {
+    topological_order_.reset();
+    edited_edges_.clear();
 }
 
 const TraceEvent & DagGraph::event(size_t event_index) const {

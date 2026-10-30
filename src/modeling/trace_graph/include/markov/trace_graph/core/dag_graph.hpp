@@ -108,6 +108,7 @@ struct DagSyntheticNodeSpec {
     uint64_t cpu_gap_after = 0;
     /** Only boundaries anchored to real observations have source coordinates. */
     std::optional<DagObservedPoint> observed_point;
+    std::shared_ptr<const TraceArgMap> shared_attrs;
 };
 
 /**
@@ -254,7 +255,8 @@ public:
 
     std::shared_ptr<const DagAdjacency> adjacency() const;
     std::shared_ptr<const CpuIntervalIndex> cpu_intervals() const;
-    std::shared_ptr<const DagTopologicalOrder> topological_order() const { return topological_order_; }
+    std::shared_ptr<const DagTopologicalOrder> topological_order() const;
+    void release_topological_order();
 
     /** @brief Returns the stable node array. */
     [[nodiscard]] const std::vector<DagNode> & nodes() const { return nodes_; }
@@ -283,8 +285,8 @@ public:
     /** @brief Returns an edge by stable edge index. */
     [[nodiscard]] const DagEdge & edge(size_t edge_index) const;
 
-    /** @brief Returns a mutable edge by stable edge index. */
-    DagEdge & mutable_edge(size_t edge_index);
+    /** Redirect one endpoint while retaining edge identity and provenance. */
+    void redirect_edge_target(size_t edge_index, size_t target);
 
     /** @brief Updates the sole authoritative execution duration for a node. */
     void set_node_duration(size_t node_id, uint64_t duration);
@@ -495,7 +497,9 @@ private:
     std::unordered_map<size_t, TraceEvent> event_overrides_;
     mutable std::shared_ptr<const DagAdjacency> adjacency_;
     mutable std::shared_ptr<const CpuIntervalIndex> cpu_intervals_;
+    // Proven prefix; direct edits are resolved before returning a current order.
     mutable std::shared_ptr<const DagTopologicalOrder> topological_order_;
+    mutable std::vector<size_t> edited_edges_;
     mutable std::optional<ActiveCounts> active_counts_;
     friend DagMutationResult apply_dag_mutation_plan(DagGraph &, const DagMutationPlan &);
     friend DagTopologyValidationReport validate_active_dag(const DagGraph &);

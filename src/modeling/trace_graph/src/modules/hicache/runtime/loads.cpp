@@ -138,7 +138,17 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                 if (program == generated_submissions_.end()) throw std::runtime_error("New load lacks proven scheduler resources");
                 if (!page_bytes_ || bytes % page_bytes_) throw std::runtime_error("Target load is not whole KV pages");
                 const auto & p = program->second;
-                auto built = generate_page_first_submission(*graph_, p.main, p.worker, p.compute, p.stream, bytes / page_bytes_, page_bytes_, p.layers, "load");
+                auto built = generate_page_first_submission(*graph_,
+                                                            p.main,
+                                                            p.worker,
+                                                            p.compute,
+                                                            p.stream,
+                                                            bytes / page_bytes_,
+                                                            page_bytes_,
+                                                            p.layers,
+                                                            "load",
+                                                            false,
+                                                            compact_programs_);
                 bind_host_operations(built.plan, built.operations, operator_provider_);
                 ++shared_cost_batches_;
                 const std::vector<size_t> lanes{ graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id };

@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <ranges>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -415,11 +416,11 @@ DagTopologyValidationReport validate_topology(const std::vector<bool> & active_n
 
 // Keep the existing order if new work fits between its proven predecessors
 // and successors. Otherwise the same overlay goes through full Kahn validation.
-std::shared_ptr<const DagTopologicalOrder> extend_order(const ProspectiveGraph & graph, const DagTopologicalOrder & base) {
-    const auto old_count = graph.base.node_count(), added = graph.active_nodes.size() - old_count;
+std::shared_ptr<const DagTopologicalOrder> extend_order(size_t node_count, std::span<const VirtualEdge> edges, const DagTopologicalOrder & base) {
+    const auto old_count = base.positions.size(), added = node_count - old_count;
     std::vector<size_t> slots(added, 0), indegree(added, 0);
     std::vector<std::vector<size_t>> successors(added);
-    for (const auto & edge : graph.edges) {
+    for (const auto & edge : edges) {
         if (edge.src < old_count && edge.dst < old_count) {
             if (base.positions[edge.src] >= base.positions[edge.dst]) return {};
         }
@@ -440,11 +441,11 @@ std::shared_ptr<const DagTopologicalOrder> extend_order(const ProspectiveGraph &
         }
     }
     if (ready.size() != added) return {};
-    for (const auto & edge : graph.edges)
+    for (const auto & edge : edges)
         if (edge.src >= old_count && edge.dst < old_count && slots[edge.src - old_count] > base.positions[edge.dst]) return {};
 
     auto result = std::make_shared<DagTopologicalOrder>();
-    result->nodes.reserve(graph.active_nodes.size());
+    result->nodes.reserve(node_count);
     std::ranges::stable_sort(ready, {}, [&](size_t id) { return slots[id]; });
     size_t next = 0;
     for (size_t slot = 0; slot <= old_count; ++slot) {
@@ -480,7 +481,8 @@ PreparedDagMutation prepare_dag_mutation(const DagGraph & graph, const DagMutati
         order = graph.topological_order();
     }
     if (order) {
-        auto extended = prospective.active_nodes.size() == graph.node_count() ? order : extend_order(prospective, *order);
+        auto extended =
+            prospective.active_nodes.size() == graph.node_count() ? order : extend_order(prospective.active_nodes.size(), prospective.edges, *order);
         if (prospective.active_nodes.size() == graph.node_count())
             for (const auto & edge : prospective.edges)
                 if (order->positions[edge.src] >= order->positions[edge.dst]) {
@@ -522,10 +524,48 @@ std::string failure_message(const DagTopologyValidationReport & report) {
 
 } // namespace dag_mutation_detail
 
+std::shared_ptr<const DagTopologicalOrder> DagGraph::topological_order() const {
+    if (!topological_order_ || (edited_edges_.empty() && topological_order_->positions.size() == node_count())) return topological_order_;
+
+    // Direct boundary insertion is also a graph edit. Resolve its small delta
+    // before another atomic plan, instead of forgetting the proven source order.
+    std::ranges::sort(edited_edges_);
+    edited_edges_.erase(std::unique(edited_edges_.begin(), edited_edges_.end()), edited_edges_.end());
+    std::vector<dag_mutation_detail::VirtualEdge> edits;
+    edits.reserve(edited_edges_.size());
+    bool valid = true;
+    for (const auto id : edited_edges_) {
+        const auto & changed = edge(id);
+        if (!changed.active) continue;
+        if (changed.src >= node_count() || changed.dst >= node_count() || !node(changed.src).active || !node(changed.dst).active
+            || changed.src == changed.dst) {
+            valid = false;
+            break;
+        }
+        if (changed.kind == DagEdgeKind::Mutation || !changed.effect_id().empty()) {
+            const auto index = adjacency();
+            for (const auto other : index->outgoing(changed.src)) {
+                if (other == id) continue;
+                const auto & candidate = edge(other);
+                if (candidate.dst == changed.dst && candidate.kind == changed.kind && candidate.effect_id() == changed.effect_id()) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid) break;
+        edits.push_back({ changed.src, changed.dst, changed.kind, std::string(changed.effect_id()) });
+    }
+    topological_order_ = valid ? dag_mutation_detail::extend_order(node_count(), edits, *topological_order_) : nullptr;
+    edited_edges_.clear();
+    return topological_order_;
+}
+
 DagTopologyValidationReport validate_active_dag(const DagGraph & graph) {
     std::shared_ptr<const DagTopologicalOrder> order;
     auto result = dag_mutation_detail::validate_graph_storage(graph, &order);
     graph.topological_order_ = std::move(order);
+    graph.edited_edges_.clear();
     return result;
 }
 

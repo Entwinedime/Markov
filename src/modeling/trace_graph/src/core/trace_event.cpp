@@ -230,6 +230,13 @@ void TraceEvent::set_args_json_slice(std::shared_ptr<const std::string> buffer, 
     arg_layers_.reset();
 }
 
+void TraceEvent::share_args(std::shared_ptr<const TraceArgMap> args) {
+    if (!arg_layers_) arg_layers_ = std::make_unique<std::vector<TraceArgLayer>>();
+    arg_layers_->push_back({ .overrides = std::move(args) });
+    args_materialized_ = false;
+    args_.reset();
+}
+
 std::string_view TraceEvent::args_json_view() const {
     if (args_buffer_ && args_offset_ <= args_buffer_->size() && args_length_ <= args_buffer_->size() - args_offset_) {
         return std::string_view(args_buffer_->data() + args_offset_, args_length_);

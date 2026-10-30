@@ -123,7 +123,8 @@ HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources
                                                     page_bytes_,
                                                     1,
                                                     "write",
-                                                    write_back_);
+                                                    write_back_,
+                                                    compact_programs_);
     bind_host_operations(generated.plan, generated.operations, operator_provider_);
     const auto lanes = generated.plan.resource_lanes(*graph_);
     const auto service_us = io_completion_.duration("write_device_to_host", page_bytes_, bytes / page_bytes_, 0);

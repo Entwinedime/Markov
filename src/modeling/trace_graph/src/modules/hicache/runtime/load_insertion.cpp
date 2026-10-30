@@ -17,7 +17,7 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
             throw std::runtime_error("Generated load replacement lacks exact call boundaries");
         hosts.push_back(observe_host_template(source, record.pid, record.tid, record.source_start_us, record.source_end_us));
         if (!loads_[i].layers.empty()) continue;
-        auto empty = prepare_host_expansion(source, queues, hosts.back(), "original empty load: ");
+        auto empty = prepare_host_expansion(source, queues, hosts.back(), "original empty load: ", { .compact = compact_programs_ });
         if (!hosts.back().worker_nodes.empty() || !empty.streams.empty() || !empty.waits.empty() || !empty.event_waits.empty())
             throw std::runtime_error("Empty load cost contains device or worker work");
         // Only the exact unchanged call migrates its source cost. Another

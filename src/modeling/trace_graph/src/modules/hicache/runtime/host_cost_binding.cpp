@@ -15,8 +15,8 @@ void bind_worker_segment(core::DagSyntheticNodeSpec & worker, uint64_t service_u
 
 void bind_host_operation(HiCacheHostExpansion & plan, const HostOperationSlots & slots, const cost::HostOperationCost & cost, std::string_view source) {
     auto & main = plan.nodes[slots.main].work;
-    main.duration = cost.main_us;
-    main.cpu_gap_after = cost.main_residual_us;
+    main.duration = core::checked_multiply_u64(cost.main_us, slots.main_repetitions, "Repeated caller service overflow");
+    main.cpu_gap_after = core::checked_multiply_u64(cost.main_residual_us, slots.main_repetitions, "Repeated caller residual overflow");
     main.attrs["cost_binding_source"] = source;
 
     if (slots.worker) {

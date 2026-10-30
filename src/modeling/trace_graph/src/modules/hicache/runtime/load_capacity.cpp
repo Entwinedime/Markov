@@ -83,7 +83,7 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
     std::map<size_t, uint64_t> remaining_gaps;
     std::map<std::string, std::pair<EmptyLoadBranch, Call>> pending;
     for (const auto & [branch, host] : hosts) {
-        auto original = prepare_host_expansion(source, queues, host, "no host load: ");
+        auto original = prepare_host_expansion(source, queues, host, "no host load: ", { .compact = compact_programs_ });
         if (!host.worker_nodes.empty() || !original.streams.empty() || !original.waits.empty() || !original.event_waits.empty())
             throw std::runtime_error("Inactive host-load branch contains device or worker work");
         const auto first = branch->entry_node;

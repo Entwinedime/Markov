@@ -157,18 +157,29 @@ void HiCacheWriteStreamInsertions::constrain_synchronizations(size_t lane, const
 
 
 namespace {
-HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::span<const HiCacheHostExpansion::Node> work,
-                                     std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
-                                     std::optional<size_t> previous_host_return, std::span<const size_t> event_completions) {
+HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+                                     std::optional<size_t> previous_host_return, std::span<const size_t> event_completions,
+                                     std::span<const size_t> extra_observers = {}) {
     if (event_completions.size() != plan.event_waits.size()) throw std::invalid_argument("Host expansion requires explicit target event completions");
     if (positions.size() != plan.streams.size() + plan.waits.size()) throw std::invalid_argument("Host expansion requires resolved stream and wait positions");
 
-    std::vector<size_t> nodes(work.size(), core::DagNode::kNoNode);
-    for (size_t i = 0; i < work.size(); ++i) {
-        const auto & node = work[i];
-        if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(node.work, nodes.at(*node.task_predecessor));
-        else if (node.submission) nodes[i] = future.append_cpu_task(node.work, nodes.at(*node.submission), *node.queue_member);
-        else nodes[i] = future.append(node.work);
+    std::vector<bool> observers(plan.nodes.size(), false);
+    observers.at(plan.host_return) = true;
+    for (const auto & stream : plan.streams) {
+        observers.at(stream.first) = true;
+        observers.at(stream.last) = true;
+    }
+    for (const auto * waits : { &plan.waits, &plan.event_waits, &plan.collective_completions })
+        for (const auto & wait : *waits) observers.at(wait.consumer) = true;
+    for (const auto local : extra_observers) observers.at(local) = true;
+
+    std::vector<size_t> nodes(plan.nodes.size(), core::DagNode::kNoNode);
+    for (size_t i = 0; i < plan.nodes.size(); ++i) {
+        const auto & node = plan.nodes[i];
+        const bool observe = observers[i] || node.observe_start;
+        if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(node.work, nodes.at(*node.task_predecessor), observe);
+        else if (node.submission) nodes[i] = future.append_cpu_task(node.work, nodes.at(*node.submission), *node.queue_member, observe);
+        else nodes[i] = future.append(node.work, simulation::BoundaryOrder::Ordinary, std::nullopt, observe);
     }
 
     for (const auto & edge : plan.edges) future.depend(nodes.at(edge.from), nodes.at(edge.to), edge.kind);
@@ -190,7 +201,7 @@ HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::spa
 
 HiCacheExpandedHost expand_host(const HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
                                 std::optional<size_t> previous_host_return, std::span<const size_t> event_completions) {
-    return expand_host_work(plan, plan.nodes, positions, future, previous_host_return, event_completions);
+    return expand_host_work(plan, positions, future, previous_host_return, event_completions);
 }
 
 void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us) {
@@ -210,7 +221,8 @@ void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us) {
 
 HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
                                   std::optional<size_t> previous_host_return) {
-    auto host = expand_host_work(plan, plan.nodes, positions, future, previous_host_return, {});
+    const size_t observers[]{ plan.write_start, plan.completion };
+    auto host = expand_host_work(plan, positions, future, previous_host_return, {}, observers);
     return { host.host_return, host.nodes.at(plan.write_start), host.nodes.at(plan.completion), std::move(host.stream_tails), std::move(host.nodes) };
 }
 

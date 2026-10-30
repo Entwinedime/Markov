@@ -121,7 +121,7 @@ GeneratedLayerWait generate_layer_wait(const core::DagGraph & graph, size_t main
 
 GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph & graph, size_t main, size_t worker, size_t compute, size_t transfer_stream,
                                                            size_t pages, uint64_t page_bytes, size_t completion_count, std::string_view operation,
-                                                           bool write_back) {
+                                                           bool write_back, bool compact_copies) {
     if (!pages || !completion_count || !page_bytes || page_bytes % 2 || graph.node(compute).lane_id == graph.node(transfer_stream).lane_id
         || graph.node(transfer_stream).is_cpu || graph.node(main).gpu_id != graph.node(transfer_stream).gpu_id || !graph.node(main).is_cpu
         || !graph.node(worker).is_cpu || graph.node(compute).is_cpu || graph.node(main).lane_id == graph.node(worker).lane_id
@@ -189,19 +189,54 @@ GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph 
 
     const auto first_copy = declare_work("first_copy");
     const auto copy = declare_work("copy");
-    for (size_t page = 0; page < pages; ++page) {
-        for (size_t kv = 0; kv < 2; ++kv) {
-            (void)operation_cpu(page == 0 && kv == 0 ? first_copy : copy, prefix + " K/V page submission");
-            const auto submit = cpu(prefix + " K/V page submitted");
-            const auto transfer = plan.nodes.size();
-            plan.nodes.push_back({
-                { .name = prefix + " K/V page transfer", .category = "hicache_patch", .is_cpu = false, .lane_key = transfer_lane }
-            });
-            plan.edges.push_back({ submit, transfer, core::DagEdgeKind::Mutation });
-            plan.edges.push_back({ *previous_device, transfer, core::DagEdgeKind::Stream });
-            plan.payload.emplace(transfer, page_bytes / 2);
-            plan.payload_bytes = core::checked_add_u64(plan.payload_bytes, page_bytes / 2, "Transfer payload overflow");
-            previous_device = transfer;
+    const auto payload_bytes = core::checked_multiply_u64(pages, page_bytes, "Transfer payload overflow");
+    if (compact_copies) {
+        const auto copies = core::checked_multiply_u64(pages, 2, "K/V copy count overflow");
+        (void)operation_cpu(first_copy, prefix + " K/V page submission");
+        const auto first_submitted = cpu(prefix + " K/V page submitted");
+        const auto repeated = operation_cpu(copy, prefix + " K/V page submission");
+        result.operations[copy].slots.back().main_repetitions = copies - 1;
+        plan.nodes[repeated].work.attrs["repeated_operations"] = std::to_string(copies - 1);
+        const auto last_submitted = cpu(prefix + " K/V page submitted");
+        const auto before_last = plan.nodes.size();
+        plan.nodes.push_back({
+            { .name = prefix + " K/V page transfer",
+             .category = "hicache_patch",
+             .is_cpu = false,
+             .lane_key = transfer_lane,
+             .attrs = { { "repeated_operations", std::to_string(copies - 1) } } }
+        });
+        const auto last = plan.nodes.size();
+        plan.nodes.push_back({
+            { .name = prefix + " K/V page transfer", .category = "hicache_patch", .is_cpu = false, .lane_key = transfer_lane }
+        });
+        // A serial caller and stream form a tandem pipeline. With constant
+        // repeat intervals and cumulative byte rounding, the first and last
+        // submissions bound completion; no internal copy has an external port.
+        plan.edges.push_back({ first_submitted, before_last, core::DagEdgeKind::Mutation });
+        plan.edges.push_back({ *previous_device, before_last, core::DagEdgeKind::Stream });
+        plan.edges.push_back({ before_last, last, core::DagEdgeKind::Stream });
+        plan.edges.push_back({ last_submitted, last, core::DagEdgeKind::Mutation });
+        plan.payload.emplace(before_last, payload_bytes - page_bytes / 2);
+        plan.payload.emplace(last, page_bytes / 2);
+        plan.payload_bytes = payload_bytes;
+        previous_device = last;
+    }
+    else {
+        for (size_t page = 0; page < pages; ++page) {
+            for (size_t kv = 0; kv < 2; ++kv) {
+                (void)operation_cpu(page == 0 && kv == 0 ? first_copy : copy, prefix + " K/V page submission");
+                const auto submit = cpu(prefix + " K/V page submitted");
+                const auto transfer = plan.nodes.size();
+                plan.nodes.push_back({
+                    { .name = prefix + " K/V page transfer", .category = "hicache_patch", .is_cpu = false, .lane_key = transfer_lane }
+                });
+                plan.edges.push_back({ submit, transfer, core::DagEdgeKind::Mutation });
+                plan.edges.push_back({ *previous_device, transfer, core::DagEdgeKind::Stream });
+                plan.payload.emplace(transfer, page_bytes / 2);
+                plan.payload_bytes = core::checked_add_u64(plan.payload_bytes, page_bytes / 2, "Transfer payload overflow");
+                previous_device = transfer;
+            }
         }
     }
 
@@ -215,6 +250,7 @@ GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph 
         plan.edges.push_back({ *previous_device, record, core::DagEdgeKind::Stream });
         previous_device = record;
         result.completion_records.push_back(record);
+        plan.nodes[record].observe_start = true;
     }
     plan.completion = *previous_device;
     plan.streams.push_back({ transfer_stream, wait, plan.completion });

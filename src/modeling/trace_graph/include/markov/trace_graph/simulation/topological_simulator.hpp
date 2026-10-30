@@ -22,6 +22,7 @@ namespace markov::trace_graph::simulation {
 struct SimulationResult {
     uint64_t e2e_us = 0;
     size_t processed_nodes = 0;
+    size_t expansion_callbacks = 0;
     size_t cpu_queue_count = 0;
     size_t cpu_task_count = 0;
     size_t max_cpu_queue_depth = 0;
@@ -34,6 +35,8 @@ struct SimulationResult {
 [[nodiscard]] inline uint64_t topological_edge_delay_us(const core::DagNode & source, core::DagEdgeKind kind) noexcept {
     constexpr uint64_t kMaxPlausibleCpuGapUs = 1'000'000'000;
     if (kind != core::DagEdgeKind::Sequential || !source.is_cpu) return 0;
+    // The observed-gap sanity cap must not truncate a modeled aggregate.
+    if (source.kind == core::DagNodeKind::Synthetic && !source.observed_cpu_coordinates) return source.cpu_gap_after;
     return source.cpu_gap_after <= kMaxPlausibleCpuGapUs ? source.cpu_gap_after : 0;
 }
 
@@ -67,21 +70,25 @@ enum class BoundaryOrder { Ordinary, AfterConcurrentStarts };
 class FutureDag {
 public:
     virtual ~FutureDag() = default;
+    /** Pending work and the current expansion may still bind their costs. */
+    [[nodiscard]] virtual bool can_bind_cost(size_t node) const = 0;
     // A zero-cost observation may run after ordinary starts at the same time.
     // This resolves simultaneous state changes without adding artificial time.
     // owner optionally supplies rank/PID for multi-rank work emitted together;
     // it does not add an execution dependency. The current boundary still does.
-    virtual size_t append(const core::DagSyntheticNodeSpec & node, BoundaryOrder order = BoundaryOrder::Ordinary,
-                          std::optional<size_t> owner = std::nullopt) = 0;
+    // Private program steps may skip expansion observation; costs, dependencies
+    // and queue execution are unchanged. Exported state boundaries must observe.
+    virtual size_t append(const core::DagSyntheticNodeSpec & node, BoundaryOrder order = BoundaryOrder::Ordinary, std::optional<size_t> owner = std::nullopt,
+                          bool observe_start = true) = 0;
     /** Add one measured task to an existing recognized worker FIFO. The unique
      * cross-thread submission must not have completed. queue_member proves
      * the worker identity; no observed task or queue order is overwritten. */
-    virtual size_t append_cpu_task(const core::DagSyntheticNodeSpec & node, size_t submission, size_t queue_member) = 0;
+    virtual size_t append_cpu_task(const core::DagSyntheticNodeSpec & node, size_t submission, size_t queue_member, bool observe_start = true) = 0;
     /** Extend an unstarted generated task after its current last member.
      * Keeps the same submission/FIFO ownership; only the first member carries
      * dispatch delay. The queue is released after the new last member, allowing
      * device launches from earlier members without releasing the worker. */
-    virtual size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & node, size_t previous) = 0;
+    virtual size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & node, size_t previous, bool observe_start = true) = 0;
     virtual void depend(size_t predecessor, size_t successor, core::DagEdgeKind kind = core::DagEdgeKind::Mutation) = 0;
 };
 using ExpandAtStart = std::function<void(size_t node_id, uint64_t start_us, FutureDag & future)>;

@@ -21,11 +21,12 @@ namespace markov::trace_graph::modules::hicache::runtime {
 class HiCachePhaseCalls {
 public:
     HiCachePhaseCalls(HiCacheLayerCalls & layers, HiCacheWriteStreamInsertions & insertions, const structure::hicache::SchedulerComputeResources & resources,
-                      cost::OperatorCostProvider & provider)
+                      cost::OperatorCostProvider & provider, bool compact_programs)
         : layers_(layers),
           insertions_(insertions),
           resources_(resources),
-          provider_(provider) {}
+          provider_(provider),
+          compact_programs_(compact_programs) {}
 
     void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::AttentionCall> calls,
               std::span<const adapters::sglang::AttentionMetadataCall> metadata, std::span<const adapters::sglang::DenseCall> dense, uint64_t begin_us,
@@ -51,6 +52,7 @@ private:
     HiCacheWriteStreamInsertions & insertions_;
     const structure::hicache::SchedulerComputeResources & resources_;
     cost::OperatorCostProvider & provider_;
+    bool compact_programs_;
     std::map<size_t, Call> calls_;
     std::map<size_t, structure::hicache::PhaseCallPlan> work_;
     std::set<size_t> owned_;

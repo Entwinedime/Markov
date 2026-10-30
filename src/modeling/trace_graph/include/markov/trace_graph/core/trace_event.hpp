@@ -116,6 +116,9 @@ struct TraceEvent {
     /** @brief Points args at a reader-owned buffer slice instead of copying the source text. */
     void set_args_json_slice(std::shared_ptr<const std::string> buffer, const TraceByteRange & range);
 
+    /** Share immutable argument defaults; node-local overrides retain precedence. */
+    void share_args(std::shared_ptr<const TraceArgMap> args);
+
     /** @brief Returns raw args for marker checks and single-key lazy parsing. */
     [[nodiscard]] std::string_view args_json_view() const;
 

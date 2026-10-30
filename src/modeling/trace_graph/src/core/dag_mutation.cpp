@@ -290,6 +290,7 @@ DagMutationResult apply_dag_mutation_plan(DagGraph & graph, const DagMutationPla
     if (result.journal.active_nodes_after != prospective.active_node_count || result.journal.active_edges_after != prospective.active_edge_count)
         throw std::logic_error("DAG mutation application differs from its validated node/edge counts");
     graph.topological_order_ = prepared.order;
+    graph.edited_edges_.clear();
     result.prospective_active_node_count = prospective.active_node_count;
     result.prospective_active_edge_count = prospective.active_edge_count;
 #ifdef DEBUG

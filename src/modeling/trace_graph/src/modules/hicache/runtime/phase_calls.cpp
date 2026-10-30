@@ -9,6 +9,7 @@
 #include "markov/trace_graph/structure/missing_work.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <utility>
@@ -18,15 +19,16 @@ namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
 
 void describe_phase_call(HiCacheHostExpansion & plan, const structure::hicache::PhaseCallPlan & work) {
-    for (auto & node : plan.nodes) {
-        auto & attributes = node.work.attrs;
-        attributes["phase_tensor_request_id"] = work.request_id;
-        attributes["phase_tensor_logical_input"] = std::to_string(work.logical_input);
-        attributes["phase_tensor_phase"] = work.decode_iteration ? "decode" : "prefill";
-        attributes["phase_tensor_call_kind"] = work.call_kind;
-        if (work.decode_iteration) attributes["phase_tensor_iteration"] = std::to_string(*work.decode_iteration);
-        if (work.layer_index) attributes["phase_tensor_layer"] = std::to_string(*work.layer_index);
-    }
+    core::TraceArgMap attributes{
+        {    "phase_tensor_request_id",                              work.request_id },
+        { "phase_tensor_logical_input",           std::to_string(work.logical_input) },
+        {         "phase_tensor_phase", work.decode_iteration ? "decode" : "prefill" },
+        {     "phase_tensor_call_kind",                               work.call_kind }
+    };
+    if (work.decode_iteration) attributes["phase_tensor_iteration"] = std::to_string(*work.decode_iteration);
+    if (work.layer_index) attributes["phase_tensor_layer"] = std::to_string(*work.layer_index);
+    const auto description = std::make_shared<const core::TraceArgMap>(std::move(attributes));
+    for (auto & node : plan.nodes) node.work.shared_attrs = description;
 }
 
 void inherit_collective_completions(const core::DagGraph & graph, const HiCacheHostExpansion & original, HiCacheHostExpansion & generated) {
@@ -103,7 +105,11 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
         }
         std::vector<size_t> callbacks;
         for (const auto & check : checks) callbacks.push_back(check.anchor);
-        auto retained = prepare_host_expansion(source, queues, hosts.back(), "retained phase work: ", callbacks, true);
+        auto retained = prepare_host_expansion(source,
+                                               queues,
+                                               hosts.back(),
+                                               "retained phase work: ",
+                                               { .callback_points = callbacks, .retain_collective_completions = true, .compact = compact_programs_ });
         std::map<size_t, std::vector<size_t>> source_members;
         for (const auto & [original_node, copied_node] : retained.source_nodes) source_members[copied_node].push_back(original_node);
         for (const auto & [copied_node, members] : source_members)

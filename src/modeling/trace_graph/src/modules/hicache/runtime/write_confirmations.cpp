@@ -50,6 +50,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
         if (step.completed_batch) {
             plan.event_waits.push_back({ core::DagNode::kNoNode, main });
             generated.acknowledgements.push_back(returned);
+            plan.nodes[returned].observe_start = true;
         }
         HostOperationSlots slots{ .main = main };
         cost::OperationCostRequest request{ .work = step.work };

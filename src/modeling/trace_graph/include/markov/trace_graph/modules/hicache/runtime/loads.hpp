@@ -29,8 +29,9 @@ class HiCacheLoads {
 public:
     explicit HiCacheLoads(HiCacheWriteStreamInsertions & insertions, const frontend::HiCacheConfig & config,
                           const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider,
-                          const structure::hicache::IoCompletionProvider & completion)
+                          const structure::hicache::IoCompletionProvider & completion, bool compact_programs)
         : page_bytes_(config.kv_bytes_per_page),
+          compact_programs_(compact_programs),
           io_completion_(completion),
           operator_provider_(provider),
           compute_resources_(compute_resources),
@@ -60,6 +61,7 @@ private:
     std::map<std::pair<std::string, std::string>, GeneratedSubmission> generated_submissions_;
     core::DagGraph * graph_ = nullptr;
     uint64_t page_bytes_ = 0;
+    bool compact_programs_;
     structure::hicache::IoCompletionProvider io_completion_;
     cost::OperatorCostProvider & operator_provider_;
     const structure::hicache::SchedulerComputeResources & compute_resources_;

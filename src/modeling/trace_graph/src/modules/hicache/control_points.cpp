@@ -83,7 +83,7 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
             if (previous) graph.add_edge(*previous, prefix, core::DagEdgeKind::Sequential);
             else
                 for (const auto edge : source.incoming_edge_ids(id))
-                    if (graph.edge(edge).active) graph.mutable_edge(edge).dst = prefix;
+                    if (graph.edge(edge).active) graph.redirect_edge_target(edge, prefix);
             const auto boundary = graph.add_synthetic_node({
                 .name = points[indices.front()].name + ".point",
                 .category = "observed_boundary",

@@ -49,13 +49,14 @@ public:
     }
     HiCacheWriteCalls(model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, HiCacheWriteStreamInsertions & insertions,
                       const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider,
-                      const structure::hicache::IoCompletionProvider & completion)
+                      const structure::hicache::IoCompletionProvider & completion, bool compact_programs)
         : replay_(replay),
           writes_(replay.state()),
           stream_insertions_(insertions),
           page_size_(config.page_size),
           page_bytes_(config.kv_bytes_per_page),
           write_back_(config.write_policy == "write_back"),
+          compact_programs_(compact_programs),
           allocator_need_sort_(config.device_allocator_need_sort),
           operator_provider_(provider),
           io_completion_(completion),
@@ -191,6 +192,7 @@ private:
     uint64_t page_size_;
     uint64_t page_bytes_;
     bool write_back_;
+    bool compact_programs_;
     bool allocator_need_sort_ = false;
     cost::OperatorCostProvider & operator_provider_;
     structure::hicache::IoCompletionProvider io_completion_;

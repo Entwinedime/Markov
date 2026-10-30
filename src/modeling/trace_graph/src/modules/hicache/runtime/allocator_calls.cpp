@@ -133,7 +133,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
                                                   fact.decode_iterations[request] });
             }
         }
-        auto retained = prepare_host_expansion(source, queues, hosts.back(), "retained allocator: ");
+        auto retained = prepare_host_expansion(source, queues, hosts.back(), "retained allocator: ", { .compact = compact_programs_ });
         std::map<size_t, std::vector<size_t>> original_nodes;
         for (const auto & [original_node, copied_node] : retained.source_nodes) original_nodes[copied_node].push_back(original_node);
         for (const auto & [copied_node, members] : original_nodes)

@@ -47,6 +47,8 @@ struct HiCacheHostExpansion {
         std::optional<size_t> submission, queue_member;
         // Local previous member of the same task; never a second FIFO job.
         std::optional<size_t> task_predecessor;
+        // Additional state callbacks inside an otherwise private program.
+        bool observe_start = false;
     };
     struct Edge {
         size_t from, to;
@@ -122,16 +124,21 @@ void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size
  * callback points inside the same interval. These points retain a source_nodes
  * correspondence so the caller can move nested execution callbacks after
  * expansion; they do not imply migration of the callback's modeled work.
- * Worker members remain distinct so intermediate device launches retain their
- * predecessors. A task has one dispatch delay and holds its queue until its tail.
+ * Dispatch, device launches and queue release remain explicit. Optional
+ * compaction joins only private serial CPU segments within the same task.
  * retain_collective_completions opts into exact external HCCL dependencies;
  * its caller must hand them over during removal and preserve their source
  * nodes through expansion, including when generating different tensor work.
  */
+struct HostExpansionOptions {
+    std::span<const size_t> callback_points;
+    bool retain_collective_completions = false;
+    bool compact = false;
+};
+
 [[nodiscard]] HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                           const HiCacheHostTemplate & host,
-                                                          std::string_view prefix = "target control: ", std::span<const size_t> callback_points = {},
-                                                          bool retain_collective_completions = false);
+                                                          std::string_view prefix = "target control: ", HostExpansionOptions options = {});
 [[nodiscard]] HiCacheWriteExpansion prepare_write_expansion(const adapters::sglang::HiCacheSourceIndex & source,
                                                             const simulation::detail::CpuTaskQueues & queues, const patch::HiCacheIoOperationRecord & write,
                                                             const HiCacheHostTemplate & host, size_t completion);

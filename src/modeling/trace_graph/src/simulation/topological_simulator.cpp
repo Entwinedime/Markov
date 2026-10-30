@@ -146,6 +146,7 @@ public:
           cost_at_start_(std::move(cost_at_start)),
           expand_at_start_(std::move(expand_at_start)),
           execution_(storage_.node_ids.size(), Execution::Pending),
+          observe_start_(storage_.node_ids.size(), true),
           ready_generation_(storage_.node_ids.size(), 0),
           chronological_(!queues_.tasks.empty() || static_cast<bool>(cost_at_start_) || static_cast<bool>(expand_at_start_)) {
         ready_.reserve(active_node_count_);
@@ -288,7 +289,8 @@ private:
         if (!chronological_)
             start_time_[node_slot(node_id)] =
                 core::checked_add_u64(start_time_[node_slot(node_id)], effective_ready_delay(nodes_[node_id]), "DAG CPU ready-delay overflow");
-        if (expand_at_start_) {
+        if (expand_at_start_ && observe_start_[node_slot(node_id)]) {
+            ++result_.expansion_callbacks;
             expanding_node_ = node_id;
             expand_at_start_(node_id, start_time_[node_slot(node_id)], *this);
             expanding_node_ = kInvalidNode;
@@ -323,7 +325,9 @@ private:
         if (storage_.indegree[node_slot(dst)] == 0) make_ready(dst);
     }
 
-    size_t append(const core::DagSyntheticNodeSpec & spec, BoundaryOrder order, std::optional<size_t> owner) override {
+    bool can_bind_cost(size_t id) const override { return !graph_.node(id).active || id == expanding_node_ || execution_[node_slot(id)] == Execution::Pending; }
+
+    size_t append(const core::DagSyntheticNodeSpec & spec, BoundaryOrder order, std::optional<size_t> owner, bool observe_start) override {
         if (expanding_node_ == kInvalidNode || spec.cpu_task_ready_delay_us)
             throw std::invalid_argument("Future work requires an active expansion and explicit dependencies, not a new native CPU task");
         if (order == BoundaryOrder::AfterConcurrentStarts && (spec.duration || spec.cpu_gap_after))
@@ -341,6 +345,7 @@ private:
         start_time_.push_back(0);
         completion_time_.push_back(0);
         execution_.push_back(Execution::Pending);
+        observe_start_.push_back(observe_start);
         ready_generation_.push_back(0);
         queues_.node_task.push_back(kInvalidNode);
         queues_.submitted_task.push_back(kInvalidNode);
@@ -349,7 +354,7 @@ private:
         return id;
     }
 
-    size_t append_cpu_task(const core::DagSyntheticNodeSpec & spec, size_t submission, size_t queue_member) override {
+    size_t append_cpu_task(const core::DagSyntheticNodeSpec & spec, size_t submission, size_t queue_member, bool observe_start) override {
         if (expanding_node_ == kInvalidNode || !spec.is_cpu || spec.cpu_gap_after || submission >= nodes_.size() || queue_member >= nodes_.size()
             || !nodes_[submission].active || !nodes_[submission].is_cpu || execution_[node_slot(submission)] == Execution::Done
             || queues_.submitted_task[submission] != kInvalidNode || queues_.node_task[queue_member] == kInvalidNode || !spec.cpu_task_ready_delay_us)
@@ -360,7 +365,7 @@ private:
             throw std::invalid_argument("New CPU task must join the declared cross-thread worker on the same rank");
         auto plain = spec;
         plain.cpu_task_ready_delay_us.reset();
-        const auto id = append(plain, BoundaryOrder::Ordinary, submission);
+        const auto id = append(plain, BoundaryOrder::Ordinary, submission, observe_start);
         graph_.mutable_node(id).explicit_cpu_task = true;
         graph_.mutable_node(id).cpu_ready_delay_before = *spec.cpu_task_ready_delay_us;
         const auto task = queues_.tasks.size();
@@ -372,7 +377,7 @@ private:
         return id;
     }
 
-    size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & spec, size_t previous) override {
+    size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & spec, size_t previous, bool observe_start) override {
         if (previous >= nodes_.size() || !nodes_[previous].active || !nodes_[previous].explicit_cpu_task
             || execution_[node_slot(previous)] != Execution::Pending || !spec.is_cpu || spec.cpu_gap_after || spec.cpu_task_ready_delay_us
             || graph_.node_lane_key(previous) != spec.lane_key)
@@ -382,7 +387,7 @@ private:
             throw std::invalid_argument("CPU task continuation must extend the current last member");
 
         const auto submission = queues_.tasks[task_id].submission;
-        const auto id = append(spec, BoundaryOrder::Ordinary, submission);
+        const auto id = append(spec, BoundaryOrder::Ordinary, submission, observe_start);
         graph_.mutable_node(id).explicit_cpu_task = true;
         queues_.node_task[id] = task_id;
         queues_.tasks[task_id].last = id;
@@ -515,6 +520,7 @@ private:
     NodeCostAtStart cost_at_start_;
     ExpandAtStart expand_at_start_;
     std::vector<Execution> execution_;
+    std::vector<bool> observe_start_;
     std::vector<uint64_t> ready_generation_;
     std::unordered_set<size_t> deferred_boundaries_;
     std::unordered_map<size_t, std::vector<size_t>> added_outgoing_;
@@ -529,6 +535,7 @@ SimulationResult run_control_topological_simulation(core::DagGraph & graph) {
 }
 
 SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start, const ExpandAtStart & expand_at_start) {
+    graph.release_topological_order();
     return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::Full, cost_at_start, expand_at_start).run();
 }
 

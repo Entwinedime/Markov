@@ -26,6 +26,7 @@
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include "modules/hicache/runtime/source_preparation.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -35,6 +36,11 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
+
+bool compact_execution_programs(const simulation::NodeCostAtStart & transform) {
+    const auto * fine = std::getenv("TRACE_GRAPH_FINE_PROGRAMS");
+    return !transform && (!fine || std::string_view(fine) != "1");
+}
 
 /** One target owns its mutable graph, cache state, callbacks and cost bindings.
  * Source/config/HTTP inputs are borrowed for this synchronous run. Resource
@@ -53,17 +59,18 @@ public:
           begin_us_(begin_us),
           end_us_(end_us),
           final_cost_transform_(final_cost_transform),
+          compact_programs_(compact_execution_programs(final_cost_transform)),
           io_completion_(runtime::io_completion_provider(config.io_cost)),
           replay_(source_graph_, config, io_completion_, config.io_cost.storage_batch_pages, config.io_cost.resource_lanes, true, {}, prepared.input),
           source_calls_(prepared.phase_calls),
           preparation_source_(prepared.allocator),
           operator_provider_(config.operator_models),
-          loads_(stream_insertions_, config, compute_resources_.schedule, operator_provider_, io_completion_),
+          loads_(stream_insertions_, config, compute_resources_.schedule, operator_provider_, io_completion_, compact_programs_),
           layer_calls_(stream_insertions_, operator_provider_),
-          phase_calls_(layer_calls_, stream_insertions_, compute_resources_.forward, operator_provider_),
-          allocator_calls_(stream_insertions_, operator_provider_),
+          phase_calls_(layer_calls_, stream_insertions_, compute_resources_.forward, operator_provider_, compact_programs_),
+          allocator_calls_(stream_insertions_, operator_provider_, compact_programs_),
           confirmations_(operator_provider_),
-          writes_(replay_, config, stream_insertions_, compute_resources_.schedule, operator_provider_, io_completion_),
+          writes_(replay_, config, stream_insertions_, compute_resources_.schedule, operator_provider_, io_completion_, compact_programs_),
           write_confirmations_(operator_provider_, config.page_size, compute_resources_.schedule),
           storage_writes_(replay_.state(), config, io_completion_),
           layer_consumer_([this](const std::string & pid, uint64_t batch) -> const std::vector<size_t> & { return loads_.layer_consumer(pid, batch); }) {}
@@ -73,8 +80,8 @@ public:
 private:
     void prepare_source();
     nlohmann::json replace_source_regions();
-    void admit_fact_work(const model::HiCacheReplayFact & input);
-    void bind_phase_migrations(std::map<size_t, structure::CostMigration> operations);
+    void admit_fact_work(const model::HiCacheReplayFact & input, const simulation::FutureDag & future);
+    void bind_phase_migrations(std::map<size_t, structure::CostMigration> operations, const simulation::FutureDag & future);
     uint64_t estimate_node_cost(size_t node, uint64_t start_us, uint64_t duration);
     void expand_at_start(size_t node, uint64_t elapsed_us, simulation::FutureDag & future);
     void finish();
@@ -87,6 +94,7 @@ private:
     const core::ClientRequestChain & chain_;
     uint64_t begin_us_, end_us_;
     simulation::NodeCostAtStart final_cost_transform_;
+    bool compact_programs_;
     HiCacheWindowResult output_;
     structure::hicache::IoCompletionProvider io_completion_;
     model::HiCacheModelReplay replay_;
@@ -110,7 +118,8 @@ private:
     HiCacheLifecycleCalls lifecycles_;
     HiCacheLayerCalls::Consumer layer_consumer_;
     std::map<size_t, uint64_t> operator_costs_;
-    std::set<size_t> phase_cost_migrations_, started_;
+    std::set<size_t> phase_cost_migrations_;
+    size_t prepared_node_count_ = 0;
     size_t admitted_prefills_ = 0, admitted_allocations_ = 0;
 };
 
@@ -121,6 +130,7 @@ HiCacheWindowResult HiCacheExecution::run() {
     metrics.checkpoint("source_observations_and_binding");
 
     auto replacement_phases = replace_source_regions();
+    prepared_node_count_ = graph_.node_count();
     metrics.checkpoint("source_region_replacement");
 
     output_.simulation = simulation::run_topological_simulation(
@@ -132,6 +142,9 @@ HiCacheWindowResult HiCacheExecution::run() {
     finish();
     metrics.checkpoint("execution_accounting");
     output_.performance = metrics.report();
+    output_.performance["compact_programs"] = compact_programs_;
+    output_.performance["executed_nodes"] = output_.simulation.processed_nodes;
+    output_.performance["expansion_callbacks"] = output_.simulation.expansion_callbacks;
     output_.performance["source_replacement_phases"] = std::move(replacement_phases);
     output_.performance["operator_queries_nested"] = operator_provider_.performance();
     return std::move(output_);
@@ -223,7 +236,7 @@ nlohmann::json HiCacheExecution::replace_source_regions() {
     return metrics.phases();
 }
 
-void HiCacheExecution::admit_fact_work(const model::HiCacheReplayFact & input) {
+void HiCacheExecution::admit_fact_work(const model::HiCacheReplayFact & input, const simulation::FutureDag & future) {
     ++output_.consumed_facts;
     const auto & phase_work = replay_.current_phase_work();
     if (admitted_allocations_ < phase_work.allocator_calls.size()) {
@@ -283,11 +296,11 @@ void HiCacheExecution::admit_fact_work(const model::HiCacheReplayFact & input) {
         }
 
         auto operations = structure::hicache::phase_migration_candidates(source_graph_, source_phase, prefill, decode);
-        bind_phase_migrations(std::move(operations));
+        bind_phase_migrations(std::move(operations), future);
     }
 }
 
-void HiCacheExecution::bind_phase_migrations(std::map<size_t, structure::CostMigration> operations) {
+void HiCacheExecution::bind_phase_migrations(std::map<size_t, structure::CostMigration> operations, const simulation::FutureDag & future) {
     std::erase_if(operations, [this](const auto & item) {
         return phase_calls_.owns(item.first) || allocator_calls_.owns(item.first) || collective_services_.owns(item.first);
     });
@@ -299,16 +312,21 @@ void HiCacheExecution::bind_phase_migrations(std::map<size_t, structure::CostMig
 
         // Unchanged CPU work may already have executed. A no-op is
         // not a retroactive update; actual changes are.
-        const auto bound_duration = started_.contains(cost.node_id) && final_cost_transform_
+        const bool started = !future.can_bind_cost(cost.node_id);
+        const auto bound_duration = started && final_cost_transform_
                                         ? final_cost_transform_(cost.node_id, graph_.node(cost.node_id).simulation_start, cost.duration_us)
                                         : cost.duration_us;
         if (bound_duration == graph_.node(cost.node_id).duration) continue;
-        if (started_.contains(cost.node_id)) throw std::runtime_error("Phase admitted after an operator already started");
+        if (started) throw std::runtime_error("Phase admitted after an operator already started");
         if (!operator_costs_.emplace(cost.node_id, cost.duration_us).second) throw std::runtime_error("Duplicate phase ownership");
     }
 }
 
 uint64_t HiCacheExecution::estimate_node_cost(size_t node, uint64_t start_us, uint64_t duration) {
+    // Dynamic programs already carry bound costs; collective/source overrides
+    // address only nodes prepared before execution. NodeScale still visits all.
+    if (node >= prepared_node_count_ && !final_cost_transform_) return duration;
+
     if (operator_costs_.contains(node)) duration = operator_costs_.at(node);
     if (const auto cost = collective_services_.caller_cost(graph_, node, operator_provider_)) duration = *cost;
     if (const auto cost = collective_services_.worker_cost(graph_, node, operator_provider_)) duration = *cost;
@@ -335,9 +353,9 @@ void HiCacheExecution::expand_at_start(size_t node, uint64_t elapsed_us, simulat
     for (const auto id : lifecycles_.advance(node, time, replay_)) {
         const auto & input = replay_.fact(id);
         writes_.applied(input);
-        if (input.consumed) admit_fact_work(input);
+        if (input.consumed) admit_fact_work(input, future);
     }
-    for (const auto id : writes_.advance(node, time, future)) admit_fact_work(replay_.fact(id));
+    for (const auto id : writes_.advance(node, time, future)) admit_fact_work(replay_.fact(id), future);
     waiting_.advance(node, time, future);
     confirmations_.advance(node, time, future);
     write_confirmations_.advance(node, time, replay_.state());
@@ -346,7 +364,7 @@ void HiCacheExecution::expand_at_start(size_t node, uint64_t elapsed_us, simulat
             const auto & input = replay_.fact(id);
             replay_.apply(id, time, node);
             writes_.applied(input);
-            if (input.consumed) admit_fact_work(input);
+            if (input.consumed) admit_fact_work(input, future);
         }
     loads_.advance(node, time, future);
     phase_calls_.advance(graph_, node, layer_consumer_, future);
@@ -354,7 +372,6 @@ void HiCacheExecution::expand_at_start(size_t node, uint64_t elapsed_us, simulat
     layer_calls_.advance(node, layer_consumer_, future);
     queries_.advance(node, time, future);
     storage_writes_.advance(node, time, future);
-    started_.insert(node);
 }
 
 void HiCacheExecution::finish() {
@@ -397,9 +414,9 @@ void HiCacheExecution::finish() {
 
     // Binding provenance is independent of whether a numerical override was
     // needed. Never infer migration merely from a surviving trace node.
-    for (const auto id : started_) {
-        const auto & node = graph_.node(id);
+    for (const auto & node : graph_.nodes()) {
         if (!node.active) continue;
+        const auto id = node.id;
 
         std::string origin = "unclassified";
         if (phase_cost_migrations_.contains(id)) origin = "phase_source_migration";

@@ -5,6 +5,7 @@
 #include "markov/trace_graph/modules/hicache/fact.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
+#include "modules/hicache/runtime/host_compaction.hpp"
 #include <algorithm>
 #include <set>
 #include <span>
@@ -175,8 +176,9 @@ std::vector<HiCacheEvictionRegion> observe_eviction_regions(const adapters::sgla
 }
 
 HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                            const HiCacheHostTemplate & host, std::string_view prefix, std::span<const size_t> callback_points,
-                                            bool retain_collective_completions) {
+                                            const HiCacheHostTemplate & host, std::string_view prefix, HostExpansionOptions options) {
+    const auto callback_points = options.callback_points;
+    const auto retain_collective_completions = options.retain_collective_completions;
     const auto & graph = source.graph();
     HiCacheHostExpansion plan;
     auto & mapped = plan.source_nodes;
@@ -388,6 +390,8 @@ HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourc
     // Main-thread pieces were copied in call order. Source node IDs can come
     // from different trace files, so they must not order queued event ACKs.
     std::ranges::stable_sort(plan.event_waits, {}, &HiCacheHostExpansion::Wait::consumer);
+    for (const auto point : callback_points) plan.nodes.at(plan.source_nodes.at(point)).observe_start = true;
+    if (options.compact) compact_host_program(plan, callback_points);
     return plan;
 }
 

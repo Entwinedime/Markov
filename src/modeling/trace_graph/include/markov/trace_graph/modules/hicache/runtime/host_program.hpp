@@ -31,6 +31,7 @@ struct HostOperationSlots {
     std::optional<size_t> worker_return;
     std::optional<size_t> tail;
     std::vector<DeviceLaunch> device_launches;
+    uint64_t main_repetitions = 1;
 };
 
 /** Bind a worker segment's service/residual interval in microseconds.
@@ -88,7 +89,7 @@ struct GeneratedTransferSubmission {
  */
 [[nodiscard]] GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
                                                                          size_t transfer_stream, size_t pages, uint64_t page_bytes, size_t completion_count,
-                                                                         std::string_view operation, bool write_back = false);
+                                                                         std::string_view operation, bool write_back = false, bool compact_copies = true);
 /** Bind a worker FIFO to an explicitly identified compute stream using this
  * main lane's submission -> worker -> device evidence. The target operation
  * itself need not have occurred in base; the caller supplies the compute role. */
