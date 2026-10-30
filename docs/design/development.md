@@ -121,7 +121,11 @@ scripts/model.sh prepare-costs --request <performance.json>
 
 自动 runtime 采样目前限 SGLang 模板负载，独立采集开启形状记录，CPU 服务仍需同源轻量依据。物理 I/O 使用 `physical_calibration` 或显式 `physical_capture`，声明页域、设备、CPU 放置、预算与 `physical_services`；不声明就不启动物理采样。现有物理采样器限 Ascend/page-first/file 路径。
 
-结果在 `performance_summary.json`，导出的 `cost_model.json` 可复用。ready 只对应声明模型；dry-run 不采集、入库或训练。独立模型的变量、公式、时间口径与外推规则见[性能模型](performance.md)。
+需要按已有工作覆盖减少采集时，`sampling_work` 按 suite 的 experiment ID 列出要补的操作，每项包含 `operation`、`implementation`、`timing_scope`、`features`；变量须与对应训练声明的回归和覆盖变量齐备。流程先从已有库训练适用响应，联合工作点已测且响应有效时跳过该采样任务，单纯落在每个变量的范围内不算联合覆盖。未声明的任务按显式采样执行，不声称已自动选出最小方案。采后仍缺声明工作就报告缺口、保留原始 trace，不按精度反复追加采样。
+
+结果在 `performance_summary.json`，导出的 `cost_model.json` 可复用。ready 只对应声明模型；dry-run 不采集、入库或训练。摘要记录采样选择、导入和训练墙钟；采集 manifest 分别记录服务启动、工作负载、profiler 导出与退出时间。启动及首请求可能包含编译/加载，首请求延迟不等于纯编译耗时。独立模型的变量、公式、时间口径与外推规则见[性能模型](performance.md)。
+
+新增的性能采集在全部提取、入库与训练检查成功后，默认只保留操作测量、CPU 校正、配置和必要报告，清理本次创建且位于运行目录内的原始 trace。`retain_raw_traces: true` 可保留完整采集。失败、未完成和外部共享目录不清理；已有采集及 base trace 不适用这条策略。删除原始 trace 后不能重新提取未保存的特征，需要时重新采集。
 
 ### 导入、替换、训练
 
@@ -142,9 +146,13 @@ scripts/model.sh cost-db inspect \
 
 没有 CPU 校正就省略该参数，样本保留 profiled 口径，不能冒充正常服务。物理和控制测量经 `--evidence` 导入；原始声明文件缺失要停止，不从旧系数反造样本。
 
+`--observations <rows.jsonl>` 接收每行一条完整操作测量，也支持 `.jsonl.gz`，不再接收整份 JSON 数组。运行时导出使用 `operator_observations_file` 与 `operator_observation_count` 引用测量流，小型独立 CPU 原语可以内嵌操作行。导入 profile 时，`--measurement-dir <directory>` 可保留包含来源、窗口、校正依据和精确操作行的 gzip 文件；`prepare-costs` 自动安排保留。多份 profile 逐采集提交事务，摘要记录已完成项；后续失败不撤回前面已提交的采集。
+
+每份采集的导入摘要另列提取/保留流加载、数据库导入、测量压缩时间和字节数。成本命令的 `*.metrics.json`（导入目录内为 `maintenance_metrics.json`）记录容器内墙钟与控制器内存峰值；外层准备时间另外包含容器启动。manifest 的导出后大小只统计本次 `run_dir/trace`，不计外部目录；它与外部定时采样的空间峰值、文件系统实际占用是不同指标，不能相互代替。自动 token 记录放在所选准备输出目录内，与完整采集分开保留。
+
 重复导入按原采集身份与测量位置去重；已知重命名副本通过 `--capture-aliases` 指明身份。修正提取规则时，`--replace-captures` 在事务中**完整替换所选采集的派生观测**，失败回滚；它不是局部追加开关，提交部分数据会移除该采集未提交的旧样本。替换后显式重训，已有包不会自动改变。
 
-旧库需要转换时使用 `cost-db migrate --database <old.sqlite> --output <new.sqlite> --summary <migration.json>`。旧库只读，输出必须不存在；普通导入和训练不暗中转换。物理证据转换仍可能需要原测量文件，缺失则失败，不覆盖旧库。维护和训练顺序进行，不假定有跨进程在线更新协议。
+逐行事实库需要转换时使用 `cost-db migrate --database <old.sqlite> --output <new.sqlite> --summary <migration.json>`。该命令将已分离部署、采集和来源的逐行事实转换为工作点与精确分布，不重新打开原始 trace 或物理测量文件，不从历史系数反造事实。更早的其他存储布局不能直接输入此命令。旧库只读，输出必须不存在；普通导入和训练不暗中转换。维护和训练顺序进行，不假定有跨进程在线更新协议。
 
 ## 直接预测与并发
 
