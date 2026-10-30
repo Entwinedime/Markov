@@ -53,20 +53,27 @@ std::span<const source::CpuInterval> Queries::source_cpu_gaps() {
     return source_cpu_gaps_;
 }
 
-const Response & Queries::query_client_delay(std::size_t request, bool response) {
+const Response & Queries::query_client_delay(std::size_t request, planning::ClientInterval interval) {
     ++requests_;
-    const auto key = std::pair(request, response);
+    const auto key = std::pair(request, interval);
     const auto existing = client_delays_.find(key);
     if (existing != client_delays_.end()) return existing->second;
 
     const auto & observed = source_->observations();
     const auto & window = observed.requests[request];
-    const auto port = response ? window.sent : window.received;
     Response result{ Status::UnobservedSource, std::nullopt, std::nullopt, {}, std::nullopt };
-    if (port) {
-        const auto at = observed.points[*port].time_ns;
-        const auto duration = response ? window.end_ns - at : at - window.begin_ns;
-        if (duration >= 0) result = { Status::Ready, duration, Coverage::SourceResidual, {}, std::nullopt };
+    if (interval == planning::ClientInterval::BetweenRequests) {
+        const auto duration = window.begin_ns - observed.requests[request - 1].end_ns;
+        result = { Status::Ready, duration, Coverage::SourceResidual, {}, std::nullopt };
+    }
+    else {
+        const bool response = interval == planning::ClientInterval::Egress;
+        const auto port = response ? window.sent : window.received;
+        if (port) {
+            const auto at = observed.points[*port].time_ns;
+            const auto duration = response ? window.end_ns - at : at - window.begin_ns;
+            if (duration >= 0) result = { Status::Ready, duration, Coverage::SourceResidual, {}, std::nullopt };
+        }
     }
     return client_delays_.emplace(key, std::move(result)).first->second;
 }

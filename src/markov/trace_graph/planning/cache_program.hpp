@@ -92,9 +92,10 @@ private:
         FinalPublished,
         ReleasedPages,
         QuerySubmitted,
-        QueryDone
+        QueryDone,
+        ClientReady
     };
-    enum class RequestStage { BeforeStart, Ingress, Waiting, Admitting, Active, Querying, Response };
+    enum class RequestStage { BeforeStart, ClientPacing, Ingress, Waiting, Admitting, Active, Querying, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -191,6 +192,7 @@ private:
     std::optional<RadixId> host_pin_;
     std::optional<std::string> issue_;
     std::optional<graph::NodeId> cause_;
+    std::optional<graph::NodeId> client_pacing_;
     std::size_t request_ = 0;
     std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evicted_pages_ = 0;
     std::size_t pending_queries_ = 0;

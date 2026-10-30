@@ -176,12 +176,12 @@ void CacheProgram::begin_request(ProgramRuntime & runtime, bool drain) {
     const auto begin = runtime.next_node();
     PlannedMutation mutation{
         0,
-        { { resource, Boundary{} }, { resource, SourceClientDelay{ request_, false }, action(ActionKind::Received, request_) } },
+        { { resource, Boundary{} }, { resource, SourceClientDelay{ request_, ClientInterval::Ingress }, action(ActionKind::Received, request_) } },
         { { begin, begin + 1, graph::EdgeKind::ClientOrder } }
     };
 
-    // A drain may finish after the previous response; retain both causes.
-    if (request_) mutation.dependencies.push_back({ *requests_[request_ - 1].response, begin, graph::EdgeKind::ClientOrder });
+    // Client preparation and background drain overlap after the prior response.
+    if (client_pacing_) mutation.dependencies.push_back({ *client_pacing_, begin, graph::EdgeKind::ClientOrder });
     if (drain) {
         for (const auto tail : copy_frontier_)
             if (tail) mutation.dependencies.push_back({ *tail, begin, graph::EdgeKind::Synchronization });
@@ -199,7 +199,7 @@ void CacheProgram::begin_request(ProgramRuntime & runtime, bool drain) {
 void CacheProgram::respond(ProgramRuntime & runtime, std::size_t request) {
     const auto resource = source_.client_resource();
     const auto response = runtime.next_node();
-    if (!submit(runtime, { 0, { { resource, SourceClientDelay{ request, true }, action(ActionKind::ResponseDone, request) } }, {} })) return;
+    if (!submit(runtime, { 0, { { resource, SourceClientDelay{ request, ClientInterval::Egress }, action(ActionKind::ResponseDone, request) } }, {} })) return;
     requests_[request].response = response;
     request_stage_ = RequestStage::Response;
     waiting_ = false;
@@ -636,6 +636,19 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ResponseDone)) {
         requests_[request_++].completed = true;
+        if (request_ < requests_.size()) {
+            const auto pacing = runtime.next_node();
+            PlannedMutation mutation{
+                0,
+                { { source_.client_resource(), SourceClientDelay{ request_, ClientInterval::BetweenRequests }, action(ActionKind::ClientReady, request_) } },
+                { { event.identity, pacing, graph::EdgeKind::ClientOrder } }
+            };
+            if (!submit(runtime, std::move(mutation))) return;
+            client_pacing_ = pacing;
+            request_stage_ = RequestStage::ClientPacing;
+        }
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::ClientReady)) {
         request_stage_ = RequestStage::BeforeStart;
         advance(runtime);
     }

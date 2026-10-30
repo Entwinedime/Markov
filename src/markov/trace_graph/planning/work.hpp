@@ -3,10 +3,19 @@
 #include <compare>
 #include <map>
 #include <string>
+#include <string_view>
 
 namespace markov::trace_graph::planning {
 
 using Features = std::map<std::string, double>;
+
+enum class ClientInterval { Ingress, Egress, BetweenRequests };
+
+constexpr std::string_view client_interval_name(ClientInterval interval) {
+    if (interval == ClientInterval::Ingress) return "ingress";
+    if (interval == ClientInterval::Egress) return "egress";
+    return "between_requests";
+}
 
 struct WorkKind {
     std::string operation;

@@ -9,11 +9,17 @@ void SerialProgram::start(ProgramRuntime & runtime) {
     PlannedMutation mutation{ 0, {}, {} };
     const auto first = runtime.next_node();
     for (const auto & request : requests_) {
+        const auto pacing = first + mutation.operations.size();
+        if (!ports_.empty())
+            mutation.operations.push_back({
+                0,
+                SourceClientDelay{ request.source_request, ClientInterval::BetweenRequests }
+            });
         const auto start = first + mutation.operations.size();
         mutation.operations.push_back({ 0, Boundary{} });
         mutation.operations.push_back({
             0,
-            SourceClientDelay{ request.source_request, false }
+            SourceClientDelay{ request.source_request, ClientInterval::Ingress }
         });
         mutation.operations.push_back({ 0, SourceRegionGap{ request.before_execution } });
         if (runtime.records_graph()) mutation.operations.back().position = OperationPosition{ request.source_request, 0, 0, "before_execution" };
@@ -26,10 +32,13 @@ void SerialProgram::start(ProgramRuntime & runtime) {
         if (runtime.records_graph()) mutation.operations.back().position = OperationPosition{ request.source_request, 0, 0, "after_execution" };
         mutation.operations.push_back({
             0,
-            SourceClientDelay{ request.source_request, true }
+            SourceClientDelay{ request.source_request, ClientInterval::Egress }
         });
         const auto response = first + mutation.operations.size() - 1;
-        if (!ports_.empty()) mutation.dependencies.push_back({ ports_.back().response, start, graph::EdgeKind::ClientOrder });
+        if (!ports_.empty()) {
+            mutation.dependencies.push_back({ ports_.back().response, pacing, graph::EdgeKind::ClientOrder });
+            mutation.dependencies.push_back({ pacing, start, graph::EdgeKind::ClientOrder });
+        }
         for (auto node = start + 1; node <= response; ++node) mutation.dependencies.push_back({ node - 1, node, graph::EdgeKind::DataDependency });
         ports_.push_back({ start, response });
     }

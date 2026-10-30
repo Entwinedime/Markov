@@ -125,6 +125,7 @@ nlohmann::json serial_prediction_report(const adapters::PreparedPrediction & inp
          { "Closed synchronous requests on the declared single-device deployment, fresh KV per request; no serving overlap or offload model.",
             "Target phases come from workload and chunking rules. Changed phase and controller costs use independent data; target observations are not read.",
             "Controller remainder is grouped before phases: no external intermediate consumers exist in this supported execution.",
+            "Serial client pacing retains the source interval between requests, outside each request's HTTP. Changed client behavior is not modeled.",
             "Source HTTP transport and outer handler intervals remain explicit residual estimates; changed frontend behavior and profiler effects are "
             "uncertain.",
             "First-phase and first-request flags are aggregate estimates, not a complete compilation/cache model. Execution does not certify E2E "

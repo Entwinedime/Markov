@@ -31,7 +31,7 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
         }
         else if (const auto * delay = std::get_if<planning::SourceRegionGap>(&operation.cost)) response = &costs_.query_region_gap(delay->interval);
         else if (const auto * client = std::get_if<planning::SourceClientDelay>(&operation.cost))
-            response = &costs_.query_client_delay(client->request, client->response);
+            response = &costs_.query_client_delay(client->request, client->interval);
         else if (const auto * interval = std::get_if<planning::SourceCpuGap>(&operation.cost))
             response = &costs_.query_source_cpu_gap(interval->interval, operation.resource);
 

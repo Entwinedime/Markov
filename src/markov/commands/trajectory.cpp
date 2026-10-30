@@ -97,9 +97,9 @@ nlohmann::json generated_graph_report(const simulation::ProgramResult & result) 
         else {
             const auto client = std::get<planning::SourceClientDelay>(*evidence.work);
             node["origin"] = {
-                {     "type", "source_client" },
-                {  "request",  client.request },
-                { "response", client.response }
+                {     "type",                                 "source_client" },
+                {  "request",                                  client.request },
+                { "interval", planning::client_interval_name(client.interval) }
             };
         }
     }

@@ -27,7 +27,7 @@ public:
     const Response & query(const planning::Work & work);
     const Response & query_source(const planning::Work & work, std::size_t observation, std::size_t resource);
     const Response & query_region_gap(std::size_t interval);
-    const Response & query_client_delay(std::size_t request, bool response);
+    const Response & query_client_delay(std::size_t request, planning::ClientInterval interval);
     const Response & query_source_cpu_gap(std::size_t interval, std::size_t resource);
     const Response & query_source_work(const planning::Work & work, std::size_t interval, std::size_t resource);
     std::size_t requests() const { return requests_; }
@@ -56,7 +56,7 @@ private:
     std::set<std::size_t> limited_models_;
     std::vector<std::optional<Response>> source_responses_;
     std::map<std::size_t, Response> region_gaps_;
-    std::map<std::pair<std::size_t, bool>, Response> client_delays_;
+    std::map<std::pair<std::size_t, planning::ClientInterval>, Response> client_delays_;
     std::vector<source::CpuInterval> source_cpu_gaps_;
     std::vector<std::optional<Response>> source_cpu_responses_;
     std::vector<source::CpuInterval> native_cpu_intervals_;

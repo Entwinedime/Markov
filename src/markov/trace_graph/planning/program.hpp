@@ -20,11 +20,11 @@ struct SourceRegionGap {
     std::size_t interval;
 };
 
-// Transport tails are referenced directly by request, without materializing a
-// detailed source graph. These intervals remain explicit residual estimates.
+// Client intervals reference the source request without a detailed graph.
+// BetweenRequests ends at this request's start, outside its HTTP duration.
 struct SourceClientDelay {
     std::size_t request;
-    bool response;
+    ClientInterval interval;
 };
 
 // A source inter-call interval is a residual approximation, not proven service.

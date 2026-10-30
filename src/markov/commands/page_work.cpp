@@ -73,8 +73,8 @@ Json cost_gap_json(const simulation::CostGap & gap, const source::SourceContext 
     if (const auto * work = std::get_if<planning::Work>(&gap.work)) result["work"] = work_json(*work);
     else if (const auto * client = std::get_if<planning::SourceClientDelay>(&gap.work)) {
         result["source_client_delay"] = {
-            {  "request",  client->request },
-            { "response", client->response }
+            {  "request",                                  client->request },
+            { "interval", planning::client_interval_name(client->interval) }
         };
     }
     else if (const auto * source_gap = std::get_if<planning::SourceRegionGap>(&gap.work)) result["source_region_gap"] = source_gap->interval;

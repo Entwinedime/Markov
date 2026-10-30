@@ -224,6 +224,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             "Modeled parent waits use target readiness ports. Other source frontend/control intervals retain their opaque work and waits; unidentified "
             "probe overhead and changed control behavior remain uncertain.",
             "Cache query CPU retains the source residual approximation; state-dependent tree overhead and competing I/O/compute need further validation.",
+            "Serial client pacing retains the source interval between requests, outside each request's HTTP. Changed client behavior is not modeled.",
             "HTTP send and post-send CPU are separate; unconsumed overlapped computation and background I/O still drain after HTTP.",
             "No normal E2E accuracy or complete device-causality qualification is implied by execution." } }
     };

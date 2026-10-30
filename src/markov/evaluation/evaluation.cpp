@@ -42,7 +42,7 @@ struct Measurement {
 std::optional<Address> address(const Json & node) {
     if (node.at("origin").at("type") == "source_client") {
         const auto & origin = node.at("origin");
-        return Address{ origin.at("request").get<std::size_t>(), 0, std::nullopt, origin.at("response").get<bool>() ? "egress" : "ingress", std::nullopt };
+        return Address{ origin.at("request").get<std::size_t>(), 0, std::nullopt, origin.at("interval").get<std::string>(), std::nullopt };
     }
     if (!node.contains("position")) return std::nullopt;
 
@@ -163,6 +163,7 @@ Json report(const PreparedEvaluation & input) {
     const auto & regions = input.target.context.regions();
     for (std::size_t id = 0; id < observed.requests.size(); ++id) {
         const auto & window = observed.requests[id];
+        if (id) measured[{ id, 0, std::nullopt, "between_requests", std::nullopt }].push_back({ window.begin_ns - observed.requests[id - 1].end_ns, nullptr });
         if (window.received) {
             const auto ns = observed.points[*window.received].time_ns - window.begin_ns;
             if (ns >= 0) measured[{ id, 0, std::nullopt, "ingress", std::nullopt }].push_back({ ns, nullptr });
@@ -256,17 +257,17 @@ Json report(const PreparedEvaluation & input) {
     const auto target_sec = begin && end ? Json((*end - *begin) / 1e9) : Json(nullptr);
     const auto order = order_report(serialized, ordered);
     return {
-        {                                      "status",                             "completed"                                                        },
-        {                                  "prediction",                                                                  trajectory.prediction.string() },
-        {                                      "target",                                                                                 cell.at("name") },
-        {                             "target_manifest",                                                             input.target.manifest.path.string() },
-        {                    "target_profiled_http_sec",                                                                                      target_sec },
-        {             "target_profiled_request_sum_sec",                                                                            request_sum_ns / 1e9 },
-        { "target_profiled_client_between_requests_sec",                     begin && end ? Json((*end - *begin - request_sum_ns) / 1e9) : Json(nullptr) },
-        {                 "original_predicted_http_sec",                                                                      cell.at("formal_http_sec") },
-        {                    "original_replay_http_sec",                                                                original.at("formal_replay_sec") },
-        {                      "oracle_replay_http_sec",                  replay.overrides.empty() ? Json(nullptr) : replacement.at("formal_replay_sec") },
-        {                              "fully_replaced",                                      replaceable != 0 && replay.overrides.size() == replaceable },
+        {                                      "status",                  "completed"                                                        },
+        {                                  "prediction",                                                       trajectory.prediction.string() },
+        {                                      "target",                                                                      cell.at("name") },
+        {                             "target_manifest",                                                  input.target.manifest.path.string() },
+        {                    "target_profiled_http_sec",                                                                           target_sec },
+        {             "target_profiled_request_sum_sec",                                                                 request_sum_ns / 1e9 },
+        { "target_profiled_client_between_requests_sec",          begin && end ? Json((*end - *begin - request_sum_ns) / 1e9) : Json(nullptr) },
+        {                 "original_predicted_http_sec",                                                           cell.at("formal_http_sec") },
+        {                    "original_replay_http_sec",                                                     original.at("formal_replay_sec") },
+        {                      "oracle_replay_http_sec",       replay.overrides.empty() ? Json(nullptr) : replacement.at("formal_replay_sec") },
+        {                              "fully_replaced",                           replaceable != 0 && replay.overrides.size() == replaceable },
         {                               "cost_coverage",
          { { "observed_response_nodes", observed.cost_observations.size() },
          { "replaceable_nodes", replaceable },
@@ -274,12 +275,12 @@ Json report(const PreparedEvaluation & input) {
          { "retained_nodes", missing.size() },
          { "matches", std::move(matches) },
          { "unmatched_predicted", std::move(missing) },
-         { "unmatched_observed", std::move(unused) } }                                                                                                  },
-        {                              "observed_order",                                                                                           order },
+         { "unmatched_observed", std::move(unused) } }                                                                                       },
+        {                              "observed_order",                                                                                order },
         {                               "qualification",
          "Independent evaluator only. Exact request/iteration/participant, work and scope matching; unresolved costs retain the original estimate. Replay "
          "fixes the executed path and does not regenerate branches. Target is profiled HTTP, not normal E2E. Semantic/cpu order coverage is not a complete "
-         "cache or device-causality certificate. The client bookkeeping gap remains in target HTTP but is not represented by immediate serial arrival." }
+         "cache or device-causality certificate. Client intervals remain in full HTTP; replacing their source estimates is diagnostic only." }
     };
 }
 
