@@ -124,7 +124,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
                 fields = {"request_ids": [body["rid"]]}
                 if self.server.plan["profiling"]:
                     stamp = time.time_ns()
-                    engine.writer.write("runtime.request.socket_received", stamp, stamp, fields)
+                    received_ns = stamp
                 params = body["sampling_params"]
                 output = engine.generate(body["rid"], body["input_ids"], params["max_new_tokens"], params["ignore_eos"])
                 value = {
@@ -135,9 +135,13 @@ class InferenceHandler(BaseHTTPRequestHandler):
                     },
                 }
                 if self.server.plan["profiling"]:
-                    stamp = time.time_ns()
-                    engine.writer.write("runtime.response.scheduler_send", stamp, stamp, fields)
+                    sent_ns = time.time_ns()
                 self.reply(value)
+                if engine.writer is not None:
+                    engine.flush()
+                if self.server.plan["profiling"]:
+                    engine.writer.write("runtime.request.socket_received", received_ns, received_ns, fields)
+                    engine.writer.write("runtime.response.scheduler_send", sent_ns, sent_ns, fields)
                 if self.server.plan["profiling"]:
                     self.server.profiler.step()
             else:
@@ -191,8 +195,12 @@ class Capture(SerialHttpClient):
             for path in files:
                 with path.open(encoding="utf-8") as stream:
                     for line in stream:
-                        fields = json.loads(line)["args"]
-                        responses.add((fields["phase"], fields["emit_token"]))
+                        event = json.loads(line)
+                        fields = event["args"]
+                        if event["name"] == "runtime.ktransformers.phase":
+                            responses.add((fields["phase"], fields["emit_token"]))
+                        elif event["name"] == "runtime.ktransformers.generate":
+                            responses.add(("control", False))
             write_json(
                 self.directory / "region_measurements.json",
                 {
@@ -237,6 +245,7 @@ class Capture(SerialHttpClient):
             raise ValueError("Single-device KTransformers profiling requires one phase observation stream")
         ports = {name: Counter() for name in ("runtime.request.socket_received", "runtime.response.scheduler_send")}
         phases = Counter()
+        generations = Counter()
         with probes[0].open(encoding="utf-8") as stream:
             for line in stream:
                 event = json.loads(line)
@@ -244,6 +253,8 @@ class Capture(SerialHttpClient):
                     ports[event["name"]].update(event["args"]["request_ids"])
                 elif event["name"] == "runtime.ktransformers.phase":
                     phases.update(event["args"]["request_ids"])
+                elif event["name"] == "runtime.ktransformers.generate":
+                    generations.update(event["args"]["request_ids"])
         expected = Counter({row["logical_request_id"]: 1 for row in self.rows})
         chunk = self.plan["server"]["prefill_chunk_tokens"]
         expected_phases = {
@@ -252,7 +263,7 @@ class Capture(SerialHttpClient):
             else row["generated_tokens"]
             for row in self.rows
         }
-        if any(counts != expected for counts in ports.values()) or phases != expected_phases:
+        if any(counts != expected for counts in ports.values()) or phases != expected_phases or generations != expected:
             raise ValueError("KTransformers phase observations do not cover the completed HTTP workload")
         write_json(
             self.directory / "profile_manifest.json",

@@ -68,21 +68,15 @@ class Inference:
         self.writer: EventWriter | None = None
         self.request_id = ""
         self.first_phases: set[str] = set()
+        self.request_count = 0
+        self.records: list[tuple] = []
 
     def step(self, tokens: Tensor, cache: Cache, phase: str, emit: bool) -> int | None:
         torch = self.torch
         if self.writer is not None:
             query = tokens.shape[1]
             context = cache.get_seq_length() + query
-            fields = {
-                "request_ids": [self.request_id],
-                "phase": phase,
-                "query_tokens": query,
-                "context_tokens": context,
-                "first_phase": phase not in self.first_phases,
-                "emit_token": emit,
-                "attention_backend": self.settings["attention_backend"],
-            }
+            first = phase not in self.first_phases
             self.first_phases.add(phase)
             begin_ns = time.time_ns()
             cpu_begin_ns = time.thread_time_ns()
@@ -95,11 +89,16 @@ class Inference:
         torch.npu.synchronize()
         if self.writer is not None:
             end_ns = time.time_ns()
-            fields["thread_cpu_ns"] = time.thread_time_ns() - cpu_begin_ns
-            self.writer.write("runtime.ktransformers.phase", begin_ns, end_ns, fields)
+            self.records.append(
+                (phase, query, context, first, emit, begin_ns, end_ns, time.thread_time_ns() - cpu_begin_ns)
+            )
         return token
 
     def generate(self, identity: str, input_ids: list[int], output_tokens: int, ignore_eos: bool) -> list[int]:
+        if self.writer is not None:
+            begin_ns = time.time_ns()
+            self.records = []
+
         from transformers import DynamicCache
 
         if len(input_ids) + output_tokens > self.settings["max_context_tokens"]:
@@ -120,4 +119,38 @@ class Inference:
             while len(result) < output_tokens and (ignore_eos or result[-1] not in endings):
                 tokens = torch.tensor([[result[-1]]], dtype=torch.int64, device="npu:0")
                 result.append(self.step(tokens, cache, "decode", True))
+
+        if self.writer is not None:
+            self.generation = (
+                begin_ns,
+                time.time_ns(),
+                {
+                    "request_ids": [identity],
+                    "input_tokens": len(input_ids),
+                    "prefill_steps": (len(input_ids) + chunk - 1) // chunk,
+                    "decode_steps": len(result) - 1,
+                    "first_request": self.request_count == 0,
+                },
+            )
+        self.request_count += 1
         return result
+
+    def flush(self) -> None:
+        """Serialize observations after HTTP publication, outside measured generation."""
+        for phase, query, context, first, emit, begin_ns, end_ns, cpu_ns in self.records:
+            self.writer.write(
+                "runtime.ktransformers.phase",
+                begin_ns,
+                end_ns,
+                {
+                    "request_ids": [self.request_id],
+                    "phase": phase,
+                    "query_tokens": query,
+                    "context_tokens": context,
+                    "first_phase": first,
+                    "emit_token": emit,
+                    "attention_backend": self.settings["attention_backend"],
+                    "thread_cpu_ns": cpu_ns,
+                },
+            )
+        self.writer.write("runtime.ktransformers.generate", *self.generation)
