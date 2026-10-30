@@ -115,6 +115,7 @@ class SourcePreparation:
     cpu_service_cost: Path | None
     wall_seconds: float
     performance: dict[str, Any] = field(default_factory=dict)
+    reused: bool = False
 
 
 @dataclass(frozen=True)

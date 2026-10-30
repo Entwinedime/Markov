@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from markov_internal.common.io import load_json
+from markov_internal.common.paths import require_repo_path
 from markov_internal.modeling.cost.hicache import HiCacheCostModels
+from markov_internal.modeling.source_dag.profiles import cpu_service_inputs
 from markov_internal.modeling.types import TargetHiCacheConfig
 
 
@@ -61,3 +64,42 @@ class WorkflowOptions:
     cpu_service_costs: dict[Path, Path] = field(default_factory=dict)
     source_resources: dict[str, str] | None = None
     experiment_reports: bool = False
+
+    @classmethod
+    def from_inputs(
+        cls,
+        inputs: PredictionInputs,
+        output_dir: Path,
+        *,
+        targets: tuple[TargetHiCacheConfig, ...] = (),
+        jobs: int = 1,
+        trace_threads: int = 1,
+        trace_file_threads: int = 1,
+        diagnostics: str = "off",
+        experiment_reports: bool = False,
+        dry_run: bool = False,
+        continue_on_error: bool = True,
+    ) -> WorkflowOptions:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (jobs, trace_threads, trace_file_threads)
+        ):
+            raise ValueError("prediction concurrency and trace threads must be positive integers")
+        sources = tuple(require_repo_path(path).resolve() for path in inputs.source_manifests)
+        cost_path = require_repo_path(inputs.cost_model).resolve()
+        return cls(
+            source_manifests=sources,
+            target_configs=targets,
+            output_dir=require_repo_path(output_dir),
+            diagnostics=DiagnosticLevel(diagnostics),
+            cost_models=HiCacheCostModels.from_raw(load_json(cost_path)),
+            cost_model_path=cost_path,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+            trace_threads=trace_threads,
+            trace_file_threads=trace_file_threads,
+            model_run_jobs=jobs,
+            cpu_service_costs=cpu_service_inputs(list(inputs.cpu_service_costs), sources),
+            source_resources=inputs.resource_environment,
+            experiment_reports=experiment_reports,
+        )

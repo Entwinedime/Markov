@@ -41,6 +41,7 @@ services:
     command: bash
 
   modeling:
+    init: true
     working_dir: /workspace/trace-sim
     mem_limit: ${TRACE_SIM_MODELING_MEMORY_LIMIT:-320g}
     memswap_limit: ${TRACE_SIM_MODELING_MEMORY_LIMIT:-320g}

@@ -8,12 +8,9 @@ from pathlib import Path
 from markov_internal.common.commands import positive_int
 from markov_internal.common.io import load_json, write_json_atomic
 from markov_internal.common.paths import repo_relative_path, require_repo_path
-from markov_internal.modeling.cost.hicache import HiCacheCostModels
-from markov_internal.modeling.source_dag.profiles import cpu_service_inputs
-from markov_internal.modeling.context import DiagnosticLevel, WorkflowOptions
+from markov_internal.modeling.context import DiagnosticLevel, PredictionInputs, WorkflowOptions
 from markov_internal.modeling.types import TargetHiCacheConfig
 from markov_internal.modeling.predictor import predict
-from markov_internal.applications.comparison import configuration_comparison
 
 
 def display_prediction(summary: dict, report_path: Path) -> None:
@@ -134,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     cost_model_path = require_repo_path(args.cost_model).resolve()
-    cost_models = HiCacheCostModels.from_raw(load_json(cost_model_path))
     sources = tuple(require_repo_path(path).resolve() for path in args.source_manifest)
     output = (
         require_repo_path(args.output_dir)
@@ -145,26 +141,26 @@ def main(argv: list[str] | None = None) -> int:
     if len({target.label for target in targets}) != len(targets):
         raise ValueError("target config names must be unique within one prediction request")
 
-    options = WorkflowOptions(
-        source_manifests=sources,
-        cpu_service_costs=cpu_service_inputs(args.cpu_service_cost, sources),
-        target_configs=targets,
-        output_dir=output,
-        diagnostics=DiagnosticLevel(args.diagnostics),
-        dry_run=args.dry_run,
-        continue_on_error=args.continue_on_error,
+    options = WorkflowOptions.from_inputs(
+        PredictionInputs(
+            sources,
+            cost_model_path,
+            tuple(args.cpu_service_cost),
+            load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
+        ),
+        output,
+        targets=targets,
+        jobs=args.model_run_jobs,
         trace_threads=args.trace_threads,
         trace_file_threads=args.trace_file_threads,
-        model_run_jobs=args.model_run_jobs,
-        cost_models=cost_models,
-        cost_model_path=cost_model_path,
-        source_resources=load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
+        diagnostics=args.diagnostics,
+        dry_run=args.dry_run,
+        continue_on_error=args.continue_on_error,
         experiment_reports=args.experiment_reports,
     )
     try:
         summary = predict(options)
         prediction = summary["prediction"]
-        prediction["configuration_comparison"] = configuration_comparison(prediction["cells"])
         report = output / "workflow_summary.json"
         write_json_atomic(report, summary)
         display_prediction(summary, report)

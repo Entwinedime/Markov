@@ -3,45 +3,81 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
-from markov_internal.common.io import write_json_atomic
+from markov_internal.common.io import write_json, write_json_atomic
 from markov_internal.common.paths import repo_relative_path
 from markov_internal.common.process import container_peak_memory_bytes
 from markov_internal.modeling.context import WorkflowOptions
-from markov_internal.modeling.execution.model_executor import plan_model_runs, run_model_runs
-from markov_internal.modeling.source_dag.profiles import discover_profile_runs
+from markov_internal.modeling.execution.model_executor import ExecutionSession, plan_model_runs, run_model_runs
+from markov_internal.modeling.source_dag.profiles import ProfileRunRef, discover_profile_runs
 from markov_internal.modeling.preflight import preflight_sources
 from markov_internal.modeling.execution.results import build_row, read_row, summarize
-from markov_internal.modeling.types import ModelRunResult, ModelRunStarted, SourcePreparation
+from markov_internal.modeling.types import ModelRunResult, ModelRunStarted, SourcePreparation, TargetHiCacheConfig
 from markov_internal.modeling.deployment import cost_environment_matches, source_environment
 
 
-def predict(options: WorkflowOptions) -> dict[str, Any]:
-    """Return compact execution facts; HTTP times are microseconds or None on failure.
+class PredictionSession:
+    """An explicit fixed-input lifetime, with at most one resident native source."""
 
-    Inputs are already prepared and read-only. This call does not capture, train,
-    rank candidates or read target observations. Current reports are published
-    after each completion so interruption never exposes an old successful run.
-    """
+    def __init__(self, options: WorkflowOptions) -> None:
+        self.options = options
+        self.runs = discover_profile_runs(options.source_manifests)
+        self.execution = ExecutionSession(options.output_dir, options.diagnostics)
+        self.preflight: dict[str, Any] | None = None
+        costs = options.cost_models
+        # Isolation follows actual capture lineage, not suite-local run labels.
+        if set(costs.source_manifests) & {source.manifest_path.resolve() for source in self.runs}:
+            raise ValueError("current base captures must be excluded from independently trained prediction costs")
+        if any(
+            not cost_environment_matches(source_environment(source, options.source_resources), costs.deployment)
+            for source in self.runs
+        ):
+            raise ValueError("database cost model does not apply to the selected source deployment")
+
+    def __enter__(self) -> PredictionSession:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.execution.close()
+
+    def predict(self, targets: tuple[TargetHiCacheConfig, ...], output_dir: Path) -> dict[str, Any]:
+        started = time.monotonic()
+        options = replace(self.options, target_configs=targets, output_dir=output_dir)
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        (options.output_dir / "workflow_summary.json").unlink(missing_ok=True)
+        reused = self.preflight is not None
+        if self.preflight is None:
+            self.preflight = preflight_sources(self.options, self.runs)
+        write_json(options.output_dir / "preflight_summary.json", self.preflight)
+        return _predict(options, self.runs, self.preflight, self.execution, started, reused)
+
+
+def predict(options: WorkflowOptions) -> dict[str, Any]:
+    """One-shot public call through the same session used for later target batches."""
 
     started = time.monotonic()
-    options.output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = options.output_dir / "workflow_summary.json"
-    report_path.unlink(missing_ok=True)
-    runs = discover_profile_runs(options.source_manifests)
-    costs = options.cost_models
-    # Suite-local run labels are not database identities. Complete manifest
-    # provenance carries original captures, known aliases and paired inputs.
-    if set(costs.source_manifests) & {source.manifest_path.resolve() for source in runs}:
-        raise ValueError("current base captures must be excluded from independently trained prediction costs")
-    if any(
-        not cost_environment_matches(source_environment(source, options.source_resources), costs.deployment)
-        for source in runs
-    ):
-        raise ValueError("database cost model does not apply to the selected source deployment")
+    with PredictionSession(options) as session:
+        summary = session.predict(options.target_configs, options.output_dir)
+        close_started = time.monotonic()
+    summary["performance"]["session_close_wall_seconds"] = time.monotonic() - close_started
+    summary["performance"]["one_shot_wall_seconds"] = time.monotonic() - started
+    write_json_atomic(options.output_dir / "workflow_summary.json", summary)
+    return summary
 
-    preflight_report = preflight_sources(options, runs)
+
+def _predict(
+    options: WorkflowOptions,
+    runs: list[ProfileRunRef],
+    preflight_report: dict[str, Any],
+    execution: ExecutionSession,
+    started: float,
+    reused: bool,
+) -> dict[str, Any]:
+    report_path = options.output_dir / "workflow_summary.json"
+    costs = options.cost_models
     specs = plan_model_runs(options, runs, preflight_report)
     rows = {
         spec.run_id: {
@@ -62,13 +98,14 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
         "cost_training_captures": list(costs.source_captures),
         "cost_training_manifests": [str(repo_relative_path(path)) for path in costs.source_manifests],
         "source_preparations": [],
+        "source_reuses": [],
         "prediction": summarize(list(rows.values())),
     }
     write_json_atomic(report_path, summary)
 
-    for result in run_model_runs(options, specs):
+    for result in run_model_runs(options, specs, execution):
         if isinstance(result, SourcePreparation):
-            summary["source_preparations"].append(
+            summary["source_reuses" if result.reused else "source_preparations"].append(
                 {
                     "source_manifest": str(repo_relative_path(result.manifest)),
                     "cpu_service_cost": str(repo_relative_path(result.cpu_service_cost))
@@ -90,7 +127,8 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
 
     summary["performance"] = {
         "prediction_wall_seconds": time.monotonic() - started,
-        "scope": "prepared-input prediction including preflight, source preparation, targets and incremental reports; excludes capture/training",
+        "preflight_reused": reused,
+        "scope": "current batch inside an open session, including any new preflight/source preparation, targets and reports; excludes capture/training and final session close",
     }
     peak = container_peak_memory_bytes()
     if peak is not None:

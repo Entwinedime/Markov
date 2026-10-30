@@ -12,7 +12,7 @@ from markov_internal.applications.search.request import SearchRequest
 from markov_internal.applications.search.results import prediction_rows, update_results
 from markov_internal.common.io import load_json, write_json, write_json_atomic
 from markov_internal.common.paths import repo_relative_path, require_repo_path
-from markov_internal.modeling.invoke import invoke_prediction
+from markov_internal.modeling.invoke import PredictionClient
 from markov_internal.modeling.sglang_config import hicache_server_flags
 from markov_internal.modeling.source_dag.profiles import (
     cpu_service_metadata,
@@ -103,8 +103,30 @@ def _prepare(request: SearchRequest, state: dict[str, Any]) -> tuple[PreparedInp
 def run_search(request: SearchRequest, *, dry_run: bool = False, resume: bool = False) -> dict[str, Any]:
     """Local search reuses the batch predictor and cumulative accounting, not a second simulator."""
 
+    with PredictionClient(
+        request.output_dir / "prediction_sessions",
+        jobs=request.execution["model_run_jobs"],
+        trace_threads=request.execution["trace_threads"],
+        trace_file_threads=request.execution["trace_file_threads"],
+        diagnostics=request.execution["diagnostics"],
+        experiment_reports=request.execution.get("experiment_reports", False),
+        dry_run=dry_run,
+    ) as predictor:
+        state = _search_rounds(request, predictor, dry_run=dry_run, resume=resume)
+    if not dry_run:
+        close_seconds = predictor.last_close_wall_seconds
+        state["prediction_session_close_wall_seconds"] = close_seconds
+        for field in ("search_wall_seconds", "total_wall_seconds", "invocation_wall_seconds"):
+            state[field] += close_seconds
+        write_json_atomic(request.output_dir / "search_summary.json", state)
+    return state
+
+
+def _search_rounds(
+    request: SearchRequest, predictor: PredictionClient, *, dry_run: bool, resume: bool
+) -> dict[str, Any]:
     if dry_run or request.algorithm not in {"local", "coordinate"}:
-        return _run_batch(request, dry_run=dry_run, resume=resume)
+        return _run_batch(request, predictor, dry_run=dry_run, resume=resume)
 
     charged = 0
     unchanged = 0
@@ -115,7 +137,7 @@ def run_search(request: SearchRequest, *, dry_run: bool = False, resume: bool = 
     batch = max(32, len(request.space.branches)) * len(request.weights)
     while True:
         limit = min(request.max_predictions, charged + batch)
-        state = _run_batch(replace(request, max_predictions=limit), resume=resume, explore=unchanged >= 2)
+        state = _run_batch(replace(request, max_predictions=limit), predictor, resume=resume, explore=unchanged >= 2)
         count = state["charged_predictions"]
         if count <= charged or count >= request.max_predictions or state["stop_reason"] != "prediction_budget":
             state["plan"]["max_predictions"] = request.max_predictions
@@ -128,7 +150,12 @@ def run_search(request: SearchRequest, *, dry_run: bool = False, resume: bool = 
 
 
 def _run_batch(
-    request: SearchRequest, *, dry_run: bool = False, resume: bool = False, explore: bool = False
+    request: SearchRequest,
+    predictor: PredictionClient,
+    *,
+    dry_run: bool = False,
+    resume: bool = False,
+    explore: bool = False,
 ) -> dict[str, Any]:
     """A comparison uses unchanged inputs/code/costs. Resume explicitly affirms that.
 
@@ -299,71 +326,71 @@ def _run_batch(
         for workload, targets in scheduled.items():
             if not targets:
                 continue
-            remaining = request.max_wall_sec - previous_wall - (time.monotonic() - search_started)
-            if remaining <= 0:
-                state["stop_reason"] = "wall_budget"
-                break
+            width = request.execution["model_run_jobs"]
+            for start in range(0, len(targets), width):
+                chunk = targets[start : start + width]
+                remaining = request.max_wall_sec - previous_wall - (time.monotonic() - search_started)
+                if remaining <= 0:
+                    state["stop_reason"] = "wall_budget"
+                    break
 
-            source = source_map[workload]
-            cpu = cpu_map.get(source.manifest_path.resolve())
-            selected_inputs = replace(
-                inputs, source_manifests=(source.manifest_path,), cpu_service_costs=(cpu,) if cpu else ()
-            )
-            directory = output / "predictions" / f"attempt_{len(state['attempts']) + 1}"
-            attempt = {
-                "status": "running",
-                "workload": workload,
-                "targets": [target.label for target in targets],
-                "scheduled_predictions": len(targets),
-                "charged_predictions": len(targets),
-                "report": None,
-                "prediction_dir": str(repo_relative_path(directory)),
-                "wall_seconds": None,
-            }
-            state["attempts"].append(attempt)
-            write_json_atomic(report, state)
-            outcome = invoke_prediction(
-                selected_inputs,
-                tuple(targets),
-                directory,
-                jobs=request.execution["model_run_jobs"],
-                trace_threads=request.execution["trace_threads"],
-                trace_file_threads=request.execution["trace_file_threads"],
-                diagnostics=request.execution["diagnostics"],
-                experiment_reports=request.execution.get("experiment_reports", False),
-                max_wall_sec=remaining,
-            )
-            attempt.update(
-                status="finished",
-                return_code=outcome.return_code,
-                wall_seconds=outcome.wall_seconds,
-                charged_predictions=outcome.charged_predictions(len(targets)),
-            )
-            if outcome.summary is not None:
-                cells = outcome.summary["prediction"]["cells"]
-                attempt.update(
-                    report=str(repo_relative_path(outcome.report_path)),
-                    self_charged_predictions=sum(
-                        row["attempted"] for row in cells if row["target_config"] == base.label
-                    ),
-                    source_preparations=outcome.summary["source_preparations"],
-                    completed_predictions=sum(row["status"] == "EXECUTED" for row in cells),
+                source = source_map[workload]
+                cpu = cpu_map.get(source.manifest_path.resolve())
+                selected_inputs = replace(
+                    inputs, source_manifests=(source.manifest_path,), cpu_service_costs=(cpu,) if cpu else ()
                 )
-                if (outcome.return_code in {124, 130, 137} or outcome.return_code < 0) and outcome.launched:
-                    attempt["accounting_note"] = "interrupted batch; submitted work is conservatively charged"
-                    attempt["self_charged_predictions"] = int(base.label in attempt["targets"])
-            else:
-                if outcome.launched:
-                    attempt["accounting_note"] = "no current report; submitted work is conservatively charged"
-                    attempt["self_charged_predictions"] = int(base.label in attempt["targets"])
-                else:
+                directory = output / "predictions" / f"attempt_{len(state['attempts']) + 1}"
+                attempt = {
+                    "status": "running",
+                    "workload": workload,
+                    "targets": [target.label for target in chunk],
+                    "scheduled_predictions": len(chunk),
+                    "charged_predictions": len(chunk),
+                    "report": None,
+                    "prediction_dir": str(repo_relative_path(directory)),
+                    "wall_seconds": None,
+                }
+                state["attempts"].append(attempt)
+                write_json_atomic(report, state)
+                outcome = predictor.predict(
+                    selected_inputs,
+                    tuple(chunk),
+                    directory,
+                    max_wall_sec=remaining,
+                )
+                attempt.update(
+                    status="finished",
+                    return_code=outcome.return_code,
+                    wall_seconds=outcome.wall_seconds,
+                    charged_predictions=outcome.charged_predictions(len(chunk)),
+                )
+                if outcome.summary is not None:
+                    cells = outcome.summary["prediction"]["cells"]
                     attempt.update(
-                        charged_predictions=0, self_charged_predictions=0, accounting_note="deadline before launch"
+                        report=str(repo_relative_path(outcome.report_path)),
+                        self_charged_predictions=sum(
+                            row["attempted"] for row in cells if row["target_config"] == base.label
+                        ),
+                        source_preparations=outcome.summary["source_preparations"],
+                        completed_predictions=sum(row["status"] == "EXECUTED" for row in cells),
                     )
-            update_results(request, state)
-            write_json_atomic(report, state)
-            if outcome.return_code in {124, 130}:
-                state["stop_reason"] = "wall_budget" if outcome.return_code == 124 else "interrupted"
+                    if (outcome.return_code in {124, 130, 137} or outcome.return_code < 0) and outcome.launched:
+                        attempt["accounting_note"] = "interrupted batch; submitted work is conservatively charged"
+                        attempt["self_charged_predictions"] = int(base.label in attempt["targets"])
+                else:
+                    if outcome.launched:
+                        attempt["accounting_note"] = "no current report; submitted work is conservatively charged"
+                        attempt["self_charged_predictions"] = int(base.label in attempt["targets"])
+                    else:
+                        attempt.update(
+                            charged_predictions=0, self_charged_predictions=0, accounting_note="deadline before launch"
+                        )
+                update_results(request, state)
+                write_json_atomic(report, state)
+                if outcome.return_code in {124, 130}:
+                    state["stop_reason"] = "wall_budget" if outcome.return_code == 124 else "interrupted"
+                    break
+            if state["stop_reason"] in {"wall_budget", "interrupted"}:
                 break
 
         state["status"] = "completed" if state["stop_reason"] == "space_exhausted" else "stopped"

@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 from collections.abc import Iterator
 from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from markov_internal.common.io import load_json, write_json
+from markov_internal.common.io import load_json, truncate_log_tail, write_json
 from markov_internal.common.naming import safe_slug
-from markov_internal.common.paths import ROOT_DIR
-from markov_internal.common.process import stop_process
-from markov_internal.modeling.backend import build_trace_graph_command
 from markov_internal.modeling.source_dag.profiles import ProfileRunRef
 from markov_internal.common.progress import StageProgress
 from markov_internal.modeling.types import ModelRunResult, ModelRunSpec, ModelRunStarted, SourcePreparation
+from markov_internal.modeling.run_config import ModelingRunConfig
 from markov_internal.modeling.execution.runner_adapter import hicache_model_config, runner_config
+from markov_internal.modeling.execution.source_session import SourceSession
 
 if TYPE_CHECKING:
-    from markov_internal.modeling.context import WorkflowOptions
+    from markov_internal.modeling.context import DiagnosticLevel, WorkflowOptions
 
 
 def plan_model_runs(
@@ -55,8 +52,41 @@ def plan_model_runs(
     return specs
 
 
+class ExecutionSession:
+    """Only the current source stays resident; switching it releases the old process."""
+
+    def __init__(self, directory: Path, diagnostics: DiagnosticLevel) -> None:
+        self.directory = directory
+        self.diagnostics = diagnostics
+        self.source: SourceSession | None = None
+        self.identity: tuple[Path, Path | None] | None = None
+        self.source_count = 0
+
+    def source_for(self, config: ModelingRunConfig) -> SourceSession:
+        identity = config.profile_manifest, config.cpu_service_cost
+        if identity != self.identity or (
+            self.source is not None and self.source.process is None and self.source.failed
+        ):
+            self.close()
+            self.source = SourceSession(config, self.directory / "sources" / str(self.source_count))
+            self.source_count += 1
+            self.identity = identity
+        return self.source
+
+    def close(self) -> None:
+        if self.source is not None:
+            source = self.source
+            self.source = None
+            self.identity = None
+            source.close()
+            if not source.failed and not self.diagnostics.keep_debug_artifacts:
+                source.log_path.unlink(missing_ok=True)
+            else:
+                truncate_log_tail(source.log_path, self.diagnostics.failure_log_max_bytes)
+
+
 def run_model_runs(
-    options: WorkflowOptions, specs: list[ModelRunSpec]
+    options: WorkflowOptions, specs: list[ModelRunSpec], session: ExecutionSession
 ) -> Iterator[ModelRunResult | ModelRunStarted | SourcePreparation]:
     """Execute one plan; keep unstarted cells explicit after a command failure."""
 
@@ -64,7 +94,7 @@ def run_model_runs(
     progress = StageProgress("prediction", len(specs), detail, unit="target")
     completed = set()
     succeeded = failed = skipped = 0
-    for result, inflight in _result_stream(options, specs):
+    for result, inflight in _result_stream(options, specs, session):
         if not isinstance(result, ModelRunResult):
             yield result
             continue
@@ -95,7 +125,7 @@ def run_model_runs(
 
 
 def _result_stream(
-    options: WorkflowOptions, specs: list[ModelRunSpec]
+    options: WorkflowOptions, specs: list[ModelRunSpec], session: ExecutionSession
 ) -> Iterator[tuple[ModelRunResult | ModelRunStarted | SourcePreparation, int]]:
     """Prepare each source once; native targets keep the bounded job policy.
 
@@ -107,9 +137,9 @@ def _result_stream(
     for spec in specs:
         sources.setdefault((spec.source.manifest_path, spec.cpu_service_cost), []).append(spec)
 
-    for source_index, batch in enumerate(sources.values()):
+    for batch in sources.values():
         failed = False
-        for result, inflight in _run_source(options, batch, options.output_dir / "sources" / str(source_index)):
+        for result, inflight in _run_source(options, batch, session):
             if isinstance(result, ModelRunResult):
                 failed |= result.return_code != 0
             yield result, inflight
@@ -118,14 +148,9 @@ def _result_stream(
 
 
 def _run_source(
-    options: WorkflowOptions, specs: list[ModelRunSpec], source_directory: Path
+    options: WorkflowOptions, specs: list[ModelRunSpec], session: ExecutionSession
 ) -> Iterator[tuple[ModelRunResult | ModelRunStarted | SourcePreparation, int]]:
-    """Publish live per-target outcomes from one prepared-source process.
-
-    Popen is needed here because the native backend streams completion records;
-    one-shot run_command cannot report progress while a batch is executing.
-    stop_process owns interruption cleanup for the entire process group.
-    """
+    """Publish one batch while the owning session retains the source process."""
 
     ready = []
     configs = []
@@ -171,8 +196,9 @@ def _run_source(
     if not ready:
         return
 
+    native = session.source_for(configs[0])
+    source_directory = native.directory
     source_directory.mkdir(parents=True, exist_ok=True)
-    (source_directory / "source_replay_report.json").unlink(missing_ok=True)
     plan_path = source_directory / "target_plan.json"
     write_json(
         plan_path,
@@ -185,69 +211,59 @@ def _run_source(
             ],
         },
     )
-    batch_log = source_directory / "source_preparation.log"
+    batch_log = native.log_path
     completed = set()
-    process = None
     return_code = 1
     try:
-        with batch_log.open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(
-                build_trace_graph_command(configs[0], target_plan=plan_path),
-                cwd=ROOT_DIR,
-                stdout=subprocess.PIPE,
-                stderr=log,
-                text=True,
-                start_new_session=True,
-            )
-            for line in process.stdout:
-                outcome = json.loads(line)
-                if outcome.get("event") == "source_prepared":
-                    yield (
-                        SourcePreparation(
-                            ready[0].source.manifest_path,
-                            ready[0].cpu_service_cost,
-                            outcome["wall_seconds"],
-                            outcome["performance"],
-                        ),
-                        0,
-                    )
-                    continue
-
-                index = outcome["index"]
-                if outcome.get("event") == "target_started":
-                    yield ModelRunStarted(ready[index]), 0
-                    continue
-
-                result = _finish_result(
-                    options,
-                    ready[index],
-                    outcome["return_code"],
-                    outcome["skip_reason"],
-                    outcome.get("performance", {}),
+        for outcome in native.execute(plan_path):
+            if outcome.get("event") == "batch_started":
+                native.memory_budget = {key: value for key, value in outcome.items() if key != "event"}
+                continue
+            if outcome.get("event") in {"source_prepared", "source_reused"}:
+                yield (
+                    SourcePreparation(
+                        ready[0].source.manifest_path,
+                        ready[0].cpu_service_cost,
+                        outcome.get("wall_seconds", 0.0),
+                        outcome.get("performance", {}),
+                        reused=outcome["event"] == "source_reused",
+                    ),
+                    0,
                 )
-                completed.add(index)
-                yield result, outcome["inflight"]
-            return_code = process.wait()
+                continue
+            if outcome.get("event") == "batch_completed":
+                return_code = outcome["return_code"]
+                break
+
+            index = outcome["index"]
+            if outcome.get("event") == "target_started":
+                yield ModelRunStarted(ready[index]), 0
+                continue
+
+            result = _finish_result(
+                options,
+                ready[index],
+                outcome["return_code"],
+                outcome["skip_reason"],
+                {**outcome.get("performance", {}), "prediction_memory_budget": native.memory_budget},
+            )
+            completed.add(index)
+            yield result, outcome["inflight"]
     except Exception as error:
+        native.failed = True
+        native.close()
         with batch_log.open("a", encoding="utf-8") as log:
             log.write(f"\nnative prediction batch failed: {error}\n")
-    finally:
-        stop_process(process)
-        if process is not None and process.stdout is not None:
-            process.stdout.close()
 
     # Source preparation/process failure has no target result. Preserve its
     # cause for all affected cells rather than reading leftovers or filling 0.
-    truncate_log_tail(batch_log, options.diagnostics.failure_log_max_bytes)
+    if native.process is None:
+        truncate_log_tail(batch_log, options.diagnostics.failure_log_max_bytes)
     for index, spec in enumerate(ready):
         if index not in completed:
             detail = batch_log.read_text(encoding="utf-8") or "native target completion record missing"
             (spec.output_dir / "model.log").write_text(detail, encoding="utf-8")
             yield _finish_result(options, spec, return_code or 1), 0
-    if not options.diagnostics.keep_debug_artifacts and return_code == 0:
-        batch_log.unlink(missing_ok=True)
-    else:
-        truncate_log_tail(batch_log, options.diagnostics.failure_log_max_bytes)
 
 
 def _finish_result(
@@ -275,16 +291,3 @@ def _finish_result(
         log.unlink(missing_ok=True)
 
     return ModelRunResult(spec, return_code, skip_reason, missing_costs, structure_gaps, performance or {})
-
-
-def truncate_log_tail(path: Path, limit: int) -> None:
-    """Retain at most ``limit`` trailing bytes from one failed command log."""
-
-    if not path.is_file() or path.stat().st_size <= limit:
-        return
-    marker = f"[model log truncated to final {limit} bytes]\n".encode()
-    tail_bytes = max(0, limit - len(marker))
-    with path.open("rb") as log_file:
-        log_file.seek(-tail_bytes, 2)
-        tail = log_file.read()
-    path.write_bytes(marker + tail)
