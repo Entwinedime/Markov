@@ -5,16 +5,13 @@ from collections import Counter
 from contextlib import ExitStack
 import os
 from pathlib import Path
-import signal
-import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 import json
 
 from markov.artifacts.request import read_json
 from markov.artifacts.writing import write_json
+from markov.instrumentation.http import SerialHttpClient, encode_inputs, inference_server
 
 
 CAPTURE_OWNED_ARGUMENTS = {
@@ -76,48 +73,25 @@ def capture_environment(profiling: bool, calibration: bool = False) -> dict[str,
     return environment
 
 
-class Capture:
-    def __init__(self, path: Path):
+class Capture(SerialHttpClient):
+    def __init__(self, path: Path) -> None:
         self.path = path
         self.directory = path.parent
         self.plan = read_json(path)
-        self.deadline = time.monotonic() + self.plan["budget"]["wall_sec"]
-        self.client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        self.rows = []
-
-    def remaining(self):
-        value = self.deadline - time.monotonic()
-        if value <= 0:
-            raise TimeoutError("Capture wall-time budget reached")
-        return value
-
-    def http(self, route: str, body=None):
-        data = None if body is None else json.dumps(body).encode()
-        request = urllib.request.Request(
-            "http://127.0.0.1:30000" + route, data=data, headers={"Content-Type": "application/json"}
+        super().__init__(
+            self.directory,
+            self.plan["workload"]["formal_begin_index"],
+            time.monotonic() + self.plan["budget"]["wall_sec"],
         )
-        begin = time.time_ns()
-        with self.client.open(request, timeout=self.remaining()) as response:
-            payload = response.read()
-        end = time.time_ns()
-        return payload, begin, end
 
-    def prepare_inputs(self):
+    def prepare_inputs(self) -> list[dict]:
         requests = self.plan["workload"]["requests"]
-        tokenizer = None
-        if any(row["prompt"] is not None for row in requests):
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.plan["server"]["model_path"],
-                local_files_only=True,
-                trust_remote_code=self.plan["server"].get("trust_remote_code", False),
-            )
-        for row in requests:
-            if row["input_ids"] is None:
-                row["input_ids"] = tokenizer.encode(row["prompt"])
-        if sum(len(row["input_ids"]) for row in requests) > self.plan["budget"]["input_tokens"]:
-            raise ValueError("The tokenized workload exceeds the remaining input-token budget")
+        encode_inputs(
+            requests,
+            self.plan["server"]["model_path"],
+            self.plan["budget"]["input_tokens"],
+            self.plan["server"].get("trust_remote_code", False),
+        )
 
         server = self.plan["server"]
         if "max_total_tokens" in server and "page_size" in server and not server.get("disable_radix_cache", False):
@@ -134,7 +108,7 @@ class Capture:
                     )
         return requests
 
-    def run(self):
+    def run(self) -> None:
         profiling_requested = self.plan["profiling"]
         if self.plan["calibration"]:
             (self.directory / "regions").mkdir()
@@ -161,48 +135,29 @@ class Capture:
         profiling = False
         with ExitStack() as stack:
             gate = stack.enter_context(control.open("r+b", buffering=0)) if profiling_requested else None
-            log = stack.enter_context((self.directory / "server.log").open("w"))
-            server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                while True:
-                    if server.poll() is not None:
-                        raise RuntimeError(f"Inference server exited with {server.returncode}; see server.log")
-                    try:
-                        self.http("/model_info")
-                        break
-                    except (urllib.error.URLError, TimeoutError):
-                        self.remaining()
-                        time.sleep(min(0.5, self.remaining()))
-                if profiling_requested:
-                    self.http(
-                        "/start_profile",
-                        {
-                            "output_dir": str(self.directory / "trace"),
-                            "activities": ["CPU", "GPU"],
-                            "with_stack": False,
-                            "record_shapes": False,
-                        },
-                    )
-                    profiling = True
-                    gate.write(b"\1")
-                for ordinal, row in enumerate(requests):
-                    self.request(ordinal, row)
-                if profiling_requested:
-                    self.http("/stop_profile", {})
-                    profiling = False
-            finally:
-                if gate is not None:
-                    gate.seek(0)
-                    gate.write(b"\0")
-                # Export finishes before shutdown on success; failed captures
-                # retain their partial files without publishing a ready manifest.
-                if server.poll() is None:
-                    server.terminate()
-                    try:
-                        server.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(server.pid, signal.SIGKILL)
-                        server.wait(timeout=15)
+            with inference_server(command, self.directory / "server.log", self):
+                try:
+                    if profiling_requested:
+                        self.http(
+                            "/start_profile",
+                            {
+                                "output_dir": str(self.directory / "trace"),
+                                "activities": ["CPU", "GPU"],
+                                "with_stack": False,
+                                "record_shapes": False,
+                            },
+                        )
+                        profiling = True
+                        gate.write(b"\1")
+                    for ordinal, row in enumerate(requests):
+                        self.request(ordinal, row)
+                    if profiling_requested:
+                        self.http("/stop_profile", {})
+                        profiling = False
+                finally:
+                    if gate is not None:
+                        gate.seek(0)
+                        gate.write(b"\0")
         if profiling:
             raise RuntimeError("Profiler did not finish exporting")
         if profiling_requested:
@@ -260,57 +215,6 @@ class Capture:
                     "workload_report": "workload_report.json",
                 },
             )
-
-    def request(self, ordinal, item):
-        identity = f"request_{ordinal}"
-        body = {
-            "rid": identity,
-            "input_ids": item["input_ids"],
-            "return_logprob": item["return_logprob"],
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": item["max_new_tokens"],
-                "ignore_eos": item["ignore_eos"],
-            },
-        }
-        row = {
-            "kind": "request",
-            "logical_request_id": identity,
-            "measure": ordinal >= self.plan["workload"]["formal_begin_index"],
-            "input_tokens": len(item["input_ids"]),
-            "max_new_tokens": item["max_new_tokens"],
-            "status": "running",
-        }
-        self.rows.append(row)
-        write_json(self.directory / "workload_report.json", {"requests": self.rows})
-        try:
-            payload, begin, end = self.http("/generate", body)
-            response = json.loads(payload)
-        except Exception as error:
-            row.update(status="error", error=str(error))
-            write_json(self.directory / "workload_report.json", {"requests": self.rows})
-            raise
-        row.update(
-            status="ok",
-            start_time_ms=self.milliseconds(begin),
-            end_time_ms=self.milliseconds(end),
-            generated_tokens=response["meta_info"]["completion_tokens"],
-            response=response,
-        )
-
-        finish = response["meta_info"]["finish_reason"]
-        if finish["type"] in ("abort", "error") or (
-            item["ignore_eos"] and row["generated_tokens"] != item["max_new_tokens"]
-        ):
-            row.update(status="error", error="The runtime aborted or changed the requested fixed output count")
-
-        write_json(self.directory / "workload_report.json", {"requests": self.rows})
-        if row["status"] == "error":
-            raise ValueError(row["error"])
-
-    @staticmethod
-    def milliseconds(ns):
-        return f"{ns // 1_000_000}.{ns % 1_000_000:06d}"
 
     def publish_manifest(self):
         from markov.adapters.ascend.clock import trace_clock
