@@ -111,8 +111,11 @@ def affine(points: Points, feature: str | list[str] | None) -> dict:
     return {"intercept_ns": intercept, "coefficients_ns": dict(zip(names, coefficients))}
 
 
-def nonnegative_affine(points: Points, features: str | list[str]) -> dict:
+def nonnegative_affine(points: Points, features: str | list[str] | None) -> dict:
     """Enumerate active sets for the few nonnegative additive service terms."""
+    if features is None:
+        return affine(points, None)
+
     names = features if isinstance(features, list) else [features]
     columns = [[1.0] * len(points)] + [[work[name] for work, _ in points] for name in names]
     target = [duration for _, duration in points]
