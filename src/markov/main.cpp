@@ -4,6 +4,7 @@
 #include "markov/adapters/source.hpp"
 #include "markov/commands/costs.hpp"
 #include "markov/commands/prediction.hpp"
+#include "markov/commands/replay.hpp"
 #include "markov/commands/source.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
 
@@ -28,6 +29,7 @@ void usage(std::ostream & stream) {
               "       markov_core page-work <page_work_request.json> [report.json]\n"
               "       markov_core costs <cost_queries.json> [report.json]\n"
               "       markov_core predict <prepared_request.json> [report.json]\n"
+              "       markov_core replay <replay_request.json> [report.json]\n"
               "       markov_core tensor-work <capture.json> [report.json]\n";
 }
 
@@ -92,8 +94,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string_view command(argv[1]);
-    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work" && command != "tensor-work"
-        && command != "predict") {
+    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work" && command != "tensor-work" && command != "predict"
+        && command != "replay") {
         usage(std::cerr);
         return 2;
     }
@@ -103,7 +105,15 @@ int main(int argc, char ** argv) {
         if (argc == 4) output = std::filesystem::absolute(argv[3]).lexically_normal();
 
         nlohmann::json result;
-        if (command == "predict") {
+        if (command == "replay") {
+            const auto request = markov::adapters::prepare_replay(argv[2]);
+            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(), request.source.manifest.path };
+            for (const auto & file : request.source.manifest.files) inputs.push_back(file.path);
+            if (request.source.manifest.configuration_path) inputs.push_back(*request.source.manifest.configuration_path);
+            prepare_output(output, inputs);
+            result = markov::commands::replay_report(request);
+        }
+        else if (command == "predict") {
             const auto request = markov::adapters::prepare_prediction(argv[2]);
             std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(),
                                                        request.models_path,

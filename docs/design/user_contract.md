@@ -23,18 +23,27 @@ empty/prepared 是声明的初始条件，不是自动检测结果。输入准�
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
 hicache_write_policy、hicache_io_backend、hicache_mem_layout；其余执行设置保持来源条件。
 目前传输组合限 kernel_ascend/page_first_direct，batch=1；新增页几何、回载或其他成本域不满足时明确停止，不从相似目标借值。
+设备容量还受 SGLang 的准入预留约束：页对齐后的输入加所需输出之外，再留一页，并满足严格小于池的条件。
+否则框架可能缩减输出，甚至无法入场；HTTP 成功也不代表完成了原工作量，采集另核对真实结束原因和固定输出数量。
+不满足时目标返回 resource_infeasible、HTTP 为 null，不生成假想的成功结果。显式采集的已知不可能请求在启动模型前拒绝。
+当前区域预测不支持关闭 radix cache 的另一套调度分支。
 
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
-自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应和批量备份，不含回载/存储采样。
+自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份与整批回载，不含存储采样。
 同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
 preparation 中单列 base/performance 时间、sampling_rounds 和累计状态路径；这些不计入预测的 HTTP。
 
 预测容器无设备、无网络，仅挂载可执行文件、所选 base 采集目录、模型、准备输入与结果目录。
 不挂载项目/data 根目录或 evaluator 的正常测量。输出须与 base/模型输入分离；已有活跃容器时拒绝复用其输出。
 一次进程共享 source 和只读模型，当前 targets 顺序执行，jobs 尚未用于预测并发。
+execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}]；默认空列表，按声明顺序取首个子串匹配。
+匹配标签为操作、实现和计时口径的组合，只缩放已绑定的工作响应，不修改来源、模型系数或残余等待。
+区域响应只支持区域名字，不能把内部某个算子的倍率套到整个区域；更细的名字需要有对应的原生工作。
+每目标报告规则及实际命中数；0 次命中表示本次工作没有该标签，不能当作所指算子已经缩放。
+这是用户给定的敏感性假设，允许零及正的有限倍率，不授予跨硬件预测资格。
 从 configuration 首次采集后，同一输出的重复 predict 会核对部署、运行参数和 workload 后自动复用该任务的 manifest，
 不再要求用户手改输入。输入改变时要求新输出或显式 recapture；不会扫描其他目录猜来源。
 镜像和设备用于实际采集；复用来源以该次采集记录为准，需要新运行环境的来源时显式 recapture。
@@ -296,7 +305,7 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 }
 ```
 
-路径相对维护请求解析。sglang_cache_io 导入正常备份返回、完成观测及主机克隆；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
+路径相对维护请求解析。sglang_cache_io 导入正常备份、主机克隆和回载准备/提交/完成观测；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
 只填 imports 可以单独入库；已有数据可省略 imports，只用 training 的原来源路径离线训练，不再打开原始采样。training 必须显式选择，不扫描整库；预热、未选择的采集及独立留出不参加训练。
 可选 models 指向已有选定模型；训练只替换相同操作/实现/口径，完整结果原子写到 output。输出与数据库、请求及原始采集目录分开。报告区分新增/复用记录与训练响应；单设备数据不绑定模型名或全局 TP，平台、runtime 和实际工作条件仍须相容。
 
@@ -366,6 +375,24 @@ python3 -m markov.adapters.sglang.input_kernels --recipe /path/to/recipe.json --
 准备阶段可影响正式窗口的缓存和后台 I/O，必须连续执行；完整 HTTP 只统计正式请求边界。
 
 ## 结果与诊断
+
+### 显式源图成本回放
+
+```bash
+scripts/markov.sh replay --request /path/to/replay.json
+```
+
+请求给出 manifest 和独立 output，可选 node_scale、overrides、inspect_name 和 memory_limit_gib。
+路径相对请求文件解析。示例请求为 {"manifest": "/path/to/profile_manifest.json", "output": "/path/to/replay"}；
+默认沿用源观测成本，完整细图只在该诊断命令中构建，不进入普通预测。
+inspect_name 为空字符串时列出服务名字及数量；填入名字子串后列出匹配节点的 ID、原成本和绑定后成本。
+默认不生成名字统计或逐节点数据。
+overrides 例如 [{"node": 123, "duration_ns": 456}]，只替换明确节点，随后再应用 node_scale；
+边界只能为零，重复 ID、负耗时和越界 ID 会拒绝。缩放只作用于服务，gap、等待和边保持原样。
+
+该入口保持所选源图及资源次序，给出逐请求回放与观测差异；替换值由调用者负责关联和说明来源。
+当前没有自动 target 操作匹配，也没有执行式目标图的导出/重放，不能用源图回放证明目标结构正确。
+纯诊断容器只读取指定来源和请求，无设备、无数据库、无网络，输出不覆盖采集文件。
 
 普通预测只给目标配置、完整 HTTP 时间、状态、成本来源覆盖、外推/近似说明和准备开销。
 未知或失败时间为缺失值，不能为零。执行成功、存在适用模型和精度达标是不同事实。

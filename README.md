@@ -39,7 +39,7 @@ execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/
 
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
 流程先使用现有模型，按整组缺少的工作生成小型独立采样，维护模型后继续预测；不会采集 target trace 或按误差补参数。
-当前自动采样覆盖 SGLang/Ascend 串行区域响应和批量备份，回载、存储等缺口仍明确停止。
+当前自动采样覆盖 SGLang/Ascend 串行区域响应、批量备份和整批回载，存储等缺口仍明确停止。
 采样与 base 分别累计预算；中断后重跑同一命令会接管原容器、保留用量，完成任务直接复用。
 
 平台维护者也可显式维护独立数据：
@@ -71,7 +71,10 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 ```
 
 原生页几何/缓存子链用 page-work，独立模型查询用 costs；字段和范围见用户合同。
-SGLang 与 KTransformers 保持同级设计，HiCache 只属于 SGLang；KTransformers 真采集/预测和默认关闭的 NodeScale 尚待恢复。
+可选 execution.node_scale 按已绑定工作的名字做成本敏感性分析，默认关闭，不代表真实硬件提速。
+显式源图诊断可运行 `scripts/markov.sh replay --request /path/to/replay.json`，使用原始图的成本、缩放或指定节点替换值；
+它不生成 target 分支，也不能代替执行式目标图的 oracle-cost 验证。
+SGLang 与 KTransformers 保持同级设计，HiCache 只属于 SGLang；KTransformers 真采集/预测尚待恢复。
 
 ## 文档与目录
 

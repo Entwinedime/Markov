@@ -41,10 +41,18 @@ def main() -> int:
         "maintain", help="Import independent performance data and train selected offline responses."
     )
     maintenance.add_argument("--request", type=Path, required=True)
+    replay_command = commands.add_parser(
+        "replay", help="Replay a source DAG with explicit NodeScale or node-cost hypotheses."
+    )
+    replay_command.add_argument("--request", type=Path, required=True)
     args = parser.parse_args()
 
     try:
-        if args.command == "maintain":
+        if args.command == "replay":
+            from markov.workflow.replay import replay
+
+            result = replay(args.request)
+        elif args.command == "maintain":
             from markov.workflow.performance import maintain_performance
 
             result = maintain_performance(args.request)
