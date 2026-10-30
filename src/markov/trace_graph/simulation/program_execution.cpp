@@ -35,8 +35,21 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
                 operation.owner
             });
         }
-        else if (const auto * delay = std::get_if<planning::SourceDelay>(&operation.cost)) {
-            const auto & response = costs_.query_source_delay(delay->node, operation.resource);
+        else if (const auto * delay = std::get_if<planning::SourceRegionGap>(&operation.cost)) {
+            const auto & response = costs_.query_region_gap(delay->interval);
+            ++coverage[*response.coverage];
+            bound.operations.push_back({
+                { *response.duration_ns, operation.resource, graph::NodeKind::Delay },
+                operation.completion,
+                operation.owner
+            });
+        }
+        else if (const auto * client = std::get_if<planning::SourceClientDelay>(&operation.cost)) {
+            const auto & response = costs_.query_client_delay(client->request, client->response);
+            if (!response.duration_ns) {
+                if (seen_gaps_.insert(&response).second) gaps_.push_back({ *client, response });
+                continue;
+            }
             ++coverage[*response.coverage];
             bound.operations.push_back({
                 { *response.duration_ns, operation.resource, graph::NodeKind::Delay },

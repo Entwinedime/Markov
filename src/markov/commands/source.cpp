@@ -617,7 +617,7 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         {               "timing_alignment",                                                                                              std::move(alignment_report) },
         {                     "timing_sec",
          { { "read_and_interpret", source.read_and_interpret_sec },
-         { "build", source.build_sec },
+         { "build", source.build_sec + context.detailed_preparation_sec() },
          { "replay", std::chrono::duration<double>(finished - begin).count() },
          { "summary", std::chrono::duration<double>(summarized - finished).count() } }                                                                              },
         {  "dependency_correctness_proven",                                                                                                                    false },

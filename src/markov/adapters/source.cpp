@@ -60,7 +60,7 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
     return result;
 }
 
-PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path) {
+PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path, SourceDetail detail) {
     using namespace trace_graph;
     using Clock = std::chrono::steady_clock;
     const auto begin = Clock::now();
@@ -72,9 +72,17 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     else if (manifest.framework == "ktransformers") probes = std::make_unique<ProbeReader>(observations);
     else throw std::runtime_error("Framework probe interpretation is not implemented for " + manifest.framework);
     std::vector<std::size_t> counts;
+    std::vector<std::size_t> skipped;
     for (std::size_t file_id = 0; file_id < manifest.files.size(); ++file_id) {
         const auto & file = manifest.files[file_id];
         std::size_t records = 0;
+        if (detail == SourceDetail::Regions && file.channel == source::Channel::Torch) {
+            // Region work comes from semantic probes. Independent stream
+            // responses do not consume per-kernel services or exported flows.
+            counts.push_back(0);
+            skipped.push_back(file_id);
+            continue;
+        }
         if (file.channel == source::Channel::Client) {
             auto program = source::read_client_program(file.path, file_id);
             if (!observations.requests.empty() && !program.requests.empty() && program.requests.front().begin_ns < observations.requests.back().end_ns)
@@ -104,7 +112,7 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     }
     observations.normalize_resources();
     observations.resolve_flows();
-    causality.connect(observations);
+    if (detail == SourceDetail::Native) causality.connect(observations);
     for (auto & request : observations.requests) {
         const auto ports = probes->requests.find(request.identity);
         if (ports != probes->requests.end() && ports->second.received.size() == 1 && ports->second.sent.size() == 1) {
@@ -117,6 +125,7 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     const auto parsed = Clock::now();
     if (observations.spans.empty()) throw std::runtime_error("No execution spans were observed in the declared source inputs");
     source::SourceContext context(std::move(observations));
+    if (detail == SourceDetail::Regions) context.regions();
     const auto built = Clock::now();
     auto cpu_costs = cpu_costs_path ? std::optional(read_source_cpu_costs(*cpu_costs_path, manifest, context.observations())) : std::nullopt;
     const auto finished = Clock::now();
@@ -126,7 +135,8 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
              std::move(probes->roles),
              std::chrono::duration<double>(parsed - begin + finished - built).count(),
              std::chrono::duration<double>(built - parsed).count(),
-             std::move(cpu_costs) };
+             std::move(cpu_costs),
+             std::move(skipped) };
 }
 
 } // namespace markov::adapters

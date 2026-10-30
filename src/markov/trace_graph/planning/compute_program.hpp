@@ -2,7 +2,7 @@
 
 #include "markov/trace_graph/planning/compute_plan.hpp"
 #include "markov/trace_graph/planning/native_calls.hpp"
-#include "markov/trace_graph/planning/program.hpp"
+#include "markov/trace_graph/planning/request_compute.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
 #include <cstdint>
@@ -20,62 +20,27 @@ struct FrameCompute {
     ComputePlan plan;
 };
 
-enum class ComputeScope { Compute, Request };
-
-struct ControlWork {
-    std::vector<Work> work;
-    std::vector<AsyncCompletion> completions = {};
-};
-
-class RequestControls {
-public:
-    virtual ~RequestControls() = default;
-    virtual FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) = 0;
-    // No value means the control awaits a state event; an empty vector is a completed no-op.
-    virtual std::optional<ControlWork> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) = 0;
-    virtual void end_result_control(ProgramRuntime & runtime, std::size_t request, std::size_t frame, ResultControlPoint control, graph::NodeId completion) = 0;
-};
-
-struct ComputeStats {
-    struct Preparation {
-        std::size_t sequences = 0, operations = 0;
-    };
-    struct FramePorts {
-        source::Index source_frame;
-        std::optional<graph::NodeId> entry, submitted, result_ready, completed, callers_entry, callers_completed, result_work_completed, sent;
-        std::optional<std::size_t> allocator_view_offset_pages;
-    };
-    std::size_t collective_services = 0, participant_arrivals = 0;
-    std::size_t compute_calls = 0, compute_services = 0;
-    std::size_t native_operations = 0, dispatch_delays = 0, source_cpu_gaps = 0;
-    std::map<std::string, Preparation> preparations;
-    std::vector<FramePorts> frames;
-    graph::Time maximum_arrival_span_ns = 0, participant_wait_ns = 0;
-    void add(const ComputeStats & other);
-};
-
 // Native blocking tensor collectives fence the known work on each participant.
 // Arrivals, the shared completion service and subsequent compute use one clock.
 // Observed overlap releases the next caller while retaining queue dependencies.
-class ComputeProgram final : public Program {
+class ComputeProgram final : public RequestComputation {
 public:
-    static constexpr simulation::Component first_owner = 2;
     ComputeProgram(const source::SourceContext & source, std::vector<FrameCompute> frames, std::size_t first_resource, PreparationCache & preparations,
                    ExecutionQueues & queues, ComputeScope scope = ComputeScope::Compute, simulation::Component owner = first_owner,
                    RequestControls * controls = nullptr, std::size_t request = 0);
     ComputeProgram(const ComputeProgram &) = delete;
 
-    void resume_controls(ProgramRuntime & runtime, graph::NodeId cause);
-    void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt);
+    void resume_controls(ProgramRuntime & runtime, graph::NodeId cause) override;
+    void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt) override;
     void start(ProgramRuntime & runtime) override { start(runtime, std::nullopt); }
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
     bool complete() const override { return complete_ || issue_.has_value(); }
     std::size_t resources() const { return first_resource_ + source_.observations().collective_groups.size(); }
-    const std::optional<std::string> & issue() const { return issue_; }
-    const ComputeStats & stats() const { return stats_; }
-    std::optional<graph::NodeId> prefill_result_ready() const { return prefill_result_ready_; }
-    std::optional<graph::NodeId> results_ready() const { return results_ready_; }
-    std::optional<graph::NodeId> sent() const { return sent_; }
+    const std::optional<std::string> & issue() const override { return issue_; }
+    const ComputeStats & stats() const override { return stats_; }
+    std::optional<graph::NodeId> prefill_result_ready() const override { return prefill_result_ready_; }
+    std::optional<graph::NodeId> results_ready() const override { return results_ready_; }
+    std::optional<graph::NodeId> sent() const override { return sent_; }
 
 private:
     enum class ActionKind : std::uint32_t {

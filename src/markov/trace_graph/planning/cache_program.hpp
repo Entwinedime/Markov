@@ -3,6 +3,7 @@
 #include "markov/trace_graph/planning/cache.hpp"
 #include "markov/trace_graph/planning/compute_program.hpp"
 #include "markov/trace_graph/planning/program.hpp"
+#include "markov/trace_graph/planning/region_compute.hpp"
 #include "markov/trace_graph/planning/storage.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
@@ -49,7 +50,8 @@ struct CacheCopyResult {
 class CacheProgram final : public Program, public RequestControls {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
-                 std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt);
+                 std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt,
+                 std::optional<RegionBackend> regions = std::nullopt);
 
     // Storage borrows this cache, so the program must remain at one address.
     CacheProgram(const CacheProgram &) = delete;
@@ -57,7 +59,9 @@ public:
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
     bool complete() const override;
 
-    std::size_t resources() const { return compute_resource_begin() + source_.observations().collective_groups.size(); }
+    std::size_t resources() const {
+        return compute_resource_begin() + (regions_ ? 2 * backend_.participants : source_.observations().collective_groups.size());
+    }
     ComputeStats compute_stats() const;
     const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
     const std::vector<CacheRequestResult> & requests() const { return requests_; }
@@ -75,6 +79,8 @@ private:
     enum class ActionKind : std::uint32_t {
         CopyDone,
         CopyParticipantDone,
+        CopyGranted,
+        CopyReturned,
         EvictionDone,
         Received,
         AdmissionGranted,
@@ -99,6 +105,10 @@ private:
         std::vector<PrefixId> storage_pages;
         std::vector<graph::NodeId> copy_completions = {}, caller_returns = {};
     };
+    struct RegionCopyTurn {
+        TransferId transfer;
+        std::size_t request, rank;
+    };
     struct RunningRequest {
         struct Insertion {
             RadixId leaf;
@@ -107,7 +117,7 @@ private:
             std::vector<graph::NodeId> completions;
             std::optional<graph::NodeId> completed;
         };
-        std::unique_ptr<ComputeProgram> compute;
+        std::unique_ptr<RequestComputation> compute;
         std::optional<BufferId> buffer;
         std::optional<RadixId> pin, committed;
         std::optional<PublicationId> prefix_publication, final_publication;
@@ -146,13 +156,15 @@ private:
     void compute(ProgramRuntime & runtime);
     void query(ProgramRuntime & runtime, const CacheMatch & matched);
     void publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request);
-    void backup_prefix(ProgramRuntime & runtime, RadixId leaf);
+    void backup_prefix(ProgramRuntime & runtime, RadixId leaf, std::size_t request);
     void commit(ProgramRuntime & runtime, std::size_t request);
     void publish_result(ProgramRuntime & runtime, std::size_t request);
     bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
     bool make_host_room(std::size_t pages);
-    bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after);
+    bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages);
+    bool region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
+    bool submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
     std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
 
@@ -161,6 +173,8 @@ private:
     Cache cache_;
     const CacheBackend backend_;
     PreparationCache preparations_;
+    std::optional<RegionBackend> regions_;
+    RegionPreparation region_preparation_;
     std::optional<Storage> storage_;
     ExecutionQueues queues_;
     std::vector<RunningRequest> running_;
@@ -168,6 +182,7 @@ private:
     ComputeStats compute_stats_;
     std::vector<CacheRequestResult> requests_;
     std::map<TransferId, PendingCopy> copies_;
+    std::vector<RegionCopyTurn> region_copy_turns_;
     std::vector<CacheCopyResult> completed_copies_;
     std::array<std::optional<graph::NodeId>, 2> copy_frontier_;
     std::vector<RadixId> pending_evictions_;

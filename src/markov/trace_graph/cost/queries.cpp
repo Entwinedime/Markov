@@ -1,5 +1,6 @@
 #include "markov/trace_graph/cost/queries.hpp"
 #include "markov/trace_graph/source/context.hpp"
+#include "markov/trace_graph/source/regions.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -10,7 +11,14 @@ namespace markov::trace_graph::cost {
 Queries::Queries(const Models & models, const source::SourceContext * source, const source::CpuCosts * cpu_costs)
     : models_(models),
       source_(source),
-      source_responses_(source ? source->observations().work_observations.size() : 0) {
+      cpu_costs_(cpu_costs),
+      source_responses_(source ? source->observations().work_observations.size() : 0) {}
+
+void Queries::prepare_source_costs() {
+    if (source_costs_prepared_) return;
+
+    const auto * source = source_;
+    const auto * cpu_costs = cpu_costs_;
     if (source) source_cpu_gaps_ = source::cpu_intervals(source->observations(), source->graph(), source->cpu_gaps(), cpu_costs);
     source_cpu_responses_.resize(source_cpu_gaps_.size());
     if (source) {
@@ -37,10 +45,40 @@ Queries::Queries(const Models & models, const source::SourceContext * source, co
         }
         source_native_work_responses_.resize(source->native_work().size());
     }
+    source_costs_prepared_ = true;
+}
+
+std::span<const source::CpuInterval> Queries::source_cpu_gaps() {
+    prepare_source_costs();
+    return source_cpu_gaps_;
+}
+
+const Response & Queries::query_client_delay(std::size_t request, bool response) {
+    ++requests_;
+    const auto key = std::pair(request, response);
+    const auto existing = client_delays_.find(key);
+    if (existing != client_delays_.end()) return existing->second;
+
+    const auto & observed = source_->observations();
+    const auto & window = observed.requests[request];
+    const auto port = response ? window.sent : window.received;
+    Response result{ Status::UnobservedSource, std::nullopt, std::nullopt, {}, std::nullopt };
+    if (port) {
+        const auto at = observed.points[*port].time_ns;
+        const auto duration = response ? window.end_ns - at : at - window.begin_ns;
+        if (duration >= 0) result = { Status::Ready, duration, Coverage::SourceResidual, {}, std::nullopt };
+    }
+    return client_delays_.emplace(key, std::move(result)).first->second;
+}
+
+std::span<const source::CpuInterval> Queries::native_cpu_intervals() {
+    prepare_source_costs();
+    return native_cpu_intervals_;
 }
 
 const Response & Queries::query_source_work(const planning::Work & work, std::size_t interval, std::size_t resource) {
     if (!source_) throw std::logic_error("Source work requested without source evidence");
+    prepare_source_costs();
     const auto & original = source_->native_work()[interval];
     if (original.timing != source::NativeTiming::Cpu) {
         if (original.work != work || original.region.resource != resource) return query(work);
@@ -90,6 +128,7 @@ const Response & Queries::query_source_work(const planning::Work & work, std::si
 
 const Response & Queries::query_source_cpu_gap(std::size_t interval, std::size_t resource) {
     if (!source_ || source_->cpu_gaps()[interval].resource != resource) throw std::logic_error("Source CPU gap requires its original caller");
+    prepare_source_costs();
     ++requests_;
     auto & response = source_cpu_responses_[interval];
     if (response) return *response;
@@ -145,15 +184,15 @@ const Response & Queries::query(const planning::Work & work) {
     return response;
 }
 
-const Response & Queries::query_source_delay(graph::NodeId id, std::size_t resource) {
-    if (!source_) throw std::logic_error("Source delay requested without source evidence");
-    const auto & node = source_->graph().graph.nodes()[id];
-    if (node.resource != resource || node.kind != graph::NodeKind::ResidualGap
-        || source_->observations().resources[resource].kind != source::ResourceKind::Client)
-        throw std::logic_error("Source delay is not a retained client interval on the target resource");
-
+const Response & Queries::query_region_gap(std::size_t interval) {
     ++requests_;
-    return source_delays_.try_emplace(id, Response{ Status::Ready, node.duration_ns, Coverage::SourceResidual, {}, std::nullopt }).first->second;
+    const auto existing = region_gaps_.find(interval);
+    if (existing != region_gaps_.end()) return existing->second;
+
+    const auto & source = source_->regions().residual(interval);
+    auto duration = source.observation.end_ns - source.observation.begin_ns;
+    for (const auto & excluded : source.excluded) duration -= excluded.end_ns - excluded.begin_ns;
+    return region_gaps_.emplace(interval, Response{ Status::Ready, duration, Coverage::SourceRegionResidual, {}, std::nullopt }).first->second;
 }
 
 } // namespace markov::trace_graph::cost

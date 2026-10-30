@@ -13,7 +13,7 @@
 namespace markov::trace_graph::simulation {
 
 struct CostGap {
-    std::variant<planning::Work, planning::SourceCpuGap> work;
+    std::variant<planning::Work, planning::SourceCpuGap, planning::SourceClientDelay, planning::SourceRegionGap> work;
     cost::Response response;
 };
 

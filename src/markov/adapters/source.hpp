@@ -15,6 +15,8 @@
 
 namespace markov::adapters {
 
+enum class SourceDetail { Regions, Native };
+
 // One prepared capture owns its provenance and immutable source context.
 // Reports and target planners borrow it; neither reopens the trace files.
 struct PreparedSource {
@@ -25,6 +27,7 @@ struct PreparedSource {
     double read_and_interpret_sec;
     double build_sec;
     std::optional<SourceCpuCosts> cpu_costs;
+    std::vector<std::size_t> skipped_files = {};
 };
 
 struct PageWorkRequest {
@@ -36,7 +39,8 @@ struct PageWorkRequest {
     std::optional<trace_graph::planning::KernelCacheInitial> kernel_cache_initial = std::nullopt;
 };
 
-PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path = std::nullopt);
+PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path = std::nullopt,
+                              SourceDetail detail = SourceDetail::Native);
 PageWorkRequest read_page_work_request(const std::filesystem::path & path);
 
 } // namespace markov::adapters

@@ -21,6 +21,7 @@ Execution::Execution(const graph::Graph & graph, std::span<const graph::Time> in
 },
       incoming_(graph.incoming_counts().begin(), graph.incoming_counts().end()) {
     std::size_t resources = 0;
+    result_.edges = graph.edges().size();
     for (const auto & operation : graph.nodes()) resources = std::max(resources, operation.resource + 1);
     lanes_.resize(resources);
     for (graph::NodeId id = 0; id < original_nodes_; ++id) {
@@ -87,7 +88,10 @@ graph::NodeId Execution::submit(Mutation mutation) {
 void Execution::record_edge(graph::Edge edge) {
     auto & edges = edge.from < original_nodes_ ? source_additions_[edge.from] : owned_[edge.from - original_nodes_].successors;
     const auto same = [&](const graph::Edge & value) { return value.to == edge.to && value.kind == edge.kind; };
-    if (std::ranges::none_of(edges, same)) edges.push_back(edge);
+    if (std::ranges::none_of(edges, same)) {
+        edges.push_back(edge);
+        ++result_.edges;
+    }
 }
 
 std::size_t Execution::schedule_at(graph::Time time_ns, Component owner, Action action) {

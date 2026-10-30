@@ -38,6 +38,6 @@ struct SourceGraph {
 // Partition observed CPU wall intervals without charging both parent and child.
 // Their waiting portions are not yet proof of transferable CPU service costs.
 // Preserve named boundaries and explicit flow edges; retain CPU gaps separately.
-SourceGraph build_source_graph(Observations & observations);
+SourceGraph build_source_graph(const Observations & observations);
 
 } // namespace markov::trace_graph::source

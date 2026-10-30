@@ -1,3 +1,5 @@
+#include "markov/adapters/ascend/sampling/clock.hpp"
+
 #include <ATen/Functions.h>
 
 #include <cerrno>
@@ -12,31 +14,7 @@
 #include <time.h>
 #include <vector>
 
-namespace {
-
-std::int64_t clock_ns(clockid_t clock) {
-    timespec value;
-    if (clock_gettime(clock, &value)) throw std::system_error(errno, std::generic_category(), "Read allocation clock");
-    return value.tv_sec * 1'000'000'000LL + value.tv_nsec;
-}
-
-struct Duration {
-    std::int64_t wall_ns, cpu_ns;
-};
-
-class Timer {
-public:
-    Timer() : wall_(clock_ns(CLOCK_MONOTONIC_RAW)), cpu_(clock_ns(CLOCK_THREAD_CPUTIME_ID)) {}
-    Duration stop() const {
-        const auto cpu_end = clock_ns(CLOCK_THREAD_CPUTIME_ID);
-        return { clock_ns(CLOCK_MONOTONIC_RAW) - wall_, cpu_end - cpu_ };
-    }
-
-private:
-    std::int64_t wall_, cpu_;
-};
-
-} // namespace
+using namespace markov::adapters::ascend::sampling;
 
 // Python initializes torch_npu in the matching runtime. No tensors or C++
 // exceptions cross this ABI; construction and destruction stay in that runtime.

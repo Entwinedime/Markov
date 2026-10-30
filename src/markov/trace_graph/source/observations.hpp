@@ -151,6 +151,7 @@ struct ComputeFrame {
     RecordRef record;
     std::vector<ObservedCallSequence> preparations;
     std::vector<ObservedCallSequence> lookups = {};
+    std::optional<ObservedRegion> preparation_region = std::nullopt;
 };
 
 struct CollectiveGroup {

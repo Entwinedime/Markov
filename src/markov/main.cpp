@@ -1,7 +1,9 @@
 #include "markov/adapters/ascend/tensor_work.hpp"
 #include "markov/adapters/costs.hpp"
+#include "markov/adapters/prediction.hpp"
 #include "markov/adapters/source.hpp"
 #include "markov/commands/costs.hpp"
+#include "markov/commands/prediction.hpp"
 #include "markov/commands/source.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
 
@@ -25,6 +27,7 @@ void usage(std::ostream & stream) {
               "       markov_core source <profile_manifest.json> [report.json]\n"
               "       markov_core page-work <page_work_request.json> [report.json]\n"
               "       markov_core costs <cost_queries.json> [report.json]\n"
+              "       markov_core predict <prepared_request.json> [report.json]\n"
               "       markov_core tensor-work <capture.json> [report.json]\n";
 }
 
@@ -89,7 +92,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string_view command(argv[1]);
-    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work" && command != "tensor-work") {
+    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work" && command != "tensor-work"
+        && command != "predict") {
         usage(std::cerr);
         return 2;
     }
@@ -99,9 +103,23 @@ int main(int argc, char ** argv) {
         if (argc == 4) output = std::filesystem::absolute(argv[3]).lexically_normal();
 
         nlohmann::json result;
-        if (command == "tensor-work") {
-            result = markov::adapters::ascend::tensor_work_report(argv[2]);
+        if (command == "predict") {
+            const auto request = markov::adapters::prepare_prediction(argv[2]);
+            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(),
+                                                       request.models_path,
+                                                       request.source.manifest.path };
+            for (const auto & file : request.source.manifest.files) inputs.push_back(file.path);
+            if (request.source.manifest.configuration_path) inputs.push_back(*request.source.manifest.configuration_path);
+            prepare_output(output, inputs);
+            result = markov::commands::prediction_report(request);
+        }
+        else if (command == "tensor-work") {
             const auto capture = std::filesystem::absolute(argv[2]).lexically_normal();
+            if (output) {
+                const auto relative = output->lexically_relative(capture.parent_path());
+                if (!relative.empty() && *relative.begin() != "..") throw std::runtime_error("Tensor work report must be outside the raw capture directory");
+            }
+            result = markov::adapters::ascend::tensor_work_report(capture);
             prepare_output(output, { capture, capture.parent_path() / "measurements.jsonl", result.at("trace").get<std::string>() });
         }
         else if (command == "costs") {

@@ -288,6 +288,16 @@ void ProbeReader::finish() {
     // Sidecars may follow the main probe file; qualify after every input is read.
     std::vector<const BatchResult *> results(output_.compute_frames.size(), nullptr);
     for (const auto & result : output_.batch_results) results.at(result.frame) = &result;
+    for (auto & frame : output_.compute_frames) {
+        const auto result = results[&frame - output_.compute_frames.data()];
+        if (!result) continue;
+        const auto [begin, end] = schedule_inputs_.equal_range(frame.requests);
+        for (auto at = begin; at != end; ++at) {
+            const auto & fact = at->second;
+            if (fact.phase != frame.phase || fact.region.resource != result->run.resource || fact.region.end_ns > result->run.begin_ns) continue;
+            if (!frame.preparation_region || frame.preparation_region->end_ns < fact.region.end_ns) frame.preparation_region = fact.region;
+        }
+    }
     for (const auto & pending : pending_inputs_) {
         auto & frame = output_.compute_frames[pending.frame];
         auto & preparation = frame.preparations[pending.preparation];

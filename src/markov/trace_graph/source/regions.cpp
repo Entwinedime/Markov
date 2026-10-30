@@ -1,0 +1,67 @@
+#include "markov/trace_graph/source/regions.hpp"
+#include "markov/trace_graph/source/context.hpp"
+
+#include <algorithm>
+#include <map>
+#include <tuple>
+
+namespace markov::trace_graph::source {
+
+Regions::Regions(const SourceContext & source) : frames_(source.observations().compute_frames.size()) {
+    struct Segment {
+        Index frame, step;
+        ObservedRegion interval;
+        Time received_ns;
+    };
+    const auto & observed = source.observations();
+    std::map<Index, std::vector<Segment>> lanes;
+    std::map<Index, std::vector<ObservedRegion>> exclusions;
+    for (const auto & span : observed.spans) {
+        // Waits inside modeled parents have explicit target producers. Outside
+        // those parents, control work is still opaque: retain its source wait
+        // rather than deleting time without a replacement dependency.
+        if (span.role == SpanRole::ProfilerOverhead) exclusions[span.resource].push_back({ span.resource, span.begin_ns, span.end_ns, span.record });
+    }
+    for (auto & [resource, intervals] : exclusions) std::ranges::sort(intervals, {}, &ObservedRegion::begin_ns);
+
+    for (Index frame = 0; frame < frames_.size(); ++frame) {
+        const auto & facts = observed.compute_frames[frame];
+        const auto * result = source.frame_result(frame);
+        if (!result || !facts.preparation_region || facts.requests.size() != 1) continue;
+        const auto request = std::ranges::find(observed.requests, observed.names[facts.requests.front()], &RequestWindow::identity);
+        if (request == observed.requests.end()) continue;
+        const auto received = request->received ? observed.points[*request->received].time_ns : request->begin_ns;
+        lanes[result->run.resource].push_back({ frame, 0, *facts.preparation_region, received });
+        lanes[result->run.resource].push_back({ frame, 1, result->run, received });
+        if (result->processed) lanes[result->run.resource].push_back({ frame, 2, result->processed->region, received });
+    }
+    for (auto & [resource, segments] : lanes) {
+        std::ranges::sort(segments, {}, [](const Segment & value) { return std::pair(value.interval.begin_ns, value.interval.end_ns); });
+        auto previous = segments.front().received_ns;
+        for (const auto & segment : segments) {
+            const auto begin = std::max(previous, segment.received_ns);
+            if (begin <= segment.interval.begin_ns) {
+                ResidualRegion gap{
+                    { resource, begin, segment.interval.begin_ns, segment.interval.record },
+                    {}
+                };
+                auto cursor = begin;
+                for (const auto & excluded : exclusions[resource]) {
+                    if (excluded.end_ns <= cursor) continue;
+                    if (excluded.begin_ns >= gap.observation.end_ns) break;
+                    const auto first = std::max(cursor, excluded.begin_ns);
+                    const auto last = std::min(gap.observation.end_ns, excluded.end_ns);
+                    if (first < last) gap.excluded.push_back({ resource, first, last, excluded.record });
+                    cursor = std::max(cursor, last);
+                }
+                auto & ports = frames_[segment.frame];
+                auto & reference = segment.step == 0 ? ports.before_preparation : segment.step == 1 ? ports.before_run : ports.before_result;
+                reference = residuals_.size();
+                residuals_.push_back(std::move(gap));
+            }
+            previous = std::max(previous, segment.interval.end_ns);
+        }
+    }
+}
+
+} // namespace markov::trace_graph::source

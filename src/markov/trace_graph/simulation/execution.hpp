@@ -41,6 +41,7 @@ struct ExecutionResult {
     std::vector<graph::Time> completions_ns;
     std::vector<OperationState> states;
     std::size_t executed = 0;
+    std::size_t edges = 0;
 };
 
 // The same clock schedules observed graphs and generated work. New mutations

@@ -6,6 +6,75 @@
 
 namespace markov::trace_graph::planning {
 
+bool CacheProgram::region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after,
+                               std::size_t request) {
+    copies_.emplace(
+        transfer,
+        PendingCopy{ node, evict_after, kind, pages, std::nullopt, kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
+    kind == CopyKind::Load ? ++loads_ : ++backups_;
+    for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
+        const auto turn = region_copy_turns_.size();
+        region_copy_turns_.push_back({ transfer, request, rank });
+
+        // Load and write-back eviction already own the admission turn. Other
+        // backups must wait for the same caller lease as request computation.
+        if (kind == CopyKind::Load || evict_after) {
+            if (!submit_region_copy(runtime, turn, *cause_)) return false;
+        }
+        else queues_.callers.acquire(runtime, running_[request].callers[rank], 0, action(ActionKind::CopyGranted, turn), cause_);
+    }
+    return true;
+}
+
+bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause) {
+    const auto [transfer, request, rank] = region_copy_turns_[turn];
+    auto & pending = copies_.at(transfer);
+    const auto kind = pending.kind;
+    const auto pages = pending.pages;
+    const double page_bytes = page_tokens_ * backend_.bytes_per_token;
+    const Features features{
+        {           "pages",                    pages },
+        {      "page_bytes",               page_bytes },
+        {          "layers",          backend_.layers },
+        { "bytes_per_token", backend_.bytes_per_token }
+    };
+    const Work caller{
+        kind == CopyKind::Backup ? backend_.backup_caller : WorkKind{ "cache.load.caller", backend_.load.implementation, "caller_blocking_interval" },
+        features
+    };
+    const Work completion{
+        kind == CopyKind::Backup ? backend_.backup_completion
+                                 : WorkKind{ "cache.load.completion", backend_.load.implementation, "completion_observation_upper_interval" },
+        features
+    };
+    const Work clone{
+        {                  "cache.index_clone", "aten.clone:cpu:int64", "caller_blocking_interval" },
+        { { "elements", pages * page_tokens_ }, { "element_bytes", 8 },       { "tensor_rank", 1 } }
+    };
+    const auto begin = runtime.next_node();
+    const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
+    const auto returned = kind == CopyKind::Backup && !pending.evict_after ? std::optional(action(ActionKind::CopyReturned, turn)) : std::nullopt;
+    PlannedMutation mutation{
+        0,
+        { { running_[request].callers[rank], std::cref(caller) },
+          { resource, std::cref(completion) },
+          { running_[request].callers[rank], std::cref(clone), returned } },
+        {      { cause, begin, graph::EdgeKind::DataDependency },
+          { cause, begin + 1, graph::EdgeKind::DataDependency },
+          { begin, begin + 2, graph::EdgeKind::DataDependency }          }
+    };
+    if (const auto previous = queues_.native.find(resource); previous != queues_.native.end()) {
+        mutation.dependencies.push_back({ previous->second, begin, graph::EdgeKind::ResourceOrder });
+        mutation.dependencies.push_back({ previous->second, begin + 1, graph::EdgeKind::ResourceOrder });
+    }
+    if (!runtime.submit(std::move(mutation))) return false;
+    pending.caller_returns.push_back(begin + 2);
+    pending.copy_completions.push_back(begin + 1);
+    queues_.native[resource] = begin + 1;
+    join_copy(runtime, transfer);
+    return true;
+}
+
 bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages) {
     const Features features{
         {           "pages",                                   pages },
@@ -155,7 +224,7 @@ void CacheProgram::join_copy(ProgramRuntime & runtime, TransferId transfer) {
     for (const auto node : copy.caller_returns) mutation.dependencies.push_back({ node, end, graph::EdgeKind::DataDependency });
     if (runtime.submit(std::move(mutation))) {
         copy.completion = end;
-        copy_frontier_[1] = end;
+        copy_frontier_[copy.kind == CopyKind::Load ? 0 : 1] = end;
     }
 }
 

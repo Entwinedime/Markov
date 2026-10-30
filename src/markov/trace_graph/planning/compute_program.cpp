@@ -236,7 +236,7 @@ void ComputeProgram::compile_frame(std::size_t id) {
                 issue_ = "preparation_device_binding_unavailable";
                 return;
             }
-            source.bind_native_sources(entry.index, calls.calls);
+            source.bind_native_sources(entry.index, calls.calls, *placement);
             const auto before = pending.plan.operations();
             // Preparation may produce inputs on another device stream.
             // NativePlan retains that producer before subsequent forward work.
@@ -369,7 +369,7 @@ void ComputeProgram::run_result(ProgramRuntime & runtime, std::size_t id, graph:
     }
     for (auto & native : calls.calls)
         if (native.async_work) native.async_completion = work->completions.at(*native.async_work);
-    source_.bind_native_sources(step.sequence, calls.calls);
+    source_.bind_native_sources(step.sequence, calls.calls, step.resources);
     if (!step.plan.extend(calls, step.resources, preparations_)) {
         issue_ = "kernel_cache_initial_state_unavailable";
         return;

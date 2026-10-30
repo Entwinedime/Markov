@@ -23,7 +23,10 @@ add_library(markov_source
     src/markov/trace_graph/source/clients.cpp
     src/markov/trace_graph/source/build.cpp
     src/markov/trace_graph/source/context.cpp
+    src/markov/trace_graph/source/details.cpp
+    src/markov/trace_graph/source/regions.cpp
     src/markov/trace_graph/source/native_work.cpp
+    src/markov/trace_graph/source/native_queues.cpp
     src/markov/trace_graph/source/services.cpp
     src/markov/trace_graph/source/cpu_costs.cpp
     src/markov/trace_graph/planning/token_paths.cpp
@@ -45,6 +48,7 @@ add_library(markov_prediction
     src/markov/trace_graph/planning/cache_controls.cpp
     src/markov/trace_graph/planning/storage.cpp
     src/markov/trace_graph/planning/compute_program.cpp
+    src/markov/trace_graph/planning/region_compute.cpp
     src/markov/trace_graph/planning/native_calls.cpp
     src/markov/trace_graph/simulation/program_execution.cpp
 )
@@ -55,6 +59,7 @@ add_library(markov_adapters
     src/markov/adapters/probes.cpp
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp
+    src/markov/adapters/prediction.cpp
     src/markov/adapters/ascend/causality.cpp
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/ascend/tensor_work.cpp
@@ -80,6 +85,7 @@ add_executable(markov_core
     src/markov/commands/source.cpp
     src/markov/commands/page_work.cpp
     src/markov/commands/costs.cpp
+    src/markov/commands/prediction.cpp
     src/markov/commands/cpu_costs.cpp
 )
 target_link_libraries(markov_core PRIVATE markov_adapters)

@@ -62,6 +62,7 @@ enum class Coverage {
     Extrapolated,
     SourceService,
     SourceResidual,
+    SourceRegionResidual,
     SourceCpuResidual,
     SourceCpuEstimate,
     SourceDispatchResidual,

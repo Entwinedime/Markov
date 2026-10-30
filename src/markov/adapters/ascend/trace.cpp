@@ -48,6 +48,9 @@ void TraceReader::record(std::size_t position, const nlohmann::json & event) {
     if (phase != "X" && phase != "s" && phase != "f") return;
 
     const auto category = event.value("cat", std::string{});
+    // Level0 exports native launch flows even when its CANN process-name
+    // metadata is absent. The flow category still identifies that display domain.
+    if (phase == "s" && category == "HostToDevice") runtime_processes_.insert(process);
     // Native flow destinations are device ports even when the exporter uses a
     // different display PID from its hardware duration records.
     const bool device_flow = phase == "f" && (category == "async_npu" || category == "HostToDevice");

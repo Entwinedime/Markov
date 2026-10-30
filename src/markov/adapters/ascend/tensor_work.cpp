@@ -2,6 +2,7 @@
 
 #include "markov/adapters/ascend/trace.hpp"
 #include "markov/trace_graph/source/chrome_reader.hpp"
+#include "markov/trace_graph/source/native_queues.hpp"
 #include "markov/trace_graph/source/services.hpp"
 
 #include <fstream>
@@ -44,6 +45,9 @@ nlohmann::json tensor_work_report(const std::filesystem::path & capture) {
     if (markers.size() != cases.size() * repeats) throw std::runtime_error("Tensor trace marker count differs from its recipe");
 
     std::vector<ObservedRegion> regions;
+    std::vector<ObservedRegion> caller_apis;
+    std::vector<Index> queue_ids;
+    std::vector<trace_graph::planning::NativeCall> definitions;
     auto measurements = Json::array();
     for (Index case_id = 0; case_id < cases.size(); ++case_id) {
         const auto & operation = cases[case_id].at("operation");
@@ -60,7 +64,32 @@ nlohmann::json tensor_work_report(const std::filesystem::path & capture) {
             }
             const auto expected = operation == "clone" ? "aclnnInplaceCopy" : "aclnnCat";
             if (!queue || observed.names[queue->name] != expected) throw std::runtime_error("Tensor trace does not contain its declared queued operation");
+            const ObservedSpan * caller_api = nullptr;
+            for (const auto & span : observed.spans) {
+                if (span.resource != marker.resource || span.begin_ns < marker.begin_ns || marker.end_ns < span.end_ns
+                    || span.begin_ns > queue->submission.begin_ns || span.end_ns < queue->submission.end_ns
+                    || observed.names[span.name] != (operation == "clone" ? "aten::clone" : "aten::cat"))
+                    continue;
+                if (caller_api) throw std::runtime_error("Tensor trace contains ambiguous caller API boundaries");
+                caller_api = &span;
+            }
+            if (!caller_api) throw std::runtime_error("Tensor trace lacks its physical caller API");
             regions.push_back({ marker.resource, marker.begin_ns, marker.end_ns, marker.record });
+            caller_apis.push_back({ caller_api->resource, caller_api->begin_ns, caller_api->end_ns, caller_api->record });
+            queue_ids.push_back(static_cast<Index>(queue - observed.native_queue_calls.data()));
+            double elements = 0;
+            for (const auto & size : cases[case_id].at("input_sizes")) elements += size.get<double>();
+            const auto dtype = cases[case_id].at("dtype").get<std::string>();
+            trace_graph::planning::Work work{
+                { operation == "clone" ? "tensor.clone" : "tensor.concatenate",
+                 std::string(operation == "clone" ? "aten.clone:npu:" : "aten.cat:npu:") + dtype,
+                 "device_service" },
+                { { "elements", elements },
+                 { "element_bytes", dtype == "int64" ? 8 : 4 },
+                 { "tensor_rank", 1 },
+                 { "input_tensors", cases[case_id].at("input_sizes").size() } }
+            };
+            definitions.push_back({ work, trace_graph::planning::CallKind::Queued, { work } });
             measurements.push_back({
                 {                "case",                          case_id },
                 {             "ordinal",                          ordinal },
@@ -76,7 +105,10 @@ nlohmann::json tensor_work_report(const std::filesystem::path & capture) {
 
     // Use exact flow destinations and exclusive services, never kernel order or proximity.
     const auto graph = build_source_graph(observed);
+    const NativeQueues queues(observed, graph);
     const auto services = bind_device_services(observed, graph, regions);
+    std::vector<ObservedRegion> cpu_regions;
+    std::vector<std::pair<Index, std::string>> cpu_owners;
     for (Index id = 0; id < services.size(); ++id) {
         const auto & service = services[id];
         if (!service.available() || !service.resource)
@@ -93,16 +125,52 @@ nlohmann::json tensor_work_report(const std::filesystem::path & capture) {
         if (duration <= 0) throw std::runtime_error("Tensor device service must be positive");
         measurements[id]["device_service_ns"] = duration;
         measurements[id]["device_records"] = std::move(records);
+        const auto & queue = observed.native_queue_calls[queue_ids[id]];
+        const auto & api = caller_apis[id];
+        const auto ports = queues.ports(queue_ids[id], definitions[id]);
+        measurements[id]["worker_tid"] =
+            observed.resources[queue.execution.resource].identity.substr(observed.resources[queue.execution.resource].identity.rfind(':') + 1);
+        measurements[id]["code_preparation"] = ports.code_preparation;
+        if (ports.dispatch) measurements[id]["dispatch_ns"] = ports.dispatch->end_ns - ports.dispatch->begin_ns;
+        cpu_regions.push_back({ api.resource, api.begin_ns, queue.submission.begin_ns, api.record });
+        cpu_owners.emplace_back(id, "caller_before");
+        cpu_regions.push_back({ api.resource, queue.submission.begin_ns, api.end_ns, api.record });
+        cpu_owners.emplace_back(id, "caller_after");
+        if (ports.launches.front().worker_before) {
+            cpu_regions.push_back(*ports.launches.front().worker_before);
+            cpu_owners.emplace_back(id, "worker_before");
+        }
+        if (ports.worker_after) {
+            cpu_regions.push_back(*ports.worker_after);
+            cpu_owners.emplace_back(id, "worker_after");
+        }
+    }
+    const auto cpu = cpu_intervals(observed, graph, cpu_regions);
+    for (Index id = 0; id < cpu.size(); ++id) {
+        const auto & measured = cpu[id];
+        const auto & region = cpu_regions[id];
+        const auto & [owner, role] = cpu_owners[id];
+        measurements[owner]["profiled_cpu"][role] = {
+            {           "begin_ns",             region.begin_ns },
+            {             "end_ns",               region.end_ns },
+            {           "position",      region.record.position },
+            {         "service_ns",         measured.service_ns },
+            {        "residual_ns",        measured.residual_ns },
+            {            "wait_ns",            measured.wait_ns },
+            { "instrumentation_ns", measured.instrumentation_ns },
+            {      "unobserved_ns",      measured.unobserved_ns }
+        };
     }
     return {
-        {           "status",                                                                                  "completed"                             },
-        {          "capture",                                                            std::filesystem::absolute(capture).lexically_normal().string() },
-        {            "trace",                                                                                                            trace.string() },
-        {         "metadata",                                                                                                                  metadata },
-        {     "measurements",                                                                                                   std::move(measurements) },
-        { "unresolved_flows",                                                                                          observed.unresolved_flows.size() },
+        {           "status",                       "completed"                             },
+        {          "capture", std::filesystem::absolute(capture).lexically_normal().string() },
+        {            "trace",                                                 trace.string() },
+        {         "metadata",                                                       metadata },
+        {     "measurements",                                        std::move(measurements) },
+        { "unresolved_flows",                               observed.unresolved_flows.size() },
         {    "qualification",
-         "Independent initialized device services from profiled exact native flows; caller and worker timestamps are provenance, not normal CPU costs." }
+         "Independent device services and profiled caller/worker partitions from shared native ownership. Profiled CPU partitions require separate normal "
+         "measurements before estimating normal costs."                                     }
     };
 }
 

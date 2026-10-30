@@ -144,9 +144,12 @@ graph::NodeId SourceGraph::append(Time begin_ns, Time duration_ns, Index resourc
     return id;
 }
 
-SourceGraph build_source_graph(Observations & observations) {
+SourceGraph build_source_graph(const Observations & observations) {
     SourceGraph result;
-    const auto client_resource = observations.resource(ResourceKind::Client, "http_client");
+    const auto client = std::ranges::find_if(observations.resources, [](const Resource & resource) {
+        return resource.kind == ResourceKind::Client && resource.identity == "http_client";
+    });
+    const auto client_resource = static_cast<Index>(client - observations.resources.begin());
     result.point_nodes.resize(observations.points.size());
     std::map<Index, LaneInput> lanes;
     for (Index i = 0; i < observations.spans.size(); ++i) {

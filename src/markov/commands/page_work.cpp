@@ -71,6 +71,13 @@ Json cost_gap_json(const simulation::CostGap & gap, const source::SourceContext 
     if (gap.response.status == cost::Status::UnresolvedSourceWait) result["kind"] = "source_dependency_gap";
     if (gap.response.status == cost::Status::UnmodeledSourceWork) result["kind"] = "source_work_gap";
     if (const auto * work = std::get_if<planning::Work>(&gap.work)) result["work"] = work_json(*work);
+    else if (const auto * client = std::get_if<planning::SourceClientDelay>(&gap.work)) {
+        result["source_client_delay"] = {
+            {  "request",  client->request },
+            { "response", client->response }
+        };
+    }
+    else if (const auto * source_gap = std::get_if<planning::SourceRegionGap>(&gap.work)) result["source_region_gap"] = source_gap->interval;
     else {
         const auto id = std::get<planning::SourceCpuGap>(gap.work).interval;
         const auto & region = source.cpu_gaps()[id];
@@ -274,6 +281,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
          "synchronization approximates ready-state service, not wake-up under load. Symmetric copy services and dedicated copy queues are assumed. "
          "Client ingress/response intervals are source residual approximations for the same request work and frontend deployment, not CPU services. "
          "Inter-call CPU uses corrected source residual approximations for the same caller recipe; known waits require explicit dependencies. "
+         "When selected, paired native CPU models use normal C++ API/thread demand and separately profiled port shares; these shares and isolated "
+         "dispatch/residual terms have unvalidated normal-runtime uncertainty. They do not supply the remaining framework control CPU. "
          "Partial request ports exclude query/admission CPU work, collective envelope CPU, other cross-stream dependencies and client pacing. "
          "Observed frame overlap advances the next caller after submission with separate queue frontiers; collectives still fence each segment. "
          "Observed serial int64 token output includes pool relay, asynchronous copy and a completion marker. "
