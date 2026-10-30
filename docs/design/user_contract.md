@@ -80,6 +80,8 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 预测必须启用 execution.record_graph；评价器核对部署、完整编码 workload、正式窗口及目标设置，不能把其他条件的 trace 当作真值。
 SGLang 的 target 采集使用 capture --record-regions，同时记录通常的因果观察与实验区域计时；
 KTransformers 的同步阶段默认已有对应观察。该开关不改变普通采集默认值，也不创建可导入性能库的独立校准元数据。
+启用 file 存储时，SGLang 还记录原生文件批次的分段和完整 token 祖先关系，区分新键写入、已有键处理及实际页复制/发布。
+评价只替换工作、rank、顺序和数据内容都对应的成本；没有对应或分段采集失败时保留原预测并报告欠项。
 
 evaluate 使用独立 markov_evaluate 可执行文件，只挂载明确选择的预测、base、target 与自身输出，没有设备、网络或数据库。
 评价输出必须在预测和采集目录之外，避免后续预测挂载到评分数据。

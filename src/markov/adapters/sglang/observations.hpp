@@ -37,6 +37,7 @@ private:
     void observe_result(const ProbeEvent & event);
     void observe_control(const ProbeEvent & event);
     void observe_response(const ProbeEvent & event);
+    void observe_storage(const ProbeEvent & event);
     std::optional<std::filesystem::path> configuration_;
     std::string result_implementation_;
     std::optional<bool> deterministic_sampling_;

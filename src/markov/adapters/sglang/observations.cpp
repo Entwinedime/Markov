@@ -76,6 +76,10 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
+    if (event.name.starts_with("storage.file.")) {
+        observe_storage(event);
+        return;
+    }
     if (event.name.starts_with("region.")) {
         observe_response(event);
         return;

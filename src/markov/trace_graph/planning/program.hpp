@@ -5,6 +5,7 @@
 #include "markov/trace_graph/simulation/events.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string_view>
@@ -35,9 +36,13 @@ struct SourceCpuGap {
 // Diagnostic address in the generated execution, separate from cost features.
 // Port names are static literals; an unknown participant stays unqualified.
 struct OperationPosition {
-    std::size_t request, iteration;
+    std::optional<std::size_t> request;
+    std::size_t iteration;
     std::optional<std::size_t> participant;
     std::string_view port;
+
+    // Full logical token ancestry through the last page of this operation.
+    std::optional<std::vector<std::int64_t>> data = std::nullopt;
 };
 
 struct PlannedOperation {

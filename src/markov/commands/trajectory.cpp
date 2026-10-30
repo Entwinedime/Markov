@@ -67,11 +67,12 @@ nlohmann::json generated_graph_report(const simulation::ProgramResult & result) 
         if (evidence.position) {
             const auto & position = *evidence.position;
             node["position"] = {
-                {     "request",                                                   position.request },
+                {     "request",         position.request ? Json(*position.request) : Json(nullptr) },
                 {   "iteration",                                                 position.iteration },
                 { "participant", position.participant ? Json(*position.participant) : Json(nullptr) },
                 {        "port",                                         std::string(position.port) }
             };
+            if (position.data) node["position"]["data"] = *position.data;
         }
         if (!evidence.work)
             node["origin"] = {

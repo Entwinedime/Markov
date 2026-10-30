@@ -33,6 +33,24 @@ bool Storage::service(ProgramRuntime & runtime, const WorkKind & kind, std::size
     };
     const auto node = runtime.next_node();
     PlannedMutation mutation{ owner, { { resource_begin_ + 2 * rank + writer, std::cref(work), completion } }, {} };
+    if (runtime.records_graph()) {
+        if (writer) {
+            const auto & cursor = workers_[rank].writes.front();
+            const auto & operation = writes_.at(cursor.operation);
+            const auto page = kind == backend_.new_page || kind == backend_.existing_page ? cursor.index : cursor.batch_end - 1;
+            mutation.operations.front().position =
+                OperationPosition{ std::nullopt, cursor.operation, rank, "storage_write", paths_.suffix(operation.pages[page], 0) };
+        }
+        else {
+            const auto request = completion.subject / participants_;
+            const auto & operation = prefetches_.at(request);
+            const auto & cursor = operation.workers[rank];
+            auto page = cursor.batch_end - 1;
+            if (kind == backend_.read_page) page = cursor.read_index;
+            else if (kind == backend_.copy_publish) page = cursor.copy_index;
+            mutation.operations.front().position = OperationPosition{ request, 0, rank, "storage_read", paths_.suffix(operation.keys[page], 0) };
+        }
+    }
     if (cause) mutation.dependencies.push_back({ *cause, node, graph::EdgeKind::DataDependency });
     return runtime.submit(std::move(mutation)).has_value();
 }

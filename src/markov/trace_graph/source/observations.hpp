@@ -121,14 +121,18 @@ struct RequestExecutionRegion {
     ObservedRegion region;
 };
 
-// Measured semantic responses. Request refers to the name pool, not client order.
+// Measured semantic responses. Request refers to the name pool; background work
+// has no request. Grouped noncontiguous remainders cannot establish wall order.
 struct ObservedCost {
-    Index request, iteration;
+    std::optional<Index> request;
+    Index iteration;
     std::optional<Index> participant;
     std::string_view port;
     planning::Work work;
     Time duration_ns;
     ObservedRegion region;
+    std::optional<std::vector<std::int64_t>> data = std::nullopt;
+    bool contiguous = true;
 };
 
 struct NativeQueueCall {

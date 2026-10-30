@@ -6,12 +6,14 @@ import os
 from typing import Any, Callable
 
 from markov.adapters.sglang.preparation_probe import implementation
+from markov.adapters.sglang.storage_probe import StorageProbe
 from markov.instrumentation.events import EventWriter
 
 
 class CacheProbe:
-    def __init__(self, writer: EventWriter):
+    def __init__(self, writer: EventWriter, storage: StorageProbe | None = None) -> None:
         self.writer = writer
+        self.storage = storage
         self.dictionary_index = 0
 
     def fields(self, request, tokens):
@@ -128,7 +130,10 @@ class CacheProbe:
             "completed_tokens_before": operation.completed_tokens,
         }
         with self.writer.span("runtime.hicache.file.read_batch", fields):
-            result = original(controller, operation, hash_values, host_indices, extra_info)
+            if self.storage is None:
+                result = original(controller, operation, hash_values, host_indices, extra_info)
+            else:
+                result = self.storage.read(original, controller, operation, hash_values, host_indices, extra_info)
             fields["completed_tokens_after"] = operation.completed_tokens
             return result
 
@@ -140,7 +145,10 @@ class CacheProbe:
 
         fields = {"pages": len(hash_values), "page_tokens": controller.page_size}
         with self.writer.span("runtime.hicache.file.write_batch", fields):
-            success = original(controller, hash_values, host_indices, extra_info)
+            if self.storage is None:
+                success = original(controller, hash_values, host_indices, extra_info)
+            else:
+                success = self.storage.write(original, controller, hash_values, host_indices, extra_info)
             fields["success"] = success
             counts = controller.storage_backend.last_write_page_counts
             if counts is not None:

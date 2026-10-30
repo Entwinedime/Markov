@@ -93,10 +93,12 @@ class InputFactsProbe:
 def install() -> None:
     """The framework loads this plugin in each worker; ordinary inference is unchanged."""
     measurements = os.environ.get("MARKOV_REGION_MEASUREMENTS")
+    region_writer = None
     if measurements:
         from markov.adapters.sglang.region_probe import RegionProbe
 
-        RegionProbe(EventWriter(Path(measurements))).install()
+        region_writer = EventWriter(Path(measurements))
+        RegionProbe(region_writer).install()
 
     output = os.environ.get("MARKOV_INPUT_FACTS")
     if not output:
@@ -119,4 +121,10 @@ def install() -> None:
     PreparationProbe(writer).install()
     RequestProbe(writer).install()
     ComputeProbe(writer).install()
-    CacheProbe(writer).install()
+    storage = None
+    if region_writer is not None:
+        from markov.adapters.sglang.storage_probe import StorageProbe
+
+        storage = StorageProbe(region_writer)
+        storage.install()
+    CacheProbe(writer, storage).install()

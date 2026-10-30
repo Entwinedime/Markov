@@ -25,10 +25,12 @@ Json read(const std::filesystem::path & path) {
 }
 
 struct Address {
-    std::size_t request, iteration;
+    std::optional<std::size_t> request;
+    std::size_t iteration;
     std::optional<std::size_t> participant;
     std::string port;
     std::optional<planning::Work> work;
+    std::optional<std::vector<std::int64_t>> data = std::nullopt;
     auto operator<=>(const Address &) const = default;
 };
 
@@ -54,11 +56,12 @@ std::optional<Address> address(const Json & node) {
             raw.at("features").get<planning::Features>()
         };
     }
-    return Address{ position.at("request").get<std::size_t>(),
+    return Address{ position.at("request").is_null() ? std::nullopt : std::optional(position.at("request").get<std::size_t>()),
                     position.at("iteration").get<std::size_t>(),
                     participant,
                     position.at("port").get<std::string>(),
-                    std::move(work) };
+                    std::move(work),
+                    position.contains("data") ? std::optional(position.at("data").get<std::vector<std::int64_t>>()) : std::nullopt };
 }
 
 Json order_report(const Json & serialized, const std::vector<std::pair<const source::ObservedCost *, std::size_t>> & matched) {
@@ -66,7 +69,7 @@ Json order_report(const Json & serialized, const std::vector<std::pair<const sou
     std::map<std::size_t, std::map<Interval, std::vector<std::size_t>>> lanes;
     for (const auto & [observation, node] : matched) {
         const auto & scope = observation->work.kind.timing_scope;
-        if (scope != "thread_cpu" && scope != "synchronous_phase_interval") continue;
+        if (!observation->contiguous || (scope != "thread_cpu" && scope != "synchronous_phase_interval" && scope != "storage_worker_service")) continue;
         const auto & region = observation->region;
         lanes[region.resource][{ region.begin_ns, region.end_ns }].push_back(node);
     }
@@ -111,7 +114,8 @@ Json order_report(const Json & serialized, const std::vector<std::pair<const sou
         {                     "violations", std::move(violations) },
         { "unqualified_overlapping_groups",    overlapping_groups },
         {                  "qualification",
-         "Actual same-thread nonoverlapping CPU/closed-phase order projected onto matched nodes. Device/data, cache and within-parent orders are not "
+         "Actual same-thread nonoverlapping CPU/closed-phase/file service order projected onto matched nodes; grouped remainders excluded. Device/data, cache "
+         "and within-parent orders are not "
          "certified."                                            }
     };
 }
@@ -149,8 +153,13 @@ Json report(const PreparedEvaluation & input) {
 
     std::map<Address, std::vector<Measurement>> measured;
     for (const auto & cost : observed.cost_observations)
-        measured[{ requests.at(observed.names[cost.request]), cost.iteration, cost.participant, std::string(cost.port), cost.work }].push_back(
-            { cost.duration_ns, &cost });
+        measured[{ cost.request ? std::optional(requests.at(observed.names[*cost.request])) : std::nullopt,
+                   cost.iteration,
+                   cost.participant,
+                   std::string(cost.port),
+                   cost.work,
+                   cost.data }]
+            .push_back({ cost.duration_ns, &cost });
     const auto & regions = input.target.context.regions();
     for (std::size_t id = 0; id < observed.requests.size(); ++id) {
         const auto & window = observed.requests[id];
@@ -226,13 +235,14 @@ Json report(const PreparedEvaluation & input) {
     for (const auto & [key, values] : measured)
         if (!consumed.contains(key)) {
             unused.push_back({
-                {      "request",                                               key.request },
+                {      "request",          key.request ? Json(*key.request) : Json(nullptr) },
                 {    "iteration",                                             key.iteration },
                 {  "participant",  key.participant ? Json(*key.participant) : Json(nullptr) },
                 {         "port",                                                  key.port },
                 {         "work", key.work ? commands::work_json(*key.work) : Json(nullptr) },
                 { "observations",                                             values.size() }
             });
+            if (key.data) unused.back()["data"] = *key.data;
         }
     const auto replacement = commands::trajectory_replay_report(replay);
     std::optional<graph::Time> begin, end;
