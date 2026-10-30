@@ -12,6 +12,8 @@
 
 namespace markov::trace_graph::source_dag {
 
+class ObservationWriter;
+
 /** Stable original record and interval identity; synthetic work has no measurement. */
 [[nodiscard]] std::optional<std::string> measurement_position(const core::TraceEvent & event);
 
@@ -21,22 +23,22 @@ namespace markov::trace_graph::source_dag {
  * consistent with device starts in the source graph's common clock. Caller
  * and worker measurements remain separate per-rank CPU scopes and use only
  * this capture's correction; raw HCCL duration is never a device sample. */
-[[nodiscard]] nlohmann::json collective_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                              const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied);
+void collective_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                      const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied, ObservationWriter & rows);
 
 /** Attention, metadata and Linear samples with observed operator/submission ownership.
  * Missing or ambiguous native lowering is omitted, not filled from call wall time.
  * Device samples require unmodified raw durations. Their absence does not
  * invalidate independently measurable caller/worker scopes.
  */
-[[nodiscard]] nlohmann::json phase_tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                                const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied);
+void phase_tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied, ObservationWriter & rows);
 
 /** Extend/Decode allocator measurements using observed request lengths,
  * queue transitions and matched Torch/Triton calls. Missing geometry or
  * timing scopes are not imputed; cold launch preparation is not counted twice. */
-[[nodiscard]] nlohmann::json allocator_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                             bool cpu_service_applied);
+void allocator_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied,
+                                     ObservationWriter & rows);
 
 /** Operator-level observations on source coordinates, never target projections.
  * Profiled CPU and corrected CPU are different timing scopes. Device values
@@ -45,8 +47,8 @@ namespace markov::trace_graph::source_dag {
  * Both refer to this graph only and must not survive a graph mutation.
  * Exporters that need boundary splitting own a private graph and fresh indices.
  */
-[[nodiscard]] nlohmann::json phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                                         bool cpu_service_applied);
+void phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied,
+                                 ObservationWriter & rows);
 
 /** Whole nonblocking CPU tails after MIN, indexed by the observed queue delta,
  * plus empty blocking write entry/return and separately observed ack bodies.
@@ -56,21 +58,21 @@ namespace markov::trace_graph::source_dag {
  * Synchronization needs proof that its device predecessor completed before
  * API entry; graph-normalized sync costs are never measured CPU samples.
  */
-[[nodiscard]] nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCacheSourceIndex & source,
-                                                                const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied);
+void confirmation_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        bool cpu_service_applied, ObservationWriter & rows);
 
 /** CPU preparation before the first allocator attempt and cleanup after the
  * final failed attempt. Neither interval includes allocator service or eviction. */
-[[nodiscard]] nlohmann::json load_admission_operator_observations(const core::DagGraph & graph, bool cpu_service_applied);
+void load_admission_operator_observations(const core::DagGraph & graph, bool cpu_service_applied, ObservationWriter & rows);
 
 /** Scheduler prefix concatenation after init_load_back, separate from the
  * admitted allocator/clone interval. Only the supported op-api layout is admitted. */
-[[nodiscard]] nlohmann::json prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source,
-                                                                 const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied);
+void prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                         bool cpu_service_applied, ObservationWriter & rows);
 
 /** Per-call active submissions/returns and inactive layer waits. No per-rank
  * averages or observed dependency templates are used as operator measurements. */
-[[nodiscard]] nlohmann::json layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex & source,
-                                                              const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied);
+void layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                      bool cpu_service_applied, ObservationWriter & rows);
 
 } // namespace markov::trace_graph::source_dag

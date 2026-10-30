@@ -13,6 +13,7 @@
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 #include "markov/trace_graph/structure/ascend_event.hpp"
 #include "markov/trace_graph/structure/hicache/confirmation.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -38,9 +39,8 @@ std::optional<std::string> measurement_position(const core::TraceEvent & event) 
            + std::to_string(event.dur) + ":" + std::to_string(event.dur_submicro_ns);
 }
 
-nlohmann::json phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                           bool cpu_service_applied) {
-    nlohmann::json rows = nlohmann::json::array();
+void phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied,
+                                 ObservationWriter & rows) {
     const adapters::sglang::HiCacheSourceIndex source_index(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     // Device event instructions have one physical identity, independent of
@@ -149,20 +149,18 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
             {   "timing_scope",                                         "thread_cpu_service" },
         });
     }
-    for (const auto & row : confirmation_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : load_admission_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : prefix_concat_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : layer_wait_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : phase_tensor_operator_observations(source_index, queues, phases, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : allocator_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : collective_operator_observations(source_index, queues, phases, cpu_service_applied)) rows.push_back(row);
-    return rows;
+    confirmation_operator_observations(source_index, queues, cpu_service_applied, rows);
+    load_admission_operator_observations(graph, cpu_service_applied, rows);
+    prefix_concat_operator_observations(source_index, queues, cpu_service_applied, rows);
+    layer_wait_operator_observations(source_index, queues, cpu_service_applied, rows);
+    phase_tensor_operator_observations(source_index, queues, phases, cpu_service_applied, rows);
+    allocator_operator_observations(source_index, queues, cpu_service_applied, rows);
+    collective_operator_observations(source_index, queues, phases, cpu_service_applied, rows);
 }
 
-nlohmann::json layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
-                                                bool cpu_service_applied) {
+void layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
+                                      bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source_index.graph();
-    nlohmann::json rows = nlohmann::json::array();
     std::map<std::pair<std::string, uint64_t>, std::string> layer_positions;
     for (const auto & event : graph.runtime_observations()) {
         if (event.name != "runtime.hicache.layer_waits") continue;
@@ -270,7 +268,6 @@ nlohmann::json layer_wait_operator_observations(const adapters::sglang::HiCacheS
             });
         }
     }
-    return rows;
 }
 
 namespace {
@@ -296,10 +293,9 @@ void append_blocking_write_observations(const adapters::sglang::HiCacheSourceInd
 
 } // namespace
 
-nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
-                                                  bool cpu_service_applied) {
+void confirmation_operator_observations(const adapters::sglang::HiCacheSourceIndex & source_index, const simulation::detail::CpuTaskQueues & queues,
+                                        bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source_index.graph();
-    nlohmann::json rows = nlohmann::json::array();
     // Nonblocking confirmation costs are observed after the MIN returns;
     // empty blocking calls separately measure fixed entry/return work.
     // Queue deltas describe actual work; neither the old tail's local node
@@ -324,18 +320,22 @@ nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCach
                   { "storage_enabled", storage == "true" ? 1.0 : 0.0 },
                   { "release_lock", unlock == "true" ? 1.0 : 0.0 } }
             };
+            auto measured = nlohmann::json::array();
             (void)append_cpu_interval_observations(source_index,
                                                    event,
                                                    work,
                                                    event.ts,
                                                    core::checked_add_u64(event.ts, event.dur, "Write acknowledgement end overflow"),
                                                    cpu_service_applied,
-                                                   rows);
+                                                   measured);
+            rows.append(measured);
             continue;
         }
         const bool write = event.name == "runtime.hicache.write_completion";
         if (write && event.arg("status") == "returned" && event.arg("blocking") == "true") {
-            append_blocking_write_observations(source_index, queues, event, cpu_service_applied, rows);
+            auto measured = nlohmann::json::array();
+            append_blocking_write_observations(source_index, queues, event, cpu_service_applied, measured);
+            rows.append(measured);
             continue;
         }
         if ((!write && event.name != "runtime.hicache.load_completion") || event.arg("status") != "returned" || event.arg("blocking") != "false") continue;
@@ -367,7 +367,9 @@ nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCach
 
         if (write && *before > *after) {
             const auto observation = static_cast<size_t>(&event - graph.runtime_observations().data());
-            append_write_confirmation_observations(source_index, queues, observation, first_us, *before - *after, cpu_service_applied, rows);
+            auto measured = nlohmann::json::array();
+            append_write_confirmation_observations(source_index, queues, observation, first_us, *before - *after, cpu_service_applied, measured);
+            rows.append(measured);
             continue;
         }
 
@@ -376,17 +378,18 @@ nlohmann::json confirmation_operator_observations(const adapters::sglang::HiCach
                                              "nonblocking",
                                              "cpu_service",
                                              { { "confirmed_operations", static_cast<double>(*before - *after) } } };
-        const auto first_row = rows.size();
-        (void)append_cpu_interval_observations(source_index, event, work, first_us, end_us, cpu_service_applied, rows);
+        auto measured = nlohmann::json::array();
+        (void)append_cpu_interval_observations(source_index, event, work, first_us, end_us, cpu_service_applied, measured);
         // Keep the original measurement identity: stricter service extraction
         // must not make reimports look like additional independent samples.
-        for (size_t index = first_row; index < rows.size(); ++index) rows[index]["position"] = "confirmation_tail:" + *position;
+        for (auto & row : measured) {
+            row["position"] = "confirmation_tail:" + *position;
+            rows.push_back(row);
+        }
     }
-    return rows;
 }
 
-nlohmann::json load_admission_operator_observations(const core::DagGraph & input, bool cpu_service_applied) {
-    nlohmann::json rows = nlohmann::json::array();
+void load_admission_operator_observations(const core::DagGraph & input, bool cpu_service_applied, ObservationWriter & rows) {
     std::vector<core::TraceEvent> points;
     const auto append_boundaries = [&](const core::TraceEvent & event) {
         for (const auto at : { event.ts, core::checked_add_u64(event.ts, event.dur, "Load measurement end overflow") }) {
@@ -404,7 +407,7 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
             append_boundaries(event);
     for (const auto & event : input.hicache_fact_events())
         if (event.arg("phase") == "end" && modules::hicache::parse_hicache_fact_metadata(event).role == "loadback_decision_observed") append_boundaries(event);
-    if (points.empty()) return rows;
+    if (points.empty()) return;
 
     // Known parent self-time can straddle these measurement coordinates.
     // Split it on a private graph, using the same ownership rules as the
@@ -527,13 +530,11 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
             });
         }
     }
-    return rows;
 }
 
-nlohmann::json prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                   bool cpu_service_applied) {
+void prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                         bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source.graph();
-    nlohmann::json rows = nlohmann::json::array();
     for (const auto & admission : graph.runtime_observations()) {
         if (admission.name != "runtime.hicache.load_admission" || admission.arg("status") != "returned") continue;
         const auto position = measurement_position(admission);
@@ -666,7 +667,6 @@ nlohmann::json prefix_concat_operator_observations(const adapters::sglang::HiCac
             emit("load.admission.prefix_tail", cpu_service_applied ? "residual_interval" : "profiled_residual_interval", tail_residual_us);
         }
     }
-    return rows;
 }
 
 } // namespace markov::trace_graph::source_dag

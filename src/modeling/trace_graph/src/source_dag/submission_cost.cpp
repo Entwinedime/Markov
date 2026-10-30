@@ -113,8 +113,9 @@ void observe_worker_cost(const HiCacheHostExpansion & plan, const adapters::sgla
 
 } // namespace
 
-void append_host_operation_observations(nlohmann::json & rows, const structure::OperationWork & work, std::string_view position,
-                                        const HostOperationMeasurement & measured, bool corrected, bool submitted) {
+nlohmann::json host_operation_observations(const structure::OperationWork & work, std::string_view position, const HostOperationMeasurement & measured,
+                                           bool corrected, bool submitted) {
+    auto rows = nlohmann::json::array();
     const auto append = [&](std::string_view scope, std::optional<double> duration_us) {
         if (!duration_us) return;
 
@@ -148,6 +149,7 @@ void append_host_operation_observations(nlohmann::json & rows, const structure::
         append(label, measured.*member);
     }
     if (submitted) append("device_service", measured.device_us);
+    return rows;
 }
 
 std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHostExpansion & plan, const adapters::sglang::HiCacheSourceIndex & source,
@@ -220,7 +222,8 @@ std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHost
                          { "pages", static_cast<double>(length / page_size) } }
         };
         if (name == "clone") work.features["first_clone"] = index == names.size() ? 1.0 : 0.0;
-        append_host_operation_observations(rows, work, std::string(position) + ":" + name + ":" + std::to_string(index), measured, corrected, true);
+        for (const auto & row : host_operation_observations(work, std::string(position) + ":" + name + ":" + std::to_string(index), measured, corrected, true))
+            rows.push_back(row);
     }
     for (size_t index = 0; index < nodes.size(); ++index)
         if (!nodes[index].work.is_cpu && !assigned.contains(index)) return std::nullopt;
@@ -232,7 +235,8 @@ std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHost
                      { "page_size_tokens", static_cast<double>(page_size) },
                      { "pages", static_cast<double>(tokens / page_size) } }
     };
-    append_host_operation_observations(rows, tail, std::string(position) + ":tail", segment(nodes.size() - 1), corrected, false);
+    for (const auto & row : host_operation_observations(tail, std::string(position) + ":tail", segment(nodes.size() - 1), corrected, false))
+        rows.push_back(row);
     return rows;
 }
 

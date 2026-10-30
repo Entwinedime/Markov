@@ -180,6 +180,7 @@ target_link_libraries(trace_graph_sglang_observations PUBLIC trace_graph_source_
 # Execution coordinates rules, observations, atomic mutations and cost binding.
 add_library(trace_graph_hicache STATIC
     src/source_dag/observations.cpp
+    src/source_dag/observation_writer.cpp
     src/source_dag/confirmation.cpp
     src/source_dag/collective_cost.cpp
     src/source_dag/phase_tensor_cost.cpp

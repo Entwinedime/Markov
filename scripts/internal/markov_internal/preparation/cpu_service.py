@@ -75,6 +75,7 @@ def cpu_service_plan(
     output_dir: Path,
     *,
     forced_token_bundle: str | None,
+    include_setup_requests: bool = False,
 ) -> dict[str, Any]:
     selected = {source.manifest_path.resolve() for source in sources}
     existing = cpu_service_inputs(list(inputs.costs), tuple(selected))
@@ -85,6 +86,7 @@ def cpu_service_plan(
                 profile_manifest=source.manifest_path.resolve(),
                 light_manifest=None,
                 tp_size=positive_int(parse_server_command_flags(source.run_dir / "server_cmd.txt").get("tp_size", "1")),
+                include_setup_requests=include_setup_requests,
             )
             for source in sources
             if source.manifest_path.resolve() not in existing

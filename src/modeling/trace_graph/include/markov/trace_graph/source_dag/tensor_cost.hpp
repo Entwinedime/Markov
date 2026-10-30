@@ -17,6 +17,8 @@
 
 namespace markov::trace_graph::source_dag {
 
+class ObservationWriter;
+
 /** Measure a source CPU node without absorbing device waiting. The caller
  * supplies a CPU node from the immutable source graph. Unknown/multiple
  * synchronization producers or a producer still running at API entry yield
@@ -95,8 +97,8 @@ struct WorkerLaunchObservation {
  * without discarding independently measurable device/worker scopes. */
 void append_tensor_program_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
-                                        std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes = true,
-                                        std::optional<size_t> omitted_caller_operation = std::nullopt);
+                                        std::set<size_t> & measured_devices, bool cpu_service_applied, ObservationWriter & rows,
+                                        bool include_caller_scopes = true, std::optional<size_t> omitted_caller_operation = std::nullopt);
 
 /** Measure preparation/return intervals between an outer program's consumers.
  * Such programs alternate CPU preparation and a tensor/layer-wait consumer,

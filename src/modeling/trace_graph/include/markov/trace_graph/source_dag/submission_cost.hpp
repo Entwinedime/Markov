@@ -29,8 +29,8 @@ struct HostOperationMeasurement {
  * identity; work describes variables, not an executable calibration template.
  * CPU scopes are labeled profiled unless this capture has paired correction.
  * submitted=false emits caller scopes only. */
-void append_host_operation_observations(nlohmann::json & rows, const structure::OperationWork & work, std::string_view position,
-                                        const HostOperationMeasurement & measured, bool corrected, bool submitted);
+nlohmann::json host_operation_observations(const structure::OperationWork & work, std::string_view position, const HostOperationMeasurement & measured,
+                                           bool corrected, bool submitted);
 
 /** Measure the supported unsorted allocation followed by promoted-node clones.
  * Work lengths come from the source admission, never equal division by clone

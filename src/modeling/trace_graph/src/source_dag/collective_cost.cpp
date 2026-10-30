@@ -4,6 +4,7 @@
 #include "markov/trace_graph/source_dag/observations.hpp"
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -25,14 +26,13 @@ std::optional<std::pair<uint64_t, uint64_t>> raw_interval_ns(const core::DagGrap
 
 } // namespace
 
-nlohmann::json collective_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied) {
+void collective_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                      const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source.graph();
     const auto positions = adapters::sglang::phase_call_positions(phases);
     const auto observed = adapters::sglang::observe_device_collectives(source, queues, phases, positions);
     std::map<size_t, const adapters::sglang::DeviceCollectiveCall *> calls;
     for (const auto & call : observed.calls) calls.emplace(call.region.observation, &call);
-    auto rows = nlohmann::json::array();
 
     for (const auto & call : observed.calls) {
         const std::string component = call.position.decode_iteration ? "decode" : "prefill";
@@ -54,14 +54,16 @@ nlohmann::json collective_operator_observations(const SourceDagIndex & source, c
                 const auto & envelope = graph.runtime_observations().at(call.region.observation);
                 for (const auto & interval : *caller) {
                     const auto caller_work = structure::hicache::collective_caller_work(work, steps[interval.step]);
+                    auto measured = nlohmann::json::array();
                     (void)append_cpu_interval_observations(source,
                                                            envelope,
                                                            caller_work,
                                                            interval.begin_us,
                                                            interval.end_us,
                                                            cpu_service_applied,
-                                                           rows,
+                                                           measured,
                                                            interval.submission);
+                    rows.append(measured);
                 }
             }
 
@@ -134,7 +136,6 @@ nlohmann::json collective_operator_observations(const SourceDagIndex & source, c
             {   "timing_scope",                           "collective_completion_interval" }
         });
     }
-    return rows;
 }
 
 } // namespace markov::trace_graph::source_dag

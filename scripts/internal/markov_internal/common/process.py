@@ -149,3 +149,12 @@ def run_command(
             text=True,
             check=False,
         )
+
+
+def container_peak_memory_bytes() -> int | None:
+    """Read this container's controller, including children and shared pages once."""
+
+    for path in (Path("/sys/fs/cgroup/memory.peak"), Path("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")):
+        if path.is_file():
+            return int(path.read_text())
+    return None

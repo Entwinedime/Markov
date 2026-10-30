@@ -404,6 +404,8 @@ def _capture_artifacts(row: dict[str, Any], *, manifest_path: Path | None = None
         manifest = load_json(manifests[0])
         row["profile_manifest"] = str(repo_relative_path(manifests[0]))
         row["manifest_status"] = manifest["status"]
+        if "performance" in manifest:
+            row["performance"] = manifest["performance"]
         row["profile_captured"] = bool(manifest.get("profiling", {}).get("enabled")) and all(
             manifest.get("trace_channel_coverage", {}).get(key, 0) > 0
             for key in ("torch_trace_files", "ld_preload_trace_files", "python_probe_trace_files")
@@ -412,6 +414,17 @@ def _capture_artifacts(row: dict[str, Any], *, manifest_path: Path | None = None
         if len(reports) == 1:
             report = load_json(require_repo_path(reports[0]["path"]))
             requests = [item for item in report["requests"] if item["kind"] == "request"]
+            row["workload_timing"] = {
+                "first_request_latency_seconds": requests[0]["latency_ms"] / 1000 if requests else None,
+                "preparation_request_latency_sum_seconds": sum(
+                    item["latency_ms"] for item in requests if not item["measure"]
+                )
+                / 1000,
+                "formal_wall_seconds": report["formal_window"]["e2e_ms"] / 1000
+                if report.get("formal_window", {}).get("status") == "ok"
+                else None,
+                "scope": "observed request latency; first/preparation requests can include compilation/loading; sums may overlap and are not pure compilation time",
+            }
             row["charged_requests"] = len(requests)
             if "budgeted_output_tokens_per_request" in row:
                 input_tokens = sum(int(item["origin_input_count"]) for item in requests)

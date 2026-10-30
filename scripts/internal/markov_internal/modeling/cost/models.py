@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 import math
 from statistics import median
 from typing import Any
 
-from .database import OperationObservation
+from .measurements import OperationSamples, distribution_median
 
 
 @dataclass(frozen=True)
@@ -96,7 +96,7 @@ def parse_model_specs(declarations: list[dict[str, Any]]) -> list[ModelSpec]:
 
 
 def train_models(
-    specifications: list[ModelSpec], observations: list[OperationObservation]
+    specifications: list[ModelSpec], observations: list[OperationSamples]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Expand declared implementations and fit them from admitted measurements.
 
@@ -105,16 +105,16 @@ def train_models(
     neither outcome changes work generation or starts acquisition.
     """
 
-    observations_by_operation: dict[str, list[OperationObservation]] = defaultdict(list)
+    observations_by_operation: dict[str, list[OperationSamples]] = defaultdict(list)
     for row in observations:
         observations_by_operation[row.operation].append(row)
 
     models = []
     unmeasured_implementations = []
-    measurement_pools: dict[tuple[str, ...], dict[str, list[OperationObservation]]] = {}
+    measurement_pools: dict[tuple[str, ...], dict[str, list[OperationSamples]]] = {}
     for spec in specifications:
         if spec.source_operations not in measurement_pools:
-            by_implementation: dict[str, list[OperationObservation]] = defaultdict(list)
+            by_implementation: dict[str, list[OperationSamples]] = defaultdict(list)
             for operation in spec.source_operations:
                 for row in observations_by_operation[operation]:
                     by_implementation[row.implementation].append(row)
@@ -227,7 +227,7 @@ def _with_training_fit(
     return model
 
 
-def _train_model(spec: ModelSpec, operation_rows: list[OperationObservation]) -> dict[str, Any]:
+def _train_model(spec: ModelSpec, operation_rows: list[OperationSamples]) -> dict[str, Any]:
     """Fit one concrete implementation selected by train_models, preserving gaps."""
 
     source_operations = spec.source_operations
@@ -248,18 +248,18 @@ def _train_model(spec: ModelSpec, operation_rows: list[OperationObservation]) ->
             "reason": reason,
             "available_timing_scopes": sorted({row.timing_scope for row in operation_rows}),
             "features": missing_features or list(required),
-            "ineligible_measurements": len(candidates),
+            "ineligible_measurements": sum(row.count for row in candidates),
         }
 
     # Collapse repeated feature points within each capture first. A profiler's
     # repeated layers must not outweigh independent runs with fewer operations.
-    grouped: dict[tuple[str, tuple[float, ...]], list[float]] = defaultdict(list)
+    grouped: dict[tuple[str, tuple[float, ...]], Counter[float]] = defaultdict(Counter)
     grouped_work: dict[tuple[str, tuple[float, ...]], set[tuple[tuple[str, float], ...]]] = defaultdict(set)
     for row in rows:
         key = row.capture, tuple(row.features[name] for name in spec.features)
-        grouped[key].append(row.duration_us)
+        grouped[key].update(row.durations)
         grouped_work[key].add(tuple(sorted(row.features.items())))
-    measurements = [(point, median(values)) for (_, point), values in sorted(grouped.items())]
+    measurements = [(point, distribution_median(values)) for (_, point), values in sorted(grouped.items())]
     feature_points = sorted({point for point, _ in measurements})
     # Keep measured-domain coordinates separate from fitting coordinates:
     # adding a coverage condition must not silently add a coefficient or
@@ -280,11 +280,14 @@ def _train_model(spec: ModelSpec, operation_rows: list[OperationObservation]) ->
         "extrapolation_features": list(spec.extrapolation_features),
         "source_captures": sorted({row.capture for row in rows}),
         "source_manifests": sorted({row.manifest for row in rows}),
-        "measurement_count": len(rows),
+        "measurement_count": sum(row.count for row in rows),
         "training_points": len(measurements),
         "measured_feature_points": [dict(zip(required, point)) for point in coverage_points],
-        "ineligible_measurements": len(candidates) - len(rows),
-        "observed_duration_range_us": [min(row.duration_us for row in rows), max(row.duration_us for row in rows)],
+        "ineligible_measurements": sum(row.count for row in candidates) - sum(row.count for row in rows),
+        "observed_duration_range_us": [
+            min(min(row.durations) for row in rows),
+            max(max(row.durations) for row in rows),
+        ],
         "max_within_capture_spread_us": max(max(values) - min(values) for values in grouped.values()),
         "collapsed_distinct_work_groups": sum(len(points) > 1 for points in grouped_work.values()),
         "omitted_observed_features": sorted({name for row in rows for name in row.features} - set(spec.features)),

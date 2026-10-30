@@ -1,3 +1,4 @@
+#include "source_dag/observation_writer.hpp"
 /**
  * @file
  * @brief Orchestrates one complete C++ TraceGraph backend execution.
@@ -6,9 +7,9 @@
  * and artifact generation are injected at phase boundaries without duplicating the
  * workflow itself.
  */
-#include "markov/trace_graph/cli/workflow.hpp"
 #include "core/execution_metrics.hpp"
 #include "frontend/cost_package.hpp"
+#include "markov/trace_graph/cli/workflow.hpp"
 
 #include "markov/trace_graph/cli/cpu_service_preparation.hpp"
 #include "markov/trace_graph/cli/file_output.hpp"
@@ -200,27 +201,28 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
         const adapters::sglang::HiCacheSourceIndex source(graph);
         const auto operations = modules::hicache::patch::build_hicache_io_operation_ledger(source);
         auto io = hicache_io_observations(graph, operations, !options.cpu_service_cost.empty());
-        auto operator_observations = source_dag::phase_operator_observations(graph, phases, !options.cpu_service_cost.empty());
+        source_dag::ObservationWriter operator_observations(options.outputs.operator_observations);
+        source_dag::phase_operator_observations(graph, phases, !options.cpu_service_cost.empty(), operator_observations);
         if (!options.cpu_service_cost.empty()) {
             // Submission attribution splits a working graph at control points.
             // Keep the original observations intact and use the same paired
             // measurements as the independent write exporter. Other control
             // families are already collected by phase_operator_observations.
             auto write_graph = graph;
-            auto write = modules::hicache::runtime::export_write_calibration(write_graph,
-                                                                             options.trace_input.window_start_us.value_or(0),
-                                                                             options.trace_input.window_end_us.value_or(std::numeric_limits<uint64_t>::max()));
-            for (auto & observation : write["operator_observations"]) {
-                if (observation["operation"].get_ref<const std::string &>().starts_with("write.submission."))
-                    operator_observations.push_back(std::move(observation));
-            }
+            (void)modules::hicache::runtime::export_write_calibration(write_graph,
+                                                                      options.trace_input.window_start_us.value_or(0),
+                                                                      options.trace_input.window_end_us.value_or(std::numeric_limits<uint64_t>::max()),
+                                                                      operator_observations,
+                                                                      false,
+                                                                      "write.submission.");
         }
 
+        operator_observations.finish();
         write_json_file(options.outputs.run_summary,
                         {
-                            {      "observation_scope",                           "cost" },
-                            { "source_io_observations",                               io },
-                            {  "operator_observations", std::move(operator_observations) }
+                            {          "observation_scope",                       "cost" },
+                            {     "source_io_observations",                           io },
+                            { "operator_observation_count", operator_observations.size() }
         });
         return 0;
     }

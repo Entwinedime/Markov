@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,7 +12,7 @@ from typing import Any
 
 from markov_internal.common.io import load_json, write_json
 from markov_internal.common.paths import require_repo_path, repo_relative_path
-from markov_internal.modeling.source_dag.profiles import discover_profile_runs
+from markov_internal.modeling.source_dag.profiles import cpu_service_metadata, discover_profile_runs
 from markov_internal.modeling.workload import controlled_request_window, discover_workload_window
 from markov_internal.modeling.context import DiagnosticLevel
 
@@ -18,7 +20,7 @@ from markov_internal.modeling.context import DiagnosticLevel
 def summarize(audit: dict[str, Any], operation: str, page_size: int) -> dict[str, Any]:
     """Publish measured scopes; Python does not interpret nodes or dependencies."""
 
-    if not audit["operator_observations"]:
+    if not audit["operator_observation_count"]:
         raise ValueError("Independent calibration contains no usable operation observations")
 
     result = dict(audit, role="fixed_calibration", operation=operation)
@@ -62,7 +64,7 @@ def main() -> None:
     )
     if args.page_size <= 0:
         raise ValueError("Page size must be positive")
-    correction = load_json(service)
+    correction = cpu_service_metadata(service)
     if require_repo_path(correction["source_manifest"]).resolve() != source.resolve():
         raise ValueError("CPU correction belongs to another capture")
     (profile,) = discover_profile_runs((source,))
@@ -103,9 +105,24 @@ def main() -> None:
             if result.returncode != 0 and not audit.exists():
                 break
             observed = load_json(audit)
-            if args.diagnostics == DiagnosticLevel.FULL.value:
-                write_json(output / (operation + "_audit.json"), observed)
             costs = summarize(observed, operation, args.page_size)
+            measurements = output / (operation + "_observations.jsonl.gz")
+            pending = measurements.with_name(measurements.name + ".pending")
+            try:
+                with (
+                    require_repo_path(observed["operator_observations_file"]).open("rb") as rows,
+                    gzip.open(pending, "wb") as compressed,
+                ):
+                    shutil.copyfileobj(rows, compressed)
+                pending.replace(measurements)
+            finally:
+                pending.unlink(missing_ok=True)
+            costs["operator_observations_file"] = str(repo_relative_path(measurements))
+            if args.diagnostics == DiagnosticLevel.FULL.value:
+                write_json(
+                    output / (operation + "_audit.json"),
+                    dict(observed, operator_observations_file=str(repo_relative_path(measurements))),
+                )
             costs["source_manifest"] = str(repo_relative_path(source))
             costs["cpu_service_file"] = str(repo_relative_path(service))
             costs["measurement_manifests"] = [str(repo_relative_path(source)), correction["light_manifest"]]

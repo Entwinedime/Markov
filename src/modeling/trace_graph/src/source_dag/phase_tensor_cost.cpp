@@ -8,6 +8,7 @@
 #include "markov/trace_graph/source_dag/observations.hpp"
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -17,10 +18,9 @@
 
 namespace markov::trace_graph::source_dag {
 
-nlohmann::json phase_tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                  const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied) {
+void phase_tensor_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source.graph();
-    nlohmann::json rows = nlohmann::json::array();
     const auto positions = adapters::sglang::phase_call_positions(phases);
     const auto calls = adapters::sglang::observe_attention_calls(source, queues, phases, positions);
     const auto layer_waits = modules::hicache::observe_hicache_layer_waits(source);
@@ -76,7 +76,6 @@ nlohmann::json phase_tensor_operator_observations(const SourceDagIndex & source,
             for (const auto & row : tensor_program_outer_observations(source, region.work, program, matched, cpu_service_applied, layer_waits.calls))
                 rows.push_back(row);
     }
-    return rows;
 }
 
 } // namespace markov::trace_graph::source_dag

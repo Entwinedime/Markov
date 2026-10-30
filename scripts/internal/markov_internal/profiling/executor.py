@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import shutil
 import subprocess
 import time
@@ -43,6 +45,7 @@ class ProfileRun:
         """Prepare and check one run without starting processes or writing files."""
 
         self.cfg = cfg
+        self.wall_timing: dict[str, float] = {}
         self.dry_run = dry_run
         self.framework = str(cfg.get("framework", "sglang"))
         self.adapter = framework_adapter(self.framework)
@@ -111,7 +114,8 @@ class ProfileRun:
             server_env = build_server_env(self.cfg, self.runtime, self.layout, self.adapter, self.python_targets)
             with temporary_model_config(self.cfg, self.model_path, self.layout):
                 try:
-                    server_process = self._start_server(server_env)
+                    with self._measure_wall("server_startup_seconds"):
+                        server_process = self._start_server(server_env)
                     log("Server is ready.")
 
                     profile_cfg = self.runtime.channel_options["torch"]
@@ -122,11 +126,13 @@ class ProfileRun:
                         and profile_cfg.get("enabled", True)
                     )
                     if torch_enabled:
-                        start_torch_profiler(self.layout, self.server_cfg, self.runtime)
+                        with self._measure_wall("profiler_start_seconds"):
+                            start_torch_profiler(self.layout, self.server_cfg, self.runtime)
 
                     if self.bench_command is not None:
                         workload_started = True
-                        self._run_bench(server_env)
+                        with self._measure_wall("workload_seconds"):
+                            self._run_bench(server_env)
 
                     drain_sec = self.runtime.post_workload_drain_sec
                     if drain_sec > 0:
@@ -134,18 +140,22 @@ class ProfileRun:
                             f"Keeping capture channels active for {drain_sec:g}s after the workload "
                             "to retain asynchronous lifecycle tail evidence."
                         )
-                        time.sleep(drain_sec)
+                        with self._measure_wall("post_workload_drain_seconds"):
+                            time.sleep(drain_sec)
 
                     if torch_enabled and should_stop_torch_profiler_after_workload(profile_cfg):
-                        stop_torch_profiler(self.layout, self.server_cfg, self.runtime, server_env)
+                        with self._measure_wall("profiler_stop_and_export_seconds"):
+                            stop_torch_profiler(self.layout, self.server_cfg, self.runtime, server_env)
                 finally:
-                    stop_process(server_process)
-                    shutdown_cooldown_sec = float(self.server_cfg.get("shutdown_cooldown_sec", 0))
-                    if server_process is not None and shutdown_cooldown_sec > 0:
-                        log(f"Cooling down after server shutdown for {shutdown_cooldown_sec:g}s.")
-                        time.sleep(shutdown_cooldown_sec)
+                    with self._measure_wall("server_shutdown_seconds"):
+                        stop_process(server_process)
+                        shutdown_cooldown_sec = float(self.server_cfg.get("shutdown_cooldown_sec", 0))
+                        if server_process is not None and shutdown_cooldown_sec > 0:
+                            log(f"Cooling down after server shutdown for {shutdown_cooldown_sec:g}s.")
+                            time.sleep(shutdown_cooldown_sec)
                     try:
-                        storage_cleanup = self._cleanup_hicache_storage(server_env)
+                        with self._measure_wall("storage_cleanup_seconds"):
+                            storage_cleanup = self._cleanup_hicache_storage(server_env)
                     except Exception as cleanup_error:
                         status = "failed"
                         cleanup_message = f"HiCache storage cleanup failed: {cleanup_error}"
@@ -171,12 +181,21 @@ class ProfileRun:
                 workload_started=workload_started,
                 error=error,
                 storage_cleanup=storage_cleanup,
+                wall_timing=self.wall_timing,
             )
 
         if status == "failed":
             raise RuntimeError(error)
         log("Profile run completed.")
         return self.layout.run_dir
+
+    @contextmanager
+    def _measure_wall(self, stage: str) -> Iterator[None]:
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.wall_timing[stage] = time.monotonic() - started
 
     def _cleanup_hicache_storage(self, server_env: dict[str, str]) -> dict[str, Any] | None:
         """Remove run-local backend files after the server has exited.

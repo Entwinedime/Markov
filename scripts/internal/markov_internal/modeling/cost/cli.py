@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 from ...common.io import load_json, write_json
 from ...common.paths import require_repo_path
-from .database import CostDatabase, OperationObservation
+from ...common.process import container_peak_memory_bytes
+from .database import CostDatabase
+from .measurements import read_observations
 from .migration import migrate_database
 from .models import estimate
 from .package import import_evidence, import_profiles, train
@@ -21,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     importer.add_argument("--database", type=Path, required=True)
     inputs = importer.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--observations", type=Path, help="JSON with operator observation rows")
+    inputs.add_argument("--observations", type=Path, help="JSON Lines with one complete operator observation per line")
     inputs.add_argument("--profile-manifest", type=Path, action="append")
     inputs.add_argument("--evidence", type=Path, help="JSON with explicit physical_io/control_costs measurements")
     importer.add_argument("--cpu-service-cost", type=Path, action="append", default=[])
@@ -40,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
         "--resource-environment",
         type=Path,
         help="explicit device/host/storage/implementation declaration for selected historical profiles",
+    )
+    importer.add_argument(
+        "--measurement-dir", type=Path, help="retain compact profile measurements for trace retirement"
     )
     importer.add_argument("--output-dir", type=Path, required=True)
 
@@ -67,9 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.action == "import" and args.resource_environment and not args.profile_manifest:
         parser.error("--resource-environment annotates explicitly selected --profile-manifest inputs only")
+    if args.action == "import" and args.measurement_dir and not args.profile_manifest:
+        parser.error("--measurement-dir requires --profile-manifest")
     if args.action == "import" and args.include_setup_requests and not args.profile_manifest:
         parser.error("--include-setup-requests requires --profile-manifest")
 
+    started = time.monotonic()
     if args.action == "import":
         database = CostDatabase(require_repo_path(args.database))
         output = require_repo_path(args.output_dir)
@@ -77,10 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             rows = load_json(require_repo_path(args.evidence))["evidence"]
             result = import_evidence(database, rows, replace_captures=args.replace_captures)
         elif args.observations:
-            rows = [
-                OperationObservation.from_raw(row)
-                for row in load_json(require_repo_path(args.observations))["observations"]
-            ]
+            rows = read_observations(require_repo_path(args.observations))
             result = database.import_measurements(rows, [], replace_captures=args.replace_captures)
         else:
             result = import_profiles(
@@ -92,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                 load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
                 include_setup_requests=args.include_setup_requests,
                 replace_captures=args.replace_captures,
+                measurement_dir=require_repo_path(args.measurement_dir) if args.measurement_dir else None,
             )
         write_json(output / "import_summary.json", result)
     elif args.action == "train":
@@ -133,6 +140,20 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("inspect needs --database or both --model and --work")
         write_json(require_repo_path(args.output), result)
 
+    destination = (
+        require_repo_path(args.output_dir) / "maintenance_metrics.json"
+        if args.action == "import"
+        else require_repo_path(args.summary if args.action == "migrate" else args.output).with_suffix(".metrics.json")
+    )
+    write_json(
+        destination,
+        {
+            "action": args.action,
+            "wall_seconds": time.monotonic() - started,
+            "container_peak_memory_bytes": container_peak_memory_bytes(),
+            "scope": "modeling command including extraction and child processes; excludes container startup; shared pages counted once",
+        },
+    )
     return 2 if result.get("status") == "missing_data" else 0
 
 

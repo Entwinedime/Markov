@@ -16,6 +16,8 @@
 
 namespace markov::trace_graph::source_dag {
 
+class ObservationWriter;
+
 using modules::hicache::CpuCollectiveObservation;
 using modules::hicache::CpuCollectiveTiming;
 using modules::hicache::PrefetchControlObservation;
@@ -27,8 +29,8 @@ using modules::hicache::model::PrefetchSchedulerTiming;
  * retained; no first-call template or cross-call averaging. Intervals include
  * scheduling/communication residuals and only apply CPU correction where the
  * source supplies measured spans. They are not pure CPU service samples. */
-[[nodiscard]] nlohmann::json prefetch_query_observations(const core::DagGraph & graph, const CpuCollectiveObservation & collectives,
-                                                         const PrefetchWorkerObservations & workers, uint64_t begin_us, uint64_t end_us);
+void prefetch_query_observations(const core::DagGraph & graph, const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers,
+                                 uint64_t begin_us, uint64_t end_us, ObservationWriter & rows);
 
 struct PrefetchCheckCpuTiming {
     std::optional<uint64_t> check_to_max, max_to_false_return, max_to_stop, best_effort_to_stop, stop_to_min, min_to_visible;

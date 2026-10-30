@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from ..common.commands import command_to_text
 from ..common.io import write_json
 from ..common.paths import prepend_repo_src_to_sys_path
+from ..common.process import container_peak_memory_bytes
 
 prepend_repo_src_to_sys_path()
 
@@ -50,6 +51,7 @@ def write_profile_manifest(
     error: str | None = None,
     storage_cleanup: dict[str, Any] | None = None,
     workload_started: bool | None = None,
+    wall_timing: dict[str, float] | None = None,
 ) -> None:
     """Write the profile manifest consumed by downstream C++ modeling."""
 
@@ -76,4 +78,13 @@ def write_profile_manifest(
         manifest["workload_started"] = workload_started
     if storage_cleanup is not None:
         manifest["profiling"]["hicache_storage_cleanup"] = storage_cleanup
+    if wall_timing is not None:
+        manifest["performance"] = {
+            **wall_timing,
+            "container_peak_memory_bytes": container_peak_memory_bytes(),
+            "post_export_trace_logical_bytes": sum(
+                item.stat().st_size for item in (run_dir / "trace").rglob("*") if item.is_file()
+            ),
+            "scope": "non-overlapping run stages; startup may compile/load; workload includes preparation and formal requests; post-export size covers run_dir/trace only, excludes external roots and is not a sampled transient peak",
+        }
     write_json(run_dir / "profile_manifest.json", manifest)

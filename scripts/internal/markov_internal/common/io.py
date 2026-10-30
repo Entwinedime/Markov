@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import gzip
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,15 @@ def load_json(path: Path) -> Any:
     """Load and decode one UTF-8 JSON file."""
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
+    """Read one measurement at a time, including retained gzip streams."""
+
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as source:
+        for line in source:
+            yield json.loads(line)
 
 
 def write_json(path: Path, value: Any) -> None:

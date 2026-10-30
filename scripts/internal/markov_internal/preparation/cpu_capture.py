@@ -9,6 +9,7 @@ from markov_internal.common.io import load_json, write_json
 from markov_internal.common.manifest import workload_report_path
 from markov_internal.common.paths import ROOT_DIR, require_repo_path, repo_relative_path
 from markov_internal.preparation.calibration.light_capture import light_capture_config
+from markov_internal.preparation.resources import wait_for_normal_resources
 from markov_internal.preparation.capture import (
     ProfileBudget,
     pending_capture_reason,
@@ -56,6 +57,8 @@ def capture_light_base(pair: dict, plan: dict, *, dry_run: bool = False) -> Path
         )
         return None
 
+    if not dry_run:
+        wait_for_normal_resources(root)
     budget = ProfileBudget(**plan["capture_budget"])
     remaining, limits = budget.available_for(plan["capture_usage"], **counts)
     if limits:
@@ -102,4 +105,5 @@ def capture_light_base(pair: dict, plan: dict, *, dry_run: bool = False) -> Path
             row["light_manifest"] = str(repo_relative_path(manifest_path))
     finally:
         plan["capture_usage"] = profile_usage(attempts)
+    plan.setdefault("created_profile_manifests", []).append(str(repo_relative_path(manifest_path)))
     return manifest_path

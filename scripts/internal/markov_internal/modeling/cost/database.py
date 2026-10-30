@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from contextlib import closing
-from dataclasses import dataclass
 import json
-import math
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -14,46 +13,7 @@ from typing import Any
 from ...common.paths import require_repo_path
 from ..deployment import cost_environment_matches
 from .control import control_entries
-
-
-@dataclass(frozen=True)
-class OperationObservation:
-    """One operation measured in one capture; durations are microseconds.
-
-    capture and position identify measurement provenance, not fitting features.
-    manifest names the original profile manifest or independent primitive
-    measurement document; the latter does not claim to contain a runtime trace.
-    deployment contains semantic resource/implementation settings. Different
-    captures with identical work remain distinct measurements.
-    """
-
-    capture: str
-    manifest: str
-    deployment: dict[str, Any]
-    position: str
-    operation: str
-    implementation: str
-    features: dict[str, float]
-    duration_us: float
-    timing_scope: str
-
-    @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> OperationObservation:
-        observation = cls(**raw)
-        if not observation.capture or not observation.position or not observation.operation or not observation.manifest:
-            raise ValueError("cost observations need capture, manifest, operation and source position")
-        if observation.duration_us < 0 or not math.isfinite(observation.duration_us):
-            raise ValueError("measured duration_us must be finite and non-negative")
-        if not observation.timing_scope or any(not math.isfinite(value) for value in observation.features.values()):
-            raise ValueError("cost observations need a timing scope and finite features")
-
-        return observation
-
-
-def _json(value: Any) -> str:
-    """Canonical semantic values for SQLite equality, not an integrity digest."""
-
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+from .measurements import OperationObservation, OperationSamples, SampleWriter, canonical_json, unpack_samples
 
 
 def _deployment_ids(connection: sqlite3.Connection, deployment: dict[str, Any]) -> tuple[int, ...]:
@@ -147,10 +107,18 @@ def create_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS observations (
             capture_id INTEGER NOT NULL REFERENCES captures(id),
             source_id INTEGER NOT NULL REFERENCES capture_sources(id),
-            position TEXT NOT NULL, operation TEXT NOT NULL, implementation TEXT NOT NULL,
-            features TEXT NOT NULL, duration_us REAL NOT NULL, timing_scope TEXT NOT NULL,
-            PRIMARY KEY (capture_id, position, timing_scope)
+            work_id INTEGER NOT NULL REFERENCES work_points(id),
+            count INTEGER NOT NULL CHECK (count > 0),
+            distribution BLOB NOT NULL, positions BLOB NOT NULL,
+            PRIMARY KEY (capture_id, source_id, work_id)
         ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS work_points (
+            id INTEGER PRIMARY KEY,
+            operation TEXT NOT NULL, implementation TEXT NOT NULL,
+            timing_scope TEXT NOT NULL, features TEXT NOT NULL,
+            UNIQUE (operation, implementation, timing_scope, features)
+        );
+        CREATE INDEX IF NOT EXISTS work_observations ON observations(work_id, capture_id);
         CREATE TABLE IF NOT EXISTS evidence (
             capture_id INTEGER NOT NULL REFERENCES captures(id),
             source_id INTEGER NOT NULL REFERENCES capture_sources(id),
@@ -258,7 +226,7 @@ class CostDatabase:
 
     def import_measurements(
         self,
-        observations: list[OperationObservation],
+        observations: Iterable[OperationObservation],
         evidence: list[dict[str, Any]],
         *,
         replace_captures: bool = False,
@@ -278,17 +246,13 @@ class CostDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path)) as connection:
             create_tables(connection)
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS observations_work ON observations "
-                "(operation, implementation, timing_scope, capture_id)"
-            )
             with connection:
                 return self._import(connection, observations, evidence, replace_captures=replace_captures)
 
     def _import(
         self,
         connection: sqlite3.Connection,
-        observations: list[OperationObservation],
+        observations: Iterable[OperationObservation],
         evidence: list[dict[str, Any]],
         *,
         replace_captures: bool,
@@ -296,12 +260,8 @@ class CostDatabase:
         """Apply one admitted import; the caller owns its transaction."""
 
         evidence_counts = dict(inserted=0, duplicate_imports=0)
-        observation_counts = dict(inserted=0, duplicate_imports=0)
-        replaced = (
-            sorted({row.capture for row in observations} | {row["capture"] for row in evidence})
-            if replace_captures
-            else []
-        )
+        writer = SampleWriter(connection)
+        replaced = []
         removed = dict(observations=0, evidence=0)
         deployments = dict(connection.execute("SELECT description, id FROM deployments"))
         captures = {
@@ -325,7 +285,7 @@ class CostDatabase:
                 raise ValueError(f"conflicting deployment for original capture: {capture}")
 
             if new_capture or changed_environment:
-                description = _json(deployment)
+                description = canonical_json(deployment)
                 if description not in deployments:
                     deployments[description] = connection.execute(
                         "INSERT INTO deployments (description) VALUES (?)", (description,)
@@ -342,6 +302,16 @@ class CostDatabase:
                 captures[capture] = identity, deployment
 
             identity = captures[capture][0]
+            captures[capture] = identity, deployment
+            if replace_captures and capture not in admitted_captures:
+                replaced.append(capture)
+                removed["observations"] += connection.execute(
+                    "SELECT COALESCE(SUM(count),0) FROM observations WHERE capture_id=?", (identity,)
+                ).fetchone()[0]
+                connection.execute("DELETE FROM observations WHERE capture_id=?", (identity,))
+                removed["evidence"] += connection.execute(
+                    "DELETE FROM evidence WHERE capture_id=?", (identity,)
+                ).rowcount
             admitted_captures.add(capture)
 
             key = identity, manifest
@@ -357,15 +327,6 @@ class CostDatabase:
 
             return identity, sources[key][0]
 
-        if replaced:
-            for capture in replaced:
-                if capture not in captures:
-                    continue
-                for table in ("observations", "evidence"):
-                    removed[table] += connection.execute(
-                        f"DELETE FROM {table} WHERE capture_id=?", (captures[capture][0],)
-                    ).rowcount
-
         for row in evidence:
             identity, source_id = admit_source(row["capture"], row["manifest"], row["deployment"], True)
             for manifest in evidence_manifests(row):
@@ -375,7 +336,7 @@ class CostDatabase:
             if payload is None:
                 continue
 
-            encoded = _json(payload)
+            encoded = canonical_json(payload)
             stored = connection.execute(
                 "SELECT payload FROM evidence WHERE capture_id=? AND kind=?", (identity, row["kind"])
             ).fetchone()
@@ -390,41 +351,23 @@ class CostDatabase:
 
         for row in observations:
             identity, source_id = admit_source(row.capture, row.manifest, row.deployment, True)
-            stored = connection.execute(
-                "SELECT operation, implementation, features, duration_us FROM observations "
-                "WHERE capture_id=? AND position=? AND timing_scope=?",
-                (identity, row.position, row.timing_scope),
-            ).fetchone()
-            if stored is not None:
-                # Aliases and numeric JSON spelling do not change a work point.
-                if (
-                    stored[:2] != (row.operation, row.implementation)
-                    or json.loads(stored[2]) != row.features
-                    or stored[3] != row.duration_us
-                ):
-                    raise ValueError(f"conflicting cost reimport: {row.capture}/{row.position}")
-                observation_counts["duplicate_imports"] += 1
-                continue
-
-            connection.execute(
-                "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    identity,
-                    source_id,
-                    row.position,
-                    row.operation,
-                    row.implementation,
-                    _json(row.features),
-                    row.duration_us,
-                    row.timing_scope,
-                ),
+            writer.add(
+                identity,
+                source_id,
+                row.position,
+                row.operation,
+                row.implementation,
+                row.timing_scope,
+                row.features,
+                row.duration_us,
             )
-            observation_counts["inserted"] += 1
+
+        writer.flush()
 
         return {
-            "operators": observation_counts,
+            "operators": writer.counts,
             "evidence": evidence_counts,
-            "replaced_captures": replaced,
+            "replaced_captures": sorted(replaced),
             "removed_derived_rows": removed,
             "retrain_exported_packages": bool(replaced),
         }
@@ -455,40 +398,33 @@ class CostDatabase:
 
     def observations(
         self, deployment: dict[str, Any], *, operations: tuple[str, ...], excluded_captures: set[str]
-    ) -> list[OperationObservation]:
-        """Read one operation family, omitting holdouts; metadata is read-only.
+    ) -> list[OperationSamples]:
+        """Read exact work-point distributions without expanding observations or positions."""
 
-        Other timing scopes remain available to classify missing measurements.
-        Deployment and provenance descriptions are joined, not stored per row.
-        """
-
-        environment = json.loads(_json(deployment))
         placeholders = ",".join("?" for _ in operations)
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
             deployments = _deployment_ids(connection, deployment)
             domains = ",".join("?" for _ in deployments)
             stored = connection.execute(
-                "SELECT c.name, o.position, s.manifest, o.operation, o.implementation, "
-                "o.features, o.duration_us, o.timing_scope FROM observations o "
+                "SELECT c.name, s.manifest, w.operation, w.implementation, "
+                "w.features, w.timing_scope, o.distribution FROM observations o "
                 "JOIN captures c ON c.id=o.capture_id JOIN capture_sources s ON s.id=o.source_id "
-                f"WHERE c.deployment_id IN ({domains}) AND o.operation IN ({placeholders}) "
-                "ORDER BY o.operation, o.implementation, o.timing_scope, c.name, o.position",
+                "JOIN work_points w ON w.id=o.work_id "
+                f"WHERE c.deployment_id IN ({domains}) AND w.operation IN ({placeholders}) "
+                "ORDER BY w.operation, w.implementation, w.timing_scope, c.name, o.source_id, o.work_id",
                 (*deployments, *operations),
             )
-
             return [
-                OperationObservation(
+                OperationSamples(
                     capture=capture,
                     manifest=manifest,
-                    deployment=environment,
-                    position=position,
                     operation=operation,
                     implementation=implementation,
                     features=json.loads(features),
-                    duration_us=duration,
                     timing_scope=scope,
+                    durations=dict(unpack_samples(distribution)),
                 )
-                for capture, position, manifest, operation, implementation, features, duration, scope in stored
+                for capture, manifest, operation, implementation, features, scope, distribution in stored
                 if capture not in excluded_captures
             ]
 
@@ -499,7 +435,7 @@ class CostDatabase:
             deployments = _deployment_ids(connection, deployment)
             placeholders = ",".join("?" for _ in deployments)
             counts = connection.execute(
-                "SELECT c.name, COUNT(*) FROM observations o JOIN captures c ON c.id=o.capture_id "
+                "SELECT c.name, SUM(o.count) FROM observations o JOIN captures c ON c.id=o.capture_id "
                 f"WHERE c.deployment_id IN ({placeholders}) GROUP BY c.name",
                 deployments,
             )
@@ -511,9 +447,9 @@ class CostDatabase:
         with closing(sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)) as connection:
             environments = dict(connection.execute("SELECT id, description FROM deployments"))
             groups = connection.execute(
-                "SELECT c.deployment_id, o.operation, o.implementation, o.timing_scope, COUNT(*), COUNT(DISTINCT o.capture_id) "
-                "FROM observations o JOIN captures c ON c.id=o.capture_id "
-                "GROUP BY c.deployment_id, o.operation, o.implementation, o.timing_scope"
+                "SELECT c.deployment_id, w.operation, w.implementation, w.timing_scope, SUM(o.count), COUNT(DISTINCT o.capture_id) "
+                "FROM observations o JOIN captures c ON c.id=o.capture_id JOIN work_points w ON w.id=o.work_id "
+                "GROUP BY c.deployment_id, w.operation, w.implementation, w.timing_scope"
             ).fetchall()
             groups.sort(key=lambda row: (environments[row[0]], *row[1:4]))
 
@@ -523,9 +459,9 @@ class CostDatabase:
             # identity, not its potentially large JSON description per record.
             coverage: dict[tuple[int, str, str, str], dict[str, Any]] = {}
             for environment, operation, implementation, scope, raw_features, count in connection.execute(
-                "SELECT c.deployment_id, o.operation, o.implementation, o.timing_scope, o.features, COUNT(*) "
-                "FROM observations o JOIN captures c ON c.id=o.capture_id "
-                "GROUP BY c.deployment_id, o.operation, o.implementation, o.timing_scope, o.features"
+                "SELECT c.deployment_id, w.operation, w.implementation, w.timing_scope, w.features, SUM(o.count) "
+                "FROM observations o JOIN captures c ON c.id=o.capture_id JOIN work_points w ON w.id=o.work_id "
+                "GROUP BY c.deployment_id, w.operation, w.implementation, w.timing_scope, w.features"
             ):
                 key = environment, operation, implementation, scope
                 group = coverage.setdefault(key, {"distinct_work_points": 0, "features": {}})

@@ -79,6 +79,10 @@ void validate_options(const CliOptions & options) {
         throw CliUsageError("--target-plan supplies target models and cannot be combined with single-run model, observation or CPU preparation");
     if (options.source_observations_only && (!options.model_config.empty() || !options.prepare_cpu_service.empty() || !options.outputs.graph.empty()))
         throw CliUsageError("Source observation extraction cannot be combined with model, CPU preparation or graph output");
+    if (!options.outputs.operator_observations.empty() && (!options.source_observations_only || !options.outputs.structure_report.empty()))
+        throw CliUsageError("--operator-observations requires cost-only source extraction");
+    if (options.source_observations_only && options.outputs.structure_report.empty() && options.outputs.operator_observations.empty())
+        throw CliUsageError("Cost extraction requires --operator-observations <output.jsonl>");
     if (options.profile_manifest.empty()) throw CliUsageError("--profile-manifest is required");
     if (options.prepare_cpu_service.empty() != options.cpu_service_output.empty())
         throw CliUsageError("--prepare-cpu-service and --cpu-service-output must be supplied together");
@@ -120,6 +124,7 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--graph-output") options.outputs.graph = next_value(index, argc, argv, argument);
         else if (argument == "--source-replay-report") options.outputs.source_replay_report = next_value(index, argc, argv, argument);
         else if (argument == "--structure-report") options.outputs.structure_report = next_value(index, argc, argv, argument);
+        else if (argument == "--operator-observations") options.outputs.operator_observations = next_value(index, argc, argv, argument);
         else if (argument == "--model-config") options.model_config = next_value(index, argc, argv, argument);
         else if (argument == "--target-plan") options.target_plan = next_value(index, argc, argv, argument);
         else if (argument == "--cpu-service-cost") options.cpu_service_cost = next_value(index, argc, argv, argument);
@@ -160,6 +165,7 @@ void print_usage(const char * program) {
               << "  --prepare-cpu-service FILE      Generate service intervals from same-base measurements; no prediction\n"
               << "  --cpu-service-output FILE       Output for --prepare-cpu-service (replaces --run-summary)\n"
               << "  --source-observations-only      Extract costs, or structure only with --structure-report; no simulation\n"
+              << "  --operator-observations <path>  Stream cost observations as JSON Lines\n"
               << "  --source-replay-report FILE     Experimental raw source DAG replay, before costs or transforms\n"
               << "  --structure-report FILE         Experimental executed work; observed structure in source-only mode\n"
               << "  --graph-output FILE             Optional full DAG Chrome trace\n"

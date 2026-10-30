@@ -2,6 +2,7 @@
 #include "markov/trace_graph/source_dag/observations.hpp"
 #include "markov/trace_graph/source_dag/prefetch.hpp"
 #include "markov/trace_graph/structure/hicache/query.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <nlohmann/json.hpp>
@@ -11,8 +12,8 @@
 
 namespace markov::trace_graph::source_dag {
 
-nlohmann::json prefetch_query_observations(const core::DagGraph & graph, const CpuCollectiveObservation & collectives,
-                                           const PrefetchWorkerObservations & workers, uint64_t begin_us, uint64_t end_us) {
+void prefetch_query_observations(const core::DagGraph & graph, const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers,
+                                 uint64_t begin_us, uint64_t end_us, ObservationWriter & rows) {
     const auto & events = graph.runtime_observations();
     const auto end = [](const core::TraceEvent & event) { return core::checked_add_u64(event.ts, event.dur, "Query observation end overflow"); };
     std::set<size_t> rounds;
@@ -20,7 +21,6 @@ nlohmann::json prefetch_query_observations(const core::DagGraph & graph, const C
         if (query.issue.empty() && events[query.observation].ts >= begin_us && query.agreement_rounds.size() == 1)
             rounds.insert(query.agreement_rounds.front());
 
-    auto rows = nlohmann::json::array();
     for (const auto id : rounds) {
         const auto & round = collectives.rounds[id];
         const auto agreement = modules::hicache::observe_cpu_all_reduce_envelope(graph, round);
@@ -68,7 +68,6 @@ nlohmann::json prefetch_query_observations(const core::DagGraph & graph, const C
         if (group.size() == 4 * round.members.size())
             for (auto & row : group) rows.push_back(std::move(row));
     }
-    return rows;
 }
 
 } // namespace markov::trace_graph::source_dag

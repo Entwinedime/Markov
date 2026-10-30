@@ -34,6 +34,7 @@ from markov_internal.preparation.capture import (
     recorded_capture,
     run_profile_attempt,
 )
+from markov_internal.preparation.resources import wait_for_normal_resources
 
 if TYPE_CHECKING:
     from markov_internal.preparation.scenario import ScenarioRequest
@@ -328,6 +329,7 @@ def capture_profile_jobs(
         "budget": asdict(budget) if budget else None,
         "jobs": [],
         "profile_manifests": [],
+        "created_profile_manifests": [],
     }
     pending = []
     for job in jobs:
@@ -373,6 +375,8 @@ def capture_profile_jobs(
             if limits:
                 plan.update(status="capture_budget_exhausted", limits=limits)
                 return plan
+            if job.inputs["suite"]["framework"] == "sglang":
+                wait_for_normal_resources(output_dir)
             work_root = output_dir / f"{purpose}_captures"
             work_root.mkdir(parents=True, exist_ok=True)
             output = Path(tempfile.mkdtemp(prefix=f"{mode}_", dir=work_root))
@@ -392,7 +396,7 @@ def capture_profile_jobs(
                     argv, "--forced-token-plan", str(Path(args.output_dir) / "forced_token_plan.json")
                 )
                 config["profiling"] = {"enabled": False, "channels": []}
-                config["run_root"] = "data/no_profile_runs/sglang"
+                config["run_root"] = str(repo_relative_path(output_dir / f"{purpose}_token_runs"))
                 config["metadata"]["profile_mode"] = "forced_token_capture"
                 config["metadata"]["full_dag_contract"] = (
                     "Not applicable to token capture; the subsequent replay produces source DAG traces."
@@ -434,5 +438,6 @@ def capture_profile_jobs(
                 bundle = row["forced_token_bundle"]
             else:
                 plan["profile_manifests"].append(row["profile_manifest"])
+                plan["created_profile_manifests"].append(row["profile_manifest"])
     plan["status"] = "profiles_captured"
     return plan

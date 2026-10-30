@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
 from markov_internal.common.io import write_json_atomic
 from markov_internal.common.paths import repo_relative_path
+from markov_internal.common.process import container_peak_memory_bytes
 from markov_internal.modeling.context import WorkflowOptions
 from markov_internal.modeling.execution.model_executor import plan_model_runs, run_model_runs
 from markov_internal.modeling.source_dag.profiles import discover_profile_runs
@@ -92,12 +92,9 @@ def predict(options: WorkflowOptions) -> dict[str, Any]:
         "prediction_wall_seconds": time.monotonic() - started,
         "scope": "prepared-input prediction including preflight, source preparation, targets and incremental reports; excludes capture/training",
     }
-    # Modeling Docker mounts its own controller at these roots, including v1
-    # hosts whose /proc membership retains the full host-side scope path.
-    for path in (Path("/sys/fs/cgroup/memory.peak"), Path("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")):
-        if path.is_file():
-            summary["performance"]["container_peak_memory_bytes"] = int(path.read_text())
-            break
+    peak = container_peak_memory_bytes()
+    if peak is not None:
+        summary["performance"]["container_peak_memory_bytes"] = peak
 
     write_json_atomic(report_path, summary)
     return summary

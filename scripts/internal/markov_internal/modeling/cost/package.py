@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+import time
 from typing import Any
 
-from ...common.io import load_json
-from ...common.paths import repo_relative_path, require_repo_path
+from ...common.io import load_json, write_json_atomic
+from ...common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ..deployment import require_cost_environment, source_environment
-from ..source_dag.profiles import cpu_service_inputs, discover_profile_runs
+from ..source_dag.profiles import cpu_service_inputs, cpu_service_metadata, discover_profile_runs
 from .control import ControlMeasurement, control_entries
-from .database import CostDatabase, OperationObservation
+from .database import CostDatabase
+from .measurements import OperationObservation, operation_rows
 from .io import service_cost_evidence
 from .models import ModelSpec, parse_model_specs, train_models
 from .physical import read_physical_measurements
@@ -28,43 +30,100 @@ def import_profiles(
     *,
     include_setup_requests: bool = False,
     replace_captures: bool = False,
+    measurement_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Extract explicitly selected historical captures, never the prediction base."""
+    """Extract and commit one capture at a time; independent inputs never accumulate."""
 
-    # Import is a boundary workflow. Prediction and operator inference do not
-    # depend on framework acquisition, profile discovery or raw trace readers.
     from ..source_dag.observations import scan_observations
 
     sources = discover_profile_runs(tuple(path.resolve() for path in manifests))
     correction = cpu_service_inputs(services, tuple(source.manifest_path.resolve() for source in sources))
-    rows = []
-    evidence = []
-    for source in sources:
-        observation = scan_observations(
-            source,
-            scratch,
-            role="history",
-            cpu_service=correction.get(source.manifest_path.resolve()),
-            include_setup_requests=include_setup_requests,
-        )
-        manifest = str(repo_relative_path(source.manifest_path))
-        # A suite-local run_id can repeat across independent captures. Keep
-        # existing provenance on reimport; new identity follows its manifest.
-        # Explicit aliases handle renamed copies, never fitting variables.
-        capture = aliases[manifest] if manifest in aliases else database.capture_identity(manifest)
-        deployment = source_environment(source, resources)
-        observation["resource_environment_basis"] = (
-            "explicit_import_declaration" if resources is not None else "capture_metadata_or_unknown"
-        )
-        for row in observation["operator_observations"]:
-            rows.append(
-                OperationObservation.from_raw(dict(row, capture=capture, manifest=manifest, deployment=deployment))
-            )
-        evidence.append(
-            dict(capture=capture, manifest=manifest, deployment=deployment, kind="runtime_io", payload=observation)
-        )
+    result = {
+        "status": "importing",
+        "operators": dict(inserted=0, duplicate_imports=0),
+        "evidence": dict(inserted=0, duplicate_imports=0),
+        "captures": [],
+        "replaced_captures": [],
+        "removed_derived_rows": dict(observations=0, evidence=0),
+        "retrain_exported_packages": False,
+    }
+    report = scratch / "import_summary.json"
+    write_json_atomic(report, result)
+    try:
+        for source in sources:
+            manifest = str(repo_relative_path(source.manifest_path))
+            capture = aliases[manifest] if manifest in aliases else database.capture_identity(manifest)
+            deployment = source_environment(source, resources)
+            with scan_observations(
+                source,
+                scratch,
+                role="history",
+                cpu_service=correction.get(source.manifest_path.resolve()),
+                include_setup_requests=include_setup_requests,
+            ) as observation:
+                metadata = observation.metadata
+                metadata["resource_environment_basis"] = (
+                    "explicit_import_declaration" if resources is not None else "capture_metadata_or_unknown"
+                )
+                rows = (
+                    OperationObservation.from_raw(dict(row, capture=capture, manifest=manifest, deployment=deployment))
+                    for row in observation.rows()
+                )
+                import_started = time.monotonic()
+                imported = database.import_measurements(
+                    rows,
+                    [
+                        dict(
+                            capture=capture,
+                            manifest=manifest,
+                            deployment=deployment,
+                            kind="runtime_io",
+                            payload=metadata,
+                        )
+                    ],
+                    replace_captures=replace_captures,
+                )
+                import_wall_seconds = time.monotonic() - import_started
+                retained = None
+                retention_started = time.monotonic()
+                if measurement_dir is not None:
+                    destination = (
+                        measurement_dir
+                        / source.manifest_path.parent.resolve().relative_to(ROOT_DIR.resolve())
+                        / "measurements.jsonl.gz"
+                    )
+                    retained = str(repo_relative_path(observation.retain(destination)))
 
-    return database.import_measurements(rows, evidence, replace_captures=replace_captures)
+                for kind in ("operators", "evidence", "removed_derived_rows"):
+                    for key, value in imported[kind].items():
+                        result[kind][key] += value
+                result["replaced_captures"] = sorted(
+                    set(result["replaced_captures"]) | set(imported["replaced_captures"])
+                )
+                result["retrain_exported_packages"] |= imported["retrain_exported_packages"]
+                result["captures"].append(
+                    {
+                        "source_manifest": manifest,
+                        "operators": imported["operators"],
+                        "operator_observation_count": metadata["operator_observation_count"],
+                        "measurements": retained,
+                        "performance": {
+                            "extraction_or_retained_load_wall_seconds": observation.preparation_wall_seconds,
+                            "database_import_wall_seconds": import_wall_seconds,
+                            "measurement_retention_wall_seconds": time.monotonic() - retention_started,
+                            "measurement_stream_bytes": observation.rows_path.stat().st_size,
+                            "retained_measurement_bytes": require_repo_path(retained).stat().st_size if retained else 0,
+                        },
+                    }
+                )
+                write_json_atomic(report, result)
+        result["status"] = "completed"
+        return result
+    except BaseException as error:
+        result.update(status="failed", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        write_json_atomic(report, result)
 
 
 def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
@@ -195,7 +254,6 @@ def import_evidence(
     Conflicts roll back the database transaction; raw measurement files remain.
     """
 
-    measurements = []
     for row in evidence:
         payload = row["payload"]
         if row["kind"] == "physical_io":
@@ -204,16 +262,20 @@ def import_evidence(
             if "control_calibrations" in payload:
                 payload["control_measurements"] = payload.pop("control_calibrations")
             payload["control_measurements"] = embed_control_measurements(payload["control_measurements"])
-            measurements.extend(control_observations(row))
-        elif row["kind"] == "cpu_primitive":
-            measurements.extend(
-                OperationObservation.from_raw(
-                    dict(observation, capture=row["capture"], manifest=row["manifest"], deployment=row["deployment"])
-                )
-                for observation in payload["operator_observations"]
-            )
 
-    return database.import_measurements(measurements, evidence, replace_captures=replace_captures)
+    def observations() -> Iterator[OperationObservation]:
+        for row in evidence:
+            if row["kind"] == "control_costs":
+                yield from control_observations(row)
+            elif row["kind"] == "cpu_primitive":
+                for observation in operation_rows(row["payload"]):
+                    yield OperationObservation.from_raw(
+                        dict(
+                            observation, capture=row["capture"], manifest=row["manifest"], deployment=row["deployment"]
+                        )
+                    )
+
+    return database.import_measurements(observations(), evidence, replace_captures=replace_captures)
 
 
 def physical_evidence(physical: dict[str, Any], deployment: dict[str, Any]) -> dict[str, Any]:
@@ -229,7 +291,7 @@ def physical_evidence(physical: dict[str, Any], deployment: dict[str, Any]) -> d
     )
 
 
-def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]:
+def control_observations(evidence: dict[str, Any]) -> Iterator[OperationObservation]:
     """Admit exported primitive measurements, not parameters or sample topology.
 
     Each evidence row describes one original capture. Multiple documents from
@@ -237,12 +299,10 @@ def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]
     CPU correction belongs to the document's own capture, never the base.
     """
 
-    rows: list[OperationObservation] = []
-
     for _, value in control_entries(evidence["payload"].get("control_measurements", {})):
-        observations = value.get("operator_observations", [])
-        if not observations:
+        if not value.get("operator_observations_file") and not value.get("operator_observations"):
             continue
+        observations = operation_rows(value)
 
         # Query rows explicitly measure coarse wall intervals, not corrected
         # CPU service. Other primitive exports retain the paired-CPU contract.
@@ -265,18 +325,14 @@ def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]
                 }
             ):
                 raise ValueError("query exports measure control intervals, not pure CPU service")
-            rows.append(
-                OperationObservation.from_raw(
-                    dict(
-                        observation,
-                        capture=evidence["capture"],
-                        manifest=evidence["manifest"],
-                        deployment=evidence["deployment"],
-                    )
+            yield OperationObservation.from_raw(
+                dict(
+                    observation,
+                    capture=evidence["capture"],
+                    manifest=evidence["manifest"],
+                    deployment=evidence["deployment"],
                 )
             )
-
-    return rows
 
 
 def _with_measurement_sources(value: dict[str, Any]) -> dict[str, Any]:
@@ -286,7 +342,7 @@ def _with_measurement_sources(value: dict[str, Any]) -> dict[str, Any]:
         return value
     manifests = [value["source_manifest"]]
     if value.get("cost_basis") == "paired_cpu_service":
-        correction = load_json(require_repo_path(value["cpu_service_file"]))
+        correction = cpu_service_metadata(require_repo_path(value["cpu_service_file"]))
         manifests.append(correction["light_manifest"])
     return dict(value, measurement_manifests=manifests)
 

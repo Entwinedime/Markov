@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import gzip
+
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable
@@ -45,13 +48,13 @@ def model_declarations(inventory: dict[str, Any], rules: list[dict[str, Any]]) -
     return result
 
 
-def control_observations(
+def control_measurements(
     root: Path,
     manifests: list[Path],
     service_by_source: dict[Path, Path],
     source_info: dict[Path, dict[str, Any]],
     run: Callable[..., int],
-) -> list[dict[str, Any]]:
+) -> list[tuple[str, dict[str, Any]]]:
     """Validate control evidence before the expensive bulk graph import."""
 
     rows = []
@@ -94,15 +97,7 @@ def control_observations(
             run(f"control_{index + 1}", command)
             documents = [load_json(path) for path in paths]
 
-        for document in documents:
-            rows.extend(
-                dict(
-                    row,
-                    capture=capture,
-                    manifest=capture,
-                )
-                for row in document["operator_observations"]
-            )
+        rows.extend((capture, document) for document in documents)
 
     return rows
 
@@ -124,7 +119,7 @@ def prepare_costs(
         return publish_costs(recipe, root, database, inventory, run)
 
     service_by_source = {require_repo_path(load_json(path)["source_manifest"]): path for path in services}
-    rows = control_observations(root, manifests, service_by_source, source_info, run)
+    controls = control_measurements(root, manifests, service_by_source, source_info, run)
     runtime_import = measurement_root / "runtime_import"
     resources = root / "costs" / "resources.json"
     write_json(resources, recipe["resources"])
@@ -228,8 +223,7 @@ def prepare_costs(
     if prepared["status"] not in {"ready", "missing_data"}:
         raise RuntimeError(f"independent measurements failed: {prepared['status']}; see {request.parent}")
 
-    for row in rows:
-        row["deployment"] = deployment
+    rows = []
 
     sampling = recipe["sampling"]
     for kind in ("idle-sync", "eviction-cpu"):
@@ -280,8 +274,17 @@ def prepare_costs(
                     }
                 )
 
-    observations = root / "costs" / "control_observations.json"
-    write_json(observations, {"observations": rows})
+    observations = root / "costs" / "control_observations.jsonl"
+    with observations.open("w") as output:
+        for capture, document in controls:
+            path = require_repo_path(document["operator_observations_file"])
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8") as measured:
+                for line in measured:
+                    row = dict(json.loads(line), capture=capture, manifest=capture, deployment=deployment)
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for row in rows:
+            output.write(json.dumps(row, ensure_ascii=False) + "\n")
     run(
         "control_import",
         [

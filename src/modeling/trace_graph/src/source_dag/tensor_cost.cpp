@@ -4,6 +4,7 @@
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -533,7 +534,7 @@ nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const
 
 void append_tensor_program_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
-                                        std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes,
+                                        std::set<size_t> & measured_devices, bool cpu_service_applied, ObservationWriter & rows, bool include_caller_scopes,
                                         std::optional<size_t> omitted_caller_operation) {
     for (const auto & [position, observation] : matched) {
         const auto & operation = program[position];

@@ -3,6 +3,7 @@
 #include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
+#include "source_dag/observation_writer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -14,9 +15,8 @@
 
 namespace markov::trace_graph::source_dag {
 
-nlohmann::json allocator_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
-    using Json = nlohmann::json;
-    Json rows = Json::array();
+void allocator_operator_observations(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied,
+                                     ObservationWriter & rows) {
     std::set<size_t> measured_devices;
     for (const auto & call : adapters::sglang::observe_allocator_programs(source, queues)) {
         if (!call.program) continue;
@@ -39,7 +39,6 @@ nlohmann::json allocator_operator_observations(const SourceDagIndex & source, co
         if (call.has_preparation || !call.complete_tensor_mapping) continue;
         for (const auto & row : tensor_program_outer_observations(source, call.region.work, program, matched, cpu_service_applied)) rows.push_back(row);
     }
-    return rows;
 }
 
 } // namespace markov::trace_graph::source_dag

@@ -19,6 +19,7 @@ struct OutputPaths {
     std::string graph;
     std::string source_replay_report;
     std::string structure_report;
+    std::string operator_observations;
 #ifdef DEBUG
     std::string model_summary;
 #endif

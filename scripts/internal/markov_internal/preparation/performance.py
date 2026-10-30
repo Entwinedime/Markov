@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -13,15 +14,17 @@ from markov_internal.common.manifest import profile_labels
 from markov_internal.common.paths import repo_relative_path, require_repo_path, running_in_modeling_container
 from markov_internal.modeling.cost.control import read_control_measurements
 from markov_internal.modeling.cost.database import CostDatabase
-from markov_internal.modeling.cost.models import parse_model_specs
+from markov_internal.modeling.cost.models import estimate, parse_model_specs
 from markov_internal.modeling.cost.package import control_evidence, physical_evidence
 from markov_internal.modeling.deployment import require_cost_environment, source_environment
 from markov_internal.modeling.source_dag.profiles import discover_profile_runs
-from markov_internal.profiling.suite import profile_experiments
+from markov_internal.profiling.suite import experiment_identity, profile_experiments
 from markov_internal.preparation.profile_capture import capture_profile_jobs, profile_capture_job
 from markov_internal.preparation.capture import PhysicalBudget, ProfileBudget, pending_group_capture
 from markov_internal.preparation.cost_preparation import import_cost_measurements, train_cost_model
 from markov_internal.preparation.cpu_service import CpuServiceInputs, cpu_service_plan, prepare_cpu_services
+from markov_internal.modeling.source_dag.profiles import cpu_service_metadata
+from markov_internal.preparation.performance_retention import retire_performance_traces
 from markov_internal.preparation.physical_capture import (
     SERVICE_SAMPLERS,
     PhysicalCaptureInputs,
@@ -51,6 +54,8 @@ class PerformanceRequest:
     include_setup_requests: bool
     evidence: Path | None
     observations: Path | None
+    retain_raw_traces: bool = False
+    sampling_work: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> PerformanceRequest:
@@ -74,6 +79,8 @@ class PerformanceRequest:
             "include_setup_requests",
             "evidence",
             "observations",
+            "retain_raw_traces",
+            "sampling_work",
         }
         if unknown := set(raw) - allowed:
             raise ValueError(f"unknown performance inputs; targets and scores are not accepted: {sorted(unknown)}")
@@ -83,6 +90,8 @@ class PerformanceRequest:
         services = frozenset(raw.get("physical_services", []))
         if services - SERVICE_SAMPLERS.keys():
             raise ValueError(f"unsupported physical services: {sorted(services - SERVICE_SAMPLERS.keys())}")
+        if not isinstance(raw.get("retain_raw_traces", False), bool):
+            raise ValueError("retain_raw_traces must be a boolean")
 
         return cls(
             database=require_repo_path(raw["database"]),
@@ -102,7 +111,61 @@ class PerformanceRequest:
             include_setup_requests=bool(raw.get("include_setup_requests", False)),
             evidence=require_repo_path(raw["evidence"]) if raw.get("evidence") else None,
             observations=require_repo_path(raw["observations"]) if raw.get("observations") else None,
+            retain_raw_traces=raw.get("retain_raw_traces", False),
+            sampling_work=parse_sampling_work(raw.get("sampling_work", {})),
         )
+
+
+def parse_sampling_work(raw: Any) -> dict[str, list[dict[str, Any]]]:
+    """Declare actual work, not configuration names as fitting coordinates."""
+
+    if not isinstance(raw, dict):
+        raise ValueError("sampling_work must map experiment IDs to nonempty operation lists")
+    for identity, points in raw.items():
+        if not isinstance(identity, str) or not identity or not isinstance(points, list) or not points:
+            raise ValueError("sampling_work requires an experiment ID and nonempty operation list")
+        for point in points:
+            if not isinstance(point, dict) or set(point) != {"operation", "implementation", "timing_scope", "features"}:
+                raise ValueError("sampling work needs operation, implementation, timing_scope and features")
+            if any(
+                not isinstance(point[key], str) or not point[key]
+                for key in ("operation", "implementation", "timing_scope")
+            ):
+                raise ValueError("sampling operation identity must contain nonempty strings")
+            features = point["features"]
+            if not isinstance(features, dict) or any(
+                not isinstance(name, str)
+                or not name
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for name, value in features.items()
+            ):
+                raise ValueError("sampling work features need names and finite numbers")
+    return raw
+
+
+def missing_sampling_work(package: dict[str, Any], points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A fitted range alone does not establish that the requested joint work was measured."""
+
+    indexed = {
+        (model["operation"], model["implementation"], model["timing_scope"]): model
+        for model in package.get("operator_models", [])
+    }
+    missing = []
+    for point in points:
+        model = indexed.get(tuple(point[key] for key in ("operation", "implementation", "timing_scope")))
+        result = (
+            estimate(model, point["features"])
+            if model is not None
+            else {"status": "missing_data", "reason": "missing_model"}
+        )
+        if result["status"] == "ready":
+            if not result["outside_measured_range"] and not result["unseen_feature_combination"]:
+                continue
+            result = {"status": "missing_data", "reason": "unmeasured_joint_work"}
+        missing.append(dict(point, gap=result))
+    return missing
 
 
 def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -> dict[str, Any]:
@@ -118,6 +181,20 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
     training = load_json(request.training)
     require_cost_environment(training["deployment"])
     specifications = parse_model_specs(training.get("models", []))
+    for points in request.sampling_work.values():
+        for point in points:
+            declared = next(
+                (
+                    spec
+                    for spec in specifications
+                    if spec.operation == point["operation"]
+                    and spec.timing_scope == point["timing_scope"]
+                    and spec.implementation in {"*", point["implementation"]}
+                ),
+                None,
+            )
+            if declared is None or set(point["features"]) != set(declared.required_features):
+                raise ValueError("sampling work must name a declared model and all its regression/coverage features")
     output = request.output_dir
 
     started = time.monotonic()
@@ -130,14 +207,17 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
     }
     try:
         manifests = list(request.profile_manifests)
+        created_profiles: set[Path] = set()
         if request.profile_suite:
             suite = load_json(request.profile_suite)
             if suite["framework"] != "sglang":
                 raise ValueError("automatic performance replay currently supports SGLang template workloads only")
 
             jobs = []
+            identities = []
             for index, experiment in enumerate(profile_experiments(suite), start=1):
                 config_id, workload = profile_labels(experiment)
+                identities.append(experiment_identity(experiment, index))
                 jobs.append(
                     profile_capture_job(
                         experiment,
@@ -148,11 +228,42 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
                         purpose="performance",
                     )
                 )
-            if len({(job.config_id, job.workload) for job in jobs}) != len(jobs):
+            if len(set(identities)) != len(identities) or len({(job.config_id, job.workload) for job in jobs}) != len(
+                jobs
+            ):
                 raise ValueError("declare one performance experiment per configuration/workload")
+            if unknown := request.sampling_work.keys() - set(identities):
+                raise ValueError(f"sampling_work names unknown experiments: {sorted(unknown)}")
+
+            measured = {}
+            if request.sampling_work and request.database.is_file() and not dry_run:
+                refresh_started = time.monotonic()
+                refreshed = train_cost_model(database, training, output / "sampling_preflight")
+                summary["sampling_preflight_wall_seconds"] = time.monotonic() - refresh_started
+                if refreshed is None:
+                    summary["status"] = "sampling_preflight_failed"
+                    return summary
+                measured = load_json(refreshed)
+
+            selected = []
+            summary["sampling_plan"] = []
+            for identity, job in zip(identities, jobs):
+                required = request.sampling_work.get(identity)
+                gaps = missing_sampling_work(measured, required) if required else []
+                reuse = required is not None and bool(measured) and not gaps
+                summary["sampling_plan"].append(
+                    {
+                        "experiment": identity,
+                        "status": "covered_by_database" if reuse else "capture_declared_work",
+                        "coverage_declared": required is not None,
+                        "missing_work": gaps,
+                    }
+                )
+                if not reuse:
+                    selected.append(job)
 
             captured = capture_profile_jobs(
-                jobs, output, request.capture_budget, dry_run=dry_run, purpose="performance"
+                selected, output, request.capture_budget, dry_run=dry_run, purpose="performance"
             )
             summary["runtime_capture"] = captured
             if captured["status"] != "profiles_captured":
@@ -160,10 +271,21 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
                 return summary
 
             manifests.extend(require_repo_path(value) for value in captured["profile_manifests"])
+            created_profiles.update(
+                require_repo_path(value).resolve() for value in captured["created_profile_manifests"]
+            )
+        elif request.sampling_work:
+            raise ValueError("sampling_work requires profile_suite")
 
         sources = tuple(discover_profile_runs(tuple(dict.fromkeys(manifests))))
         summary["profile_manifests"] = [str(repo_relative_path(source.manifest_path)) for source in sources]
-        cpu = cpu_service_plan(sources, request.cpu_service, output, forced_token_bundle=request.forced_token_bundle)
+        cpu = cpu_service_plan(
+            sources,
+            request.cpu_service,
+            output,
+            forced_token_bundle=request.forced_token_bundle,
+            include_setup_requests=request.include_setup_requests,
+        )
         summary["cpu_service"] = cpu
         corrections = prepare_cpu_services(cpu, dry_run=dry_run)
         if cpu["status"] not in {"prepared", "not_requested"}:
@@ -211,12 +333,14 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
 
         def import_inputs(kind: str, arguments: list[str]) -> bool:
             directory = output / f"{kind}_import"
+            import_started = time.monotonic()
             code = import_cost_measurements(request.database, directory, arguments)
             summary["imports"].append(
                 {
                     "kind": kind,
                     "return_code": code,
                     "report": str(repo_relative_path(directory / "import_summary.json")),
+                    "wall_seconds": time.monotonic() - import_started,
                 }
             )
             if code:
@@ -239,6 +363,7 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
                 arguments.extend(("--resource-environment", str(repo_relative_path(path))))
             if request.include_setup_requests:
                 arguments.append("--include-setup-requests")
+            arguments.extend(("--measurement-dir", str(repo_relative_path(output / "runtime_measurements"))))
             if not import_inputs("runtime", arguments):
                 return summary
 
@@ -276,19 +401,47 @@ def prepare_performance(request: PerformanceRequest, *, dry_run: bool = False) -
             )
             return summary
 
+        training_started = time.monotonic()
         model = train_cost_model(database, training, output)
+        summary["training_wall_seconds"] = time.monotonic() - training_started
         if model is None:
             summary["status"] = "training_failed"
             return summary
 
         package = load_json(model)
+        sampling_gaps = {
+            identity: gaps
+            for identity, points in request.sampling_work.items()
+            if (gaps := missing_sampling_work(package, points))
+        }
         summary.update(
-            status="measurement_incomplete" if capture_incomplete else package["status"],
+            status="measurement_incomplete" if capture_incomplete or sampling_gaps else package["status"],
             cost_model=str(repo_relative_path(model)),
             ready_operator_models=len(package["operator_models"]),
             missing_operator_models=package["missing_models"],
             missing_io=package.get("io_training", {}).get("missing", []),
+            missing_sampling_work=sampling_gaps,
         )
+        if request.retain_raw_traces:
+            summary["raw_retention"] = {"status": "retained_by_request"}
+        elif not capture_incomplete and not sampling_gaps and package["status"] in {"ready", "missing_data"}:
+            evidence_to_keep = {}
+            if sources:
+                imported = load_json(output / "runtime_import" / "import_summary.json")
+                evidence_to_keep.update(
+                    (
+                        require_repo_path(row["source_manifest"]).resolve(),
+                        ("operation_samples", require_repo_path(row["measurements"])),
+                    )
+                    for row in imported["captures"]
+                    if require_repo_path(row["source_manifest"]).resolve() in created_profiles
+                )
+            created_light = {require_repo_path(path).resolve() for path in cpu.get("created_profile_manifests", [])}
+            for path in corrections:
+                light = require_repo_path(cpu_service_metadata(path)["light_manifest"]).resolve()
+                if light in created_light:
+                    evidence_to_keep[light] = "cpu_service_cost", path
+            summary["raw_retention"] = retire_performance_traces(evidence_to_keep)
         return summary
     except BaseException as error:
         summary.update(status="failed", error=f"{type(error).__name__}: {error}")

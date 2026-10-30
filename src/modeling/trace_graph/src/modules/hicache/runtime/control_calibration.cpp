@@ -7,6 +7,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/source_dag/submission_cost.hpp"
+#include "source_dag/observation_writer.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -17,7 +18,8 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 using Json = nlohmann::json;
 
-Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t end, bool release_only) {
+Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t end, source_dag::ObservationWriter & observations, bool release_only,
+                              std::string_view operation_prefix) {
     const adapters::sglang::HiCacheSourceIndex initial(graph);
     std::vector<core::TraceEvent> points;
     std::vector<std::pair<adapters::sglang::HiCacheFactObservation, HiCacheEvictionRegion>> regions;
@@ -69,9 +71,8 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
     const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     Json result{
-        {                  "rows", Json::array() },
-        {     "eviction_controls", Json::array() },
-        { "operator_observations", Json::array() }
+        {              "rows", Json::array() },
+        { "eviction_controls", Json::array() },
     };
     for (const auto & [pid, tid, first, last] : inactive_loads) {
         const auto host = observe_host_template(source, pid, tid, first, last);
@@ -90,14 +91,16 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                  {       "cpu_service",      cpu_us },
                  { "residual_interval", residual_us }
         }) {
-            result["operator_observations"].push_back({
-                {       "position",           position },
-                {      "operation", "load.noop_return" },
-                { "implementation",      "no_host_hit" },
-                {       "features",     Json::object() },
-                {    "duration_us",           duration },
-                {   "timing_scope",              scope },
-            });
+            observations.push_back(
+                {
+                    {       "position",           position },
+                    {      "operation", "load.noop_return" },
+                    { "implementation",      "no_host_hit" },
+                    {       "features",     Json::object() },
+                    {    "duration_us",           duration },
+                    {   "timing_scope",              scope },
+            },
+                operation_prefix);
         }
     }
     if (!release_only) {
@@ -138,7 +141,7 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                                      { "page_bytes", static_cast<double>(page_bytes) },
                                      { "pages", static_cast<double>(plan.payload_bytes / page_bytes) } },
                     };
-                    source_dag::append_host_operation_observations(result["operator_observations"], work, position, primitive, true, submitted);
+                    observations.append(source_dag::host_operation_observations(work, position, primitive, true, submitted), operation_prefix);
                 }
             }
             result["rows"].push_back({
@@ -204,7 +207,7 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                                          { "release_buffer_pages", static_cast<double>(buffer) },
                                          { "need_sort", allocation->arg("need_sort") == "true" ? 1.0 : 0.0 } },
                         };
-                        source_dag::append_host_operation_observations(result["operator_observations"], work, position, primitive, true, submitted);
+                        observations.append(source_dag::host_operation_observations(work, position, primitive, true, submitted), operation_prefix);
                     }
                 }
             }
@@ -226,14 +229,16 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                      {       "cpu_service",      cpu_us },
                      { "residual_interval", residual_us }
             }) {
-                result["operator_observations"].push_back({
-                    {       "position",                                    position },
-                    {      "operation",                          "eviction.control" },
-                    { "implementation", eviction_control_name(region.control_phase) },
-                    {       "features",                              Json::object() },
-                    {    "duration_us",                                    duration },
-                    {   "timing_scope",                                       scope },
-                });
+                observations.push_back(
+                    {
+                        {       "position",                                    position },
+                        {      "operation",                          "eviction.control" },
+                        { "implementation", eviction_control_name(region.control_phase) },
+                        {       "features",                              Json::object() },
+                        {    "duration_us",                                    duration },
+                        {   "timing_scope",                                       scope },
+                },
+                    operation_prefix);
             }
         }
         if (region.preceding_kind)

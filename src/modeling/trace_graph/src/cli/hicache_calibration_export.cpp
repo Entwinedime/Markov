@@ -1,3 +1,4 @@
+#include "source_dag/observation_writer.hpp"
 // Offline extraction from an explicitly selected independent calibration only.
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -33,14 +34,19 @@ namespace hc = modules::hicache;
 namespace {
 
 
-int export_operation(core::DagGraph graph, const std::string & manifest, uint64_t begin_us, uint64_t end_us, const std::string & output_path,
+int export_operation(core::DagGraph & graph, const std::string & manifest, uint64_t begin_us, uint64_t end_us, const std::string & output_path,
                      const std::string & operation, const std::string & cpu_service) {
     const bool corrected = cpu_service != "-";
+    const auto observation_path = output_path + ".observations.jsonl";
+    source_dag::ObservationWriter observations(observation_path);
     const auto publish = [&](nlohmann::json document) {
+        observations.finish();
         document.update({
-            {  "source_manifest",                                      manifest },
-            { "cpu_service_file",                  corrected ? cpu_service : "" },
-            {       "cost_basis", corrected ? "paired_cpu_service" : "profiled" }
+            { "operator_observations_file",                              observation_path },
+            { "operator_observation_count",                           observations.size() },
+            {            "source_manifest",                                      manifest },
+            {           "cpu_service_file",                  corrected ? cpu_service : "" },
+            {                 "cost_basis", corrected ? "paired_cpu_service" : "profiled" }
         });
         if (!document.contains("limitations"))
             document["limitations"] = "Only attributable measured scopes are exported; absent scopes remain missing. CPU correction uses this capture's paired "
@@ -53,22 +59,21 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
     const adapters::sglang::HiCacheSourceIndex source(graph);
     if (operation == "prefetch-query") {
         const auto rounds = hc::observe_cpu_collectives(source);
-        auto rows = source_dag::prefetch_query_observations(graph, rounds, hc::observe_prefetch_workers(source, rounds), begin_us, end_us);
-        if (rows.empty()) throw std::runtime_error("Independent window has no complete query observations");
+        source_dag::prefetch_query_observations(graph, rounds, hc::observe_prefetch_workers(source, rounds), begin_us, end_us, observations);
+        if (observations.size() == 0) throw std::runtime_error("Independent window has no complete query observations");
         publish({
-            {                  "role","fixed_calibration"                                      },
-            {             "operation",    "prefetch_query" },
-            { "operator_observations",     std::move(rows) },
-            {           "limitations",
+            {        "role","fixed_calibration"                            },
+            {   "operation",    "prefetch_query" },
+            { "limitations",
              "All complete independent query groups; CPU correction only on measured spans. Scheduling and communication residuals retain source conditions; "
-             "not pure CPU service."                      }
+             "not pure CPU service."            }
         });
         return 0;
     }
     if (operation == "write-host" || operation == "release-host") {
         if (!corrected) throw std::runtime_error("Shared write/release costs require paired CPU correction");
         const bool release_only = operation == "release-host";
-        auto document = hc::runtime::export_write_calibration(graph, begin_us, end_us, release_only);
+        auto document = hc::runtime::export_write_calibration(graph, begin_us, end_us, observations, release_only);
         if (document["rows"].empty())
             throw std::runtime_error(release_only ? "Independent capture has no complete ordinary release"
                                                   : "Independent capture has no complete write operation");
@@ -76,8 +81,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         // that graph, not the source snapshot taken before the split.
         const adapters::sglang::HiCacheSourceIndex calibrated(graph);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-        for (const auto & observation : source_dag::confirmation_operator_observations(calibrated, queues, corrected))
-            document["operator_observations"].push_back(observation);
+        source_dag::confirmation_operator_observations(calibrated, queues, corrected, observations);
         document.update({
             {        "role",                                                "fixed_calibration"                     },
             { "limitations",
@@ -96,7 +100,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         const auto rounds = hc::observe_cpu_collectives(source);
         const auto workers = hc::observe_prefetch_workers(source, rounds);
         const auto grouped = hc::observe_prefetch_requests(source, rounds, policy);
-        auto operator_rows = nlohmann::json::array();
+        auto & operator_rows = observations;
         std::set<size_t> check_rounds;
         if (corrected)
             for (const auto & [request, ranks] : grouped)
@@ -239,12 +243,11 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                 }
             }
         }
-        if (operator_rows.empty()) throw std::runtime_error("Independent capture has no complete prefetch measurements");
+        if (operator_rows.size() == 0) throw std::runtime_error("Independent capture has no complete prefetch measurements");
         publish({
             {                            "role",                                                                                                           "fixed_calibration" },
             {                       "operation",                                                                                                               "prefetch_wait" },
             {                   "source_policy",                                                                                                                        policy },
-            {           "operator_observations",                                                                                                      std::move(operator_rows) },
             {             "scheduler_intervals",                                                                                                           scheduler_intervals },
             { "unavailable_scheduler_intervals",                                                                                                         unavailable_intervals },
             {                       "estimator", "All attributable progress calls and scheduler retry intervals; training balances captures. Target state determines retries." },
@@ -254,10 +257,10 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
     }
     if (operation == "audit-layer-wait") {
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+        source_dag::layer_wait_operator_observations(source, queues, corrected, observations);
         publish({
-            { "role", "fixed_calibration" },
-            { "operation", "layer_wait" },
-            { "operator_observations", source_dag::layer_wait_operator_observations(source, queues, corrected) }
+            {      "role", "fixed_calibration" },
+            { "operation",        "layer_wait" },
         });
         return 0;
     }
@@ -279,7 +282,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         const auto waits = hc::observe_hicache_layer_waits(bounded);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         auto rows = nlohmann::json::array();
-        auto operator_rows = nlohmann::json::array();
+        auto & operator_rows = observations;
         for (const auto & record : ledger.records) {
             if (record.kind != hc::patch::HiCacheIoOperationKind::Load) continue;
             if (record.device_transfer_node_ids.empty()) {
@@ -350,13 +353,12 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                         .implementation = "kernel_ascend.page_first_direct.load",
                         .features = features.get<std::map<std::string, double>>(),
                     };
-                    source_dag::append_host_operation_observations(operator_rows,
-                                                                   work,
-                                                                   "load_submission:" + record.pid + ":" + record.tid + ":"
-                                                                       + std::to_string(record.source_start_us) + ":" + name,
-                                                                   cost,
-                                                                   corrected,
-                                                                   submitted);
+                    operator_rows.append(source_dag::host_operation_observations(work,
+                                                                                 "load_submission:" + record.pid + ":" + record.tid + ":"
+                                                                                     + std::to_string(record.source_start_us) + ":" + name,
+                                                                                 cost,
+                                                                                 corrected,
+                                                                                 submitted));
                 }
                 row.update({
                     { "status",         "observed" },
@@ -373,9 +375,8 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             rows.push_back(std::move(row));
         }
         publish({
-            {                  "role", "independent_load_submission_audit" },
-            {                  "rows",                     std::move(rows) },
-            { "operator_observations",            std::move(operator_rows) }
+            { "role", "independent_load_submission_audit" },
+            { "rows",                     std::move(rows) },
         });
         return 0;
     }
@@ -408,7 +409,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         const adapters::sglang::HiCacheSourceIndex bounded(graph);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         nlohmann::json rows = nlohmann::json::array();
-        auto operator_rows = nlohmann::json::array();
+        auto & operator_rows = observations;
         for (const auto & fact : bounded.fact_nodes()) {
             if (fact.fact_role != "loadback_decision_observed" || fact.phase != "end" || !fact.effective_token_count) continue;
             nlohmann::json row{
@@ -466,15 +467,12 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             }
             rows.push_back(std::move(row));
         }
-        auto operator_observations = source_dag::load_admission_operator_observations(graph, corrected);
-        for (const auto & observation : source_dag::prefix_concat_operator_observations(bounded, queues, corrected))
-            operator_observations.push_back(observation);
-        for (const auto & observation : operator_rows) operator_observations.push_back(observation);
+        source_dag::load_admission_operator_observations(graph, corrected, observations);
+        source_dag::prefix_concat_operator_observations(bounded, queues, corrected, observations);
 
         publish({
-            {                  "role",         "independent_cost_audit" },
-            {                  "rows",                  std::move(rows) },
-            { "operator_observations", std::move(operator_observations) }
+            { "role", "independent_cost_audit" },
+            { "rows",          std::move(rows) },
         });
         return 0;
     }
@@ -505,17 +503,16 @@ int main(int argc, char ** argv) try {
         graph.cpu_service_cost() = io::read_cpu_service_cost(service, argv[1]);
     }
 
-    // Operation extraction may split CPU gaps. Each operation owns its copy;
-    // the final one can consume the graph without another full allocation.
-    for (size_t index = 0; index < exports.size(); ++index) {
-        const auto & [output, operation] = exports[index];
-        const auto status = export_operation(index + 1 == exports.size() ? std::move(graph) : graph,
-                                             argv[1],
-                                             *options.window_start_us,
-                                             *options.window_end_us,
-                                             output,
-                                             operation,
-                                             argv[6]);
+    graph.share_source_events();
+    (void)graph.adjacency();
+    (void)graph.cpu_intervals();
+    for (const auto & [output, operation] : exports) {
+        // Only these exporters split observed CPU intervals. Read-only exports
+        // share the source; each modifying export owns its working graph.
+        const bool modifies = operation == "write-host" || operation == "release-host" || operation == "audit-load-submission" || operation == "audit-load";
+        std::optional<core::DagGraph> working;
+        if (modifies) working.emplace(graph);
+        const auto status = export_operation(working ? *working : graph, argv[1], *options.window_start_us, *options.window_end_us, output, operation, argv[6]);
         if (status != 0) return status;
     }
     return 0;
