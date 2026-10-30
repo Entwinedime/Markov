@@ -47,10 +47,15 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     cost::Queries costs(input.costs.models, &source);
     auto cells = Json::array();
     for (const auto & target : input.targets) {
+        const Json capacity{
+            { "device", target.cache.device_pages },
+            {   "host",   target.cache.host_pages }
+        };
         if (target.infeasible) {
             cells.push_back({
                 {                  "name",           target.name },
                 {         "configuration",  target.configuration },
+                {  "cache_capacity_pages",              capacity },
                 {                "status", "resource_infeasible" },
                 {                 "issue",    *target.infeasible },
                 {             "cost_gaps",         Json::array() },
@@ -108,6 +113,17 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                 requests.back()["start_node"] = result.graph->operation_nodes[*request.start].value();
                 requests.back()["response_node"] = result.graph->operation_nodes[*request.response].value();
             }
+            if (const auto * storage = program.storage()) {
+                const auto & prefetch = storage->results()[id];
+                requests.back()["prefetch"] = {
+                    { "requested_pages", prefetch.requested_pages },
+                    {   "queried_pages",   prefetch.queried_pages },
+                    { "published_pages", prefetch.published_pages },
+                    {  "accepted_pages",  prefetch.accepted_pages },
+                    {     "worker_done",     prefetch.worker_done },
+                    {   "stopped_early",   prefetch.stopped_early }
+                };
+            }
         }
         auto gaps = Json::array();
         for (const auto & gap : result.cost_gaps) {
@@ -130,6 +146,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         cells.push_back({
             {                  "name",                                                  target.name                                      },
             {         "configuration",                                                                               target.configuration },
+            {  "cache_capacity_pages",                                                                                           capacity },
             {                "status",
              complete          ? "predicted"
              : program.issue() ? "structure_unavailable"
@@ -150,6 +167,24 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {        "simulation_sec",                                        std::chrono::duration<double>(Clock::now() - begin).count() }
         });
         if (result.graph) cells.back()["execution_graph"] = generated_graph_report(result);
+        if (const auto * storage = program.storage()) {
+            const auto & stats = storage->stats();
+            cells.back()["host_evicted_pages"] = program.host_evicted_pages();
+            cells.back()["storage"] = {
+                {         "queries",stats.queries                                    },
+                {      "prefetches",      stats.prefetches },
+                {      "read_pages",      stats.read_pages },
+                {    "copied_pages",    stats.copied_pages },
+                { "rejected_copies", stats.rejected_copies },
+                {  "write_enqueues",          stats.writes },
+                {       "new_pages",       stats.new_pages },
+                {  "existing_pages",  stats.existing_pages },
+                {            "idle",       storage->idle() },
+                {   "qualification",
+                 "Buffered file worker costs; query/admission remain logical. Best effort stops at admission; timeout is the earliest deadline, not measured "
+                 "scheduler polling."                     }
+            };
+        }
     }
     rusage usage{};
     const auto usage_status = getrusage(RUSAGE_SELF, &usage);

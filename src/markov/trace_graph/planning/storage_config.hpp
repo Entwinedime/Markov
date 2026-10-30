@@ -21,7 +21,7 @@ struct StorageConfig {
 struct StorageBackend {
     std::size_t batch_pages;
     WorkKind allocate, read_page, copy_publish, read_return;
-    WorkKind gather_check, new_prepare, new_page;
+    WorkKind gather, batch_prepare, new_page, existing_page;
 };
 
 struct PrefetchResult {
@@ -32,7 +32,7 @@ struct PrefetchResult {
 
 struct StorageStats {
     std::size_t queries = 0, prefetches = 0, read_pages = 0, copied_pages = 0, rejected_copies = 0;
-    std::size_t writes = 0, new_pages = 0, existing_pages = 0, disk_evictions = 0, host_evictions = 0;
+    std::size_t writes = 0, new_pages = 0, existing_pages = 0, disk_evictions = 0, host_evicted_pages = 0;
     std::size_t peak_reserved_pages = 0, peak_stored_pages = 0;
 };
 

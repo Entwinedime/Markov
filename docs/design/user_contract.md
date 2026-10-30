@@ -21,18 +21,33 @@ empty/prepared 是声明的初始条件，不是自动检测结果。输入准�
 文本 prompt 需与采集原文相同，由 manifest 声明的配置取得实际 token，再核对源语义；预测不加载 tokenizer。
 采集配置没有保留实际编码时不能猜 token，已有 input_ids 仍直接核对源前缀。目标配置覆盖 base 对应字段，name 仅用于结果标识。
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
-hicache_write_policy、hicache_io_backend、hicache_mem_layout；其余执行设置保持来源条件。
+hicache_write_policy、hicache_io_backend、hicache_mem_layout，以及下述文件存储设置；其余执行设置保持来源条件。
 目前传输组合限 kernel_ascend/page_first_direct，batch=1；新增页几何、回载或其他成本域不满足时明确停止，不从相似目标借值。
 设备容量还受 SGLang 的准入预留约束：页对齐后的输入加所需输出之外，再留一页，并满足严格小于池的条件。
 否则框架可能缩减输出，甚至无法入场；HTTP 成功也不代表完成了原工作量，采集另核对真实结束原因和固定输出数量。
 不满足时目标返回 resource_infeasible、HTTP 为 null，不生成假想的成功结果。显式采集的已知不可能请求在启动模型前拒绝。
 当前区域预测不支持关闭 radix cache 的另一套调度分支。
 
+主机池按原生规则计算：先把设备 token 池向下对齐页大小，再以浮点 ratio 相乘并截断 token，
+最后取整页数加一；主机池必须大于设备池。当前只支持 hicache_ratio，不支持正的显式 hicache_size。
+主机分配不足时按整次申请量淘汰可回收的 LRU 段，不只释放容量差额；被保护或在途的页不能回收。
+
+文件存储通过 hicache_storage_backend="file" 开启，初始为空且不设文件容量上限。
+hicache_storage_prefetch_policy 可选 wait_complete、best_effort、timeout。
+hicache_storage_backend_extra_config 仅接收内联 JSON 字符串，允许原生 prefetch_threshold、
+prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max 四项；不读外部 @file，其他设置明确拒绝。
+文件 worker 按独立正常采样估计；查询与准入仍为逻辑端口，best_effort 在即时准入时停止，timeout 只表示最早 deadline，
+尚未包含原生调度器轮询延迟。这两个策略的运行结果不能当作正常精度或搜索排名依据。
+
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
+cache_capacity_pages 按参与进程报告 device/host 页容量；文件目标另报 host_evicted_pages，是实际回收页数而非淘汰次数。
+逐请求 prefetch 区分申请、查询命中、发布和最终接受页数，storage 汇总实际读写工作，不能只用接受页数代表 I/O 量。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
-自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份与整批回载，不含存储采样。
+自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载与 buffered 文件 worker。
+文件配方不加载模型权重，不运行 HTTP 请求；在采集输出下临时构造真实 K/V 页，读写核对后删除页文件，只保留轻量计时。
+这是暖文件缓存下的 buffered 响应，不保证冷介质、fsync 或争用时的性能。
 同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
 preparation 中单列 base/performance 时间、sampling_rounds 和累计状态路径；这些不计入预测的 HTTP。
 
@@ -256,11 +271,12 @@ kv_published_ns 与 modeled_work_completed_ns 分别列出最终 KV 可读及该
 
 cache 内可增加 storage 对象，声明 backend 为 file、initial_state 为 empty，以及 prefetch_stop_policy。
 capacity_pages 可为正整数或 null，分别表示每参与进程的文件页容量或不设该上限；预测不读取真实文件目录。
+这里是组件诊断的逻辑 LRU 上限，不等同于原生文件后端的容量/水位淘汰规则；完整预测暂只允许无上限的文件存储。
 prefetch_stop_policy 支持 wait_complete、best_effort、timeout；prefetch_threshold_tokens 可省略，使用当前原生默认值。
 prefetch_timeout 可声明 base_sec、per_ki_token_sec、max_sec，按原生线性预算计算，从操作入队开始计时。
 报告分别列出查询、工作进度、控制端接受、新增主机页、被拒绝发布的复制和最终 worker 状态，不能把它们都叫作命中。
 当前只覆盖对称参与进程下的 I/O 与已有计算子集。查询及准入 CPU 尚未绑定，因此 best_effort 按即时准入停止，
-timeout 也基于这组部分成本；阶段耗时拆分含近似，不能拿这些运行结果当作完整 HTTP 精度。
+timeout 也基于最早 deadline，未还原调度轮询；不能拿这些运行结果当作完整 HTTP 精度。
 
 缓存组件报告另列 query_index_copies 和 query_operations，分别表示目标查询产生的索引复制描述数和成功提交的原生操作数。
 它们不包含查询外围的全部 Python/CPU 工作，也不代表 KV 内容传输或完整请求覆盖。旧来源缺少匹配段数时，合法目标工作仍会生成，但不能授权对应源成本迁移；查询缺口与之后的插入缺口分别按实际遇到的位置报告。

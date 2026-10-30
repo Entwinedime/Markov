@@ -1,9 +1,7 @@
 #include "markov/adapters/prediction.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <fstream>
-#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -38,8 +36,17 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     const auto & base = captured.at("server").at("arguments");
     if (base.value("disable_radix_cache", false))
         throw std::runtime_error("Regional prediction requires an active radix cache; cache-disabled scheduling is not restored");
-    const std::set<std::string> variable{ "page_size",     "max_total_tokens",     "max_prefill_tokens", "enable_hierarchical_cache",
-                                          "hicache_ratio", "hicache_write_policy", "hicache_io_backend", "hicache_mem_layout" };
+    const std::set<std::string> variable{ "page_size",
+                                          "max_total_tokens",
+                                          "max_prefill_tokens",
+                                          "enable_hierarchical_cache",
+                                          "hicache_ratio",
+                                          "hicache_write_policy",
+                                          "hicache_io_backend",
+                                          "hicache_mem_layout",
+                                          "hicache_storage_backend",
+                                          "hicache_storage_prefetch_policy",
+                                          "hicache_storage_backend_extra_config" };
     std::vector<PredictionTarget> targets;
     for (const auto & target : raw.at("targets")) {
         auto configuration = base;
@@ -53,13 +60,14 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
         const auto prefill = positive(configuration, "max_prefill_tokens");
         if (tokens < page || configuration.at("hicache_io_backend") != "kernel_ascend" || configuration.at("hicache_mem_layout") != "page_first_direct")
             throw std::runtime_error("Regional cache prediction needs positive capacity and kernel_ascend/page_first_direct");
+        if (configuration.value("hicache_size", 0.0) > 0)
+            throw std::runtime_error("Regional prediction currently requires ratio-sized host memory; explicit hicache_size is not restored");
         const auto ratio = configuration.at("hicache_ratio").get<double>();
-        const auto host_pages = static_cast<long double>(tokens / page) * ratio;
-        if (!std::isfinite(ratio) || ratio <= 0 || host_pages < 1 || host_pages >= std::numeric_limits<std::size_t>::max())
-            throw std::runtime_error("HiCache ratio must describe a finite positive host capacity");
+        const auto host_pages =
+            configuration.at("enable_hierarchical_cache").get<bool>() ? sglang::host_capacity_pages((tokens / page) * page, page, ratio) : 1;
         Json settings{
             { "device_pages",                            tokens / page },
-            {   "host_pages",     static_cast<std::size_t>(host_pages) },
+            {   "host_pages",                               host_pages },
             { "write_policy", configuration.at("hicache_write_policy") },
             {   "io_backend",   configuration.at("hicache_io_backend") },
             {  "host_layout",   configuration.at("hicache_mem_layout") }
@@ -69,6 +77,7 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
             cache.host_pages = 0;
             cache.backup_after_hits.reset();
         }
+        cache.storage = sglang::configured_storage(configuration, cache.device_pages, cache.host_pages);
         const auto result_implementation =
             configuration.at("enable_hierarchical_cache").get<bool>() ? "sglang.ascend.eager:HiRadixCache" : "sglang.ascend.eager:RadixCache";
         targets.push_back({ target.at("name").get<std::string>(), std::move(configuration), page, prefill, result_implementation, std::move(cache) });

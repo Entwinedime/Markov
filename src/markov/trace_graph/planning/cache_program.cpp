@@ -50,7 +50,7 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
 }
 
 bool CacheProgram::make_host_room(std::size_t pages) {
-    host_evictions_ += cache_.reclaim_host(pages);
+    if (cache_.available_pages(Tier::Host) < pages) host_evicted_pages_ += cache_.evict_host_pages(pages);
     return cache_.available_pages(Tier::Host) >= pages;
 }
 

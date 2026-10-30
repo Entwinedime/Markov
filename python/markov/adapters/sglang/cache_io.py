@@ -3,6 +3,7 @@
 import argparse
 import gc
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -186,10 +187,10 @@ def main() -> None:
     if (
         not isinstance(operations, list)
         or not operations
-        or set(operations) - {"backup", "load"}
+        or set(operations) - {"backup", "load", "file"}
         or len(set(operations)) != len(operations)
     ):
-        raise ValueError("operations must select backup, load, or both")
+        raise ValueError("operations must select backup, load, or file")
     cases = recipe["cases"]
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases must be a nonempty array")
@@ -202,6 +203,7 @@ def main() -> None:
             raise ValueError("Each load segment must contain at least one page")
 
     args.output.mkdir(parents=True, exist_ok=False)
+    os.environ["SGLANG_STEP_TIMING_DIR"] = ""
     sampler = CacheIOSampler(device, geometry)
     with (args.output / "measurements.jsonl").open("x", encoding="utf-8", buffering=1) as stream:
         for page_tokens in sorted({case["page_tokens"] for case in cases}):
@@ -210,11 +212,14 @@ def main() -> None:
             for case in selected:
                 for operation in operations:
                     for ordinal in range(warmup + repeats):
-                        measurement = (
-                            sampler.measure_backup(controller, case["pages"])
-                            if operation == "backup"
-                            else sampler.measure_load(controller, case["pages"], case.get("segments", 1))
-                        )
+                        if operation == "backup":
+                            measurement = sampler.measure_backup(controller, case["pages"])
+                        elif operation == "load":
+                            measurement = sampler.measure_load(controller, case["pages"], case.get("segments", 1))
+                        else:
+                            from markov.adapters.sglang.file_io import FileIOSampler
+
+                            measurement = FileIOSampler(sampler, controller, args.output).measure(case["pages"])
                         stream.write(
                             json.dumps(
                                 {
@@ -240,8 +245,8 @@ def main() -> None:
                 "dtype": "bfloat16",
                 "backend": "kernel_ascend",
                 "host_layout": "page_first_direct",
-                "scope": "Independent initialized idle single-device controller I/O; no weights, trace, probe or target",
-                "completion_boundary": "Write or start-loading entry to finish-event synchronize return; includes the observing API",
+                "scope": "Independent initialized idle controller/host/file I/O; no weights, profiler, snapshot or target",
+                "completion_boundary": "Device responses include finish-event observation. File responses cover native buffer allocation/read/publication and materialize/batch_set intervals.",
                 "limitations": "No competing I/O or CPU load; initialization and verification outside timing; idle sync is retained without subtraction",
             },
             indent=2,

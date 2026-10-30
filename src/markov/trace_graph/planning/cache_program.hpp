@@ -71,7 +71,7 @@ public:
     std::size_t backups() const { return backups_; }
     std::size_t loads() const { return loads_; }
     std::size_t device_evictions() const { return device_evictions_; }
-    std::size_t host_evictions() const { return host_evictions_ + (storage_ ? storage_->stats().host_evictions : 0); }
+    std::size_t host_evicted_pages() const { return host_evicted_pages_ + (storage_ ? storage_->stats().host_evicted_pages : 0); }
     std::size_t peak_device_pages() const { return cache_.peak_pages(Tier::Device); }
     std::size_t peak_host_pages() const { return cache_.peak_pages(Tier::Host); }
 
@@ -190,7 +190,7 @@ private:
     std::optional<std::string> issue_;
     std::optional<graph::NodeId> cause_;
     std::size_t request_ = 0;
-    std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evictions_ = 0;
+    std::size_t backups_ = 0, loads_ = 0, device_evictions_ = 0, host_evicted_pages_ = 0;
     std::size_t pending_queries_ = 0;
     RequestStage request_stage_ = RequestStage::BeforeStart;
     bool waiting_ = false;

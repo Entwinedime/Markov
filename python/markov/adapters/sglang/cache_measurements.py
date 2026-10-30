@@ -26,7 +26,44 @@ RESPONSES = {
             "completion_observation_upper_interval",
         ),
     },
+    "file": {
+        "file_allocate_ns": ("cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service"),
+        "file_read_page_ns": ("cache.prefetch.read_page", "file.generic_page_get", "storage_worker_service"),
+        "file_copy_publish_ns": ("cache.prefetch.page_publish", "file.generic_page_get", "storage_worker_service"),
+        "file_return_ns": ("cache.prefetch.return", "file.generic_page_get", "storage_worker_service"),
+        "file_new_gather_ns": (
+            "cache.storage_write.gather",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+        "file_existing_gather_ns": (
+            "cache.storage_write.gather",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+        "file_new_batch_prepare_ns": (
+            "cache.storage_write.batch_prepare",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+        "file_existing_batch_prepare_ns": (
+            "cache.storage_write.batch_prepare",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+        "file_new_page_ns": (
+            "cache.storage_write.new_page",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+        "file_existing_page_ns": (
+            "cache.storage_write.existing_page",
+            "file.materialize_then_batch_set",
+            "storage_worker_service",
+        ),
+    },
 }
+FILE_PER_PAGE = {"file_read_page_ns", "file_copy_publish_ns", "file_new_page_ns", "file_existing_page_ns"}
 
 
 def recipes(captured: dict) -> dict:
@@ -37,7 +74,20 @@ def recipes(captured: dict) -> dict:
     limits.append(captured["limitations"])
     result = {}
     for direction in captured["recipe"].get("operations", ["backup"]):
-        for kind in RESPONSES[direction].values():
+        for quantity, kind in RESPONSES[direction].items():
+            if direction == "file":
+                result[kind] = {
+                    "feature": None if quantity in FILE_PER_PAGE else "pages",
+                    "curve": "page_bytes",
+                    "nonnegative": True,
+                    "extrapolation_features": ["pages"],
+                    "limitations": limits
+                    + [
+                        "Native buffered file responses on warm filesystem cache; no fsync or cold-media guarantee.",
+                        "Allocation includes read-batch iteration overhead; batch-prepare includes write-loop/return overhead. Recording overhead remains included.",
+                    ],
+                }
+                continue
             if kind[0] == "cache.index_clone":
                 result[kind] = {
                     "feature": "elements",
@@ -129,6 +179,17 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
                 "bytes_per_token": bytes_per_token,
             }
             for quantity, kind in RESPONSES[direction].items():
+                if direction == "file":
+                    per_page = quantity in FILE_PER_PAGE
+                    durations = row[quantity] if per_page else [row[quantity]]
+                    if len(durations) != (pages if per_page else 1):
+                        raise ValueError(f"File response has the wrong page count: {path}, line {position}")
+                    for index, duration in enumerate(durations):
+                        if type(duration) is not int or duration < 0:
+                            raise ValueError(f"Invalid ns response: {path}, line {position}, {quantity}")
+                        features = {"pages": 1 if per_page else pages, "page_bytes": tokens * bytes_per_token}
+                        yield Measurement(position, f"{quantity}:{index}", *kind, features, duration, row["warmup"])
+                    continue
                 duration = row[quantity]
                 if type(duration) is not int or duration < 0:
                     raise ValueError(f"Invalid ns response: {path}, line {position}, {quantity}")

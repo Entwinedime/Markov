@@ -8,7 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前可通过正式入口完成限定范围的 SGLang/Ascend 预测，已运行 self 和两种写策略 cross。
+当前可通过正式入口完成限定范围的 SGLang/Ascend 预测，已运行 self、受压主机回载和文件存储回访。
 这证明调用链已接通，精度仍未达标；其他框架、矩阵实验和搜索尚在恢复。
 
 ## 怎样运行
@@ -39,7 +39,8 @@ execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/
 
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
 流程先使用现有模型，按整组缺少的工作生成小型独立采样，维护模型后继续预测；不会采集 target trace 或按误差补参数。
-当前自动采样覆盖 SGLang/Ascend 串行区域响应、批量备份和整批回载，存储等缺口仍明确停止。
+当前自动采样覆盖 SGLang/Ascend 串行区域响应、批量备份、整批回载和 buffered 文件读写 worker。
+文件预取的请求端查询、准入与轮询时序仍有近似，不能据此比较 best_effort 与 timeout 的真实优劣。
 采样与 base 分别累计预算；中断后重跑同一命令会接管原容器、保留用量，完成任务直接复用。
 
 平台维护者也可显式维护独立数据：

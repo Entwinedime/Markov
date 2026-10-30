@@ -55,7 +55,7 @@ bool Storage::prepare(ProgramRuntime & runtime, std::size_t request, std::span<c
         return true;
     }
     cache_.pin_host(matched.host);
-    stats_.host_evictions += cache_.reclaim_host(requested);
+    if (cache_.available_pages(Tier::Host) < requested) stats_.host_evicted_pages += cache_.evict_host_pages(requested);
     const auto count = std::min(requested, cache_.available_pages(Tier::Host));
     if (count * page_tokens_ < config_.threshold_tokens) {
         cache_.unpin_host(matched.host);
@@ -100,6 +100,7 @@ bool Storage::prepare(ProgramRuntime & runtime, std::size_t request, std::span<c
     ++stats_.prefetches;
     if (read_queue_.size() == 1) start_read(runtime, request, cause);
 
+    // shortcut: Issue and admission share this port; separate them when modeling scheduler polling.
     if (config_.policy == PrefetchPolicy::BestEffort) stop(runtime, request, cause);
     else if (config_.policy == PrefetchPolicy::Timeout) {
         const auto budget = std::min<long double>(
@@ -232,7 +233,7 @@ bool Storage::finish_read(ProgramRuntime & runtime, std::size_t request, graph::
 
 void Storage::enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause) {
     cache_.pin_host(source);
-    write_queue_.push_back({ source, std::move(pages), 0, 0, false, cause });
+    write_queue_.push_back({ source, std::move(pages), 0, 0, cause });
     ++stats_.writes;
     if (write_queue_.size() == 1) start_write(runtime, cause);
 }
@@ -240,9 +241,8 @@ void Storage::enqueue_write(ProgramRuntime & runtime, RadixId source, std::vecto
 void Storage::start_write(ProgramRuntime & runtime, std::optional<graph::NodeId> cause) {
     auto & operation = write_queue_.front();
     operation.batch_end = std::min(operation.index + backend_.batch_pages, operation.pages.size());
-    operation.prepared = false;
     service(runtime,
-            backend_.gather_check,
+            backend_.gather,
             operation.batch_end - operation.index,
             true,
             action(ActionKind::Gathered, 0),
@@ -259,21 +259,13 @@ void Storage::reserve_file() {
 
 bool Storage::write_page(ProgramRuntime & runtime, graph::NodeId cause) {
     auto & operation = write_queue_.front();
-    while (operation.index < operation.batch_end) {
+    if (operation.index < operation.batch_end) {
         const auto key = operation.pages[operation.index];
-        if (files_.contains(key)) {
-            touch(key);
-            ++stats_.existing_pages;
-            ++operation.index;
-            continue;
+        if (files_.contains(key)) { service(runtime, backend_.existing_page, 1, true, action(ActionKind::PageTouched, 0), cause); }
+        else {
+            reserve_file();
+            service(runtime, backend_.new_page, 1, true, action(ActionKind::PageWritten, 0), cause);
         }
-        if (!operation.prepared) {
-            operation.prepared = true;
-            service(runtime, backend_.new_prepare, operation.batch_end - operation.index, true, action(ActionKind::Prepared, 0), cause);
-            return false;
-        }
-        reserve_file();
-        service(runtime, backend_.new_page, 1, true, action(ActionKind::PageWritten, 0), cause);
         return false;
     }
     if (operation.index != operation.pages.size()) {
@@ -329,6 +321,13 @@ bool Storage::on_event(ProgramRuntime & runtime, const simulation::Event & event
         stop(runtime, request, std::nullopt);
         break;
     case ActionKind::Gathered:
+        service(runtime,
+                backend_.batch_prepare,
+                write_queue_.front().batch_end - write_queue_.front().index,
+                true,
+                action(ActionKind::Prepared, 0),
+                event.identity);
+        break;
     case ActionKind::Prepared:
         return write_page(runtime, event.identity);
     case ActionKind::PageWritten: {
@@ -336,6 +335,12 @@ bool Storage::on_event(ProgramRuntime & runtime, const simulation::Event & event
         files_[operation.pages[operation.index++]] = ++access_;
         ++stats_.new_pages;
         stats_.peak_stored_pages = std::max(stats_.peak_stored_pages, files_.size());
+        return write_page(runtime, event.identity);
+    }
+    case ActionKind::PageTouched: {
+        auto & operation = write_queue_.front();
+        touch(operation.pages[operation.index++]);
+        ++stats_.existing_pages;
         return write_page(runtime, event.identity);
     }
     }

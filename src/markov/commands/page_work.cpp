@@ -266,7 +266,7 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         {         "backup_submissions",                                                                                                 program.backups() },
         {           "load_submissions",                                                                                                   program.loads() },
         {           "device_evictions",                                                                                        program.device_evictions() },
-        {             "host_evictions",                                                                                          program.host_evictions() },
+        {         "host_evicted_pages",                                                                                      program.host_evicted_pages() },
         {                   "requests",                                                                                               std::move(requests) },
         {             "executed_nodes",                                                                                         result.execution.executed },
         {           "subset_finish_ns", result.execution.completions_ns.empty() ? Json(nullptr) : Json(std::ranges::max(result.execution.completions_ns)) },
@@ -358,8 +358,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             {                 "idle",                                                      storage->idle() },
             {        "qualification",
              "Native service order with inferred stage costs. Queries and admission are logical only; best effort therefore stops at immediate admission. "
-             "Timeouts use this partial cost set, not complete runtime latency. Existing-key materialization is used to infer the write split; phase "
-             "durations are not separately measured."                                                     }
+             "Timeouts use this partial cost set, not complete runtime latency. Write materialization and batch bookkeeping are charged for all pages; "
+             "existing/new native set branches have separate responses."                                  }
         };
     }
     return report;

@@ -17,6 +17,17 @@
 
 namespace markov::adapters::sglang {
 
+std::size_t host_capacity_pages(std::size_t device_tokens, std::size_t page_tokens, double ratio) {
+    const double tokens = static_cast<double>(device_tokens) * ratio;
+    if (!std::isfinite(ratio) || ratio <= 0 || !std::isfinite(tokens)
+        || tokens >= static_cast<long double>(std::numeric_limits<std::size_t>::max() - page_tokens))
+        throw std::runtime_error("HiCache ratio exceeds the supported host-token range");
+
+    const auto pages = static_cast<std::size_t>(tokens) / page_tokens + 1;
+    if (pages <= device_tokens / page_tokens) throw std::runtime_error("SGLang requires a larger host pool than device pool");
+    return pages;
+}
+
 std::size_t minimum_device_tokens(std::size_t prompt_tokens, std::size_t output_tokens, std::size_t page_tokens) {
     const auto paged = ((prompt_tokens + page_tokens - 1) / page_tokens) * page_tokens;
     const auto limit = std::numeric_limits<std::size_t>::max();
@@ -70,6 +81,37 @@ trace_graph::planning::StorageConfig read_storage(const nlohmann::json & raw, st
 }
 
 } // namespace
+
+std::optional<trace_graph::planning::StorageConfig> configured_storage(const nlohmann::json & configuration, std::size_t device_pages, std::size_t host_pages) {
+    using Json = nlohmann::json;
+    if (!configuration.contains("hicache_storage_backend") || configuration.at("hicache_storage_backend").is_null()) return std::nullopt;
+    if (configuration.at("hicache_storage_backend") != "file" || !configuration.at("enable_hierarchical_cache").get<bool>())
+        throw std::runtime_error("Storage prediction requires file storage with HiCache enabled");
+
+    Json extra = Json::object();
+    if (configuration.contains("hicache_storage_backend_extra_config") && !configuration.at("hicache_storage_backend_extra_config").is_null()) {
+        const auto value = configuration.at("hicache_storage_backend_extra_config").get<std::string>();
+        if (value.starts_with("@")) throw std::runtime_error("Storage prediction requires inline extra configuration, not an external target file");
+        extra = Json::parse(value);
+    }
+    const std::set<std::string> fields{ "prefetch_threshold", "prefetch_timeout_base", "prefetch_timeout_per_ki_token", "prefetch_timeout_max" };
+    for (const auto & [key, value] : extra.items()) {
+        if (!fields.contains(key)) throw std::runtime_error("Storage prediction does not yet support extra setting: " + key);
+    }
+    return read_storage(
+        {
+            { "backend", "file" },
+            { "initial_state", "empty" },
+            { "prefetch_stop_policy", configuration.value("hicache_storage_prefetch_policy", "timeout") },
+            { "prefetch_threshold_tokens", extra.value("prefetch_threshold", Json(256)) },
+            { "prefetch_timeout",
+             { { "base_sec", extra.value("prefetch_timeout_base", 2.0) },
+                { "per_ki_token_sec", extra.value("prefetch_timeout_per_ki_token", 0.1) },
+                { "max_sec", extra.value("prefetch_timeout_max", 30.0) } } }
+    },
+        device_pages,
+        host_pages);
+}
 
 CacheSettings read_cache_settings(const nlohmann::json & raw) {
     const std::set<std::string> fields{ "device_pages", "host_pages", "write_policy", "io_backend", "host_layout", "storage" };
@@ -153,9 +195,10 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
           { "cache.prefetch.read_page", "file.generic_page_get", "storage_worker_service" },
           { "cache.prefetch.page_publish", "file.generic_page_get", "storage_worker_service" },
           { "cache.prefetch.return", "file.generic_page_get", "storage_worker_service" },
-          { "cache.storage_write.gather_check", "file.materialize_then_batch_set", "storage_worker_service" },
-          { "cache.storage_write.new_prepare", "file.materialize_then_batch_set", "storage_worker_service" },
-          { "cache.storage_write.new_page", "file.materialize_then_batch_set", "storage_worker_service" } }
+          { "cache.storage_write.gather", "file.materialize_then_batch_set", "storage_worker_service" },
+          { "cache.storage_write.batch_prepare", "file.materialize_then_batch_set", "storage_worker_service" },
+          { "cache.storage_write.new_page", "file.materialize_then_batch_set", "storage_worker_service" },
+          { "cache.storage_write.existing_page", "file.materialize_then_batch_set", "storage_worker_service" } }
     };
 }
 

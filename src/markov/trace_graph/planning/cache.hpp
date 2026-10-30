@@ -103,7 +103,10 @@ public:
     RadixId commit_host(std::span<const PrefixId> pages, BufferId buffer);
     void release(BufferId buffer);
     void trim(BufferId buffer, std::size_t remaining_pages);
-    std::size_t reclaim_host(std::size_t required_pages);
+
+    // Remove whole eligible segments until at least requested_pages were freed,
+    // or no candidate remains. Existing free capacity is not part of that count.
+    std::size_t evict_host_pages(std::size_t requested_pages);
 
     void pin_device(RadixId node);
     void unpin_device(RadixId node);

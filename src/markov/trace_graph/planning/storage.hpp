@@ -34,7 +34,7 @@ public:
     const StorageStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { Allocated, PageRead, PageCopied, ReadReturned, Accept, Timeout, Gathered, Prepared, PageWritten };
+    enum class ActionKind : std::uint32_t { Allocated, PageRead, PageCopied, ReadReturned, Accept, Timeout, Gathered, Prepared, PageWritten, PageTouched };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct Prefetch {
@@ -51,7 +51,6 @@ private:
         RadixId source;
         std::vector<PrefixId> pages;
         std::size_t index = 0, batch_end = 0;
-        bool prepared = false;
         graph::NodeId enqueue_cause;
     };
 

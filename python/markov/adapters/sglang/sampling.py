@@ -104,6 +104,11 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
                 if segments > 1:
                     io_cases.add((page, max(needed, segments), segments))
+        elif operation.startswith(("cache.prefetch.", "cache.storage_write.")):
+            io_operations.add("file")
+            for name in requirement["targets"]:
+                page = int(cells[name]["configuration"]["page_size"])
+                io_cases.update((page, pages, 1) for pages in (1, max(2, int(work["features"]["pages"]))))
 
     commands = []
     for (page, enabled), target in sorted(regions.items()):
@@ -114,6 +119,12 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             math.ceil((len(row["input_ids"]) + row["max_new_tokens"]) / page) * page for row in workload["requests"]
         )
         configuration = {key: value for key, value in target.items() if key not in CAPTURE_OWNED_ARGUMENTS}
+        for key in (
+            "hicache_storage_backend",
+            "hicache_storage_prefetch_policy",
+            "hicache_storage_backend_extra_config",
+        ):
+            configuration.pop(key, None)
         configuration.update(
             page_size=page,
             enable_hierarchical_cache=enabled,

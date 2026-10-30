@@ -196,11 +196,13 @@ void Cache::trim(BufferId buffer, std::size_t remaining_pages) {
     allocation.pages = remaining_pages;
 }
 
-std::size_t Cache::reclaim_host(std::size_t required_pages) {
+std::size_t Cache::evict_host_pages(std::size_t requested_pages) {
     std::size_t removed = 0;
     for (const auto node : eviction_order(Tier::Host)) {
-        if (available_pages(Tier::Host) >= required_pages) break;
-        removed += evict_host(node);
+        if (removed >= requested_pages) break;
+
+        const auto pages = tree_.nodes()[node].pages.size();
+        if (evict_host(node)) removed += pages;
     }
     return removed;
 }

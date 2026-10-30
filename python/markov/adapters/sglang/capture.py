@@ -61,6 +61,9 @@ def capture_environment(profiling: bool, calibration: bool = False) -> dict[str,
         "MARKOV_NATIVE_PROBE": "",
         "MARKOV_REGION_MEASUREMENTS": "/capture/regions" if calibration else "",
         "LD_PRELOAD": "",
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/capture/storage",
+        "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "0",
+        "SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "0",
     }
     if profiling:
         environment.update(
