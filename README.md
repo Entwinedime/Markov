@@ -72,8 +72,8 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 
 原生页几何/缓存子链用 page-work，独立模型查询用 costs；字段和范围见用户合同。
 可选 execution.node_scale 按已绑定工作的名字做成本敏感性分析，默认关闭，不代表真实硬件提速。
-显式源图诊断可运行 `scripts/markov.sh replay --request /path/to/replay.json`，使用原始图的成本、缩放或指定节点替换值；
-它不生成 target 分支，也不能代替执行式目标图的 oracle-cost 验证。
+显式诊断运行 `scripts/markov.sh replay --request /path/to/replay.json`，可选源图，或打开 execution.record_graph 后保存的目标执行图。
+回放可替换明确节点成本、缩放已有工作；它固定已有路径，不重新选择时间分支，也不自动匹配 target 真实成本。
 SGLang 与 KTransformers 保持同级设计，HiCache 只属于 SGLang；KTransformers 真采集/预测尚待恢复。
 
 ## 文档与目录

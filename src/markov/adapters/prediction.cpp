@@ -117,9 +117,13 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
             || captured_request.formal != (id >= workload.at("formal_begin_index").get<std::size_t>()))
             throw std::runtime_error("Regional prediction currently requires the same fixed output count and formal workload boundary");
     }
-    return { std::move(source),  std::move(selected),
-             models_path,        initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
-             std::move(targets), std::move(scaling) };
+    return { std::move(source),
+             std::move(selected),
+             models_path,
+             initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
+             std::move(targets),
+             std::move(scaling),
+             raw.value("record_graph", false) };
 }
 
 } // namespace markov::adapters

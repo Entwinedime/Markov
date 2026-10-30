@@ -44,13 +44,19 @@ struct ExecutionResult {
     std::size_t edges = 0;
 };
 
+struct GeneratedGraph {
+    graph::Graph graph;
+    std::vector<std::optional<graph::NodeId>> operation_nodes;
+    std::vector<std::optional<graph::NodeId>> timer_nodes;
+};
+
 // The same clock schedules observed graphs and generated work. New mutations
 // append owned operations atomically; dependencies may only target the new batch.
 // Completion actions are routed directly, without polling unrelated components.
 class Execution {
 public:
     Execution(const graph::Graph & graph, std::span<const graph::Time> initial_availability_ns);
-    Execution(std::size_t resources, EventReceiver & receiver);
+    Execution(std::size_t resources, EventReceiver & receiver, bool record_graph = false);
 
     graph::NodeId next_node() const { return result_.starts_ns.size(); }
     graph::NodeId submit(Mutation mutation);
@@ -63,6 +69,10 @@ public:
     graph::Time now_ns() const { return now_ns_; }
     const ExecutionResult & result() const { return result_; }
     ExecutionResult take_result();
+
+    // Freeze the completed generated path, including callback releases and
+    // fired relative deadlines. Cancelled work is absent, never zero cost.
+    GeneratedGraph generated_graph() const;
 
 private:
     enum class ScheduledKind { Completion, Available, Timer };
@@ -86,6 +96,9 @@ private:
         Component owner;
         Action action;
         bool active = true;
+        bool fired = false;
+        graph::Time delay_ns = 0;
+        std::optional<Event> cause;
     };
 
     const graph::Node & node(graph::NodeId id) const;
@@ -108,6 +121,8 @@ private:
     std::map<graph::NodeId, std::vector<graph::Edge>> source_additions_;
     std::vector<Lane> lanes_;
     std::vector<Timer> timers_;
+    std::optional<std::vector<std::optional<Event>>> creation_causes_;
+    std::optional<Event> current_event_;
     std::priority_queue<Scheduled, std::vector<Scheduled>, std::greater<Scheduled>> scheduled_;
 };
 

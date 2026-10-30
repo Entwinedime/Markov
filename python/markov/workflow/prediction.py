@@ -62,6 +62,7 @@ def _predict(request: PredictionRequest) -> dict:
         "targets": [asdict(target) for target in request.targets],
         "kernel_cache_initial_state": request.execution.kernel_cache_initial_state,
         "node_scale": [asdict(rule) for rule in request.execution.node_scale],
+        "record_graph": request.execution.record_graph,
     }
     seen = set()
     preparation = None

@@ -7,19 +7,25 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace markov::adapters {
 
+struct PredictedTrajectory {
+    std::filesystem::path prediction;
+    nlohmann::json cell;
+};
+
 struct PreparedReplay {
-    PreparedSource source;
+    std::variant<PreparedSource, PredictedTrajectory> input;
     std::vector<trace_graph::cost::ScalingRule> node_scale;
     std::map<trace_graph::graph::NodeId, trace_graph::graph::Time> overrides;
     std::optional<std::string> inspect_name;
 };
 
-// Diagnostic only: explicit costs replace nodes in the selected source DAG.
-// This does not map a target profile or regenerate conditional execution.
+// Diagnostic only: replace costs in a source DAG or recorded generated path.
+// Neither mode maps a target profile or reselects conditional execution.
 PreparedReplay prepare_replay(const std::filesystem::path & path);
 
 } // namespace markov::adapters

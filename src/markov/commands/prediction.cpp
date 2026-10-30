@@ -1,5 +1,6 @@
 #include "markov/commands/prediction.hpp"
 #include "markov/commands/costs.hpp"
+#include "markov/commands/trajectory.hpp"
 #include "markov/trace_graph/planning/cache_program.hpp"
 #include "markov/trace_graph/simulation/program_execution.hpp"
 
@@ -77,7 +78,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                                        input.initial,
                                        planning::RegionBackend{ "sglang.ascend.eager", target.result_implementation, target.maximum_prefill_tokens });
         simulation::ProgramResult result;
-        if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale).run();
+        if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale, input.record_graph).run();
         const bool complete =
             !program.issue() && result.cost_gaps.empty() && std::ranges::all_of(program.requests(), [&](const planning::CacheRequestResult & request) {
                 return request.completed && request.response && result.execution.states[*request.response] == simulation::OperationState::Complete;
@@ -103,6 +104,10 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                 {     "loaded_pages",                               request.loaded_pages },
                 {   "prefill_tokens",                             request.prefill_tokens }
             });
+            if (result.graph) {
+                requests.back()["start_node"] = result.graph->operation_nodes[*request.start].value();
+                requests.back()["response_node"] = result.graph->operation_nodes[*request.response].value();
+            }
         }
         auto gaps = Json::array();
         for (const auto & gap : result.cost_gaps) {
@@ -144,6 +149,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {              "requests",                                                                                std::move(requests) },
             {        "simulation_sec",                                        std::chrono::duration<double>(Clock::now() - begin).count() }
         });
+        if (result.graph) cells.back()["execution_graph"] = generated_graph_report(result);
     }
     rusage usage{};
     const auto usage_status = getrusage(RUSAGE_SELF, &usage);

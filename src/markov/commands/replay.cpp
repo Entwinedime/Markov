@@ -1,4 +1,5 @@
 #include "markov/commands/replay.hpp"
+#include "markov/commands/trajectory.hpp"
 
 #include <map>
 #include <optional>
@@ -12,7 +13,9 @@ namespace markov::commands {
 nlohmann::json replay_report(const adapters::PreparedReplay & input) {
     using namespace trace_graph;
     using Json = nlohmann::json;
-    const auto & source = input.source.context;
+    if (std::holds_alternative<adapters::PredictedTrajectory>(input.input)) return trajectory_replay_report(input);
+    const auto & prepared = std::get<adapters::PreparedSource>(input.input);
+    const auto & source = prepared.context;
     const auto & observed = source.observations();
     const auto & original = source.graph();
     if (!input.overrides.empty() && input.overrides.rbegin()->first >= original.graph.nodes().size())
@@ -77,7 +80,7 @@ nlohmann::json replay_report(const adapters::PreparedReplay & input) {
         });
     return {
         {            "status",                                                                                                         "completed" },
-        {          "manifest",                                                                                 input.source.manifest.path.string() },
+        {          "manifest",                                                                                     prepared.manifest.path.string() },
         {             "nodes",                                                                                          transformed.nodes().size() },
         {             "edges",                                                                                          transformed.edges().size() },
         {    "executed_nodes",                                                                                                     result.executed },

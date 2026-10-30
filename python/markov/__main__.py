@@ -42,7 +42,7 @@ def main() -> int:
     )
     maintenance.add_argument("--request", type=Path, required=True)
     replay_command = commands.add_parser(
-        "replay", help="Replay a source DAG with explicit NodeScale or node-cost hypotheses."
+        "replay", help="Replay a source DAG or recorded predicted path with explicit costs."
     )
     replay_command.add_argument("--request", type=Path, required=True)
     args = parser.parse_args()

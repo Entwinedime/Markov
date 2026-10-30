@@ -17,6 +17,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -107,9 +108,13 @@ int main(int argc, char ** argv) {
         nlohmann::json result;
         if (command == "replay") {
             const auto request = markov::adapters::prepare_replay(argv[2]);
-            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(), request.source.manifest.path };
-            for (const auto & file : request.source.manifest.files) inputs.push_back(file.path);
-            if (request.source.manifest.configuration_path) inputs.push_back(*request.source.manifest.configuration_path);
+            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal() };
+            if (const auto * source = std::get_if<markov::adapters::PreparedSource>(&request.input)) {
+                inputs.push_back(source->manifest.path);
+                for (const auto & file : source->manifest.files) inputs.push_back(file.path);
+                if (source->manifest.configuration_path) inputs.push_back(*source->manifest.configuration_path);
+            }
+            else inputs.push_back(std::get<markov::adapters::PredictedTrajectory>(request.input).prediction);
             prepare_output(output, inputs);
             result = markov::commands::replay_report(request);
         }

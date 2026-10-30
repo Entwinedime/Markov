@@ -92,6 +92,7 @@ add_executable(markov_core
     src/markov/commands/costs.cpp
     src/markov/commands/prediction.cpp
     src/markov/commands/replay.cpp
+    src/markov/commands/trajectory.cpp
     src/markov/commands/cpu_costs.cpp
 )
 target_link_libraries(markov_core PRIVATE markov_adapters)

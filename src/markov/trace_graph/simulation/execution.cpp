@@ -29,7 +29,9 @@ Execution::Execution(const graph::Graph & graph, std::span<const graph::Time> in
     }
 }
 
-Execution::Execution(std::size_t resources, EventReceiver & receiver) : receiver_(&receiver), lanes_(resources) {}
+Execution::Execution(std::size_t resources, EventReceiver & receiver, bool record_graph) : receiver_(&receiver), lanes_(resources) {
+    if (record_graph) creation_causes_.emplace();
+}
 
 const graph::Node & Execution::node(graph::NodeId id) const {
     return id < original_nodes_ ? source_->nodes()[id] : owned_[id - original_nodes_].operation.node;
@@ -74,6 +76,7 @@ graph::NodeId Execution::submit(Mutation mutation) {
     result_.completions_ns.resize(end, 0);
     incoming_.insert(incoming_.end(), incoming.begin(), incoming.end());
     result_.states.resize(end, OperationState::Pending);
+    if (creation_causes_) creation_causes_->resize(end, current_event_);
     for (auto & operation : mutation.operations) {
         const auto owner = operation.owner.value_or(mutation.owner);
         owned_.push_back({ std::move(operation), owner, {} });
@@ -97,7 +100,7 @@ void Execution::record_edge(graph::Edge edge) {
 std::size_t Execution::schedule_at(graph::Time time_ns, Component owner, Action action) {
     if (time_ns < now_ns_) throw std::runtime_error("Cannot schedule an action before the execution clock");
     const auto id = timers_.size();
-    timers_.push_back({ owner, action, true });
+    timers_.push_back({ owner, action, true, false, time_ns - now_ns_, creation_causes_ ? current_event_ : std::nullopt });
     scheduled_.push({ time_ns, ScheduledKind::Timer, id });
     return id;
 }
@@ -185,7 +188,11 @@ void Execution::complete(graph::NodeId id) {
         for (const auto & edge : operation.successors) release(edge);
         const auto action = operation.operation.completion;
         const auto owner = operation.owner;
-        if (action) receiver_->on_event(*this, { owner, *action, EventOrigin::Completion, id });
+        if (action) {
+            current_event_ = Event{ owner, *action, EventOrigin::Completion, id };
+            receiver_->on_event(*this, *current_event_);
+            current_event_.reset();
+        }
     }
     if (service && !stopped_) start_next(resource);
 }
@@ -202,9 +209,12 @@ void Execution::run() {
         else {
             auto & timer = timers_[event.identity];
             timer.active = false;
+            timer.fired = true;
             const auto owner = timer.owner;
             const auto action = timer.action;
-            receiver_->on_event(*this, { owner, action, EventOrigin::Timer, event.identity });
+            current_event_ = Event{ owner, action, EventOrigin::Timer, event.identity };
+            receiver_->on_event(*this, *current_event_);
+            current_event_.reset();
         }
     }
     if (stopped_) return;
@@ -216,5 +226,40 @@ void Execution::run() {
 }
 
 ExecutionResult Execution::take_result() { return std::move(result_); }
+
+GeneratedGraph Execution::generated_graph() const {
+    if (!creation_causes_) throw std::runtime_error("Generated graph recording was not enabled");
+
+    GeneratedGraph output;
+    output.operation_nodes.resize(owned_.size());
+    output.timer_nodes.resize(timers_.size());
+    for (graph::NodeId id = 0; id < owned_.size(); ++id) {
+        if (result_.states[id] == OperationState::Cancelled) continue;
+        if (result_.states[id] != OperationState::Complete) throw std::runtime_error("Cannot freeze an unfinished generated path");
+
+        output.operation_nodes[id] = output.graph.append(owned_[id].operation.node);
+    }
+    for (std::size_t id = 0; id < timers_.size(); ++id) {
+        if (timers_[id].fired) output.timer_nodes[id] = output.graph.append({ timers_[id].delay_ns, 0, graph::NodeKind::Delay });
+    }
+    const auto cause_node = [&](const Event & event) {
+        return (event.origin == EventOrigin::Completion ? output.operation_nodes[event.identity] : output.timer_nodes[event.identity]).value();
+    };
+    for (graph::NodeId id = 0; id < owned_.size(); ++id) {
+        if (!output.operation_nodes[id]) continue;
+
+        const auto node = *output.operation_nodes[id];
+        for (const auto & edge : owned_[id].successors) {
+            if (output.operation_nodes[edge.to]) output.graph.connect(node, *output.operation_nodes[edge.to], edge.kind);
+        }
+        if (const auto & cause = (*creation_causes_)[id]) output.graph.connect(cause_node(*cause), node, graph::EdgeKind::Submission);
+    }
+    for (std::size_t id = 0; id < timers_.size(); ++id) {
+        if (output.timer_nodes[id] && timers_[id].cause)
+            output.graph.connect(cause_node(*timers_[id].cause), *output.timer_nodes[id], graph::EdgeKind::Submission);
+    }
+    output.graph.finalize();
+    return output;
+}
 
 } // namespace markov::trace_graph::simulation

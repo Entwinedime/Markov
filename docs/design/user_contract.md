@@ -376,7 +376,7 @@ python3 -m markov.adapters.sglang.input_kernels --recipe /path/to/recipe.json --
 
 ## 结果与诊断
 
-### 显式源图成本回放
+### 显式成本回放
 
 ```bash
 scripts/markov.sh replay --request /path/to/replay.json
@@ -390,9 +390,21 @@ inspect_name 为空字符串时列出服务名字及数量；填入名字子串�
 overrides 例如 [{"node": 123, "duration_ns": 456}]，只替换明确节点，随后再应用 node_scale；
 边界只能为零，重复 ID、负耗时和越界 ID 会拒绝。缩放只作用于服务，gap、等待和边保持原样。
 
-该入口保持所选源图及资源次序，给出逐请求回放与观测差异；替换值由调用者负责关联和说明来源。
-当前没有自动 target 操作匹配，也没有执行式目标图的导出/重放，不能用源图回放证明目标结构正确。
-纯诊断容器只读取指定来源和请求，无设备、无数据库、无网络，输出不覆盖采集文件。
+预测可显式设置 execution.record_graph=true，把已完成目标的 execution_graph 和逐请求 start_node/response_node 写入报告。
+默认关闭，不建立工作副本或输出逐节点明细；缺成本或未完成的目标不导出可回放图。
+图保存工作变量、成本来源、组件归属、原执行节点、端口及依赖；被取消工作不作为零成本节点进入固定路径。
+回调触发后续工作的关系另存为 submission 边，已触发的定时器保存为相对其启动原因的等待。
+原开始/结束时间只用于比较，不作为回放调度约束。资源实际次序保留，改成本后下游可随依赖移动。
+
+回放目标图的请求使用 prediction 与 target，替代 manifest，例如
+{"prediction": "/path/to/prediction/report.json", "target": "candidate", "output": "/path/to/replay"}。
+其余缩放、替换、检查名字和内存参数沿用；目标的 work 标签可包含 caller 延迟，按相应工作缩放，源残余不随之缩放。
+相对 deadline 是策略条件，不能当成操作成本覆盖。报告给出逐请求变化和 operation_timing_differences，后者比较原有操作的全部起止时间。
+
+该入口保持所选图及资源次序，替换值由调用者负责关联和说明来源。
+目前没有自动 target 操作匹配；保存和复现预测图本身不能证明它与 target 真实结构相同，也不是正常精度或完整 oracle-cost 验收。
+回放不重新选择时间分支，改成本后原分支可能不再成立，结论只适用于固定路径。
+源回放容器只读指定采集，目标图回放只读所选预测报告；两者无设备、无数据库、无网络，输出不覆盖输入。
 
 普通预测只给目标配置、完整 HTTP 时间、状态、成本来源覆盖、外推/近似说明和准备开销。
 未知或失败时间为缺失值，不能为零。执行成功、存在适用模型和精度达标是不同事实。

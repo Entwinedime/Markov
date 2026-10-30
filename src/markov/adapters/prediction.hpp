@@ -26,6 +26,7 @@ struct PreparedPrediction {
     trace_graph::planning::KernelCacheInitial initial;
     std::vector<PredictionTarget> targets;
     std::vector<trace_graph::cost::ScalingRule> node_scale;
+    bool record_graph;
 };
 
 // Only declared base, workload and independent models enter prediction.

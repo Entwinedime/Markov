@@ -128,6 +128,7 @@ class Execution:
     capture: CaptureSettings | None = None
     kernel_cache_initial_state: str | None = None
     node_scale: tuple[ScalingRule, ...] = ()
+    record_graph: bool = False
 
     @classmethod
     def parse(cls, raw: dict[str, Any], directory: Path) -> Execution:
@@ -135,7 +136,15 @@ class Execution:
 
         reject_unknown(
             raw,
-            {"output", "jobs", "memory_limit_gib", "capture", "kernel_cache_initial_state", "node_scale"},
+            {
+                "output",
+                "jobs",
+                "memory_limit_gib",
+                "capture",
+                "kernel_cache_initial_state",
+                "node_scale",
+                "record_graph",
+            },
             "execution",
         )
         memory_limit = raw.get("memory_limit_gib")
@@ -144,6 +153,9 @@ class Execution:
         initial = raw.get("kernel_cache_initial_state")
         if initial is not None and initial not in ("empty", "prepared"):
             raise ValueError("execution.kernel_cache_initial_state must be empty or prepared")
+        record_graph = raw.get("record_graph", False)
+        if type(record_graph) is not bool:
+            raise ValueError("execution.record_graph must be a boolean")
 
         return cls(
             resolve_path(directory, raw["output"]),
@@ -152,6 +164,7 @@ class Execution:
             CaptureSettings.parse(raw["capture"]) if "capture" in raw else None,
             initial,
             tuple(ScalingRule.parse(rule) for rule in raw.get("node_scale", [])),
+            record_graph,
         )
 
 
