@@ -3,7 +3,7 @@
     "platform": "Ascend 910B",
     "framework": "sglang",
     "runtime": "ascend",
-    "model": "Qwen/Qwen3-32B",
+    "model": "/path/to/local/model",
     "dtype": "bfloat16",
     "tensor_parallel": 2
   },
@@ -38,6 +38,32 @@
   "execution": {
     "output": "../data/prediction",
     "jobs": 1,
-    "memory_limit_gib": 4
+    "memory_limit_gib": 4,
+    "kernel_cache_initial_state": "empty",
+    "capture": {
+      "image": "markov-sglang:ubuntu22.04",
+      "devices": [0, 1],
+      "memory_limit_gib": 120,
+      "cpus": 16,
+      "budget": {
+        "starts": 2,
+        "wall_sec": 600,
+        "requests": 8,
+        "input_tokens": 10000,
+        "output_tokens": 128,
+        "retained_mib": 2048
+      }
+    }
+  },
+  "performance": {
+    "database": "../data/performance.sqlite",
+    "sampling_budget": {
+      "starts": 5,
+      "wall_sec": 900,
+      "requests": 64,
+      "input_tokens": 20000,
+      "output_tokens": 192,
+      "retained_mib": 256
+    }
   }
 }

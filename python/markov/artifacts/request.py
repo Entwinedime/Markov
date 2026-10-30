@@ -143,6 +143,8 @@ class PredictionRequest:
     workload: Path
     targets: tuple[Target, ...]
     models: Path | None
+    database: Path | None
+    sampling_budget: dict[str, int] | None
     execution: Execution
 
     @classmethod
@@ -157,13 +159,21 @@ class PredictionRequest:
             raise ValueError("target names must be unique within a request")
 
         performance = raw.get("performance", {})
-        reject_unknown(performance, {"models"}, "performance")
+        from markov.artifacts.capture import parse_budget
+
+        reject_unknown(performance, {"models", "database", "sampling_budget"}, "performance")
         model_path = performance.get("models")
+        database = performance.get("database")
+        sampling_budget = parse_budget(performance["sampling_budget"]) if "sampling_budget" in performance else None
+        if sampling_budget is not None and database is None:
+            raise ValueError("Shared sampling requires performance.database")
         return cls(
             Deployment.parse(raw["deployment"]),
             BaseInput.parse(raw["base"], directory),
             resolve_path(directory, raw["workload"]),
             targets,
             resolve_path(directory, model_path) if model_path is not None else None,
+            resolve_path(directory, database) if database is not None else None,
+            sampling_budget,
             Execution.parse(raw["execution"], directory),
         )

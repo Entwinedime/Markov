@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from markov.artifacts.request import positive_integer, reject_unknown, required_text
+
+
+def parse_budget(raw: dict) -> dict[str, int]:
+    fields = {"starts", "wall_sec", "requests", "input_tokens", "output_tokens", "retained_mib"}
+    reject_unknown(raw, fields, "capture budget")
+    return {key: positive_integer(raw[key], f"budget.{key}") for key in sorted(fields)}
+
+
+@dataclass(frozen=True)
+class DeviceCommand:
+    module: str
+    arguments: tuple[str, ...]
+    payload: dict
+    artifact: str
+    result_key: str
+    mounts: tuple[tuple[Path, str, bool], ...] = ()
+    environment: dict[str, str] = field(default_factory=dict)
+    requests: int = 0
+    input_tokens: int | None = 0
+    output_tokens: int = 0
+    usage_file: str | None = None
+    measurement_adapter: str | None = None
 
 
 @dataclass(frozen=True)
@@ -26,10 +49,7 @@ class CaptureSettings:
             or len(set(devices)) != len(devices)
         ):
             raise ValueError("capture.devices must be unique nonnegative device indices")
-        limits = raw["budget"]
-        fields = {"starts", "wall_sec", "requests", "input_tokens", "output_tokens", "retained_mib"}
-        reject_unknown(limits, fields, "capture budget")
-        budget = {key: positive_integer(limits[key], f"capture.budget.{key}") for key in sorted(fields)}
+        budget = parse_budget(raw["budget"])
         return cls(
             required_text(raw["image"], "capture.image"),
             tuple(devices),

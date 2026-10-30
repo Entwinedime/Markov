@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 
 from markov.artifacts.request import PredictionRequest
@@ -61,7 +62,7 @@ def main() -> int:
                 result = InferenceCapture(
                     request, profiling=args.command == "capture", calibration=args.command == "calibrate"
                 ).run(recapture=args.recapture)
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"markov: {error}", file=sys.stderr)
         return 2
 

@@ -81,8 +81,16 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
         const auto & captured_request = observations.requests[id];
         if (request.at("return_logprob").get<bool>()) throw std::runtime_error("Regional prediction does not yet model logprob output work");
         const auto prompt = observations.request_tokens.at(captured_request.identity).prompt.value().path;
-        if (request.at("input_ids").is_null() || request.at("input_ids").get<std::vector<std::int64_t>>() != observations.token_paths.suffix(prompt, 0))
-            throw std::runtime_error("Regional prediction currently needs input_ids matching the base's observed workload");
+        auto requested_tokens = request.at("input_ids");
+        if (requested_tokens.is_null()) {
+            // Capture records the tokenizer's actual input, including its text
+            // origin. Prediction never loads a tokenizer or guesses token IDs.
+            const auto & actual = captured.at("workload").at("requests").at(id);
+            if (request.at("prompt") != actual.at("prompt")) throw std::runtime_error("Requested text differs from the captured workload");
+            requested_tokens = actual.at("input_ids");
+        }
+        if (requested_tokens.get<std::vector<std::int64_t>>() != observations.token_paths.suffix(prompt, 0))
+            throw std::runtime_error("Requested tokens differ from the base's observed workload");
         std::size_t outputs = 0;
         for (const auto frame : source.context.request_frames(captured_request.identity)) {
             const auto * result = source.context.frame_result(frame);

@@ -8,6 +8,7 @@
 #include <numeric>
 #include <set>
 #include <sys/resource.h>
+#include <variant>
 
 namespace markov::commands {
 
@@ -18,6 +19,30 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     const auto & source = input.source.context;
     const auto & observations = source.observations();
     const auto backend = adapters::sglang::cache_backend(source);
+    const planning::AttentionGeometry * attention = nullptr;
+    for (const auto & description : observations.work_descriptions) {
+        for (const auto & part : description.recipe) {
+            attention = std::get_if<planning::AttentionGeometry>(&part.operation.geometry);
+            if (attention) break;
+        }
+        if (attention) break;
+    }
+    double context_tokens = 0;
+    for (const auto & frame : observations.compute_frames)
+        for (const auto tokens : frame.sequence_tokens) context_tokens = std::max(context_tokens, tokens);
+    std::set<std::string> final_phases;
+    for (const auto & result : observations.batch_results)
+        if (!result.final_sends.empty())
+            final_phases.insert(observations.compute_frames[result.frame].phase == planning::Phase::Prefill ? "prefill" : "decode");
+    Json sampling_context{
+        { "max_context_tokens",context_tokens                               },
+        {       "final_phases",        final_phases },
+        {           "geometry",
+         { { "layers", backend.layers },
+         { "kv_heads", attention->kv_heads },
+         { "key_dim", attention->query_key_dim },
+         { "value_dim", attention->value_dim } }   }
+    };
     cost::Queries costs(input.costs.models, &source);
     auto cells = Json::array();
     for (const auto & target : input.targets) {
@@ -100,6 +125,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     }
     return {
         { "deployment", input.costs.deployment },
+        { "sampling_context", std::move(sampling_context) },
         { "status", std::ranges::all_of(cells, [](const Json & cell) { return cell.at("e2e_predicted").get<bool>(); }) ? "completed" : "incomplete" },
         { "manifest", input.source.manifest.path.string() },
         { "models", input.models_path.string() },
@@ -115,7 +141,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         { "limitations",
          { "Serial fixed-token eager requests on the declared deployment; target observations are not read.",
             "CPU and opaque stream responses overlap. Stream intervals include host starvation and internal communication; TP shares the latest ready input.",
-            "First-phase and new-input-size terms estimate observed initialization conditions, not an exact compiler cache.",
+            "First-phase initialization remains an estimate. New input preparations use the adapter's specialization rules, not raw token lengths.",
             "Modeled parent waits use target readiness ports. Other source frontend/control intervals retain their opaque work and waits; unidentified "
             "probe overhead and changed control behavior remain uncertain.",
             "Cache query CPU retains the source residual approximation; state-dependent tree overhead and competing I/O/compute need further validation.",

@@ -2,11 +2,14 @@
 
 import json
 from pathlib import Path
+import tempfile
 
 
 def write_json(path: Path, value) -> None:
-    pending = path.with_name(path.name + ".partial")
-    stream = pending.open("x", encoding="utf-8")
+    stream = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".partial", delete=False
+    )
+    pending = Path(stream.name)
     try:
         with stream:
             json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)

@@ -9,7 +9,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 ```
 
 当前可通过正式入口完成限定范围的 SGLang/Ascend 预测，已运行 self 和两种写策略 cross。
-这证明调用链已接通，精度仍未达标；其他框架、自动成本准备、矩阵实验和搜索尚在恢复。
+这证明调用链已接通，精度仍未达标；其他框架、矩阵实验和搜索尚在恢复。
 
 ## 怎样运行
 
@@ -21,22 +21,28 @@ scripts/build.sh Release
 scripts/markov.sh plan --request configs/prediction.json
 ```
 
-plan 只预览输入与准备动作，不启动设备。示例尚未指定本机模型、镜像、设备和独立模型，不能直接预测。
+plan 只预览输入与准备动作，不启动设备。先按实际部署修改示例中的模型位置、镜像、设备和预算；
+预览不会核验这些资源能否真正启动。
 请求中的相对路径以请求文件目录为起点。
 
-已准备 base manifest 和适用成本包后：
+同一个请求可以采集 base 并预测，重复运行会复用相同输入的 base：
 
 ```bash
 scripts/markov.sh predict --request /path/to/request.json
 ```
 
-请求提供 deployment、workload、base.manifest、targets、performance.models，以及 execution.output 和
+请求提供 deployment、workload、base、targets、performance.database（或显式 performance.models），以及 execution.output 和
 execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/prediction/report.json，
 包含完整正式 HTTP、逐请求耗时、后台完成、缺口、成本来源、近似、图规模和运行开销。
 同一会话只准备一次 source；每个 target 独立维护缓存和执行状态。
 预测容器只挂载指定程序、base、模型和输出，不挂载整个仓库、真实设备或正常评分数据。
 
-首次使用目前仍需分步准备，尚非一键自动流程：
+首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
+流程先使用现有模型，按整组缺少的工作生成小型独立采样，维护模型后继续预测；不会采集 target trace 或按误差补参数。
+当前自动采样覆盖 SGLang/Ascend 串行区域响应和批量备份，回载、存储等缺口仍明确停止。
+采样与 base 分别累计预算；中断后重跑同一命令会接管原容器、保留用量，完成任务直接复用。
+
+平台维护者也可显式维护独立数据：
 
 ```bash
 scripts/markov.sh capture --request /path/to/base_request.json
@@ -45,14 +51,14 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 ```
 
 capture 用 base.configuration、实际推理镜像、设备与累计预算采集，返回 manifest；
-calibrate 用另一个小型 workload 记录语义区域，不开 profiler 或 snapshot；maintain 显式导入、选择训练并导出模型。
-HiCache 物理 I/O 另有独立采样，普通用户的整组需求分析和自动组合是后续工作。
+calibrate 用另一个小型 workload 记录语义区域，不开 profiler 或 snapshot；maintain 显式导入、选择训练并发布库中的现行模型。
+predict 从数据库导出本组的只读选择，用户无需手拼模型文件；未选中的历史记录不会自动参加训练。
 正常对照单独运行 measure，关闭 profiler 与 Markov 探针；它只用于独立评价，不用于预测或训练。
 
 ## 已验证范围与限制
 
 当前实际输入为 Qwen3-32B/BF16/TP2、Ascend 910B3、SGLang eager/FIA，串行固定输出。
-预测需使用与 base 一致的 input_ids、ignore_eos 和输出数量；暂不接受文本 prompt 直接预测。
+预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
 CPU 返回、流进度和结果可读分别保留；gap、未归属控制、Prefill/Decode 不从完整 HTTP 中扣除。
 首次使用条件、源控制残余与竞争仍有近似，执行成功不表示结构完整或正常精度已验收。

@@ -21,11 +21,13 @@ class RequestInput:
         reject_unknown(
             raw, {"prompt", "input_ids", "max_new_tokens", "ignore_eos", "return_logprob"}, "workload request"
         )
-        if ("prompt" in raw) == ("input_ids" in raw):
-            raise ValueError("Each workload request needs exactly one of prompt or input_ids")
-        prompt = required_text(raw["prompt"], "prompt") if "prompt" in raw else None
+        prompt = raw.get("prompt")
         ids = raw.get("input_ids")
-        if "input_ids" in raw and (
+        if (prompt is None) == (ids is None):
+            raise ValueError("Each workload request needs exactly one non-null prompt or input_ids")
+        if prompt is not None:
+            prompt = required_text(prompt, "prompt")
+        if ids is not None and (
             not isinstance(ids, list) or not ids or any(type(token) is not int or token < 0 for token in ids)
         ):
             raise ValueError("input_ids must be a nonempty array of nonnegative integers")
@@ -48,9 +50,12 @@ class Workload:
 
     @classmethod
     def load(cls, path: Path):
-        raw = read_json(path)
+        return cls.parse(read_json(path))
+
+    @classmethod
+    def parse(cls, raw: dict) -> Workload:
         reject_unknown(raw, {"requests", "arrival", "formal_begin_index"}, "workload")
-        if raw["arrival"] != "serial":
+        if raw.get("arrival", "serial") != "serial":
             raise ValueError("Only serial request arrival is supported")
         requests = tuple(RequestInput.parse(row) for row in raw["requests"])
         begin = raw.get("formal_begin_index", 0)

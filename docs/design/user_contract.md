@@ -9,11 +9,17 @@ scripts/markov.sh predict --request /path/to/request.json
 ```
 
 沿用下方共同请求：base.manifest 复用采集，或 base.configuration 加 execution.capture 先采 base；
-performance.models 必须指向适用的离线模型，execution.kernel_cache_initial_state 必须为 empty 或 prepared。
-empty/ prepared 是声明的初始条件，不是自动检测结果；当前区域模型的 first_phase/new_input_size 只是首次使用代理，不能保证还原全部编译状态。
+performance.database 指向已维护的性能库，或用 performance.models 显式选择离线模型；两者都有时 models 优先。
+数据库只在准备阶段读取现行选择，并导出小型只读模型；预测容器不打开数据库，不自动训练未选中的原始记录。
+可选 performance.sampling_budget 声明整组共享补采的六项累计预算，需要同时提供 database 和 execution.capture。
+没有现行模型时可从空库开始；只有实际成本查询发现缺口才补采，维护后重新执行目标，绝不填零遍历分支。
+execution.kernel_cache_initial_state 必须为 empty 或 prepared。
+empty/prepared 是声明的初始条件，不是自动检测结果。输入准备另按原生工作规格记录新准备数量；
+首次 phase 仍覆盖未细分的初次准备，不能保证还原全部编译器或驱动缓存状态。
 
-当前要求相同部署、串行 input_ids、ignore_eos=true、与 base 一致的输出数量和 formal_begin_index；
-文本 prompt 可采集但尚不能直接预测。目标配置覆盖 base 对应字段，name 仅用于结果标识。
+当前要求相同部署、串行输入、ignore_eos=true、与 base 一致的输出数量和 formal_begin_index。
+文本 prompt 需与采集原文相同，由 manifest 声明的配置取得实际 token，再核对源语义；预测不加载 tokenizer。
+采集配置没有保留实际编码时不能猜 token，已有 input_ids 仍直接核对源前缀。目标配置覆盖 base 对应字段，name 仅用于结果标识。
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
 hicache_write_policy、hicache_io_backend、hicache_mem_layout；其余执行设置保持来源条件。
 目前传输组合限 kernel_ascend/page_first_direct，batch=1；新增页几何、回载或其他成本域不满足时明确停止，不从相似目标借值。
@@ -21,11 +27,20 @@ hicache_write_policy、hicache_io_backend、hicache_mem_layout；其余执行设
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
+cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
+自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应和批量备份，不含回载/存储采样。
+同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
+preparation 中单列 base/performance 时间、sampling_rounds 和累计状态路径；这些不计入预测的 HTTP。
 
 预测容器无设备、无网络，仅挂载可执行文件、所选 base 采集目录、模型、准备输入与结果目录。
 不挂载项目/data 根目录或 evaluator 的正常测量。输出须与 base/模型输入分离；已有活跃容器时拒绝复用其输出。
 一次进程共享 source 和只读模型，当前 targets 顺序执行，jobs 尚未用于预测并发。
-从 configuration 首次采集后仍需显式改用返回的 manifest，重复 predict 不自动识别先前成功采集；自动复用与准备后续接入。
+从 configuration 首次采集后，同一输出的重复 predict 会核对部署、运行参数和 workload 后自动复用该任务的 manifest，
+不再要求用户手改输入。输入改变时要求新输出或显式 recapture；不会扫描其他目录猜来源。
+镜像和设备用于实际采集；复用来源以该次采集记录为准，需要新运行环境的来源时显式 recapture。
+同一输出有进程锁，活跃预测容器会在改写输入前被识别。
+中断后的采集先核对原容器：仍在运行就等待，正常退出则记账后复用，句柄缺失记失败及保守用量。
+容器自身也有时间上限；只有退出和用量写入状态后才移除容器，不凭产物存在推断成功。
 
 ## 输入预览和采集检查
 
@@ -37,14 +52,16 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core inspect-manifest /
 ```
 
 plan 读取请求、核对 workload/manifest/模型包的声明路径并列出已知准备动作，不构图、启动设备或创建结果目录。
+configuration 的准备动作是采集或复用，预览不判断该任务是否可以复用，也不将数据库路径存在等同于模型已维护。
 输出 not_evaluated 列出尚未分析的源语义、目标工作和成本覆盖，不能据此认定模型可用。
 manifest 检查只读取 manifest 和文件元数据；输出 inputs_accessible 不代表通道内容、源 DAG 或正常性能已通过。
 
 请求路径以声明它的文件目录为起点。base 二选一：manifest 复用真实来源，configuration 声明需要采集的配置。
 每个 target 只有 name 和 configuration；name 用于定位结果，不作为结构或成本特征。
 deployment 包含 platform、framework、runtime、model、dtype、tensor_parallel；工作配置由相应适配器解释。
-performance.models 可省略，表示独立模型尚未选定；execution 必须给 output，jobs 默认为 1，memory_limit_gib 可显式声明。
-示例在 configs 中，不预置本机模型路径、设备编号、评分文件或实验身份。
+performance.models 和 performance.database 均可省略作输入预览；实际预测需要其中之一。
+execution 必须给 output，jobs 默认为 1，memory_limit_gib 可显式声明。
+示例在 configs 中；模型位置、镜像、设备和预算须按实际部署修改，不含评分文件或实验身份。
 
 采集文件可以相对 manifest 所在目录声明；完整采集移动后，原 run_dir 内的绝对引用按同一采集的相对位置解析。
 这不扫描目录、猜测相似文件或自动兼容历史字段。采集外的独立绝对来源仍使用其明确路径。
@@ -81,9 +98,10 @@ profiling_ready 只授予这些声明通道的导出资格，不证明全部语�
 事件等待由目标生产者依赖产生，不迁移 source 阻塞时长。原生库只在推理 SDK 构建，纯 modeling 不加载它；采集窗口外关闭记录。
 
 输出位于 execution.output/base，包含累计状态及每次 captures 子目录。已成功的任务默认拒绝重采；
-将返回的 manifest 显式填入 base.manifest 可复用，或加 --recapture 重新采集并保留已有额度消耗和文件。
-失败不会把上一份 manifest 当成本次成功返回。进程中断遗留 running 状态时，目前须先核对本任务容器与实际用量，再恢复状态；尚无自动孤儿恢复。
-用户仍需自行提供适用的独立成本；采集入口没有恢复完整 CPU 校正和数据库准备。
+将返回的 manifest 显式填入 base.manifest 可复用，predict 也可自动复用相同 configuration 任务；
+capture 加 --recapture 重新采集并保留已有额度消耗和文件。
+失败不会把上一份 manifest 当成本次成功返回；中断后同一入口自动接管本任务容器并保留累计用量。
+采集入口不训练成本；完整 CPU 校正仍未恢复，独立数据由准备与维护流程负责。
 
 ### 正常测量与小型区域校准
 
@@ -96,7 +114,7 @@ scripts/markov.sh calibrate --request /path/to/calibration_request.json
 measure 将 profiler、Markov Python 与原生观察全部关闭，输出 normal/normal_observation.json 及独立 workload_report。
 该时间可以供后续评价读取，预测与训练不读取它。当前入口只运行声明的单个配置，并非已经实现整组 target 的评价编排。
 
-calibrate 运行独立选择的小型 workload，仅安装输入准备、eager batch、结果处理/发送包络和异步 NPU event。
+calibrate 运行独立选择的小型 workload，安装输入准备、分配规格、eager batch、结果处理/发送包络和异步 NPU event。
 它不安装底层算子探针、不采 snapshot、不启 profiler，输出 calibration/region_measurements.json 及轻量 JSONL。
 线程 CPU、caller 返回与 current-stream 区间分开记录；查询已完成 event 不新增前向同步。
 结果模型区分 HiRadixCache 与 RadixCache，不能用未启 HiCache 的结果 CPU 响应冒充启用分支。
@@ -106,7 +124,7 @@ warmup 依据 formal_begin_index 排除，请求身份仅用于关联与预热�
 
 三种运行分别保留 base、normal、calibration 子目录及累计状态；失败与 recapture 均不重置所属预算。
 校准仍需显式累计运行及存储预算，不能将额外性能采样转记到 base 或评价。
-调用者当前仍须提供独立校准 workload、选择训练与初始状态；整组需求分析和自动准备尚未恢复。
+显式 calibrate 由维护者选择独立 workload 和训练来源；普通 predict 可按整组需求自动构造、采集并维护上述有限工作。
 
 ### SGLang 输入分支观察
 
@@ -320,7 +338,8 @@ deployment 沿用预测请求的六项条件。每项工作为 operation、imple
 特征 ranges、完整 measured_points、extrapolation_features、allow_new_combinations 及 sources。
 可选 limitations 是已知测量与预测限制的文字列表；未提供时为空，不改变工作域或公式。
 response.form 为 affine 时包含 intercept_ns 和 coefficients_ns；为 coefficient_curve 时包含 feature 与 points，
-每个测点含 coordinate、intercept_ns 和 coefficients_ns。测点严格递增，曲线坐标的适用范围不得超出测点区间。
+每个测点含 coordinate、intercept_ns 和 coefficients_ns。一个锚点表示仅支持该坐标；多个锚点严格递增，
+曲线坐标的适用范围不得超出测点区间。
 这些是离线维护结果，不在查询过程中拟合；旧成本资产需显式转换单位和合同，程序不猜格式或长期兼容两套字段。
 
 报告逐项返回状态、可用时的整数 duration_ns、覆盖类别和模型来源引用。缺失或不支持的耗时为 null。

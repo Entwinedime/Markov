@@ -16,19 +16,27 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         request.base.manifest.stat()
     if request.models is not None:
         request.models.stat()
+    if request.database is not None and request.models is None and request.sampling_budget is None:
+        request.database.stat()
 
     preparation = []
     if request.base.manifest is None:
-        preparation.append("capture_base")
+        preparation.append("capture_or_reuse_base")
     if request.models is None:
-        preparation.append("select_independent_cost_models")
+        preparation.append(
+            "prepare_shared_costs"
+            if request.sampling_budget is not None
+            else "export_maintained_models"
+            if request.database is not None
+            else "select_independent_cost_models"
+        )
 
     return {
         "status": "planned",
         "deployment": asdict(request.deployment),
         "base": {
             "manifest": str(request.base.manifest) if request.base.manifest is not None else None,
-            "requires_capture": request.base.manifest is None,
+            "requires_preparation": request.base.manifest is None,
         },
         "workload": str(request.workload),
         "workload_size": {
@@ -42,8 +50,17 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         "capture": asdict(request.execution.capture) if request.execution.capture is not None else None,
         "targets": [item.name for item in request.targets],
         "models": str(request.models) if request.models is not None else None,
+        "database": str(request.database) if request.database is not None else None,
+        "sampling_budget": request.sampling_budget,
         "preparation": preparation,
-        "not_evaluated": ["source_semantics", "target_work", "cost_coverage", "execution"],
+        "not_evaluated": [
+            "base_reuse",
+            "maintained_model_availability",
+            "source_semantics",
+            "target_work",
+            "cost_coverage",
+            "execution",
+        ],
         "execution": {
             "output": str(request.execution.output),
             "jobs": request.execution.jobs,
