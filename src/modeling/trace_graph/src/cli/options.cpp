@@ -75,6 +75,7 @@ void select_trace_channels(io::ManifestTraceInputOptions & options, const std::s
 }
 
 void validate_options(const CliOptions & options) {
+    if (options.target_session && options.target_plan.empty()) throw CliUsageError("--target-session requires --target-plan");
     if (!options.target_plan.empty() && (options.source_observations_only || !options.prepare_cpu_service.empty() || !options.model_config.empty()))
         throw CliUsageError("--target-plan supplies target models and cannot be combined with single-run model, observation or CPU preparation");
     if (options.source_observations_only && (!options.model_config.empty() || !options.prepare_cpu_service.empty() || !options.outputs.graph.empty()))
@@ -131,6 +132,7 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--prepare-cpu-service") options.prepare_cpu_service = next_value(index, argc, argv, argument);
         else if (argument == "--cpu-service-output") options.cpu_service_output = next_value(index, argc, argv, argument);
         else if (argument == "--source-observations-only") options.source_observations_only = true;
+        else if (argument == "--target-session") options.target_session = true;
 #ifdef DEBUG
         else if (argument == "--actual-e2e-us") { options.actual_e2e_us = nonnegative_u64(next_value(index, argc, argv, argument), argument); }
         else if (argument == "--hicache-oracle-cost-replay") options.hicache_oracle_cost_replay = next_value(index, argc, argv, argument);
@@ -161,6 +163,7 @@ void print_usage(const char * program) {
               << "Model and output:\n"
               << "  --model-config FILE             Optional SimulationModule config\n"
               << "  --target-plan FILE              Internal same-source batch; private target executions\n"
+              << "  --target-session                Read further JSON-encoded plan paths from stdin until EOF\n"
               << "  --cpu-service-cost FILE         Optional same-base CPU service intervals\n"
               << "  --prepare-cpu-service FILE      Generate service intervals from same-base measurements; no prediction\n"
               << "  --cpu-service-output FILE       Output for --prepare-cpu-service (replaces --run-summary)\n"

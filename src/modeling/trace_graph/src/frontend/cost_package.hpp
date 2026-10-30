@@ -4,9 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 
 namespace markov::trace_graph::frontend {
@@ -23,10 +23,11 @@ struct CostPackage {
 class CostPackages {
 public:
     const CostPackage & get(const std::string & filename);
-    size_t size() const { return packages_.size(); }
+    size_t size() const { return package_.has_value() ? 1 : 0; }
 
 private:
-    std::map<std::string, CostPackage> packages_;
+    std::string path_;
+    std::optional<CostPackage> package_;
 };
 
 } // namespace markov::trace_graph::frontend

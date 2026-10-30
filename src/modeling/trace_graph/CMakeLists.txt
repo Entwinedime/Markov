@@ -326,6 +326,7 @@ target_sources(trace_graph
         src/cli/run_summary.cpp
         src/cli/workflow.cpp
         src/cli/prediction_batch.cpp
+        src/cli/prediction_memory.cpp
         src/cli/main.cpp
 )
 target_link_libraries(trace_graph

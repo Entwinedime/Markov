@@ -128,7 +128,10 @@ HiCacheIoCostConfig CostPackage::io_for_page(uint64_t page_bytes) const {
 
 const CostPackage & CostPackages::get(const std::string & filename) {
     const auto path = std::filesystem::canonical(filename).string();
-    if (const auto found = packages_.find(path); found != packages_.end()) return found->second;
+    if (package_) {
+        if (path != path_) throw std::runtime_error("A prediction session uses one cost package; start another session to change it");
+        return *package_;
+    }
 
     const auto raw = read_json_file(path);
     const auto & io = raw.at("hicache");
@@ -151,7 +154,9 @@ const CostPackage & CostPackages::get(const std::string & filename) {
     }
     // Validate the remaining service and resource fields at admission, before trace loading.
     package.io_for_page(kv_bytes);
-    return packages_.emplace(path, std::move(package)).first->second;
+    path_ = path;
+    package_ = std::move(package);
+    return *package_;
 }
 
 } // namespace markov::trace_graph::frontend

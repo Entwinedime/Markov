@@ -30,6 +30,7 @@ struct CliOptions {
     std::string profile_manifest;
     std::string model_config;
     std::string target_plan;
+    bool target_session = false;
     std::string cpu_service_cost;
     std::string prepare_cpu_service;
     std::string cpu_service_output;
