@@ -70,6 +70,22 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 中断后的采集先核对原容器：仍在运行就等待，正常退出则记账后复用，句柄缺失记失败及保守用量。
 容器自身也有时间上限；只有退出和用量写入状态后才移除容器，不凭产物存在推断成功。
 
+## KTransformers 采集与独立数据
+
+KTransformers 与 SGLang 使用相同的 capture、measure、calibrate、maintain 和 replay 入口及累计预算。
+当前 KTransformers 真实范围为单 NPU、dense safetensors、原生 KTransformersLinear/KLinearTorch、同步 eager 阶段，
+已验证 Llama-2-7B/float16。没有 HiCache，每请求从空 KV 开始；MoE、量化、多卡及正式 target 预测尚未取得资格。
+
+配置示例为 [ktransformers_capture.json](../../configs/ktransformers_capture.json)。base.configuration 声明 max_context_tokens，
+可选 cpu_threads、attention_backend（eager/sdpa）和 prefill_chunk_tokens；未声明 chunk 则整段 Prefill。
+模型位置、dtype 和 TP 属于 deployment；当前仅支持 float16/bfloat16、TP=1，实际只验证了 eager/float16。
+采集明确生成原始 trace、轻量阶段观察和 HTTP 报告；正常测量关闭 profiler 与观察记录，独立校准只保留小型阶段计时。
+这些调用链已经实现，不表示所有后端设置或完整性能预测已验收；predict 尚不支持该框架，不将静态回放冒充 target 结果。
+
+独立阶段数据可经 maintain 的 ktransformers_phases 适配器导入既有 SQLite，显式选择来源再发布模型。
+成本查询使用 inference.prefill/decode、synchronous_phase_interval 及相应实现，测点和域外缺口沿用共同模型合同。
+模型只来自独立校准，不读 base 的 profiler 时长或正常评价；改变工作域时不能借相似后端的响应填零。
+
 ## 输入预览和采集检查
 
 ```bash

@@ -27,6 +27,11 @@ DeviceTask 统一拥有设备互斥、累计用量、实际容器恢复和终态
 C++ 适配器核对部署、固定 workload 和支持设置，再一次提取语义观察、请求端口及区域引用。
 普通预测不解析完整设备 trace，也不构造细图；manifest 仍明确声明所有来源，细图与原生因果诊断按需加载。
 
+采集工作流按框架选择适配器，设备任务仍只有一个所有者；HTTP 客户端、文本编码、服务就绪和进程组回收共用，
+框架适配器只处理原生模型、观察、配置和产物发布。KTransformers 的 dense/Torch 入口使用真实原生线性算子，
+同步阶段及其数据适配留在框架目录，不反向改变 SGLang 执行或共用核心；当前目标程序尚未接入该入口。
+分布式与非分布式导出共用 Ascend 时钟换算，非分布式调用者显式提供进程身份，不依靠猜测 rank 或内部版本判断。
+
 CacheProgram 拥有唯一的目标缓存、准入、发布和请求生命周期。它组合 RequestComputation 接口：
 正式路径用 RegionCompute 表达输入准备、batch、结果处理与发送；显式原生诊断使用 ComputeProgram。
 两者共享 CallerSchedule、资源前沿和 ProgramExecution，不各自维护缓存或局部时钟。

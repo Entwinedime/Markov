@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 
-def sample_clock():
+def sample_clock(rank: int | None = None) -> dict | None:
     import torch.distributed as dist
     import torch_npu
 
@@ -20,10 +20,10 @@ def sample_clock():
         unix_ns = time.time_ns()
         after = profiler._get_syscnt()
         samples.append({"before": before, "unix_ns": unix_ns, "after": after})
-    return {"rank": dist.get_rank(), "samples": samples, "ns_per_tick": 1000 / frequency}
+    return {"rank": dist.get_rank() if rank is None else rank, "samples": samples, "ns_per_tick": 1000 / frequency}
 
 
-def trace_clock(trace: Path, anchors: dict) -> dict:
+def trace_clock(trace: Path, anchors: dict, rank: int | None = None) -> dict:
     from torch_npu.profiler.analysis._profiler_config import ProfilerConfig
     from torch_npu.profiler.analysis.prof_common_func._path_manager import ProfilerPathManager
 
@@ -35,7 +35,10 @@ def trace_clock(trace: Path, anchors: dict) -> dict:
         raise ValueError("This Ascend capture requires recorded system-counter clock anchors")
     info = json.loads(Path(ProfilerPathManager.get_info_file_path(str(directory))).read_text())
     start, end = info["start_info"], info["end_info"]
-    anchor = anchors[info["rank_id"]]
+
+    # A non-distributed capture explicitly supplies its rank; its vendor
+    # metadata has no distributed rank field to infer one from.
+    anchor = anchors[info["rank_id"] if rank is None else rank]
     samples = anchor["samples"]
     tick = samples[0]["before"]
     tick_ns = 1000 / config._freq

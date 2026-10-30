@@ -1,0 +1,37 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B",
+    "framework": "ktransformers",
+    "runtime": "ascend",
+    "model": "/path/to/local/dense/model",
+    "dtype": "float16",
+    "tensor_parallel": 1
+  },
+  "base": {
+    "configuration": {
+      "attention_backend": "eager",
+      "cpu_threads": 2,
+      "max_context_tokens": 512
+    }
+  },
+  "workload": "workload.json",
+  "targets": [{"name": "self", "configuration": {}}],
+  "execution": {
+    "output": "../data/ktransformers",
+    "kernel_cache_initial_state": "empty",
+    "capture": {
+      "image": "markov-ktransformers:ubuntu22.04",
+      "devices": [0],
+      "memory_limit_gib": 64,
+      "cpus": 8,
+      "budget": {
+        "starts": 2,
+        "wall_sec": 300,
+        "requests": 8,
+        "input_tokens": 2000,
+        "output_tokens": 64,
+        "retained_mib": 1024
+      }
+    }
+  }
+}

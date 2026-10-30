@@ -12,7 +12,7 @@
 | R0 复盘整改 | 与 R1 合并交付 | 完整请求优先、大 base、小校准、粗粒度程序 |
 | R1 完整 SGLang 预测 | 限定范围交付 | self 与两个 cross 已运行；精度未通过 |
 | R2 用户流程与共享准备 | 限定范围交付 | 新 base、空库、整组补采、恢复、复用已运行；仅授予已测区域/备份范围 |
-| R3 保留框架与关键分支 | 实施中；回载、文件 worker、入队/准入及固定路径回放有有限证据 | 查询/轮询成本、KTransformers、真实目标 oracle、逐层/竞争仍缺 |
+| R3 保留框架与关键分支 | 实施中；SGLang 缓存及 KTransformers 采集/源回放有真实证据 | KTransformers 目标预测、真实 oracle、控制/轮询及逐层/竞争仍缺 |
 | R4 实验与资源搜索 | 未开始 | 共用预测器的矩阵和有实际取舍的有限搜索 |
 | R5 完整回归与清理 | 未开始 | 自有 60/186 格、三类报告、正常精度和同口径效率 |
 
@@ -70,7 +70,7 @@ R1 全活动 Python Ruff/格式、本批 C++ 格式与 diff whitespace 通过；
 
 源细图回放只验证观测成本下的边界。profiler 警告、时钟逆序和未闭合项仍保留；capture_completeness_proven、
 dependency_correctness_proven、normal_runtime_accuracy_proven 均未授予 true。
-当前活动源码 161 文件/21,244 行（含空行；不含 CMake、第三方和 deprecated），旧基线为 546 文件/88,814 行。
+当前活动源码 165 文件/21,817 行（含空行；不含 CMake、第三方和 deprecated），旧基线为 546 文件/88,814 行。
 规模小不表示能力已全部恢复，历史 60/186 格不能充作新结果。
 
 ## R2 已验证的前半链
@@ -196,12 +196,33 @@ self/wait_complete/best_effort/零预算 timeout 的 3,222 个已执行操作按
 证据为 data/r3/admission_checks.json、file_admission、admission_no_file、file_profile_facts.json 及两个 file_evaluation_*；原文件采样的来源和用量保留。
 这些是开发条件及固定路径证据，不是留出精度或完整目标结构认证；查询 CPU、异步键查询和真实调度轮询尚未建模完整。
 
+## R3 KTransformers 的真实输入与独立阶段成本
+
+本批从已推送 a9b0f42 开始。公共 capture/measure/calibrate 已实际运行完整 Llama-2-7B/float16、单 Ascend 910B3，
+32 层、225 个原生 KTransformersLinear/KLinearTorch 模块，同步 eager，每请求清空 KV；不是只验证 import 或截小模型。
+正常三次成功运行均为 3 请求/128 输入/9 输出，正式两个请求的完整 HTTP 为 0.511264/0.513078/0.523440 秒；没有 profiler 或 probe 文件。
+
+Base 成功采集约 86.64 MB、37.952 秒；此前一次在时钟元数据发布阶段失败，原始现场与用量保留。
+源 DAG 为 375,858 节点/422,078 边，三请求静态回放逐项零差，profiled 正式窗口为 0.724409 秒。
+该数字仅对照同次带 profiler 观察，不与正常耗时混作预测精度，也未证明全部设备因果。
+
+独立性能数据一次启动 19.609 秒，6 请求/224 输入/18 输出，无预热剔除，首次阶段由 P 单列，得到 18 个阶段计时。
+原始任务约 30 KB，含 SQLite 与导出约 71.9 KB，后处理保守记录 1.699 秒；没有采 profiler/snapshot，没有测完整驻留峰值。
+维护发布 Prefill/Decode 两类同步响应，重复导入为 0 新增/18 复用；C++ 隔离查询 4 ready/1 越域，越域耗时为 null。
+K 本批累计 7 启动，正常/来源各有一次失败，预算及失败不清零；正常启动上限 3→4，其余 600 秒/9 请求/384 输入/27 输出/128 MiB 保持。
+
+两个框架共用 HTTP 客户端、编码、健康检查与服务进程回收；新 SGLang 正常复验输出 4/4/4/4，末请求主机回载 448 tokens，四个既有预测结果逐项不变。
+该 SGLang 评价保留旧三次历史，启动上限 3→4、请求上限 12→13，其余额度不变；正常耗时波动不计作精度修复。
+公开 K plan/采集示例已接通；正式 predict 在设备启动前返回不支持，避免误把采集恢复当成目标预测完成。
+证据为 data/r3/ktransformers/checks.json、capture、independent_eager、models.json、source_replay 和 cost_queries；全部由本项目新采，没有复制旧资产。
+
 ## R3 仍要完成什么
 
-KTransformers 目前只完成镜像与原生规则核对，尚无真实完整请求；不能把现有入口或历史结果当作恢复。
+KTransformers 已有单 NPU dense 的真实来源、正常对照与独立阶段成本；目标结构生成、完整预测及共享自动准备尚缺，其他部署未验证。
 源图和执行式目标图的固定路径回放已恢复；真实 target 成本的对应、覆盖和 oracle-cost 分析仍缺，不能以显式倍率替代。
 区域回载仍是全层完成屏障，未验证逐层重叠、与旧计算争流、首次加载和全部树控制 CPU；文件入队/检查已分离，控制成本和轮询仍缺。
-下一批优先恢复 KTransformers 真实来源及共同预测切片，避免继续围绕单项缓存内部边界延后跨框架交付；同时保留真实 oracle 及必要控制成本欠项。
+下一批将 KTransformers 的语义阶段和目标工作接入共用执行器，交付 self 与受支持 cross 的完整 HTTP；不再建立第二套时钟、数据库或批次平台。
+真实 oracle 及必要控制成本欠项继续保留，不能以源静态回放或成本查询替代目标预测。
 后续控制细化先核对语义和独立可观测量，不通过扩大文件成本掩盖缺失时序。
 当前工作量核对不能替代完整因果和结构报告，不进入 R4，不按残差加倍率。
 

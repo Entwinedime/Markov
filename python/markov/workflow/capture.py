@@ -46,12 +46,17 @@ class InferenceCapture:
             return {"status": "reused", "manifest": str(self.request.base.manifest)}
         if self.settings is None:
             raise ValueError("Inference capture needs execution.capture with a runtime image, devices and budget")
-        if (self.request.deployment.framework, self.request.deployment.runtime) != ("sglang", "ascend"):
-            raise ValueError("Inference capture currently supports SGLang/Ascend; other adapters are not restored")
+        if self.request.deployment.runtime != "ascend":
+            raise ValueError("Inference capture currently supports the Ascend runtime")
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
             raise ValueError("Single-host capture needs one declared device per tensor-parallel rank")
 
-        from markov.adapters.sglang import capture as adapter
+        if self.request.deployment.framework == "sglang":
+            from markov.adapters.sglang import capture as adapter
+        elif self.request.deployment.framework == "ktransformers":
+            from markov.adapters.ktransformers import capture as adapter
+        else:
+            raise ValueError("Inference capture does not support this framework")
 
         workload = self.workload if self.workload is not None else Workload.load(self.request.workload)
         server = adapter.server_arguments(self.request.deployment, self.request.base.configuration)
