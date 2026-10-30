@@ -244,6 +244,13 @@ python3 -m markov.adapters.ascend.tensor_responses --recipe /path/to/recipe.json
 配方包含 device、warmup、repeats 和 cases；每个案例给出 operation（clone 或 concatenate）、dtype（int32 或 int64）和正整数 input_sizes，例如 clone 的 [128] 或 concatenate 的 [64, 64]。输出逐次保留预热、调用的 wall/thread CPU 时间、完成观测及数值校验。用于当前离线训练时，clone 需至少两个元素规模；cat 的每个输入段数需有两个规模，并提供至少两种段数，否则明确报告数据不足。启动、构造、同步前准备及数值核对不在主机调用计时内。
 外层仍须负责设备空闲、串行、累计预算及回收。完成观测包含同步 API，整段主线程统计没有拆出队列提交和后台发射；不能把成功采样当作目标队列成本或完整 HTTP 已恢复。
 
+需要独立设备成本时，给该采样命令加 `--trace`。正常计时结束后，另行采集已初始化的操作 trace；两次运行的计时不混用。
+在 modeling 环境执行 `markov_core tensor-work /path/to/new_capture/capture.json /path/to/tensor_device.json`，
+复用原始 DAG 的 Ascend trace 解释及独占设备服务归属，核对每次调用的实际原生提交与精确 flow 终点。
+维护请求使用 `{"adapter": "ascend_tensor_device", "capture": "/path/to/tensor_device.json"}` 导入和显式训练。
+该响应使用通用的 tensor.clone/tensor.concatenate 操作，不绑定 HiCache、模型或配置身份；当前一维连续张量仍受 dtype、元素数和输入段数约束。
+报告保留主机/后台队列边界供追溯，但不将它们当作正常 CPU 服务训练；无唯一设备归属时停止解释，不按 kernel 顺序或时间接近猜配。
+
 ### 已实现的独立成本查询
 
 ```bash
