@@ -28,6 +28,7 @@ struct PrefetchResult {
     bool examined = false, ready = false;
     std::size_t requested_pages = 0, queried_pages = 0, published_pages = 0, accepted_pages = 0, inserted_pages = 0;
     bool stopped_early = false, worker_done = false, rebased_suffix = false;
+    std::optional<graph::Time> issued_ns, first_check_ns, accepted_ns, worker_finished_ns;
 };
 
 struct StorageStats {

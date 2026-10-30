@@ -116,12 +116,16 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             if (const auto * storage = program.storage()) {
                 const auto & prefetch = storage->results()[id];
                 requests.back()["prefetch"] = {
-                    { "requested_pages", prefetch.requested_pages },
-                    {   "queried_pages",   prefetch.queried_pages },
-                    { "published_pages", prefetch.published_pages },
-                    {  "accepted_pages",  prefetch.accepted_pages },
-                    {     "worker_done",     prefetch.worker_done },
-                    {   "stopped_early",   prefetch.stopped_early }
+                    {    "requested_pages",                                                         prefetch.requested_pages },
+                    {      "queried_pages",                                                           prefetch.queried_pages },
+                    {    "published_pages",                                                         prefetch.published_pages },
+                    {     "accepted_pages",                                                          prefetch.accepted_pages },
+                    {        "worker_done",                                                             prefetch.worker_done },
+                    {      "stopped_early",                                                           prefetch.stopped_early },
+                    {          "issued_ns",                   prefetch.issued_ns ? Json(*prefetch.issued_ns) : Json(nullptr) },
+                    {     "first_check_ns",         prefetch.first_check_ns ? Json(*prefetch.first_check_ns) : Json(nullptr) },
+                    {        "accepted_ns",               prefetch.accepted_ns ? Json(*prefetch.accepted_ns) : Json(nullptr) },
+                    { "worker_finished_ns", prefetch.worker_finished_ns ? Json(*prefetch.worker_finished_ns) : Json(nullptr) }
                 };
             }
         }
@@ -171,18 +175,18 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             const auto & stats = storage->stats();
             cells.back()["host_evicted_pages"] = program.host_evicted_pages();
             cells.back()["storage"] = {
-                {         "queries",stats.queries                                    },
-                {      "prefetches",      stats.prefetches },
-                {      "read_pages",      stats.read_pages },
-                {    "copied_pages",    stats.copied_pages },
-                { "rejected_copies", stats.rejected_copies },
-                {  "write_enqueues",          stats.writes },
-                {       "new_pages",       stats.new_pages },
-                {  "existing_pages",  stats.existing_pages },
-                {            "idle",       storage->idle() },
+                {         "queries",               stats.queries                                    },
+                {      "prefetches",                                                stats.prefetches },
+                {      "read_pages",                                                stats.read_pages },
+                {    "copied_pages",                                              stats.copied_pages },
+                { "rejected_copies",                                           stats.rejected_copies },
+                {  "write_enqueues",                                                    stats.writes },
+                {       "new_pages",                                                 stats.new_pages },
+                {  "existing_pages",                                            stats.existing_pages },
+                {            "idle",                                                 storage->idle() },
                 {   "qualification",
-                 "Buffered file worker costs; query/admission remain logical. Best effort stops at admission; timeout is the earliest deadline, not measured "
-                 "scheduler polling."                     }
+                 "Buffered file worker costs. Enqueue/check are separate; pre-admission control reuses the source residual. Hash queries and earliest "
+                 "event-driven checks omit measured scheduler polling and changed control service." }
             };
         }
     }

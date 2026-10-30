@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -124,6 +125,7 @@ private:
         std::vector<std::size_t> callers;
         std::vector<graph::NodeId> admission;
         std::vector<graph::NodeId> query_submissions;
+        std::map<std::size_t, std::size_t> admission_gaps;
         bool queried = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
@@ -154,7 +156,7 @@ private:
     void wait_for_progress(ProgramRuntime & runtime);
     void respond(ProgramRuntime & runtime, std::size_t request);
     void compute(ProgramRuntime & runtime);
-    void query(ProgramRuntime & runtime, const CacheMatch & matched);
+    void query(ProgramRuntime & runtime, std::span<const PrefixId> lookup, const CacheMatch & matched);
     void publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request);
     void backup_prefix(ProgramRuntime & runtime, RadixId leaf, std::size_t request);
     void commit(ProgramRuntime & runtime, std::size_t request);

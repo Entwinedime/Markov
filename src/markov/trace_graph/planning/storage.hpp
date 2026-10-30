@@ -24,8 +24,12 @@ public:
     Storage(Cache & cache, const TokenPaths & paths, std::size_t page_tokens, std::size_t bytes_per_token, std::size_t participants, std::size_t resource_begin,
             std::size_t requests, StorageConfig config, StorageBackend backend);
     Storage(const Storage &) = delete;
-    bool prepare(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
-                 std::optional<graph::NodeId> cause);
+
+    // Issue once at enqueue; admission checks consume only the progress already
+    // published by the worker. Completion alone cannot insert a host prefix.
+    void begin_prefetch(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
+                        std::optional<graph::NodeId> cause);
+    bool check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause);
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
     bool idle() const { return prefetches_.empty() && write_queue_.empty(); }
@@ -45,6 +49,7 @@ private:
         RadixId anchor;
         std::optional<std::size_t> timer;
         std::optional<graph::NodeId> enqueue_cause;
+        std::optional<graph::NodeId> publication_cause, deadline_cause;
         bool terminated = false, stopping = false;
     };
     struct Write {
@@ -63,7 +68,7 @@ private:
     void return_read(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause);
     bool finish_read(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause);
     void stop(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause);
-    bool accept(std::size_t request);
+    bool accept(std::size_t request, graph::Time now_ns);
     void start_write(ProgramRuntime & runtime, std::optional<graph::NodeId> cause);
     bool write_page(ProgramRuntime & runtime, graph::NodeId cause);
     void touch(PrefixId key);

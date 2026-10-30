@@ -2,6 +2,7 @@
 
 #include "markov/trace_graph/planning/compute_plan.hpp"
 #include "markov/trace_graph/planning/compute_program.hpp"
+#include "markov/trace_graph/source/regions.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -30,12 +31,21 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
         for (const auto frame : source.request_frames(source.observations().requests[request].identity)) {
             const auto operations = source.frame_operations(frame);
             if (!operations.empty()) callers.insert(source.observations().work_observations[operations.front()].resource);
+            if (regions_ && source.observations().compute_frames[frame].phase == Phase::Prefill) {
+                const auto * result = source.frame_result(frame);
+                const auto gap = source.regions().frame(frame).before_preparation;
+                if (result && gap) running_[request].admission_gaps.try_emplace(result->run.resource, *gap);
+            }
         }
         if (callers.size() != backend_.participants) {
             issue_ = "request_caller_resources_unavailable";
             return;
         }
         running_[request].callers.assign(callers.begin(), callers.end());
+        if (regions_ && running_[request].admission_gaps.size() != callers.size()) {
+            issue_ = "request_admission_regions_unavailable";
+            return;
+        }
     }
     if (storage)
         storage_.emplace(cache_,
@@ -241,12 +251,15 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     const auto lookup = observed.token_paths.pages(tokens.lookup_input.value().path, page_tokens_);
     const auto matched = cache_.match(lookup);
     if (!running_[request_].queried) {
-        query(runtime, matched);
+        query(runtime, lookup, matched);
         return;
     }
-    if (storage_ && !storage_->prepare(runtime, request_, lookup, matched, cause_)) {
-        wait_for_progress(runtime);
-        return;
+    if (storage_) {
+        storage_->begin_prefetch(runtime, request_, lookup, matched, cause_);
+        if (!storage_->check_prefetch(runtime, request_, cause_)) {
+            wait_for_progress(runtime);
+            return;
+        }
     }
     running_[request_].pin = matched.device;
     cache_.pin_device(*running_[request_].pin);
@@ -293,7 +306,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     compute(runtime);
 }
 
-void CacheProgram::query(ProgramRuntime & runtime, const CacheMatch & matched) {
+void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> lookup, const CacheMatch & matched) {
     const auto & observed = source_.observations();
     const auto & request = observed.requests[request_];
     std::vector<Work> copies;
@@ -313,17 +326,26 @@ void CacheProgram::query(ProgramRuntime & runtime, const CacheMatch & matched) {
     request_stage_ = RequestStage::Querying;
     requests_[request_].query_index_copies += copies.size();
     if (regions_) {
+        if (storage_) storage_->begin_prefetch(runtime, request_, lookup, matched, cause_);
         const auto begin = runtime.next_node();
         PlannedMutation mutation{ 0, {}, {} };
         for (const auto caller : running.callers) {
             const auto node = begin + mutation.operations.size();
-            mutation.operations.push_back({ caller, Boundary{}, action(ActionKind::QuerySubmitted, request_) });
+            PlannedOperation control{ caller, Boundary{}, action(ActionKind::QuerySubmitted, request_) };
+            const auto gap = running.admission_gaps.find(caller);
+            if (gap != running.admission_gaps.end()) control.cost = SourceRegionGap{ gap->second };
+            mutation.operations.push_back(std::move(control));
             mutation.operations.push_back({ caller, Boundary{}, action(ActionKind::QueryDone, request_) });
             mutation.dependencies.push_back({ node, node + 1, graph::EdgeKind::DataDependency });
         }
-        // The source residual before preparation owns query CPU. These ports
-        // only control admission; they do not create a second charge.
-        if (submit(runtime, std::move(mutation))) pending_queries_ += running.callers.size();
+
+        // Keep the first control residual before admission, where prefetch can
+        // progress. RegionCompute must not charge that same interval again.
+        if (submit(runtime, std::move(mutation))) {
+            pending_queries_ += running.callers.size();
+            compute_stats_.source_cpu_gaps += running.admission_gaps.size();
+            running.admission_gaps.clear();
+        }
         return;
     }
     for (const auto frame_id : source_.request_frames(request.identity)) {

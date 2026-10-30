@@ -36,14 +36,18 @@ hicache_write_policy、hicache_io_backend、hicache_mem_layout，以及下述文
 hicache_storage_prefetch_policy 可选 wait_complete、best_effort、timeout。
 hicache_storage_backend_extra_config 仅接收内联 JSON 字符串，允许原生 prefetch_threshold、
 prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max 四项；不读外部 @file，其他设置明确拒绝。
-文件 worker 按独立正常采样估计；查询与准入仍为逻辑端口，best_effort 在即时准入时停止，timeout 只表示最早 deadline，
-尚未包含原生调度器轮询延迟。这两个策略的运行结果不能当作正常精度或搜索排名依据。
+文件 worker 按独立正常采样估计，发起与准入检查分开。首轮准备前的 source 控制残余在准入前支付一次，
+预取可在其间推进；这不是源控制已完成正常校正或 target 查询成本的独立预测。
+best_effort 在首次准入检查时停止，timeout 从发起计时，截止到达不直接接受缓存页。
+后续检查按可推进事件尽早唤醒，尚无原生调度器轮询延迟和变化查询成本；不能据此认证这两个策略的精度或排名。
 
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
 cache_capacity_pages 按参与进程报告 device/host 页容量；文件目标另报 host_evicted_pages，是实际回收页数而非淘汰次数。
 逐请求 prefetch 区分申请、查询命中、发布和最终接受页数，storage 汇总实际读写工作，不能只用接受页数代表 I/O 量。
+issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一仿真时钟的发起、首次检查、接受与后台返回；
+相应操作未发生时为 null。后台读完并不自动插入缓存，接受仍依赖请求端检查及已发布的前缀。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
 自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载与 buffered 文件 worker。
 文件配方不加载模型权重，不运行 HTTP 请求；在采集输出下临时构造真实 K/V 页，读写核对后删除页文件，只保留轻量计时。

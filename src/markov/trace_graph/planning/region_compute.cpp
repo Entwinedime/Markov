@@ -142,7 +142,7 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id, graph::Nod
     const auto gap = *source_.regions().frame(frame.description.source_frame).before_preparation;
     PlannedMutation mutation{
         owner_,
-        { { frame.caller, SourceRegionGap{ gap } },
+        { { frame.caller, Boundary{} },
           { frame.caller, std::cref(frame.prepare_cpu) },
           { first_resource_ + 2 * frame.rank, std::cref(frame.prepare_stream) },
           { frame.caller, std::cref(frame.prepare_return), std::nullopt, true },
@@ -154,10 +154,15 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id, graph::Nod
           { begin + 1, begin + 4, graph::EdgeKind::DataDependency },
           { begin + 3, begin + 4, graph::EdgeKind::DataDependency } }
     };
+
+    // Request admission owns the root control interval. Later frames retain
+    // their own pre-preparation residual, without recharging that first gap.
+    if (frame.previous) mutation.operations.front().cost = SourceRegionGap{ gap };
+
     if (runtime.submit(std::move(mutation))) {
         stats_.frames[id].entry = begin;
         frame.input_ready = begin + 2;
-        ++stats_.source_cpu_gaps;
+        if (frame.previous) ++stats_.source_cpu_gaps;
         ++stats_.preparations["semantic_input"].sequences;
         stats_.preparations["semantic_input"].operations += 2;
     }

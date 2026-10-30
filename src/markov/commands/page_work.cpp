@@ -230,16 +230,20 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
         if (const auto * storage = program.storage()) {
             const auto & prefetch = storage->results()[i];
             item["prefetch"] = {
-                {            "examined",        prefetch.examined },
-                {    "controller_ready",           prefetch.ready },
-                {         "worker_done",     prefetch.worker_done },
-                {     "requested_pages", prefetch.requested_pages },
-                {       "queried_pages",   prefetch.queried_pages },
-                {     "published_pages", prefetch.published_pages },
-                {      "accepted_pages",  prefetch.accepted_pages },
-                { "inserted_host_pages",  prefetch.inserted_pages },
-                {       "stopped_early",   prefetch.stopped_early },
-                {      "rebased_suffix",  prefetch.rebased_suffix }
+                {            "examined",                                                                prefetch.examined },
+                {    "controller_ready",                                                                   prefetch.ready },
+                {         "worker_done",                                                             prefetch.worker_done },
+                {     "requested_pages",                                                         prefetch.requested_pages },
+                {       "queried_pages",                                                           prefetch.queried_pages },
+                {     "published_pages",                                                         prefetch.published_pages },
+                {      "accepted_pages",                                                          prefetch.accepted_pages },
+                {           "issued_ns",                   prefetch.issued_ns ? Json(*prefetch.issued_ns) : Json(nullptr) },
+                {      "first_check_ns",         prefetch.first_check_ns ? Json(*prefetch.first_check_ns) : Json(nullptr) },
+                {         "accepted_ns",               prefetch.accepted_ns ? Json(*prefetch.accepted_ns) : Json(nullptr) },
+                {  "worker_finished_ns", prefetch.worker_finished_ns ? Json(*prefetch.worker_finished_ns) : Json(nullptr) },
+                { "inserted_host_pages",                                                          prefetch.inserted_pages },
+                {       "stopped_early",                                                           prefetch.stopped_early },
+                {      "rebased_suffix",                                                          prefetch.rebased_suffix }
             };
         }
         requests.push_back(std::move(item));
@@ -357,8 +361,8 @@ Json cache_execution(const source::SourceContext & source, std::size_t page_toke
             {    "peak_stored_pages",                                              stats.peak_stored_pages },
             {                 "idle",                                                      storage->idle() },
             {        "qualification",
-             "Native service order with inferred stage costs. Queries and admission are logical only; best effort therefore stops at immediate admission. "
-             "Timeouts use this partial cost set, not complete runtime latency. Write materialization and batch bookkeeping are charged for all pages; "
+             "Native service order with independent stage costs. This component has no request-enqueue/control region, so checks remain logical. "
+             "Timeouts use earliest checks, not measured scheduler polling. Write materialization and batch bookkeeping are charged for all pages; "
              "existing/new native set branches have separate responses."                                  }
         };
     }
