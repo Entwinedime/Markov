@@ -166,6 +166,8 @@ modeling 容器默认内存及内存加交换区上限为 320 GiB，可用 `TRAC
 
 完整 HTTP 读取 `http_client.e2e_us`；`simulated_e2e_us` / `full_graph_e2e_us` 可能含请求后的后台工作，不能混用。默认 `--diagnostics off` 走 Release，保留紧凑摘要、复现输入与失败日志；`--diagnostics full` 走 validation，增加明细和成功日志。实验需要额外源回放与结构报告时使用 `--experiment-reports`。
 
+`performance` 保存真实程序的阶段墙钟、CPU 及内存，不是模拟成本。嵌套阶段不能相加，PSS/私有页是快照，进程 RSS 峰值不能直接相加当整组峰值；整组峰值取独立容器的 cgroup 记录。排查成本查询时可用 `TRACE_GRAPH_QUERY_METRICS=1 scripts/model.sh predict ...`，额外记录查询计时与不同工作点，默认关闭，以免统计本身影响效率比较。
+
 ## 实验、搜索与评分
 
 配置例子为 [accuracy_example.json](../../configs/modeling/accuracy_example.json) 和 [search_example.json](../../configs/modeling/search_example.json)。实验支持 `--predict-only` / `--score-only`，搜索支持 `--dry-run` / `--resume`：
