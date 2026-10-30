@@ -2,6 +2,7 @@
 
 #include "markov/adapters/probes.hpp"
 
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -24,9 +25,8 @@ struct AttentionDescriptor {
 // state; their enclosing wall duration is not a second CPU service charge.
 class ProbeReader final : public adapters::ProbeReader {
 public:
-    ProbeReader(trace_graph::source::Observations & output, std::optional<bool> deterministic_sampling)
-        : adapters::ProbeReader(output),
-          deterministic_sampling_(deterministic_sampling) {}
+    ProbeReader(trace_graph::source::Observations & output, std::optional<bool> deterministic_sampling,
+                const std::optional<std::filesystem::path> & configuration);
 
 private:
     void observe(const ProbeEvent & event) override;
@@ -36,6 +36,9 @@ private:
     void observe_collective(const ProbeEvent & event);
     void observe_result(const ProbeEvent & event);
     void observe_control(const ProbeEvent & event);
+    void observe_response(const ProbeEvent & event);
+    std::optional<std::filesystem::path> configuration_;
+    std::string result_implementation_;
     std::optional<bool> deterministic_sampling_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;

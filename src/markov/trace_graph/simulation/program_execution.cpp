@@ -59,7 +59,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
             evidence.push_back({ response ? std::optional(describe()) : std::nullopt,
                                  response ? response->coverage : std::nullopt,
                                  operation.owner.value_or(mutation.owner),
-                                 operation.completion });
+                                 operation.completion,
+                                 operation.position });
     }
     if (!gaps_.empty()) {
         clock_.stop();

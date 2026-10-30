@@ -16,6 +16,16 @@ add_library(markov_graph
 target_include_directories(markov_graph PUBLIC src)
 target_compile_options(markov_graph PRIVATE -Wall -Wextra -Wpedantic)
 
+add_library(markov_work
+    src/markov/trace_graph/planning/token_paths.cpp
+    src/markov/trace_graph/planning/radix_tree.cpp
+    src/markov/trace_graph/planning/cache.cpp
+    src/markov/trace_graph/planning/compute.cpp
+    src/markov/trace_graph/planning/native_calls.cpp
+)
+target_link_libraries(markov_work PUBLIC markov_graph)
+target_compile_options(markov_work PRIVATE -Wall -Wextra -Wpedantic)
+
 add_library(markov_source
     src/markov/trace_graph/source/manifest.cpp
     src/markov/trace_graph/source/chrome_reader.cpp
@@ -29,13 +39,9 @@ add_library(markov_source
     src/markov/trace_graph/source/native_queues.cpp
     src/markov/trace_graph/source/services.cpp
     src/markov/trace_graph/source/cpu_costs.cpp
-    src/markov/trace_graph/planning/token_paths.cpp
-    src/markov/trace_graph/planning/radix_tree.cpp
-    src/markov/trace_graph/planning/cache.cpp
-    src/markov/trace_graph/planning/compute.cpp
     src/markov/trace_graph/planning/compute_plan.cpp
 )
-target_link_libraries(markov_source PUBLIC markov_graph nlohmann_json::nlohmann_json)
+target_link_libraries(markov_source PUBLIC markov_work nlohmann_json::nlohmann_json)
 target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_cost
@@ -54,7 +60,6 @@ add_library(markov_prediction
     src/markov/trace_graph/planning/storage.cpp
     src/markov/trace_graph/planning/compute_program.cpp
     src/markov/trace_graph/planning/region_compute.cpp
-    src/markov/trace_graph/planning/native_calls.cpp
     src/markov/trace_graph/simulation/program_execution.cpp
 )
 target_link_libraries(markov_prediction PUBLIC markov_source markov_cost)
@@ -63,6 +68,7 @@ target_compile_options(markov_prediction PRIVATE -Wall -Wextra -Wpedantic)
 add_library(markov_adapters
     src/markov/adapters/ktransformers/observations.cpp
     src/markov/adapters/ktransformers/prediction.cpp
+    src/markov/adapters/ktransformers/work.cpp
     src/markov/adapters/probes.cpp
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp
@@ -72,6 +78,7 @@ add_library(markov_adapters
     src/markov/adapters/ascend/trace.cpp
     src/markov/adapters/ascend/tensor_work.cpp
     src/markov/adapters/sglang/observations.cpp
+    src/markov/adapters/sglang/region_observations.cpp
     src/markov/adapters/sglang/dense.cpp
     src/markov/adapters/sglang/dense_calls.cpp
     src/markov/adapters/sglang/cache_indices.cpp
@@ -88,15 +95,21 @@ if(TRACE_GRAPH_DEBUG)
     target_compile_definitions(markov_graph PUBLIC TRACE_GRAPH_DEBUG)
 endif()
 
+add_library(markov_reports
+    src/markov/commands/io.cpp
+    src/markov/commands/costs.cpp
+    src/markov/commands/replay.cpp
+    src/markov/commands/trajectory.cpp
+)
+target_link_libraries(markov_reports PUBLIC markov_adapters)
+
 add_executable(markov_core
     src/markov/commands/serial_prediction.cpp
     src/markov/main.cpp
     src/markov/commands/source.cpp
     src/markov/commands/page_work.cpp
-    src/markov/commands/costs.cpp
     src/markov/commands/prediction.cpp
-    src/markov/commands/replay.cpp
-    src/markov/commands/trajectory.cpp
     src/markov/commands/cpu_costs.cpp
 )
-target_link_libraries(markov_core PRIVATE markov_adapters)
+target_link_libraries(markov_core PRIVATE markov_reports)
+

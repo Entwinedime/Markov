@@ -15,6 +15,8 @@ namespace markov::adapters {
 struct PredictedTrajectory {
     std::filesystem::path prediction;
     nlohmann::json cell;
+    nlohmann::json deployment;
+    std::filesystem::path source_manifest;
 };
 
 struct PreparedReplay {
@@ -27,5 +29,6 @@ struct PreparedReplay {
 // Diagnostic only: replace costs in a source DAG or recorded generated path.
 // Neither mode maps a target profile or reselects conditional execution.
 PreparedReplay prepare_replay(const std::filesystem::path & path);
+PredictedTrajectory read_trajectory(const std::filesystem::path & prediction, const std::string & target);
 
 } // namespace markov::adapters

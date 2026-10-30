@@ -3,6 +3,7 @@
 #include "markov/adapters/prediction.hpp"
 #include "markov/adapters/source.hpp"
 #include "markov/commands/costs.hpp"
+#include "markov/commands/io.hpp"
 #include "markov/commands/prediction.hpp"
 #include "markov/commands/replay.hpp"
 #include "markov/commands/source.hpp"
@@ -10,12 +11,10 @@
 
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -54,35 +53,6 @@ nlohmann::json manifest_report(const markov::trace_graph::source::ProfileManifes
     };
 }
 
-void write_report(const nlohmann::json & result, const std::filesystem::path & destination) {
-    auto pending = destination;
-    pending += ".partial";
-    std::ofstream stream(pending, std::ios::out | std::ios::noreplace);
-    if (!stream) throw std::runtime_error("Cannot write report: " + destination.string());
-    stream.exceptions(std::ios::badbit | std::ios::failbit);
-    try {
-        stream << result.dump(2) << '\n';
-        stream.close();
-        std::filesystem::rename(pending, destination);
-    }
-    catch (...) {
-        std::error_code ignored;
-        std::filesystem::remove(pending, ignored);
-        throw;
-    }
-}
-
-void prepare_output(const std::optional<std::filesystem::path> & output, const std::vector<std::filesystem::path> & inputs) {
-    if (!output) return;
-
-    auto pending = *output;
-    pending += ".partial";
-    for (const auto & input : inputs) {
-        if (*output == input || pending == input) throw std::runtime_error("Report output would replace an input: " + input.string());
-    }
-    std::filesystem::create_directories(output->parent_path());
-}
-
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -115,7 +85,7 @@ int main(int argc, char ** argv) {
                 if (source->manifest.configuration_path) inputs.push_back(*source->manifest.configuration_path);
             }
             else inputs.push_back(std::get<markov::adapters::PredictedTrajectory>(request.input).prediction);
-            prepare_output(output, inputs);
+            markov::commands::prepare_output(output, inputs);
             result = markov::commands::replay_report(request);
         }
         else if (command == "predict") {
@@ -125,7 +95,7 @@ int main(int argc, char ** argv) {
                                                        request.source.manifest.path };
             for (const auto & file : request.source.manifest.files) inputs.push_back(file.path);
             if (request.source.manifest.configuration_path) inputs.push_back(*request.source.manifest.configuration_path);
-            prepare_output(output, inputs);
+            markov::commands::prepare_output(output, inputs);
             result = markov::commands::prediction_report(request);
         }
         else if (command == "tensor-work") {
@@ -135,11 +105,11 @@ int main(int argc, char ** argv) {
                 if (!relative.empty() && *relative.begin() != "..") throw std::runtime_error("Tensor work report must be outside the raw capture directory");
             }
             result = markov::adapters::ascend::tensor_work_report(capture);
-            prepare_output(output, { capture, capture.parent_path() / "measurements.jsonl", result.at("trace").get<std::string>() });
+            markov::commands::prepare_output(output, { capture, capture.parent_path() / "measurements.jsonl", result.at("trace").get<std::string>() });
         }
         else if (command == "costs") {
             const auto queries = markov::adapters::read_cost_queries(argv[2]);
-            prepare_output(output, { std::filesystem::absolute(argv[2]).lexically_normal(), queries.models_path });
+            markov::commands::prepare_output(output, { std::filesystem::absolute(argv[2]).lexically_normal(), queries.models_path });
             const auto selected = markov::adapters::read_cost_models(queries.models_path);
             result = markov::commands::cost_report(queries, selected);
         }
@@ -157,7 +127,7 @@ int main(int argc, char ** argv) {
             if (manifest.capture_origin_manifest) inputs.push_back(*manifest.capture_origin_manifest);
             if (manifest.configuration_path) inputs.push_back(*manifest.configuration_path);
             for (const auto & file : manifest.files) inputs.push_back(file.path);
-            prepare_output(output, inputs);
+            markov::commands::prepare_output(output, inputs);
             if (page_request)
                 result = markov::commands::page_work_report(markov::adapters::prepare_source(manifest, page_request->cpu_costs_path),
                                                             page_request->page_sizes_tokens,
@@ -167,7 +137,7 @@ int main(int argc, char ** argv) {
             else result = command == "source" ? markov::commands::source_report(markov::adapters::prepare_source(manifest)) : manifest_report(manifest);
             if (selected_costs) result["models"] = page_request->models_path->string();
         }
-        if (output) write_report(result, *output);
+        if (output) markov::commands::write_report(result, *output);
         else std::cout << result.dump(2) << '\n';
         return 0;
     }

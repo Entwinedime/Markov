@@ -16,8 +16,14 @@ void SerialProgram::start(ProgramRuntime & runtime) {
             SourceClientDelay{ request.source_request, false }
         });
         mutation.operations.push_back({ 0, SourceRegionGap{ request.before_execution } });
-        for (const auto & work : request.work) mutation.operations.push_back({ 0, std::cref(work) });
+        if (runtime.records_graph()) mutation.operations.back().position = OperationPosition{ request.source_request, 0, 0, "before_execution" };
+        for (std::size_t at = 0; at < request.work.size(); ++at) {
+            mutation.operations.push_back({ 0, std::cref(request.work[at]) });
+            if (runtime.records_graph())
+                mutation.operations.back().position = OperationPosition{ request.source_request, at ? at - 1 : 0, 0, at ? "phase" : "control" };
+        }
         mutation.operations.push_back({ 0, SourceRegionGap{ request.after_execution } });
+        if (runtime.records_graph()) mutation.operations.back().position = OperationPosition{ request.source_request, 0, 0, "after_execution" };
         mutation.operations.push_back({
             0,
             SourceClientDelay{ request.source_request, true }

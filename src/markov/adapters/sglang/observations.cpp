@@ -76,6 +76,10 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
+    if (event.name.starts_with("region.")) {
+        observe_response(event);
+        return;
+    }
     const auto & name = event.name;
     const auto & args = event.args;
     const auto & process = event.process;
@@ -281,6 +285,12 @@ void ProbeReader::observe(const ProbeEvent & event) {
 }
 
 void ProbeReader::finish() {
+    for (const auto & collective : output_.collectives) {
+        auto & frame = output_.compute_frames[collective.frame];
+        if (frame.participant && *frame.participant != collective.rank)
+            throw std::runtime_error("One source frame contains conflicting collective participants");
+        frame.participant = collective.rank;
+    }
     output_.counts["result_copy_without_batch_run"] += result_copies_.size();
     output_.counts["result_send_without_processing"] += result_sends_.size();
     result_copies_.clear();

@@ -40,6 +40,7 @@ Index Observations::canonical_resource(Index resource) const {
 }
 
 void Observations::normalize_resources() {
+    for (auto & cost : cost_observations) cost.region.resource = canonical_resource(cost.region.resource);
     for (auto & execution : request_executions) execution.region.resource = canonical_resource(execution.region.resource);
     for (auto & span : spans) span.resource = canonical_resource(span.resource);
     for (auto & point : points) point.resource = canonical_resource(point.resource);

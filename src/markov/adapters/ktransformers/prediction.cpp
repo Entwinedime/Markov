@@ -1,4 +1,5 @@
 #include "markov/adapters/ktransformers/prediction.hpp"
+#include "markov/adapters/ktransformers/work.hpp"
 #include "markov/trace_graph/source/regions.hpp"
 
 #include <algorithm>
@@ -15,19 +16,6 @@ using trace_graph::planning::Work;
 std::size_t positive(const Json & value, const char * name) {
     if (!value.is_number_integer() || value.get<std::int64_t>() <= 0) throw std::runtime_error(std::string(name) + " must be positive");
     return value.get<std::size_t>();
-}
-
-std::string implementation(const Json & configuration, const std::string & mode) {
-    return "ktransformers.dense.torch:" + configuration.at("attention_backend").get<std::string>() + ":" + mode
-           + ":threads=" + std::to_string(configuration.at("cpu_threads").get<std::size_t>());
-}
-
-Work phase(const Json & configuration, const std::string & name, std::size_t query, std::size_t context, bool first, bool emit) {
-    const auto q = static_cast<double>(query), c = static_cast<double>(context);
-    return {
-        {   "inference." + name, implementation(configuration,                  emit ? "emit" : "cache_only"),         "synchronous_phase_interval" },
-        { { "query_tokens", q },      { "context_tokens", c }, { "attention_pairs", q * (2 * c - q + 1) / 2 }, { "first_phase", first ? 1.0 : 0.0 } }
-    };
 }
 
 } // namespace
@@ -87,21 +75,15 @@ std::vector<SerialPredictionTarget> prepare_targets(const Json & request, const 
             const auto prefill_steps = (input + width - 1) / width;
             const auto & ports = source.regions().request(id);
             auto & program = target.requests.emplace_back(trace_graph::planning::SerialRequest{ id, *ports.before_execution, *ports.after_execution, {} });
-            program.work.push_back({
-                {                    "inference.request_control",implementation(target.configuration,"control"),"exclusive_request_interval"                            },
-                { { "input_tokens", static_cast<double>(input) },
-                 { "prefill_steps", static_cast<double>(prefill_steps) },
-                 { "decode_steps", static_cast<double>(output - 1) },
-                 { "first_request", id == 0 ? 1.0 : 0.0 } }
-            });
+            program.work.push_back(control_work(target.configuration, input, prefill_steps, output - 1, id == 0));
             for (std::size_t begin = 0; begin < input;) {
                 const auto query = std::min(width, input - begin);
                 begin += query;
-                program.work.push_back(phase(target.configuration, "prefill", query, begin, first_prefill, begin == input));
+                program.work.push_back(phase_work(target.configuration, "prefill", query, begin, first_prefill, begin == input));
                 first_prefill = false;
             }
             for (std::size_t token = 1; token < output; ++token) {
-                program.work.push_back(phase(target.configuration, "decode", 1, input + token, first_decode, true));
+                program.work.push_back(phase_work(target.configuration, "decode", 1, input + token, first_decode, true));
                 first_decode = false;
             }
         }

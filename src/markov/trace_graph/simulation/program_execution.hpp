@@ -26,6 +26,7 @@ struct OperationEvidence {
     std::optional<cost::Coverage> coverage;
     Component owner;
     std::optional<Action> completion;
+    std::optional<planning::OperationPosition> position;
 };
 
 struct ProgramResult {
@@ -45,6 +46,7 @@ public:
                      bool record_graph = false);
     ProgramResult run();
     graph::NodeId next_node() const override { return clock_.next_node(); }
+    bool records_graph() const override { return record_graph_; }
     graph::Time now_ns() const override { return clock_.now_ns(); }
     std::optional<graph::NodeId> submit(planning::PlannedMutation mutation) override;
     std::size_t schedule_at(graph::Time time_ns, Component owner, Action action) override { return clock_.schedule_at(time_ns, owner, action); }

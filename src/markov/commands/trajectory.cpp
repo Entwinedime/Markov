@@ -64,6 +64,15 @@ nlohmann::json generated_graph_report(const simulation::ProgramResult & result) 
         node["completion_ns"] = result.execution.completions_ns[id];
         node["coverage"] = evidence.coverage ? Json(cost_coverage_name(*evidence.coverage)) : Json(nullptr);
         node["action"] = evidence.completion ? Json{ { "kind", evidence.completion->kind }, { "subject", evidence.completion->subject } } : Json(nullptr);
+        if (evidence.position) {
+            const auto & position = *evidence.position;
+            node["position"] = {
+                {     "request",                                                   position.request },
+                {   "iteration",                                                 position.iteration },
+                { "participant", position.participant ? Json(*position.participant) : Json(nullptr) },
+                {        "port",                                         std::string(position.port) }
+            };
+        }
         if (!evidence.work)
             node["origin"] = {
                 { "type", "boundary" }

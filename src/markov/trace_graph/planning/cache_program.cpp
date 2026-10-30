@@ -334,6 +334,15 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
             PlannedOperation control{ caller, Boundary{}, action(ActionKind::QuerySubmitted, request_) };
             const auto gap = running.admission_gaps.find(caller);
             if (gap != running.admission_gaps.end()) control.cost = SourceRegionGap{ gap->second };
+            if (runtime.records_graph() && gap != running.admission_gaps.end()) {
+                for (const auto frame_id : source_.request_frames(request.identity)) {
+                    const auto & frame = observed.compute_frames[frame_id];
+                    if (frame.phase == Phase::Prefill && frame.preparation_region && frame.preparation_region->resource == caller) {
+                        control.position = OperationPosition{ request_, 0, frame.participant, "before_prepare" };
+                        break;
+                    }
+                }
+            }
             mutation.operations.push_back(std::move(control));
             mutation.operations.push_back({ caller, Boundary{}, action(ActionKind::QueryDone, request_) });
             mutation.dependencies.push_back({ node, node + 1, graph::EdgeKind::DataDependency });

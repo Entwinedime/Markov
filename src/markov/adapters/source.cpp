@@ -69,8 +69,9 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     ascend::RuntimeCausality causality;
     std::unique_ptr<ProbeReader> probes;
     if (manifest.framework == "sglang")
-        probes = std::make_unique<sglang::ProbeReader>(observations, sglang::read_deterministic_sampling(manifest.configuration_path));
-    else if (manifest.framework == "ktransformers") probes = std::make_unique<ktransformers::ProbeReader>(observations);
+        probes =
+            std::make_unique<sglang::ProbeReader>(observations, sglang::read_deterministic_sampling(manifest.configuration_path), manifest.configuration_path);
+    else if (manifest.framework == "ktransformers") probes = std::make_unique<ktransformers::ProbeReader>(observations, manifest.configuration_path);
     else throw std::runtime_error("Framework probe interpretation is not implemented for " + manifest.framework);
     std::vector<std::size_t> counts;
     std::vector<std::size_t> skipped;

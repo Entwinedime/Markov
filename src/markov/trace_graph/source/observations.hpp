@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -120,6 +121,16 @@ struct RequestExecutionRegion {
     ObservedRegion region;
 };
 
+// Measured semantic responses. Request refers to the name pool, not client order.
+struct ObservedCost {
+    Index request, iteration;
+    std::optional<Index> participant;
+    std::string_view port;
+    planning::Work work;
+    Time duration_ns;
+    ObservedRegion region;
+};
+
 struct NativeQueueCall {
     Index name;
     ObservedRegion submission, execution;
@@ -157,6 +168,7 @@ struct ComputeFrame {
     std::vector<ObservedCallSequence> preparations;
     std::vector<ObservedCallSequence> lookups = {};
     std::optional<ObservedRegion> preparation_region = std::nullopt;
+    std::optional<Index> participant = std::nullopt;
 };
 
 struct CollectiveGroup {
@@ -251,6 +263,7 @@ public:
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;
     std::vector<RequestExecutionRegion> request_executions;
+    std::vector<ObservedCost> cost_observations;
     std::vector<WorkloadBarrier> workload_barriers;
     std::vector<WorkDescription> work_descriptions;
     std::vector<ObservedWork> work_observations;

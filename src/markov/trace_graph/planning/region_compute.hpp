@@ -7,6 +7,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace markov::trace_graph::planning {
@@ -90,6 +91,7 @@ private:
     void advance(ProgramRuntime & runtime, std::size_t frame);
     void process_result(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
     void finish(ProgramRuntime & runtime);
+    void identify(ProgramRuntime & runtime, PlannedMutation & mutation, const Frame & frame, std::string_view port) const;
     graph::NodeId join(ProgramRuntime & runtime, std::span<const graph::NodeId> causes, ActionKind action);
 
     const source::SourceContext & source_;

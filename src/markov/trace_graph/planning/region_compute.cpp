@@ -7,6 +7,15 @@
 
 namespace markov::trace_graph::planning {
 
+void RegionCompute::identify(ProgramRuntime & runtime, PlannedMutation & mutation, const Frame & frame, std::string_view port) const {
+    if (!runtime.records_graph()) return;
+
+    const auto participant = source_.observations().compute_frames[frame.description.source_frame].participant;
+    for (auto & operation : mutation.operations) operation.position = OperationPosition{ request_, frame.group, participant, port };
+    if (std::holds_alternative<SourceRegionGap>(mutation.operations.front().cost))
+        mutation.operations.front().position->port = port == "prepare" ? "before_prepare" : port == "batch" ? "before_batch" : "before_result";
+}
+
 Features RegionPreparation::enter(std::size_t caller, Phase phase, const FrameInput & input, std::span<const Work> preparations) {
     const auto first = phases_.emplace(caller, phase).second;
     std::size_t fresh = 0;
@@ -158,6 +167,7 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id, graph::Nod
     // Request admission owns the root control interval. Later frames retain
     // their own pre-preparation residual, without recharging that first gap.
     if (frame.previous) mutation.operations.front().cost = SourceRegionGap{ gap };
+    identify(runtime, mutation, frame, "prepare");
 
     if (runtime.submit(std::move(mutation))) {
         stats_.frames[id].entry = begin;
@@ -190,6 +200,7 @@ void RegionCompute::run_frame(ProgramRuntime & runtime, std::size_t id, graph::N
           { begin + 2, begin + 4, graph::EdgeKind::DataDependency },
           { begin + 3, begin + 4, graph::EdgeKind::DataDependency } }
     };
+    identify(runtime, mutation, frame, "batch");
     runtime.submit(std::move(mutation));
 }
 
@@ -202,6 +213,9 @@ void RegionCompute::launch_group(ProgramRuntime & runtime, std::size_t group_id)
         const auto & frame = frames_[id];
         const auto node = begin + mutation.operations.size();
         mutation.operations.push_back({ first_resource_ + 2 * frame.rank + 1, std::cref(frame.batch_stream), action(ActionKind::Ready, id) });
+        if (runtime.records_graph())
+            mutation.operations.back().position =
+                OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "batch" };
         for (const auto peer : group.frames) {
             mutation.dependencies.push_back({ *frames_[peer].entered, node, graph::EdgeKind::Synchronization });
             mutation.dependencies.push_back({ *frames_[peer].input_ready, node, graph::EdgeKind::DataDependency });
@@ -256,6 +270,7 @@ void RegionCompute::process_result(ProgramRuntime & runtime, std::size_t id, gra
         mutation.operations.push_back({ frame.caller, std::cref(frame.result_tail), action(ActionKind::ResultDone, id) });
         mutation.dependencies.push_back({ begin + 1, begin + 2, graph::EdgeKind::DataDependency });
     }
+    identify(runtime, mutation, frame, "result");
     runtime.submit(std::move(mutation));
 }
 

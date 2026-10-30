@@ -7,6 +7,18 @@
 
 namespace markov::adapters {
 
+PredictedTrajectory read_trajectory(const std::filesystem::path & prediction, const std::string & target) {
+    std::ifstream report(prediction);
+    const auto document = nlohmann::json::parse(report);
+    for (const auto & cell : document.at("cells")) {
+        if (cell.at("name") != target) continue;
+        if (!cell.at("e2e_predicted").get<bool>() || !cell.contains("execution_graph"))
+            throw std::runtime_error("Evaluation or replay needs a completed prediction recorded with execution.record_graph");
+        return { prediction, cell, document.at("deployment"), document.at("manifest").get<std::string>() };
+    }
+    throw std::runtime_error("Target is absent from the selected prediction");
+}
+
 PreparedReplay prepare_replay(const std::filesystem::path & path) {
     std::ifstream stream(path);
     const auto raw = nlohmann::json::parse(stream);
@@ -29,21 +41,7 @@ PreparedReplay prepare_replay(const std::filesystem::path & path) {
     if (raw.contains("prediction")) {
         auto prediction = std::filesystem::path(raw.at("prediction").get<std::string>());
         if (prediction.is_relative()) prediction = path.parent_path() / prediction;
-        std::ifstream report(prediction);
-        const auto document = nlohmann::json::parse(report);
-        const auto target = raw.at("target").get<std::string>();
-        for (const auto & cell : document.at("cells")) {
-            if (cell.at("name") != target) continue;
-            if (!cell.at("e2e_predicted").get<bool>() || !cell.contains("execution_graph"))
-                throw std::runtime_error("Replay needs a completed prediction recorded with execution.record_graph");
-            return {
-                PredictedTrajectory{ prediction, cell },
-                std::move(scaling),
-                std::move(overrides),
-                std::move(inspect)
-            };
-        }
-        throw std::runtime_error("Replay target is absent from the selected prediction");
+        return { read_trajectory(prediction, raw.at("target").get<std::string>()), std::move(scaling), std::move(overrides), std::move(inspect) };
     }
     if (raw.contains("target")) throw std::runtime_error("Source replay does not select a target");
     auto manifest = std::filesystem::path(raw.at("manifest").get<std::string>());
