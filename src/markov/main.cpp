@@ -1,3 +1,4 @@
+#include "markov/adapters/ascend/tensor_work.hpp"
 #include "markov/adapters/costs.hpp"
 #include "markov/adapters/source.hpp"
 #include "markov/commands/costs.hpp"
@@ -23,7 +24,8 @@ void usage(std::ostream & stream) {
     stream << "usage: markov_core inspect-manifest <profile_manifest.json> [report.json]\n"
               "       markov_core source <profile_manifest.json> [report.json]\n"
               "       markov_core page-work <page_work_request.json> [report.json]\n"
-              "       markov_core costs <cost_queries.json> [report.json]\n";
+              "       markov_core costs <cost_queries.json> [report.json]\n"
+              "       markov_core tensor-work <capture.json> [report.json]\n";
 }
 
 nlohmann::json manifest_report(const markov::trace_graph::source::ProfileManifest & manifest) {
@@ -87,7 +89,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string_view command(argv[1]);
-    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work") {
+    if (command != "inspect-manifest" && command != "source" && command != "costs" && command != "page-work" && command != "tensor-work") {
         usage(std::cerr);
         return 2;
     }
@@ -97,7 +99,12 @@ int main(int argc, char ** argv) {
         if (argc == 4) output = std::filesystem::absolute(argv[3]).lexically_normal();
 
         nlohmann::json result;
-        if (command == "costs") {
+        if (command == "tensor-work") {
+            result = markov::adapters::ascend::tensor_work_report(argv[2]);
+            const auto capture = std::filesystem::absolute(argv[2]).lexically_normal();
+            prepare_output(output, { capture, capture.parent_path() / "measurements.jsonl", result.at("trace").get<std::string>() });
+        }
+        else if (command == "costs") {
             const auto queries = markov::adapters::read_cost_queries(argv[2]);
             prepare_output(output, { std::filesystem::absolute(argv[2]).lexically_normal(), queries.models_path });
             const auto selected = markov::adapters::read_cost_models(queries.models_path);

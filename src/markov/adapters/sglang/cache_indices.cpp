@@ -16,11 +16,15 @@ public:
         for (const auto & copy : work) {
             const bool host = copy.features.at("host") != 0;
             Work clone{
-                {                                           "cache.index_clone", host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64", host ? "caller_blocking_interval" : "device_service" },
-                { { "elements", copy.features.at("pages") * input.page_tokens },                                 { "element_bytes", 8 },                                 { "tensor_rank", 1 } }
+                {                   host ? "cache.index_clone" : "tensor.clone",
+                 host ? "aten.clone:cpu:int64" : "aten.clone:npu:int64",
+                 host ? "caller_blocking_interval" : "device_service"                                                        },
+                { { "elements", copy.features.at("pages") * input.page_tokens }, { "element_bytes", 8 }, { "tensor_rank", 1 } }
             };
             NativeCall call{ clone, host ? CallKind::HostCall : CallKind::Queued, host ? std::vector<Work>{} : std::vector<Work>{ clone } };
             if (!host) {
+                call.work.features["input_tensors"] = 1;
+                call.launches.front().features["input_tensors"] = 1;
                 call.queue_name = "aclnnInplaceCopy";
                 call.worker_features = {
                     { "element_bytes", 8 },
@@ -49,7 +53,9 @@ public:
             features["tensor_rank"] = 1;
             if (!concatenate) features["source_element_bytes"] = 8;
             Work physical{
-                { operation.kind.operation, concatenate ? "aten.cat:npu:int64" : "aten.copy_:npu:int64_to_request_table", "device_service" },
+                { concatenate ? "tensor.concatenate" : operation.kind.operation,
+                 concatenate ? "aten.cat:npu:int64" : "aten.copy_:npu:int64_to_request_table",
+                 "device_service" },
                 std::move(features)
             };
             if (concatenate && physical.features.at("elements") == 0) continue;

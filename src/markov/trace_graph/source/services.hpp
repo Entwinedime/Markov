@@ -28,6 +28,7 @@ struct DeviceService {
 // Bind only observed native submissions with a unique enclosing work call and
 // an exact device start port. No nearest-time or kernel-name matching is used.
 std::vector<DeviceService> bind_device_services(const Observations & observations, const SourceGraph & graph);
+std::vector<DeviceService> bind_device_services(const Observations & observations, const SourceGraph & graph, std::span<const ObservedRegion> regions);
 
 struct CpuInterval {
     Time service_ns = 0, wait_ns = 0, residual_ns = 0, instrumentation_ns = 0, unobserved_ns = 0;

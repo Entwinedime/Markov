@@ -125,9 +125,19 @@ struct Lane {
 } // namespace
 
 std::vector<DeviceService> bind_device_services(const Observations & observations, const SourceGraph & graph) {
-    std::vector<DeviceService> result(observations.work_observations.size());
+    std::vector<ObservedRegion> regions;
+    for (const auto & work : observations.work_observations) regions.push_back({ work.resource, work.begin_ns, work.end_ns, work.record });
+    auto result = bind_device_services(observations, graph, regions);
+    for (Index id = 0; id < result.size(); ++id)
+        if (!result[id].issue && observations.work_descriptions[observations.work_observations[id].description].observed.size() != 1)
+            result[id].issue = ServiceIssue::SharedProbe;
+    return result;
+}
+
+std::vector<DeviceService> bind_device_services(const Observations & observations, const SourceGraph & graph, std::span<const ObservedRegion> regions) {
+    std::vector<DeviceService> result(regions.size());
     std::vector<Lane> lanes(observations.resources.size());
-    for (Index id = 0; id < observations.work_observations.size(); ++id) lanes[observations.work_observations[id].resource].work.push_back(id);
+    for (Index id = 0; id < regions.size(); ++id) lanes[regions[id].resource].work.push_back(id);
     for (Index id = 0; id < observations.spans.size(); ++id) {
         const auto & span = observations.spans[id];
         if (observations.resources[span.resource].kind == ResourceKind::DeviceStream) lanes[span.resource].device_spans.push_back(id);
@@ -151,7 +161,7 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
         if (lane.work.empty()) continue;
 
         std::ranges::sort(lane.work, {}, [&](Index id) {
-            const auto & call = observations.work_observations[id];
+            const auto & call = regions[id];
             return std::tuple(call.begin_ns, call.end_ns, call.record.file, call.record.position);
         });
         std::ranges::sort(lane.submissions, {}, [&](Index id) { return observations.points[observations.dependencies[id].before].time_ns; });
@@ -163,9 +173,9 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
         for (const auto submission : lane.submissions) {
             const auto & link = observations.dependencies[submission];
             const auto time = observations.points[link.before].time_ns;
-            while (next < lane.work.size() && observations.work_observations[lane.work[next]].begin_ns <= time) {
+            while (next < lane.work.size() && regions[lane.work[next]].begin_ns <= time) {
                 const auto id = lane.work[next];
-                active.emplace(observations.work_observations[id].end_ns, id);
+                active.emplace(regions[id].end_ns, id);
                 ++next;
             }
             while (!active.empty() && active.begin()->first <= time) active.erase(active.begin());
@@ -175,9 +185,6 @@ std::vector<DeviceService> bind_device_services(const Observations & observation
                 for (const auto & [end, id] : active) result[id].issue = ServiceIssue::AmbiguousOwner;
                 continue;
             }
-            if (!result[work].issue && observations.work_descriptions[observations.work_observations[work].description].observed.size() != 1)
-                result[work].issue = ServiceIssue::SharedProbe;
-
             const auto & port = observations.points[link.after];
             const auto & candidates = lanes[port.resource].device_spans;
             const auto at = std::ranges::lower_bound(candidates, port.time_ns, {}, [&](Index id) { return observations.spans[id].begin_ns; });

@@ -57,6 +57,7 @@ add_library(markov_adapters
     src/markov/adapters/source.cpp
     src/markov/adapters/ascend/causality.cpp
     src/markov/adapters/ascend/trace.cpp
+    src/markov/adapters/ascend/tensor_work.cpp
     src/markov/adapters/sglang/observations.cpp
     src/markov/adapters/sglang/dense.cpp
     src/markov/adapters/sglang/dense_calls.cpp
