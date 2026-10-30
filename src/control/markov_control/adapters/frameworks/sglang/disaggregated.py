@@ -20,13 +20,14 @@ class GraphTransport:
         self.buffers = queue.metadata_buffers
         self.kv_args = KVArgs()
         setup_state_kv_args(
-            self.kv_args, queue.token_to_kv_pool, queue.draft_token_to_kv_pool,
-            queue.scheduler.model_config.num_hidden_layers, req_to_token_pool=queue.scheduler.req_to_token_pool,
+            self.kv_args,
+            queue.token_to_kv_pool,
+            queue.draft_token_to_kv_pool,
+            queue.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=queue.scheduler.req_to_token_pool,
         )
         port = queue.scheduler.server_args.disaggregation_bootstrap_port
-        self.prefill_info_table = {
-            f"markov-prefill:{port}": SimpleNamespace(dp_size=1, follow_bootstrap_room=False)
-        }
+        self.prefill_info_table = {f"markov-prefill:{port}": SimpleNamespace(dp_size=1, follow_bootstrap_room=False)}
 
 
 class GraphSender(BaseKVSender):
@@ -40,12 +41,28 @@ class GraphSender(BaseKVSender):
     def init(self, num_kv_indices, aux_index=None):
         self.index = aux_index
 
+    def should_send_kv_chunk(self, num_pages, last_chunk):
+        self.final = last_chunk
+        return super().should_send_kv_chunk(num_pages, last_chunk)
+
     def send(self, kv_indices, state_indices=None):
-        payload = {
-            name: value[self.index].tolist()
-            for name, value in vars(self.manager.buffers).items() if isinstance(value, torch.Tensor)
-        }
-        self.manager.peer.call("transfer_submit", request=self.request, payload=payload)
+        payload = (
+            {
+                name: value[self.index].tolist()
+                for name, value in vars(self.manager.buffers).items()
+                if isinstance(value, torch.Tensor)
+            }
+            if self.final
+            else None
+        )
+        self.manager.peer.call(
+            "transfer_submit",
+            request=self.request,
+            pages=(kv_indices - 1).tolist(),
+            final=self.final,
+            metadata_slot=self.index,
+            payload=payload,
+        )
         self.sent = True
 
     def poll(self):
@@ -132,9 +149,7 @@ class ReservationQueue(decode.DecodePreallocQueue):
 
 class TransferQueue(decode.DecodeTransferQueue):
     def _commit_transfer_to_req(self, request):
-        self.scheduler.peer.call(
-            "received", request=int(request.req.rid), metadata_slot=request.metadata_buffer_index
-        )
+        self.scheduler.peer.call("received", request=int(request.req.rid), metadata_slot=request.metadata_buffer_index)
         return super()._commit_transfer_to_req(request)
 
 

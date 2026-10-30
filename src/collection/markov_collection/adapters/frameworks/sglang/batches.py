@@ -26,18 +26,26 @@ class BatchTensors:
     }
 
     @staticmethod
+    def phase(batch: Any) -> str:
+        if batch.forward_mode.is_mixed():
+            return "mixed"
+        return "prefill" if batch.forward_mode.is_extend() else "decode"
+
+    @staticmethod
     def members(batch: Any) -> list[dict[str, Any]]:
-        prefill = batch.forward_mode.is_extend()
+        lengths = batch.extend_lens if batch.forward_mode.is_extend() else [1] * len(batch.reqs)
+        decoding = {request.rid for request in batch.decoding_reqs or ()}
+
+        # Prepared columns include each member's actual input, even when cached prefix indices lag behind.
         return [
             {
                 "id": request.rid,
-                "new_tokens": request.extend_input_len if prefill else 1,
-                "context_tokens": len(request.prefix_indices)
-                if prefill
-                else len(request.origin_input_ids) + len(request.output_ids) - 1,
+                "new_tokens": tokens,
+                "context_tokens": sequence - tokens,
                 "slot": int(request.req_pool_idx),
+                "phase": "decode" if batch.forward_mode.is_decode() or request.rid in decoding else "prefill",
             }
-            for request in batch.reqs
+            for request, sequence, tokens in zip(batch.reqs, batch.seq_lens_cpu.tolist(), lengths, strict=True)
         ]
 
     @staticmethod
@@ -57,7 +65,7 @@ class BatchTensors:
     @staticmethod
     def declare_model_inputs(regions: list[dict[str, Any]], values: list[dict[str, Any]]) -> None:
         for region in regions:
-            if region["role"] not in {"Prefill", "Decode"}:
+            if region["role"] not in {"Prefill", "Decode", "Mixed"}:
                 continue
             metadata = region["metadata"]
             columns = {

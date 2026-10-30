@@ -57,8 +57,19 @@ class TensorAssignmentCall(NativeCall):
             if shape is None:
                 continue
 
-            # The native indexing binding removes leading unit axes before dispatching the assignment.
             guards = []
+            if any(not isinstance(expression, int) for expression in shape):
+
+                # An empty payload writes no elements; its observed no-op must not match nonempty copies.
+                guards.append(
+                    {
+                        "condition": ["or", *[["eq", expression, 0] for expression in shape]],
+                        "expected": 0 in tensor["shape"],
+                        "basis": "assignment_empty_payload",
+                    }
+                )
+
+            # The native indexing binding removes leading unit axes before dispatching the assignment.
             for size, expression in zip(tensor["shape"], shape, strict=True):
                 if not isinstance(expression, int):
                     guards.append(
@@ -67,7 +78,9 @@ class TensorAssignmentCall(NativeCall):
                 if size != 1:
                     break
             previous = [
-                guard for guard in metadata.get("execution_guards", []) if guard.get("basis") != "assignment_value_rank"
+                guard
+                for guard in metadata.get("execution_guards", [])
+                if guard.get("basis") not in {"assignment_value_rank", "assignment_empty_payload"}
             ]
             if guards or previous:
                 metadata["execution_guards"] = [*guards, *previous]
@@ -154,13 +167,17 @@ class TensorViewObservation(TorchFunctionMode):
         self.index = index
         self.result = None
 
+    def buffer_geometry(self, tensor: Any) -> tuple | None:
+        declared = self.buffers.get(id(tensor))
+        return declared[1] if declared is not None and declared[0] is tensor else None
+
     def __torch_function__(self, function: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
         kwargs = kwargs or {}
         if function is not torch.Tensor.__getitem__ or self.values.recording.current_scope.get() != self.scope:
             return function(*args, **kwargs)
 
-        declared = self.buffers.get(id(args[0]))
-        if declared is None or declared[0] is not args[0]:
+        geometry = self.buffer_geometry(args[0])
+        if geometry is None:
             return function(*args, **kwargs)
         if self.index is not None:
             if args[1] != self.index:
@@ -177,7 +194,7 @@ class TensorViewObservation(TorchFunctionMode):
             function,
             {},
             interface="buffer_view",
-            geometry=declared[1],
+            geometry=geometry,
             start=self.start,
         )(*args, **kwargs)
         return self.result

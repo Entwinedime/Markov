@@ -23,13 +23,15 @@ example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 
 `MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，TP 本地分片不要求现场拥有目标数量的卡；PP 采集使用实际 TP×PP 参与进程。
 
-原生入口加载镜像中安装的Python采集包；修改采集源码后也要重建`sglang-profile`，仓库挂载不会自动替换已安装的包。使用本机代理且构建网络不可达时，可通过已有的`MARKOV_BUILD_NETWORK=host`选择构建网络；运行镜像和依赖仍由同一Dockerfile制作。
+正式探索在任务准备阶段将挂载的Python采集源码安装到隔离原生容器；直接使用镜像入口则运行镜像内的包。阶段交付时重建`sglang-profile`，使镜像快照与源码一致。使用本机代理且构建网络不可达时，可通过已有的`MARKOV_BUILD_NETWORK=host`选择构建网络；运行镜像和依赖仍由同一Dockerfile制作。
 
 配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP×PP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_devices` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
 
 PP 配置可增加 `"pp": 3, "microbatch_requests": 2`；部署的 `physical_devices` 需要容纳该来源组的 TP×PP 参与者，placement 按 stage 内 TP rank 排列。当前 Ascend 实现不支持 PP2。每域的一次 PP 会话启动全部必要参与者，代表发布观察，其余角色使用独立绑定；目标使用同一控制器维护多微批次和唯一 KV 状态。
 
-P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；目标在两池内分别声明 `tp` 与容量，示例仍为双方 TP1、PP1。P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；placement 先列 P 的全部 rank，再列 D 的全部 rank。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `pool_free_pages` 报告两池可回收总量。对称/非对称 TP、双方 PP4 和 MoE 双方 TP=EP2 已有有限开发核对；原生要求 Decode PP 等于 Prefill PP 或1，来源限制和独立验证边界继续保留。
+一级缓存入口示例为 [prefix_cache.json](prefix_cache.json)：`example/automatic_graph/run.sh --input example/automatic_graph/prefix_cache.json`。输入固定Qwen3-8B、TP1，选择原生控制及`prefix_cache=true`，两种容量/并发与两份共享内容请求集共四个目标。采集适配器在一份代表会话中分组观察缓存机制，用户不指定组批。结果的`resources`允许缓存页留存；终态守恒不代替中途引用或设备内容就绪验证。MoE还需提供对应EP拓扑的路由条件，缓存键同时比较token与逐位置专家条件；路由分歧只保留此前的共同前缀，模型输入token不变。
+
+P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_graph/run.sh --input example/automatic_graph/disaggregated.json`。确认其中两张采集卡可用；目标在两池内分别声明 `tp` 与容量，示例仍为双方 TP1、PP1。P 每次处理一个完整 prompt，D 预约后接收 KV，再发布首 token 和继续 Decode；placement 先列 P 的全部 rank，再列 D 的全部 rank。源页在传输确认后释放，待合并页在下一次分配需要时通过原生模板整理；结果 `resources` 分别报告各池容量、空闲页/槽位和缓存持有量。对称/非对称 TP、双方 PP4 和 MoE 双方 TP=EP2 已有有限开发核对；原生要求 Decode PP 等于 Prefill PP 或1，来源限制和独立验证边界继续保留。
 
 MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --input example/automatic_graph/expert.json`。示例为完整 Qwen1.5 MoE、TP2/EP2，需两张实际采集卡；请求路由按层和逻辑 token 区间给出，padding 路由单独声明。它是给定路由的条件结构，仍执行 gate/top-k 等工作，不能从长度推断真实内容路由；缺少原型或来源覆盖为 partial 时如实报告。
 
@@ -37,13 +39,19 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 ## 来源复用与结果含义
 
-每次任务固定一个模型。dtype、TP、PP、EP、attention backend 和 page_size 相同的配置共享来源；每个域保留实际逻辑 rank 的本地分片。可隔离 TP 先取得必要根角色，由实际模块和原生词表分片 API 规划其余代表，再为等价 peer 生成独立绑定。原生组仍启动协议所需的参与者，模型加载后比较模块布局和角色职责，仅选代表观察与导出；PP4、EP4 复用、TP2×PP3×EP2 及限定多 rank PD 组合已有开发核对。`inputs/role-plans` 和结果的 `role_source` 区分观察与派生。不同模型或域分别建立来源，不以相似 shape 自动替代所有职责，也不声明同库跨 TP 或跨页大小变换。
+每次任务固定一个模型。dtype、TP、PP、EP、attention backend、page_size及chunk、mixed、prefix cache机制相同的配置共享来源；每个域保留实际逻辑 rank 的本地分片。可隔离 TP 先取得必要根角色，由实际模块和原生词表分片 API 规划其余代表，再为等价 peer 生成独立绑定。原生组仍启动协议所需的参与者，模型加载后比较模块布局和角色职责，仅选代表观察与导出；PP4、EP4 复用、TP2×PP3×EP2 及限定多 rank PD 组合已有开发核对。`inputs/role-plans` 和结果的 `role_source` 区分观察与派生。不同模型或域分别建立来源，不以相似 shape 自动替代所有职责，也不声明同库跨 TP 或跨页大小变换。
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 
-一键探索使用轻量控制器，基线为 FCFS、分开的 Prefill/Decode、固定输出长度和冷逻辑 KV。已有模板也可通过下文的原生控制入口运行：原生代码决定组批及PP/PD推进，核心管理KV资源和模拟完成反馈。两种控制不保证产生相同批次，当前均未启用chunk、overlap和prefix caching。
+一键探索默认使用轻量控制器，基线为 FCFS、分开的 Prefill/Decode、固定输出长度和冷逻辑 KV。先用下文命令构建control镜像，任务顶层设置 `"control": "native"` 可使用原生控制；已有模板也可通过下文的原生控制入口运行。原生代码决定组批及PP/PD推进，核心管理KV资源和模拟完成反馈，两种控制不保证产生相同批次。
 
-统一预热使用与目标序列分开的固定五请求，并按原生 ATB 上界预留 workspace；预热不计入目标服务时间，但计入采集费用。当前 runtime 规则针对 CANN 9.0/Ascend910B 的 dense 路径，workspace 预留限制为相等且不大于 128 的 head 维度。其他缓存、chunk、overlap、speculative 或内容相关路径需要相应能力。
+共同实例配置可加 `"prefill_chunk_tokens": 128`，PD放在 `pd.prefill` 内，要求原生控制、正整数且页对齐。chunk机制单独建来源域，目标chunk长度在域内变换；中间块保存KV索引并继续下一块，最终块才生成输出。单worker、dense TP2、MoE TP2/EP2、dense TP1×PP3、P1/D1、P TP2/D TP4、P/D各TP2/EP2及P/D各TP1×PP3已有分块开发核对。
+
+`"mixed_batches": true`用于共同实例，要求原生chunk控制及对应的mixed来源。当前官方FA环境下，Qwen3-8B的TP1、TP2和PP3已完成包含一级缓存的开发闭环；有限到达案例核对了就绪Decode的预算保留及后续Prefill完成。Qwen1.5 MoE的一个TP2/EP2补齐mixed批次被原生attention拒绝，该组合没有合格mixed来源；非mixed chunk/cache已有开发证据。以上不授予任意负载公平性或独立结构资格，overlap尚未开放。
+
+请求输入使用可复现的合成内容：可用workload的`prefixes`（`id`、`parent`、`tokens`）及请求的`prefix_id`声明共享部分，其余prompt和生成后缀互不共享。采集保留原生采样工作，再注入与预测相同的输出token；这是条件执行结构，不是真实文本生成。内容字段本身不启用缓存；共同实例配置或`pd.prefill`显式设置`"prefix_cache": true`，并选择原生控制及同机制来源。一级缓存已接通限定开发范围；PD仅Prefill侧缓存，Decode仍通过KV交接。单worker可与chunk组合，其他机制组合仍须各自取得证据。
+
+统一预热使用与目标序列分开的固定五请求，并按原生 ATB 上界预留 workspace；预热不计入目标服务时间，但计入采集费用。当前 runtime 规则针对 CANN 9.0/Ascend910B 的 dense 路径，workspace 预留限制为相等且不大于 128 的 head 维度。新的并行chunk/缓存组合、overlap、speculative 或其他内容相关路径需要各自的实现和证据。
 
 给定耗时改变后，完成事件会改变后续组批。一次运行完成、条件结构可展开、独立原生对照相符和性能精度通过分别判断，不能相互代替。
 
@@ -64,7 +72,7 @@ data/<UTC时间>_automatic-graph/
   work/                         SDK、观察库与尚未发布的草稿
 ```
 
-默认保留后续消费需要的规范来源与模板，随状态提交释放无引用历史。首次运行加 `--details` 才保留完整图、逐批/逐 token 记录和原始 profiler/runtime 导出；完整组合结果改写到 diagnostics。全部域资产发布后释放私有 work，即使目标结构仍为 partial。数据和构建产物不提交 Git。
+默认保留后续消费需要的规范来源与模板，随状态提交释放无引用历史。PD来源另保留每rank的`transport-rank-N.json`注册端点/地址，以及`rank-N.json`中实际复制的地址片段，用于对应原生rank、层、head和页；进程地址不进入模板或目标身份。首次运行加 `--details` 才保留完整图、逐批/逐 token 记录和原始 profiler/runtime 导出；完整组合结果改写到 diagnostics。全部域资产发布后释放私有 work，即使目标结构仍为 partial。数据和构建产物不提交 Git。
 
 恢复沿用原目录：
 
@@ -173,12 +181,18 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 | [operations.py](operations.py) | 共用操作、端口及数据依赖核对，独立于serving配对和调度 |
 | [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿；共用依赖路径查询，保持完整图中的跨rank/flow路径 |
 | [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
-| [request_state.py](request_state.py) | 根据实际提交/完成记录核对请求进度、槽位与KV页所有权；由evidence调用 |
+| [request_state.py](request_state.py) | 核对共同动作顺序、请求输入范围和输出进度；另核对终态资源及逐rank索引绑定，不重演独占页池 |
+| [resource_history.py](resource_history.py) | 核对所有者实际分配、共享绑定、传输、释放与终态，以及页归还时已提交模型/传输的设备消费者是否结束；不选择缓存策略 |
+| [operands.py](operands.py) | 按当时资源绑定核对SGLang模型入口的KV位置、槽位和长度；检查同rank/layer的attention状态存储及跨动作设备路径 |
 | [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |
 
 这些入口读取公共结果和原生事实，不回流修改被验预测。物理工作有归属不等于全部依赖已恢复；不完整参数或关联保留 partial，不能按最近时间强配。结构来源 profiler 耗时不直接成为 CPU、设备、通信成本，dummy 权重也不提供数值或内容相关行为的正确性结论。
 
-预测状态核对消费当前程序的`--details`产物，以实际提交/完成序号处理同时间戳事件，并核对模板实际返回的页与请求释放效果。检查器只记录已经发生的分配、交接和释放，不选择组批或复写页池算法；中间PP动作携带的计划效果不提前提交。当前判据限于冷KV、完整prefill、无前缀缓存和抢占，不能直接套用未来的缓存驻留或分块行为。该项自洽不代表与原生调度策略等价。
+预测状态核对消费当前程序含`resource_history`的`--details`产物，以实际提交/完成序号处理同时间戳事件。请求检查统一核对到达、连续Prefill输入段、撤回重算及输出进度，首段可从已绑定的缓存前缀开始；中间PP结果不覆盖下一块已预约的范围。资源检查从实际变更核对分配快照、共享前缀、引用、淘汰、传输页对应及图完成后的回收，并与终态身份对照，不重演另一套分配/缓存策略。
+
+资源历史只在details下生成，不记录完整token内容；按动作提交时的资源绑定与实际设备区间核对页归还晚于模型/传输消费者完成。另沿各设备队列的末端工作核对到释放动作完成端口的依赖路径，这项检查不依赖给定耗时，覆盖的前沿数记录为`release_device_frontiers`。报告的matched仅表示已声明工作和资源记录自洽，不证明设备消费者已全部采到、实际KV数值或原生目标等价。旧明细缺少资源历史时须从保留模板和输入重新预测，旧报告保持原结论，不维护绕过资源检查的兼容路径。
+
+`model_operands`进一步核对模型入口的整型内容与当时实际页绑定。attention按接口声明的持久读写存储检查同rank/layer绑定稳定，并检查前次设备完成至后次设备入口存在路径；这项路径检查不依赖某组节点耗时。它不执行backend内部的block table计算，也不验证KV浮点数值或PD搬运的逐字节地址；这些边界不能被入口索引一致或整存储依赖掩盖。
 
 执行核对还沿目标图每个输入值的实际producer，检查生产调用的CPU返回能否到达使用调用的入口，报告在`value_production`。该项保证值描述符先产生再使用，不按原生批次顺序替换目标生产者；设备内容就绪及共享存储读写保护属于另外的关系，不能仅凭描述符检查就授予这些资格。
 

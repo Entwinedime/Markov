@@ -24,6 +24,6 @@ exec docker run --rm --init --network none \
     -v "$MARKOV_DOCKER:/usr/bin/docker:ro" \
     -v "$MARKOV_COMPOSE:/usr/libexec/docker/cli-plugins/docker-compose:ro" \
     -e "MARKOV_IMAGE_PREFIX=$MARKOV_IMAGE_PREFIX" \
-    -e "PYTHONPATH=$MARKOV_ROOT/src/application:$MARKOV_ROOT/src/collection" \
+    -e "PYTHONPATH=$MARKOV_ROOT/src/application:$MARKOV_ROOT/src/collection:$MARKOV_ROOT/src/workload" \
     -w "$MARKOV_ROOT" "$MARKOV_IMAGE_PREFIX-modeling:ubuntu24.04" \
     python3 "${MARKOV_ENTRY[@]}" "$@"

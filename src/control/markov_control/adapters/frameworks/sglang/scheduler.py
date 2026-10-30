@@ -6,7 +6,9 @@ from pathlib import Path
 
 import torch
 from markov_control.adapters.frameworks.sglang.batches import BatchAllocation, NativeBatch
+from markov_control.adapters.frameworks.sglang.prefix_cache import PrefixCache
 from markov_control.adapters.frameworks.sglang.requests import NativeRequestReceiver, RequestInput
+from markov_control.adapters.frameworks.sglang.resources import ChunkIndices
 from markov_control.adapters.frameworks.sglang.runner import MetadataRunner
 from markov_control.peer import ControlPeer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -14,28 +16,38 @@ from sglang.srt.managers import schedule_batch
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.registry import register_radix_cache_backend
 from sglang.srt.model_executor import model_runner
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 class PublishedRequests:
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, allocator) -> None:
         self.identities = set()
         self.enabled = enabled
+        self.allocator = allocator
 
     def send_output(self, output, *args, **kwargs):
         if self.enabled:
             self.identities.update(output.rids)
 
     def complete(self, peer, batch, kind):
+        tail = {}
+        trace = self.allocator.trace
+        if trace is not None and trace.result_tail is not None:
+            tail["index_tail"], trace.result_tail = trace.result_tail, None
         return peer.call(
             kind,
             members=[
-                {"request": int(req.rid), "generated_tokens": len(req.output_ids),
-                 "finished": req.finished(), "emits_output": req.rid in self.identities,
-                 "metadata_slot": req.metadata_buffer_index}
+                {
+                    "request": int(req.rid),
+                    "generated_tokens": len(req.output_ids),
+                    "finished": req.finished(),
+                    "emits_output": req.rid in self.identities,
+                }
                 for req in batch.reqs
             ],
+            **tail,
         )
 
 
@@ -51,12 +63,13 @@ class ResultReady:
 
 
 class NativeScheduler(Scheduler):
-    def __init__(self, peer, settings, model_path: str, source, rank: int) -> None:
+    def __init__(self, peer, settings, model_path: str, source, rank: int, workload) -> None:
         self.peer = peer
         self.control_rank = rank
         self.graph_rank = source["ranks"][rank]
         self.control_round = 0
         model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri())
+        register_radix_cache_backend("markov", PrefixCache.build)
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog
         BatchAllocation(schedule_batch)
         schedule_batch.ScheduleBatch = NativeBatch
@@ -76,8 +89,10 @@ class NativeScheduler(Scheduler):
             max_prefill_tokens=settings["max_prefill_tokens"],
             page_size=settings["page_size"],
             attention_backend="torch_native",
-            disable_radix_cache=True,
-            chunked_prefill_size=-1,
+            disable_radix_cache=source["disable_radix_cache"],
+            radix_cache_backend="markov",
+            chunked_prefill_size=settings["prefill_chunk_tokens"] or -1,
+            enable_mixed_chunk=settings["mixed_batches"],
             disable_overlap_schedule=True,
             disable_cuda_graph=True,
             disable_custom_all_reduce=True,
@@ -95,16 +110,26 @@ class NativeScheduler(Scheduler):
             moe_dp_rank=0,
             dp_rank=None,
         )
+        if settings["mixed_batches"] != self.is_mixed_chunk:
+            raise ValueError("native configuration did not retain the requested mixed-batch mode")
+        if source["disable_radix_cache"] != self.server_args.disable_radix_cache:
+            raise ValueError("native configuration did not retain the source prefix-cache mode")
 
         # Preserve native receive, dispatch, selection, result processing and idle housekeeping.
         bootstrap = ("markov-prefill", args.disaggregation_bootstrap_port) if source["mode"] != "null" else None
+        self.request_input = RequestInput(
+            peer,
+            self.model_config.vocab_size,
+            bootstrap,
+            workload,
+            settings["expert_routes"] if not source["disable_radix_cache"] else None,
+        )
         self.request_receiver = NativeRequestReceiver(
-            replace(
-                self.request_receiver, recv_from_tokenizer=RequestInput(peer, self.model_config.vocab_size, bootstrap)
-            )
+            replace(self.request_receiver, recv_from_tokenizer=self.request_input)
         )
         self.model_worker.forward_batch_generation = self.model_result
-        self.published = PublishedRequests(self.ps.pp_rank == 0)
+        ChunkIndices(self.tree_cache, peer)
+        self.published = PublishedRequests(self.ps.pp_rank == 0, self.token_to_kv_pool_allocator)
         self.output_streamer.send_to_detokenizer = self.published
 
     def current_lane(self):
@@ -122,7 +147,25 @@ class NativeScheduler(Scheduler):
     def prepare(self, batch):
         if batch is not None:
             batch.control_work = dict(self.peer.context)
-            self.peer.call("prepare")
+            prefill = batch.forward_mode.is_extend()
+            lengths = batch.extend_lens if prefill else [1] * len(batch.reqs)
+            decoding = {req.rid for req in batch.decoding_reqs or ()}
+
+            # Final batch columns describe model input; request objects can retain older prefix-cache views.
+            self.peer.call(
+                "prepare",
+                phase="mixed" if batch.forward_mode.is_mixed() else "prefill" if prefill else "decode",
+                members=[
+                    {
+                        "request": int(req.rid),
+                        "generated_tokens": len(req.output_ids),
+                        "context_tokens": sequence - tokens,
+                        "new_tokens": tokens,
+                        "phase": "decode" if not prefill or req.rid in decoding else "prefill",
+                    }
+                    for req, sequence, tokens in zip(batch.reqs, batch.seq_lens_cpu.tolist(), lengths, strict=True)
+                ],
+            )
         return batch
 
     def update_running_batch(self, batch):
@@ -135,10 +178,12 @@ class NativeScheduler(Scheduler):
     def model_result(self, batch, **kwargs):
         self.peer.call("model")
 
-        # Workloads specify output lengths, not generated text; these token values carry only control progress.
+        # Generated values obey the same private continuation as native observations.
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
-            next_token_ids=torch.ones(len(batch.reqs), dtype=torch.int64),
+            next_token_ids=torch.tensor(
+                [self.request_input.output_token(req.rid) for req in batch.reqs], dtype=torch.int64
+            ),
             copy_done=ResultReady(self.peer, dict(self.peer.context)),
         )
 

@@ -59,7 +59,8 @@ class NativeExpertRoutes:
             return original(scheduler, batch, *args, **kwargs)
 
         previous = self.members
-        self.members = BatchTensors.members(batch)
+        with self.values.metadata():
+            self.members = BatchTensors.members(batch)
         try:
             return original(scheduler, batch, *args, **kwargs)
         finally:

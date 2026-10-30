@@ -38,6 +38,10 @@ public:
 
 private:
     Batch resident_batch(const nlohmann::json & requests, std::size_t delivered) const;
+    struct Preparation {
+        std::vector<Batch> allocations;
+        std::size_t lane;
+    };
     struct Frame {
         std::shared_ptr<const BatchWork> work;
         std::size_t lane;
@@ -46,7 +50,9 @@ private:
         std::vector<std::size_t> released_pages;
         std::set<std::string> messages;
         bool released = false;
+        std::vector<std::int64_t> generated_before{};
     };
+    void observe_progress(Frame & frame, const nlohmann::json & members) const;
     BatchEffects result_effects(const Frame & frame, const nlohmann::json & members) const;
 
     // Requests and pool outlive the participant; completed actions never retain another resource account.
@@ -55,6 +61,7 @@ private:
     std::string group_;
     std::size_t stage_;
     NativeRole role_;
+    std::map<std::size_t, Preparation> preparations_;
     std::map<std::size_t, Frame> frames_;
     std::map<std::size_t, std::shared_ptr<const BatchWork>> reservations_;
     std::map<std::size_t, std::size_t> lanes_;

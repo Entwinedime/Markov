@@ -22,6 +22,7 @@ public:
     std::size_t admission_members() const;
     void advance(Phase phase);
     void join_prefill(Phase phase);
+    void consume_running();
     std::size_t select(std::span<const BatchMember> members);
     std::optional<std::size_t> idle();
     std::map<std::string, std::size_t> decode_inputs() const;
@@ -43,6 +44,7 @@ private:
     std::set<std::string> fields_;
     std::optional<View> running_;
     std::optional<View> prefill_;
+    bool selected_ = false;
 };
 
 } // namespace markov::sglang

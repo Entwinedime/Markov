@@ -78,8 +78,9 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     const auto region_begin = graph_.regions.size();
     std::vector<RankWork> work;
     BatchProgram result{ std::nullopt, {}, {} };
-    const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute || action.step == ServingStep::Send
-                       || action.step == ServingStep::Wait || (action.step == ServingStep::Receive && !action.channel.empty())
+    const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute
+                       || (action.step == ServingStep::Send && !action.channel.empty()) || action.step == ServingStep::Wait
+                       || (action.step == ServingStep::Receive && !action.channel.empty())
                        || ((action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
     if (local) {
         for (const auto rank : group.members) {
@@ -150,14 +151,14 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
 
 BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool handoff) {
     const auto begin = graph_.operations.size();
-    const auto & batch = action.work->batch;
+    const auto & batch = action.batch_work().batch;
     auto & builder = *ranks_.at(rank);
     if (action.step == ServingStep::Prepare) flows_.try_emplace(action.flow);
     auto & flow = flows_.at(action.flow);
     BatchProgram result{ std::nullopt, {}, {} };
     switch (action.step) {
     case ServingStep::Prepare: {
-        auto prepared = builder.prepare(batch, action.lane);
+        auto prepared = builder.prepare(action.batch_work(), action.lane);
         flow.inputs[rank] = std::move(prepared.ports.outputs);
         result.completions.push_back(graph_.execution.region_call(prepared.region).returned);
         break;
@@ -224,12 +225,13 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
     }
     case ServingStep::Result: {
         const auto program = builder.complete(batch,
-                                              action.work->effects,
+                                              action.batch_work().effects,
                                               action.lane,
                                               flow.outputs.at(rank),
                                               flow.tokens.at(rank),
-                                              action.work->metadata_slots,
-                                              handoff || instance_.id == "prefill");
+                                              action.batch_work().metadata_slots,
+                                              handoff || instance_.id == "prefill",
+                                              action.batch_work().index_tail);
         result.publication = program.publication;
         result.returned_pages = program.returned_pages;
         result.completions.push_back(program.completion);

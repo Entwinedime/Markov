@@ -5,6 +5,8 @@
 #include <map>
 #include <set>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "markov/adapters/frameworks/sglang/kv_transfer.hpp"
@@ -35,11 +37,18 @@ public:
 private:
     using RankPorts = std::map<std::size_t, std::vector<std::size_t>>;
 
+    struct Offered {
+        RankPorts ready;
+        std::set<TransferBinding> consumers;
+    };
+
     struct Handoff {
         RankPorts reserved;
         RankPorts prepared;
         RankPorts transferred;
         RankPorts received;
+        std::map<TaskIdentity, Offered> offered;
+        std::map<std::pair<std::size_t, std::size_t>, std::vector<std::size_t>> copied;
         std::set<std::size_t> accepted;
         std::set<std::size_t> released;
     };

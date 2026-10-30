@@ -8,9 +8,21 @@
 
 namespace markov {
 
+const char * phase_name(Phase phase) {
+    switch (phase) {
+    case Phase::Prefill:
+        return "prefill";
+    case Phase::Decode:
+        return "decode";
+    case Phase::Mixed:
+        return "mixed";
+    }
+    throw std::logic_error("unknown serving phase");
+}
+
 std::vector<Request> Request::read(const nlohmann::json & source) {
     if (!source.is_array() || source.empty()) throw std::invalid_argument("serving needs a nonempty request array");
-    constexpr std::array fields{ "id", "arrival_ns", "prompt_tokens", "output_tokens" };
+    constexpr std::array fields{ "id", "arrival_ns", "prompt_tokens", "output_tokens", "prefix_id" };
     std::vector<Request> requests;
     for (const auto & request : source) {
         for (const auto & [name, _] : request.items()) {
@@ -23,6 +35,7 @@ std::vector<Request> Request::read(const nlohmann::json & source) {
                              request.at("arrival_ns").get<std::int64_t>(),
                              request.at("prompt_tokens").get<std::int64_t>(),
                              request.at("output_tokens").get<std::int64_t>() });
+        if (request.contains("prefix_id")) requests.back().prefix_id = request.at("prefix_id").get<std::string>();
     }
 
     // Stable arrival order gives both simulation and recorded batches the same request identities.
@@ -61,6 +74,8 @@ std::string_view ServingAction::step_name() const {
         return "batch";
     case ServingStep::Select:
         return "select";
+    case ServingStep::Retain:
+        return "retain";
     case ServingStep::Stage:
         return "stage";
     case ServingStep::Prepare:
@@ -87,6 +102,8 @@ std::string_view ServingAction::step_name() const {
         return "accept";
     case ServingStep::Release:
         return "release";
+    case ServingStep::Indices:
+        return "indices";
     }
     throw std::logic_error("unknown serving step");
 }

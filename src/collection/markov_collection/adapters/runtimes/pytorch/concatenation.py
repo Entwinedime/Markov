@@ -14,7 +14,8 @@ from markov_collection.instrumentation.calls import NativeCall
 @dataclass(frozen=True)
 class GroupRepetition:
     count: str
-    kind: Literal["reuse", "produce"]
+    kind: Literal["reuse", "produce", "map"]
+    mapping: dict[str, str] | None = None
 
 
 class ConcatenationCall(NativeCall):
@@ -38,11 +39,14 @@ class ConcatenationCall(NativeCall):
             metadata["parent_groups"] = {"segments": self.parent_group}
         if self.repetition is not None:
             metadata["group_repetitions"] = {"segments": {"count": self.repetition.count, "kind": self.repetition.kind}}
+            if self.repetition.mapping is not None:
+                metadata["group_repetitions"]["segments"]["mapping"] = self.repetition.mapping
 
         metadata["guards"] = [{"condition": ["eq", "L", 0], "expected": False}]
         metadata["entrypoint"] = "concatenate"
         metadata["argument_relations"] = [{"input_group": "segments"}, *metadata["arguments"][1:]]
         metadata["attributes"] = {"axis": axis}
+        metadata["ports"] = {"inputs": {}, "outputs": self.values.port_values({"result": result})}
 
         # The caller keeps its operand expressions; concat_extent belongs only to this interface.
         shapes = self.values.shapes

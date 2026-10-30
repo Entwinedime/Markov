@@ -234,7 +234,18 @@ class SGLangAllocation:
 
         indexed = IndexedRegions(regions, operations, values)
         for member in regions:
-            if member["metadata"].get("entrypoint") != "allocation_member":
+            metadata = member["metadata"]
+            if metadata.get("entrypoint") == "kv_allocate" and "release_pages" in metadata["ports"]["outputs"]:
+
+                # The merge clears this named pool; it is not the allocator's M-element output buffer.
+                empty = values[metadata["ports"]["outputs"]["release_pages"]]
+                producer = operations[empty["producer"]]
+                if producer["name"] != "aten.empty.memory_format" or producer["arguments"][0] != [0]:
+                    raise ValueError("native allocation must clear its deferred pool with an empty tensor")
+                empty["shape_relation"] = [0]
+                producer["argument_relations"] = [{"shape": [0]}]
+
+            if metadata.get("entrypoint") != "allocation_member":
                 continue
             written: Any = 0
             for identity in indexed.children[member["id"]]:

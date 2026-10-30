@@ -13,10 +13,9 @@ import torch
 from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation
 
 
+# CANN 9.0 SplitToConcat / IsSupportConcatDV2, commit 51abc745ad50d50ef762d0e843dae2d0cb7ea06b.
+# https://gitcode.com/cann/ops-math/blob/51abc745ad50d50ef762d0e843dae2d0cb7ea06b/conversion/concat_d/op_api/aclnn_cat.cpp
 class AscendConcatenation:
-
-    # CANN 9.0 SplitToConcat / IsSupportConcatDV2, commit 51abc745ad50d50ef762d0e843dae2d0cb7ea06b.
-    # https://gitcode.com/cann/ops-math/blob/51abc745ad50d50ef762d0e843dae2d0cb7ea06b/conversion/concat_d/op_api/aclnn_cat.cpp
     fan_in = 32
     aligned_fan_in = 512
     alignment_bytes = 32
@@ -77,9 +76,7 @@ class AscendConcatenation:
         # Mixed types already fix operand order; named ports retain which empty operand removes a cast.
         ports = {f"segment_{index}": value["id"] for index, value in enumerate(values)}
         parameters = {f"extent_{index}": value["shape"][0] for index, value in enumerate(values)}
-        contracts = [
-            {"value": value["id"], "shape": [f"extent_{index}"]} for index, value in enumerate(values)
-        ]
+        contracts = [{"value": value["id"], "shape": [f"extent_{index}"]} for index, value in enumerate(values)]
         total: Any = 0
         for name in parameters:
             total = name if total == 0 else ["add", total, name]
@@ -105,6 +102,7 @@ class AscendConcatenation:
             metadata = region["metadata"]
             if metadata.get("interface") != "concatenate":
                 continue
+            metadata.setdefault("ports", {"inputs": {}, "outputs": {"result": metadata["outputs"][0]}})
             operands = metadata["arguments"][0]
             values = [source_values[operand["value"]] for operand in operands]
             dtype = source_values[metadata["outputs"][0]]["dtype"]

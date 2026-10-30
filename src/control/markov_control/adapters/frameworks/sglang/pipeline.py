@@ -55,8 +55,12 @@ class PipelineScheduler(NativeScheduler):
     def tensor(self, geometry, work, channel):
         dtype = getattr(torch, geometry["dtype"].removeprefix("torch."))
 
-        # Proxy values never execute; sampled token placeholders drive native request progress on CPU.
-        value = torch.ones(geometry["shape"], dtype=dtype, device="meta" if channel == "proxy" else "cpu")
+        # Hidden states need only geometry; output tokens carry the declared content around the PP ring.
+        value = (
+            torch.empty(geometry["shape"], dtype=dtype, device="meta")
+            if channel == "proxy"
+            else torch.tensor(geometry["tokens"], dtype=dtype)
+        )
         self.tensor_work[value] = dict(work)
         return value
 
@@ -64,9 +68,13 @@ class PipelineScheduler(NativeScheduler):
         response = self.peer.call("model")
         values = response["values"][str(self.graph_rank)]
         if self.pp_group.is_last_rank:
+            geometry = {
+                **values["sampled_tokens"],
+                "tokens": [self.request_input.output_token(req.rid) for req in batch.reqs],
+            }
             return GenerationBatchResult(
                 logits_output=None,
-                next_token_ids=self.tensor(values["sampled_tokens"], self.peer.context, "output"),
+                next_token_ids=self.tensor(geometry, self.peer.context, "output"),
             )
         tensors = {
             name.removeprefix("proxy."): self.tensor(geometry, self.peer.context, "proxy")
@@ -86,7 +94,12 @@ class PipelineScheduler(NativeScheduler):
             "work": work,
             "channel": channel,
             "values": {
-                name: {"shape": list(value.shape), "dtype": str(value.dtype)} for name, value in tensors.items()
+                name: {
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    **({"tokens": value.tolist()} if channel == "output" else {}),
+                }
+                for name, value in tensors.items()
             },
         }
         self.peer.exchange(

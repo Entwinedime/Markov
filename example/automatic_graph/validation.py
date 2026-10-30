@@ -13,6 +13,7 @@ from typing import Any
 from markov_application.exploration import BudgetExceeded, Exploration
 from markov_application.specification import read_specification
 from markov_collection.artifacts import write_json
+from request_state import ResourceStateEvidence
 from serving import native_configuration
 
 
@@ -35,7 +36,7 @@ def analyze(task: Exploration, script: str, arguments: list[str]) -> None:
             "-v",
             f"{task.root}:{task.root}",
             "-e",
-            f"PYTHONPATH={task.root}/src/application:{task.root}/src/collection",
+            f"PYTHONPATH={task.root}/src/application:{task.root}/src/collection:{task.root}/src/workload",
             task.environment.modeling_image,
             *task.environment.limited(command, task.available("processing")),
         ],
@@ -46,13 +47,6 @@ def analyze(task: Exploration, script: str, arguments: list[str]) -> None:
 def completion_checks(target: dict[str, Any], result: dict[str, Any]) -> dict[str, bool]:
     if result["control_status"] != "complete":
         return {"control": False}
-    settings = target["configuration"]
-    recovered = (
-        result["pool_free_pages"]
-        == {role: pool["max_total_tokens"] // settings["page_size"] for role, pool in settings["pd"].items()}
-        if "pd" in settings
-        else result["free_pages"] == settings["max_total_tokens"] // settings["page_size"]
-    )
     expected = {request["id"]: request["output_tokens"] for request in target["requests"]}
     actual = {request["id"]: request["generated_tokens"] for request in result["requests"]}
     inputs = {request["id"]: request for request in target["requests"]}
@@ -65,7 +59,7 @@ def completion_checks(target: dict[str, Any], result: dict[str, Any]) -> dict[st
             for request in result["requests"]
             for field in ("arrival_ns", "prompt_tokens", "output_tokens")
         ),
-        "pool_recovery": recovered,
+        "pool_recovery": all(ResourceStateEvidence(result["resources"]).summary_checks().values()),
         "output_times": all(
             request["arrival_ns"]
             <= request["first_output_ns"]
@@ -151,6 +145,10 @@ class NativeValidation:
                 observed["serving_input"] is None or observed["serving_input"]["ep_routes"] != target["ep_routes"]
             ):
                 raise ValueError("native capture routing differs from the case")
+            for directory in self.task.acquisition.observation_directories(self.domain, self.capture):
+                content = json.loads((directory / "session.json").read_text())["content"]
+                if content != {"requests": target["requests"], "prefixes": target.get("prefixes", [])}:
+                    raise ValueError("native capture content differs from the case")
             if self.resuming and not self.interpreted():
                 self.task.prepare()
                 self.interpret()
@@ -173,9 +171,10 @@ class NativeValidation:
         )
         request["configuration"] = configuration
         request["requests"] = pairs
-        if self.domain.get("pd"):
-            request["submissions"] = [list(range(len(pairs)))]
-        request["serving_input"] = target if "ep_routes" in target else None
+
+        # Target observation replaces the discovery recipe, including its cache-priming submission groups.
+        request["submissions"] = [list(range(len(pairs)))]
+        request["serving_input"] = target
         request["observe_all_workers"] = True
         path = self.capture / "capture.json"
         write_json(path, request, indent=2)

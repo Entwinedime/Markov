@@ -17,7 +17,7 @@ class TensorGeometryObservation:
         data_shape: tuple[str | int, ...] | None = None,
         sources: tuple[Any, ...] | None = None,
         factories: dict[Any, tuple[str | int | torch.SymInt, ...]] | None = None,
-        scalars: dict[tuple[Any, str], int] | None = None,
+        scalars: dict[tuple[Any, str], int | torch.SymInt] | None = None,
     ) -> None:
         self.values = values
         self.data_shape = data_shape
@@ -54,7 +54,7 @@ class TensorGeometryObservation:
             return self.factories.get(function)
         return None
 
-    def local_geometry(self, code: Any, name: str) -> int | None:
+    def local_geometry(self, code: Any, name: str) -> int | torch.SymInt | None:
         return self.scalars.get((code, name))
 
 

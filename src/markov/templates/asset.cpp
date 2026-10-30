@@ -193,6 +193,9 @@ void TemplateAsset::validate_calls(std::size_t identity, std::vector<CallVisit> 
         if (const auto * call = std::get_if<CallStep>(&step)) {
             if (call->family) roles.push_back(*call->family);
             else validate_calls(call->layout, visiting);
+            for (const auto & [_, group] : call->input_groups) {
+                if (const auto * mapping = std::get_if<MappedGroup>(&group)) roles.push_back(mapping->family);
+            }
         }
     }
 

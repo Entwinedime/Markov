@@ -32,6 +32,29 @@ class DependencyPaths:
             missing.update((source, target) for target in targets)
         return missing
 
+    @staticmethod
+    def resource_order(graph: dict[str, Any], nodes: list[dict[str, Any]]) -> dict[int, int]:
+
+        # Construction IDs can differ from native execution order on a thread or stream.
+        previous = {
+            edge["target"]: edge["source"] for edge in graph["dependencies"] if edge["kind"] == "resource_order"
+        }
+        order: dict[int, int] = {}
+        for node in nodes:
+            cursor = node["id"]
+            path = []
+            visiting = set()
+            while cursor in previous and cursor not in order:
+                if cursor in visiting:
+                    raise ValueError("execution resource order is cyclic")
+                visiting.add(cursor)
+                path.append(cursor)
+                cursor = previous[cursor]
+            order.setdefault(cursor, 0)
+            for entry in reversed(path):
+                order[entry] = order[previous[entry]] + 1
+        return order
+
 
 class ExecutionComparison:
     api_kinds = {
@@ -50,7 +73,7 @@ class ExecutionComparison:
         self.positions = {operation["id"]: position for position, operation in enumerate(target)}
         self.execution = execution
         self.nodes = [node for node in execution["nodes"] if node.get("operation") in self.positions]
-        self.order = self.resource_order()
+        self.order = DependencyPaths.resource_order(execution, self.nodes)
 
     @staticmethod
     def issue(action: dict[str, Any]) -> tuple[int, int]:
@@ -81,30 +104,6 @@ class ExecutionComparison:
             "stream_frontiers": streams,
             "scope": ("API inventory, event/stream completion and queue drain; host service duration is separate"),
         }
-
-    def resource_order(self) -> dict[int, int]:
-
-        # Construction IDs can differ from native execution order on a thread or stream.
-        previous = {
-            edge["target"]: edge["source"]
-            for edge in self.execution["dependencies"]
-            if edge["kind"] == "resource_order"
-        }
-        order: dict[int, int] = {}
-        for node in self.nodes:
-            cursor = node["id"]
-            path = []
-            visiting = set()
-            while cursor in previous and cursor not in order:
-                if cursor in visiting:
-                    raise ValueError("execution resource order is cyclic")
-                visiting.add(cursor)
-                path.append(cursor)
-                cursor = previous[cursor]
-            order.setdefault(cursor, 0)
-            for entry in reversed(path):
-                order[entry] = order[previous[entry]] + 1
-        return order
 
     def queue_frontiers(self) -> dict[str, Any]:
         items = {}
@@ -315,11 +314,7 @@ class ExecutionComparison:
             items.sort(key=lambda item: (item["issue"][1], item["order"], item["secondary"]))
             keys = [item["key"] for item in items]
             owners = self.owner_sequences(keys)
-            candidates = [
-                resource
-                for resource, expected in target_owners.items()
-                if owners == expected
-            ]
+            candidates = [resource for resource, expected in target_owners.items() if owners == expected]
             if len(candidates) != 1:
                 return {
                     "same": None if candidates else False,

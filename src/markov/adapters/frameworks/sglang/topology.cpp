@@ -96,14 +96,15 @@ nlohmann::json ServingTopology::control_source(const TemplateAsset & asset, cons
 
     // Native worker metadata comes from the same source and rank binding used for graph expansion.
     return {
-        {           "id",                                     name },
-        {        "ranks",                   instance(name).members },
-        { "model_config",        implementation.at("model_config") },
-        {        "dtype",               implementation.at("dtype") },
-        {         "mode", implementation.at("disaggregation_mode") },
-        {           "tp",             environment.at("logical_tp") },
-        {           "ep",             environment.at("logical_ep") },
-        {           "pp",             environment.at("logical_pp") }
+        { "id", name },
+        { "ranks", instance(name).members },
+        { "model_config", implementation.at("model_config") },
+        { "dtype", implementation.at("dtype") },
+        { "mode", implementation.at("disaggregation_mode") },
+        { "disable_radix_cache", implementation.value("disable_radix_cache", true) },
+        { "tp", environment.at("logical_tp") },
+        { "ep", environment.at("logical_ep") },
+        { "pp", environment.at("logical_pp") }
     };
 }
 

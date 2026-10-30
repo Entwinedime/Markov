@@ -8,19 +8,25 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "markov/contracts/index_work.hpp"
+
 namespace markov {
 
-enum class Phase { Prefill, Decode };
+enum class Phase { Prefill, Decode, Mixed };
+
+const char * phase_name(Phase phase);
 
 struct Request {
     std::string id;
     std::int64_t arrival_ns;
     std::int64_t prompt_tokens;
     std::int64_t output_tokens;
+    std::optional<std::string> prefix_id{};
 
     static std::vector<Request> read(const nlohmann::json & source);
 };
@@ -61,6 +67,7 @@ struct BatchMember {
 
     std::optional<std::size_t> previous_page;
     std::vector<std::size_t> new_pages;
+    Phase phase;
 };
 
 // A batch is a decision snapshot; committing it remains the controller's responsibility.
@@ -85,6 +92,10 @@ struct RequestCompletion {
     bool finished;
     bool emits_output;
     std::vector<std::size_t> released_pages;
+    bool continues_prefill = false;
+
+    // Snapshot read by a cache operation; releasing a subset must not change this operand's contents.
+    std::vector<std::size_t> mapped_pages{};
 };
 
 // Effects can shape the result graph before execution; the completion event commits them later.
@@ -103,9 +114,34 @@ struct BatchWork {
     BatchEffects effects;
     std::vector<KvPageCopy> transferred_pages{};
     std::map<std::size_t, std::size_t> metadata_slots{};
+    bool final_transfer = true;
+
+    // Separate native preparations feed one model call; empty means the batch was prepared as a whole.
+    std::vector<Batch> preparations{};
+
+    // Decode's grouped index release follows native output publication inside result processing.
+    std::optional<IndexWork> index_tail{};
 };
 
-enum class ServingStep { Batch, Select, Stage, Prepare, Compute, Send, Receive, Wait, ReadResult, Result, Reserve, Model, Transfer, Accept, Release };
+enum class ServingStep {
+    Batch,
+    Select,
+    Retain,
+    Stage,
+    Prepare,
+    Compute,
+    Send,
+    Receive,
+    Wait,
+    ReadResult,
+    Result,
+    Reserve,
+    Model,
+    Transfer,
+    Accept,
+    Release,
+    Indices
+};
 
 struct TransferBinding {
     std::string source;
@@ -114,10 +150,10 @@ struct TransferBinding {
     auto operator<=>(const TransferBinding &) const = default;
 };
 
-// Task identifies one decision; flow identifies the model iteration crossing its stages.
+// Task identifies one decision; flow links continued model work or a transfer to its source send.
 struct ServingAction {
     TaskIdentity task;
-    std::shared_ptr<const BatchWork> work;
+    std::variant<std::shared_ptr<const BatchWork>, std::shared_ptr<const IndexWork>> work;
     std::int64_t scheduled_ns;
     std::size_t flow;
     std::size_t lane;
@@ -125,6 +161,9 @@ struct ServingAction {
     ServingStep step;
     std::string channel{};
     std::optional<TransferBinding> transfer{};
+
+    const BatchWork & batch_work() const { return *std::get<std::shared_ptr<const BatchWork>>(work); }
+    const IndexWork & index_work() const { return *std::get<std::shared_ptr<const IndexWork>>(work); }
 
     bool commits_requests() const { return step == ServingStep::Batch || step == ServingStep::Result || step == ServingStep::Accept; }
     std::string_view step_name() const;

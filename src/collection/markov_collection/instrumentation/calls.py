@@ -45,6 +45,7 @@ class NativeCall:
         with self.recording.scope(role, path=self.path) as scope, ExitStack() as input_bindings:
             with self.values.metadata():
                 bound = {}
+                declared_inputs = []
                 if self.signature is not None:
                     arguments = self.signature.bind(*args, **kwargs)
                     arguments.apply_defaults()
@@ -55,13 +56,18 @@ class NativeCall:
                         for attribute in attributes:
                             value = getattr(value, attribute)
                         if value is not None:
+                            declared_inputs.append(value)
                             input_bindings.enter_context(self.values.bind_input(value, axes))
 
                 scope.metadata["arguments"], scope.metadata["keywords"] = self.arguments(args, kwargs)
                 reads, writes = self.resources(bound)
                 state_writes = self.values.tensor_leaves(writes)
                 opaque = self.values.tensor_leaves(reads) + state_writes
-                scope.metadata["inputs"] = list(dict.fromkeys(self.values.references((args, kwargs, opaque))))
+
+                # Declared object fields remain graph inputs even when the enclosing object is opaque.
+                scope.metadata["inputs"] = list(
+                    dict.fromkeys(self.values.references((args, kwargs, opaque, declared_inputs)))
+                )
                 if opaque:
                     scope.metadata["opaque_inputs"] = self.values.references(opaque)
 

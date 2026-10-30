@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from markov_workload import WorkloadContent
+
 
 class ExpertRouteConditions:
     def __init__(self, model: dict[str, Any], size: int) -> None:
@@ -86,9 +88,10 @@ class ExpertRouteConditions:
 
         return result
 
-    def representative(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
+    def representative(self, requests: list[dict[str, Any]], prefixes=()) -> dict[str, Any]:
         assignments = []
         padding = []
+        content = WorkloadContent(requests, prefixes)
         width = self.experts // (self.padding + 1)
         for layer in range(self.layers):
             balanced = [
@@ -96,11 +99,26 @@ class ExpertRouteConditions:
             ]
             choices = (balanced, list(range(self.top_k)), list(range(self.experts - self.top_k, self.experts)))
             for index, request in enumerate(requests):
+                shared = content.lengths[request.get("prefix_id")]
+
+                # Shared content supplies real cache hits; private tails retain expert-load diversity.
+                if shared:
+                    assignments.append(
+                        {
+                            "request": request["id"],
+                            "layers": [layer, layer + 1],
+                            "tokens": [0, shared],
+                            "experts": balanced,
+                        }
+                    )
+                length = request["prompt_tokens"] + request["output_tokens"] - 1
+                if shared == length:
+                    continue
                 assignments.append(
                     {
                         "request": request["id"],
                         "layers": [layer, layer + 1],
-                        "tokens": [0, request["prompt_tokens"] + request["output_tokens"] - 1],
+                        "tokens": [shared, length],
                         "experts": choices[(layer + index) % len(choices)],
                     }
                 )

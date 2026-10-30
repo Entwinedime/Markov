@@ -381,6 +381,7 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         { "dependencies",   nlohmann::json::array() },
         {        "scope",     "public_source_graph" }
     };
+    if (source_.contains("execution_domain")) result["execution_domain"] = source_.at("execution_domain");
     result["external_resources"] = external_resources_;
     result["runtime_coverage"] = std::move(runtime.coverage);
     result["physical_coverage"] = std::move(device.coverage);

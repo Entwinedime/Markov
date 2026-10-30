@@ -125,7 +125,7 @@ class PrebuiltLoop(NativeLoop):
             metadata["parameters"] = {
                 "request_slot": request.req_pool_idx,
                 "prefix_tokens": len(request.prefix_indices),
-                "new_tokens": request.extend_input_len,
+                "new_tokens": request.extend_range.length,
                 "token_offset": frame.f_locals["offset"],
             }
         metadata["ports"] = {"inputs": self.values.port_values(inputs), "outputs": {}}
@@ -178,6 +178,9 @@ class PrebuiltCall(NativeCall):
         metadata.update(
             entrypoint="prebuilt_prepare" if self.prepare else "prebuilt_process",
             entrypoint_phase=None,
-            parameters={"M": sum(request.extend_input_len for request in self.batch.reqs), "B": len(self.batch.reqs)},
+            parameters={
+                "M": sum(request.extend_range.length for request in self.batch.reqs),
+                "B": len(self.batch.reqs),
+            },
             ports={"inputs": self.input_ports, "outputs": self.values.port_values(self.output_tensors)},
         )

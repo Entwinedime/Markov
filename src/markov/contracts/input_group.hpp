@@ -20,7 +20,7 @@ using GroupValues = std::map<std::string, std::vector<std::size_t>>;
 // Members share an element geometry; count and sums describe the whole collection.
 struct InputGroup {
     std::string dtype;
-    std::string device;
+    std::optional<std::string> device;
     std::vector<Expression> shape;
     std::vector<std::string> member_dtypes;
 

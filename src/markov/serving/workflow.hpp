@@ -7,6 +7,7 @@
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/execution/executor.hpp"
+#include "markov/resources/trace.hpp"
 #include "markov/templates/batch_expansion.hpp"
 
 namespace markov {
@@ -14,7 +15,7 @@ namespace markov {
 // Assemble graph effects before committing their corresponding controller state changes.
 class ServingWorkflow {
 public:
-    ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations);
+    ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations, ResourceTrace * trace = nullptr);
 
     nlohmann::json run(bool details);
 
@@ -27,6 +28,7 @@ private:
     ServingControl & controller_;
     BatchExpansion & expansion_;
     Executor executor_;
+    ResourceTrace * trace_;
 };
 
 } // namespace markov

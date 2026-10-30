@@ -9,10 +9,11 @@
 
 namespace markov {
 
-ServingWorkflow::ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations)
+ServingWorkflow::ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations, ResourceTrace * trace)
     : controller_(controller),
       expansion_(expansion),
-      executor_(durations) {}
+      executor_(durations),
+      trace_(trace) {}
 
 nlohmann::json ServingWorkflow::run(bool details) {
     nlohmann::json result{
@@ -49,14 +50,16 @@ nlohmann::json ServingWorkflow::run(bool details) {
     std::size_t state_order = 0;
 
     while (!controller_.done() || !pending.empty()) {
+        if (trace_) trace_->context(executor_.now_ns(), state_order, "plan");
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
 
             // Resolve graph work before execution acceptance; a control backend may already hold its reservations.
             auto program = expansion_.expand(*action);
-            const bool publishes = action->commits_requests() && std::ranges::any_of(action->work->effects.members, &RequestCompletion::emits_output);
+            const bool publishes = action->commits_requests() && std::ranges::any_of(action->batch_work().effects.members, &RequestCompletion::emits_output);
             if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");
             auto decision = details ? describe_action(*action, program) : nlohmann::json{};
             executor_.submit(expansion_.graph(), action->task, program);
+            if (trace_) trace_->context(executor_.now_ns(), state_order, "start", action->task);
             controller_.start(*action);
             if (details) decision["submitted_order"] = state_order++;
 
@@ -96,12 +99,13 @@ nlohmann::json ServingWorkflow::run(bool details) {
         const auto & event = *next;
         auto & work = pending.at(event.task);
         if (event.kind == ExecutionEvent::Kind::Published) {
-            record_publication(result, work.action.work->effects, event.time_ns, details);
+            record_publication(result, work.action.batch_work().effects, event.time_ns, details);
             if (details) work.decision["published_ns"] = event.time_ns;
             continue;
         }
 
         // Publication does not release pages; result-processing completion commits those effects.
+        if (trace_) trace_->context(event.time_ns, state_order, "complete", work.action.task);
         controller_.finish(work.action, work.program, event.time_ns);
         if (details) {
             work.decision["completed_ns"] = event.time_ns;
@@ -119,16 +123,27 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
     if (!expansion_.graph().execution.pending_communications().empty()) throw std::invalid_argument("serving finished with unmatched communication endpoints");
     result["control_status"] = "complete";
-    result["free_pages"] = controller_.free_pages();
     result["completed_ns"] = executor_.now_ns();
     if (details) result["execution_timeline"] = executor_.timeline();
     return result;
 }
 
 nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, const BatchProgram & program) const {
-    const auto & batch = action.work->batch;
+    if (action.step == ServingStep::Indices)
+        return {
+            {             "step",                                                       action.step_name() },
+            {     "scheduled_ns",                                                      action.scheduled_ns },
+            {             "flow",                                                              action.flow },
+            {             "lane",                                                              action.lane },
+            {            "stage",   action.stage ? nlohmann::json(*action.stage) : nlohmann::json(nullptr) },
+            { "commits_requests",                                                                    false },
+            {             "task", { { "group", action.task.group }, { "sequence", action.task.sequence } } },
+            { "index_operations",                                    action.index_work().operations.size() },
+            {  "execution_ports",   { { "publication", nullptr }, { "completions", program.completions } } }
+        };
+    const auto & batch = action.batch_work().batch;
     nlohmann::json decision{
-        {                 "phase",                                    batch.phase == Phase::Prefill ? "prefill" : "decode"                                  },
+        {                 "phase",                                                                 phase_name(batch.phase)                                  },
         {                     "M",                                                                                                        batch.new_tokens() },
         {                     "B",                                                                                                      batch.members.size() },
         {                     "R",                                                                                                    batch.request_capacity },
@@ -149,6 +164,7 @@ nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, co
     for (const auto & member : batch.members) {
         decision["members"].push_back({
             {             "id",                                                 controller_.request(member.request).id },
+            {          "phase",                                                               phase_name(member.phase) },
             {           "slot",                                                                            member.slot },
             { "context_tokens",                                                                  member.context_tokens },
             {     "new_tokens",                                                                      member.new_tokens },
@@ -163,9 +179,11 @@ nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, co
             {      "source",      action.transfer->source },
             { "destination", action.transfer->destination }
         };
-    if (!action.work->transferred_pages.empty()) {
+    if (action.step == ServingStep::Transfer || (action.step == ServingStep::Send && action.channel.empty()))
+        decision["final_transfer"] = action.batch_work().final_transfer;
+    if (!action.batch_work().transferred_pages.empty()) {
         decision["page_copies"] = nlohmann::json::array();
-        for (const auto & page : action.work->transferred_pages)
+        for (const auto & page : action.batch_work().transferred_pages)
             decision["page_copies"].push_back({
                 {      "source",      page.source },
                 { "destination", page.destination }
@@ -195,7 +213,8 @@ void ServingWorkflow::record_publication(nlohmann::json & result, const BatchEff
 
 void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json & decision, const ServingAction & action, std::int64_t time_ns,
                                         bool details) const {
-    const auto & effects = action.work->effects;
+    if (action.step == ServingStep::Indices) return;
+    const auto & effects = action.batch_work().effects;
     for (std::size_t index = 0; index < effects.members.size(); ++index) {
         const auto & member = effects.members[index];
 
@@ -203,10 +222,11 @@ void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json 
         if (action.commits_requests() && member.finished) result["requests"][member.request]["state_committed_ns"] = time_ns;
         if (details)
             decision["members"][index].update({
-                { "generated_tokens", member.generated_tokens },
-                {  "resident_tokens",  member.resident_tokens },
-                {         "finished",         member.finished },
-                {   "released_pages",   member.released_pages }
+                {  "generated_tokens",  member.generated_tokens },
+                {   "resident_tokens",   member.resident_tokens },
+                { "continues_prefill", member.continues_prefill },
+                {          "finished",          member.finished },
+                {    "released_pages",    member.released_pages }
             });
     }
 }

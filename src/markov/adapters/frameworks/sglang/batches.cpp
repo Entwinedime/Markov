@@ -29,11 +29,12 @@ std::size_t BatchViews::admission_members() const {
 
 void BatchViews::advance(Phase phase) {
     join_prefill(phase);
-    if (phase == Phase::Decode) filter(running_.value(), "decode");
+    if (phase == Phase::Decode && !selected_) filter(running_.value(), "decode");
+    selected_ = false;
 }
 
 void BatchViews::join_prefill(Phase phase) {
-    const std::string name = phase == Phase::Prefill ? "prefill" : "decode";
+    const std::string name = phase_name(phase);
 
     // Native scheduling filters the preceding Prefill before joining it to the running view.
     if (prefill_) {
@@ -46,6 +47,11 @@ void BatchViews::join_prefill(Phase phase) {
     }
 }
 
+void BatchViews::consume_running() {
+    running_.reset();
+    selected_ = false;
+}
+
 std::size_t BatchViews::select(std::span<const BatchMember> members) {
     auto & view = running_.value();
     view.kept_rows.clear();
@@ -55,6 +61,7 @@ std::size_t BatchViews::select(std::span<const BatchMember> members) {
         view.kept_rows.push_back(row - view.requests.begin());
     }
     const auto filtered = filter(view, "decode");
+    selected_ = true;
     if (view.requests.empty()) running_.reset();
     return filtered;
 }
@@ -73,7 +80,8 @@ std::optional<std::size_t> BatchViews::idle() {
     const bool finished_running = running_ && running_->kept_rows.empty();
     if (!finished_prefill && !finished_running) return std::nullopt;
 
-    const auto region = graph_.begin_composition("Schedule", "control", {}, {});
+    const bool owns_call = !graph_.composition();
+    const auto region = owns_call ? graph_.begin_composition("Schedule", "control", {}, {}) : graph_.composition().value();
 
     // Native idle scheduling filters the last Prefill before clearing the running view.
     for (auto * view : { &prefill_, &running_ }) {
@@ -82,7 +90,7 @@ std::optional<std::size_t> BatchViews::idle() {
             view->reset();
         }
     }
-    graph_.end_composition({});
+    if (owns_call) graph_.end_composition({});
     return region;
 }
 
@@ -90,10 +98,11 @@ void BatchViews::remember(Phase phase, const std::map<std::string, std::size_t> 
     View view{ columns(ports), {}, {} };
     for (std::size_t row = 0; row < effects.members.size(); ++row) {
         view.requests.push_back(effects.members[row].request);
-        if (!effects.members[row].finished) view.kept_rows.push_back(static_cast<std::int64_t>(row));
+        const auto & member = effects.members[row];
+        if (!member.finished && !member.continues_prefill) view.kept_rows.push_back(static_cast<std::int64_t>(row));
     }
 
-    (phase == Phase::Prefill ? prefill_ : running_) = std::move(view);
+    (phase == Phase::Decode ? running_ : prefill_) = std::move(view);
 }
 
 void BatchViews::live_values(std::vector<std::size_t *> & values) {

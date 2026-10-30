@@ -28,6 +28,31 @@ class CollectiveCall(NativeCall):
         ]
 
     @staticmethod
+    def declare_gather_shape(metadata: dict[str, Any], values: list[dict[str, Any]]) -> list[Any] | None:
+        source, output = metadata["inputs"][0], metadata["outputs"][0]
+        shape = values[source]["shape_relation"]
+        if shape is None:
+            return None
+
+        # B and padded B are caller expressions; the same native API consumes local tensor extents.
+        axes = {f"collective_dim_{axis}": axis for axis, size in enumerate(shape) if not isinstance(size, int)}
+        metadata.setdefault("parameters", {}).update(
+            {name: values[source]["shape"][axis] for name, axis in axes.items()}
+        )
+        metadata.setdefault("call_parameters", {}).update({name: shape[axis] for name, axis in axes.items()})
+        local = list(shape)
+        for name, axis in axes.items():
+            local[axis] = name
+        result = list(local)
+        spec = metadata["communication"]
+        axis = spec["dimension"]
+        result[axis] = ["mul", spec["size"], result[axis]]
+        metadata["shape_contracts"] = [
+            item for item in metadata.get("shape_contracts", []) if item["value"] not in (source, output)
+        ] + [{"value": source, "shape": local}, {"value": output, "shape": result}]
+        return local
+
+    @staticmethod
     def bind_transports(
         regions: list[dict[str, Any]], operations: list[dict[str, Any]], values: list[dict[str, Any]]
     ) -> None:
@@ -52,8 +77,7 @@ class CollectiveCall(NativeCall):
             # Mark the actual backend call; all-gather's later layout work remains local device work.
             transport["communication"] = True
             if primitive == "all_gather" and not metadata["communication"].get("buffered_output"):
-                source = values[metadata["inputs"][0]]
-                shape = source["shape_relation"]
+                shape = CollectiveCall.declare_gather_shape(metadata, values)
                 if shape is None:
                     continue
 
@@ -147,7 +171,7 @@ class ProcessGroupObservation:
             from sglang.srt.managers.io_struct import ProfileReqOutput, ProfileReqType
 
             # The native Torch profiler stops with a TP/DP barrier, including peers without an exporter.
-            if request.type == ProfileReqType.STOP_PROFILE:
+            if request.req_type == ProfileReqType.STOP_PROFILE:
                 distributed.barrier(manager.dp_tp_cpu_group)
 
             # This worker still serves the group; only observation and export are skipped.

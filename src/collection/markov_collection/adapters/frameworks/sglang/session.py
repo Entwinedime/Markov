@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
+
+from markov_workload import WorkloadContent
 
 from markov_collection.artifacts import write_json
 
@@ -31,6 +33,7 @@ class NativeServingSession:
         attention_backend: str = "ascend",
         observe_all_workers: bool = False,
         serving_input: dict[str, Any] | None = None,
+        submissions: Sequence[Sequence[int]] | None = None,
     ) -> None:
 
         self.native_group = pp_size > 1 or ep_size > 1 or observe_all_workers
@@ -53,6 +56,11 @@ class NativeServingSession:
         self.native_library = native_library
         self.observe_all_workers = observe_all_workers
         self.serving_input = serving_input
+        self.submissions = [list(range(len(requests)))] if submissions is None else submissions
+        if not all(self.submissions) or sorted(index for group in self.submissions for index in group) != list(
+            range(len(requests))
+        ):
+            raise ValueError("native submissions must contain every request exactly once")
         if (
             serving_input is not None
             and tuple((request["prompt_tokens"], request["output_tokens"]) for request in serving_input["requests"])
@@ -91,15 +99,19 @@ class NativeServingSession:
         return (*initial, (tail[0], 3))
 
     @staticmethod
-    def check_responses(responses: Iterable[dict[str, Any]], expected: dict[str, int]) -> None:
+    def check_responses(
+        responses: Iterable[dict[str, Any]], expected: dict[str, int], tokens: dict[str, int] | None = None
+    ) -> None:
         completed = set()
         for response in responses:
             metadata = response["meta_info"]
+            identity = metadata["id"]
+            if tokens is not None and any(token != tokens[identity] for token in response["output_ids"]):
+                raise RuntimeError(f"native request {identity} did not preserve its declared synthetic output")
             reason = metadata["finish_reason"]
             if reason is None:
                 continue
 
-            identity = metadata["id"]
             if reason["type"] != "length" or metadata["completion_tokens"] != expected[identity]:
                 raise RuntimeError(f"native request {identity} did not finish its fixed output: {reason}")
             completed.add(identity)
@@ -109,18 +121,42 @@ class NativeServingSession:
 
     def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
         print(f"markov: native {prefix}begin", flush=True)
-        response = engine.generate(
-            input_ids=[[1] * prompt for prompt, _ in requests],
-            sampling_params=[
-                {"max_new_tokens": output, "temperature": 0, "ignore_eos": True} for _, output in requests
-            ],
-            rid=[f"{prefix}{index}" for index in range(len(requests))],
-            stream=True,
-        )
+        source = self.content_input(requests, self.serving_input if prefix != "warmup/" else None)
+        content = WorkloadContent(source["requests"], source["prefixes"])
+        content.check_vocabulary(engine.tokenizer_manager.model_config.vocab_size)
+        groups = [list(range(len(requests)))] if prefix == "warmup/" else self.submissions
+        for indices in groups:
 
-        # HTTP success and a closed stream can still contain aborted native requests.
-        self.check_responses(response, {f"{prefix}{index}": output for index, (_, output) in enumerate(requests)})
+            # Grouped discovery keeps the same content IDs and native cache across submissions.
+            response = engine.generate(
+                input_ids=[content.prompt(source["requests"][index]["id"]) for index in indices],
+                sampling_params=[
+                    {"max_new_tokens": requests[index][1], "temperature": 0, "ignore_eos": True} for index in indices
+                ],
+                rid=[f"{prefix}{index}" for index in indices],
+                stream=True,
+            )
+
+            # HTTP success and a closed stream can still contain aborted native requests.
+            tokens = (
+                None
+                if prefix == "warmup/"
+                else {f"{prefix}{index}": content.output_token(source["requests"][index]["id"]) for index in indices}
+            )
+            self.check_responses(response, {f"{prefix}{index}": requests[index][1] for index in indices}, tokens)
         print(f"markov: native {prefix}complete", flush=True)
+
+    @staticmethod
+    def content_input(requests, source=None) -> dict:
+        return {
+            "requests": source["requests"]
+            if source is not None
+            else [
+                {"id": str(index), "prompt_tokens": prompt, "output_tokens": output}
+                for index, (prompt, output) in enumerate(requests)
+            ],
+            "prefixes": source.get("prefixes", []) if source is not None else [],
+        }
 
     @staticmethod
     def reset(engine: object) -> None:
@@ -154,6 +190,8 @@ class NativeServingSession:
             "ep_size": self.ep_size,
             "observe_all_workers": self.observe_all_workers,
             "serving_input": self.serving_input,
+            "content": self.content_input(self.requests, self.serving_input),
+            "submissions": self.submissions,
         }
         if self.tp_size > 1 and not self.native_group:
             session["shard"] = {"size": self.tp_size, "rank": self.rank}
@@ -183,9 +221,7 @@ class NativeServingSession:
             **expert_options,
             load_format="dummy",
             attention_backend=self.attention_backend,
-            **self.configuration,
-            chunked_prefill_size=-1,
-            disable_radix_cache=True,
+            **{"chunked_prefill_size": -1, "disable_radix_cache": True, **self.configuration},
             disable_overlap_schedule=True,
             disable_cuda_graph=True,
             mem_fraction_static=0.8,
@@ -242,7 +278,8 @@ class NativeServingSession:
             "configuration": self.configuration,
             "matrix_selection": self.matrix_selection,
             "worker_limits": engine._scheduler_init_result.scheduler_infos,
-            "routing_source": "workload" if self.serving_input is not None else "native",
+            "routing_source": "workload" if (self.serving_input or {}).get("ep_routes") else "native",
+            "content_source": "declared_prefixes_and_private_continuations",
         }
         write_json(self.output / "session-summary.json", summary, indent=2)
         print(json.dumps(summary))

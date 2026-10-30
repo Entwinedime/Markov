@@ -16,6 +16,12 @@ def native_configuration(settings: dict[str, Any]) -> dict[str, int]:
     configuration = {name: settings[name] for name in ("page_size", "max_running_requests", "max_total_tokens")}
     if "max_prefill_tokens" in settings:
         configuration["max_prefill_tokens"] = settings["max_prefill_tokens"]
+    if "prefill_chunk_tokens" in settings:
+        configuration["chunked_prefill_size"] = settings["prefill_chunk_tokens"]
+    if "mixed_batches" in settings:
+        configuration["enable_mixed_chunk"] = settings["mixed_batches"]
+    if "prefix_cache" in settings:
+        configuration["disable_radix_cache"] = not settings["prefix_cache"]
     if settings.get("pp", 1) > 1:
         configuration["pp_async_batch_depth"] = 0
         if "microbatch_requests" in settings:
@@ -58,8 +64,7 @@ if __name__ == "__main__":
         pp_size = settings.get("pp", pp_size)
         ep_size = settings.get("ep", {}).get("size", 1)
         configuration = native_configuration({**settings, "pp": pp_size})
-        if "ep" in settings:
-            serving_input = specification
+        serving_input = specification
 
     if tp_size < 1 or not 0 <= arguments.rank < tp_size:
         parser.error("rank must be in [0, tp-size)")

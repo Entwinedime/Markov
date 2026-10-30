@@ -15,6 +15,8 @@
 
 namespace markov {
 
+class ResourceTrace;
+
 // Assemble one serving run; CLI owns input assets and the optional native transport.
 class ServingSimulation {
 public:
@@ -22,8 +24,9 @@ public:
     nlohmann::json run(bool details);
 
 private:
-    nlohmann::json joint(bool details);
-    nlohmann::json disaggregated(bool details);
+    std::int64_t prefill_chunk_tokens(const nlohmann::json & pool, const ServingSettings & settings) const;
+    nlohmann::json joint(ResourceTrace * trace);
+    nlohmann::json disaggregated(ResourceTrace * trace);
 
     std::span<const TemplateAsset> assets_;
     const nlohmann::json & input_;

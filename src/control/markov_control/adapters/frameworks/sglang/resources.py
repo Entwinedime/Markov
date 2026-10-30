@@ -25,7 +25,15 @@ class RequestSlots:
         return [slot + 1 for slot in self.peer.call("free_slots")]
 
     def alloc(self, reqs):
-        bindings = self.peer.call("slots", members=[{"request": int(req.rid)} for req in reqs])
+        members = []
+        for req in reqs:
+            member = {"request": int(req.rid)}
+
+            # The opaque core handle supplies cached pages; any uncached tail remains request-owned.
+            if req.last_node is not None:
+                member["prefix"] = {"node": req.last_node, "tokens": len(req.prefix_indices)}
+            members.append(member)
+        bindings = self.peer.call("slots", members=members)
         for req, binding in zip(reqs, bindings, strict=True):
             req.req_pool_idx = binding["slot"] + 1
         return [req.req_pool_idx for req in reqs]
@@ -47,6 +55,22 @@ class KvStorage:
         return None
 
 
+class ChunkIndices:
+    def __init__(self, cache, peer: ControlPeer) -> None:
+        self.native_retain = cache.cache_unfinished_req
+        self.trace = getattr(cache, "trace", None)
+        self.peer = peer
+        cache.cache_unfinished_req = self.retain
+
+    def retain(self, request, chunked=False):
+        result = self.native_retain(request, chunked=chunked)
+
+        # Preserve native call timing; a saved chunk is consumed by the following scheduling decision.
+        if chunked and self.trace is None:
+            self.peer.call("retain", request=int(request.rid))
+        return result
+
+
 class PageAllocator:
     def __init__(self, peer: ControlPeer, size: int, page_size: int) -> None:
         self.peer = peer
@@ -59,6 +83,7 @@ class PageAllocator:
         self.tokens = []
         self.group = None
         self.reservation = None
+        self.trace = None
 
     def available_size(self):
         return self.peer.call("capacity")["pages"] * self.page_size
@@ -75,9 +100,9 @@ class PageAllocator:
             bindings = self.peer.call("allocate", phase=self.phase, members=members)
         else:
             req = self.reservation
-            bindings = self.peer.call("reserve_pages", phase="prefill", members=[
-                {"request": int(req.rid), "tokens": req.kv_allocated_len}
-            ])
+            bindings = self.peer.call(
+                "reserve_pages", phase="prefill", members=[{"request": int(req.rid), "tokens": req.kv_allocated_len}]
+            )
 
         # SGLang reserves physical page zero; core identities start at zero.
         indices = [index + self.page_size for binding in bindings for index in binding["indices"]]
@@ -95,6 +120,15 @@ class PageAllocator:
         return self.allocate()
 
     def free(self, indices):
+        if self.trace is not None:
+            with self.trace.metadata():
+                pages = torch.unique(indices // self.page_size - 1).tolist()
+            pending = sum(tensor.numel() for tensor in self.group) if self.group is not None else 0
+            mode = "immediate" if self.group is None else "deferred"
+            self.trace.release([indices], pages, mode, pending)
+            if self.group is not None and indices.numel() != 0:
+                self.group.append(indices)
+            return
         if indices.numel() == 0:
             return
         if self.group is not None:
@@ -110,4 +144,9 @@ class PageAllocator:
         pending = self.group
         self.group = None
         if pending:
-            self.free(torch.cat(pending))
+            if self.trace is None:
+                self.free(torch.cat(pending))
+            else:
+                pages = torch.unique(torch.cat(pending) // self.page_size - 1).tolist()
+                self.trace.release(pending, pages, "group")
+                self.peer.call("release_pages", pages=pages)

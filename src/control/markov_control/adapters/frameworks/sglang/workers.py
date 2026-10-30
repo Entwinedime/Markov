@@ -64,8 +64,9 @@ class NativeWorkers:
                     workers.append((instance, configured["settings"], str(model), rank))
                 for group in configured["groups"]:
                     begin = first + group["stage"] * instance["tp"]
-                    groups.append({**group, "instance": instance["id"],
-                                   "members": tuple(range(begin, begin + instance["tp"]))})
+                    groups.append(
+                        {**group, "instance": instance["id"], "members": tuple(range(begin, begin + instance["tp"]))}
+                    )
             connections, children = [], []
             for _ in workers:
                 parent, child = Pipe()
@@ -73,7 +74,7 @@ class NativeWorkers:
                 children.append(resources.enter_context(child))
             context = multiprocessing.start_processes(
                 cls.worker,
-                args=(workers, kernel_python, children),
+                args=(workers, configuration["workload"], kernel_python, children),
                 nprocs=len(workers),
                 start_method="spawn",
                 join=False,
@@ -93,7 +94,7 @@ class NativeWorkers:
                         process.join()
 
     @staticmethod
-    def worker(index, workers, kernel_python, connections) -> None:
+    def worker(index, workers, workload, kernel_python, connections) -> None:
         source, settings, directory, rank = workers[index]
         for position, connection in enumerate(connections):
             if position != index:
@@ -116,7 +117,7 @@ class NativeWorkers:
                 implementation = PipelineDisaggregatedScheduler if source["pp"] > 1 else DisaggregatedScheduler
             else:
                 implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
-            scheduler = implementation(peer, settings, directory, source, rank)
+            scheduler = implementation(peer, settings, directory, source, rank, workload)
             peer.send({"kind": "ready"})
             try:
                 scheduler.run_event_loop()
@@ -182,6 +183,8 @@ class NativeCalls:
                 self.ready.append(WorkerCall(operation, {"kind": "input", "group": group["id"]}, (channel,)))
             return
         message = {**message, "group": group["id"]}
+
+        # Native rank-local statistics may read capacity without another worker making the same query.
         if message["kind"] in ("capacity", "free_slots"):
             self.ready.append(WorkerCall(operation, message, (channel,)))
             return
@@ -192,8 +195,13 @@ class NativeCalls:
             message = {"kind": "ready"}
         self.pending[channel] = (operation, message)
         if all(participant in self.pending for participant in members):
-            if any(self.pending[participant] != (operation, message) for participant in members):
-                raise ValueError("Native TP workers disagree on a core action")
+            for participant in members:
+                other_operation, other = self.pending[participant]
+                if (other_operation, other) != (operation, message):
+                    fields = sorted(key for key in other.keys() | message.keys() if other.get(key) != message.get(key))
+                    raise ValueError(
+                        f"Native TP group {group['id']} disagrees on {other['kind']} / {message['kind']}: {fields}"
+                    )
             self.ready.append(WorkerCall(operation, message, members))
             for participant in members:
                 del self.pending[participant]

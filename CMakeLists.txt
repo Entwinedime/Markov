@@ -16,6 +16,8 @@ add_library(markov_core
     src/markov/controller/native_group.cpp
     src/markov/controller/native_transfer.cpp
     src/markov/resources/kv_pool.cpp
+    src/markov/resources/prefix_index.cpp
+    src/markov/resources/trace.cpp
     src/markov/controller/serving.cpp
     src/markov/execution/protocol.cpp
     src/markov/execution/durations.cpp
@@ -24,6 +26,7 @@ add_library(markov_core
     src/markov/contracts/expert_routes.cpp
     src/markov/contracts/input_group.cpp
     src/markov/contracts/serving.cpp
+    src/markov/contracts/index_work.cpp
     src/markov/contracts/topology.cpp
     src/markov/contracts/integer_data.cpp
     src/markov/graph/access.cpp
@@ -31,6 +34,7 @@ add_library(markov_core
     src/markov/graph/source_graph.cpp
     src/markov/production/source_projection.cpp
     src/markov/production/execution_source.cpp
+    src/markov/production/execution_reuse.cpp
     src/markov/production/execution_pattern.cpp
     src/markov/production/template_library.cpp
     src/markov/templates/group_execution.cpp
@@ -54,6 +58,7 @@ add_library(markov_application
     src/markov/adapters/frameworks/sglang/topology.cpp
     src/markov/adapters/frameworks/sglang/structure.cpp
     src/markov/adapters/frameworks/sglang/rank_structure.cpp
+    src/markov/adapters/frameworks/sglang/rank_indices.cpp
     src/markov/application/simulation.cpp
     src/markov/application/control_stream.cpp
 )

@@ -1,0 +1,40 @@
+{
+  "framework": "sglang",
+  "control": "native",
+  "model": {"path": "/models/Qwen3-8B", "dtype": "bfloat16"},
+  "deployment": {"physical_devices": [4]},
+  "budget": {
+    "native_seconds": 600,
+    "processing_seconds": 1800,
+    "temporary_bytes": 6442450944,
+    "retained_bytes": 2147483648
+  },
+  "configurations": [
+    {"id": "serial", "tp": 1, "attention_backend": "ascend", "prefix_cache": true,
+     "page_size": 128, "max_running_requests": 1, "max_total_tokens": 1024, "max_prefill_tokens": 1024},
+    {"id": "paired", "tp": 1, "attention_backend": "ascend", "prefix_cache": true,
+     "page_size": 128, "max_running_requests": 2, "max_total_tokens": 2048, "max_prefill_tokens": 1024}
+  ],
+  "workloads": [
+    {"id": "shared", "prefixes": [
+      {"id": "shared", "tokens": 128}, {"id": "long", "parent": "shared", "tokens": 128}
+    ], "requests": [
+      {"id": "A", "arrival_ns": 0, "prompt_tokens": 385, "output_tokens": 2, "prefix_id": "long"},
+      {"id": "B", "arrival_ns": 0, "prompt_tokens": 257, "output_tokens": 1, "prefix_id": "shared"},
+      {"id": "C", "arrival_ns": 0, "prompt_tokens": 513, "output_tokens": 3, "prefix_id": "long"}
+    ]},
+    {"id": "staggered", "prefixes": [
+      {"id": "shared", "tokens": 128}, {"id": "long", "parent": "shared", "tokens": 128}
+    ], "requests": [
+      {"id": "A", "arrival_ns": 0, "prompt_tokens": 257, "output_tokens": 2, "prefix_id": "shared"},
+      {"id": "B", "arrival_ns": 1000000, "prompt_tokens": 385, "output_tokens": 3, "prefix_id": "long"},
+      {"id": "C", "arrival_ns": 2000000, "prompt_tokens": 129, "output_tokens": 1, "prefix_id": "shared"}
+    ]}
+  ],
+  "node_durations_ns": {
+    "host": 10, "enqueue": 1, "submit": 1, "device": 100,
+    "copy": 1, "copy_async": 1, "transfer": 100, "wait_stream": 0,
+    "wait_entry": 0, "queue_return": 0, "record_event": 1,
+    "wait_event": 1, "wait_event_complete": 0, "barrier": 0, "communication": 100
+  }
+}

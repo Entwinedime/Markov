@@ -136,13 +136,20 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
 
         try {
             auto bound = invocation;
+            const auto & layout = asset.layout(frame.layout);
+            const auto & definition = asset.definition(layout.definition);
+
+            // A call family can contain grouped and positional signatures; select one before expanding its body.
+            if (definition.input_groups.size() != bound.input_groups.size()
+                || !std::ranges::all_of(definition.input_groups, [&](const auto & group) { return bound.input_groups.contains(group.first); }))
+                throw LayoutMismatch(role + " input-group signature differs");
             if (inputs != nullptr) {
-                const auto & layout = asset.layout(frame.layout);
 
                 // Required values come from their producer; only declared state may remain unbound.
                 if (!std::ranges::all_of(layout.required_inputs, [&](const auto & name) { return inputs->ports.contains(name); }))
                     throw LayoutMismatch(role + " requires its declared input ports");
-                const auto & definition = asset.definition(layout.definition);
+                if (!std::ranges::all_of(inputs->ports, [&](const auto & port) { return layout.ports.inputs.contains(port.first); }))
+                    throw LayoutMismatch(role + " input-port signature differs");
                 auto parameters = bind_parameters({}, frame.bindings.values, bound, bound.parameter_scopes);
                 if (!bind_input_parameters(layout, definition, inputs->ports, inputs->graph, parameters))
                     throw LayoutMismatch(role + " input geometry differs");
@@ -394,13 +401,13 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                 });
             }
 
-            require_value(identities[index],
-                          {
-                              { "kind", "tensor" },
-                              { "dtype", group.member_dtype(index) },
-                              { "device", group.device },
-                              { "shape", group.dimensions(parameters, members[index]) }
-            });
+            nlohmann::json type{
+                { "kind", "tensor" },
+                { "dtype", group.member_dtype(index) },
+                { "shape", group.dimensions(parameters, members[index]) }
+            };
+            if (group.device) type["device"] = *group.device;
+            require_value(identities[index], type);
         }
 
         region_inputs.insert(region_inputs.end(), identities.begin(), identities.end());
@@ -600,6 +607,21 @@ void TemplateInstance::expand_child(const CallStep & call, std::size_t child_ind
             child_invocation.input_groups.emplace(name, invocation.input_groups.at(*group));
         }
         else if (const auto * fixed = std::get_if<std::vector<std::size_t>>(&binding)) child_groups.emplace(name, remap(*fixed, values));
+        else if (const auto * mapping = std::get_if<MappedGroup>(&binding)) {
+            const auto & source = input_groups.at(mapping->group);
+            const auto & members = invocation.input_groups.at(mapping->group);
+            auto & outputs = child_groups[name];
+            for (std::size_t index = 0; index < source.size(); ++index) {
+                Invocation member;
+                member.parameters = members.at(index);
+                ValuePorts ports;
+                ports.inputs.emplace(mapping->input, source[index]);
+
+                // Select by this member's geometry; empty and resident inputs may take different native branches.
+                const auto produced = expand_call(mapping->family, member, parameters, region, ports, sequences, scopes);
+                outputs.push_back(graph_.regions.at(produced).at("ports").at("outputs").at(mapping->output).get<std::size_t>());
+            }
+        }
         else {
             const auto & generated = std::get<GeneratedGroup>(binding);
             const auto count = generated.count.evaluate(parameters);
@@ -660,17 +682,26 @@ void TemplateInstance::expand_child(const CallStep & call, std::size_t child_ind
         for (const auto & [name, value] : child.ports.outputs) bound.outputs.emplace(name, child_values.at(value).value());
         expand_call(*call.family, child_invocation, parameters, region, bound, sequences, scopes);
     }
-    else
+    else {
+
+        // Fixed children bind local axes from their ports just like replaceable call families.
+        auto arguments = bind_parameters(parameters, bindings.children.at(child_index).values, child_invocation, scopes);
+        std::map<std::string, std::size_t> inputs;
+        for (const auto & [name, value] : child.ports.inputs) inputs.emplace(name, child_values.at(value).value());
+        if (!bind_input_parameters(child, asset_.definition(child.definition), inputs, graph_, arguments))
+            throw LayoutMismatch("child input geometry differs for layout " + std::to_string(call.layout));
+
         expand(call.layout,
                bindings.children.at(child_index),
                std::move(child_invocation),
-               parameters,
+               std::move(arguments),
                region,
                remap(call.resources, resources),
                std::move(child_values),
                std::move(child_groups),
                sequences,
                scopes);
+    }
 }
 
 const std::vector<StateChange> & TemplateInstance::state_changes() const { return graph_.state_changes; }

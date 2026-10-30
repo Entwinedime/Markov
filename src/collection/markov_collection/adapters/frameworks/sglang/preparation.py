@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.overrides import TorchFunctionMode
 
 from markov_collection.adapters.frameworks.sglang.batches import (
     BatchTensors,
@@ -52,8 +53,85 @@ class ExtendAllocationCall(CollectionCall):
             }
             metadata["parent_groups"] = {"prefixes": "prefixes"}
 
-        with TensorGeometryObservation(self.values, ("B",), (batch.prefix_lens, batch.extend_lens)):
+        with (
+            TensorGeometryObservation(self.values, ("B",), (batch.prefix_lens, batch.extend_lens)),
+            PrefixLocations(self.values, [request.prefix_indices for request in batch.reqs]),
+        ):
             return super().invoke(batch)
+
+
+class PrefixLocationCall(NativeCall):
+    def __init__(self, values: Any, function: Any, args: tuple, kwargs: dict) -> None:
+        super().__init__(values.recording, values, "prefix_location", self.evaluate, {"prefix": {0: "extent"}})
+        self.function, self.args, self.kwargs = function, args, kwargs
+
+    def evaluate(self, prefix: Any) -> Any:
+
+        # The nonempty branch reads the last existing index, including its storage dependency.
+        with TensorViewObservation(
+            self.values, [(prefix, (1,))], start=self.values.shapes.symbol("extent") - 1, index=slice(-1, None)
+        ):
+            return self.function(*self.args, **self.kwargs)
+
+    def completed(self, args: tuple, kwargs: dict, result: Any, metadata: dict) -> None:
+        prefix = args[0]
+        self.declare(metadata, self.values.value(prefix), self.values.value(result), prefix.numel())
+
+    @staticmethod
+    def declare(metadata: dict, prefix: int, result: int, extent: int) -> None:
+        metadata.update(
+            entrypoint="prefix_location",
+            entrypoint_phase=None,
+            parameters={"extent": extent},
+            guards=[{"condition": ["eq", "extent", 0], "expected": extent == 0}],
+            ports={"inputs": {"prefix": prefix}, "outputs": {"location": result}},
+        )
+
+
+class PrefixLocations(TorchFunctionMode):
+    @staticmethod
+    def declare(source: dict) -> None:
+        regions, values, operations = source["regions"], source["values"], source["operations"]
+        for region in regions:
+            metadata = region["metadata"]
+            groups = metadata.get("input_groups", {})
+
+            # Empty prefixes can be host tensors; each member's callable constrains its actual device.
+            if "prefixes" in groups:
+                groups["prefixes"].pop("device", None)
+            declaration = metadata.get("group_repetitions", {}).get("segments", {})
+            if declaration.get("mapping", {}).get("family") != "prefix_location":
+                continue
+            prefixes = regions[region["parent"]]["metadata"]["input_groups"]["prefixes"]["members"]
+            for prefix, output in zip(prefixes, groups["segments"]["members"], strict=True):
+                identity = operations[values[output["value"]]["producer"]]["region"]
+                while regions[identity]["parent"] != region["parent"]:
+                    identity = regions[identity]["parent"]
+                producer = regions[identity]["metadata"]
+                if producer.get("entrypoint") == "prefix_location":
+                    continue
+                if producer.get("interface") != "tensor_from_data" or prefix["parameters"]["extent"] != 0:
+                    raise ValueError("prefix location requires its native empty factory or tail view")
+
+                # The existing factory is the whole empty branch; retain its recorded host and device work.
+                PrefixLocationCall.declare(producer, prefix["value"], output["value"], 0)
+                producer["inputs"].append(prefix["value"])
+                producer.setdefault("shape_contracts", []).append({"value": prefix["value"], "shape": ["extent"]})
+
+    def __init__(self, values: Any, prefixes: list[Any]) -> None:
+        super().__init__()
+        self.values = values
+        self.prefixes = {id(prefix): prefix for prefix in prefixes}
+        self.scope = values.recording.current_scope.get()
+
+    def __torch_function__(self, function: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
+        kwargs = kwargs or {}
+        if self.values.recording.current_scope.get() != self.scope or function is not torch.Tensor.__getitem__:
+            return function(*args, **kwargs)
+        prefix = self.prefixes.get(id(args[0]))
+        if prefix is None or args[1] != slice(-1, None):
+            return function(*args, **kwargs)
+        return PrefixLocationCall(self.values, function, args, kwargs)(prefix)
 
 
 class ForwardBatchCall(NativeCall):
@@ -80,11 +158,18 @@ class BatchPreparationCall(TensorGeometryCall):
         }
         if batch.forward_mode.is_extend():
             inputs["prompt_tokens"] = batch.prefill_input_ids_cpu
+        if batch.forward_mode.is_mixed():
+            inputs["mixed_slots"] = batch.mix_running_indices
 
         return inputs
 
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
         batch = self.batch
+        metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        metadata["parameters"] = {
+            "B": len(batch.reqs),
+            "M": len(batch.reqs) if self.decode else sum(request.extend_range.length for request in batch.reqs),
+        }
         inputs = {
             "request_map": batch.req_to_token_pool.req_to_token,
             "free_pages": batch.token_to_kv_pool_allocator.free_pages,
@@ -117,11 +202,60 @@ class BatchPreparationCall(TensorGeometryCall):
             "free_pages": batch.token_to_kv_pool_allocator.free_pages,
         }
         metadata["entrypoint"] = "batch_preparation"
+        metadata["entrypoint_phase"] = "decode" if self.decode else "prefill"
         metadata["ports"] = {"inputs": self.input_ports, "outputs": self.values.port_values(self.output_ports)}
 
         # Batch columns must come from their producer; only persistent pools may be initialized here.
         metadata["required_inputs"] = sorted(set(self.input_ports) - {"request_map", "free_pages"})
         return None
+
+
+class BatchMixCall(NativeCall):
+    def __init__(self, values: Any, original: Any, batch: Any, running: Any) -> None:
+        inputs = {
+            **{f"self.{path}": {0: "prefill_members"} for path in BatchTensors.fields.values()},
+            **{f"running_batch.{path}": {0: "decode_members"} for path in BatchTensors.fields.values()},
+            "self.out_cache_loc": {0: "prefill_tokens"},
+            "self.prefill_input_ids_cpu": {0: "prefill_tokens"},
+            "running_batch.out_cache_loc": {0: "decode_members"},
+        }
+        super().__init__(values.recording, values, original.__qualname__, original, inputs)
+        self.batch, self.running = batch, running
+        self.parameters = {
+            "prefill_members": len(batch.reqs),
+            "decode_members": len(running.reqs),
+            "prefill_tokens": batch.extend_num_tokens,
+        }
+
+    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
+        inputs = {
+            **{f"prefill.{name}": tensor for name, tensor in BatchPreparationCall.model_inputs(self.batch).items()},
+            **{f"decode.{name}": tensor for name, tensor in BatchPreparationCall.model_inputs(self.running).items()},
+        }
+        self.input_ports = self.values.port_values(inputs)
+        return tuple(inputs.values()), ()
+
+    def outputs(self, result: Any) -> Any:
+        return tuple(self.output_tensors.values())
+
+    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
+        metadata.update(
+            entrypoint="batch_mix",
+            entrypoint_phase="mixed",
+            parameters=self.parameters,
+            derived_parameters=[
+                {"name": "B", "expression": ["add", "prefill_members", "decode_members"]},
+                {"name": "M", "expression": ["add", "prefill_tokens", "decode_members"]},
+            ],
+        )
+        self.output_tensors = BatchPreparationCall.model_inputs(self.batch)
+
+        # Only native merge and concatenation produce the shared model columns.
+        axes = {"kv_locations": "M", "prompt_tokens": "prefill_tokens", "mixed_slots": "decode_members"}
+        for name, tensor in self.output_tensors.items():
+            self.values.bind(tensor, {0: axes.get(name, "B")})
+        metadata["ports"] = {"inputs": self.input_ports, "outputs": self.values.port_values(self.output_tensors)}
+        metadata["required_inputs"] = sorted(self.input_ports)
 
 
 class InputStagingCall(NativeCall):
@@ -167,7 +301,9 @@ class SGLangPreparation:
             original.__qualname__,
             original,
             {},
-            repetition=GroupRepetition("B", "produce"),
+            repetition=GroupRepetition(
+                "B", "map", {"group": "prefixes", "family": "prefix_location", "input": "prefix", "output": "location"}
+            ),
         )(*args, **kwargs)
 
     def request_arrays(self, original: Any, *args: Any, **kwargs: Any) -> Any:
@@ -205,6 +341,9 @@ class SGLangPreparation:
 
     def prepare_decode(self, original: Any, batch: Any) -> Any:
         return BatchPreparationCall(self.values, original, batch, decode=True, fields=self.fields)(batch)
+
+    def mix_batch(self, original: Any, batch: Any, running: Any) -> Any:
+        return BatchMixCall(self.values, original, batch, running)(batch, running)
 
     def filter_batch(self, original: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         if self.values.recording.current_scope.get() is None or not batch.reqs:
@@ -244,9 +383,7 @@ class SGLangPreparation:
     def stage_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return InputStagingCall(
             self.values.recording, self.values, original.__qualname__, original, {}, native_padding=self.native_padding
-        )(
-            *args, **kwargs
-        )
+        )(*args, **kwargs)
 
     def attention_metadata(self, original: Any, backend: Any, forward_batch: Any) -> Any:
         if self.values.recording.current_scope.get() is None:
@@ -270,6 +407,7 @@ class SGLangPreparation:
             "sglang.srt.mem_cache.common.alloc_req_slots": self.request_slots,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend": self.prepare_extend,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_decode": self.prepare_decode,
+            "sglang.srt.managers.schedule_batch.ScheduleBatch.mix_with_running": self.mix_batch,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.filter_batch": self.filter_batch,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.merge_batch": self.merge_batch,
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new": self.forward_batch,

@@ -59,7 +59,7 @@ class RequestCacheCall(NativeCall):
             slot = self.request.req_pool_idx
 
             # Read the same native length without consuming the request's release state.
-            length = self.request._cache_commit_len() if self.finished else self.request.fill_len
+            length = self.request._cache_commit_len() if self.finished else self.request.extend_range.end
             metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
             metadata["entrypoint"] = "request_cache_release" if self.finished else "request_cache_retain"
             metadata["entrypoint_phase"] = None
@@ -105,6 +105,18 @@ class RequestCacheCall(NativeCall):
         return None
 
 
+class PoolAllocationView(TensorViewObservation):
+    def __init__(self, values: Any, pool: Any, shape: tuple, **kwargs: Any) -> None:
+        super().__init__(values, [], **kwargs)
+        self.pool = pool
+        self.shape = shape
+
+    def buffer_geometry(self, tensor: Any) -> tuple | None:
+
+        # Native allocation may replace free_pages by merging deferred releases before taking its slices.
+        return self.shape if tensor is self.pool.free_pages else None
+
+
 class PoolAllocationCall(NativeCall):
     def __init__(self, values: Any, original: Any, pool: Any, inputs: dict[str, dict[int, str]]) -> None:
         super().__init__(values.recording, values, original.__qualname__, original, inputs)
@@ -120,24 +132,37 @@ class PoolAllocationCall(NativeCall):
 
     def allocation_views(self, pages: int) -> TensorViewObservation:
         metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        self.merged = self.pool.need_sort and pages > self.before_count
+        available: Any = "free_pages_before"
         metadata["entrypoint"] = "kv_allocate"
         metadata["call_family"] = "kv_allocate"
         metadata["parameters"] = {"allocated_pages": pages, "free_pages_before": self.before_count}
         metadata["bindings"] = {"page_size": self.pool.page_size, "need_sort": int(self.pool.need_sort)}
         metadata["guards"] = [
             {"condition": ["le", 0, "allocated_pages"], "expected": True},
-            {"condition": ["le", "allocated_pages", "free_pages_before"], "expected": True},
+            {"condition": ["le", "allocated_pages", "free_pages_before"], "expected": not self.merged},
             {"condition": ["eq", "page_size", self.pool.page_size], "expected": True},
             {"condition": "need_sort", "expected": self.pool.need_sort},
         ]
+        if self.merged:
+
+            # This branch consumes the deferred pool; the ordinary branch has no such input or state change.
+            deferred = self.pool.release_pages
+            self.values.bind_shape(deferred, (self.values.shapes.symbol("release_pages_before"),))
+            self.input_ports.update(self.values.port_values({"release_pages": deferred}))
+            metadata["parameters"]["release_pages_before"] = len(deferred)
+            available = ["add", "free_pages_before", "release_pages_before"]
+            metadata["guards"].append({"condition": ["le", "allocated_pages", available], "expected": True})
+
         metadata["derived_parameters"] = [
-            {"name": "free_pages_after", "expression": ["add", "free_pages_before", ["mul", -1, "allocated_pages"]]}
+            {"name": "free_pages_after", "expression": ["add", available, ["mul", -1, "allocated_pages"]]}
         ]
         metadata["state_effects"] = {"free_pages": {"before": "free_pages_before", "after": "free_pages_after"}}
 
         symbols = self.values.shapes
-        tail = [(self.pool.free_pages, (symbols.symbol("free_pages_after"),))]
-        return TensorViewObservation(self.values, tail, start=symbols.symbol("allocated_pages"))
+        return PoolAllocationView(
+            self.values, self.pool, (symbols.symbol("free_pages_after"),), start=symbols.symbol("allocated_pages")
+        )
 
     def completed(
         self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
@@ -147,10 +172,19 @@ class PoolAllocationCall(NativeCall):
             "inputs": self.input_ports,
             "outputs": self.values.port_values({"kv_locations": result, "free_pages": self.pool.free_pages}),
         }
+        if self.merged:
+            metadata["ports"]["outputs"].update(self.values.port_values({"release_pages": self.pool.release_pages}))
+            metadata["parameters"]["release_pages_after"] = len(self.pool.release_pages)
+            metadata["derived_parameters"].append({"name": "release_pages_after", "expression": 0})
+            metadata["state_effects"]["release_pages"] = {
+                "before": "release_pages_before",
+                "after": "release_pages_after",
+            }
         return None
 
     def outputs(self, result: Any) -> Any:
-        return result, self.pool.free_pages
+        outputs = result, self.pool.free_pages
+        return (*outputs, self.pool.release_pages) if self.merged else outputs
 
 
 class TokenAllocationCall(PoolAllocationCall):
@@ -163,9 +197,10 @@ class TokenAllocationCall(PoolAllocationCall):
             # The non-paged serving path calls alloc directly, with tokens as its unit.
             pages = need_size // self.pool.page_size
             views = self.allocation_views(pages)
-            allocated = TensorViewObservation(
+            allocated = PoolAllocationView(
                 self.values,
-                [(self.pool.free_pages, (self.values.shapes.symbol("allocated_pages"),))],
+                self.pool,
+                (self.values.shapes.symbol("allocated_pages"),),
                 index=slice(None, pages),
             )
 

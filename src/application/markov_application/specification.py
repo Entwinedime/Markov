@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
+from markov_workload import WorkloadContent
 
 
 def check_fields(source: dict[str, Any], fields: set[str], context: str) -> None:
@@ -18,7 +19,7 @@ def read_specification(path: Path) -> dict[str, Any]:
     document = json.loads(path.read_text())
     check_fields(
         document,
-        {"framework", "model", "deployment", "budget", "configurations", "workloads", "node_durations_ns"},
+        {"framework", "control", "model", "deployment", "budget", "configurations", "workloads", "node_durations_ns"},
         "task",
     )
     check_fields(document["model"], {"path", "dtype"}, "model")
@@ -28,6 +29,8 @@ def read_specification(path: Path) -> dict[str, Any]:
     )
     if document["framework"] != "sglang":
         raise ValueError("this acquisition entrypoint currently provides SGLang/Ascend")
+    if document.get("control", "lightweight") not in ("lightweight", "native"):
+        raise ValueError("control must be lightweight or native")
     deployment = document["deployment"]["physical_devices"]
     if (
         not isinstance(deployment, list)
@@ -53,12 +56,17 @@ def read_specification(path: Path) -> dict[str, Any]:
         check_fields(
             configuration,
             {"id", "attention_backend", "page_size", "placement"}
-            | ({"pd"} if pd else geometry | capacity | {"microbatch_requests"}),
+            | (
+                {"pd"}
+                if pd
+                else geometry
+                | capacity
+                | {"microbatch_requests", "prefill_chunk_tokens", "mixed_batches", "prefix_cache"}
+            ),
             "configuration",
         )
         if type(configuration["page_size"]) is not int or not 0 < configuration["page_size"] <= maximum:
             raise ValueError("configuration page_size is outside its positive integer range")
-
         pools = [(configuration, capacity)]
         if pd:
             check_fields(configuration["pd"], {"prefill", "decode"}, "pd")
@@ -66,11 +74,32 @@ def read_specification(path: Path) -> dict[str, Any]:
             for role in ("prefill", "decode"):
                 fields = capacity if role == "prefill" else capacity - {"max_prefill_tokens"}
                 pool = configuration["pd"][role]
-                check_fields(pool, fields | geometry, "pd." + role)
+                check_fields(
+                    pool,
+                    fields | geometry | ({"prefill_chunk_tokens", "prefix_cache"} if role == "prefill" else set()),
+                    "pd." + role,
+                )
                 pools.append((pool, fields))
 
         ranks = 0
         for pool, fields in pools:
+            if "prefix_cache" in pool:
+                if type(pool["prefix_cache"]) is not bool:
+                    raise ValueError("prefix_cache must be boolean")
+                if pool["prefix_cache"] and document.get("control", "lightweight") != "native":
+                    raise ValueError("prefix_cache requires native control")
+            if "mixed_batches" in pool:
+                if type(pool["mixed_batches"]) is not bool:
+                    raise ValueError("mixed_batches must be boolean")
+                if pool["mixed_batches"] and "prefill_chunk_tokens" not in pool:
+                    raise ValueError("mixed_batches requires chunked Prefill")
+            if "prefill_chunk_tokens" in pool:
+                if document.get("control", "lightweight") != "native":
+                    raise ValueError("prefill_chunk_tokens requires native control")
+                chunk = pool["prefill_chunk_tokens"]
+                if type(chunk) is not int or not 0 < chunk <= maximum or chunk % configuration["page_size"]:
+                    raise ValueError("prefill_chunk_tokens must be positive and page aligned")
+
             for name in fields | {"tp"}:
                 if type(pool[name]) is not int or not 0 < pool[name] <= maximum:
                     raise ValueError(f"configuration {name} is outside its positive integer range")
@@ -118,7 +147,7 @@ def read_specification(path: Path) -> dict[str, Any]:
 
     # Reject malformed workloads before paying for a native source; per-configuration capacity remains a result.
     for workload in document["workloads"]:
-        check_fields(workload, {"id", "requests", "ep_routes"}, "workload")
+        check_fields(workload, {"id", "requests", "prefixes", "ep_routes"}, "workload")
         routes = workload.get("ep_routes", {})
         if not isinstance(routes, dict) or routes.keys() - topologies.keys():
             raise ValueError("workload routes must be keyed by declared EP topology IDs")
@@ -131,7 +160,7 @@ def read_specification(path: Path) -> dict[str, Any]:
         ):
             raise ValueError("workload request IDs must be nonempty strings and unique")
         for request in requests:
-            check_fields(request, {"id", "arrival_ns", "prompt_tokens", "output_tokens"}, "request")
+            check_fields(request, {"id", "arrival_ns", "prompt_tokens", "output_tokens", "prefix_id"}, "request")
             for name in ("arrival_ns", "prompt_tokens", "output_tokens"):
                 value = request[name]
                 minimum = 0 if name == "arrival_ns" else 1
@@ -139,6 +168,7 @@ def read_specification(path: Path) -> dict[str, Any]:
                     raise ValueError(f"request {name} is outside its integer range: {request['id']}")
             if request["prompt_tokens"] + request["output_tokens"] - 1 > maximum:
                 raise ValueError(f"request token length overflows: {request['id']}")
+        WorkloadContent(requests, workload.get("prefixes", ()))
 
     durations = document["node_durations_ns"]
     if not isinstance(durations, dict) or any(

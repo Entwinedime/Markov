@@ -106,13 +106,20 @@ struct GeneratedGroup {
     std::variant<ReusedGroupValue, GroupProducer> element;
 };
 
+struct MappedGroup {
+    std::string group;
+    std::string family;
+    std::string input;
+    std::string output;
+};
+
 struct CallStep {
     std::size_t layout;
     std::vector<std::size_t> inputs;
     std::vector<std::size_t> outputs;
     std::vector<std::size_t> resources;
     std::optional<std::string> family;
-    std::map<std::string, std::variant<std::vector<std::size_t>, std::string, GeneratedGroup>> input_groups;
+    std::map<std::string, std::variant<std::vector<std::size_t>, std::string, GeneratedGroup, MappedGroup>> input_groups;
     std::map<std::string, Expression> parameters;
 };
 

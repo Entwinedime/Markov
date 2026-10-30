@@ -218,6 +218,11 @@ TemplateCatalog::TemplateCatalog(nlohmann::json document) {
                     for (const auto & [name, binding] : step.at("input_groups").items()) {
                         if (binding.is_string()) call.input_groups.emplace(name, binding.get<std::string>());
                         else if (binding.is_array()) call.input_groups.emplace(name, binding.get<std::vector<std::size_t>>());
+                        else if (binding.contains("map")) {
+                            const auto & mapping = binding.at("map");
+                            call.input_groups.emplace(name,
+                                                      MappedGroup{ mapping.at("group"), mapping.at("family"), mapping.at("input"), mapping.at("output") });
+                        }
                         else {
                             if (binding.contains("value") == binding.contains("producer"))
                                 throw std::invalid_argument("generated group requires exactly one element provider");
@@ -292,6 +297,8 @@ void TemplateCatalog::validate() const {
                 if (!groups.contains(name)) throw std::invalid_argument("child has no input group " + name);
                 if (const auto * parent = std::get_if<std::string>(&binding); parent != nullptr && !definition.input_groups.contains(*parent))
                     throw std::invalid_argument("child references an undefined parent input group " + *parent);
+                if (const auto * mapping = std::get_if<MappedGroup>(&binding); mapping != nullptr && !definition.input_groups.contains(mapping->group))
+                    throw std::invalid_argument("mapped group references an undefined parent input group " + mapping->group);
 
                 // A repeated producer is safe only when each element is independent of caller state.
                 if (const auto * generated = std::get_if<GeneratedGroup>(&binding)) {

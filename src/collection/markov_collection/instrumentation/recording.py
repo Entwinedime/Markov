@@ -19,18 +19,21 @@ class Scope:
 
     def __enter__(self) -> Scope:
         parent = self.recording.current_scope.get()
-        self.identity = len(self.recording.regions)
-        self.record = {
-            "id": self.identity,
-            "parent": parent,
-            "role": self.role,
-            "metadata": self.metadata,
-            "operation_begin": len(self.recording.operations),
-            "started_ns": time.perf_counter_ns(),
-            "thread": threading.get_native_id(),
-            "started_cpu_ns": time.thread_time_ns(),
-        }
-        self.recording.regions.append(self.record)
+
+        # Background transfers share region identities with the scheduler thread.
+        with self.recording.scope_lock:
+            self.identity = len(self.recording.regions)
+            self.record = {
+                "id": self.identity,
+                "parent": parent,
+                "role": self.role,
+                "metadata": self.metadata,
+                "operation_begin": len(self.recording.operations),
+                "started_ns": time.perf_counter_ns(),
+                "thread": threading.get_native_id(),
+                "started_cpu_ns": time.thread_time_ns(),
+            }
+            self.recording.regions.append(self.record)
 
         # Restore this exact parent token on exit so nested calls retain their original owner.
         self.token = self.recording.current_scope.set(self.identity)
@@ -53,6 +56,7 @@ class Recording:
     def __init__(self, markers: Any) -> None:
         self.markers = markers
         self.current_scope: ContextVar[int | None] = ContextVar("markov_scope", default=None)
+        self.scope_lock = threading.Lock()
 
         self.regions: list[dict[str, Any]] = []
         self.operations: list[dict[str, Any]] = []

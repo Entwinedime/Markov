@@ -17,6 +17,7 @@ class SGLangObservation:
     def __init__(self, description: dict[str, Any]) -> None:
         from torch.utils.weak import WeakIdKeyDictionary
 
+        from markov_collection.adapters.frameworks.sglang.content import NativeContent
         from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.primitives import IndexedWritePrototypes
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
@@ -33,6 +34,7 @@ class SGLangObservation:
         self.workspaces = AscendWorkspaces(self.synchronization, Path(description["native_library"]))
         self.workspace_states: dict[str, list[dict[str, int]]] = {}
         self.operators = AscendOperatorObservation(self.recording)
+        self.content = NativeContent(self.operators.values, description)
         self.concatenation = AscendConcatenation(self.operators)
         selection = description["matrix_selection"]
         self.matrices = AscendMatrices(
@@ -84,7 +86,7 @@ class SGLangObservation:
             self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
 
         self.routing = None
-        if description.get("serving_input") is not None:
+        if (description.get("serving_input") or {}).get("ep_routes"):
             from markov_collection.adapters.frameworks.sglang.native_routes import NativeExpertRoutes
 
             self.routing = NativeExpertRoutes(self.operators.values, description)
@@ -95,6 +97,7 @@ class SGLangObservation:
 
         result = original(runner)
         self.model = runner.model
+        self.content.content.check_vocabulary(runner.model_config.vocab_size)
 
         if self.routing is not None:
             self.routing.configure(self.model, runner.model_config.hf_config.num_hidden_layers)
@@ -137,6 +140,11 @@ class SGLangObservation:
             "model_config": runner.model_config.hf_config.to_dict(),
             "dtype": str(runner.model_config.dtype),
             "attention_backend": runner.server_args.attention_backend,
+            "chunked_prefill_size": runner.server_args.chunked_prefill_size,
+            "enable_mixed_chunk": runner.server_args.enable_mixed_chunk,
+            "disable_radix_cache": runner.server_args.disable_radix_cache,
+            "ascend_use_fa": os.environ.get("ASCEND_USE_FA", "False").lower() in {"1", "true"},
+            "ascend_use_fia": os.environ.get("ASCEND_USE_FIA", "False").lower() in {"1", "true"},
             "load_format": runner.server_args.load_format,
             "disaggregation_mode": runner.server_args.disaggregation_mode,
             "moe_a2a_backend": runner.server_args.moe_a2a_backend,
@@ -152,8 +160,9 @@ class SGLangObservation:
         phase = "control"
         members = []
         if batch is not None:
-            phase = "prefill" if batch.forward_mode.is_extend() else "decode"
-            members = BatchTensors.members(batch)
+            phase = BatchTensors.phase(batch)
+            with self.operators.values.metadata():
+                members = BatchTensors.members(batch)
 
         identity = len(self.recording.batches)
         self.recording.batches.append(
@@ -165,7 +174,11 @@ class SGLangObservation:
                 "members": members,
                 "parameters": {
                     "M": sum(item["new_tokens"] for item in members),
+                    "max_query_tokens": max((item["new_tokens"] for item in members), default=0),
                     "B": len(members),
+                    "prefill_members": sum(item["phase"] == "prefill" for item in members),
+                    "decode_members": sum(item["phase"] == "decode" for item in members),
+                    "prefill_tokens": sum(item["new_tokens"] for item in members if item["phase"] == "prefill"),
                     "R": scheduler.req_to_token_pool.size,
                     "slot_capacity": scheduler.req_to_token_pool.req_to_token.shape[0] - 1,
                     "max_sequence_tokens": max(
@@ -199,13 +212,17 @@ class SGLangObservation:
             shapes.bind_shape(mapping, (shapes.symbol("slot_capacity") + 1, mapping.shape[1]))
 
     def schedule(self, original: Any, scheduler: Any) -> Any:
-        if self.pipeline is not None:
 
-            # The native loop installs its running view before this scheduling call can replace it.
+        # The native loop installs its running view before this scheduling call can replace it.
+        if self.pipeline is not None:
             self.batch_lane = next(
                 index for index, batch in enumerate(scheduler.running_mbs) if batch is scheduler.running_batch
             )
         pending = list(scheduler.waiting_queue)
+
+        # PP may remove the unfinished request from its last microbatch before scheduling its next chunk.
+        if scheduler.chunked_req is not None:
+            pending.append(scheduler.chunked_req)
         for batch in (scheduler.running_batch, scheduler.last_batch):
             if batch is not None:
                 pending.extend(batch.reqs)
@@ -279,6 +296,9 @@ class SGLangObservation:
                     self.operators.values.bounded_parameter(name, 1, sys.maxsize)
                 for tensor in BatchTensors.read(batch).values():
                     self.operators.values.bind(tensor, {0: "B"})
+                if phase == "mixed":
+                    self.operators.values.bind(batch.prefill_input_ids_cpu, {0: "prefill_tokens"})
+                    self.operators.values.bind(batch.mix_running_indices, {0: "decode_members"})
                 self.operators.values.bind_shape(
                     scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("slot_capacity") + 1,)
                 )
@@ -451,7 +471,7 @@ class SGLangObservation:
             values,
             "sglang.FutureMap.stash",
             original,
-            {"future_indices": {0: "B"}, "payload": {0: "B"}},
+            {"future_indices": {0: "B"}, "payload.bonus_tokens": {0: "B"}},
         )(relay, indices, payload)
 
     def release_pages(self, original: Any, pool: Any, free_index: Any) -> Any:
@@ -465,6 +485,9 @@ class SGLangObservation:
         return call(pool, free_index)
 
     def request_cache(self, original: Any, cache: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        from markov_collection.adapters.frameworks.sglang.prefix import PrefixServiceCall
         from markov_collection.adapters.frameworks.sglang.state import RequestCacheCall
 
         if self.recording.current_scope.get() is None:
@@ -472,9 +495,17 @@ class SGLangObservation:
                 return self.disaggregation.release(original, cache, request, *args, **kwargs)
             return original(cache, request, *args, **kwargs)
 
-        call = RequestCacheCall(
-            self.operators.values, original, cache, request, original.__name__ == "cache_finished_req"
-        )
+        values = self.operators.values
+        if isinstance(cache, RadixCache):
+            if not cache.disable:
+                return PrefixServiceCall(self.recording, values, original.__qualname__, original, {})(
+                    cache, request, *args, **kwargs
+                )
+
+            # Disabled RadixCache keeps no unfinished mapping; ChunkCache has a different native contract.
+            if original.__name__ == "cache_unfinished_req":
+                return original(cache, request, *args, **kwargs)
+        call = RequestCacheCall(values, original, cache, request, original.__name__ == "cache_finished_req")
         return call(cache, request, *args, **kwargs)
 
     def flush(self, original: Any, scheduler: Any, empty_cache: bool = True) -> Any:
@@ -494,13 +525,13 @@ class SGLangObservation:
             pool = scheduler.token_to_kv_pool_allocator
             self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device), pool.need_sort)
             self.indexed_writes.request_map(scheduler.req_to_token_pool.req_to_token)
+
+            # Prefill members remain unpadded; Decode follows native MLP token alignment.
             self.materializations = AscendMaterializations(
                 self.operators,
                 pool.page_size,
                 scheduler.req_to_token_pool.req_to_token.dtype,
                 ("B", "max_sequence_tokens"),
-
-                # Prefill members remain unpadded; Decode follows native MLP token alignment.
                 (1, self.ep_size),
             )
             with torch.npu.stream(self.model_stream):
@@ -571,6 +602,7 @@ class SGLangObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
+        from markov_collection.adapters.frameworks.sglang.prefix import PrefixObservation
         from markov_collection.adapters.frameworks.sglang.preparation import SGLangPreparation
         from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
         from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
@@ -586,6 +618,7 @@ class SGLangObservation:
             fields = self.pipeline.fields
         self.preparation = SGLangPreparation(self.operators, fields, self.ep_size > 1)
         self.preparation.install()
+        PrefixObservation(self.operators.values, self.preparation.match_prefix).install()
         if self.ep_size > 1:
             from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
 
@@ -604,8 +637,11 @@ class SGLangObservation:
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free": self.release_pages,
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_finished_req": self.request_cache,
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_unfinished_req": self.request_cache,
+            "sglang.srt.mem_cache.radix_cache.RadixCache.cache_finished_req": self.request_cache,
+            "sglang.srt.mem_cache.radix_cache.RadixCache.cache_unfinished_req": self.request_cache,
             "torch_npu.profiler.tensorboard_trace_handler": AscendTrace.capture_handler,
             functions.target: functions.split_qkv,
+            "flash_attn_npu_v3.flash_attn_with_kvcache": functions.flash_attention,
         }
         if self.disaggregation is not None:
             targets.pop("sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run")
@@ -624,6 +660,7 @@ class SGLangObservation:
 
         if self.routing is not None:
             self.routing.install()
+        self.content.install()
 
         if self.shard is not None:
             self.shard.install()

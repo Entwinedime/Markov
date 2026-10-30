@@ -42,7 +42,13 @@ class MemfabricObservation:
 
         # Lengths describe submitted buffers; the native transport may coalesce adjacent ranges.
         with self.recording.scope(
-            "RemoteCopy", transport="ascend_sdma", bytes=sum(lengths), segments=list(lengths)
+            "RemoteCopy",
+            transport="ascend_sdma",
+            bytes=sum(lengths),
+            segments=list(lengths),
+            destination_session=session,
+            source_addresses=list(buffers),
+            destination_addresses=list(destinations),
         ) as scope:
             result = original(engine, session, buffers, destinations, lengths)
             scope.metadata["status"] = result

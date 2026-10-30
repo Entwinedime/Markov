@@ -32,12 +32,12 @@ bool DisaggregatedController::RequestState::transferred() const {
 Batch DisaggregatedController::view(std::size_t request, const KvPool & pool) const {
     auto batch = pool.plan(Phase::Prefill);
     const auto & resident = pool.residence(request);
-    batch.members.push_back({ request, resident.slot.value(), resident.tokens, 0, resident.pages.back(), {} });
+    batch.members.push_back({ request, resident.slot.value(), resident.allocated_tokens, 0, resident.pages.back(), {}, Phase::Prefill });
     return batch;
 }
 
 ServingAction DisaggregatedController::action(ServingStep step, Batch batch, BatchEffects effects, std::int64_t now_ns, std::size_t flow) const {
-    if (step == ServingStep::Batch) effects = this->effects(batch, false);
+    if (step == ServingStep::Batch) effects = this->effects(batch);
     const auto & group = step == ServingStep::Model || step == ServingStep::Release ? groups_.prefill
                          : step == ServingStep::Transfer                            ? groups_.transfer
                                                                                     : groups_.decode;
@@ -55,6 +55,9 @@ ServingAction DisaggregatedController::action(ServingStep step, Batch batch, Bat
         const auto & source = prefill_.residence(request).pages;
         const auto & destination = decode_.residence(request).pages;
         for (std::size_t page = 0; page < source.size(); ++page) work.transferred_pages.push_back({ source[page], destination.at(page) });
+        auto & member = work.batch.members.front();
+        member.new_tokens = member.context_tokens;
+        member.context_tokens = 0;
     }
     return {
         { group, next_task_ },
@@ -62,17 +65,27 @@ ServingAction DisaggregatedController::action(ServingStep step, Batch batch, Bat
     };
 }
 
-BatchEffects DisaggregatedController::effects(const Batch & batch, bool first_output) const {
+BatchEffects DisaggregatedController::effects(const Batch & batch) const {
     BatchEffects result;
     for (const auto & member : batch.members) {
         const auto & state = requests_[member.request];
         const auto & resident = decode_.residence(member.request);
         const auto generated = state.generated + 1;
         const bool finished = generated == state.input.output_tokens;
-        auto pages = finished ? resident.pages : std::vector<std::size_t>{};
-        if (finished) pages.insert(pages.end(), member.new_pages.begin(), member.new_pages.end());
-        result.members.push_back(
-            { member.request, member.slot, generated, resident.tokens + (first_output ? 0 : member.new_tokens), finished, true, std::move(pages) });
+        std::vector<std::size_t> mapped;
+        if (finished || member.phase == Phase::Prefill) {
+            mapped = resident.pages;
+            mapped.insert(mapped.end(), member.new_pages.begin(), member.new_pages.end());
+        }
+        result.members.push_back({ member.request,
+                                   member.slot,
+                                   generated,
+                                   member.context_tokens + member.new_tokens,
+                                   finished,
+                                   true,
+                                   finished ? mapped : std::vector<std::size_t>{},
+                                   false,
+                                   std::move(mapped) });
     }
     return result;
 }
@@ -87,7 +100,9 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
             const auto & resident = prefill_.residence(request);
             if (!state.transferred() || !resident.slot) continue;
             auto batch = view(request, prefill_);
-            BatchEffects completion{ { { request, resident.slot.value(), state.generated, resident.tokens, true, false, resident.pages } } };
+            BatchEffects completion{
+                { { request, resident.slot.value(), state.generated, resident.allocated_tokens, true, false, resident.pages, false, resident.pages } }
+            };
             return action(ServingStep::Release, std::move(batch), std::move(completion), now_ns, state.flow);
         }
     }
@@ -120,7 +135,7 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
             batch.members.push_back(std::move(installed));
         }
         if (ready) {
-            auto completion = effects(batch, true);
+            auto completion = effects(batch);
             return action(ServingStep::Accept, std::move(batch), std::move(completion), now_ns, next_task_);
         }
     }
@@ -131,7 +146,7 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
             auto batch = view(request, decode_);
             batch.members.front().new_tokens = batch.members.front().context_tokens;
             batch.members.front().context_tokens = 0;
-            auto completion = effects(batch, true);
+            auto completion = effects(batch);
             return action(ServingStep::Accept, std::move(batch), std::move(completion), now_ns, state.flow);
         }
     }
@@ -175,7 +190,7 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
 
                 BatchEffects completion;
                 for (const auto & member : batch.members) {
-                    completion.members.push_back({ member.request, member.slot, 1, member.new_tokens, false, false, {} });
+                    completion.members.push_back({ member.request, member.slot, 1, member.new_tokens, false, false, {}, false, member.new_pages });
                 }
                 return action(ServingStep::Model, std::move(batch), std::move(completion), now_ns, next_task_);
             }
@@ -191,7 +206,9 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
                 KvDemand{ request, state.input.prompt_tokens }
             };
             auto batch = prefill_.plan(Phase::Prefill, demands);
-            BatchEffects completion{ { { request, batch.members.front().slot, 1, state.input.prompt_tokens, false, false, {} } } };
+            BatchEffects completion{
+                { { request, batch.members.front().slot, 1, state.input.prompt_tokens, false, false, {}, false, batch.members.front().new_pages } }
+            };
             return action(ServingStep::Model, std::move(batch), std::move(completion), now_ns, state.flow);
         }
     }
@@ -201,7 +218,8 @@ std::optional<ServingAction> DisaggregatedController::plan(std::int64_t now_ns, 
         if (recorded_decode) {
             for (const auto & member : recorded_decode->members) {
                 if (requests_[member.request].stage != RequestStage::Active) return std::nullopt;
-                if (decode_.residence(member.request).tokens != member.context_tokens) throw std::invalid_argument("recorded decode context is not ready");
+                if (decode_.residence(member.request).allocated_tokens != member.context_tokens)
+                    throw std::invalid_argument("recorded decode context differs from allocated KV");
                 demands.push_back({ member.request, member.new_tokens });
             }
         }
@@ -234,7 +252,7 @@ std::optional<TaskIdentity> & DisaggregatedController::channel(ServingStep step)
 
 void DisaggregatedController::start(const ServingAction & action) {
     if (action.task.sequence != next_task_ || action.scheduled_ns < last_event_ns_) throw std::logic_error("action is not the current PD plan");
-    const auto & batch = action.work->batch;
+    const auto & batch = action.batch_work().batch;
     if (action.step == ServingStep::Reserve) {
         decode_.reserve(batch);
         const auto identity = batch.members.front().request;
@@ -263,19 +281,15 @@ void DisaggregatedController::finish(const ServingAction & action, const BatchPr
     if (busy != action.task || completed_ns < last_event_ns_) throw std::logic_error("completion does not belong to the pending PD action");
     busy.reset();
     last_event_ns_ = completed_ns;
-    const auto request = action.work->batch.members.front().request;
+    const auto request = action.batch_work().batch.members.front().request;
     auto & state = requests_[request];
 
     switch (action.step) {
     case ServingStep::Reserve:
-        decode_.advance(request, state.input.prompt_tokens);
         state.stage = RequestStage::Reserved;
         break;
     case ServingStep::Model:
-        for (const auto & member : action.work->batch.members) {
-            prefill_.advance(member.request, member.new_tokens);
-            requests_[member.request].stage = RequestStage::ModelReady;
-        }
+        for (const auto & member : action.batch_work().batch.members) { requests_[member.request].stage = RequestStage::ModelReady; }
         break;
     case ServingStep::Transfer:
         state.stage = RequestStage::Transferred;
@@ -290,11 +304,10 @@ void DisaggregatedController::finish(const ServingAction & action, const BatchPr
         break;
     case ServingStep::Accept:
     case ServingStep::Batch:
-        for (const auto & member : action.work->effects.members) {
+        for (const auto & member : action.batch_work().effects.members) {
             auto & current = requests_[member.request];
             current.generated = member.generated_tokens;
             current.stage = member.finished ? RequestStage::Finished : RequestStage::Active;
-            decode_.advance(member.request, member.resident_tokens);
             if (member.finished) decode_.release(member.request);
         }
         decode_.return_pages(returned_pages);

@@ -1,18 +1,56 @@
-"""The common dense attention interface owns output geometry and KV effects."""
+"""Keep attention coordination and device calls inside one semantic region."""
 
 from __future__ import annotations
 
 import inspect
 from typing import Any
 
+from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
+from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
+from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation
+from markov_collection.adapters.runtimes.pytorch.factories import TensorGeometryObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
 class AttentionCall(NativeCall):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs, interface="paged_attention")
+        super().__init__(*args, **kwargs)
         self.layer = self.original.__self__
         self.signature = inspect.signature(self.original)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        with self.values.metadata():
+            arguments = self.signature.bind(*args, **kwargs).arguments
+            shapes = self.values.shapes
+            backend = get_attn_backend()
+            pool = backend.token_to_kv_pool
+            cache = shapes.tensor(pool.k_buffer).shape
+            code = AscendAttnBackend.forward_decode.__code__
+
+            # Native Decode rebinds q and num_tokens; retain their input geometry at the call boundary.
+            dimensions = {
+                (code, "num_tokens"): shapes.tensor(arguments["q"]).shape[0],
+                (code, "forward_batch.batch_size"): shapes.tensor(arguments["forward_batch"].seq_lens).shape[0],
+                (AscendAttnBackend.forward_mixed.__code__, "num_block"): cache[-4],
+                (AscendAttnBackend.forward_mixed.__code__, "block_size"): cache[-3],
+            }
+            for method in (AscendAttnBackend.forward_extend, AscendAttnBackend.forward_decode):
+                dimensions[method.__code__, "self.page_size"] = backend.page_size
+
+            # The native KV writer owns its page/head layout; read those fields without calling the writer again.
+            writer = inspect.unwrap(pool.set_kv_buffer).__code__
+            for name in ("page_size", "head_num", "head_dim", "v_head_dim"):
+                dimensions[writer, f"self.{name}"] = getattr(pool, name)
+
+        with (
+            TensorGeometryObservation(self.values, scalars=dimensions),
+            AscendFunctionObservation(self.values),
+            ConcatenationObservation(self.values),
+        ):
+            return super().invoke(*args, **kwargs)
 
     def completed(
         self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
@@ -28,6 +66,7 @@ class AttentionCall(NativeCall):
         # The native layer supplies head geometry; only the query's row count varies with the batch.
         rows = shapes.tensor(query).shape[0]
         metadata["attributes"] = {
+            "phase": BatchTensors.phase(arguments["forward_batch"]),
             "q_heads": self.layer.tp_q_head_num,
             "kv_heads": self.layer.tp_k_head_num,
             "qk_dim": self.layer.qk_head_dim,

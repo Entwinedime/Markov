@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from contextvars import copy_context
 from functools import partial
 from typing import Any
 
+from markov_collection.artifacts import write_json
+
 
 class DisaggregationObservation:
     def __init__(self, serving: Any, role: str) -> None:
+        from torch.utils.weak import WeakIdKeyDictionary
+
         from markov_collection.adapters.runtimes.ascend.transfer import MemfabricObservation
 
         self.serving = serving
@@ -17,7 +22,7 @@ class DisaggregationObservation:
         self.operators = serving.operators
         self.values = self.operators.values
         self.rooms: dict[int, dict[str, Any]] = {}
-        self.pages: dict[tuple[int, ...], dict[str, Any]] = {}
+        self.transfers: Any = WeakIdKeyDictionary()
         self.transport = MemfabricObservation(self.recording)
 
     def registration(self, original: Any, queue: Any) -> Any:
@@ -53,6 +58,18 @@ class DisaggregationObservation:
             "buffers": buffers,
             "metadata_item_bytes": list(manager.kv_args.aux_item_lens),
         }
+
+        # Process addresses identify observed copies; they never become template or target identities.
+        write_json(
+            self.serving.directory / f"transport-rank-{self.serving.parallel['rank']}.json",
+            {
+                "session": manager.engine.get_session_id(),
+                "kv_addresses": list(manager.kv_args.kv_data_ptrs),
+                "kv_bytes": list(manager.kv_args.kv_data_lens),
+                "metadata_addresses": list(manager.kv_args.aux_data_ptrs),
+                "metadata_bytes": list(manager.kv_args.aux_data_lens),
+            },
+        )
         return manager
 
     def poll_readiness(self, original: Any, *args: Any, **kwargs: Any) -> Any:
@@ -186,15 +203,32 @@ class DisaggregationObservation:
             ]
             return result
 
-    def send(self, original: Any, scheduler: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+    def send(self, original: Any, scheduler: Any, request: Any, last_chunk=False, end_idx=None) -> Any:
         if not self.serving.selected or request.rid not in self.serving.requests:
-            return original(scheduler, request, *args, **kwargs)
+            return original(scheduler, request, last_chunk=last_chunk, end_idx=end_idx)
 
         from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewObservation
 
         metadata = self.request_metadata(request, scheduler.req_to_token_pool)
+        begin = request.start_send_idx
+        end = min(request.extend_range.end, len(request.origin_input_ids)) if end_idx is None else end_idx
+        if not last_chunk:
+            end -= end % scheduler.token_to_kv_pool_allocator.page_size
+        if end < begin:
+            return original(scheduler, request, last_chunk=last_chunk, end_idx=end_idx)
+        metadata["parameters"].update(
+            M=end - begin,
+            send_begin=begin,
+            max_sequence_tokens=end,
+            last_chunk=int(last_chunk),
+            metadata_slot=request.metadata_buffer_index,
+            handoff_id=request.bootstrap_room,
+        )
         self.rooms[request.bootstrap_room] = metadata
-        with self.recording.scope("KvSend", **metadata) as scope:
+
+        # PP can send the previous chunk outside both scheduling and result processing.
+        observation = self.operators if self.recording.current_scope.get() is None else nullcontext()
+        with observation, self.recording.scope("KvSend", **metadata) as scope:
             self.bind_metadata(scheduler.disagg_metadata_buffers, scope.metadata)
 
             with self.values.metadata():
@@ -204,19 +238,20 @@ class DisaggregationObservation:
                 scope.metadata["bindings"] = {"request_map_stride": mapping.stride(0)}
                 scope.metadata["ports"] = {"inputs": self.values.port_values({"request_map": mapping}), "outputs": {}}
 
-                # Declare the complete-prefill slice before CPU materialization and its downstream views.
+                # Native sends complete pages until the final call carries the remaining tail.
                 symbols = self.values.shapes
                 view = TensorViewObservation(
                     self.values,
                     [(mapping, (symbols.symbol("M"),))],
-                    start=symbols.symbol("request_slot") * symbols.symbol("request_map_stride"),
-                    index=(slot, slice(0, len(request.origin_input_ids))),
+                    start=symbols.symbol("request_slot") * symbols.symbol("request_map_stride")
+                    + symbols.symbol("send_begin"),
+                    index=(slot, slice(begin, end)),
                 )
 
             with view:
-                result = original(scheduler, request, *args, **kwargs)
+                result = original(scheduler, request, last_chunk=last_chunk, end_idx=end_idx)
             if view.result is None:
-                raise ValueError("KV send did not read its declared complete-prefill slice")
+                raise ValueError("KV send did not read its declared token slice")
             return result
 
     def bind_metadata(self, buffers: Any, metadata: dict[str, Any]) -> None:
@@ -230,13 +265,15 @@ class DisaggregationObservation:
                 self.values.bind_shape(tensor, (2 * self.values.shapes.symbol("R"), *tensor.shape[1:]))
             metadata["metadata_buffers"] = self.values.port_values(tensors)
 
-    def enqueue(self, original: Any, sender: Any, indices: Any, *args: Any, **kwargs: Any) -> Any:
-        metadata = self.rooms.get(sender.bootstrap_room)
+    def enqueue(self, original: Any, manager: Any, room: int, indices: Any, *args: Any, **kwargs: Any) -> Any:
+        metadata = self.rooms.get(room)
+
+        # Native chunks retain this array; equal page lists can belong to different concurrent transfers.
         if metadata is not None:
-            self.pages[tuple(map(int, indices))] = metadata
+            self.transfers[indices] = metadata
             scope = self.recording.regions[self.recording.current_scope.get()]["metadata"]
             scope["source_pages"] = indices.tolist()
-        return original(sender, indices, *args, **kwargs)
+        return original(manager, room, indices, *args, **kwargs)
 
     def transfer(
         self,
@@ -249,7 +286,7 @@ class DisaggregationObservation:
         grouping: str,
     ) -> Any:
         self.serving.parallel["kv_layout"]["copy_grouping"] = grouping
-        metadata = self.pages.get(tuple(map(int, source)))
+        metadata = self.transfers.get(source)
         if metadata is None:
             return original(session, source, destination_buffers, destination, *args)
 
@@ -265,7 +302,12 @@ class DisaggregationObservation:
         if metadata is None:
             return original(manager, request, *args, **kwargs)
 
-        with self.recording.scope("KvMetadataTransfer", **metadata):
+        with self.recording.scope(
+            "KvMetadataTransfer",
+            **metadata,
+            destination_session=request.mooncake_session_id,
+            destination_metadata_slot=request.dst_aux_index,
+        ):
             return original(manager, request, *args, **kwargs)
 
     def release(self, original: Any, cache: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
@@ -303,7 +345,7 @@ class DisaggregationObservation:
                 "SchedulerBatchResultProcessor.process_batch_result_prebuilt"
             ): self.prebuilt_result,
             "sglang.srt.managers.scheduler.Scheduler.send_kv_chunk": self.send,
-            "sglang.srt.disaggregation.mooncake.conn.MooncakeKVSender.send": self.enqueue,
+            "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": self.enqueue,
             "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_aux": self.metadata_transfer,
             (
                 "sglang.srt.distributed.device_communicators.mooncake_transfer_engine."

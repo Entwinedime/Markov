@@ -49,7 +49,7 @@ private:
 
     Batch view(std::size_t request, const KvPool & pool) const;
     ServingAction action(ServingStep step, Batch batch, BatchEffects effects, std::int64_t now_ns, std::size_t flow) const;
-    BatchEffects effects(const Batch & batch, bool first_output) const;
+    BatchEffects effects(const Batch & batch) const;
     std::optional<std::size_t> next_waiting() const;
     std::optional<TaskIdentity> & channel(ServingStep step);
 

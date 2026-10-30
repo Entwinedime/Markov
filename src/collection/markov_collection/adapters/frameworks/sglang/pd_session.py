@@ -15,6 +15,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from markov_workload import WorkloadContent
+
 from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
 from markov_collection.artifacts import write_json
 
@@ -69,6 +71,8 @@ class NativeDisaggregatedSession:
         ]:
             raise ValueError("injected workload must describe the submitted native requests")
         self.output = Path(request["output"])
+        self.content_input = NativeServingSession.content_input(request["requests"], source)
+        self.content = WorkloadContent(self.content_input["requests"], self.content_input["prefixes"])
         self.services = self.instances(request)
         self.children: list[subprocess.Popen[bytes]] = []
 
@@ -102,6 +106,7 @@ class NativeDisaggregatedSession:
                 "disaggregation_role": role,
                 "observe_all_workers": self.request.get("observe_all_workers", False),
                 "serving_input": self.request.get("serving_input"),
+                "content": self.content_input,
             },
         )
 
@@ -137,9 +142,6 @@ class NativeDisaggregatedSession:
             "ascend",
             "--disaggregation-bootstrap-port",
             str(self.bootstrap_port),
-            "--chunked-prefill-size",
-            "-1",
-            "--disable-radix-cache",
             "--disable-overlap-schedule",
             "--disable-cuda-graph",
             "--mem-fraction-static",
@@ -147,8 +149,16 @@ class NativeDisaggregatedSession:
             "--log-level",
             "warning",
         ]
-        for key, value in self.request["configuration"][role].items():
-            command.extend(["--" + key.replace("_", "-"), str(value)])
+
+        # Merge defaults before encoding CLI flags so Prefill can enable cache independently of Decode.
+        configuration = {"chunked_prefill_size": -1, "disable_radix_cache": True, **self.request["configuration"][role]}
+        for key, value in configuration.items():
+            flag = "--" + key.replace("_", "-")
+            if isinstance(value, bool):
+                if value:
+                    command.append(flag)
+            else:
+                command.extend([flag, str(value)])
 
         environment = dict(
             os.environ,
@@ -206,8 +216,15 @@ class NativeDisaggregatedSession:
             time.sleep(0.05)
 
     def generate(self, device: int, prefix: str, pairs: Any, rooms: list[int], indices: list[int]) -> list[Any]:
+        if prefix == "warmup":
+            source = NativeServingSession.content_input(pairs)
+            content = WorkloadContent(source["requests"])
+            identities = [request["id"] for request in source["requests"]]
+        else:
+            content = self.content
+            identities = [self.content_input["requests"][index]["id"] for index in indices]
         payload = {
-            "input_ids": [[1] * prompt for prompt, _ in pairs],
+            "input_ids": [content.prompt(identity) for identity in identities],
             "sampling_params": [
                 {"max_new_tokens": output, "temperature": 0, "ignore_eos": True} for _, output in pairs
             ],
@@ -255,7 +272,15 @@ class NativeDisaggregatedSession:
                             f"{prefix}/{index}": 1 if role == "prefill" else output
                             for index, (_, output) in enumerate(pairs)
                         }
-                        NativeServingSession.check_responses(rows, expected)
+                        tokens = (
+                            None
+                            if prefix == "warmup"
+                            else {
+                                f"{prefix}/{index}": self.content.output_token(request["id"])
+                                for index, request in enumerate(self.content_input["requests"])
+                            }
+                        )
+                        NativeServingSession.check_responses(rows, expected, tokens)
                     print(f"markov: native PD {prefix} complete", flush=True)
 
                     # Both native replies complete before reset; the observation keeps warmed allocator state.
@@ -312,7 +337,10 @@ class NativeDisaggregatedSession:
                     "transport": "ascend_sdma",
                     "native_participants": [rank for instance in self.services for rank in instance["ranks"]],
                     "observed_roles": plan["observed_roles"],
-                    "routing_source": "workload" if self.request.get("serving_input") is not None else "native",
+                    "routing_source": "workload"
+                    if (self.request.get("serving_input") or {}).get("ep_routes")
+                    else "native",
+                    "content_source": "declared_prefixes_and_private_continuations",
                     "instances": [
                         {key: value for key, value in instance.items() if key != "ranks"} for instance in self.services
                     ],

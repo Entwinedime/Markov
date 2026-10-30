@@ -166,7 +166,7 @@ nlohmann::json SourceGraph::summary() const {
                 for (std::size_t index = 0; index < members.size(); ++index) {
                     const auto value = specification.at("members")[index].at("value").get<std::size_t>();
                     const auto & record = source_.at("values").at(value);
-                    if (record.at("dtype") != group.member_dtype(index) || record.at("device") != group.device
+                    if (record.at("dtype") != group.member_dtype(index) || (group.device && record.at("device") != *group.device)
                         || values_.at(value).shape != group.dimensions(bindings, members[index]))
                         gaps.push_back({
                             {      "region",                              region.at("id") },

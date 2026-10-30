@@ -33,12 +33,15 @@ struct NativeInstance {
     ServingSettings settings;
     std::size_t batch_limit;
     std::vector<NativeParticipant> participants;
+    std::int64_t prefill_chunk_tokens = 0;
+    bool mixed_batches = false;
+    nlohmann::json expert_routes = nullptr;
 };
 
 // The peer owns native queues and progress; this endpoint owns delivery and in-flight work only.
 class NativeController final : public ServingControl {
 public:
-    NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
+    NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer, const nlohmann::json & prefixes,
                      std::span<const NativeTransferRoute> transfers = {});
 
     std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;

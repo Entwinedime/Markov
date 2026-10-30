@@ -63,7 +63,7 @@ std::optional<ServingAction> ServingController::plan(std::int64_t now_ns, const 
             { group_, next_task_ },
             std::move(work), now_ns, next_flow_, lane, 0, stages_ == 1 ? ServingStep::Batch : ServingStep::Stage
         };
-        if (candidate->work->batch.phase == Phase::Prefill) break;
+        if (candidate->batch_work().batch.phase == Phase::Prefill) break;
     }
     return candidate;
 }
@@ -108,8 +108,8 @@ std::shared_ptr<const BatchWork> ServingController::plan_batch(std::size_t lane,
         for (const auto & member : recorded->members) {
             const auto & request = requests_[member.request];
             if (request.input.arrival_ns > now_ns) return {};
-            if (kv_.residence(member.request).tokens != member.context_tokens)
-                throw std::invalid_argument("replay context is not ready for request: " + request.input.id);
+            if (kv_.residence(member.request).allocated_tokens != member.context_tokens)
+                throw std::invalid_argument("replay context differs from allocated KV for request: " + request.input.id);
             selected.push_back(member.request);
         }
         if (selected.size() > batch_limit_ || (prefill && selected.size() > kv_.free_slots().size()))
@@ -131,7 +131,7 @@ void ServingController::start(const ServingAction & action) {
     if (action.scheduled_ns < last_event_ns_) throw std::invalid_argument("cannot submit a plan before the last completion");
     auto & lane = lanes_.at(action.lane);
     if (!lane.flow) {
-        const auto & batch = action.work->batch;
+        const auto & batch = action.batch_work().batch;
         kv_.reserve(batch);
 
         for (const auto & member : batch.members) {
@@ -142,7 +142,7 @@ void ServingController::start(const ServingAction & action) {
         }
         if (replay_) replay_->advance("model");
 
-        lane.flow = Flow{ next_flow_++, action.work, 0, std::nullopt };
+        lane.flow = Flow{ next_flow_++, std::get<std::shared_ptr<const BatchWork>>(action.work), 0, std::nullopt };
     }
 
     lane.flow->running = action.task;
@@ -157,19 +157,20 @@ BatchEffects ServingController::effects(const Batch & batch) const {
         const auto & resident = kv_.residence(member.request);
         const auto generated = state.generated_tokens + 1;
         const bool finished = generated == state.input.output_tokens;
-        std::vector<std::size_t> released;
-        if (finished) {
-            released = resident.pages;
-            released.insert(released.end(), member.new_pages.begin(), member.new_pages.end());
+        std::vector<std::size_t> mapped;
+        if (finished || member.phase == Phase::Prefill) {
+            mapped = resident.pages;
+            mapped.insert(mapped.end(), member.new_pages.begin(), member.new_pages.end());
         }
 
         result.members.push_back({ .request = member.request,
                                    .slot = member.slot,
                                    .generated_tokens = generated,
-                                   .resident_tokens = resident.tokens + member.new_tokens,
+                                   .resident_tokens = member.context_tokens + member.new_tokens,
                                    .finished = finished,
                                    .emits_output = true,
-                                   .released_pages = std::move(released) });
+                                   .released_pages = finished ? mapped : std::vector<std::size_t>{},
+                                   .mapped_pages = std::move(mapped) });
     }
 
     return result;
@@ -187,10 +188,9 @@ void ServingController::finish(const ServingAction & action, const BatchProgram 
         return;
     }
 
-    for (const auto & member : action.work->effects.members) {
+    for (const auto & member : action.batch_work().effects.members) {
         auto & state = requests_.at(member.request);
         state.generated_tokens = member.generated_tokens;
-        kv_.advance(member.request, member.resident_tokens);
         if (member.finished) kv_.release(member.request);
     }
 

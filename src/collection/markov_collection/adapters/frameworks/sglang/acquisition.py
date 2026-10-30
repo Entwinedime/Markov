@@ -8,6 +8,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from markov_workload import WorkloadContent
+
 from markov_collection.adapters.frameworks.sglang.routes import ExpertRouteConditions
 from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
 
@@ -25,6 +27,9 @@ class SGLangAcquisition:
         for configuration in specification["configurations"]:
             for workload in specification["workloads"]:
                 try:
+                    WorkloadContent(workload["requests"], workload.get("prefixes", ())).check_vocabulary(
+                        model["vocab_size"]
+                    )
                     pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
                     for pool in pools:
                         if "ep" not in pool:
@@ -37,7 +42,7 @@ class SGLangAcquisition:
                         source = workload.get("ep_routes", {}).get(topology["id"])
                         ExpertRouteConditions(model, topology["size"]).check(source, workload["requests"])
                 except (KeyError, TypeError, ValueError) as error:
-                    failures[f"{configuration['id']}/{workload['id']}"] = f"route input: {error}"
+                    failures[f"{configuration['id']}/{workload['id']}"] = f"workload input: {error}"
         return failures
 
     @staticmethod
@@ -63,6 +68,9 @@ class SGLangAcquisition:
             "dtype": model["dtype"],
             "attention_backend": configuration["attention_backend"],
             "page_size": configuration["page_size"],
+            "chunked_prefill": "prefill_chunk_tokens" in configuration.get("pd", {}).get("prefill", configuration),
+            "mixed_batches": configuration.get("mixed_batches", False),
+            "prefix_cache": configuration.get("pd", {}).get("prefill", configuration).get("prefix_cache", False),
         }
         if "pd" in configuration:
             domain["pd"] = tuple(
@@ -151,15 +159,18 @@ class SGLangAcquisition:
     @staticmethod
     def row_limits(configurations: list[dict[str, Any]], max_prompt_tokens: int) -> dict[str, int]:
         members = 0
-        rows = max_prompt_tokens
+        rows = 0
         for configuration in configurations:
             prefill = configuration["pd"]["prefill"] if "pd" in configuration else configuration
             budget = prefill["max_prefill_tokens"]
             page_size = configuration["page_size"]
 
-            # Native Prefill can batch whole requests in both serving modes, independently of our controller.
-            prefix = (budget - 1) // page_size * page_size
-            rows = max(rows, budget, prefix + max_prompt_tokens)
+            # Native chunk budgeting caps all rows, while whole-request admission may exceed its soft budget.
+            if "prefill_chunk_tokens" in prefill:
+                prefill_rows = prefill["prefill_chunk_tokens"]
+            else:
+                prefix = (budget - 1) // page_size * page_size
+                prefill_rows = max(max_prompt_tokens, budget, prefix + max_prompt_tokens)
 
             pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
             for pool in pools:
@@ -167,8 +178,39 @@ class SGLangAcquisition:
 
                 # Native MLP synchronization pads Decode members as well as Prefill tokens.
                 members = max(members, (pool["max_running_requests"] + size - 1) // size * size)
-                rows = (rows + size - 1) // size * size
+                rows = max(rows, (prefill_rows + size - 1) // size * size)
         return {"M": max(rows, members), "B": members}
+
+    @staticmethod
+    def cache_content(page_size: int, initial: Sequence[tuple[int, int]]) -> dict[str, Any]:
+
+        # Fixed mechanism coverage: prime, split/hit, force eviction, then revisit shared content.
+        prefixes = [
+            {"id": "shared", "tokens": page_size},
+            {"id": "long", "parent": "shared", "tokens": page_size},
+        ]
+        requests = [
+            {"id": f"representative-{index}", "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
+            for index, (prompt, output) in enumerate(initial)
+        ]
+        for pages, output, prefix in (
+            (3, 2, "long"),
+            (2, 1, "shared"),
+            (3, 3, "long"),
+            (4, 2, None),
+            (1, 2, "shared"),
+            (3, 1, "long"),
+        ):
+            request = {
+                "id": f"representative-{len(requests)}",
+                "arrival_ns": 0,
+                "prompt_tokens": pages * page_size + 1,
+                "output_tokens": output,
+            }
+            if prefix is not None:
+                request["prefix_id"] = prefix
+            requests.append(request)
+        return {"requests": requests, "prefixes": prefixes}
 
     @staticmethod
     def request(
@@ -184,6 +226,10 @@ class SGLangAcquisition:
             from markov_collection.adapters.frameworks.sglang.pd_session import NativeDisaggregatedSession
 
             requests = NativeDisaggregatedSession.structure_requests(domain["page_size"])
+        initial_count = len(requests)
+        content = SGLangAcquisition.cache_content(domain["page_size"], requests) if domain["prefix_cache"] else None
+        if content is not None:
+            requests = tuple((request["prompt_tokens"], request["output_tokens"]) for request in content["requests"])
         model = specification["model"]
         configurations = [
             configuration
@@ -195,14 +241,37 @@ class SGLangAcquisition:
             if domain.get("pd")
             else SGLangAcquisition.configuration(domain["page_size"], domain["pp"])
         )
-        if domain.get("pd"):
 
-            # In-flight transfers retain slots; let the fixed representative set reach multi-member admission.
+        # In-flight transfers retain slots; let the fixed representative set reach multi-member admission.
+        if domain.get("pd"):
             for pool in representative.values():
                 pool["max_running_requests"] = max(pool["max_running_requests"], len(requests))
-        configurations.append(
-            {"page_size": domain["page_size"], "pd": representative} if domain.get("pd") else representative
+        if domain["prefix_cache"]:
+            native = representative["prefill"] if domain.get("pd") else representative
+            native.update(
+                disable_radix_cache=False,
+                max_total_tokens=8 * domain["page_size"],
+                max_prefill_tokens=8 * domain["page_size"],
+            )
+        range_configuration = (
+            {"page_size": domain["page_size"], "pd": {role: dict(pool) for role, pool in representative.items()}}
+            if domain.get("pd")
+            else dict(representative)
         )
+
+        # The planner consumes our contract; the native session consumes the framework's setting.
+        if domain["chunked_prefill"]:
+            pool = range_configuration["pd"]["prefill"] if domain.get("pd") else range_configuration
+            native = representative["prefill"] if domain.get("pd") else representative
+
+            # Cached chunks must create multi-page edges so the fixed shared-prefix requests exercise splitting.
+            chunk_tokens = domain["page_size"] * (2 if domain["prefix_cache"] else 1)
+            pool["prefill_chunk_tokens"] = chunk_tokens
+            native["chunked_prefill_size"] = chunk_tokens
+        if domain["mixed_batches"]:
+            representative["enable_mixed_chunk"] = True
+            range_configuration["mixed_batches"] = True
+        configurations.append(range_configuration)
         maximum_prompt = max(
             max(prompt for prompt, _ in requests),
             max(
@@ -222,28 +291,41 @@ class SGLangAcquisition:
                 "limits": limits,
             },
         }
-        if domain.get("pd"):
-            result["submissions"] = NativeDisaggregatedSession.structure_submissions(requests)
-        if model_configuration.get("num_experts", 0):
-            result["serving_input"] = SGLangAcquisition.source_input(
-                result, model_configuration, specification["node_durations_ns"]
+        if domain.get("pd") or domain["prefix_cache"]:
+            groups = (
+                NativeDisaggregatedSession.structure_submissions(requests[:initial_count])
+                if domain.get("pd")
+                else [list(range(initial_count))]
             )
+            if domain["prefix_cache"]:
+                groups.extend([initial_count + index for index in group] for group in ((0,), (1, 2), (3,), (4, 5)))
+            result["submissions"] = groups
+        if model_configuration.get("num_experts", 0) or content is not None:
+            result["serving_input"] = SGLangAcquisition.source_input(result, model_configuration, content)
         return result
 
     @staticmethod
-    def source_input(request: dict[str, Any], model: dict[str, Any], durations: dict[str, int]) -> dict[str, Any]:
-        requests = [
-            {"id": f"representative-{index}", "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
-            for index, (prompt, output) in enumerate(request["requests"])
-        ]
+    def source_input(request: dict[str, Any], model: dict[str, Any], content: dict[str, Any] | None) -> dict[str, Any]:
+        requests = (
+            content["requests"]
+            if content is not None
+            else [
+                {"id": f"representative-{index}", "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
+                for index, (prompt, output) in enumerate(request["requests"])
+            ]
+        )
         roles = request["pd"] if "pd" in request else (("model", request["tp"], request["pp"], request["ep"]),)
         pools = {}
         routes = {}
         for role, tp, pp, ep in roles:
             settings = request["configuration"][role] if "pd" in request else request["configuration"]
             pool = {name: settings[name] for name in ("max_running_requests", "max_total_tokens", "max_prefill_tokens")}
-            topology = {"id": f"representative-{role}", "size": ep}
-            pool["ep"] = topology
+            if "chunked_prefill_size" in settings:
+                pool["prefill_chunk_tokens"] = settings["chunked_prefill_size"]
+            if settings.get("enable_mixed_chunk", False):
+                pool["mixed_batches"] = True
+            if not settings.get("disable_radix_cache", True):
+                pool["prefix_cache"] = True
             if "pd" in request:
                 pool["tp"] = tp
                 if role == "decode":
@@ -251,19 +333,27 @@ class SGLangAcquisition:
             if pp > 1:
                 pool.update(pp=pp, microbatch_requests=settings["pp_max_micro_batch_size"])
             pools[role] = pool
-            routes[topology["id"]] = ExpertRouteConditions(model, ep).representative(requests)
+            if model.get("num_experts", 0):
+                topology = {"id": f"representative-{role}", "size": ep}
+                pool["ep"] = topology
+                routes[topology["id"]] = ExpertRouteConditions(model, ep).representative(
+                    requests, content["prefixes"] if content is not None else ()
+                )
 
         configuration = {"page_size": request["page_size"]}
         if "pd" in request:
             configuration["pd"] = pools
         else:
             configuration.update(pools["model"])
-        return {
+        result = {
             "configuration": configuration,
             "requests": requests,
-            "ep_routes": routes,
-            "node_durations_ns": durations,
         }
+        if content is not None:
+            result["prefixes"] = content["prefixes"]
+        if routes:
+            result["ep_routes"] = routes
+        return result
 
     @staticmethod
     def command(stage: str, request: str) -> list[str]:
@@ -305,6 +395,7 @@ class SGLangAcquisition:
             attention_backend=request["attention_backend"],
             observe_all_workers=request.get("observe_all_workers", False),
             serving_input=request.get("serving_input"),
+            submissions=request.get("submissions"),
         ).run()
         summary = json.loads((Path(request["output"]) / "session-summary.json").read_text())
         for rank in summary["observed_roles"]:

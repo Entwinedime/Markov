@@ -82,7 +82,7 @@ std::size_t DisaggregatedStructure::append_transfer(const KvTransfer & route, st
 }
 
 void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & handoff) {
-    const auto & pages = action.work->transferred_pages;
+    const auto & pages = action.batch_work().transferred_pages;
     const auto page_size = prefill_.sources().front()->environment().at("kv_layout").at("page_size").get<std::int64_t>();
     std::int64_t runs = 0;
     for (std::size_t page = 0; page < pages.size(); ++page) {
@@ -92,9 +92,13 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
     for (const auto & route : transfers_.copies()) {
         if (action.transfer && (resource_group(route.source) != action.transfer->source || resource_group(route.destination) != action.transfer->destination))
             continue;
-        auto ready = handoff.prepared.at(route.source);
+        const auto & offered = action.transfer ? handoff.offered.at({ action.transfer->source, action.flow }).ready : handoff.prepared;
+        auto ready = offered.at(route.source);
         const auto & reserved = handoff.reserved.at(route.destination);
         ready.insert(ready.end(), reserved.begin(), reserved.end());
+        const auto identity = std::pair{ route.source, route.destination };
+        const auto & previous = handoff.copied[identity];
+        ready.insert(ready.end(), previous.begin(), previous.end());
         std::vector<std::size_t> copied;
         std::int64_t bulk_bytes = 0;
         for (const auto & slice : route.slices) {
@@ -108,12 +112,22 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
         if (!route.per_buffer_tokens)
             copied.push_back(append_transfer(route, bulk_bytes, runs * static_cast<std::int64_t>(route.slices.size()), ready, "kv", route.slices));
 
-        // Metadata acknowledges every KV fragment for this source/destination pair.
-        const auto bytes = std::accumulate(route.metadata_item_bytes.begin(), route.metadata_item_bytes.end(), std::int64_t{ 0 });
-        const auto done = append_transfer(route, bytes, static_cast<std::int64_t>(route.metadata_item_bytes.size()), copied, "metadata", {});
-        metadata_bytes_ += bytes;
-        handoff.transferred[route.source].push_back(done);
-        handoff.transferred[route.destination].push_back(done);
+        // Only the final metadata acknowledges all preceding fragments of this rank pair.
+        if (action.batch_work().final_transfer) {
+            const auto bytes = std::accumulate(route.metadata_item_bytes.begin(), route.metadata_item_bytes.end(), std::int64_t{ 0 });
+            const auto done = append_transfer(route, bytes, static_cast<std::int64_t>(route.metadata_item_bytes.size()), copied, "metadata", {});
+            metadata_bytes_ += bytes;
+            handoff.transferred[route.source].push_back(done);
+            handoff.transferred[route.destination].push_back(done);
+            handoff.copied.erase(identity);
+        }
+        else handoff.copied[identity] = std::move(copied);
+    }
+    if (action.transfer) {
+        const TaskIdentity sent{ action.transfer->source, action.flow };
+        auto & offered = handoff.offered.at(sent);
+        offered.consumers.erase(*action.transfer);
+        if (offered.consumers.empty()) handoff.offered.erase(sent);
     }
 }
 
@@ -152,17 +166,23 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     BatchProgram result{ std::nullopt, {}, {} };
     const auto & members = topology_.parallel().group(action.task.group).members;
     const bool source = action.step != ServingStep::Transfer && topology_.parallel().group(members.front(), "serving").id == groups_.prefill;
-    const bool source_result = action.step == ServingStep::Model || (action.step == ServingStep::Result && source);
+    const bool produced = source && (action.step == ServingStep::Model || action.step == ServingStep::Compute);
+    const bool sent = action.step == ServingStep::Send && action.channel.empty() && source;
     const bool received = action.step == ServingStep::Receive && action.channel.empty();
     const bool released = action.step == ServingStep::Release && source;
 
-    if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.work->batch.members.front().request));
+    if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.batch_work().batch.members.front().request));
     else {
         auto & instance = source ? prefill_ : decode_;
         const bool consumes_transfer = received || released;
         RankPorts prerequisites;
-        if (consumes_transfer || action.step == ServingStep::Accept) {
-            for (const auto & member : action.work->batch.members) {
+        if (source && action.step == ServingStep::Indices && action.index_work().release_request) {
+
+            // Cached pages unlock in index work, before the later request-slot release.
+            prerequisites = handoffs_.at(*action.index_work().release_request).transferred;
+        }
+        else if (consumes_transfer || action.step == ServingStep::Accept) {
+            for (const auto & member : action.batch_work().batch.members) {
                 const auto & handoff = handoffs_.at(member.request);
                 const auto & ready = consumes_transfer ? handoff.transferred : handoff.received;
                 for (const auto & [rank, ports] : ready) prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
@@ -172,13 +192,24 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     }
 
     auto drained = graph_.execution.terminal_nodes(node_begin);
-    if (action.step == ServingStep::Reserve || source_result || received || action.step == ServingStep::Accept || released) {
+    if (action.step == ServingStep::Reserve || produced || sent || received || action.step == ServingStep::Accept || released) {
 
         // Batch membership may change between P computation and D admission; request identity is stable.
-        for (const auto & member : action.work->batch.members) {
+        for (const auto & member : action.batch_work().batch.members) {
             auto & handoff = handoffs_[member.request];
-            if (action.step == ServingStep::Reserve || source_result)
-                bind_readiness(action, result, drained, action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared);
+            if (action.step == ServingStep::Reserve || produced) {
+                auto & ports = action.step == ServingStep::Reserve ? handoff.reserved : handoff.prepared;
+                for (const auto rank : members) ports.erase(rank);
+                bind_readiness(action, result, drained, ports);
+            }
+            if (sent) {
+                auto & offered = handoff.offered[action.task];
+                for (const auto rank : members) offered.ready[rank] = handoff.prepared.at(rank);
+                bind_readiness(action, result, drained, offered.ready);
+                for (const auto & binding : transfer_bindings()) {
+                    if (binding.source == action.task.group) offered.consumers.insert(binding);
+                }
+            }
             if (received) bind_readiness(action, result, drained, handoff.received);
             if (action.step == ServingStep::Accept) handoff.accepted.insert(members.begin(), members.end());
             if (released) handoff.released.insert(members.begin(), members.end());
@@ -189,7 +220,7 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     }
 
     // Resource effects and transfers commit only after their participating ranks' work has drained.
-    if (!action.stage || received || released || action.step == ServingStep::Reserve || action.step == ServingStep::Accept)
+    if (!drained.empty() && (!action.stage || received || released || action.step == ServingStep::Reserve || action.step == ServingStep::Accept))
         result.completions = std::move(drained);
 
     for (auto region = region_begin; region < graph_.regions.size(); ++region) {
@@ -233,6 +264,10 @@ std::vector<std::size_t> DisaggregatedStructure::retire() {
         for (const auto * ports : { &handoff.reserved, &handoff.prepared, &handoff.transferred, &handoff.received }) {
             for (const auto & [rank, ready] : *ports) nodes.insert(nodes.end(), ready.begin(), ready.end());
         }
+        for (const auto & [task, offered] : handoff.offered) {
+            for (const auto & [rank, ready] : offered.ready) nodes.insert(nodes.end(), ready.begin(), ready.end());
+        }
+        for (const auto & [route, copied] : handoff.copied) nodes.insert(nodes.end(), copied.begin(), copied.end());
     }
     return nodes;
 }

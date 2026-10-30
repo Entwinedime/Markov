@@ -100,11 +100,21 @@ class AscendTrace:
 
     @staticmethod
     def exported_trace(directory: Path) -> Path:
-        from torch_npu.profiler.profiler import analyse
+        from torch_npu.profiler.analysis._npu_profiler import NpuProfiler
+        from torch_npu.profiler.analysis.prof_common_func._constant import Constant
+        from torch_npu.profiler.analysis.prof_common_func._path_manager import ProfilerPathManager
+
+        (profile,) = ProfilerPathManager.get_profiler_path_list(str(directory))
+        trace = Path(profile) / Constant.OUTPUT_DIR / "trace_view.json"
+        trace.parent.mkdir(exist_ok=True)
 
         # SDK output is not atomic; an existing trace can belong to an interrupted analysis.
-        analyse(str(directory))
-        (trace,) = directory.rglob("trace_view.json")
+        trace.unlink(missing_ok=True)
+
+        # Structural observation consumes the timeline, not database and aggregate report exports.
+        NpuProfiler.analyse(
+            profile, analysis_type=Constant.EXPORT_CHROME_TRACE, output_path=str(trace), export_type=[Constant.Text]
+        )
         return trace
 
     runtime_kinds = {

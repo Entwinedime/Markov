@@ -19,6 +19,8 @@ class SGLangSource:
         from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
         from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
+        from markov_collection.adapters.frameworks.sglang.prefix import PrefixObservation
+        from markov_collection.adapters.frameworks.sglang.preparation import PrefixLocations
         from markov_collection.adapters.frameworks.sglang.state import PoolPorts
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
@@ -31,9 +33,12 @@ class SGLangSource:
         source = json.loads(path.read_text())
 
         # Interpretation can be repeated from the captured facts without another native session.
+        SGLangSource.declare_execution_domain(source, directory)
         SGLangSource.result_interfaces(source["regions"])
         ExpertObservation.declare(source)
         BatchTensors.declare_model_inputs(source["regions"], source["values"])
+        PrefixLocations.declare(source)
+        PrefixObservation.declare(source["regions"], source["values"])
         AscendConcatenation.declare(source["regions"], source["values"])
         AscendMatrices.declare(
             source["regions"], source["operations"], source["values"], source["environment"]["matrix_selection"]
@@ -67,6 +72,30 @@ class SGLangSource:
         observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
         physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
         write_json(directory / name, physical)
+
+    @staticmethod
+    def declare_execution_domain(source: dict[str, Any], directory: Path) -> None:
+        environment = source["environment"]
+        implementation = environment["implementation"]
+        session = json.loads((directory / "session.json").read_text())
+        origin = Path(session["output"])
+        if implementation["disaggregation_mode"] in {"prefill", "decode"}:
+            origin = origin.parent
+
+        # One native session supplies the implementation; logical coordinates preserve worker duties.
+        source["execution_domain"] = {
+            "session": str(origin),
+            "runtime": {name: environment[name] for name in ("framework", "torch", "torch_npu", "cann", "device")},
+            "parallel": {
+                name: environment[name]
+                for name in ("logical_tp", "logical_pp", "logical_ep", "tp_rank", "pp_rank", "ep_rank")
+            },
+            "implementation": {
+                name: value
+                for name, value in implementation.items()
+                if name not in {"disaggregation_mode", "chunked_prefill_size"}
+            },
+        }
 
     @staticmethod
     def result_interfaces(regions: list[dict[str, Any]]) -> None:

@@ -326,6 +326,9 @@ class Exploration:
                         "max_total_tokens",
                         "page_size",
                         "max_prefill_tokens",
+                        "prefill_chunk_tokens",
+                        "mixed_batches",
+                        "prefix_cache",
                         "pd",
                         "pp",
                         "ep",
@@ -339,6 +342,8 @@ class Exploration:
                     "requests": workload["requests"],
                     "node_durations_ns": self.specification["node_durations_ns"],
                 }
+                if "prefixes" in workload:
+                    inputs["prefixes"] = workload["prefixes"]
                 pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
                 if any("ep" in pool for pool in pools):
                     inputs["ep_routes"] = workload["ep_routes"]
@@ -349,10 +354,18 @@ class Exploration:
                 if self.details:
                     arguments.append("--details")
                 try:
-                    self.step(
-                        self.environment.tool_command(arguments, [asset, target], result, self.available("processing")),
-                        "processing",
-                    )
+                    remaining = self.available("processing")
+                    if self.specification.get("control", "lightweight") == "native":
+                        command = [
+                            "bash",
+                            str(self.root / "scripts/markov-control.sh"),
+                            *arguments[1:],
+                            "--timeout-seconds",
+                            str(remaining / 1e9),
+                        ]
+                    else:
+                        command = self.environment.tool_command(arguments, [asset, target], result, remaining)
+                    self.step(command, "processing")
                     self.state["results"][key] = str(result.relative_to(self.directory))
                     self.state["failures"].pop(key, None)
                     self.save()

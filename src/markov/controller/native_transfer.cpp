@@ -17,10 +17,6 @@ nlohmann::json NativeTransfer::call(const nlohmann::json & message) {
     auto & endpoint = handoff.endpoints[group];
     const auto kind = message.at("kind").get<std::string>();
     if (kind == "transfer_sender" || kind == "transfer_receiver") endpoint.registered = true;
-    else if (kind == "transfer_submit") {
-        if (!endpoint.payload.is_null()) throw std::invalid_argument("native transfer submitted twice");
-        endpoint.payload = message.at("payload");
-    }
     else if (kind != "transfer_poll") throw std::invalid_argument("unknown native transfer call: " + kind);
 
     bool ready = true;
@@ -49,47 +45,76 @@ nlohmann::json NativeTransfer::call(const nlohmann::json & message) {
     };
 }
 
+void NativeTransfer::submit(const ServingAction & action, const nlohmann::json & payload) {
+    const auto & member = action.batch_work().batch.members.front();
+    auto & endpoint = handoffs_.at(member.request).endpoints.at(action.task.group);
+    if (!endpoint.payload.is_null() || member.context_tokens != endpoint.submitted_tokens || action.batch_work().final_transfer != !payload.is_null())
+        throw std::invalid_argument("native KV fragments must be contiguous with metadata only on the last send");
+
+    endpoint.submitted_tokens += member.new_tokens;
+    endpoint.payload = payload;
+    endpoint.fragments.emplace(action.task.sequence, Fragment{ member, action.batch_work().final_transfer, false, {}, {} });
+}
+
 std::optional<ServingAction> NativeTransfer::plan(std::int64_t now_ns) {
     for (auto & [request, handoff] : handoffs_) {
         for (const auto & route : routes_) {
             const auto & binding = route.binding;
-            const auto & source = handoff.endpoints[binding.source];
-            const auto & destination = handoff.endpoints[binding.destination];
-            if (!source.ready || !destination.ready || source.payload.is_null() || handoff.submitted.contains(binding)) continue;
-            const std::array demands{
-                KvDemand{ request, 0 }
-            };
-            auto batch = route.destination.plan(Phase::Prefill, demands);
-            BatchWork work{ std::move(batch), {}, {} };
-            const auto & source_pages = route.source.residence(request).pages;
-            const auto & destination_pages = route.destination.residence(request).pages;
-            for (std::size_t page = 0; page < source_pages.size(); ++page) work.transferred_pages.push_back({ source_pages[page], destination_pages.at(page) });
-            handoff.submitted.insert(binding);
-            const auto sequence = sequence_++;
-            return ServingAction{
-                { "kv", sequence },
-                std::make_shared<const BatchWork>(std::move(work)), now_ns, sequence, 0, std::nullopt, ServingStep::Transfer, {},
-                binding
-            };
+            auto & source = handoff.endpoints[binding.source];
+            if (!handoff.endpoints[binding.destination].ready) continue;
+            for (auto & [flow, fragment] : source.fragments) {
+                if (!fragment.ready || fragment.submitted.contains(binding)) continue;
+                const std::array demands{
+                    KvDemand{ request, 0 }
+                };
+                auto batch = route.destination.plan(Phase::Prefill, demands);
+                auto & member = batch.members.front();
+                member.context_tokens = fragment.member.context_tokens;
+                member.new_tokens = fragment.member.new_tokens;
+                BatchWork work{ std::move(batch), {}, {} };
+                work.final_transfer = fragment.final;
+                const auto & source_pages = route.source.residence(request).pages;
+                const auto & destination_pages = route.destination.residence(request).pages;
+                const auto begin = route.source.pages_for(fragment.member.context_tokens);
+                const auto end = route.source.pages_for(fragment.member.context_tokens + fragment.member.new_tokens);
+                for (auto page = begin; page < end; ++page) work.transferred_pages.push_back({ source_pages.at(page), destination_pages.at(page) });
+                fragment.submitted.insert(binding);
+
+                // Copy flow names the source send task; each copy keeps its own transfer task identity.
+                return ServingAction{
+                    { "kv", sequence_++ },
+                    std::make_shared<const BatchWork>(std::move(work)), now_ns, flow, 0, std::nullopt, ServingStep::Transfer, {},
+                    binding
+                };
+            }
         }
     }
     return std::nullopt;
 }
 
 void NativeTransfer::finish(const ServingAction & action) {
-    const bool source = std::ranges::any_of(routes_, [&](const auto & route) { return route.binding.source == action.task.group; });
+    const bool sent = action.step == ServingStep::Send && action.channel.empty();
     const bool received = action.step == ServingStep::Receive && action.channel.empty();
-    if (action.step != ServingStep::Reserve && action.step != ServingStep::Transfer && !(action.step == ServingStep::Result && source)
-        && !(action.step == ServingStep::Release && source) && !received)
-        return;
+    const bool released =
+        action.step == ServingStep::Release && std::ranges::any_of(routes_, [&](const auto & route) { return route.binding.source == action.task.group; });
+    if (action.step != ServingStep::Reserve && action.step != ServingStep::Transfer && !sent && !received && !released) return;
 
-    for (const auto & member : action.work->batch.members) {
+    for (const auto & member : action.batch_work().batch.members) {
         auto & handoff = handoffs_.at(member.request);
-        if (action.step == ServingStep::Transfer) handoff.completed.insert(action.transfer.value());
+        if (action.step == ServingStep::Transfer) {
+            const auto & binding = *action.transfer;
+            auto & fragments = handoff.endpoints.at(binding.source).fragments;
+            auto & fragment = fragments.at(action.flow);
+            fragment.completed.insert(binding);
+            if (fragment.final) handoff.completed.insert(binding);
+            const auto destinations = std::ranges::count_if(routes_, [&](const auto & route) { return route.binding.source == binding.source; });
+            if (fragment.completed.size() == static_cast<std::size_t>(destinations)) fragments.erase(action.flow);
+        }
         else {
             auto & endpoint = handoff.endpoints.at(action.task.group);
-            if (action.step == ServingStep::Reserve || action.step == ServingStep::Result) endpoint.ready = true;
-            if (received || action.step == ServingStep::Release) endpoint.consumed = true;
+            if (sent) endpoint.fragments.at(action.task.sequence).ready = true;
+            if (action.step == ServingStep::Reserve) endpoint.ready = true;
+            if (received || released) endpoint.consumed = true;
         }
 
         if (handoff.completed.size() == routes_.size() && std::ranges::all_of(handoff.endpoints, [](const auto & entry) { return entry.second.consumed; }))
@@ -98,7 +123,11 @@ void NativeTransfer::finish(const ServingAction & action) {
 }
 
 bool NativeTransfer::running() const {
-    return std::ranges::any_of(handoffs_, [](const auto & entry) { return entry.second.submitted.size() != entry.second.completed.size(); });
+    for (const auto & [_, handoff] : handoffs_)
+        for (const auto & [_, endpoint] : handoff.endpoints)
+            for (const auto & [_, fragment] : endpoint.fragments)
+                if (fragment.submitted.size() != fragment.completed.size()) return true;
+    return false;
 }
 
 bool NativeTransfer::settled() const { return handoffs_.empty(); }

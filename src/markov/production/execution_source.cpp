@@ -95,9 +95,23 @@ nlohmann::json execution_signature(const nlohmann::json & frame) {
 
 } // namespace
 
-ExecutionSource::ExecutionSource(std::map<nlohmann::json, std::size_t> & patterns) : patterns_(patterns) {}
+ExecutionSource::ExecutionSource(std::map<nlohmann::json, std::size_t> & patterns, nlohmann::json domain) : patterns_(patterns), domain_(std::move(domain)) {}
 
 bool ExecutionSource::equivalent(const nlohmann::json & left, const nlohmann::json & right) { return execution_signature(left) == execution_signature(right); }
+
+nlohmann::json ExecutionSource::guard_signature(nlohmann::json guards) {
+    for (auto & guard : guards) {
+
+        // Diagnostic provenance does not change the condition evaluated by the consumer.
+        guard = {
+            { "condition", guard.at("condition") },
+            {  "expected",  guard.at("expected") }
+        };
+        canonicalize_expression(guard.at("condition"));
+    }
+    std::sort(guards.begin(), guards.end());
+    return guards;
+}
 
 nlohmann::json ExecutionSource::observe(const nlohmann::json & operation, std::size_t identity) {
     auto prototype = compile(operation.at("execution_observation"));
@@ -127,6 +141,17 @@ nlohmann::json ExecutionSource::observe(const nlohmann::json & operation, std::s
 void ExecutionSource::bind(nlohmann::json & frame, std::size_t definition) {
     if (frame.contains("execution")) {
         for (auto & binding : frame["execution"]) {
+            if (!domain_.is_null()) {
+                nlohmann::json anchor{
+                    { "definition", definition },
+                    { "literals", frame.at("literals") },
+                    { "operation", binding.at("operation") },
+                    { "pattern", binding.at("pattern") },
+                    { "guards", guard_signature(binding.value("guards", nlohmann::json::array())) }
+                };
+                if (binding.contains("reduction")) anchor["reduction"] = binding.at("reduction");
+                anchors_[std::move(anchor)].insert(binding.at("resources"));
+            }
             if (!binding.contains("guards")) continue;
             binding["candidate"] = candidates_.size();
             candidates_.push_back({
@@ -156,14 +181,9 @@ std::pair<nlohmann::json, std::vector<std::size_t>> ExecutionSource::selections(
         const auto & pattern = *patterns[candidate.at("pattern").get<std::size_t>()];
         const auto & resources = candidate.at("resources");
         std::set<std::size_t> context;
-        auto binding_signature = nlohmann::json::array();
-        for (const auto & value : resources) {
-            const auto resource = value.get<std::size_t>();
-
-            // Only events confined to one operation may change identities between equivalent prototypes.
-            const bool private_event = kinds_.at(resource) == "event" && !external_events_.contains(resource);
-            binding_signature.push_back(private_event ? nlohmann::json(nullptr) : value);
-            if (!private_event) context.insert(resource);
+        auto binding_signature = context_bindings(resources);
+        for (const auto & value : binding_signature) {
+            if (!value.is_null()) context.insert(value.get<std::size_t>());
         }
         auto guards = candidate.at("guards");
         auto conditions = nlohmann::json::array();
@@ -204,8 +224,7 @@ std::pair<nlohmann::json, std::vector<std::size_t>> ExecutionSource::selections(
         const auto identity = position->second;
         if (added) {
 
-            // Fixed operands distinguish calling contexts without copying them into the published selection.
-            key.erase("literals");
+            // Fixed operands remain available until cross-source execution bindings have been resolved.
             key["choices"] = nlohmann::json::array();
             groups.push_back(std::move(key));
             alternatives.emplace_back();

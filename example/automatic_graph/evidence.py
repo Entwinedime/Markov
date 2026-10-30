@@ -11,7 +11,8 @@ from typing import Any
 
 from execution import DependencyPaths
 from markov_collection.artifacts import write_json
-from request_state import RequestStateEvidence
+from request_state import IndexWorkEvidence, RequestStateEvidence, ResourceStateEvidence
+from resource_history import ResourceHistoryEvidence
 
 
 class ExecutionEvidence:
@@ -89,7 +90,8 @@ class ExecutionEvidence:
             scope = graph["regions"][region]
             identity = (
                 ("action", scope["task"]["group"], scope["task"]["sequence"])
-                if "task" in scope else ("control", scope["control"])
+                if "task" in scope
+                else ("control", scope["control"])
             )
             owned[identity].append(item)
             owner[node["id"]] = identity
@@ -107,7 +109,8 @@ class ExecutionEvidence:
 
         # A continuation can close an existing call without creating another operation or execution node.
         checks["continuation_ownership"] = all(
-            identity in owned or all(
+            identity in owned
+            or all(
                 owner[port][0] == "action"
                 and boundaries[owner[port]]["task"]["group"] == boundary["task"]["group"]
                 and boundaries[owner[port]]["flow"] == boundary["flow"]
@@ -146,12 +149,23 @@ class ExecutionEvidence:
 
         ownership = RequestStateEvidence(self.result)
         cross = {(owner[edge["source"]], owner[edge["target"]]) for edge in execution["dependencies"]}
-        handoffs = self.handoffs(ownership, cross)
+        handoffs = self.handoffs(ownership, cross, owner)
         checks.update(handoffs["checks"])
         state = ownership.check()
         checks["request_state"] = state["status"] == "matched"
-        return {
-            "status": "matched" if all(checks.values()) else "differences",
+        resources = ResourceStateEvidence(self.result["resources"]).check()
+        checks["resource_state"] = resources["status"] == "matched"
+        history = ResourceHistoryEvidence(self.result, ownership).check()
+        checks["resource_history"] = history["status"] == "matched"
+        index_work = None
+        if any(action["step"] == "indices" for action in decisions):
+            index_work = IndexWorkEvidence(self.result).check()
+            checks["cache_rank_bindings"] = index_work["status"] == "matched"
+        failures = [name for name, passed in checks.items() if not passed]
+        status = "matched" if not failures else "differences"
+        report = {
+            "status": status,
+            "scope": "recorded execution consistency; not independent native equivalence or KV content correctness",
             "checks": checks,
             "execution_nodes": len(timeline),
             "node_states": dict(Counter(item["status"] for item in timeline.values())),
@@ -159,6 +173,8 @@ class ExecutionEvidence:
             "controls": len(self.result["controls"]),
             "handoffs": handoffs["requests"],
             "request_state": state,
+            "resource_history": history,
+            "resource_state": resources,
             "value_production": {
                 "scope": "host descriptor return before consumption; device contents and storage hazards are separate",
                 "required_links": len(required),
@@ -166,19 +182,24 @@ class ExecutionEvidence:
                 "missing_links": sorted(missing)[:3],
             },
         }
+        if index_work is not None:
+            report["cache_rank_bindings"] = index_work
+        return report
 
-    def handoffs(self, ownership: RequestStateEvidence, cross: set) -> dict:
+    def handoffs(self, ownership: RequestStateEvidence, cross: set, owners: dict) -> dict:
         if "pd" not in self.result["configuration"]:
             return {"requests": 0, "checks": {"handoff_steps": True, "handoff_readiness": True}}
+
         requests = set(ownership.requests)
         sources = {name for name, role in ownership.instances.items() if role == "prefill"}
         destinations = {name for name, role in ownership.instances.items() if role == "decode"}
-        expected = {
-            (request, group, step) for request in requests for group in sources for step in ("model", "release")
-        }
+        source_steps = ("model", "send", "release") if ownership.native else ("model", "release")
+        expected = {(request, group, step) for request in requests for group in sources for step in source_steps}
         expected.update(
-            (request, group, step) for request in requests
-            for group in destinations for step in ("reserve", "receive", "accept")
+            (request, group, step)
+            for request in requests
+            for group in destinations
+            for step in ("reserve", "receive", "accept")
         )
         actions, transfers = defaultdict(list), defaultdict(list)
         for action in self.result["decisions"]:
@@ -191,35 +212,69 @@ class ExecutionEvidence:
                 transfers[request, binding["source"], binding["destination"]].append(action)
                 continue
             group = ownership.pool(action)
-            if step == "result" and group in sources:
+            if step == "compute" and group in sources:
                 step = "model"
-            if step not in ("model", "release", "reserve", "receive", "accept"):
+            if step not in ("model", "send", "release", "reserve", "receive", "accept"):
                 continue
             for member in action["members"]:
                 actions[member["id"], group, step].append(action)
 
-        complete = set(actions) == expected and all(len(rows) == 1 for rows in actions.values())
-        complete &= all(len(rows) == 1 for rows in transfers.values())
+        complete = set(actions) == expected and all(
+            len(rows) >= 1 if key[2] in ("model", "send") else len(rows) == 1 for key, rows in actions.items()
+        )
         complete &= {key[0] for key in transfers} == requests
         for request in requests:
             complete &= {source for rid, source, _ in transfers if rid == request} == sources
             complete &= {target for rid, _, target in transfers if rid == request} == destinations
 
-        ready = complete
-        if complete:
-            for (request, source, target), rows in transfers.items():
-                transfer = rows[0]
-                model = actions[request, source, "model"][0]
-                reserve = actions[request, target, "reserve"][0]
+        required = []
+        for (request, source, target), rows in transfers.items():
+            complete &= [row["final_transfer"] for row in rows] == [False] * (len(rows) - 1) + [True]
+            end = 0
+            for transfer in rows:
+                member = transfer["members"][0]
+                complete &= member["context_tokens"] == end
+                end = member["context_tokens"] + member["new_tokens"]
+                if not complete:
+                    continue
+                models = [
+                    action
+                    for action in actions[request, source, "model"]
+                    if any(
+                        m["id"] == request and m["context_tokens"] < end <= m["context_tokens"] + m["new_tokens"]
+                        for m in action["members"]
+                    )
+                ]
+                complete &= len(models) == 1
+                if not complete:
+                    continue
+                required.extend([(models[0], transfer), (actions[request, target, "reserve"][0], transfer)])
+                if ownership.native:
+                    sends = [a for a in actions[request, source, "send"] if a["task"]["sequence"] == transfer["flow"]]
+                    complete &= len(sends) == 1
+                    if sends:
+                        required.append((sends[0], transfer))
+            complete &= end == ownership.requests[request]["prompt_tokens"]
+            if complete:
                 receive = actions[request, target, "receive"][0]
-                accept = actions[request, target, "accept"][0]
-                release = actions[request, source, "release"][0]
-                for first, last in (
-                    (model, transfer), (reserve, transfer), (transfer, receive), (receive, accept), (transfer, release)
-                ):
-                    before = ("action", first["task"]["group"], first["task"]["sequence"])
-                    after = ("action", last["task"]["group"], last["task"]["sequence"])
-                    ready &= first["completed_ns"] <= last["scheduled_ns"] and (before, after) in cross
+                required.extend(
+                    [
+                        (rows[-1], receive),
+                        (receive, actions[request, target, "accept"][0]),
+                        (rows[-1], actions[request, source, "release"][0]),
+                    ]
+                )
+                required.extend(pairwise(rows))
+
+        ready = complete
+
+        # Submission may overlap prior copies; the graph must enforce their actual readiness.
+        for first, last in required:
+            before = ("action", first["task"]["group"], first["task"]["sequence"])
+
+            # Slot release may reuse the preceding cache action's completion without adding graph work.
+            after = {owners[port] for port in last["execution_ports"]["completions"]}
+            ready &= any((before, target) in cross for target in after)
         return {
             "requests": len({key[0] for key in actions}),
             "checks": {"handoff_steps": complete, "handoff_readiness": ready},
@@ -259,7 +314,7 @@ class NativeEvidence:
             if batch is None and region["parent"] is not None:
                 batch = labels[region["parent"]]
             labels.append(batch)
-            if region["role"] in {"Prefill", "Decode"}:
+            if region["role"] in {"Prefill", "Decode", "Mixed"}:
                 self.maximum_members[environment["rank"]] = max(
                     self.maximum_members[environment["rank"]], len(batches[batch]["members"])
                 )

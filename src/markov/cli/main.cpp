@@ -161,8 +161,7 @@ int main(int argc, char ** argv) {
                 { "control_status",                       result.at("control_status") },
                 {        "batches", result.at("structure").at("counts").at("batches") },
                 {        "actions", result.at("structure").at("counts").at("actions") },
-                {       "requests",                      result.at("requests").size() },
-                {     "free_pages",                           result.at("free_pages") }
+                {       "requests",                      result.at("requests").size() }
             }.dump(2) << '\n';
             return 0;
         }

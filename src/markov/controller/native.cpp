@@ -7,7 +7,7 @@
 namespace markov {
 
 NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
-                                   std::span<const NativeTransferRoute> transfers)
+                                   const nlohmann::json & prefixes, std::span<const NativeTransferRoute> transfers)
     : requests_(std::move(requests)),
       peer_(peer) {
     auto configuration = nlohmann::json::array();
@@ -32,13 +32,27 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
              { "max_total_tokens", settings.max_total_tokens },
              { "page_size", settings.page_size },
              { "max_prefill_tokens", settings.max_prefill_tokens },
+             { "prefill_chunk_tokens", instance.prefill_chunk_tokens },
+             { "mixed_batches", instance.mixed_batches },
+             { "expert_routes", instance.expert_routes },
              { "microbatch_requests", instance.batch_limit } }   }
         });
     }
     if (!transfers.empty()) transfer_ = std::make_unique<NativeTransfer>(transfers);
+    auto content = nlohmann::json::array();
+    for (const auto & request : requests_) {
+        nlohmann::json value{
+            {            "id",            request.id },
+            { "prompt_tokens", request.prompt_tokens },
+            { "output_tokens", request.output_tokens }
+        };
+        if (request.prefix_id) value["prefix_id"] = *request.prefix_id;
+        content.push_back(std::move(value));
+    }
     peer_.send({
-        {      "kind",              "configure" },
-        { "instances", std::move(configuration) }
+        {      "kind",                                                      "configure" },
+        { "instances",                                         std::move(configuration) },
+        {  "workload", { { "requests", std::move(content) }, { "prefixes", prefixes } } }
     });
     for (;;) {
         const auto call = receive_call();
@@ -86,17 +100,12 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             const bool idle = std::ranges::all_of(groups_, [&](const auto & entry) {
                 return instances_.at(entry.first) != instance || (entry.second->caught_up(input.arrived) && idle_.contains(entry.first));
             });
+
+            // With no graph work in flight, native PP consensus still needs empty receive rounds.
             const bool executing = !running_calls_.empty() || (transfer_ && transfer_->running());
             if (arrived || (!idle && (!input.sequence || *input.sequence != sequence_ || !executing))) {
                 auto arrivals = nlohmann::json::array();
-                while (input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns) {
-                    const auto & request = requests_[input.arrived];
-                    arrivals.push_back({
-                        {       "request",       input.arrived++ },
-                        { "prompt_tokens", request.prompt_tokens },
-                        { "output_tokens", request.output_tokens }
-                    });
-                }
+                while (input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns) { arrivals.push_back(input.arrived++); }
                 if (arrived) {
                     for (const auto & [group, owner] : instances_) {
                         if (owner == instance) idle_.erase(group);
@@ -137,12 +146,13 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             idle_.insert(name);
             continue;
         }
-        if (kind.starts_with("transfer_")) {
+        if (kind.starts_with("transfer_") && kind != "transfer_submit") {
             reply(identity, transfer_->call(message));
             if (kind != "transfer_poll") ++sequence_;
             continue;
         }
         if (auto action = group.plan(message, now_ns, input.arrived)) {
+            if (kind == "transfer_submit") transfer_->submit(*action, message.at("payload"));
             idle_.erase(name);
             running_calls_.emplace(action->task, identity);
             return action;

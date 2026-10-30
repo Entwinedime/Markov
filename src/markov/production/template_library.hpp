@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <map>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "markov/production/execution_source.hpp"
 
 namespace markov {
 
@@ -20,6 +23,7 @@ private:
     std::map<nlohmann::json, std::size_t> definitions_;
     std::map<nlohmann::json, std::size_t> layouts_;
     std::map<nlohmann::json, std::size_t> execution_patterns_;
+    std::vector<ExecutionSource> execution_sources_;
     nlohmann::json roles_ = nlohmann::json::array();
 };
 

@@ -47,14 +47,17 @@ class DisaggregatedTemplates:
             for identity in metadata.get("metadata_buffers", {}).values():
                 value = self.values[identity]
                 buffers[value["storage"]] = value
+
+            # Empty admission polls remain observations, not callable template entries.
             if region["role"] == "KvReserve":
                 self.reserve(region)
             elif region["role"] in ("BatchAccepted", "PrebuiltPart", "RequestOutput") and "entrypoint" in metadata:
-
-                # Empty admission polls remain observations, not callable template entries.
                 metadata["entrypoint_phase"] = None
             elif region["role"] in ("KvSend", "KvReceived"):
-                self.metadata_indices(region)
+                if region["role"] == "KvReceived" or metadata["parameters"]["last_chunk"]:
+                    self.metadata_indices(region)
+                else:
+                    metadata["guards"] = []
                 if region["role"] == "KvSend":
                     self.send(region)
             elif region["role"] == "PrebuiltResult":
@@ -136,6 +139,7 @@ class DisaggregatedTemplates:
             [
                 {"condition": ["lt", 0, "request_slot"], "expected": True},
                 {"condition": ["le", "request_slot", "slot_capacity"], "expected": True},
+                {"condition": ["eq", "last_chunk", 1], "expected": bool(metadata["parameters"]["last_chunk"])},
             ]
         )
 

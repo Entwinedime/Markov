@@ -1,5 +1,6 @@
 #include "markov/production/template_library.hpp"
 
+#include "markov/contracts/expression.hpp"
 #include "markov/contracts/input_group.hpp"
 #include "markov/production/execution_source.hpp"
 
@@ -34,6 +35,13 @@ nlohmann::json take_table(std::map<nlohmann::json, std::size_t> & table) {
     return result;
 }
 
+nlohmann::json normalized_shape(nlohmann::json shape) {
+    if (!shape.is_null()) {
+        for (auto & axis : shape) axis = Expression::read(axis).document();
+    }
+    return shape;
+}
+
 // Source identities disappear from shared definitions through encounter-ordered local slots.
 class LocalValues {
 public:
@@ -58,11 +66,11 @@ public:
         if (added) {
             const auto & record = *source_.at(source);
             values.push_back({
-                {    "kind",                                                                                "tensor" },
-                { "storage",                                       resource(record.at("storage").get<std::size_t>()) },
-                {   "shape", declarations_.contains(source) ? declarations_.at(source) : record.at("shape_relation") },
-                {   "dtype",                                                                      record.at("dtype") },
-                {  "device",                                                                     record.at("device") }
+                {    "kind",                                                                                                  "tensor" },
+                { "storage",                                                         resource(record.at("storage").get<std::size_t>()) },
+                {   "shape", normalized_shape(declarations_.contains(source) ? declarations_.at(source) : record.at("shape_relation")) },
+                {   "dtype",                                                                                        record.at("dtype") },
+                {  "device",                                                                                       record.at("device") }
             });
         }
 
@@ -87,7 +95,15 @@ public:
                 return {
                     { "value", value(source.at("value").get<std::size_t>()) }
                 };
-            if (source.contains("shape") || source.contains("scalar") || source.contains("input_group")) return source;
+            if (source.contains("shape"))
+                return {
+                    { "shape", normalized_shape(source.at("shape")) }
+                };
+            if (source.contains("scalar"))
+                return {
+                    { "scalar", Expression::read(source.at("scalar")).document() }
+                };
+            if (source.contains("input_group")) return source;
         }
 
         // Fixed numeric operands belong to this call; geometry expressions retain their declared relations.
@@ -169,6 +185,7 @@ private:
         nlohmann::json count;
         std::vector<std::size_t> members;
         std::vector<std::size_t> producers;
+        nlohmann::json mapping;
     };
 
     void index();
@@ -183,24 +200,28 @@ private:
     // The producer owns this immutable source throughout library compilation.
     const nlohmann::json & source_;
     TemplateLibrary & library_;
-    ExecutionSource execution_;
+    ExecutionSource & execution_;
 
     std::set<std::size_t> external_resources_;
     std::map<std::size_t, const nlohmann::json *> values_;
     std::map<std::string, const nlohmann::json *> modules_;
     std::vector<Region> regions_;
     std::vector<std::size_t> roots_;
+    std::set<std::size_t> mapped_roots_;
 };
 
 
 SourceTemplates::SourceTemplates(const nlohmann::json & source, TemplateLibrary & library)
     : source_(source),
       library_(library),
-      execution_(library.execution_patterns_),
+      execution_(library.execution_sources_.emplace_back(library.execution_patterns_, source.value("execution_domain", nlohmann::json{}))),
       external_resources_(source.at("external_resources").get<std::set<std::size_t>>()),
       regions_(source.at("regions").size()) {
     index();
     for (const auto root : roots_) compile(root);
+
+    // Mapped implementations remain callable after their occurrences become one member rule.
+    roots_.insert(roots_.end(), mapped_roots_.begin(), mapped_roots_.end());
 }
 
 bool SourceTemplates::contains(std::size_t region, std::size_t operation) const {
@@ -310,14 +331,18 @@ std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> Source
         if (!metadata.contains("group_repetitions")) continue;
 
         for (const auto & [name, declaration] : metadata.at("group_repetitions").items()) {
-            Repetition repetition{ declaration.at("kind").get<std::string>(), declaration.at("count"), regions_[item.identity].input_groups.at(name), {} };
+            Repetition repetition{ declaration.at("kind").get<std::string>(),
+                                   declaration.at("count"),
+                                   regions_[item.identity].input_groups.at(name),
+                                   {},
+                                   declaration.value("mapping", nlohmann::json::object()) };
             if (repetition.members.empty()) throw std::invalid_argument("a repeated group needs a source element");
 
             if (repetition.kind == "reuse") {
                 if (!std::ranges::all_of(repetition.members, [&](auto value) { return value == repetition.members.front(); }))
                     throw std::invalid_argument("reused group members must reference the same source value");
             }
-            else if (repetition.kind == "produce") {
+            else if (repetition.kind == "produce" || repetition.kind == "map") {
                 if (position < repetition.members.size()) throw std::invalid_argument("group producers must immediately precede their consumer");
                 for (std::size_t index = 0; index < repetition.members.size(); ++index) {
                     const auto value = repetition.members[index];
@@ -326,6 +351,29 @@ std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> Source
 
                     const auto region_id = source_.at("operations").at(producer.get<std::size_t>()).at("region").get<std::size_t>();
                     const auto & preceding = items[position - repetition.members.size() + index];
+
+                    // Group members are private to this consumer, whether created or mapped from an input.
+                    for (const auto & operation : source_.at("operations")) {
+                        const auto & inputs = operation.at("inputs");
+                        if (std::find(inputs.begin(), inputs.end(), value) != inputs.end() && !contains(item.identity, operation.at("id").get<std::size_t>()))
+                            throw std::invalid_argument("generated group member escapes its consumer");
+                    }
+                    if (repetition.kind == "map") {
+                        if (preceding.operation || !contains_region(preceding.identity, region_id))
+                            throw std::invalid_argument("mapped producers must immediately precede their consumer");
+                        const auto & mapping = repetition.mapping;
+                        const auto parent = source_.at("regions").at(item.identity).at("parent").get<std::size_t>();
+                        const auto & inputs = regions_[parent].input_groups.at(mapping.at("group").get<std::string>());
+                        const auto & mapped = source_.at("regions").at(preceding.identity).at("metadata");
+                        if (inputs.size() != repetition.members.size() || mapped.at("entrypoint") != mapping.at("family")
+                            || mapped.at("ports").at("inputs").size() != 1
+                            || mapped.at("ports").at("inputs").at(mapping.at("input").get<std::string>()) != inputs.at(index)
+                            || mapped.at("ports").at("outputs").at(mapping.at("output").get<std::string>()) != value
+                            || regions_[preceding.identity].outputs != std::vector<std::size_t>{ value })
+                            throw std::invalid_argument("mapped producer must bind its corresponding input and output member");
+                        repetition.producers.push_back(preceding.identity);
+                        continue;
+                    }
                     if (preceding.operation || preceding.identity != region_id)
                         throw std::invalid_argument("group producers must immediately precede their consumer");
 
@@ -347,12 +395,6 @@ std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> Source
                             throw std::invalid_argument("group element producers do not share one template and fixed bindings");
                         if (!ExecutionSource::equivalent(region.frame, prototype.frame))
                             throw std::invalid_argument("group element producers have different observed execution effects");
-                    }
-
-                    for (const auto & operation : source_.at("operations")) {
-                        const auto & inputs = operation.at("inputs");
-                        if (std::find(inputs.begin(), inputs.end(), value) != inputs.end() && !contains(item.identity, operation.at("id").get<std::size_t>()))
-                            throw std::invalid_argument("generated group member escapes its consumer");
                     }
 
                     repetition.producers.push_back(region_id);
@@ -437,9 +479,10 @@ void SourceTemplates::compile(std::size_t identity) {
     std::set<std::size_t> produced_values;
     for (const auto & [_, groups] : repetitions) {
         for (const auto & [group_name, repetition] : groups) {
-            if (repetition.kind != "produce") continue;
+            if (repetition.kind == "reuse") continue;
             for (const auto producer : repetition.producers) {
                 if (!producers.insert(producer).second) throw std::invalid_argument("one producer cannot generate two independent groups");
+                if (repetition.kind == "map") mapped_roots_.insert(producer);
             }
             produced_values.insert(repetition.members.begin(), repetition.members.end());
         }
@@ -621,7 +664,11 @@ void SourceTemplates::compile(std::size_t identity) {
                         body["input_groups"][name] = {
                             { "count", repetition.count }
                         };
-                        if (repetition.kind == "reuse") body["input_groups"][name]["value"] = local.value(repetition.members.front());
+                        if (repetition.kind == "map")
+                            body["input_groups"][name] = {
+                                { "map", repetition.mapping }
+                            };
+                        else if (repetition.kind == "reuse") body["input_groups"][name]["value"] = local.value(repetition.members.front());
                         else {
                             auto & producer = regions_[repetition.producers.front()];
                             body["input_groups"][name]["producer"] = producer.layout;
@@ -720,7 +767,7 @@ nlohmann::json SourceTemplates::document() {
 
         std::vector<std::size_t> path;
         auto root = identity;
-        while (!source_.at("regions")[root].at("parent").is_null()) {
+        while (!mapped_roots_.contains(root) && !source_.at("regions")[root].at("parent").is_null()) {
             const auto parent = source_.at("regions")[root].at("parent").get<std::size_t>();
             path.push_back(regions_[parent].call_indices.at(root));
             root = parent;
@@ -756,6 +803,7 @@ void TemplateLibrary::add_instances(const nlohmann::json & instances) {
 }
 
 nlohmann::json TemplateLibrary::document() && {
+    ExecutionSource::share(execution_sources_, roles_);
     return {
         {   "scope",                                                                                 "hierarchical_source_templates"                    },
         { "catalog",

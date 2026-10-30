@@ -159,6 +159,11 @@ nlohmann::json Expression::document() const {
 
     for (const auto & argument : operation.arguments) result.push_back(argument.document());
 
+    // Binary commutation preserves checked arithmetic; reordering longer sums/products can change overflow.
+    if (operation.arguments.size() == 2 && (operation.kind == Kind::Add || operation.kind == Kind::Multiply || operation.kind == Kind::Equal)
+        && result[2] < result[1])
+        std::swap(result[1], result[2]);
+
     return result;
 }
 

@@ -15,6 +15,16 @@ from markov_collection.adapters.runtimes.pytorch.observation import OperatorObse
 
 class AscendOperatorObservation(OperatorObservation):
     def record_operation(self, operation: Any, args: tuple, kwargs: dict) -> Any:
+        if str(operation) == "atb._npu_flash_attention_qlens.default":
+            with self.values.metadata():
+                names = (parameter.name for parameter in operation._schema.arguments)
+                arguments = dict(zip(names, args, strict=False)) | kwargs
+                prefix = arguments["context_lens"] - arguments["seq_len"]
+
+                # ATB CheckSeqlen requires 128-aligned prefixes; this binding can silently leave output unwritten.
+                if bool(prefix.remainder(128).any()):
+                    raise ValueError(f"native ATB attention requires 128-aligned prefixes, received {prefix.tolist()}")
+
         if self.values.interface is not None:
             return super().record_operation(operation, args, kwargs)
 

@@ -12,7 +12,7 @@ namespace markov {
 InputGroup InputGroup::read(const nlohmann::json & source) {
     InputGroup group;
     group.dtype = source.at("dtype").get<std::string>();
-    group.device = source.at("device").get<std::string>();
+    if (source.contains("device")) group.device = source.at("device").get<std::string>();
     group.member_dtypes = source.value("member_dtypes", std::vector<std::string>{});
     group.count = source.at("count").get<std::string>();
     for (const auto & [name, expression] : source.at("sums").items()) group.sums.emplace(name, Expression::read(expression));
