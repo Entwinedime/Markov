@@ -75,6 +75,9 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 可选 execution.node_scale 按已绑定工作的名字做成本敏感性分析，默认关闭，不代表真实硬件提速。
 显式诊断运行 `scripts/markov.sh replay --request /path/to/replay.json`，可选源图，或打开 execution.record_graph 后保存的目标执行图。
 回放可替换明确节点成本、缩放已有工作；它固定已有路径，不重新选择时间分支，也不自动匹配 target 真实成本。
+独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
+SGLang target 采集加 `--record-regions`，KTransformers 默认记录同步阶段；评价器单独编译，不进入预测/训练流程。
+报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
 SGLang 与 KTransformers 共用采集任务、预算、manifest、源图回放与性能库，HiCache 只属于 SGLang。
 KTransformers 单 NPU dense/Torch 入口已接通真实来源、独立阶段/控制成本、共享准备及完整 HTTP 预测。
 分块规则生成额外阶段，沿用共同执行器；仅支持 empty 初始化，HTTP 外层残余及首次使用仍有近似。

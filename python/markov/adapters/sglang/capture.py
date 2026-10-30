@@ -110,7 +110,7 @@ class Capture(SerialHttpClient):
 
     def run(self) -> None:
         profiling_requested = self.plan["profiling"]
-        if self.plan["calibration"]:
+        if self.plan["calibration"] or self.plan["record_regions"]:
             (self.directory / "regions").mkdir()
         control = self.directory / "native" / "enabled"
         if profiling_requested:
@@ -276,6 +276,7 @@ class Capture(SerialHttpClient):
         files = [
             {"path": str(path.relative_to(self.directory)), "host_clock": trace_clock(path, anchors)} for path in traces
         ]
+        region_files = sorted((self.directory / "regions").glob("*.jsonl")) if self.plan["record_regions"] else []
         write_json(
             self.directory / "profile_manifest.json",
             {
@@ -294,7 +295,8 @@ class Capture(SerialHttpClient):
                 },
                 "sidecar": {
                     "python_probe_files": [
-                        {"path": str(path.relative_to(self.directory)), "format": "jsonl"} for path in probes
+                        {"path": str(path.relative_to(self.directory)), "format": "jsonl"}
+                        for path in probes + region_files
                     ]
                 },
                 "bench": {"workload_report_files": [{"path": "workload_report.json"}]},

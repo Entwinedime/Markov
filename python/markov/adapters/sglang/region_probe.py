@@ -20,6 +20,7 @@ class RegionProbe:
         self.results = {}
         self.pending = []
         self.processing = None
+        self.iterations = {}
 
     @staticmethod
     def variables(batch) -> dict:
@@ -40,6 +41,7 @@ class RegionProbe:
 
     def prepare(self, original, batch):
         import torch
+        from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
         fields = {"implementation": IMPLEMENTATION, "preparation_keys": [], "new_preparations": 0}
         start = torch.npu.Event(enable_timing=True)
@@ -51,6 +53,10 @@ class RegionProbe:
             with self.writer.span("region.prepare", fields):
                 result = original(batch)
                 fields.update(self.variables(batch))
+                identity = tuple(fields["request_ids"])
+                fields["participant"] = get_tensor_model_parallel_rank()
+                fields["iteration"] = self.iterations.get(identity, 0)
+                self.iterations[identity] = fields["iteration"] + 1
                 phase, features = fields["phase"], fields["features"]
                 features.update(
                     first_phase=int(phase not in self.seen_phases),

@@ -113,3 +113,8 @@ add_executable(markov_core
 )
 target_link_libraries(markov_core PRIVATE markov_reports)
 
+add_executable(markov_evaluate
+    src/markov/evaluation/main.cpp
+    src/markov/evaluation/evaluation.cpp
+)
+target_link_libraries(markov_evaluate PRIVATE markov_reports)

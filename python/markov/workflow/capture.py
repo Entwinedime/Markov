@@ -18,11 +18,13 @@ class InferenceCapture:
         profiling: bool = True,
         calibration: bool = False,
         workload: Workload | None = None,
+        record_regions: bool = False,
     ):
         self.request = request
         self.settings = request.execution.capture
         self.profiling = profiling
         self.calibration = calibration
+        self.record_regions = record_regions
         self.workload = workload
         self.result_key = "manifest" if profiling else "calibration" if calibration else "observation"
         self.result_file = (
@@ -84,9 +86,10 @@ class InferenceCapture:
         payload = {
             "deployment": asdict(self.request.deployment),
             "server": server,
-            "environment": adapter.capture_environment(self.profiling, self.calibration),
+            "environment": adapter.capture_environment(self.profiling, self.calibration or self.record_regions),
             "profiling": self.profiling,
             "calibration": self.calibration,
+            "record_regions": self.record_regions,
             "workload": asdict(workload),
         }
         command = DeviceCommand(

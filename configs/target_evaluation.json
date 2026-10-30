@@ -1,0 +1,7 @@
+{
+  "prediction": "../data/prediction/prediction/report.json",
+  "target": "smaller_pages",
+  "manifest": "/path/to/target/profile_manifest.json",
+  "output": "../data/target_evaluation",
+  "memory_limit_gib": 4
+}

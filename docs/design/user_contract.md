@@ -70,6 +70,20 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 中断后的采集先核对原容器：仍在运行就等待，正常退出则记账后复用，句柄缺失记失败及保守用量。
 容器自身也有时间上限；只有退出和用量写入状态后才移除容器，不凭产物存在推断成功。
 
+## 独立 target 评价
+
+运行 evaluate --request 时提供 prediction、target（报告中的条件名）、manifest（真实 target profile）、output，
+可选 memory_limit_gib。示例为 [target_evaluation.json](../../configs/target_evaluation.json)。
+预测必须启用 execution.record_graph；评价器核对部署、完整编码 workload、正式窗口及目标设置，不能把其他条件的 trace 当作真值。
+SGLang 的 target 采集使用 capture --record-regions，同时记录通常的因果观察与实验区域计时；
+KTransformers 的同步阶段默认已有对应观察。该开关不改变普通采集默认值，也不创建可导入性能库的独立校准元数据。
+
+evaluate 使用独立 markov_evaluate 可执行文件，只挂载明确选择的预测、base、target 与自身输出，没有设备、网络或数据库。
+评价输出必须在预测和采集目录之外，避免后续预测挂载到评分数据。
+结果分别给出原成本回放、真实成本替换数、保留成本及未对应观察、选定 CPU 顺序的检查结果。
+fully_replaced 只表示已有图中可替换的节点均已绑定真实数值，不表示图包含全部必要操作；
+status=completed 仅表示评价完成。正常精度仍须使用 measure；profiled HTTP 及客户端跨请求间隔单列，未知成本不删除或置零。
+
 ## KTransformers 采集与独立数据
 
 KTransformers 与 SGLang 使用相同的 capture、measure、calibrate、maintain 和 replay 入口及累计预算。

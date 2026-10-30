@@ -25,6 +25,11 @@ def main() -> int:
     capture = commands.add_parser("capture", help="Capture the declared base using its runtime and cumulative budget.")
     capture.add_argument("--request", type=Path, required=True)
     capture.add_argument("--recapture", action="store_true", help="Collect again without resetting prior budget use.")
+    capture.add_argument(
+        "--record-regions",
+        action="store_true",
+        help="Record profiled region costs for independent evaluation; not training data.",
+    )
     measure = commands.add_parser("measure", help="Measure base.configuration without profiling or probes.")
     measure.add_argument("--request", type=Path, required=True)
     measure.add_argument(
@@ -45,10 +50,18 @@ def main() -> int:
         "replay", help="Replay a source DAG or recorded predicted path with explicit costs."
     )
     replay_command.add_argument("--request", type=Path, required=True)
+    evaluation_command = commands.add_parser(
+        "evaluate", help="Compare a recorded prediction with a separate real target profile."
+    )
+    evaluation_command.add_argument("--request", type=Path, required=True)
     args = parser.parse_args()
 
     try:
-        if args.command == "replay":
+        if args.command == "evaluate":
+            from markov.workflow.evaluation import evaluate
+
+            result = evaluate(args.request)
+        elif args.command == "replay":
             from markov.workflow.replay import replay
 
             result = replay(args.request)
@@ -68,7 +81,10 @@ def main() -> int:
                 from markov.workflow.capture import InferenceCapture
 
                 result = InferenceCapture(
-                    request, profiling=args.command == "capture", calibration=args.command == "calibrate"
+                    request,
+                    profiling=args.command == "capture",
+                    calibration=args.command == "calibrate",
+                    record_regions=args.command == "capture" and args.record_regions,
                 ).run(recapture=args.recapture)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"markov: {error}", file=sys.stderr)
