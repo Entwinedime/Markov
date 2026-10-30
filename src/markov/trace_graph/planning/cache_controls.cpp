@@ -38,15 +38,11 @@ bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn
         {          "layers",          backend_.layers },
         { "bytes_per_token", backend_.bytes_per_token }
     };
-    const Work caller{
-        kind == CopyKind::Backup ? backend_.backup_caller : WorkKind{ "cache.load.caller", backend_.load.implementation, "caller_blocking_interval" },
-        features
-    };
-    const Work completion{
-        kind == CopyKind::Backup ? backend_.backup_completion
-                                 : WorkKind{ "cache.load.completion", backend_.load.implementation, "completion_observation_upper_interval" },
-        features
-    };
+    const Work caller{ kind == CopyKind::Backup ? backend_.backup_caller : backend_.load_caller, features };
+    const Work completion{ kind == CopyKind::Backup ? backend_.backup_completion : backend_.load_completion, features };
+    auto preparation_features = features;
+    preparation_features["segments"] = cache_.copy_segments(transfer);
+    const Work preparation{ backend_.load_prepare, std::move(preparation_features) };
     const Work clone{
         {                  "cache.index_clone", "aten.clone:cpu:int64", "caller_blocking_interval" },
         { { "elements", pages * page_tokens_ }, { "element_bytes", 8 },       { "tensor_rank", 1 } }
@@ -54,23 +50,49 @@ bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn
     const auto begin = runtime.next_node();
     const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
     const auto returned = kind == CopyKind::Backup && !pending.evict_after ? std::optional(action(ActionKind::CopyReturned, turn)) : std::nullopt;
-    PlannedMutation mutation{
-        0,
-        { { running_[request].callers[rank], std::cref(caller) },
-          { resource, std::cref(completion) },
-          { running_[request].callers[rank], std::cref(clone), returned } },
-        {      { cause, begin, graph::EdgeKind::DataDependency },
-          { cause, begin + 1, graph::EdgeKind::DataDependency },
-          { begin, begin + 2, graph::EdgeKind::DataDependency }          }
-    };
+    PlannedMutation mutation{ 0, {}, {} };
+    graph::NodeId call_return, copy_done;
+    if (kind == CopyKind::Load) {
+        // shortcut: publish the whole load at completion; split layer progress
+        // when the region path models its overlap with attention execution.
+        // load_back prepares CPU concatenation, allocation and device clones.
+        // start_loading then publishes layer copies on its own stream. A host
+        // index clone belongs only to backup, never to this load path.
+        mutation.operations = {
+            { running_[request].callers[rank], std::cref(preparation) },
+            { running_[request].callers[rank],      std::cref(caller) },
+            {                        resource,  std::cref(completion) }
+        };
+        mutation.dependencies = {
+            { cause,     begin, graph::EdgeKind::DataDependency },
+            { begin, begin + 1, graph::EdgeKind::DataDependency },
+            { begin, begin + 2, graph::EdgeKind::DataDependency }
+        };
+        call_return = begin + 1;
+        copy_done = begin + 2;
+    }
+    else {
+        mutation.operations = {
+            { running_[request].callers[rank], std::cref(caller) },
+            { resource, std::cref(completion) },
+            { running_[request].callers[rank], std::cref(clone), returned }
+        };
+        mutation.dependencies = {
+            { cause,     begin, graph::EdgeKind::DataDependency },
+            { cause, begin + 1, graph::EdgeKind::DataDependency },
+            { begin, begin + 2, graph::EdgeKind::DataDependency }
+        };
+        call_return = begin + 2;
+        copy_done = begin + 1;
+    }
     if (const auto previous = queues_.native.find(resource); previous != queues_.native.end()) {
-        mutation.dependencies.push_back({ previous->second, begin, graph::EdgeKind::ResourceOrder });
-        mutation.dependencies.push_back({ previous->second, begin + 1, graph::EdgeKind::ResourceOrder });
+        mutation.dependencies.push_back({ previous->second, kind == CopyKind::Load ? begin + 1 : begin, graph::EdgeKind::ResourceOrder });
+        mutation.dependencies.push_back({ previous->second, copy_done, graph::EdgeKind::ResourceOrder });
     }
     if (!runtime.submit(std::move(mutation))) return false;
-    pending.caller_returns.push_back(begin + 2);
-    pending.copy_completions.push_back(begin + 1);
-    queues_.native[resource] = begin + 1;
+    pending.caller_returns.push_back(call_return);
+    pending.copy_completions.push_back(copy_done);
+    queues_.native[resource] = copy_done;
     join_copy(runtime, transfer);
     return true;
 }

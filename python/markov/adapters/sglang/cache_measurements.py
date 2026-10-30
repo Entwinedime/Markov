@@ -2,48 +2,66 @@
 
 import json
 from pathlib import Path
+from typing import Iterator
 
 from markov.artifacts.performance import Measurement
 from markov.artifacts.request import positive_integer, read_json
 
 
 IMPLEMENTATION = "sglang.HiCacheController.write:kernel_ascend.page_first_direct"
+LOAD_IMPLEMENTATION = "sglang.HiCacheController.start_loading:kernel_ascend.page_first_direct"
+LOAD_PREPARATION = "sglang.HiRadixCache.load_back:kernel_ascend.page_first_direct"
+RESPONSES = {
+    "backup": {
+        "caller_return_ns": ("cache.backup.caller", IMPLEMENTATION, "caller_blocking_interval"),
+        "completion_observed_ns": ("cache.backup.completion", IMPLEMENTATION, "completion_observation_upper_interval"),
+        "host_index_clone_ns": ("cache.index_clone", "aten.clone:cpu:int64", "caller_blocking_interval"),
+    },
+    "load": {
+        "load_prepare_return_ns": ("cache.load.prepare", LOAD_PREPARATION, "caller_blocking_interval"),
+        "load_caller_return_ns": ("cache.load.caller", LOAD_IMPLEMENTATION, "caller_blocking_interval"),
+        "load_completion_observed_ns": (
+            "cache.load.completion",
+            LOAD_IMPLEMENTATION,
+            "completion_observation_upper_interval",
+        ),
+    },
+}
 
 
-def recipes(captured):
+def recipes(captured: dict) -> dict:
     limits = [
         "Independent initialized idle single-device response; no competing I/O or CPU load. "
         "The declared deployment is supplied by the maintainer, not inferred from a capture's device index."
     ]
     limits.append(captured["limitations"])
-    return {
-        ("cache.backup.caller", IMPLEMENTATION, "caller_blocking_interval"): {
-            "feature": "pages",
-            "curve": "page_bytes",
-            "extrapolation_features": ["pages"],
-            "limitations": limits
-            + [
-                "Opaque CPU preparation/DMA overlap; page-count extrapolation assumes fixed setup and repeated per-page work."
-            ],
-        },
-        ("cache.backup.completion", IMPLEMENTATION, "completion_observation_upper_interval"): {
-            "feature": "pages",
-            "curve": "page_bytes",
-            "extrapolation_features": ["pages"],
-            "limitations": limits
-            + [
-                "Includes completion-observation API; a prediction is not a guaranteed upper bound or bare device service. "
-                "Queue occupancy uses one coarse controller lane; page-count extrapolation is an unmeasured assumption."
-            ],
-        },
-        ("cache.index_clone", "aten.clone:cpu:int64", "caller_blocking_interval"): {
-            "feature": "elements",
-            "limitations": limits + ["One complete host API response, not separately measured CPU self service."],
-        },
-    }
+    result = {}
+    for direction in captured["recipe"].get("operations", ["backup"]):
+        for kind in RESPONSES[direction].values():
+            if kind[0] == "cache.index_clone":
+                result[kind] = {
+                    "feature": "elements",
+                    "nonnegative": True,
+                    "limitations": limits
+                    + ["One complete host API response, not separately measured CPU self service."],
+                }
+                continue
+            preparation = kind[0] == "cache.load.prepare"
+            result[kind] = {
+                "feature": ["pages", "segments"] if preparation else "pages",
+                "curve": "page_bytes",
+                "nonnegative": True,
+                "extrapolation_features": ["pages"],
+                "limitations": limits
+                + [
+                    "Initialized opaque controller response; page-count extrapolation assumes fixed setup and repeated per-page work.",
+                    "Completion includes its observation API, not bare DMA. Coarse load execution waits for all layers and omits layer/compute overlap.",
+                ],
+            }
+    return result
 
 
-def metadata(path: Path):
+def metadata(path: Path) -> dict:
     captured = read_json(path)
     if captured["status"] != "completed":
         raise ValueError(f"Independent capture did not complete: {path}")
@@ -56,7 +74,7 @@ def metadata(path: Path):
     return captured
 
 
-def context(captured: dict, deployment: dict):
+def context(captured: dict, deployment: dict) -> dict:
     if (deployment["framework"], deployment["runtime"], deployment["dtype"]) != ("sglang", "ascend", captured["dtype"]):
         raise ValueError("Cache measurements require a matching SGLang/Ascend deployment and dtype")
 
@@ -69,33 +87,32 @@ def context(captured: dict, deployment: dict):
     }
 
 
-def measurements(path: Path, captured: dict):
+def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
     geometry = captured["recipe"]["geometry"]
     for name in ("layers", "kv_heads", "head_dim"):
         positive_integer(geometry[name], name)
     bytes_per_token = 4 * geometry["layers"] * geometry["kv_heads"] * geometry["head_dim"]
-    kinds = {
-        "caller_return_ns": ("cache.backup.caller", IMPLEMENTATION, "caller_blocking_interval"),
-        "completion_observed_ns": ("cache.backup.completion", IMPLEMENTATION, "completion_observation_upper_interval"),
-        "host_index_clone_ns": ("cache.index_clone", "aten.clone:cpu:int64", "caller_blocking_interval"),
-    }
     recipe = captured["recipe"]
     warmup = positive_integer(recipe["warmup"], "warmup")
     repetitions = warmup + positive_integer(recipe["repeats"], "repeats")
     cases = {
-        (positive_integer(c["page_tokens"], "page_tokens"), positive_integer(c["pages"], "pages"))
+        (positive_integer(c["page_tokens"], "page_tokens"), positive_integer(c["pages"], "pages"), c.get("segments", 1))
         for c in recipe["cases"]
     }
+    directions = recipe.get("operations", ["backup"])
     seen = set()
     with (path.parent / "measurements.jsonl").open(encoding="utf-8") as stream:
         for position, line in enumerate(stream, start=1):
             row = json.loads(line)
             pages = positive_integer(row["pages"], "pages")
             tokens = positive_integer(row["page_tokens"], "page_tokens")
+            segments = row.get("segments", 1)
+            direction = row.get("operation", "backup")
             ordinal = row["ordinal"]
-            identity = (tokens, pages, ordinal)
+            identity = (tokens, pages, segments, direction, ordinal)
             if (
-                (tokens, pages) not in cases
+                (tokens, pages, segments) not in cases
+                or direction not in directions
                 or type(ordinal) is not int
                 or not 0 <= ordinal < repetitions
                 or identity in seen
@@ -111,15 +128,16 @@ def measurements(path: Path, captured: dict):
                 "layers": geometry["layers"],
                 "bytes_per_token": bytes_per_token,
             }
-            for quantity, kind in kinds.items():
+            for quantity, kind in RESPONSES[direction].items():
                 duration = row[quantity]
                 if type(duration) is not int or duration < 0:
                     raise ValueError(f"Invalid ns response: {path}, line {position}, {quantity}")
-                features = (
-                    {"elements": pages * tokens, "element_bytes": 8, "tensor_rank": 1}
-                    if quantity == "host_index_clone_ns"
-                    else work
-                )
+                if quantity == "host_index_clone_ns":
+                    features = {"elements": pages * tokens, "element_bytes": 8, "tensor_rank": 1}
+                elif quantity == "load_prepare_return_ns":
+                    features = {**work, "segments": segments}
+                else:
+                    features = work
                 yield Measurement(position, quantity, *kind, features, duration, row["warmup"])
-    if len(seen) != len(cases) * repetitions or not seen:
+    if len(seen) != len(cases) * len(directions) * repetitions or not seen:
         raise ValueError(f"Capture does not contain all declared warmup and measured cases: {path}")

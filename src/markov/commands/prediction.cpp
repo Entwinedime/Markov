@@ -46,6 +46,28 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     cost::Queries costs(input.costs.models, &source);
     auto cells = Json::array();
     for (const auto & target : input.targets) {
+        if (target.infeasible) {
+            cells.push_back({
+                {                  "name",           target.name },
+                {         "configuration",  target.configuration },
+                {                "status", "resource_infeasible" },
+                {                 "issue",    *target.infeasible },
+                {             "cost_gaps",         Json::array() },
+                {         "e2e_predicted",                 false },
+                {       "formal_http_sec",               nullptr },
+                { "background_finish_sec",               nullptr },
+                {       "generated_nodes",                     0 },
+                {        "executed_nodes",                     0 },
+                {       "generated_edges",                     0 },
+                {              "requests",         Json::array() },
+                {              "coverage",        Json::object() },
+                {            "node_scale",         Json::array() },
+                {    "backup_submissions",                     0 },
+                {      "load_submissions",                     0 },
+                {        "simulation_sec",                     0 }
+            });
+            continue;
+        }
         const auto begin = Clock::now();
         planning::CacheProgram program(source,
                                        target.page_tokens,
@@ -55,7 +77,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                                        input.initial,
                                        planning::RegionBackend{ "sglang.ascend.eager", target.result_implementation, target.maximum_prefill_tokens });
         simulation::ProgramResult result;
-        if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources()).run();
+        if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale).run();
         const bool complete =
             !program.issue() && result.cost_gaps.empty() && std::ranges::all_of(program.requests(), [&](const planning::CacheRequestResult & request) {
                 return request.completed && request.response && result.execution.states[*request.response] == simulation::OperationState::Complete;
@@ -93,6 +115,13 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         }
         Json coverage = Json::object();
         for (const auto & [kind, count] : result.coverage) coverage[cost_coverage_name(kind)] = count;
+        auto scaling = Json::array();
+        for (std::size_t id = 0; id < input.node_scale.size(); ++id)
+            scaling.push_back({
+                {          "name",                                   input.node_scale[id].name },
+                {        "factor",                                 input.node_scale[id].factor },
+                { "matched_nodes", result.scale_matches.empty() ? 0 : result.scale_matches[id] }
+            });
         cells.push_back({
             {                  "name",                                                  target.name                                      },
             {         "configuration",                                                                               target.configuration },
@@ -109,6 +138,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {        "executed_nodes",                                                                          result.execution.executed },
             {       "generated_edges",                                                                             result.execution.edges },
             {              "coverage",                                                                                std::move(coverage) },
+            {            "node_scale",                                                                                 std::move(scaling) },
             {    "backup_submissions",                                                                                  program.backups() },
             {      "load_submissions",                                                                                    program.loads() },
             {              "requests",                                                                                std::move(requests) },

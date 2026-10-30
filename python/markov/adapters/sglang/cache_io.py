@@ -50,16 +50,25 @@ class CacheIOSampler:
         torch.npu.synchronize()
         return controller
 
-    def measure(self, controller, pages: int) -> dict:
+    def prepare_indices(self, controller, pages: int):
         torch = self.torch
         host = controller.mem_pool_host
         allocator = controller.mem_pool_device_allocator
         host.clear()
         allocator.clear()
+        controller.mem_pool_device.k_buffer_contiguous.fill_(1)
+        controller.mem_pool_device.v_buffer_contiguous.fill_(2)
         indices = allocator.alloc(pages * controller.page_size)
         if indices is None:
             raise RuntimeError("The declared case exceeds the prepared device pool")
         torch.npu.synchronize()
+        return indices
+
+    def measure_backup(self, controller, pages: int) -> dict:
+        torch = self.torch
+        host = controller.mem_pool_host
+        allocator = controller.mem_pool_device_allocator
+        indices = self.prepare_indices(controller, pages)
 
         # This is the framework's actual index readback, measured separately from its enclosing write.
         host_indices = host.alloc(len(indices))
@@ -101,6 +110,61 @@ class CacheIOSampler:
             "host_capacity_pages": host.size // controller.page_size,
         }
 
+    def measure_load(self, controller, pages: int, segments: int) -> dict:
+        torch = self.torch
+        host = controller.mem_pool_host
+        allocator = controller.mem_pool_device_allocator
+        indices = self.prepare_indices(controller, pages)
+        selected = controller.write(indices)
+        controller.ack_write_queue.pop().finish_event.synchronize()
+
+        # Prepare valid host pages outside timing, then clear the device pool so
+        # verification cannot accidentally pass using the original K/V values.
+        allocator.clear()
+        pool = controller.mem_pool_device
+        pool.k_buffer_contiguous.zero_()
+        pool.v_buffer_contiguous.zero_()
+        widths = [pages // segments + (index < pages % segments) for index in range(segments)]
+        parts = list(selected.split([count * controller.page_size for count in widths]))
+        torch.npu.synchronize()
+
+        begin = time.perf_counter_ns()
+        combined = torch.cat(parts)
+        device_indices = controller.load(combined)
+        offset = 0
+        cloned = []
+        for part in parts:
+            cloned.append(device_indices[offset : offset + len(part)].clone())
+            offset += len(part)
+        prepared = time.perf_counter_ns()
+
+        begin_load = time.perf_counter_ns()
+        controller.start_loading()
+        returned = time.perf_counter_ns()
+        ack = controller.ack_load_queue.pop()
+        ack.finish_event.synchronize()
+        completed = time.perf_counter_ns()
+
+        # The normal framework also keeps these index tensors alive through the
+        # queued transfer. Synchronization and value checks are outside timing.
+        restored = torch.cat(cloned)
+        if not torch.equal(restored, device_indices):
+            raise RuntimeError("Load index clones changed the allocated slots")
+        values = restored.cpu()
+        shape = (self.geometry["layers"], -1, self.geometry["kv_heads"], self.geometry["head_dim"])
+        if not bool(torch.all(pool.k_buffer_contiguous.view(shape)[:, values] == 1)) or not bool(
+            torch.all(pool.v_buffer_contiguous.view(shape)[:, values] == 2)
+        ):
+            raise RuntimeError("HiCache load did not restore the expected K/V pages")
+        return {
+            "load_prepare_return_ns": prepared - begin,
+            "load_caller_return_ns": returned - begin_load,
+            "load_completion_observed_ns": completed - begin_load,
+            "physical_pages_verified": pages,
+            "device_capacity_pages": allocator.size // controller.page_size,
+            "host_capacity_pages": host.size // controller.page_size,
+        }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,7 +172,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     recipe = read_json(args.recipe)
-    reject_unknown(recipe, {"device", "geometry", "warmup", "repeats", "cases"}, "cache I/O recipe")
+    reject_unknown(recipe, {"device", "geometry", "warmup", "repeats", "cases", "operations"}, "cache I/O recipe")
     device = recipe["device"]
     if type(device) is not int or device < 0:
         raise ValueError("device must be a nonnegative integer")
@@ -118,13 +182,24 @@ def main() -> None:
         positive_integer(geometry[key], key)
     warmup = positive_integer(recipe["warmup"], "warmup")
     repeats = positive_integer(recipe["repeats"], "repeats")
+    operations = recipe.get("operations", ["backup"])
+    if (
+        not isinstance(operations, list)
+        or not operations
+        or set(operations) - {"backup", "load"}
+        or len(set(operations)) != len(operations)
+    ):
+        raise ValueError("operations must select backup, load, or both")
     cases = recipe["cases"]
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases must be a nonempty array")
     for case in cases:
-        reject_unknown(case, {"page_tokens", "pages"}, "cache I/O case")
+        reject_unknown(case, {"page_tokens", "pages", "segments"}, "cache I/O case")
         for key in ("page_tokens", "pages"):
             positive_integer(case[key], key)
+        segments = positive_integer(case.get("segments", 1), "segments")
+        if segments > case["pages"]:
+            raise ValueError("Each load segment must contain at least one page")
 
     args.output.mkdir(parents=True, exist_ok=False)
     sampler = CacheIOSampler(device, geometry)
@@ -133,11 +208,25 @@ def main() -> None:
             selected = [case for case in cases if case["page_tokens"] == page_tokens]
             controller = sampler.prepare(page_tokens, max(case["pages"] for case in selected))
             for case in selected:
-                for ordinal in range(warmup + repeats):
-                    measurement = sampler.measure(controller, case["pages"])
-                    stream.write(
-                        json.dumps({**case, "warmup": ordinal < warmup, "ordinal": ordinal, **measurement}) + "\n"
-                    )
+                for operation in operations:
+                    for ordinal in range(warmup + repeats):
+                        measurement = (
+                            sampler.measure_backup(controller, case["pages"])
+                            if operation == "backup"
+                            else sampler.measure_load(controller, case["pages"], case.get("segments", 1))
+                        )
+                        stream.write(
+                            json.dumps(
+                                {
+                                    **case,
+                                    "operation": operation,
+                                    "warmup": ordinal < warmup,
+                                    "ordinal": ordinal,
+                                    **measurement,
+                                }
+                            )
+                            + "\n"
+                        )
             del controller
             gc.collect()
             sampler.torch.npu.empty_cache()
@@ -151,8 +240,8 @@ def main() -> None:
                 "dtype": "bfloat16",
                 "backend": "kernel_ascend",
                 "host_layout": "page_first_direct",
-                "scope": "Independent initialized idle single-device controller writes; no weights, trace, probe or target",
-                "completion_boundary": "Write entry to finish-event synchronize return; includes the observing API",
+                "scope": "Independent initialized idle single-device controller I/O; no weights, trace, probe or target",
+                "completion_boundary": "Write or start-loading entry to finish-event synchronize return; includes the observing API",
                 "limitations": "No competing I/O or CPU load; initialization and verification outside timing; idle sync is retained without subtraction",
             },
             indent=2,

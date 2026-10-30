@@ -165,6 +165,19 @@ private:
 
 } // namespace
 
+std::vector<cost::ScalingRule> read_node_scale(const Json & raw) {
+    if (!raw.is_array()) throw std::runtime_error("NodeScale rules must be an array");
+    std::vector<cost::ScalingRule> result;
+    for (const auto & item : raw) {
+        fields(item, { "name", "factor" });
+        auto name = item.at("name").get<std::string>();
+        const auto factor = item.at("factor").get<double>();
+        if (name.empty() || !std::isfinite(factor) || factor < 0) throw std::runtime_error("NodeScale needs a nonempty name and finite nonnegative factor");
+        result.push_back({ std::move(name), factor });
+    }
+    return result;
+}
+
 SourceCpuCosts read_source_cpu_costs(const std::filesystem::path & path, const source::ProfileManifest & manifest, const source::Observations & observations) {
     CpuCostReader reader(observations);
     auto parsed = source::read_json_records(path, "intervals", reader);

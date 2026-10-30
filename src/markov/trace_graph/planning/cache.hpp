@@ -112,6 +112,8 @@ public:
     bool backup_required(RadixId node) const;
     CopyStart begin_backup(RadixId node);
     CopyStart begin_load(RadixId node);
+    // Number of radix segments currently owned by this transfer.
+    std::size_t copy_segments(TransferId transfer) const;
     // Load layers arrive in order; acknowledgement follows full publication.
     void publish_layer(TransferId transfer);
     void publish_all(TransferId transfer);

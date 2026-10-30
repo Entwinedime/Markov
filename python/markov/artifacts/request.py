@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any
 from typing import TYPE_CHECKING
@@ -106,19 +107,36 @@ class Target:
 
 
 @dataclass(frozen=True)
+class ScalingRule:
+    name: str
+    factor: float
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> ScalingRule:
+        reject_unknown(raw, {"name", "factor"}, "node_scale rule")
+        factor = raw["factor"]
+        if type(factor) not in (int, float) or not math.isfinite(factor) or factor < 0:
+            raise ValueError("node_scale factor must be finite and nonnegative")
+        return cls(required_text(raw["name"], "node_scale name"), float(factor))
+
+
+@dataclass(frozen=True)
 class Execution:
     output: Path
     jobs: int
     memory_limit_gib: int | None
     capture: CaptureSettings | None = None
     kernel_cache_initial_state: str | None = None
+    node_scale: tuple[ScalingRule, ...] = ()
 
     @classmethod
     def parse(cls, raw: dict[str, Any], directory: Path) -> Execution:
         from markov.artifacts.capture import CaptureSettings
 
         reject_unknown(
-            raw, {"output", "jobs", "memory_limit_gib", "capture", "kernel_cache_initial_state"}, "execution"
+            raw,
+            {"output", "jobs", "memory_limit_gib", "capture", "kernel_cache_initial_state", "node_scale"},
+            "execution",
         )
         memory_limit = raw.get("memory_limit_gib")
         if memory_limit is not None:
@@ -133,6 +151,7 @@ class Execution:
             memory_limit,
             CaptureSettings.parse(raw["capture"]) if "capture" in raw else None,
             initial,
+            tuple(ScalingRule.parse(rule) for rule in raw.get("node_scale", [])),
         )
 
 

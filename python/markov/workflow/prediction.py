@@ -2,16 +2,14 @@
 
 from dataclasses import asdict
 import fcntl
-import os
 from pathlib import Path
-import subprocess
 import time
 
-from markov.artifacts.request import PredictionRequest, read_json
+from markov.artifacts.request import PredictionRequest
 from markov.artifacts.performance import encoded
 from markov.artifacts.workload import Workload
 from markov.artifacts.writing import write_json
-from markov.instrumentation.containers import container_state
+from markov.instrumentation.modeling import ModelingProcess
 from markov.workflow.capture import InferenceCapture
 from markov.workflow.performance import select_models
 from markov.workflow.preparation import PerformancePreparation
@@ -36,7 +34,7 @@ def _predict(request: PredictionRequest) -> dict:
     if request.execution.kernel_cache_initial_state is None:
         raise ValueError("Prediction requires execution.kernel_cache_initial_state: empty or prepared")
     output = request.execution.output / "prediction"
-    process = PredictionProcess(output, request.execution.memory_limit_gib or 4)
+    process = ModelingProcess(output, request.execution.memory_limit_gib or 4)
     process.check_available()
     models = select_models(
         request.deployment,
@@ -63,13 +61,14 @@ def _predict(request: PredictionRequest) -> dict:
         "workload": asdict(workload),
         "targets": [asdict(target) for target in request.targets],
         "kernel_cache_initial_state": request.execution.kernel_cache_initial_state,
+        "node_scale": [asdict(rule) for rule in request.execution.node_scale],
     }
     seen = set()
     preparation = None
     while True:
         inputs["models"] = str(models)
         write_json(prepared, inputs)
-        result = process.run(manifest, models, prepared)
+        result = process.run("predict", prepared, (manifest.parent, models))
         if result["status"] == "failed":
             return result
         requirements = {}
@@ -107,73 +106,3 @@ def _predict(request: PredictionRequest) -> dict:
     write_json(process.report, result)
     result["report"] = str(process.report)
     return result
-
-
-class PredictionProcess:
-    """Own the isolated modeling container; no database, device or evaluator mounts."""
-
-    def __init__(self, output: Path, memory_limit_gib: int):
-        self.output = output
-        self.memory_limit_gib = memory_limit_gib
-        self.cid = output / "container.id"
-        self.report = output / "report.json"
-
-    def check_available(self) -> None:
-        current = container_state(self.cid)
-        if current is not None and current["Running"]:
-            raise ValueError("This prediction output still has a running container")
-        self.report.with_name(self.report.name + ".partial").unlink(missing_ok=True)
-
-    def run(self, manifest: Path, models: Path, prepared: Path) -> dict:
-        executable = Path(__file__).resolve().parents[3] / "build/modeling/Release/markov_core"
-        self.cid.unlink(missing_ok=True)
-        args = [
-            "docker",
-            "run",
-            "--rm",
-            "--init",
-            "--network",
-            "none",
-            "--pids-limit",
-            "256",
-            "--cidfile",
-            str(self.cid),
-            "--memory",
-            f"{self.memory_limit_gib}g",
-            "--memory-swap",
-            f"{self.memory_limit_gib}g",
-        ]
-
-        # No repository/data-root mount: the evaluator's normal observations and
-        # target traces cannot enter this container, even as unused neighbors.
-        for source, target, writable in (
-            (executable, "/opt/markov/markov_core", False),
-            (manifest.parent, str(manifest.parent), False),
-            (models, str(models), False),
-            (prepared, str(prepared), False),
-            (self.output, str(self.output), True),
-        ):
-            args += ["--mount", f"type=bind,source={source},target={target}" + ("" if writable else ",readonly")]
-        args += [
-            os.environ.get("MARKOV_MODELING_IMAGE", "markov-modeling:ubuntu24.04"),
-            "/opt/markov/markov_core",
-            "predict",
-            str(prepared),
-            str(self.report),
-        ]
-        write_json(self.output / "invocation.json", args)
-        with (self.output / "run.log").open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
-            try:
-                code = process.wait()
-            finally:
-                if process.poll() is None:
-                    if self.cid.exists():
-                        subprocess.run(
-                            ["docker", "rm", "-f", self.cid.read_text().strip()], stdout=log, stderr=log, timeout=20
-                        )
-                    process.terminate()
-                    process.wait(timeout=20)
-        if code:
-            return {"status": "failed", "exit_code": code, "log": str(self.output / "run.log")}
-        return read_json(self.report)

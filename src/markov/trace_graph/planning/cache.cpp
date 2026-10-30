@@ -275,6 +275,8 @@ CopyStart Cache::begin_load(RadixId node) {
     return { CopyStatus::Started, id, pages };
 }
 
+std::size_t Cache::copy_segments(TransferId transfer) const { return publications_.at(transfer).nodes.size(); }
+
 void Cache::publish_layer(TransferId transfer) { ++publications_.at(transfer).published_layers; }
 void Cache::publish_all(TransferId transfer) { publications_.at(transfer).published_layers = config_.layers; }
 

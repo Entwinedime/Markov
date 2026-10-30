@@ -1,12 +1,14 @@
 #pragma once
 
 #include "markov/trace_graph/cost/queries.hpp"
+#include "markov/trace_graph/cost/scaling.hpp"
 #include "markov/trace_graph/planning/program.hpp"
 #include "markov/trace_graph/simulation/execution.hpp"
 
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -21,13 +23,14 @@ struct ProgramResult {
     ExecutionResult execution;
     std::vector<CostGap> cost_gaps;
     std::map<cost::Coverage, std::size_t> coverage;
+    std::vector<std::size_t> scale_matches;
 };
 
 // Bridge typed work to the existing clock. Rules never receive cost responses;
 // a gap stops this run before committing the incomplete mutation.
 class ProgramExecution final : public planning::ProgramRuntime, private EventReceiver {
 public:
-    ProgramExecution(planning::Program & program, cost::Queries & costs, std::size_t resources);
+    ProgramExecution(planning::Program & program, cost::Queries & costs, std::size_t resources, std::span<const cost::ScalingRule> scaling = {});
     ProgramResult run();
     graph::NodeId next_node() const override { return clock_.next_node(); }
     graph::Time now_ns() const override { return clock_.now_ns(); }
@@ -41,6 +44,7 @@ private:
     planning::Program & program_;
     cost::Queries & costs_;
     Execution clock_;
+    cost::NodeScale scaling_;
     std::vector<CostGap> gaps_;
 
     // Cached response addresses are stable for this cost session. Preserve

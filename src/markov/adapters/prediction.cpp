@@ -23,6 +23,7 @@ std::size_t positive(const Json & raw, const char * name) {
 PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     std::ifstream input(path);
     const auto raw = Json::parse(input);
+    auto scaling = read_node_scale(raw.value("node_scale", Json::array()));
     const auto manifest = trace_graph::source::inspect_manifest(raw.at("manifest").get<std::string>());
     const std::filesystem::path models_path(raw.at("models").get<std::string>());
     auto selected = read_cost_models(models_path);
@@ -35,6 +36,8 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     const auto captured = Json::parse(config);
     if (captured.at("deployment") != raw.at("deployment")) throw std::runtime_error("Base capture belongs to a different deployment");
     const auto & base = captured.at("server").at("arguments");
+    if (base.value("disable_radix_cache", false))
+        throw std::runtime_error("Regional prediction requires an active radix cache; cache-disabled scheduling is not restored");
     const std::set<std::string> variable{ "page_size",     "max_total_tokens",     "max_prefill_tokens", "enable_hierarchical_cache",
                                           "hicache_ratio", "hicache_write_policy", "hicache_io_backend", "hicache_mem_layout" };
     std::vector<PredictionTarget> targets;
@@ -76,6 +79,20 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
         throw std::runtime_error("Regional prediction currently supports plain eager inputs without speculative, multimodal or logprob branches");
     const auto & workload = raw.at("workload");
     if (workload.at("requests").size() != observations.requests.size()) throw std::runtime_error("Requested workload differs from the base capture");
+    for (auto & target : targets) {
+        const auto capacity = target.cache.device_pages * target.page_tokens;
+        for (std::size_t id = 0; id < observations.requests.size(); ++id) {
+            const auto & tokens = observations.request_tokens.at(observations.requests[id].identity);
+            const auto required = sglang::minimum_device_tokens(observations.token_paths.length(tokens.prompt.value().path),
+                                                                workload.at("requests").at(id).at("max_new_tokens").get<std::size_t>(),
+                                                                target.page_tokens);
+            if (capacity >= required) continue;
+
+            target.infeasible = "SGLang request " + std::to_string(id) + " needs at least " + std::to_string(required)
+                                + " device tokens including admission reservation; target provides " + std::to_string(capacity);
+            break;
+        }
+    }
     for (std::size_t id = 0; id < observations.requests.size(); ++id) {
         const auto & request = workload.at("requests").at(id);
         const auto & captured_request = observations.requests[id];
@@ -100,11 +117,9 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
             || captured_request.formal != (id >= workload.at("formal_begin_index").get<std::size_t>()))
             throw std::runtime_error("Regional prediction currently requires the same fixed output count and formal workload boundary");
     }
-    return { std::move(source),
-             std::move(selected),
-             models_path,
-             initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
-             std::move(targets) };
+    return { std::move(source),  std::move(selected),
+             models_path,        initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
+             std::move(targets), std::move(scaling) };
 }
 
 } // namespace markov::adapters

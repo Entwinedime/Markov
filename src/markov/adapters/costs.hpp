@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/cost/models.hpp"
+#include "markov/trace_graph/cost/scaling.hpp"
 #include "markov/trace_graph/source/cpu_costs.hpp"
 #include "markov/trace_graph/source/manifest.hpp"
 
@@ -33,6 +34,7 @@ struct SourceCpuCosts {
 // JSON is resolved and validated here once. The cost core receives only typed
 // work, coefficients and coordinates; it never opens the source captures.
 SelectedCosts read_cost_models(const std::filesystem::path & path);
+std::vector<trace_graph::cost::ScalingRule> read_node_scale(const nlohmann::json & raw);
 CostQueries read_cost_queries(const std::filesystem::path & path);
 SourceCpuCosts read_source_cpu_costs(const std::filesystem::path & path, const trace_graph::source::ProfileManifest & manifest,
                                      const trace_graph::source::Observations & observations);

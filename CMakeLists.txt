@@ -38,7 +38,11 @@ add_library(markov_source
 target_link_libraries(markov_source PUBLIC markov_graph nlohmann_json::nlohmann_json)
 target_compile_options(markov_source PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(markov_cost src/markov/trace_graph/cost/models.cpp src/markov/trace_graph/cost/queries.cpp)
+add_library(markov_cost
+    src/markov/trace_graph/cost/models.cpp
+    src/markov/trace_graph/cost/queries.cpp
+    src/markov/trace_graph/cost/scaling.cpp
+)
 target_include_directories(markov_cost PUBLIC src)
 target_link_libraries(markov_cost PUBLIC markov_source)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)

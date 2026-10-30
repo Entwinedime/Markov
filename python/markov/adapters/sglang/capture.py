@@ -115,6 +115,20 @@ class Capture:
                 row["input_ids"] = tokenizer.encode(row["prompt"])
         if sum(len(row["input_ids"]) for row in requests) > self.plan["budget"]["input_tokens"]:
             raise ValueError("The tokenized workload exceeds the remaining input-token budget")
+
+        server = self.plan["server"]
+        if "max_total_tokens" in server and "page_size" in server and not server.get("disable_radix_cache", False):
+            # Match Scheduler.init_req_max_new_tokens. Smaller pools can silently
+            # reduce the requested output, or leave the request unable to enter.
+            page = server["page_size"]
+            capacity = server["max_total_tokens"] // page * page
+            for index, row in enumerate(requests):
+                paged = (len(row["input_ids"]) + page - 1) // page * page
+                required = paged + row["max_new_tokens"] + page + 1
+                if capacity < required:
+                    raise ValueError(
+                        f"SGLang request {index} needs at least {required} device tokens; the pool provides {capacity}"
+                    )
         return requests
 
     def run(self):
@@ -280,7 +294,16 @@ class Capture:
             generated_tokens=response["meta_info"]["completion_tokens"],
             response=response,
         )
+
+        finish = response["meta_info"]["finish_reason"]
+        if finish["type"] in ("abort", "error") or (
+            item["ignore_eos"] and row["generated_tokens"] != item["max_new_tokens"]
+        ):
+            row.update(status="error", error="The runtime aborted or changed the requested fixed output count")
+
         write_json(self.directory / "workload_report.json", {"requests": self.rows})
+        if row["status"] == "error":
+            raise ValueError(row["error"])
 
     @staticmethod
     def milliseconds(ns):

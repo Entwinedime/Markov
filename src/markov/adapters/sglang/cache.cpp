@@ -16,6 +16,15 @@
 #include <variant>
 
 namespace markov::adapters::sglang {
+
+std::size_t minimum_device_tokens(std::size_t prompt_tokens, std::size_t output_tokens, std::size_t page_tokens) {
+    const auto paged = ((prompt_tokens + page_tokens - 1) / page_tokens) * page_tokens;
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    if (paged > limit - page_tokens || output_tokens >= limit - paged - page_tokens)
+        throw std::overflow_error("SGLang admission reservation exceeds the token-count range");
+    return paged + output_tokens + page_tokens + 1;
+}
+
 namespace {
 
 trace_graph::planning::StorageConfig read_storage(const nlohmann::json & raw, std::size_t device_pages, std::size_t host_pages) {
@@ -135,6 +144,9 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
         { "cache.backup", "kernel_ascend.page_first_direct", "device_service" },
         { "cache.backup.caller", "sglang.HiCacheController.write:kernel_ascend.page_first_direct", "caller_blocking_interval" },
         { "cache.backup.completion", "sglang.HiCacheController.write:kernel_ascend.page_first_direct", "completion_observation_upper_interval" },
+        { "cache.load.prepare", "sglang.HiRadixCache.load_back:kernel_ascend.page_first_direct", "caller_blocking_interval" },
+        { "cache.load.caller", "sglang.HiCacheController.start_loading:kernel_ascend.page_first_direct", "caller_blocking_interval" },
+        { "cache.load.completion", "sglang.HiCacheController.start_loading:kernel_ascend.page_first_direct", "completion_observation_upper_interval" },
         cache_backup(),
         { 128,
           { "cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service" },

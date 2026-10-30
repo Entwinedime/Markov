@@ -7,10 +7,11 @@
 
 namespace markov::trace_graph::simulation {
 
-ProgramExecution::ProgramExecution(planning::Program & program, cost::Queries & costs, std::size_t resources)
+ProgramExecution::ProgramExecution(planning::Program & program, cost::Queries & costs, std::size_t resources, std::span<const cost::ScalingRule> scaling)
     : program_(program),
       costs_(costs),
-      clock_(resources, *this) {}
+      clock_(resources, *this),
+      scaling_(scaling) {}
 
 std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation mutation) {
     if (!gaps_.empty()) return std::nullopt;
@@ -81,6 +82,17 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
         clock_.stop();
         return std::nullopt;
     }
+    if (scaling_.enabled()) {
+        for (std::size_t id = 0; id < mutation.operations.size(); ++id) {
+            const auto * work = std::get_if<std::reference_wrapper<const planning::Work>>(&mutation.operations[id].cost);
+            if (!work) continue;
+
+            const auto & kind = work->get().kind;
+            const auto label = kind.operation + ":" + kind.implementation + ":" + kind.timing_scope;
+            auto & duration = bound.operations[id].node.duration_ns;
+            duration = scaling_.apply(label, duration);
+        }
+    }
     const auto begin = clock_.submit(std::move(bound));
     for (const auto & [kind, count] : coverage) coverage_[kind] += count;
     return begin;
@@ -93,7 +105,12 @@ ProgramResult ProgramExecution::run() {
     if (gaps_.empty()) clock_.run();
     if (gaps_.empty() && !program_.complete()) throw std::runtime_error("No pending event can complete the generated program");
 
-    return { clock_.take_result(), std::move(gaps_), std::move(coverage_) };
+    return {
+        clock_.take_result(),
+        std::move(gaps_),
+        std::move(coverage_),
+        { scaling_.matched().begin(), scaling_.matched().end() }
+    };
 }
 
 } // namespace markov::trace_graph::simulation

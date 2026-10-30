@@ -16,6 +16,10 @@ struct CacheBackend;
 
 namespace markov::adapters::sglang {
 
+// Scheduler.init_req_max_new_tokens reserves a page beyond the page-rounded
+// prompt and requested outputs. A smaller pool silently truncates that output.
+std::size_t minimum_device_tokens(std::size_t prompt_tokens, std::size_t output_tokens, std::size_t page_tokens);
+
 struct CacheSettings {
     std::size_t device_pages, host_pages;
     std::optional<std::size_t> backup_after_hits;

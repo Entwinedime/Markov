@@ -21,7 +21,7 @@ namespace markov::trace_graph::planning {
 
 struct CacheBackend {
     std::size_t layers, bytes_per_token, participants, minimum_load_tokens;
-    WorkKind load, backup, backup_caller, backup_completion;
+    WorkKind load, backup, backup_caller, backup_completion, load_prepare, load_caller, load_completion;
 
     // Targets share one immutable native recipe, not mutable cache state.
     std::shared_ptr<const CallSequence> backup_calls;

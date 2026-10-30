@@ -3,6 +3,7 @@
 #include "markov/adapters/source.hpp"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct PredictionTarget {
     std::size_t maximum_prefill_tokens;
     std::string result_implementation;
     sglang::CacheSettings cache;
+    std::optional<std::string> infeasible = std::nullopt;
 };
 
 struct PreparedPrediction {
@@ -23,6 +25,7 @@ struct PreparedPrediction {
     std::filesystem::path models_path;
     trace_graph::planning::KernelCacheInitial initial;
     std::vector<PredictionTarget> targets;
+    std::vector<trace_graph::cost::ScalingRule> node_scale;
 };
 
 // Only declared base, workload and independent models enter prediction.

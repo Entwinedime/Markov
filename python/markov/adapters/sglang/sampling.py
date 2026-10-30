@@ -71,6 +71,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     cells = {cell["name"]: cell for cell in report["cells"]}
     regions = {}
     io_cases = set()
+    io_operations = set()
     geometry = context["geometry"]
     for requirement in requirements:
         work = requirement.get("work")
@@ -83,7 +84,15 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 regions[(int(configuration["page_size"]), bool(configuration["enable_hierarchical_cache"]))] = (
                     configuration
                 )
-        elif operation in ("cache.backup.caller", "cache.backup.completion", "cache.index_clone"):
+        elif operation in (
+            "cache.backup.caller",
+            "cache.backup.completion",
+            "cache.index_clone",
+            "cache.load.prepare",
+            "cache.load.caller",
+            "cache.load.completion",
+        ):
+            io_operations.add("load" if operation.startswith("cache.load.") else "backup")
             for name in requirement["targets"]:
                 page = int(cells[name]["configuration"]["page_size"])
                 needed = (
@@ -91,7 +100,10 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                     if "pages" in work["features"]
                     else math.ceil(work["features"]["elements"] / page)
                 )
-                io_cases.update((page, pages) for pages in (1, max(2, needed)))
+                segments = int(work["features"].get("segments", 1))
+                io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
+                if segments > 1:
+                    io_cases.add((page, max(needed, segments), segments))
 
     commands = []
     for (page, enabled), target in sorted(regions.items()):
@@ -147,7 +159,11 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             },
             "warmup": 1,
             "repeats": 3,
-            "cases": [{"page_tokens": page, "pages": pages} for page, pages in sorted(io_cases)],
+            "operations": sorted(io_operations),
+            "cases": [
+                {"page_tokens": page, "pages": pages, "segments": segments}
+                for page, pages, segments in sorted(io_cases)
+            ],
         }
         commands.append(
             DeviceCommand(
