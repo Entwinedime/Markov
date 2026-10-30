@@ -64,7 +64,7 @@ cost::Formula formula(const Json & raw) {
     fields(raw, { "form", "feature", "points" });
     cost::CoefficientCurve result{ raw.at("feature").get<std::string>(), {} };
     const auto & points = raw.at("points");
-    if (!points.is_array() || points.size() < 2) throw std::runtime_error("Cost coefficient curve requires at least two anchors");
+    if (!points.is_array() || points.empty()) throw std::runtime_error("Cost coefficient curve requires a measured anchor");
     for (const auto & point : points) {
         fields(point, { "coordinate", "intercept_ns", "coefficients_ns" });
         const auto coordinate = point.at("coordinate").get<double>();

@@ -17,9 +17,20 @@ from markov.artifacts.request import read_json
 from markov.artifacts.writing import write_json
 
 
+CAPTURE_OWNED_ARGUMENTS = {
+    "model_path",
+    "dtype",
+    "tp_size",
+    "host",
+    "port",
+    "skip_server_warmup",
+    "base_gpu_id",
+    "gpu_id_step",
+}
+
+
 def server_arguments(deployment, configuration):
-    reserved = {"model_path", "dtype", "tp_size", "host", "port", "skip_server_warmup", "base_gpu_id", "gpu_id_step"}
-    if reserved.intersection(configuration):
+    if CAPTURE_OWNED_ARGUMENTS.intersection(configuration):
         raise ValueError("Model, dtype and TP belong to deployment; capture owns the isolated endpoint and startup")
     if configuration.get("disable_cuda_graph", True) is not True:
         raise ValueError("The restored base capture currently supports eager execution")
@@ -122,6 +133,7 @@ class Capture:
             self.directory / "config.json",
             {
                 "deployment": self.plan["deployment"],
+                "workload": self.plan["workload"],
                 "server": {
                     "command": command,
                     "arguments": self.plan["server"],
@@ -182,9 +194,18 @@ class Capture:
             files = sorted((self.directory / "regions").glob("*.jsonl"))
             if len(files) != self.plan["deployment"]["tensor_parallel"]:
                 raise RuntimeError("Independent region measurement did not report every TP worker")
+            phases = set()
             for path in files:
                 with path.open(encoding="utf-8") as stream:
-                    roles = {json.loads(line)["name"] for line in stream}
+                    roles = set()
+                    for line in stream:
+                        event = json.loads(line)
+                        roles.add(event["name"])
+                        if any(
+                            int(rid.removeprefix("request_")) >= self.plan["workload"]["formal_begin_index"]
+                            for rid in event["args"]["request_ids"]
+                        ):
+                            phases.add(event["args"]["phase"])
                 if (
                     not {"region.prepare", "region.prepare_stream", "region.batch", "region.stream", "region.result"}
                     <= roles
@@ -199,6 +220,8 @@ class Capture:
                     "deployment": self.plan["deployment"],
                     "configuration": self.plan["server"],
                     "formal_begin_index": self.plan["workload"]["formal_begin_index"],
+                    "phases": sorted(phases),
+                    "output_counts": [row["generated_tokens"] for row in self.rows if row["measure"]],
                     "files": [str(path.relative_to(self.directory)) for path in files],
                     "limitations": [
                         "Eager serial batch execution with the declared deployment and initialization; not a contention model.",

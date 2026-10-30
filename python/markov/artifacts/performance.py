@@ -1,5 +1,7 @@
 """Store independent measurements by capture, original position and quantity."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -46,11 +48,37 @@ class PerformanceData:
                 warmup INTEGER NOT NULL,
                 PRIMARY KEY(capture, position, quantity)
             );
+            CREATE TABLE IF NOT EXISTS models (
+                deployment TEXT PRIMARY KEY,
+                responses TEXT NOT NULL
+            );
             """
         )
 
     def close(self):
         self.connection.close()
+
+    def selected_models(self, deployment: dict) -> dict | None:
+        row = self.connection.execute(
+            "SELECT responses FROM models WHERE deployment = ?", (encoded(deployment),)
+        ).fetchone()
+        return {"deployment": deployment, "models": json.loads(row[0])} if row is not None else None
+
+    def publish_models(self, deployment: dict, models: list[dict]) -> None:
+        # One current offline selection; observations remain separate facts.
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO models VALUES (?, ?) ON CONFLICT(deployment) DO UPDATE SET responses = excluded.responses",
+                (encoded(deployment), encoded(models)),
+            )
+
+    def capture_metadata(self, path: Path) -> dict | None:
+        row = self.connection.execute(
+            "SELECT adapter, context, metadata FROM captures WHERE identity = ?", (str(path),)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"adapter": row[0], "context": json.loads(row[1]), "metadata": json.loads(row[2])}
 
     def import_capture(self, path, adapter, context, metadata, measurements):
         identity = str(path)

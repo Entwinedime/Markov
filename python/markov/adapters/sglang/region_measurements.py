@@ -36,7 +36,7 @@ def context(captured: dict, deployment: dict) -> dict:
 
 def recipes(captured: dict) -> dict:
     result = {}
-    for phase in ("prefill", "decode"):
+    for phase in captured["phases"]:
         for operation, scope in (
             ("prepare", "thread_cpu"),
             ("prepare", "caller_blocking_interval"),
@@ -46,37 +46,33 @@ def recipes(captured: dict) -> dict:
             ("batch", "current_stream_interval"),
             ("result", "thread_cpu"),
         ):
-            predictors = (
-                ["query_tokens", "attention_pairs", "first_phase", "new_input_size"]
-                if phase == "prefill"
-                else ["attention_pairs", "first_phase"]
-            )
+            predictors = ["query_tokens", "attention_pairs"] if phase == "prefill" else ["attention_pairs"]
+            if operation != "result":
+                predictors += ["first_phase"]
+            if operation == "prepare" and phase == "prefill":
+                predictors += ["new_preparations"]
             if operation == "result":
-                predictors = (
-                    ["query_tokens", "attention_pairs"] if phase == "prefill" else ["attention_pairs", "finished"]
-                )
+                predictors += ["finished"]
             implementation = result_implementation(captured) if operation == "result" else IMPLEMENTATION
             result[(f"{operation}.{phase}", implementation, scope)] = {
                 "feature": predictors,
+                "curve": "page_tokens",
                 "nonnegative": True,
-                "coverage_features": ["context_tokens", "batch_size", "query_tokens", "new_input_size", "first_phase"]
+                "coverage_features": ["context_tokens", "batch_size", "query_tokens"]
+                + (["new_preparations"] if operation == "prepare" else [])
                 + (["finished"] if operation == "result" else []),
                 "limitations": captured["limitations"],
             }
-    for operation in ("result_send.decode", "result_tail.decode"):
-        result[(operation, result_implementation(captured), "thread_cpu")] = {
-            "feature": "attention_pairs",
-            "nonnegative": True,
-            "coverage_features": [
-                "context_tokens",
-                "batch_size",
-                "query_tokens",
-                "first_phase",
-                "new_input_size",
-                "finished",
-            ],
-            "limitations": captured["limitations"],
-        }
+    final_phases = set("prefill" if count == 1 else "decode" for count in captured["output_counts"])
+    for phase in final_phases:
+        for part in ("send", "tail"):
+            result[(f"result_{part}.{phase}", result_implementation(captured), "thread_cpu")] = {
+                "feature": "attention_pairs",
+                "curve": "page_tokens",
+                "nonnegative": True,
+                "coverage_features": ["context_tokens", "batch_size", "query_tokens", "finished"],
+                "limitations": captured["limitations"],
+            }
     return result
 
 
@@ -109,6 +105,10 @@ def measurements(path: Path, captured: dict):
                 if type(duration) is not int or duration < 0:
                     raise ValueError(f"Invalid region duration in {source}, line {position}")
                 features = {**fields["features"]}
+                if kind[0] != "prepare":
+                    features.pop("new_preparations")
+                if kind[0] == "result":
+                    features.pop("first_phase")
                 implementation = result_implementation(captured) if name == "result" else IMPLEMENTATION
                 yield Measurement(
                     position,

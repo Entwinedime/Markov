@@ -28,6 +28,37 @@ ADAPTERS = {
 Points = list[tuple[dict[str, float], float]]
 
 
+def select_models(
+    deployment: Deployment, models: Path | None, database: Path | None, output: Path, allow_empty: bool = False
+) -> Path:
+    """Export the maintained selection; prediction neither fits nor opens SQLite."""
+    if models is not None:
+        models.stat()
+        return models
+    if database is None:
+        raise ValueError("Prediction needs performance.models or a maintained performance.database")
+    if allow_empty:
+        database.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        database.stat()
+    store = PerformanceData(database)
+    try:
+        selected = store.selected_models(asdict(deployment))
+    finally:
+        store.close()
+    if selected is None and not allow_empty:
+        raise ValueError("The performance database has no maintained models for this deployment")
+    if selected is None:
+        selected = {"deployment": asdict(deployment), "models": []}
+
+    output.mkdir(parents=True, exist_ok=True)
+    destination = output / "selected_models.json"
+    if destination == database:
+        raise ValueError("Selected model output would replace the performance database")
+    write_json(destination, selected)
+    return destination
+
+
 def least_squares(columns: list[list[float]], target: list[float]) -> list[float] | None:
     """Scaled QR; a dependent feature set has no unique least-squares response."""
     count = len(columns)
@@ -123,16 +154,14 @@ def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, so
         if len({features[name] for features, _ in points}) != 1:
             raise ValueError(f"Response needs a different model form for varying {name}: {kind[0]}")
 
+    fit = nonnegative_affine if recipe.get("nonnegative", False) else affine
     if curve is None:
-        fit = nonnegative_affine if recipe.get("nonnegative", False) else affine
         response = {"form": "affine", **fit(points, feature)}
     else:
         response = {"form": "coefficient_curve", "feature": curve, "points": []}
         for coordinate in sorted({features[curve] for features, _ in points}):
             selected = [(features, duration) for features, duration in points if features[curve] == coordinate]
-            response["points"].append({"coordinate": coordinate, **affine(selected, feature)})
-        if len(response["points"]) < 2:
-            raise ValueError(f"Coefficient interpolation needs at least two measured {curve} coordinates")
+            response["points"].append({"coordinate": coordinate, **fit(selected, feature)})
     return {
         "operation": kind[0],
         "implementation": kind[1],
@@ -169,18 +198,18 @@ def maintain_performance(path: Path):
         or any(output.is_relative_to(source.parent) for source in training + imports)
     ):
         raise ValueError("Model output must be separate from the database, request and captured source directories")
-    selected = (
-        read_json(resolve_path(directory, raw["models"]))
-        if "models" in raw
-        else {"deployment": deployment, "models": []}
-    )
-    if selected["deployment"] != deployment:
-        raise ValueError("Selected models belong to a different deployment")
-
     database.parent.mkdir(parents=True, exist_ok=True)
     store = PerformanceData(database)
     imported = []
     try:
+        selected = (
+            read_json(resolve_path(directory, raw["models"]))
+            if "models" in raw
+            else store.selected_models(deployment) or {"deployment": deployment, "models": []}
+        )
+        if selected["deployment"] != deployment:
+            raise ValueError("Selected models belong to a different deployment")
+
         for item in raw.get("imports", []):
             reject_unknown(item, {"adapter", "capture"}, "measurement import")
             adapter = ADAPTERS[item["adapter"]]
@@ -216,21 +245,22 @@ def maintain_performance(path: Path):
             train_response(kind, recipe, grouped.get(kind, []), sorted(sources.get(kind, set())))
             for kind, recipe in recipes.items()
         ]
+        # Publish only successfully trained responses. SQLite keeps the current
+        # selection; the small export is the predictor's isolated input.
+        by_kind = {}
+        for model in selected["models"]:
+            kind = tuple(model[key] for key in ("operation", "implementation", "timing_scope"))
+            if kind in by_kind:
+                raise ValueError(f"Duplicate selected response: {kind}")
+            by_kind[kind] = model
+        for model in trained:
+            by_kind[tuple(model[key] for key in ("operation", "implementation", "timing_scope"))] = model
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            write_json(output, {"deployment": deployment, "models": list(by_kind.values())})
+            store.publish_models(deployment, list(by_kind.values()))
     finally:
         store.close()
-
-    # Only explicitly selected responses are replaced; prediction reads this file, not SQLite.
-    by_kind = {}
-    for model in selected["models"]:
-        kind = tuple(model[key] for key in ("operation", "implementation", "timing_scope"))
-        if kind in by_kind:
-            raise ValueError(f"Duplicate selected response: {kind}")
-        by_kind[kind] = model
-    for model in trained:
-        by_kind[tuple(model[key] for key in ("operation", "implementation", "timing_scope"))] = model
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        write_json(output, {"deployment": deployment, "models": list(by_kind.values())})
     return {
         "status": "completed",
         "database": str(database),

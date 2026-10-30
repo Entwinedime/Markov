@@ -7,18 +7,19 @@
 
 namespace markov::trace_graph::planning {
 
-Features RegionPreparation::enter(std::size_t caller, Phase phase, const FrameInput & input) {
+Features RegionPreparation::enter(std::size_t caller, Phase phase, const FrameInput & input, std::span<const Work> preparations) {
     const auto first = phases_.emplace(caller, phase).second;
-    const auto fresh = inputs_.emplace(caller, phase, input.query_tokens, input.batch_size, input.page_tokens).second;
+    std::size_t fresh = 0;
+    for (const auto & preparation : preparations) fresh += preparations_.emplace(caller, preparation).second;
     const bool empty = initial_ == KernelCacheInitial::Empty;
     return {
-        {    "query_tokens",                                                           input.query_tokens },
-        {  "context_tokens",                                                         input.context_tokens },
-        { "attention_pairs", input.query_tokens * (2 * input.context_tokens - input.query_tokens + 1) / 2 },
-        {      "batch_size",                                                             input.batch_size },
-        {     "page_tokens",                                                            input.page_tokens },
-        {     "first_phase",                                                       empty && first ? 1 : 0 },
-        {  "new_input_size",                                             empty && !first && fresh ? 1 : 0 }
+        {     "query_tokens",                                                           input.query_tokens },
+        {   "context_tokens",                                                         input.context_tokens },
+        {  "attention_pairs", input.query_tokens * (2 * input.context_tokens - input.query_tokens + 1) / 2 },
+        {       "batch_size",                                                             input.batch_size },
+        {      "page_tokens",                                                            input.page_tokens },
+        {      "first_phase",                                                       empty && first ? 1 : 0 },
+        { "new_preparations",                                                  empty && !first ? fresh : 0 }
     };
 }
 
@@ -73,7 +74,8 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
         else roots_.push_back(id);
         previous[result.run.resource] = id;
         frames_.push_back(std::move(frame));
-        stats_.frames.push_back({ description.source_frame });
+        stats_.frames.emplace_back();
+        stats_.frames.back().source_frame = description.source_frame;
     }
     for (const auto & group : groups_) {
         if (group.frames.size() != callers.size()) {
@@ -95,7 +97,24 @@ void RegionCompute::start(ProgramRuntime & runtime, std::optional<graph::NodeId>
 void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
     auto & frame = frames_[id];
     frame.description.input = controls_.begin_frame(request_, frame.description.source_frame, frame.description.input);
-    frame.features = preparation_.enter(frame.caller, frame.phase, frame.description.input);
+    const auto & observed = source_.observations().compute_frames[frame.description.source_frame];
+    const auto & region = *observed.preparation_region;
+    std::vector<Work> preparations;
+    for (const auto & sequence : observed.preparations) {
+        if (sequence.region.resource != region.resource || sequence.region.begin_ns < region.begin_ns || sequence.region.end_ns > region.end_ns) continue;
+        if (!sequence.definition) {
+            issue_ = "semantic_preparation_rule_unavailable";
+            return;
+        }
+        const auto calls = sequence.definition->describe(frame.phase, frame.description.input, sequence.source_work);
+        if (calls.issue) {
+            issue_ = calls.issue;
+            return;
+        }
+        for (const auto & call : calls.calls)
+            if (call.preparation) preparations.push_back(call.preparation->specialization);
+    }
+    frame.features = preparation_.enter(frame.caller, frame.phase, frame.description.input, preparations);
     const auto phase = frame.phase == Phase::Prefill ? "prefill" : "decode";
     const auto work = [&](std::string role, std::string scope) {
         return Work{

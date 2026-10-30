@@ -5,8 +5,8 @@
 
 #include <map>
 #include <set>
+#include <span>
 #include <string>
-#include <tuple>
 #include <vector>
 
 namespace markov::trace_graph::planning {
@@ -28,12 +28,12 @@ class RegionPreparation {
 public:
     explicit RegionPreparation(std::optional<KernelCacheInitial> initial) : initial_(initial) {}
     std::optional<KernelCacheInitial> initial() const { return initial_; }
-    Features enter(std::size_t caller, Phase phase, const FrameInput & input);
+    Features enter(std::size_t caller, Phase phase, const FrameInput & input, std::span<const Work> preparations);
 
 private:
     std::optional<KernelCacheInitial> initial_;
     std::set<std::pair<std::size_t, Phase>> phases_;
-    std::set<std::tuple<std::size_t, Phase, double, double, double>> inputs_;
+    std::set<std::pair<std::size_t, Work>> preparations_;
 };
 
 // A semantic frame has separate caller and stream progress ports. The same
