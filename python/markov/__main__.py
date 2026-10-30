@@ -17,9 +17,25 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     preview = commands.add_parser("plan", help="Preview inputs and preparation without executing them.")
     preview.add_argument("--request", type=Path, required=True)
+    prediction = commands.add_parser(
+        "predict", help="Predict all targets from one base and selected independent models."
+    )
+    prediction.add_argument("--request", type=Path, required=True)
     capture = commands.add_parser("capture", help="Capture the declared base using its runtime and cumulative budget.")
     capture.add_argument("--request", type=Path, required=True)
     capture.add_argument("--recapture", action="store_true", help="Collect again without resetting prior budget use.")
+    measure = commands.add_parser("measure", help="Measure base.configuration without profiling or probes.")
+    measure.add_argument("--request", type=Path, required=True)
+    measure.add_argument(
+        "--recapture", action="store_true", help="Repeat normal measurement without resetting budget use."
+    )
+    calibration = commands.add_parser(
+        "calibrate", help="Measure shared eager compute regions without profiler exports."
+    )
+    calibration.add_argument("--request", type=Path, required=True)
+    calibration.add_argument(
+        "--recapture", action="store_true", help="Repeat without resetting cumulative calibration use."
+    )
     maintenance = commands.add_parser(
         "maintain", help="Import independent performance data and train selected offline responses."
     )
@@ -35,10 +51,16 @@ def main() -> int:
             request = PredictionRequest.load(args.request)
             if args.command == "plan":
                 result = plan_prediction(request)
-            else:
-                from markov.workflow.capture import BaseCapture
+            elif args.command == "predict":
+                from markov.workflow.prediction import predict
 
-                result = BaseCapture(request).run(recapture=args.recapture)
+                result = predict(request)
+            else:
+                from markov.workflow.capture import InferenceCapture
+
+                result = InferenceCapture(
+                    request, profiling=args.command == "capture", calibration=args.command == "calibrate"
+                ).run(recapture=args.recapture)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         print(f"markov: {error}", file=sys.stderr)
         return 2

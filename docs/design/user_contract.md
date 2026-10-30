@@ -1,6 +1,31 @@
 # 用户输入与正式流程
 
-本文定义用户输入、准备行为和结果合同；下方操作说明仅列已实现入口，完整预测合同仍作为后续接入边界。
+本文定义用户输入、准备行为和结果合同。完整预测已接通限定的串行 SGLang/Ascend 路径；自动准备及其他保留能力尚未全部恢复。
+
+## 完整预测
+
+```bash
+scripts/markov.sh predict --request /path/to/request.json
+```
+
+沿用下方共同请求：base.manifest 复用采集，或 base.configuration 加 execution.capture 先采 base；
+performance.models 必须指向适用的离线模型，execution.kernel_cache_initial_state 必须为 empty 或 prepared。
+empty/ prepared 是声明的初始条件，不是自动检测结果；当前区域模型的 first_phase/new_input_size 只是首次使用代理，不能保证还原全部编译状态。
+
+当前要求相同部署、串行 input_ids、ignore_eos=true、与 base 一致的输出数量和 formal_begin_index；
+文本 prompt 可采集但尚不能直接预测。目标配置覆盖 base 对应字段，name 仅用于结果标识。
+支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
+hicache_write_policy、hicache_io_backend、hicache_mem_layout；其余执行设置保持来源条件。
+目前传输组合限 kernel_ascend/page_first_direct，batch=1；新增页几何、回载或其他成本域不满足时明确停止，不从相似目标借值。
+
+结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
+保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
+报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
+
+预测容器无设备、无网络，仅挂载可执行文件、所选 base 采集目录、模型、准备输入与结果目录。
+不挂载项目/data 根目录或 evaluator 的正常测量。输出须与 base/模型输入分离；已有活跃容器时拒绝复用其输出。
+一次进程共享 source 和只读模型，当前 targets 顺序执行，jobs 尚未用于预测并发。
+从 configuration 首次采集后仍需显式改用返回的 manifest，重复 predict 不自动识别先前成功采集；自动复用与准备后续接入。
 
 ## 输入预览和采集检查
 
@@ -59,6 +84,29 @@ profiling_ready 只授予这些声明通道的导出资格，不证明全部语�
 将返回的 manifest 显式填入 base.manifest 可复用，或加 --recapture 重新采集并保留已有额度消耗和文件。
 失败不会把上一份 manifest 当成本次成功返回。进程中断遗留 running 状态时，目前须先核对本任务容器与实际用量，再恢复状态；尚无自动孤儿恢复。
 用户仍需自行提供适用的独立成本；采集入口没有恢复完整 CPU 校正和数据库准备。
+
+### 正常测量与小型区域校准
+
+```bash
+scripts/markov.sh measure --request /path/to/normal_request.json
+scripts/markov.sh calibrate --request /path/to/calibration_request.json
+```
+
+沿用采集请求中的 deployment、base.configuration、workload 及 execution.capture；两者不接受 base.manifest 代替运行配置。
+measure 将 profiler、Markov Python 与原生观察全部关闭，输出 normal/normal_observation.json 及独立 workload_report。
+该时间可以供后续评价读取，预测与训练不读取它。当前入口只运行声明的单个配置，并非已经实现整组 target 的评价编排。
+
+calibrate 运行独立选择的小型 workload，仅安装输入准备、eager batch、结果处理/发送包络和异步 NPU event。
+它不安装底层算子探针、不采 snapshot、不启 profiler，输出 calibration/region_measurements.json 及轻量 JSONL。
+线程 CPU、caller 返回与 current-stream 区间分开记录；查询已完成 event 不新增前向同步。
+结果模型区分 HiRadixCache 与 RadixCache，不能用未启 HiCache 的结果 CPU 响应冒充启用分支。
+结果发送前与发送后的线程时间由同一观察划分，不算两次独立实验。
+warmup 依据 formal_begin_index 排除，请求身份仅用于关联与预热划分，不进入回归特征。
+默认维护入口以 sglang_regions 导入，显式选 training 后导出模型；不会自动训练或根据 target 误差补采。
+
+三种运行分别保留 base、normal、calibration 子目录及累计状态；失败与 recapture 均不重置所属预算。
+校准仍需显式累计运行及存储预算，不能将额外性能采样转记到 base 或评价。
+调用者当前仍须提供独立校准 workload、选择训练与初始状态；整组需求分析和自动准备尚未恢复。
 
 ### SGLang 输入分支观察
 
@@ -230,26 +278,33 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 }
 ```
 
-路径相对维护请求解析。sglang_cache_io 读取真实 cache_io 采样的完成记录及同目录 measurements.jsonl，核对声明案例、重复数、预热和物理校验，导入备份返回、完成观测及主机克隆。ascend_tensor 读取正常一维张量 clone/cat 的相同交接文件，保存整段主机响应、主线程 CPU 时间和完成观测。导入/训练不加载权重、base/target trace 或 SDK；不同操作的协议分别核对，同一响应不能混入不相容条件。
-只填 imports 可以单独入库；已有数据可省略 imports，只用 training 中的原来源路径离线训练，不再打开原始采样文件。training 必须显式选择，不自动扫描整库，也不能重复选择同一采集。预热及未选择的采集不用于训练，独立留出另经成本查询评价。
-可选 models 指向已有选定模型文件；训练结果只替换相同操作/实现/口径的响应，并将完整选定包写到 output。输出必须与数据库、请求及原始采集目录分开，完成后原子发布；失败不把半写模型当作成功。
-报告给出新增/复用记录、有效训练响应数、训练模型数和输出位置。单设备数据不按模型名或 TP 声明重采，但平台、实现条件及实际工作几何必须相容；这一入口不提供任意模型/平台的精度保证，也未接入自动设备补采、一般 runtime trace 导入或 CPU 校正。原生观察开启的张量数据可以导入保存，直接选为正常响应训练数据时会被拒绝。
+路径相对维护请求解析。sglang_cache_io 导入正常备份返回、完成观测及主机克隆；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
+只填 imports 可以单独入库；已有数据可省略 imports，只用 training 的原来源路径离线训练，不再打开原始采样。training 必须显式选择，不扫描整库；预热、未选择的采集及独立留出不参加训练。
+可选 models 指向已有选定模型；训练只替换相同操作/实现/口径，完整结果原子写到 output。输出与数据库、请求及原始采集目录分开。报告区分新增/复用记录与训练响应；单设备数据不绑定模型名或全局 TP，平台、runtime 和实际工作条件仍须相容。
 
-在兼容的 Torch-NPU 推理环境中，张量响应采样入口为：
+当前原生张量校准在兼容 Torch-NPU 推理环境中运行：
 
 ```bash
-python3 -m markov.adapters.ascend.tensor_responses --recipe /path/to/recipe.json --output /path/to/new_capture
+python3 -m markov.adapters.ascend.tensor_responses \
+  --library /path/to/libmarkov_tensor_response_sample.so \
+  --recipe /path/to/recipe.json --output /path/to/new_capture --trace
 ```
 
-配方包含 device、warmup、repeats 和 cases；每个案例给出 operation（clone 或 concatenate）、dtype（int32 或 int64）和正整数 input_sizes，例如 clone 的 [128] 或 concatenate 的 [64, 64]。输出逐次保留预热、调用的 wall/thread CPU 时间、完成观测及数值校验。用于当前离线训练时，clone 需至少两个元素规模；cat 的每个输入段数需有两个规模，并提供至少两种段数，否则明确报告数据不足。启动、构造、同步前准备及数值核对不在主机调用计时内。
-外层仍须负责设备空闲、串行、累计预算及回收。完成观测包含同步 API，整段主线程统计没有拆出队列提交和后台发射；不能把成功采样当作目标队列成本或完整 HTTP 已恢复。
+配方含 device、warmup、repeats 和 cases；案例为 clone/concatenate、int32/int64 及正整数 input_sizes，例如 [128] 或 [64, 64]。库在相应推理镜像通过 src/markov/adapters/ascend/sampling 构建，提供 MARKOV_ASCEND_ROOT 与 MARKOV_TORCH_ROOT；纯 modeling 不加载 Torch 或该库。正常采样先记录 C++ API wall/thread CPU、线程 CPU 增量及空计时/同步对照；随后另行采 profiler，不混入正常计时。输入构造、同步、线程时钟读取及结果数值核对均在 API 计时外，线程观察窗口另行保留。
 
-需要独立设备成本时，给该采样命令加 `--trace`。正常计时结束后，另行采集已初始化的操作 trace；两次运行的计时不混用。
-在 modeling 环境执行 `markov_core tensor-work /path/to/new_capture/capture.json /path/to/tensor_device.json`，
-复用原始 DAG 的 Ascend trace 解释及独占设备服务归属，核对每次调用的实际原生提交与精确 flow 终点。
-维护请求使用 `{"adapter": "ascend_tensor_device", "capture": "/path/to/tensor_device.json"}` 导入和显式训练。
-该响应使用通用的 tensor.clone/tensor.concatenate 操作，不绑定 HiCache、模型或配置身份；当前一维连续张量仍受 dtype、元素数和输入段数约束。
-报告保留主机/后台队列边界供追溯，但不将它们当作正常 CPU 服务训练；无唯一设备归属时停止解释，不按 kernel 顺序或时间接近猜配。
+在 modeling 环境解释独立 trace：
+
+```bash
+build/modeling/Release/markov_core tensor-work \
+  /path/to/new_capture/capture.json /path/to/performance/native_observations.json
+```
+
+报告必须放在原始采集目录之外，保护原始 JSONL、CSV 和 trace。解释复用 base 的同一队列端口与独占设备归属规则；不创建伪造的推理帧，也不按 kernel 顺序或时间接近猜配。
+维护输入使用 `{"adapter": "ascend_tensor_queue", "capture": "/path/to/performance/native_observations.json"}`；只需设备响应时使用 ascend_tensor_device。预测仅读取维护导出的模型，不在查询时训练或打开原始 trace。
+
+正常 CPU 总量和端口位置不是同一种观察：caller 总量来自正常 C++ API，worker 总量是扣除空同步对照后的线程 CPU 用量，可能包含队列管理；提交前后及发射/返回的比例来自另一遍 profiler。caller 的正常 wall 与 CPU 差额另作残余估计，dispatch 和显式 worker residual 仍沿用独立 profiled 观察。它们不是正常端口的直接实测，未观察到的正常线程调度空白仍有不确定性，不能把 ready 或 measured_work_point 当作精度通过。
+
+CPU 在小型已测范围内使用典型响应，cat 按输入段数区分；元素数保留为覆盖范围，不强拟合 CPU 规模系数。设备使用元素规模响应。clone 的 worker 描述沿用固定提交变量，设备覆盖另行判断。外层仍负责设备空闲、严格串行、累计预算及回收；其他平台、内存压力、首次加载、队列拥塞、自动补采及应用准备尚未由此取得资格。
 
 ### 已实现的独立成本查询
 

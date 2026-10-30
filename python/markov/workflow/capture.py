@@ -1,7 +1,8 @@
-"""Own one base-capture task, its device lease, attempts and cumulative budget."""
+"""Own one trace or normal inference task with the same device and budget lifecycle."""
 
 from dataclasses import asdict
 import fcntl
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,29 +14,43 @@ from markov.artifacts.writing import write_json
 from markov.adapters.ascend.capture import AscendDevices
 
 
-class BaseCapture:
-    def __init__(self, request: PredictionRequest):
+class InferenceCapture:
+    def __init__(self, request: PredictionRequest, profiling: bool = True, calibration: bool = False):
         self.request = request
         self.settings = request.execution.capture
-        self.directory = request.execution.output / "base"
+        self.profiling = profiling
+        self.calibration = calibration
+        self.result_key = "manifest" if profiling else "calibration" if calibration else "observation"
+        self.result_file = (
+            "profile_manifest.json"
+            if profiling
+            else "region_measurements.json"
+            if calibration
+            else "normal_observation.json"
+        )
+        self.directory = request.execution.output / (
+            "base" if profiling else "calibration" if calibration else "normal"
+        )
 
-    def run(self, recapture=False) -> dict:
+    def run(self, recapture: bool = False) -> dict:
         if self.request.base.manifest is not None:
+            if not self.profiling:
+                raise ValueError("Normal measurement requires base.configuration; a trace is not a normal observation")
             if recapture:
                 raise ValueError("Recapture needs base.configuration instead of an existing manifest")
             self.request.base.manifest.stat()
             return {"status": "reused", "manifest": str(self.request.base.manifest)}
         if self.settings is None:
-            raise ValueError("Base capture needs execution.capture with a runtime image, devices and budget")
+            raise ValueError("Inference capture needs execution.capture with a runtime image, devices and budget")
         if (self.request.deployment.framework, self.request.deployment.runtime) != ("sglang", "ascend"):
             raise ValueError(
-                "Base capture currently supports SGLang on Ascend; other capture adapters are not restored"
+                "Inference capture currently supports SGLang on Ascend; other capture adapters are not restored"
             )
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
             raise ValueError("Single-host capture needs one declared device per tensor-parallel rank")
         model = Path(self.request.deployment.model)
         if not model.is_absolute() or not model.is_dir():
-            raise ValueError("Base capture needs deployment.model to name an absolute local model directory")
+            raise ValueError("Inference capture needs deployment.model to name an absolute local model directory")
 
         from markov.adapters.sglang import capture as adapter
 
@@ -45,10 +60,8 @@ class BaseCapture:
         self.directory.mkdir(parents=True, exist_ok=True)
         state_path = self.directory / "capture_state.json"
         state = read_json(state_path) if state_path.exists() else {"attempts": []}
-        if state.get("manifest") is not None and not recapture:
-            raise ValueError(
-                f"This task already completed; reuse base.manifest={state['manifest']} or request --recapture"
-            )
+        if state.get(self.result_key) is not None and not recapture:
+            raise ValueError(f"This task already completed at {state[self.result_key]}; request --recapture to repeat")
         if any(attempt["status"] == "running" for attempt in state["attempts"]):
             raise ValueError("An unfinished capture attempt needs process/usage reconciliation before restart")
 
@@ -85,7 +98,9 @@ class BaseCapture:
         plan = {
             "deployment": asdict(self.request.deployment),
             "server": server,
-            "environment": adapter.capture_environment(),
+            "environment": adapter.capture_environment(self.profiling, self.calibration),
+            "profiling": self.profiling,
+            "calibration": self.calibration,
             "workload": asdict(workload),
             "budget": remaining,
         }
@@ -114,10 +129,20 @@ class BaseCapture:
         args += self.runtime.container_arguments()
         for source, target, writable in (
             (model, "/model", False),
+            (Path(__file__).resolve().parents[2], "/opt/markov/python", False),
             (output, "/capture", True),
         ):
             args += ["--mount", f"type=bind,source={source},target={target}" + ("" if writable else ",readonly")]
+        # Preserve the runtime SDK's Python paths while selecting this worktree's adapter.
+        image_environment = json.loads(
+            subprocess.check_output(
+                ["docker", "image", "inspect", self.settings.image, "--format", "{{json .Config.Env}}"], text=True
+            )
+        )
+        image_paths = dict(item.split("=", 1) for item in image_environment).get("PYTHONPATH", "")
         environment = {
+            "PYTHONPATH": "/opt/markov/python" + (":" + image_paths if image_paths else ""),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "OMP_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
@@ -191,13 +216,20 @@ class BaseCapture:
                 attempt["retained_bytes"] = self.retained_bytes()
                 if attempt["retained_bytes"] > remaining["retained_mib"] * 1024**2:
                     attempt["limit_reached"] = "retained_mib"
-                manifest = output / "profile_manifest.json"
-                ready = manifest.exists() and read_json(manifest)["profiling_ready"] is True
+                artifact = output / self.result_file
+                ready = artifact.exists()
+                if ready:
+                    content = read_json(artifact)
+                    ready = (
+                        content["profiling_ready"] is True
+                        if self.profiling
+                        else content["profiling"] is False and content["status"] == "completed"
+                    )
                 attempt["status"] = (
                     "completed" if attempt["exit_code"] == 0 and ready and "limit_reached" not in attempt else "failed"
                 )
                 if attempt["status"] == "completed":
-                    state["manifest"] = str(manifest)
+                    state[self.result_key] = str(artifact)
                 try:
                     after = self.runtime.snapshot()
                     (output / "device_after.txt").write_text(after, encoding="utf-8")
@@ -205,7 +237,7 @@ class BaseCapture:
                     write_json(state_path, state)
         result = {
             "status": attempt["status"],
-            "manifest": str(manifest) if attempt["status"] == "completed" else None,
+            self.result_key: str(artifact) if attempt["status"] == "completed" else None,
             "capture_state": str(state_path),
         }
         if attempt["status"] != "completed":

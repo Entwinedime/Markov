@@ -29,6 +29,8 @@ def metadata(path: Path):
     if captured["status"] != "completed":
         raise ValueError(f"Tensor response capture did not complete: {path}")
     validate_recipe(captured["recipe"])
+    if captured.get("api_boundary") == "aten_cpp":
+        raise ValueError("Native C++ samples use ascend_tensor_queue with the separately interpreted trace report")
     if type(captured["native_observer_requested"]) is not bool:
         raise ValueError("Tensor response capture must declare whether native observation was requested")
     return captured

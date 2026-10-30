@@ -2,6 +2,7 @@
 
 import argparse
 from collections import Counter
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import signal
@@ -39,18 +40,26 @@ def server_arguments(deployment, configuration):
     }
 
 
-def capture_environment():
-    """Select FIA to match the restored attention rules and independent responses."""
-    return {
-        "SGLANG_NPU_PROFILER_SERIAL_EXPORT": "1",
-        "SGLANG_NPU_PROFILER_LEVEL": "2",
+def capture_environment(profiling: bool, calibration: bool = False) -> dict[str, str]:
+    """Keep inference conditions equal while disabling all Markov instruments for normal time."""
+    environment = {
         "TRITON_ENABLE_TASKQUEUE": "true",
         "ASCEND_USE_FIA": "1",
-        "MARKOV_INPUT_FACTS": "/capture/probe",
-        "MARKOV_NATIVE_PROBE": "/capture/native",
-        "LD_PRELOAD": "/opt/markov/lib/libmarkov_runtime_probe.so",
         "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
+        "MARKOV_INPUT_FACTS": "",
+        "MARKOV_NATIVE_PROBE": "",
+        "MARKOV_REGION_MEASUREMENTS": "/capture/regions" if calibration else "",
+        "LD_PRELOAD": "",
     }
+    if profiling:
+        environment.update(
+            SGLANG_NPU_PROFILER_SERIAL_EXPORT="1",
+            SGLANG_NPU_PROFILER_LEVEL="2",
+            MARKOV_INPUT_FACTS="/capture/probe",
+            MARKOV_NATIVE_PROBE="/capture/native",
+            LD_PRELOAD="/opt/markov/lib/libmarkov_runtime_probe.so",
+        )
+    return environment
 
 
 class Capture:
@@ -98,12 +107,16 @@ class Capture:
         return requests
 
     def run(self):
-        (self.directory / "native").mkdir()
+        profiling_requested = self.plan["profiling"]
+        if self.plan["calibration"]:
+            (self.directory / "regions").mkdir()
         control = self.directory / "native" / "enabled"
-        control.write_bytes(b"\0")
+        if profiling_requested:
+            control.parent.mkdir()
+            control.write_bytes(b"\0")
+            (self.directory / "probe").mkdir()
+            (self.directory / "trace").mkdir()
         requests = self.prepare_inputs()
-        (self.directory / "probe").mkdir()
-        (self.directory / "trace").mkdir()
         command = [sys.executable, "-m", "markov.adapters.sglang.capture", "server", "--input", str(self.path)]
         write_json(
             self.directory / "config.json",
@@ -117,7 +130,9 @@ class Capture:
             },
         )
         profiling = False
-        with control.open("r+b", buffering=0) as gate, (self.directory / "server.log").open("w") as log:
+        with ExitStack() as stack:
+            gate = stack.enter_context(control.open("r+b", buffering=0)) if profiling_requested else None
+            log = stack.enter_context((self.directory / "server.log").open("w"))
             server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 while True:
@@ -129,24 +144,27 @@ class Capture:
                     except (urllib.error.URLError, TimeoutError):
                         self.remaining()
                         time.sleep(min(0.5, self.remaining()))
-                self.http(
-                    "/start_profile",
-                    {
-                        "output_dir": str(self.directory / "trace"),
-                        "activities": ["CPU", "GPU"],
-                        "with_stack": False,
-                        "record_shapes": False,
-                    },
-                )
-                profiling = True
-                gate.write(b"\1")
+                if profiling_requested:
+                    self.http(
+                        "/start_profile",
+                        {
+                            "output_dir": str(self.directory / "trace"),
+                            "activities": ["CPU", "GPU"],
+                            "with_stack": False,
+                            "record_shapes": False,
+                        },
+                    )
+                    profiling = True
+                    gate.write(b"\1")
                 for ordinal, row in enumerate(requests):
                     self.request(ordinal, row)
-                self.http("/stop_profile", {})
-                profiling = False
+                if profiling_requested:
+                    self.http("/stop_profile", {})
+                    profiling = False
             finally:
-                gate.seek(0)
-                gate.write(b"\0")
+                if gate is not None:
+                    gate.seek(0)
+                    gate.write(b"\0")
                 # Export finishes before shutdown on success; failed captures
                 # retain their partial files without publishing a ready manifest.
                 if server.poll() is None:
@@ -158,7 +176,50 @@ class Capture:
                         server.wait(timeout=15)
         if profiling:
             raise RuntimeError("Profiler did not finish exporting")
-        self.publish_manifest()
+        if profiling_requested:
+            self.publish_manifest()
+        elif self.plan["calibration"]:
+            files = sorted((self.directory / "regions").glob("*.jsonl"))
+            if len(files) != self.plan["deployment"]["tensor_parallel"]:
+                raise RuntimeError("Independent region measurement did not report every TP worker")
+            for path in files:
+                with path.open(encoding="utf-8") as stream:
+                    roles = {json.loads(line)["name"] for line in stream}
+                if (
+                    not {"region.prepare", "region.prepare_stream", "region.batch", "region.stream", "region.result"}
+                    <= roles
+                ):
+                    raise RuntimeError(f"Independent region ports are incomplete: {path}")
+            write_json(
+                self.directory / "region_measurements.json",
+                {
+                    "kind": "independent_region_measurements",
+                    "status": "completed",
+                    "profiling": False,
+                    "deployment": self.plan["deployment"],
+                    "configuration": self.plan["server"],
+                    "formal_begin_index": self.plan["workload"]["formal_begin_index"],
+                    "files": [str(path.relative_to(self.directory)) for path in files],
+                    "limitations": [
+                        "Eager serial batch execution with the declared deployment and initialization; not a contention model.",
+                        "Stream intervals include host submission starvation and internal communication; they are not exclusive GPU service.",
+                        "CPU thread time excludes blocking waits; complete HTTP and frontend residuals are not fitted here.",
+                        "Device events and lightweight wrappers have overhead; caller return and stream progress are overlapping responses.",
+                    ],
+                },
+            )
+        else:
+            write_json(
+                self.directory / "normal_observation.json",
+                {
+                    "kind": "normal_http_observation",
+                    "status": "completed",
+                    "profiling": False,
+                    "framework": "sglang",
+                    "config_path": "config.json",
+                    "workload_report": "workload_report.json",
+                },
+            )
 
     def request(self, ordinal, item):
         identity = f"request_{ordinal}"

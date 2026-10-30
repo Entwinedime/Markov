@@ -111,21 +111,28 @@ class Execution:
     jobs: int
     memory_limit_gib: int | None
     capture: CaptureSettings | None = None
+    kernel_cache_initial_state: str | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any], directory: Path) -> Execution:
         from markov.artifacts.capture import CaptureSettings
 
-        reject_unknown(raw, {"output", "jobs", "memory_limit_gib", "capture"}, "execution")
+        reject_unknown(
+            raw, {"output", "jobs", "memory_limit_gib", "capture", "kernel_cache_initial_state"}, "execution"
+        )
         memory_limit = raw.get("memory_limit_gib")
         if memory_limit is not None:
             memory_limit = positive_integer(memory_limit, "memory_limit_gib")
+        initial = raw.get("kernel_cache_initial_state")
+        if initial is not None and initial not in ("empty", "prepared"):
+            raise ValueError("execution.kernel_cache_initial_state must be empty or prepared")
 
         return cls(
             resolve_path(directory, raw["output"]),
             positive_integer(raw.get("jobs", 1), "jobs"),
             memory_limit,
             CaptureSettings.parse(raw["capture"]) if "capture" in raw else None,
+            initial,
         )
 
 

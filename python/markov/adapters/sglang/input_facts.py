@@ -92,6 +92,13 @@ class InputFactsProbe:
 
 def install() -> None:
     """The framework loads this plugin in each worker; ordinary inference is unchanged."""
+    measurements = os.environ.get("MARKOV_REGION_MEASUREMENTS")
+    if measurements:
+        from markov.adapters.sglang.region_probe import RegionProbe
+
+        RegionProbe(EventWriter(Path(measurements))).install()
+        return
+
     output = os.environ.get("MARKOV_INPUT_FACTS")
     if not output:
         return

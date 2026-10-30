@@ -1,7 +1,9 @@
 """Import independent facts and export selected offline responses; never collect or predict."""
 
+from __future__ import annotations
+
 from dataclasses import asdict
-from itertools import groupby
+from itertools import combinations, groupby
 import json
 import math
 from pathlib import Path
@@ -10,34 +12,100 @@ from statistics import median
 from markov.artifacts.performance import PerformanceData, encoded
 from markov.artifacts.request import Deployment, read_json, reject_unknown, resolve_path
 from markov.artifacts.writing import write_json
-from markov.adapters.sglang import cache_measurements
-from markov.adapters.ascend import tensor_device_measurements, tensor_measurements
+from markov.adapters.sglang import cache_measurements, region_measurements
+from markov.adapters.ascend import tensor_device_measurements, tensor_measurements, tensor_queue_measurements
 
 
 ADAPTERS = {
     "sglang_cache_io": cache_measurements,
+    "sglang_regions": region_measurements,
     "ascend_tensor": tensor_measurements,
     "ascend_tensor_device": tensor_device_measurements,
+    "ascend_tensor_queue": tensor_queue_measurements,
 }
 
 
-def affine(points, feature):
-    x = [features[feature] for features, _ in points]
-    y = [duration for _, duration in points]
-    center_x, center_y = sum(x) / len(x), sum(y) / len(y)
-    spread = sum((value - center_x) ** 2 for value in x)
-    if spread == 0:
-        raise ValueError(f"Linear response needs at least two distinct measured {feature} values")
-    coefficient = sum((a - center_x) * (b - center_y) for a, b in zip(x, y)) / spread
-    intercept = center_y - coefficient * center_x
-    if not all(math.isfinite(value) for value in (intercept, coefficient)):
+Points = list[tuple[dict[str, float], float]]
+
+
+def least_squares(columns: list[list[float]], target: list[float]) -> list[float] | None:
+    """Scaled QR; a dependent feature set has no unique least-squares response."""
+    count = len(columns)
+    q, scales = [], []
+    upper = [[0.0] * count for _ in columns]
+    for index, column in enumerate(columns):
+        scale = math.sqrt(sum(value * value for value in column))
+        if scale == 0:
+            return None
+        scales.append(scale)
+        values = [value / scale for value in column]
+        for before, basis in enumerate(q):
+            upper[before][index] = sum(a * b for a, b in zip(basis, values))
+            values = [value - upper[before][index] * axis for value, axis in zip(values, basis)]
+        upper[index][index] = math.sqrt(sum(value * value for value in values))
+        if upper[index][index] <= math.ulp(1.0) * len(target):
+            return None
+        q.append([value / upper[index][index] for value in values])
+
+    projected = [sum(axis * value for axis, value in zip(basis, target)) for basis in q]
+    fitted = [0.0] * count
+    for index in reversed(range(count)):
+        fitted[index] = (
+            projected[index] - sum(upper[index][after] * fitted[after] for after in range(index + 1, count))
+        ) / upper[index][index]
+    return [value / scale for value, scale in zip(fitted, scales)]
+
+
+def affine(points: Points, feature: str | list[str] | None) -> dict:
+    if feature is None:
+        return {"intercept_ns": median(duration for _, duration in points), "coefficients_ns": {}}
+
+    names = feature if isinstance(feature, list) else [feature]
+    columns = [[work[name] for work, _ in points] for name in names]
+    target = [duration for _, duration in points]
+    centers = [sum(column) / len(column) for column in columns]
+    center_y = sum(target) / len(target)
+    centered = [[value - center for value in column] for column, center in zip(columns, centers)]
+    coefficients = least_squares(centered, [value - center_y for value in target])
+    if coefficients is None:
+        raise ValueError(f"Measured feature columns are constant or linearly dependent: {names}")
+    intercept = center_y - sum(value * center for value, center in zip(coefficients, centers))
+    if not all(math.isfinite(value) for value in (intercept, *coefficients)):
         raise ValueError("Training produced a nonfinite response")
-    if min(intercept + coefficient * value for value in (min(x), max(x))) < 0:
-        raise ValueError("Training produced a negative duration inside its measured domain")
-    return {"intercept_ns": intercept, "coefficients_ns": {feature: coefficient}}
+    if any(
+        intercept + sum(value * features[name] for name, value in zip(names, coefficients)) < 0
+        for features, _ in points
+    ):
+        raise ValueError("Training produced a negative duration at a measured work point")
+    return {"intercept_ns": intercept, "coefficients_ns": dict(zip(names, coefficients))}
 
 
-def train_response(kind, recipe, samples, sources):
+def nonnegative_affine(points: Points, features: str | list[str]) -> dict:
+    """Enumerate active sets for the few nonnegative additive service terms."""
+    names = features if isinstance(features, list) else [features]
+    columns = [[1.0] * len(points)] + [[work[name] for work, _ in points] for name in names]
+    target = [duration for _, duration in points]
+    mean = sum(target) / len(target)
+    best_error, best = sum((value - mean) ** 2 for value in target), {0: mean}
+    for count in range(1, len(columns) + 1):
+        for active in combinations(range(len(columns)), count):
+            fitted = least_squares([columns[index] for index in active], target)
+            if fitted is None or any(value < 0 for value in fitted):
+                continue
+            error = sum(
+                (duration - sum(value * columns[column][row] for value, column in zip(fitted, active))) ** 2
+                for row, duration in enumerate(target)
+            )
+            if error < best_error:
+                best_error = error
+                best = dict(zip(active, fitted))
+    return {
+        "intercept_ns": best.get(0, 0.0),
+        "coefficients_ns": {name: best.get(index + 1, 0.0) for index, name in enumerate(names)},
+    }
+
+
+def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, sources: list[str]) -> dict:
     points = []
     for features, rows in groupby(sorted(samples, key=lambda row: encoded(row[0])), key=lambda row: encoded(row[0])):
         points.append((json.loads(features), median(duration for _, duration in rows)))
@@ -47,12 +115,17 @@ def train_response(kind, recipe, samples, sources):
     if any(set(features) != names for features, _ in points):
         raise ValueError(f"Inconsistent work variables for {kind[0]}")
     feature, curve = recipe["feature"], recipe.get("curve")
-    for name in names - {feature, curve}:
+    predictors = set(feature if isinstance(feature, list) else [feature]) - {None}
+    coverage = set(recipe.get("coverage_features", []))
+    if not coverage <= names:
+        raise ValueError(f"Unknown coverage coordinates for {kind[0]}")
+    for name in names - predictors - {curve} - coverage:
         if len({features[name] for features, _ in points}) != 1:
             raise ValueError(f"Response needs a different model form for varying {name}: {kind[0]}")
 
     if curve is None:
-        response = {"form": "affine", **affine(points, feature)}
+        fit = nonnegative_affine if recipe.get("nonnegative", False) else affine
+        response = {"form": "affine", **fit(points, feature)}
     else:
         response = {"form": "coefficient_curve", "feature": curve, "points": []}
         for coordinate in sorted({features[curve] for features, _ in points}):
