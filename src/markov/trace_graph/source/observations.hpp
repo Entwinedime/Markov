@@ -115,6 +115,11 @@ struct ObservedRegion {
     RecordRef record;
 };
 
+struct RequestExecutionRegion {
+    Index request;
+    ObservedRegion region;
+};
+
 struct NativeQueueCall {
     Index name;
     ObservedRegion submission, execution;
@@ -245,6 +250,7 @@ public:
     std::map<std::string, std::size_t> flow_audit;
     std::vector<FlowDiagnostic> unresolved_flows;
     std::vector<RequestWindow> requests;
+    std::vector<RequestExecutionRegion> request_executions;
     std::vector<WorkloadBarrier> workload_barriers;
     std::vector<WorkDescription> work_descriptions;
     std::vector<ObservedWork> work_observations;

@@ -1,5 +1,6 @@
 #include "markov/commands/prediction.hpp"
 #include "markov/commands/costs.hpp"
+#include "markov/commands/serial_prediction.hpp"
 #include "markov/commands/trajectory.hpp"
 #include "markov/trace_graph/planning/cache_program.hpp"
 #include "markov/trace_graph/simulation/program_execution.hpp"
@@ -14,6 +15,7 @@
 namespace markov::commands {
 
 nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
+    if (std::holds_alternative<std::vector<adapters::SerialPredictionTarget>>(input.targets)) return serial_prediction_report(input);
     using namespace trace_graph;
     using Json = nlohmann::json;
     using Clock = std::chrono::steady_clock;
@@ -46,7 +48,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     };
     cost::Queries costs(input.costs.models, &source);
     auto cells = Json::array();
-    for (const auto & target : input.targets) {
+    for (const auto & target : std::get<std::vector<adapters::PredictionTarget>>(input.targets)) {
         const Json capacity{
             { "device", target.cache.device_pages },
             {   "host",   target.cache.host_pages }

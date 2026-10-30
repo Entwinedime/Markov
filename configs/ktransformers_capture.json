@@ -15,7 +15,10 @@
     }
   },
   "workload": "workload.json",
-  "targets": [{"name": "self", "configuration": {}}],
+  "targets": [
+    {"name": "self", "configuration": {}},
+    {"name": "chunked", "configuration": {"prefill_chunk_tokens": 32}}
+  ],
   "execution": {
     "output": "../data/ktransformers",
     "kernel_cache_initial_state": "empty",
@@ -32,6 +35,17 @@
         "output_tokens": 64,
         "retained_mib": 1024
       }
+    }
+  },
+  "performance": {
+    "database": "../data/performance.sqlite",
+    "sampling_budget": {
+      "starts": 4,
+      "wall_sec": 600,
+      "requests": 24,
+      "input_tokens": 6000,
+      "output_tokens": 192,
+      "retained_mib": 64
     }
   }
 }

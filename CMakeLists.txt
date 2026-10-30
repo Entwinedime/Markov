@@ -48,6 +48,7 @@ target_link_libraries(markov_cost PUBLIC markov_source)
 target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_prediction
+    src/markov/trace_graph/planning/serial_program.cpp
     src/markov/trace_graph/planning/cache_program.cpp
     src/markov/trace_graph/planning/cache_controls.cpp
     src/markov/trace_graph/planning/storage.cpp
@@ -60,6 +61,8 @@ target_link_libraries(markov_prediction PUBLIC markov_source markov_cost)
 target_compile_options(markov_prediction PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
+    src/markov/adapters/ktransformers/observations.cpp
+    src/markov/adapters/ktransformers/prediction.cpp
     src/markov/adapters/probes.cpp
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp
@@ -86,6 +89,7 @@ if(TRACE_GRAPH_DEBUG)
 endif()
 
 add_executable(markov_core
+    src/markov/commands/serial_prediction.cpp
     src/markov/main.cpp
     src/markov/commands/source.cpp
     src/markov/commands/page_work.cpp

@@ -1,4 +1,5 @@
 #include "markov/adapters/prediction.hpp"
+#include "markov/adapters/ktransformers/prediction.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -25,8 +26,9 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     const auto manifest = trace_graph::source::inspect_manifest(raw.at("manifest").get<std::string>());
     const std::filesystem::path models_path(raw.at("models").get<std::string>());
     auto selected = read_cost_models(models_path);
-    if (selected.deployment != raw.at("deployment") || manifest.framework != "sglang" || selected.deployment.at("runtime") != "ascend")
-        throw std::runtime_error("Prepared regional prediction needs matching SGLang/Ascend deployment and independent models");
+    if (selected.deployment != raw.at("deployment") || manifest.framework != selected.deployment.at("framework").get<std::string>()
+        || selected.deployment.at("runtime") != "ascend")
+        throw std::runtime_error("Prediction needs matching base, deployment and independent models");
     const auto initial = raw.at("kernel_cache_initial_state").get<std::string>();
     if (initial != "empty" && initial != "prepared") throw std::runtime_error("Kernel initial state must be empty or prepared");
 
@@ -34,6 +36,18 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     const auto captured = Json::parse(config);
     if (captured.at("deployment") != raw.at("deployment")) throw std::runtime_error("Base capture belongs to a different deployment");
     const auto & base = captured.at("server").at("arguments");
+    if (manifest.framework == "ktransformers") {
+        auto source = prepare_source(manifest, std::nullopt, SourceDetail::Regions);
+        auto targets = ktransformers::prepare_targets(raw, captured, source.context);
+        return { std::move(source),
+                 std::move(selected),
+                 models_path,
+                 initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
+                 std::move(targets),
+                 std::move(scaling),
+                 raw.value("record_graph", false) };
+    }
+    if (manifest.framework != "sglang") throw std::runtime_error("No prediction adapter for " + manifest.framework);
     if (base.value("disable_radix_cache", false))
         throw std::runtime_error("Regional prediction requires an active radix cache; cache-disabled scheduling is not restored");
     const std::set<std::string> variable{ "page_size",

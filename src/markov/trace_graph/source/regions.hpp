@@ -18,6 +18,10 @@ struct ResidualRegion {
     std::vector<ObservedRegion> excluded;
 };
 
+struct RequestRegions {
+    std::optional<Index> before_execution, after_execution;
+};
+
 // Source semantic boundaries and residual references. This does not construct
 // native event nodes or estimate the cost of changed target work.
 class Regions {
@@ -25,10 +29,12 @@ public:
     explicit Regions(const SourceContext & source);
     const FrameRegions & frame(Index id) const { return frames_[id]; }
     const ResidualRegion & residual(Index id) const { return residuals_[id]; }
+    const RequestRegions & request(Index id) const { return requests_[id]; }
     std::size_t residual_count() const { return residuals_.size(); }
 
 private:
     std::vector<FrameRegions> frames_;
+    std::vector<RequestRegions> requests_;
     std::vector<ResidualRegion> residuals_;
 };
 

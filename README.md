@@ -8,8 +8,8 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前可通过正式入口完成限定范围的 SGLang/Ascend 预测，已运行 self、受压主机回载和文件存储回访。
-这证明调用链已接通，精度仍未达标；其他框架、矩阵实验和搜索尚在恢复。
+当前正式入口已运行限定范围的 SGLang 主机/文件回访，以及 KTransformers dense 的 self、分块 Prefill 和 SDPA。
+这证明两框架的完整请求预测已接通，整体精度与泛化尚未验收；矩阵实验和搜索仍在恢复。
 
 ## 怎样运行
 
@@ -76,8 +76,9 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 显式诊断运行 `scripts/markov.sh replay --request /path/to/replay.json`，可选源图，或打开 execution.record_graph 后保存的目标执行图。
 回放可替换明确节点成本、缩放已有工作；它固定已有路径，不重新选择时间分支，也不自动匹配 target 真实成本。
 SGLang 与 KTransformers 共用采集任务、预算、manifest、源图回放与性能库，HiCache 只属于 SGLang。
-KTransformers 已接通单 NPU dense/Torch 后端的真实采集、正常对照及独立阶段成本；正式目标预测尚待接入。
-采集示例为 [ktransformers_capture.json](configs/ktransformers_capture.json)，修改模型、设备和预算后用 capture、measure 或 calibrate 执行。
+KTransformers 单 NPU dense/Torch 入口已接通真实来源、独立阶段/控制成本、共享准备及完整 HTTP 预测。
+分块规则生成额外阶段，沿用共同执行器；仅支持 empty 初始化，HTTP 外层残余及首次使用仍有近似。
+采集示例为 [ktransformers_capture.json](configs/ktransformers_capture.json)，修改模型、设备和预算后可直接 predict，或单独执行 capture、measure、calibrate。
 
 ## 文档与目录
 

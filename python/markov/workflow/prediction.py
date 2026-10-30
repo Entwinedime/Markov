@@ -16,13 +16,6 @@ from markov.workflow.preparation import PerformancePreparation
 
 
 def predict(request: PredictionRequest) -> dict:
-    if request.deployment.framework == "ktransformers":
-        return {
-            "status": "unsupported_framework",
-            "e2e_predicted": False,
-            "issue": "KTransformers 已支持采集、成本维护和源图回放，目标预测尚未接通；本次不启动设备。",
-        }
-
     output = request.execution.output
     if request.base.manifest is not None and output.is_relative_to(request.base.manifest.parent):
         raise ValueError("Prediction output must be separate from the base capture")

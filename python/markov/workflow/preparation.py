@@ -26,7 +26,12 @@ class PerformancePreparation:
         self.rounds = []
 
     def prepare(self, report: dict, models: Path) -> Path | None:
-        from markov.adapters.sglang.sampling import sampling_commands
+        if self.request.deployment.framework == "sglang":
+            from markov.adapters.sglang.sampling import sampling_commands
+        elif self.request.deployment.framework == "ktransformers":
+            from markov.adapters.ktransformers.sampling import sampling_commands
+        else:
+            return None
 
         commands = sampling_commands(self.request.deployment, report, report["cost_requirements"])
         if not commands:

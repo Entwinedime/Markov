@@ -7,13 +7,34 @@
 
 namespace markov::trace_graph::source {
 
-Regions::Regions(const SourceContext & source) : frames_(source.observations().compute_frames.size()) {
+Regions::Regions(const SourceContext & source) : frames_(source.observations().compute_frames.size()), requests_(source.observations().requests.size()) {
     struct Segment {
         Index frame, step;
         ObservedRegion interval;
         Time received_ns;
     };
     const auto & observed = source.observations();
+    for (const auto & execution : observed.request_executions) {
+        const auto request = std::ranges::find(observed.requests, observed.names[execution.request], &RequestWindow::identity);
+        if (request == observed.requests.end() || !request->received || !request->sent) continue;
+
+        auto & ports = requests_[request - observed.requests.begin()];
+        const auto & region = execution.region;
+        const auto received_ns = observed.points[*request->received].time_ns;
+        const auto sent_ns = observed.points[*request->sent].time_ns;
+        if (received_ns <= region.begin_ns && region.end_ns <= sent_ns) {
+            ports.before_execution = residuals_.size();
+            residuals_.push_back({
+                { region.resource, received_ns, region.begin_ns, region.record },
+                {}
+            });
+            ports.after_execution = residuals_.size();
+            residuals_.push_back({
+                { region.resource, region.end_ns, sent_ns, region.record },
+                {}
+            });
+        }
+    }
     std::map<Index, std::vector<Segment>> lanes;
     std::map<Index, std::vector<ObservedRegion>> exclusions;
     for (const auto & span : observed.spans) {
