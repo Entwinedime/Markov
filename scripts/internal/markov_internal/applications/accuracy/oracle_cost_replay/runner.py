@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from markov_internal.common.io import load_json, write_json
-from markov_internal.common.paths import ROOT_DIR
+from markov_internal.common.paths import ROOT_DIR, require_repo_path
 from markov_internal.modeling.backend import build_trace_graph_command
 from markov_internal.modeling.run_config import ModelingOutputs, ModelingRunConfig
 from markov_internal.applications.accuracy.oracle_cost_replay.matching import (
@@ -39,13 +39,20 @@ def run_suite(
     selected, eligible_count = _select_replay_scores(candidates, max_runs)
     ledgers = _ready_ledgers(prediction_roots, selected)
     work = []
+    token_bytes_by_package: dict[Path, int] = {}
     for ledger in sorted(ledgers, key=lambda row: str(row["model_run_id"])):
         model_id = ledger["model_run_id"]
         config = load_json(prediction_roots[model_id] / "model_runs" / model_id / "cpp_model_config.json")["hicache"]
         # KV geometry is declared metadata, not a fitted cost or predicted payload.
-        token_bytes, remainder = divmod(config["kv_bytes_per_page"], config["page_size"])
-        if remainder or token_bytes <= 0:
-            raise ValueError("oracle projection requires integral positive KV bytes per token")
+        if "cost_package" in config:
+            package_path = require_repo_path(config["cost_package"]).resolve()
+            if package_path not in token_bytes_by_package:
+                token_bytes_by_package[package_path] = load_json(package_path)["hicache"]["kv_bytes_per_token_per_rank"]
+            token_bytes = token_bytes_by_package[package_path]
+        else:
+            token_bytes, remainder = divmod(config["kv_bytes_per_page"], config["page_size"])
+            if remainder or token_bytes <= 0:
+                raise ValueError("oracle projection requires integral positive KV bytes per token")
         target = target_operation_cell(ledger, target_runs[ledger["target_run_id"]], token_bytes)
         override = build_pair_oracle_override(ledger, target, source_runs[model_id])
         oracle_total = sum(row["service_us"] + row["control_us"] for row in override["costs"])

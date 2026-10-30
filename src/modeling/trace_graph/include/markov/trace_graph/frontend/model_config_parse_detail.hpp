@@ -20,6 +20,8 @@ namespace markov::trace_graph::frontend::model_config_detail {
 
 using Json = nlohmann::json;
 
+Json read_json_file(const std::string & filename);
+
 inline constexpr std::array<std::pair<std::string_view, std::string_view>, 4> kIoKinds{
     std::pair{              "prefetch", "storage_to_host" },
     std::pair{                  "load",  "host_to_device" },

@@ -12,12 +12,11 @@ def cost_query_domain(prediction: dict[str, Any]) -> str:
     if report is None:
         return "not_recorded"
 
-    queries = report["rows"]
-    if not queries:
+    if not report["query_count"]:
         return "no_independent_operator_queries"
-    if any(row["outside_range_queries"] for row in queries):
+    if report["outside_range_queries"]:
         return "outside_measured_ranges"
-    if any(row["unseen_combination_queries"] for row in queries):
+    if report["unseen_combination_queries"]:
         return "within_ranges_unseen_combination"
 
     return "measured_operator_query_points"

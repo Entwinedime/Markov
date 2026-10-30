@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from markov_internal.modeling.run_config import ModelingOutputs, ModelingRunConfig
-from markov_internal.modeling.cost.hicache import HiCacheCostModels
+from markov_internal.common.paths import repo_relative_path
 from markov_internal.modeling.types import ModelRunSpec, TargetHiCacheConfig
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ def hicache_model_config(
     *,
     source_prefetch_policy: str,
     source_target_same_config: bool,
-    cost_models: HiCacheCostModels,
+    cost_model_path: Path,
 ) -> dict[str, Any]:
     """Build the narrow C++ HiCache config."""
 
@@ -52,7 +53,7 @@ def hicache_model_config(
     hicache_config = {
         "enabled": True,
         **target.fields,
-        **cost_models.execution_costs(target.fields["page_size"]),
+        "cost_package": str(repo_relative_path(cost_model_path)),
     }
     hicache_config["dag_patch"] = {
         "enabled": True,

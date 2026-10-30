@@ -22,8 +22,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <ranges>
+#include <string_view>
 
 namespace markov::trace_graph::cli {
 
@@ -32,8 +34,21 @@ namespace {
 using Json = nlohmann::json;
 
 Json operator_query_result(const std::map<cost::OperatorCostProvider::QueryKey, cost::OperatorQuerySummary> & queries) {
+    bool details = false;
+#ifdef DEBUG
+    details = true;
+#endif
+    if (const auto flag = std::getenv("TRACE_GRAPH_QUERY_METRICS")) details |= std::string_view(flag) == "1";
+
+    size_t query_count = 0, outside = 0, unseen = 0, cache_hits = 0;
     Json rows = Json::array();
     for (const auto & [key, summary] : queries) {
+        query_count += summary.queries;
+        outside += summary.outside_range_queries;
+        unseen += summary.unseen_combination_queries;
+        cache_hits += summary.cache_hits;
+        if (!details) continue;
+
         const auto & [component, operation, implementation, scope] = key;
         rows.push_back({
             {                  "component",                          component },
@@ -43,6 +58,7 @@ Json operator_query_result(const std::map<cost::OperatorCostProvider::QueryKey, 
             {                    "queries",                    summary.queries },
             {      "outside_range_queries",      summary.outside_range_queries },
             { "unseen_combination_queries", summary.unseen_combination_queries },
+            {                 "cache_hits",                 summary.cache_hits },
             {    "queried_duration_sum_us",    summary.queried_duration_sum_us },
         });
         if (scope == "idle_stream_sync_interval")
@@ -50,14 +66,21 @@ Json operator_query_result(const std::map<cost::OperatorCostProvider::QueryKey, 
                 "Idle previously used stream; ordinary/infinite-timeout runtime APIs share one constant. Device waits are dependencies. "
                 "Blocking wake-up latency and inference contention are unmeasured, not proven zero.";
     }
-    return {
-        {              "scope","independent HiCache control, phase and allocator operator model queries"                               },
-        {               "rows",                                                           std::move(rows) },
-        { "full_cost_coverage",                                                                     false },
-        {        "limitations",
+    Json result{
+        {                         "scope","independent HiCache control, phase and allocator operator model queries"                                          },
+        {                   "query_count",                                                               query_count },
+        {         "outside_range_queries",                                                                   outside },
+        {    "unseen_combination_queries",                                                                    unseen },
+        {                    "cache_hits",                                                                cache_hits },
+        { "queried_model_component_count",                                                            queries.size() },
+        {               "details_enabled",                                                                   details },
+        {            "full_cost_coverage",                                                                     false },
+        {                   "limitations",
          "Query counts are not emitted operation counts; one queried primitive may be reused. Duration sums are not executed service totals or E2E. Source "
-         "migration, I/O payload models and retained gaps are outside this query report."                },
+         "migration, I/O payload models and retained gaps are outside this query report."                           },
     };
+    if (details) result["rows"] = std::move(rows);
+    return result;
 }
 
 Json effect_decision_result(const modules::hicache::model::HiCacheEffectDecisionLedger & ledger) {

@@ -141,7 +141,7 @@ def _run_source(
                 spec.target,
                 source_prefetch_policy=spec.source.hicache_config["prefetch_policy"],
                 source_target_same_config=spec.target.matches_source(spec.source),
-                cost_models=options.cost_models,
+                cost_model_path=options.cost_model_path,
             )
             write_json(spec.output_dir / "cpp_model_config.json", model)
             write_json(spec.output_dir / "runner_config.json", config.to_raw())

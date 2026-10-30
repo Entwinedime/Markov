@@ -66,12 +66,13 @@ target_link_libraries(trace_graph_io PUBLIC trace_graph_core trace_graph_trace_a
 add_library(trace_graph_frontend STATIC)
 target_sources(trace_graph_frontend
     PRIVATE
+        src/frontend/cost_package.cpp
         src/frontend/hicache_io_config.cpp
         src/frontend/hicache_service_config.cpp
         src/frontend/model_config.cpp
         src/frontend/trace_normalizer.cpp
 )
-target_link_libraries(trace_graph_frontend PUBLIC trace_graph_core trace_graph_trace_adapters)
+target_link_libraries(trace_graph_frontend PUBLIC trace_graph_core trace_graph_trace_adapters trace_graph_cost)
 
 add_library(trace_graph_simulation STATIC)
 target_sources(trace_graph_simulation

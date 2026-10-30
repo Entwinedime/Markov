@@ -8,6 +8,7 @@
  */
 #include "markov/trace_graph/cli/workflow.hpp"
 #include "core/execution_metrics.hpp"
+#include "frontend/cost_package.hpp"
 
 #include "markov/trace_graph/cli/cpu_service_preparation.hpp"
 #include "markov/trace_graph/cli/file_output.hpp"
@@ -300,14 +301,17 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
 int run_workflow(const CliOptions & options, core::Logger & logger) {
     if (!options.target_plan.empty()) return run_prediction_batch(options, logger);
 
+    frontend::CostPackages packages;
+
 #ifdef DEBUG
     auto modules = ModulePipeline::from_config(options.model_config,
+                                               packages,
                                                options.hicache_oracle_cost_replay,
                                                options.hicache_phase_oracle_cost_replay,
                                                options.hicache_canonical_observed_phase_scope,
                                                options.hicache_static_replay);
 #else
-    auto modules = ModulePipeline::from_config(options.model_config);
+    auto modules = ModulePipeline::from_config(options.model_config, packages);
 #endif
     const bool include_preparation = modules.uses_hicache_execution() || (options.source_observations_only && !options.outputs.structure_report.empty());
     auto source = prepare_source(options, include_preparation);

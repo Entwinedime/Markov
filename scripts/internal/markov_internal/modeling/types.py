@@ -44,6 +44,7 @@ class TargetHiCacheConfig:
                 "io_cost",
                 "phase_cost",
                 "operator_models",
+                "cost_package",
                 "kv_bytes_per_page",
                 "dag_patch",
                 *CALIBRATION_FIELDS,

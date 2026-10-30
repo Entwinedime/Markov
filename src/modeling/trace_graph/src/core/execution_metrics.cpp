@@ -1,6 +1,7 @@
 #include "core/execution_metrics.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <sys/resource.h>
@@ -27,15 +28,20 @@ nlohmann::json ExecutionMetrics::report() const {
         {                  "scope", "one process; current PSS/private bytes are snapshots, not peaks; do not sum process RSS" }
     };
 
-    // Linux rollup distinguishes shared mappings from target-private pages.
-    std::ifstream input("/proc/self/smaps_rollup");
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        const auto name = line.substr(0, colon);
-        if (name == "Rss" || name == "Pss" || name == "Private_Clean" || name == "Private_Dirty")
-            memory[name + "_bytes"] = std::stoull(line.substr(colon + 1)) * 1'024;
+    const auto flag = std::getenv("TRACE_GRAPH_MEMORY_METRICS");
+    const bool details = flag && std::string_view(flag) == "1";
+    memory["detailed_snapshot_enabled"] = details;
+    if (details) {
+        // Linux rollup walks page tables; reserve that work for explicit diagnostics.
+        std::ifstream input("/proc/self/smaps_rollup");
+        std::string line;
+        while (std::getline(input, line)) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const auto name = line.substr(0, colon);
+            if (name == "Rss" || name == "Pss" || name == "Private_Clean" || name == "Private_Dirty")
+                memory[name + "_bytes"] = std::stoull(line.substr(colon + 1)) * 1'024;
+        }
     }
 
     return {

@@ -18,11 +18,11 @@
 namespace markov::trace_graph::cli {
 
 #ifdef DEBUG
-ModulePipeline ModulePipeline::from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay,
+ModulePipeline ModulePipeline::from_config(const std::string & filename, frontend::CostPackages & packages, const std::string & hicache_oracle_cost_replay,
                                            const std::string & hicache_phase_oracle_cost_replay, bool hicache_canonical_observed_phase_scope,
                                            bool hicache_static_replay) {
 #else
-ModulePipeline ModulePipeline::from_config(const std::string & filename) {
+ModulePipeline ModulePipeline::from_config(const std::string & filename, frontend::CostPackages & packages) {
 #endif
     ModulePipeline pipeline;
 #ifdef DEBUG
@@ -34,7 +34,7 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
 #endif
     if (filename.empty()) return pipeline;
 
-    const auto config = frontend::ModelConfig::from_file(filename);
+    const auto config = frontend::ModelConfig::from_file(filename, packages);
     pipeline.modules_.reserve(3);
     if (config.hicache.enabled) {
         bool static_replay = false;

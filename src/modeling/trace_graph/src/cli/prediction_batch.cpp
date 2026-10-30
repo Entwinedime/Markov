@@ -1,5 +1,6 @@
 /** Same-source preparation with process-private target execution. */
 #include "core/execution_metrics.hpp"
+#include "frontend/cost_package.hpp"
 #include "markov/trace_graph/cli/workflow.hpp"
 
 #include "markov/trace_graph/cli/module_pipeline.hpp"
@@ -47,7 +48,7 @@ std::string output_path(const std::filesystem::path & directory, const char * na
     return enabled ? (directory / name).string() : std::string{};
 }
 
-std::vector<TargetRun> target_runs(const CliOptions & source_options, const nlohmann::json & plan) {
+std::vector<TargetRun> target_runs(const CliOptions & source_options, const nlohmann::json & plan, frontend::CostPackages & packages) {
     std::vector<TargetRun> runs;
     for (const auto & item : plan.at("runs")) {
         const std::filesystem::path directory(item.at("output_dir").get<std::string>());
@@ -61,12 +62,13 @@ std::vector<TargetRun> target_runs(const CliOptions & source_options, const nloh
 #ifdef DEBUG
         options.outputs.model_summary = output_path(directory, "model_summary.json", !source_options.outputs.model_summary.empty());
         auto modules = ModulePipeline::from_config(options.model_config,
+                                                   packages,
                                                    options.hicache_oracle_cost_replay,
                                                    options.hicache_phase_oracle_cost_replay,
                                                    options.hicache_canonical_observed_phase_scope,
                                                    options.hicache_static_replay);
 #else
-        auto modules = ModulePipeline::from_config(options.model_config);
+        auto modules = ModulePipeline::from_config(options.model_config, packages);
 #endif
         runs.push_back({ std::move(options), std::move(modules), directory / "model.log" });
     }
@@ -105,13 +107,16 @@ int run_prediction_batch(const CliOptions & options, core::Logger & logger) {
     if (jobs <= 0 || plan.at("runs").empty()) throw CliUsageError("target plan requires positive jobs and at least one run");
     const bool continue_on_error = plan.at("continue_on_error").get<bool>();
     core::ExecutionMetrics metrics;
-    auto runs = target_runs(options, plan);
+    frontend::CostPackages packages;
+    auto runs = target_runs(options, plan, packages);
     metrics.checkpoint("target_configs_and_costs_load");
     const auto preparation_started = std::chrono::steady_clock::now();
     auto source = prepare_source(options, true);
     const auto preparation_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started).count();
     metrics.checkpoint("source_preparation");
-    std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec }, { "performance", metrics.report() } }.dump() << '\n' << std::flush;
+    auto performance = metrics.report();
+    performance["cost_packages_loaded"] = packages.size();
+    std::cout << nlohmann::json{ { "event", "source_prepared" }, { "wall_seconds", preparation_sec }, { "performance", std::move(performance) } }.dump() << '\n' << std::flush;
 
     // Input loading/build futures have joined. Fork before target work: const
     // TraceEvent access may populate lazy maps and is not thread-safe.

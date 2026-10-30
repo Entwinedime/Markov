@@ -50,6 +50,7 @@ services:
     image: markov-trace-sim-modeling:ubuntu24.04
     environment:
       TRACE_GRAPH_QUERY_METRICS: ${TRACE_GRAPH_QUERY_METRICS:-0}
+      TRACE_GRAPH_MEMORY_METRICS: ${TRACE_GRAPH_MEMORY_METRICS:-0}
     volumes:
       - ../..:/workspace/trace-sim
     command: bash

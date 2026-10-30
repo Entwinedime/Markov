@@ -133,7 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum concurrent target executions per prepared source; source groups run in sequence.",
     )
     args = parser.parse_args(argv)
-    cost_models = HiCacheCostModels.from_raw(load_json(require_repo_path(args.cost_model)))
+    cost_model_path = require_repo_path(args.cost_model).resolve()
+    cost_models = HiCacheCostModels.from_raw(load_json(cost_model_path))
     sources = tuple(require_repo_path(path).resolve() for path in args.source_manifest)
     output = (
         require_repo_path(args.output_dir)
@@ -156,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         trace_file_threads=args.trace_file_threads,
         model_run_jobs=args.model_run_jobs,
         cost_models=cost_models,
+        cost_model_path=cost_model_path,
         source_resources=load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
         experiment_reports=args.experiment_reports,
     )

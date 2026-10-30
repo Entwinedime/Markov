@@ -52,6 +52,7 @@ class WorkflowOptions:
     output_dir: Path
     diagnostics: DiagnosticLevel
     cost_models: HiCacheCostModels
+    cost_model_path: Path
     dry_run: bool = False
     continue_on_error: bool = False
     trace_threads: int = 1

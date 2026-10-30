@@ -3,6 +3,7 @@
  * @brief Narrow C++ model-configuration parser implementation.
  */
 #include "markov/trace_graph/frontend/model_config.hpp"
+#include "frontend/cost_package.hpp"
 
 #include "markov/trace_graph/frontend/model_config_parse_detail.hpp"
 
@@ -135,7 +136,7 @@ NodeScaleConfig parse_node_scale(const Json & root) {
     return config;
 }
 
-HiCacheConfig parse_hicache(const Json & root) {
+HiCacheConfig parse_hicache(const Json & root, CostPackages & packages) {
     // Parsing validates explicit target facts. Policy derivation remains in HiCachePolicy.
     HiCacheConfig config{};
     auto it = root.find("hicache");
@@ -175,66 +176,17 @@ HiCacheConfig parse_hicache(const Json & root) {
     const auto disaggregation_mode = lower(string_value(object, "disaggregation_mode", ""));
     config.device_allocator_need_sort = bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
     config.io_cost = parse_hicache_io_cost(object);
-    if (object.contains("operator_models")) {
-        for (const auto & item : object.at("operator_models")) {
-            cost::OperatorModel model;
-            model.operation = item.at("operation").get<std::string>();
-            model.implementation = item.at("implementation").get<std::string>();
-            model.timing_scope = item.at("timing_scope").get<std::string>();
-            model.form = item.at("form").get<std::string>();
-            model.allow_extrapolation = item.at("allow_extrapolation").get<bool>();
-            model.extrapolation_features = item.value("extrapolation_features", std::vector<std::string>{});
-            model.feature_ranges = item.at("feature_ranges").get<decltype(model.feature_ranges)>();
-            model.measured_feature_points = item.at("measured_feature_points").get<decltype(model.measured_feature_points)>();
-            if (model.form == "piecewise_linear") {
-                model.coordinate = item.at("coordinate").get<std::string>();
-                model.points = item.at("points").get<decltype(model.points)>();
-                if (model.allow_extrapolation || !model.extrapolation_features.empty() || model.points.size() < 2 || !std::ranges::is_sorted(model.points))
-                    throw std::runtime_error("Operator curve needs ordered anchors and cannot extrapolate");
-                for (const auto & [coordinate, duration_us] : model.points)
-                    if (!std::isfinite(coordinate) || !std::isfinite(duration_us) || duration_us < 0.0)
-                        throw std::runtime_error("Operator curve needs finite coordinates and non-negative durations");
-                if (!model.feature_ranges.contains(model.coordinate)) throw std::runtime_error("Operator curve needs coverage for its coordinate");
-                const auto range = model.feature_ranges.at(model.coordinate);
-                if (range.first != model.points.front().first || range.second != model.points.back().first)
-                    throw std::runtime_error("Operator curve coverage must match its measured anchors");
-                for (size_t i = 1; i < model.points.size(); ++i)
-                    if (model.points[i - 1].first >= model.points[i].first) throw std::runtime_error("Operator curve coordinates must be distinct");
-            }
-            else if (model.form == "linear" || model.form == "constant") {
-                model.intercept_us = item.at("intercept_us").get<double>();
-                model.coefficients = item.at("coefficients").get<decltype(model.coefficients)>();
-                if (model.form == "constant" && !model.coefficients.empty())
-                    throw std::runtime_error("Constant operator models cannot contain variable coefficients");
-            }
-            else throw std::runtime_error("Unsupported operator model form: " + model.form);
+    if (object.contains("operator_models"))
+        throw std::runtime_error("Use hicache.cost_package for independent operator costs; regenerate the native model config");
+    if (const auto path = object.find("cost_package"); path != object.end()) {
+        for (const auto field : { "io_cost", "kv_bytes_per_page" })
+            if (object.contains(field)) throw std::runtime_error(std::string("cost_package cannot be combined with ") + field);
 
-            for (const auto & [feature, range] : model.feature_ranges)
-                if (!std::isfinite(range.first) || !std::isfinite(range.second) || range.first > range.second)
-                    throw std::runtime_error("Invalid operator coverage for " + feature);
-            for (const auto & feature : model.extrapolation_features)
-                if (!model.feature_ranges.contains(feature)) throw std::runtime_error("Operator extrapolation needs a declared coordinate: " + feature);
-            if (!std::isfinite(model.intercept_us)) throw std::runtime_error("Operator intercept must be finite");
-            for (const auto & [feature, value] : model.coefficients)
-                if (!std::isfinite(value) || !model.feature_ranges.contains(feature))
-                    throw std::runtime_error("Operator coefficient needs a finite value and measured coverage: " + feature);
-            if (model.measured_feature_points.empty()) throw std::runtime_error("Operator model needs at least one measured work point");
-            for (const auto & point : model.measured_feature_points) {
-                if (point.size() != model.feature_ranges.size()) throw std::runtime_error("Operator work point must cover its declared coordinates");
-                for (const auto & [feature, range] : model.feature_ranges) {
-                    const auto coordinate = point.at(feature);
-                    if (!std::isfinite(coordinate) || coordinate < range.first || coordinate > range.second)
-                        throw std::runtime_error("Operator work point lies outside its declared coverage");
-                }
-            }
-            if (std::ranges::any_of(config.operator_models, [&](const auto & previous) {
-                    return previous.operation == model.operation && previous.implementation == model.implementation
-                           && previous.timing_scope == model.timing_scope;
-                }))
-                throw std::runtime_error("Operator cost package contains overlapping model identities");
-
-            config.operator_models.push_back(std::move(model));
-        }
+        const auto & package = packages.get(path->get<std::string>());
+        config.kv_bytes_per_page = core::checked_multiply_u64(config.page_size, package.kv_bytes_per_token, "Target page bytes overflow");
+        if (config.kv_bytes_per_page == 0) throw std::runtime_error("Target page_size must be positive");
+        config.io_cost = package.io_for_page(config.kv_bytes_per_page);
+        config.operator_models = package.operators;
     }
     if (const auto phase_cost = object.find("phase_cost"); phase_cost != object.end() && !phase_cost->is_null()) {
         if (!phase_cost->is_object()) throw std::runtime_error("hicache.phase_cost must be an object");
@@ -351,14 +303,14 @@ using model_config_detail::parse_hicache;
 using model_config_detail::parse_node_scale;
 using model_config_detail::read_json_file;
 
-ModelConfig ModelConfig::from_file(const std::string & filename) {
+ModelConfig ModelConfig::from_file(const std::string & filename, CostPackages & packages) {
     // The backend accepts only this narrow input contract, not the complete experiment document.
     auto root = read_json_file(filename);
     if (!root.is_object()) { throw std::runtime_error("Model config root must be a JSON object: " + filename); }
 
     ModelConfig config;
     config.node_scale = parse_node_scale(root);
-    config.hicache = parse_hicache(root);
+    config.hicache = parse_hicache(root, packages);
     config.source_prefetch_policy = model_config_detail::string_value(root, "source_prefetch_policy", "");
 
     auto & logger = core::Logger::instance();

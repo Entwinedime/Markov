@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -155,7 +156,7 @@ struct HiCacheRules {
 struct HiCacheConfig : HiCacheRules {
     HiCacheIoCostConfig io_cost;
     HiCachePhaseCostConfig phase_cost;
-    std::vector<cost::OperatorModel> operator_models;
+    std::shared_ptr<const cost::OperatorModels> operator_models;
     bool dag_patch_enabled = false;
     bool dag_patch_source_target_same_config = false;
 };
@@ -166,13 +167,15 @@ struct HiCacheConfig : HiCacheRules {
  * Python converts the broader workflow configuration into this boundary document. The C++
  * parser intentionally does not understand experiment orchestration fields.
  */
+class CostPackages;
+
 struct ModelConfig {
     NodeScaleConfig node_scale;
     HiCacheConfig hicache;
     std::string source_prefetch_policy; // Source observation context, not a target policy/outcome.
 
     /** @brief Loads and validates one narrow model-configuration JSON file. */
-    [[nodiscard]] static ModelConfig from_file(const std::string & filename);
+    [[nodiscard]] static ModelConfig from_file(const std::string & filename, CostPackages & packages);
 };
 
 } // namespace markov::trace_graph::frontend

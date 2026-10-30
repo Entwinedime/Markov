@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/window.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
@@ -27,11 +28,12 @@ class ModulePipeline {
 public:
     /** @brief Parses one C++ model config; an empty path creates an empty pipeline. */
 #ifdef DEBUG
-    [[nodiscard]] static ModulePipeline from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay = {},
+    [[nodiscard]] static ModulePipeline from_config(const std::string & filename, frontend::CostPackages & packages,
+                                                    const std::string & hicache_oracle_cost_replay = {},
                                                     const std::string & hicache_phase_oracle_cost_replay = {},
                                                     bool hicache_canonical_observed_phase_scope = false, bool hicache_static_replay = false);
 #else
-    [[nodiscard]] static ModulePipeline from_config(const std::string & filename);
+    [[nodiscard]] static ModulePipeline from_config(const std::string & filename, frontend::CostPackages & packages);
 #endif
 
     /** @brief Applies every owned module exactly once in configuration order. */
