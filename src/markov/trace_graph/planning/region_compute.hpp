@@ -3,7 +3,10 @@
 #include "markov/trace_graph/planning/request_compute.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -67,7 +70,8 @@ private:
         PrefillReady,
         ResultsReady,
         Sent,
-        Done
+        Done,
+        ControlReady
     };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
     struct Frame {
@@ -75,21 +79,19 @@ private:
         std::size_t caller, rank, group;
         Phase phase;
         std::optional<std::size_t> previous, next;
-        std::optional<graph::NodeId> entered, input_ready;
+        std::optional<graph::NodeId> control_started, control_ready, input_ready, result_control;
         Features features;
         Work prepare_cpu, prepare_stream, prepare_return, batch_cpu, batch_stream, batch_return, result_cpu, result_tail;
         bool overlap, has_result, publishes, sends;
         bool next_started = false, result_requested = false;
     };
-    struct Group {
-        std::vector<std::size_t> frames;
-        bool launched = false;
-    };
-    void prepare(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
+    void begin_control(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
+    void prepare(ProgramRuntime & runtime, std::size_t frame);
     void run_frame(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
-    void launch_group(ProgramRuntime & runtime, std::size_t group);
+    void launch_frame(ProgramRuntime & runtime, std::size_t frame, graph::NodeId entered);
     void advance(ProgramRuntime & runtime, std::size_t frame);
     void process_result(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
+    void submit_result(ProgramRuntime & runtime, std::size_t frame);
     void finish(ProgramRuntime & runtime);
     void identify(ProgramRuntime & runtime, PlannedMutation & mutation, const Frame & frame, std::string_view port) const;
     graph::NodeId join(ProgramRuntime & runtime, std::span<const graph::NodeId> causes, ActionKind action);
@@ -102,7 +104,7 @@ private:
     ExecutionQueues & queues_;
     RequestControls & controls_;
     std::vector<Frame> frames_;
-    std::vector<Group> groups_;
+    std::vector<std::vector<std::size_t>> groups_;
     std::vector<std::size_t> roots_;
     ComputeStats stats_;
     std::optional<std::string> issue_;

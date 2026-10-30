@@ -185,7 +185,7 @@ Json report(const PreparedEvaluation & input) {
     std::vector<std::optional<Address>> addresses;
     std::map<Address, std::size_t> counts;
     for (const auto & node : nodes) {
-        addresses.push_back(address(node));
+        addresses.push_back(node.at("kind") == "boundary" ? std::nullopt : address(node));
         if (addresses.back()) ++counts[*addresses.back()];
     }
     auto missing = Json::array(), matches = Json::array();
