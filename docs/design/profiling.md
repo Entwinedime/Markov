@@ -1,8 +1,8 @@
-# Profiling 开发与使用
+# 采集、观测与交接
 
 真实采集统一从 `scripts/profile.sh` 进入，由配置选择 SGLang 或 KTransformers 容器。
 采集结果通过 `profile_manifest.json` 交给建模，不需要手工寻找或拼接 trace。
-本文讲采集合同；预测和校准编排见[建模说明](modeling_development.md)，当前证据见[工作进展](work_progress.md)。
+本文维护采集生命周期、通道、时钟和 manifest 语义；组准备操作见[开发与运行](development.md)。
 
 ## 1. 共同流程
 
@@ -88,34 +88,14 @@ scripts/model.sh build-dag --profile-manifest <ktransformers-manifest> --output-
 ```
 
 真实推理还需 image、可用设备、模型/GGUF 和对应 hook。
-dry-run 及已有共享构图证据不是新模型的真实性能采集，当前保留范围见工作进展。
+dry-run 及已有共享构图证据不是新模型的真实性能采集。
 
-## 3. SGLang 5×3 实验
-
-原对照由五个 HiCache 配置和三个 workload 组成，不是 predictor 的硬编码合同。
-
-```text
-configs/workloads/hicache_manual/configs.json
-configs/workloads/hicache_manual/w1_device_spill_qualification_ring.json
-configs/workloads/hicache_manual/w2_writeback_dual_tier_cascade.json
-configs/workloads/hicache_manual/w3_prefetch_admission_ladder_and_survival.json
-configs/experiments/hicache_manual_workload/profiling_full_dag_replay.json
-```
-
-15 份真实 profile 支撑每个 base 的 12 cross、五个 base 共 60 cross。
-开发按执行语义挑关键 cell，不因每次改动都重采全矩阵：
-
-```bash
-scripts/profile.sh configs/experiments/hicache_manual_workload/profiling_full_dag_replay.json \
-  --server <base-config> --input <workload> --forced-token-bundle <bundle> --dry-run
-```
-
-## 4. Forced-token capture 与 replay
+## 3. Forced-token capture 与 replay
 
 受控 token 是复现实验选项，不是普通预测必须人工串联的第二套流程。
 它固定真实请求顺序、输入和输出 token，使不同配置看到相同 workload。
 组的首次准备可从普通模板命令自动安排记录与回放，不要求手工补 replay 参数；
-下述命令用于单独采集与复用，具体选择由[组准备入口](modeling_development.md#首次准备)组织。
+下述命令用于单独采集与复用，普通首次准备由组入口组织。
 
 ```bash
 scripts/profile.sh configs/experiments/hicache_manual_workload/no_profile_capture.json
@@ -159,7 +139,7 @@ ShareGPT 本地语料通过同一 workload 入口转化：
 多轮历史仍来自语料给定的 assistant 消息，不假装来自本次生成。
 自然记录后按同一工作量回放，不等于预测尚未生成的内容、任意 EOS 或并发用户流量。
 
-## 5. 共享校准的采集语义
+## 4. 共享校准的采集语义
 
 base 提供源结构与未变成本，变化工作使用离线独立成本包。
 `prepare-hicache` 只有遇到实际成本缺口、显式开启且有累计预算时，才选择整组共享实验；
@@ -167,7 +147,7 @@ base 提供源结构与未变成本，变化工作使用离线独立成本包。
 
 suite、token 和 profile 均写入当次组目录；失败、超时、无效输出和重试都计入累计账本。
 缺少实际用量的失败按预留请求/token 计费，不记为零。HTTP 成功不证明 trace、状态或成本可辨识。
-候选、预算和恢复见[建模说明](modeling_development.md#6-准备流程与失败处理)，这里不再维护另一套补采规则。
+补采须先区分结构、变量与测量缺口，不为缺结构重复采集。
 
 同源 CPU 轻量配对保留 base 的实际命令与 token 计划，仅改变采集方式。
 开启已有轻量 I/O 计时后，一趟回放也可记录预取服务，不额外加请求；
@@ -182,7 +162,7 @@ DMA 的 `runtime-dma` 入口需要 base-report 提供模型几何、设备和 NU
 文件预取 sampler 记录实际框架分段时钟，不再在 worker 内启动 Torch profiler。
 空闲同步及各类计时原语的适用范围见成本文档，采样成功不表示整组成本已齐备。
 
-## 6. Trace channels 与轻量探针
+## 5. Trace channels 与轻量探针
 
 SGLang 的 Torch 记录设备及框架工作，LD_PRELOAD 记录 CPU/API/I/O 时序，
 Python probe 补充执行语义。后者不是额外一份可叠加的执行成本。
@@ -194,7 +174,7 @@ Level2 额外包含 runtime API 与 AICPU 观测，不只是硬件利用率档�
 默认关闭 PipeUtilization，`profiling.debug=true` 或显式 `SGLANG_NPU_PROFILER_AIC_METRICS=1` 才启用硬件指标。
 这是 torch-npu 的采集精细度，不是项目版本号。默认保留所需运行时信息，不额外采 AI Core 利用率指标；
 等级与运行日志保留为采集条件，不作为成本变量或部署资源身份。原始 vendor 数据不由这项设置主动删除。
-长输出的最小设置仍在本轮验证中；不能仅凭设置变轻或 trace 变小，宣称 DAG 覆盖及正常性能精度已通过。
+不能仅凭设置变轻或 trace 变小，宣称 DAG 覆盖及正常性能精度已通过。
 
 当前 torch-npu 的 Level0 会在 `trace_view.json` 中裁掉原生 AscendCL API 等记录，但同次采集的 CANN 导出仍保留它们。
 因此 manifest 的每个 Torch 条目可声明 `cann_runtime_trace_files`，列出该 rank 的原始 CANN 导出路径。
@@ -211,8 +191,6 @@ manifest 的 python_runtime_probes 记录选择，实际覆盖仍由建模检查
 `probes/` 保留通用 callable、标量取值与线程计时，SGLang 的原生插桩和 HiCache 字段读取归
 `adapters/frameworks/sglang/`。框架读取器在启动时注入，通用取值模块不自行导入 HiCache；
 manifest 中的观测族名称及事件字段不因目录变化而改变。这是代码分工，不扩张 KTransformers 的探针能力。
-10-13 重构后已在 SGLang 容器核对八个选中探针模块的导入，并通过普通入口完成新的 token 记录、
-base profile 与目标预测。该证据覆盖这次移动及实际入口，不证明所有探针分支或额外扰动都已量化。
 
 缓存查询同时记录缓存树与控制器的对象关系，不需要 snapshot 或实际写回/回载来建立身份。
 建模只接受这类直接关系或明确的调用/请求对应，不按最近时间或“只有一棵树”猜测。
@@ -243,7 +221,7 @@ Qwen3 角色由实际模块登记，其他模型可提供测量几何，但不�
 Attention/metadata/dense 共用 `thread_timing.invoke_runtime_call`：
 先记录结束墙钟与线程 CPU，再提取返回元数据、写事件；异常原样传递并记录 raised。
 其他探针有不同边界时保留独立实现，不为统一代码改变测量口径。
-10-13 已有新的普通采集，但没有新增同源 full/light 的扰动对照，不能宣称探针开销已重新量化。
+探针修改后需同源 full/light 才能重新量化扰动；普通采集成功不能代替这项对照。
 
 ### 所有者、返回值和通信
 
@@ -299,7 +277,7 @@ schedstat 每次读取及时关闭文件，诊断会增加打开/关闭开销；
 任何开销扣减须按原始线程和区间去重，只用有依据的 CPU 成分，不直接扣日志锁等待墙钟。
 新版 hook 或探针不会自动更新已有部署库与旧 trace，构建成功也不证明真实覆盖。
 
-## 7. Formal window 与时钟
+## 6. Formal window 与时钟
 
 workload report 提供语义起止，manifest 的 bench.workload_report_files 声明路径。
 显式 input.workload_report 优先；多份报告需明确选择，缺声明不扫描运行目录猜测。
@@ -334,7 +312,7 @@ manifest completed 和文件存在不能替代完整性检查。
 提高上限前须留足主机内存，并保持 rank 导出串行；它不是内存使用上限，更不保证任意大文件都能完成解析。
 对已出现上限丢失的采集，需要从同次原始数据重新导出；只修改输入设置不能修复旧文件，也不能据此复用旧 CPU 绑定。
 
-## 8. 产物与开发位置
+## 7. 产物与开发位置
 
 ```text
 <cell>/

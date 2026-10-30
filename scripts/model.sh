@@ -52,7 +52,7 @@ prepare-hicache coordinates containers from the host. Device calibration uses
 SGLang; DAG construction and prediction use modeling. Prediction cells share
 one modeling container. Build-dag also supports KTransformers without HiCache.
 
-Run an action with --help for its options. See docs/modeling_development.md for
+Run an action with --help for its options. See docs/design/user_contract.md for
 group inputs, supported cost coverage and the limitations of current predictions.
 EOF
 }
