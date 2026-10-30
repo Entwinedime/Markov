@@ -97,7 +97,7 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core costs /path/to/cos
 它只读取选定模型和工作描述，不读取 base 或 target trace，不训练模型；结果是操作成本，尚未接入完整目标预测。
 
 已有独立采样的导入与离线训练使用 `scripts/markov.sh maintain --request /path/to/maintenance.json`。
-目前接入正常 HiCache 备份返回、完成观测和主机索引克隆：SQLite 保存测量事实，显式选择训练采集后导出同一成本查询入口可读的模型。
+目前接入正常 HiCache 备份返回、完成观测、主机索引克隆及 ATen 一维张量 API 响应：SQLite 保存测量事实，显式选择训练采集后导出同一成本查询入口可读的模型。整段 API 响应不能当作队列内的 CPU/worker/设备服务。
 该命令不启动设备或服务；采集范围、输入和适用限制见用户合同。
 
 SGLang 推理环境另有轻量输入分支观察，启用方式见[用户合同](docs/design/user_contract.md#sglang-输入分支观察)。

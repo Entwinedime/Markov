@@ -230,10 +230,19 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 }
 ```
 
-路径相对维护请求解析。当前唯一导入适配器读取真实 cache_io 采样的完成记录及同目录 measurements.jsonl，核对声明案例、重复数、预热和物理校验。它导入备份返回、完成观测及主机克隆三类响应，不加载模型权重、base/target trace 或 SDK。
+路径相对维护请求解析。sglang_cache_io 读取真实 cache_io 采样的完成记录及同目录 measurements.jsonl，核对声明案例、重复数、预热和物理校验，导入备份返回、完成观测及主机克隆。ascend_tensor 读取正常一维张量 clone/cat 的相同交接文件，保存整段主机响应、主线程 CPU 时间和完成观测。导入/训练不加载权重、base/target trace 或 SDK；不同操作的协议分别核对，同一响应不能混入不相容条件。
 只填 imports 可以单独入库；已有数据可省略 imports，只用 training 中的原来源路径离线训练，不再打开原始采样文件。training 必须显式选择，不自动扫描整库，也不能重复选择同一采集。预热及未选择的采集不用于训练，独立留出另经成本查询评价。
 可选 models 指向已有选定模型文件；训练结果只替换相同操作/实现/口径的响应，并将完整选定包写到 output。输出必须与数据库、请求及原始采集目录分开，完成后原子发布；失败不把半写模型当作成功。
-报告给出新增/复用记录、有效训练响应数、训练模型数和输出位置。单设备数据不按模型名或 TP 声明重采，但平台、实现条件及实际工作几何必须相容；这一入口不提供任意模型/平台的精度保证，也未接入自动设备补采、一般 runtime trace 导入或 CPU 校正。
+报告给出新增/复用记录、有效训练响应数、训练模型数和输出位置。单设备数据不按模型名或 TP 声明重采，但平台、实现条件及实际工作几何必须相容；这一入口不提供任意模型/平台的精度保证，也未接入自动设备补采、一般 runtime trace 导入或 CPU 校正。原生观察开启的张量数据可以导入保存，直接选为正常响应训练数据时会被拒绝。
+
+在兼容的 Torch-NPU 推理环境中，张量响应采样入口为：
+
+```bash
+python3 -m markov.adapters.ascend.tensor_responses --recipe /path/to/recipe.json --output /path/to/new_capture
+```
+
+配方包含 device、warmup、repeats 和 cases；每个案例给出 operation（clone 或 concatenate）、dtype（int32 或 int64）和正整数 input_sizes，例如 clone 的 [128] 或 concatenate 的 [64, 64]。输出逐次保留预热、调用的 wall/thread CPU 时间、完成观测及数值校验。用于当前离线训练时，clone 需至少两个元素规模；cat 的每个输入段数需有两个规模，并提供至少两种段数，否则明确报告数据不足。启动、构造、同步前准备及数值核对不在主机调用计时内。
+外层仍须负责设备空闲、串行、累计预算及回收。完成观测包含同步 API，整段主线程统计没有拆出队列提交和后台发射；不能把成功采样当作目标队列成本或完整 HTTP 已恢复。
 
 ### 已实现的独立成本查询
 
