@@ -58,6 +58,7 @@ add_library(trace_graph_io STATIC)
 target_sources(trace_graph_io
     PRIVATE
         src/io/chrome_trace_io.cpp
+        src/io/cpu_service_input.hpp
         src/io/cpu_service_input.cpp
         src/io/trace_channel_join.cpp
         src/io/trace_manifest_input.cpp

@@ -39,6 +39,7 @@ Individual stages and diagnostics:
   scripts/model.sh predict --source-manifest <manifest> --target-config <config> --cost-model <cost-package.json> --output-dir <prediction-output>
   scripts/model.sh evaluate --prediction-dir <prediction-output> --target-profile-manifest <score-manifest> --output-dir <score-output>
   scripts/model.sh prepare-cpu-service --light-manifest <manifest> --profile-manifest <manifest> --tp-size <n> --output-dir <dir>
+  scripts/model.sh prepare-cpu-service --convert-input <expanded-cpu-service.json> --output-dir <new-dir>
   scripts/model.sh export-hicache-operation-costs --profile-manifest <independent-manifest> --cpu-service-cost <paired-service> --page-size <n> --output-dir <dir>
   scripts/model.sh calibrate-hicache <physical|runtime-dma|eviction-cpu|idle-sync> [options]
 

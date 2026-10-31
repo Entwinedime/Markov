@@ -1,8 +1,8 @@
 #include "source_dag/observation_writer.hpp"
 // Offline extraction from an explicitly selected independent calibration only.
+#include "io/cpu_service_input.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/model/prefetch_wait_execution.hpp"

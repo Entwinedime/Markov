@@ -24,12 +24,12 @@
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include <nlohmann/json.hpp>
 
+#include "io/cpu_service_input.hpp"
 #include "markov/trace_graph/cli/debug_support.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
-#include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"

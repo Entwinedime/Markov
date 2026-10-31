@@ -48,7 +48,7 @@ class ProfileRunRef:
 def cpu_service_metadata(path: Path) -> dict[str, Any]:
     """Read the formal CPU file's header without materializing its interval array.
 
-    The backend writer places metadata before the top-level ``spans`` field.
+    The backend writer places metadata before the top-level ``lanes`` field.
     This reads provenance only; the backend still reads and validates all costs.
     """
 
@@ -56,6 +56,8 @@ def cpu_service_metadata(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             if line.startswith('  "spans":'):
+                raise ValueError("Convert expanded CPU costs with prepare-cpu-service --convert-input")
+            if line.startswith('  "lanes":'):
                 return json.loads("".join(header).rstrip().removesuffix(",") + "\n}")
 
             header.append(line)
