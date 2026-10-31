@@ -1,0 +1,270 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B3",
+    "framework": "sglang",
+    "runtime": "ascend",
+    "dtype": "bfloat16",
+    "tensor_parallel": 2
+  },
+  "capture": {
+    "image": "markov-sglang:ubuntu22.04",
+    "devices": [
+      0,
+      1
+    ],
+    "memory_limit_gib": 64,
+    "cpus": 8
+  },
+  "source_budget": {
+    "starts": 2,
+    "wall_sec": 2400,
+    "retained_mib": 32768
+  },
+  "normal_budget": {
+    "starts": 2,
+    "wall_sec": 900,
+    "retained_mib": 8192
+  },
+  "sampling_budget": {
+    "starts": 16,
+    "wall_sec": 3600,
+    "requests": 512,
+    "input_tokens": 750000,
+    "output_tokens": 2048,
+    "retained_mib": 1024
+  },
+  "normal_repetitions": 3,
+  "prediction_memory_limit_gib": 4,
+  "diagnostic_memory_limit_gib": 24,
+  "common_configuration": {
+    "max_prefill_tokens": 4096,
+    "enable_hierarchical_cache": true,
+    "hicache_io_backend": "kernel_ascend",
+    "hicache_mem_layout": "page_first_direct",
+    "hicache_storage_backend": "file"
+  },
+  "configurations": {
+    "C1": {
+      "page_size": 128,
+      "max_total_tokens": 4096,
+      "hicache_ratio": 1.95,
+      "hicache_write_policy": "write_through",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 128}"
+    },
+    "C2": {
+      "page_size": 64,
+      "max_total_tokens": 3072,
+      "hicache_ratio": 1.32,
+      "hicache_write_policy": "write_through_selective",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 256}"
+    },
+    "C3": {
+      "page_size": 32,
+      "max_total_tokens": 3584,
+      "hicache_ratio": 4.495,
+      "hicache_write_policy": "write_back",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 512}"
+    },
+    "C4": {
+      "page_size": 64,
+      "max_total_tokens": 3072,
+      "hicache_ratio": 1.32,
+      "hicache_write_policy": "write_through_selective",
+      "hicache_storage_prefetch_policy": "best_effort",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 256}"
+    },
+    "C5": {
+      "page_size": 128,
+      "max_total_tokens": 3584,
+      "hicache_ratio": 4.49,
+      "hicache_write_policy": "write_back",
+      "hicache_storage_prefetch_policy": "timeout",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 1024, \"prefetch_timeout_base\": 2.0, \"prefetch_timeout_per_ki_token\": 0.0, \"prefetch_timeout_max\": 2.0}"
+    },
+    "wide_device_wait": {
+      "page_size": 64,
+      "max_total_tokens": 6144,
+      "hicache_ratio": 1.99,
+      "hicache_write_policy": "write_through",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 256}"
+    },
+    "tight_host_writeback": {
+      "page_size": 128,
+      "max_total_tokens": 3584,
+      "hicache_ratio": 1.5,
+      "hicache_write_policy": "write_back",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 512}"
+    },
+    "middle_threshold_selective": {
+      "page_size": 64,
+      "max_total_tokens": 3072,
+      "hicache_ratio": 1.32,
+      "hicache_write_policy": "write_through_selective",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 384}"
+    },
+    "short_timeout_writeback": {
+      "page_size": 128,
+      "max_total_tokens": 3584,
+      "hicache_ratio": 4.49,
+      "hicache_write_policy": "write_back",
+      "hicache_storage_prefetch_policy": "timeout",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 512, \"prefetch_timeout_base\": 0.01, \"prefetch_timeout_per_ki_token\": 0.0, \"prefetch_timeout_max\": 0.01}"
+    },
+    "page32_selective_best_effort": {
+      "page_size": 32,
+      "max_total_tokens": 3584,
+      "hicache_ratio": 2.0,
+      "hicache_write_policy": "write_through_selective",
+      "hicache_storage_prefetch_policy": "best_effort",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 256}"
+    },
+    "large_working_set_wait": {
+      "page_size": 128,
+      "max_total_tokens": 8192,
+      "hicache_ratio": 4.0,
+      "hicache_write_policy": "write_back",
+      "hicache_storage_prefetch_policy": "wait_complete",
+      "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 512}"
+    }
+  },
+  "configuration_sets": {
+    "original": [
+      "C1",
+      "C2",
+      "C3",
+      "C4",
+      "C5"
+    ],
+    "expanded": [
+      "wide_device_wait",
+      "tight_host_writeback",
+      "middle_threshold_selective",
+      "short_timeout_writeback",
+      "page32_selective_best_effort",
+      "large_working_set_wait"
+    ]
+  },
+  "workload_sets": {
+    "manual": [
+      "w1",
+      "w2",
+      "w3"
+    ],
+    "development": [
+      "sharegpt_independent",
+      "sharegpt_multi_turn",
+      "sharegpt_revisit"
+    ],
+    "confirmation": [
+      "confirmation_sharegpt_independent",
+      "confirmation_sharegpt_multi_turn",
+      "confirmation_sharegpt_revisit"
+    ]
+  },
+  "sharegpt": {
+    "seed": 20261010,
+    "scan_conversations": 4096,
+    "minimum_input_tokens": 32,
+    "maximum_input_tokens": 2048,
+    "independent_length_boundaries": [
+      32,
+      256,
+      768,
+      2049
+    ],
+    "revisit_minimum_tokens": 768,
+    "output_tokens": {
+      "independent": 2,
+      "multi_turn": 4,
+      "revisit": 8
+    },
+    "development": {
+      "seed": 20261010,
+      "independent_requests_per_bucket": 6,
+      "multi_turn_conversations": 4,
+      "multi_turn_turns": 4,
+      "revisit_conversations": 8,
+      "revisit_passes": 2
+    },
+    "confirmation": {
+      "seed": 20261011,
+      "independent_requests_per_bucket": 4,
+      "multi_turn_conversations": 4,
+      "multi_turn_turns": 3,
+      "revisit_conversations": 6,
+      "revisit_passes": 2
+    }
+  },
+  "dataset_url": "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json",
+  "panels": {
+    "original": {
+      "expected_cross": 60,
+      "groups": [
+        {
+          "bases": [
+            "C2",
+            "C5",
+            "C1",
+            "C3",
+            "C4"
+          ],
+          "workloads": "manual",
+          "targets": "original"
+        }
+      ]
+    },
+    "expanded": {
+      "expected_cross": 72,
+      "groups": [
+        {
+          "bases": [
+            "C5"
+          ],
+          "workloads": "manual",
+          "targets": "expanded"
+        },
+        {
+          "bases": [
+            "C5"
+          ],
+          "workloads": "development",
+          "targets": "all"
+        },
+        {
+          "bases": [
+            "C1",
+            "C2"
+          ],
+          "workloads": "development",
+          "targets": "original"
+        }
+      ]
+    },
+    "confirmation": {
+      "expected_cross": 54,
+      "groups": [
+        {
+          "bases": [
+            "C5"
+          ],
+          "workloads": "confirmation",
+          "targets": "all"
+        },
+        {
+          "bases": [
+            "C1",
+            "C2"
+          ],
+          "workloads": "confirmation",
+          "targets": "original"
+        }
+      ]
+    }
+  }
+}

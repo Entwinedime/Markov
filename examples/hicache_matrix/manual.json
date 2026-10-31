@@ -1,0 +1,822 @@
+{
+  "w1": {
+    "description": "Construct six qualified and six single-seed A tails, force and restore a backed shared anchor, then measure twelve interleaved one-shot recovery witnesses without common formal pressure.",
+    "output_tokens": 1,
+    "fragments": {
+      "A_prefix": {
+        "text": "A-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "P_prefix": {
+        "text": "P-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "N_prefix": {
+        "text": "N-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "A_tail": {
+        "text": "{branch} A-tail pressure payload remains deterministic across every revisit. ",
+        "repeat": 95
+      }
+    },
+    "families": [
+      {
+        "name": "A{i}",
+        "branches": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "e",
+          "f",
+          "g",
+          "h",
+          "i",
+          "j",
+          "k",
+          "l",
+          "m",
+          "n",
+          "o",
+          "p",
+          "q",
+          "r"
+        ],
+        "parts": [
+          {
+            "ref": "A_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "A_tail"
+          },
+          {
+            "text": "a b c d e f g h i j k l"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "P0",
+        "branches": [
+          "s"
+        ],
+        "parts": [
+          {
+            "ref": "P_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "A_tail"
+          },
+          {
+            "text": "a b c d e f g h i j k l"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "N0",
+        "branches": [
+          "t"
+        ],
+        "parts": [
+          {
+            "ref": "N_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "A_tail"
+          },
+          {
+            "text": "a b c d e f g h i j k l"
+          }
+        ],
+        "tokens": 2176
+      }
+    ],
+    "prepare": [
+      [
+        "A0",
+        3
+      ],
+      [
+        "A1",
+        3
+      ],
+      [
+        "A2",
+        3
+      ],
+      [
+        "A3",
+        3
+      ],
+      [
+        "A4",
+        3
+      ],
+      [
+        "A5",
+        3
+      ],
+      [
+        "A6",
+        1
+      ],
+      [
+        "A7",
+        1
+      ],
+      [
+        "A8",
+        1
+      ],
+      [
+        "A9",
+        1
+      ],
+      [
+        "A10",
+        1
+      ],
+      [
+        "A11",
+        1
+      ],
+      [
+        "A12",
+        1
+      ],
+      [
+        "A13",
+        1
+      ],
+      [
+        "A14",
+        1
+      ],
+      [
+        "A15",
+        1
+      ],
+      [
+        "A16",
+        1
+      ],
+      [
+        "A17",
+        1
+      ],
+      [
+        "P0",
+        1
+      ],
+      [
+        "N0",
+        1
+      ],
+      [
+        "A17",
+        3
+      ]
+    ],
+    "formal": [
+      "A0",
+      "A6",
+      "A1",
+      "A7",
+      "A2",
+      "A8",
+      "A3",
+      "A9",
+      "A4",
+      "A10",
+      "A5",
+      "A11"
+    ]
+  },
+  "w2": {
+    "description": "Separate large-host survival with six old qualified D tails, then use eight alternating single-seed 2944-token requests to force write-through, selective-delete, and synchronous write-back eviction paths.",
+    "output_tokens": 1,
+    "fragments": {
+      "D_prefix": {
+        "text": "D-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "D_tail": {
+        "text": "{branch} D-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 88
+      },
+      "D_pad": {
+        "text": " q",
+        "repeat": 87
+      },
+      "E_prefix": {
+        "text": "E-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "E_tail": {
+        "text": "{branch} E-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 88
+      },
+      "E_pad": {
+        "text": " q",
+        "repeat": 87
+      },
+      "F_prefix": {
+        "text": "F-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "F_tail": {
+        "text": "{branch} F-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 88
+      },
+      "F_pad": {
+        "text": " q",
+        "repeat": 855
+      },
+      "G_prefix": {
+        "text": "G-anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "G_tail": {
+        "text": "{branch} G-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 88
+      },
+      "G_pad": {
+        "text": " q",
+        "repeat": 855
+      }
+    },
+    "families": [
+      {
+        "name": "D{i}",
+        "branches": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "e",
+          "f",
+          "g"
+        ],
+        "parts": [
+          {
+            "ref": "D_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "D_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "D_pad"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "E{i}",
+        "branches": [
+          "h",
+          "i",
+          "j",
+          "k"
+        ],
+        "parts": [
+          {
+            "ref": "E_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "E_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "E_pad"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "F{i}",
+        "branches": [
+          "a",
+          "b",
+          "c",
+          "d"
+        ],
+        "parts": [
+          {
+            "ref": "F_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "F_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "F_pad"
+          }
+        ],
+        "tokens": 2944
+      },
+      {
+        "name": "G{i}",
+        "branches": [
+          "e",
+          "f",
+          "g",
+          "h"
+        ],
+        "parts": [
+          {
+            "ref": "G_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "G_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "G_pad"
+          }
+        ],
+        "tokens": 2944
+      }
+    ],
+    "prepare": [
+      [
+        "D0",
+        3
+      ],
+      [
+        "D1",
+        3
+      ],
+      [
+        "D2",
+        3
+      ],
+      [
+        "D3",
+        3
+      ],
+      [
+        "D4",
+        3
+      ],
+      [
+        "D5",
+        3
+      ],
+      [
+        "E0",
+        1
+      ],
+      [
+        "E1",
+        1
+      ],
+      [
+        "E2",
+        1
+      ],
+      [
+        "E3",
+        1
+      ],
+      [
+        "D6",
+        3
+      ]
+    ],
+    "formal": [
+      "D0",
+      "D1",
+      "D2",
+      "D3",
+      "D4",
+      "D5",
+      "F0",
+      "G0",
+      "F1",
+      "G1",
+      "F2",
+      "G2",
+      "F3",
+      "G3"
+    ]
+  },
+  "w3": {
+    "description": "Coldify twelve qualified E/U/T tails to storage-only, force a host-backed shared anchor, then measure one interleaved pass of twelve admission and stop-policy witnesses with no formal pressure.",
+    "output_tokens": 1,
+    "fragments": {
+      "L_prefix": {
+        "text": "L",
+        "repeat": 1
+      },
+      "X_prefix": {
+        "text": "X",
+        "repeat": 1
+      },
+      "Y_prefix": {
+        "text": "Y",
+        "repeat": 1
+      },
+      "N_prefix": {
+        "text": "N",
+        "repeat": 1
+      },
+      "common_prefix": {
+        "text": " anchor cache-state geometry keeps this exact shared prefix stable. ",
+        "repeat": 85
+      },
+      "E_tail": {
+        "text": "{branch} D-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 20
+      },
+      "E_pad": {
+        "text": " q",
+        "repeat": 6
+      },
+      "U_tail": {
+        "text": "{branch} D-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 45
+      },
+      "U_pad": {
+        "text": " q",
+        "repeat": 91
+      },
+      "T_tail": {
+        "text": "{branch} D-tail cascade payload remains deterministic across every revisit. ",
+        "repeat": 88
+      },
+      "T_pad": {
+        "text": " q",
+        "repeat": 87
+      },
+      "S_pad": {
+        "text": " q",
+        "repeat": 855
+      }
+    },
+    "families": [
+      {
+        "name": "LE{i}",
+        "branches": [
+          "a",
+          "b",
+          "j",
+          "k"
+        ],
+        "parts": [
+          {
+            "ref": "L_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "E_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "E_pad"
+          }
+        ],
+        "tokens": 1279
+      },
+      {
+        "name": "LU{i}",
+        "branches": [
+          "c",
+          "d",
+          "l",
+          "m"
+        ],
+        "parts": [
+          {
+            "ref": "L_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "U_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "U_pad"
+          }
+        ],
+        "tokens": 1664
+      },
+      {
+        "name": "LT{i}",
+        "branches": [
+          "e",
+          "f",
+          "g",
+          "h"
+        ],
+        "parts": [
+          {
+            "ref": "L_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "T_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "T_pad"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "LK",
+        "branches": [
+          "i"
+        ],
+        "parts": [
+          {
+            "ref": "L_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "T_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "T_pad"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "X{i}",
+        "branches": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "e",
+          "f",
+          "g",
+          "h",
+          "i",
+          "j"
+        ],
+        "parts": [
+          {
+            "ref": "X_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "T_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "S_pad"
+          }
+        ],
+        "tokens": 2944
+      },
+      {
+        "name": "Y0",
+        "branches": [
+          "n"
+        ],
+        "parts": [
+          {
+            "ref": "Y_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "T_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "T_pad"
+          }
+        ],
+        "tokens": 2176
+      },
+      {
+        "name": "Y1",
+        "branches": [
+          "n"
+        ],
+        "parts": [
+          {
+            "ref": "N_prefix"
+          },
+          {
+            "ref": "common_prefix"
+          },
+          {
+            "text": "x y z q "
+          },
+          {
+            "ref": "T_tail"
+          },
+          {
+            "text": "a b c d e f g h i"
+          },
+          {
+            "ref": "T_pad"
+          }
+        ],
+        "tokens": 2176
+      }
+    ],
+    "prepare": [
+      [
+        "LE0",
+        3
+      ],
+      [
+        "LU0",
+        3
+      ],
+      [
+        "LT0",
+        3
+      ],
+      [
+        "LE1",
+        3
+      ],
+      [
+        "LU1",
+        3
+      ],
+      [
+        "LT1",
+        3
+      ],
+      [
+        "LE2",
+        3
+      ],
+      [
+        "LU2",
+        3
+      ],
+      [
+        "LT2",
+        3
+      ],
+      [
+        "LE3",
+        3
+      ],
+      [
+        "LU3",
+        3
+      ],
+      [
+        "LT3",
+        3
+      ],
+      [
+        "LK",
+        3
+      ],
+      [
+        "X0",
+        3
+      ],
+      [
+        "X1",
+        3
+      ],
+      [
+        "X2",
+        3
+      ],
+      [
+        "X3",
+        3
+      ],
+      [
+        "X4",
+        3
+      ],
+      [
+        "X5",
+        3
+      ],
+      [
+        "X6",
+        3
+      ],
+      [
+        "X7",
+        3
+      ],
+      [
+        "X8",
+        3
+      ],
+      [
+        "X9",
+        3
+      ],
+      [
+        "LK",
+        1
+      ],
+      [
+        "Y0",
+        1
+      ],
+      [
+        "Y1",
+        1
+      ],
+      [
+        "LK",
+        3
+      ]
+    ],
+    "formal": [
+      "LE0",
+      "LU0",
+      "LT0",
+      "LE1",
+      "LU1",
+      "LT1",
+      "LE2",
+      "LU2",
+      "LT2",
+      "LE3",
+      "LU3",
+      "LT3"
+    ]
+  }
+}
