@@ -1,10 +1,7 @@
 #include "markov/trace_graph/planning/storage.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <functional>
-#include <limits>
-#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -97,18 +94,10 @@ void Storage::begin_prefetch(ProgramRuntime & runtime, std::size_t request, std:
     std::vector<PrefixId> keys;
     for (std::size_t page = 0; page < count; ++page) {
         const auto next = paths_.append_known(anchor, std::span(tokens).subspan(page * page_tokens_, page_tokens_));
-        if (!next || !std::ranges::all_of(workers_, [&](const Worker & worker) { return worker.files.contains(*next); })) break;
+        if (!next) break;
         keys.push_back(*next);
         anchor = *next;
     }
-    result.queried_pages = keys.size();
-    if (keys.size() * page_tokens_ < config_.threshold_tokens) {
-        cache_.release(buffer);
-        cache_.unpin_host(matched.host);
-        result.ready = result.worker_done = true;
-        return;
-    }
-    cache_.trim(buffer, keys.size());
     Prefetch operation{};
     operation.prefix.assign(lookup.begin(), lookup.begin() + host_pages);
     operation.keys = std::move(keys);
@@ -116,28 +105,12 @@ void Storage::begin_prefetch(ProgramRuntime & runtime, std::size_t request, std:
     operation.buffer = buffer;
     operation.anchor = matched.host;
     operation.enqueue_cause = cause;
-    reserved_pages_ += operation.keys.size();
+    reserved_pages_ += count;
     occupied_pages_ += count;
     prefetches_.emplace(request, std::move(operation));
-    ++stats_.prefetches;
     result.issued_ns = runtime.now_ns();
-    for (std::size_t rank = 0; rank < participants_; ++rank) {
-        auto & worker = workers_[rank];
-        worker.reads.push_back(request);
-        if (worker.reads.size() == 1) start_read(runtime, request, rank, worker.read_completion);
-    }
-
-    if (config_.policy == PrefetchPolicy::Timeout) {
-        const auto budget = std::min<long double>(
-            config_.timeout_max_ns,
-            config_.timeout_base_ns + static_cast<long double>(config_.timeout_per_ki_token_ns) * result.queried_pages * page_tokens_ / 1'024);
-        if (budget >= static_cast<long double>(std::numeric_limits<graph::Time>::max()) - runtime.now_ns())
-            throw std::runtime_error("Prefetch deadline exceeds the execution clock range");
-
-        // The native condition is elapsed > budget, hence the next integer ns.
-        prefetches_.at(request).timer =
-            runtime.schedule_at(runtime.now_ns() + static_cast<graph::Time>(std::floor(budget)) + 1, owner, action(ActionKind::Timeout, request));
-    }
+    queries_.push_back(request);
+    if (queries_.size() == 1) start_query(runtime, request);
 }
 
 PrefetchCheck Storage::check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause) {
@@ -146,9 +119,17 @@ PrefetchCheck Storage::check_prefetch(ProgramRuntime & runtime, std::size_t requ
     if (result.ready) return PrefetchCheck::Ready;
 
     const auto & operation = prefetches_.at(request);
-    const auto complete =
-        result.published_pages == operation.keys.size() || std::ranges::any_of(operation.workers, [](const ReadCursor & worker) { return worker.terminated; });
-    if (operation.stopping || complete || config_.policy == PrefetchPolicy::BestEffort || operation.deadline_cause) {
+    if (operation.queried) trim_buffer(request, result.worker_done ? result.published_pages : operation.keys.size());
+    const auto complete = operation.queried
+                          && (result.published_pages == operation.keys.size()
+                              || std::ranges::any_of(operation.workers, [](const ReadCursor & worker) { return worker.terminated; }));
+    const auto budget = std::min<long double>(config_.timeout_max_ns,
+                                              config_.timeout_base_ns
+                                                  + static_cast<long double>(config_.timeout_per_ki_token_ns) * result.queried_pages * page_tokens_ / 1'024);
+    // Native timeout checks occur on scheduler turns; the hit count is unknown
+    // until query completion, so its token-dependent budget can grow later.
+    const auto expired = config_.policy == PrefetchPolicy::Timeout && runtime.now_ns() - *result.issued_ns > budget;
+    if (operation.stopping || complete || config_.policy == PrefetchPolicy::BestEffort || expired) {
         stop(runtime, request, cause);
         return PrefetchCheck::Finalizing;
     }
@@ -230,15 +211,14 @@ void Storage::stop(ProgramRuntime & runtime, std::size_t request, std::optional<
     if (operation.stopping) return;
     operation.stopping = true;
     for (auto & cursor : operation.workers) cursor.terminated = true;
-    if (operation.timer) runtime.cancel_timer(*operation.timer);
     auto & result = results_[request];
-    result.stopped_early = result.published_pages < operation.keys.size();
+    result.stopped_early = !operation.queried || result.published_pages < operation.keys.size();
     const auto begin = runtime.next_node();
     PlannedMutation mutation{ owner, { { 0, Boundary{}, action(ActionKind::Accept, request) } }, {} };
     if (cause) mutation.dependencies.push_back({ *cause, begin, graph::EdgeKind::DataDependency });
     if (operation.enqueue_cause) mutation.dependencies.push_back({ *operation.enqueue_cause, begin, graph::EdgeKind::DataDependency });
     if (operation.publication_cause) mutation.dependencies.push_back({ *operation.publication_cause, begin, graph::EdgeKind::DataDependency });
-    if (operation.deadline_cause) mutation.dependencies.push_back({ *operation.deadline_cause, begin, graph::EdgeKind::DataDependency });
+    if (operation.query_cause) mutation.dependencies.push_back({ *operation.query_cause, begin, graph::EdgeKind::DataDependency });
     runtime.submit(std::move(mutation));
 }
 
@@ -251,8 +231,9 @@ bool Storage::accept(std::size_t request, graph::Time now_ns) {
     operation.prefix.insert(operation.prefix.end(), operation.keys.begin(), operation.keys.begin() + result.accepted_pages);
     result.inserted_pages = operation.prefix.size() - cache_.match(operation.prefix).pages;
     cache_.commit_host(operation.prefix, operation.buffer);
-    reserved_pages_ -= result.accepted_pages;
-    cache_.trim(operation.buffer, result.worker_done ? 0 : operation.keys.size() - result.accepted_pages);
+    reserved_pages_ -= result.inserted_pages;
+    const auto retained = operation.queried ? operation.keys.size() - result.accepted_pages : result.requested_pages;
+    trim_buffer(request, result.worker_done ? 0 : retained);
     occupied_pages_ -= result.requested_pages;
     cache_.unpin_host(operation.anchor);
     if (result.worker_done) {
@@ -276,14 +257,11 @@ bool Storage::finish_read(ProgramRuntime & runtime, std::size_t request, std::si
         result.worker_done = true;
         result.worker_finished_ns = runtime.now_ns();
         if (result.ready) {
-            reserved_pages_ -= operation.keys.size() - result.accepted_pages;
+            trim_buffer(request, 0);
             cache_.release(operation.buffer);
             prefetches_.erase(request);
         }
-        else {
-            reserved_pages_ -= operation.keys.size() - result.published_pages;
-            cache_.trim(operation.buffer, result.published_pages);
-        }
+        else { trim_buffer(request, result.published_pages); }
     }
     if (!worker.reads.empty()) start_read(runtime, worker.reads.front(), rank, cause);
     return done || terminated;
@@ -404,12 +382,8 @@ bool Storage::on_event(ProgramRuntime & runtime, const simulation::Event & event
     case ActionKind::Accept:
         completion_frontier_[2] = event.identity;
         return accept(subject, runtime.now_ns());
-    case ActionKind::Timeout: {
-        const auto cause = runtime.next_node();
-        runtime.submit({ owner, { { 0, Boundary{} } }, {} });
-        prefetches_.at(subject).deadline_cause = cause;
-        return results_[subject].first_check_ns.has_value();
-    }
+    case ActionKind::Queried:
+        return finish_query(runtime, subject, event.identity);
     case ActionKind::Gathered: {
         const auto & cursor = workers_[subject].writes.front();
         service(runtime, backend_.batch_prepare, cursor.batch_end - cursor.index, subject, true, action(ActionKind::Prepared, subject), event.identity);

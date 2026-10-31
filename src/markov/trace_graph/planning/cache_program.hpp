@@ -198,7 +198,7 @@ private:
     bool region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
-    std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants; }
+    std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants + bool(storage_); }
 
     const source::SourceContext & source_;
     const std::size_t page_tokens_;

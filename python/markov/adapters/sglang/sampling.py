@@ -122,6 +122,37 @@ def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -
     )
 
 
+def _prefetch_query_capture(deployment: Deployment, page: int) -> DeviceCommand:
+    # Fixed small anchors keep calibration independent of base trace size.
+    # Larger hash/check counts remain declared extrapolation, not larger captures.
+    maximum = 7
+    requests = [
+        {
+            "prompt": None,
+            "input_ids": [index % 2] * (pages * page + 1),
+            "max_new_tokens": 1,
+            "ignore_eos": True,
+            "return_logprob": False,
+        }
+        for pages in (maximum - 1, maximum)
+        for index in range(4)
+    ]
+    configuration = {
+        "page_size": page,
+        "max_total_tokens": (maximum + 3) * page,
+        "max_prefill_tokens": (maximum + 1) * page,
+        "enable_hierarchical_cache": True,
+        "hicache_ratio": 1.0,
+        "hicache_write_policy": "write_through",
+        "hicache_storage_backend": "file",
+        "hicache_storage_prefetch_policy": "wait_complete",
+        "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
+    }
+    return _region_capture_command(
+        deployment, configuration, {"requests": requests, "formal_begin_index": 1}, "sglang_prefetch_query"
+    )
+
+
 def sampling_commands(deployment: Deployment, report: dict, requirements: list[dict]) -> list[DeviceCommand]:
     """Only work, supported implementation and source geometry determine recipes."""
     if (deployment.framework, deployment.runtime) != ("sglang", "ascend"):
@@ -133,6 +164,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     io_operations = set()
     scheduler_pages = set()
     failed_load_pages = {}
+    query_pages = set()
     geometry = context["geometry"]
     for requirement in requirements:
         work = requirement.get("work")
@@ -171,6 +203,9 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
                 if segments > 1:
                     io_cases.add((page, max(needed, segments), segments))
+        elif operation == "cache.prefetch.query":
+            for name in requirement["targets"]:
+                query_pages.add(int(cells[name]["configuration"]["page_size"]))
         elif operation.startswith(("cache.prefetch.", "cache.storage_write.")):
             io_operations.add("file")
             for name in requirement["targets"]:
@@ -180,6 +215,8 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     commands = []
     for page, pages in sorted(failed_load_pages.items()):
         commands.append(_failed_load_capture(deployment, page, pages))
+    for page in sorted(query_pages):
+        commands.append(_prefetch_query_capture(deployment, page))
     for (page, enabled), target in sorted(regions.items()):
         workload = region_workload(math.ceil(context["max_context_tokens"]), page, context["final_phases"])
         capacity = sum(

@@ -99,7 +99,7 @@ def events(path: Path, captured: dict) -> Iterator[tuple[int, dict, bool]]:
 
 def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
     for position, event, warmup in events(path, captured):
-        if event["name"] in ("region.scheduler_idle", "region.load_failed"):
+        if event["name"] in ("region.scheduler_idle", "region.load_failed", "prefetch.query"):
             continue
         fields = event["args"]
         name = event["name"].removeprefix("region.")

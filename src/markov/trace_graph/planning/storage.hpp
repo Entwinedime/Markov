@@ -33,12 +33,12 @@ public:
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
     bool idle() const { return prefetches_.empty() && writes_.empty(); }
-    const std::array<std::optional<graph::NodeId>, 3> & completion_frontier() const { return completion_frontier_; }
+    const std::array<std::optional<graph::NodeId>, 4> & completion_frontier() const { return completion_frontier_; }
     const std::vector<PrefetchResult> & results() const { return results_; }
     const StorageStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { Allocated, PageRead, PageCopied, ReadReturned, Accept, Timeout, Gathered, Prepared, PageWritten, PageTouched };
+    enum class ActionKind : std::uint32_t { Allocated, PageRead, PageCopied, ReadReturned, Accept, Queried, Gathered, Prepared, PageWritten, PageTouched };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct ReadCursor {
@@ -53,10 +53,10 @@ private:
         std::vector<graph::NodeId> completed;
         BufferId buffer;
         RadixId anchor;
-        std::optional<std::size_t> timer;
         std::optional<graph::NodeId> enqueue_cause;
-        std::optional<graph::NodeId> publication_cause, deadline_cause;
-        bool stopping = false;
+        std::optional<graph::NodeId> publication_cause, query_cause;
+        std::size_t query_hits = 0;
+        bool stopping = false, queried = false;
     };
     struct Write {
         RadixId source;
@@ -78,6 +78,9 @@ private:
                  std::optional<graph::NodeId> cause);
     graph::NodeId join(ProgramRuntime & runtime, std::span<const graph::NodeId> causes);
     std::optional<graph::NodeId> queued_cause(ProgramRuntime & runtime, std::optional<graph::NodeId> enqueue, std::optional<graph::NodeId> previous);
+    void start_query(ProgramRuntime & runtime, std::size_t request);
+    bool finish_query(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause);
+    void trim_buffer(std::size_t request, std::size_t remaining_pages);
     void start_read(ProgramRuntime & runtime, std::size_t request, std::size_t rank, std::optional<graph::NodeId> cause);
     void read_page(ProgramRuntime & runtime, std::size_t request, std::size_t rank, graph::NodeId cause);
     void copy_page(ProgramRuntime & runtime, std::size_t request, std::size_t rank, graph::NodeId cause);
@@ -100,10 +103,11 @@ private:
     std::vector<Worker> workers_;
     std::size_t access_ = 0, occupied_pages_ = 0, reserved_pages_ = 0;
     std::map<std::size_t, Prefetch> prefetches_;
+    std::deque<std::size_t> queries_;
     std::map<std::size_t, Write> writes_;
 
-    // Read return, write completion and controller acceptance can finish apart.
-    std::array<std::optional<graph::NodeId>, 3> completion_frontier_;
+    // Read, write, acceptance and query workers can finish apart.
+    std::array<std::optional<graph::NodeId>, 4> completion_frontier_;
 };
 
 } // namespace markov::trace_graph::planning

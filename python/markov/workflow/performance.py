@@ -15,6 +15,7 @@ from markov.artifacts.writing import write_json
 from markov.adapters.sglang import (
     cache_control_measurements,
     cache_measurements,
+    prefetch_measurements,
     region_measurements,
     scheduler_measurements,
 )
@@ -26,6 +27,7 @@ ADAPTERS = {
     "ktransformers_phases": ktransformers_measurements,
     "sglang_cache_io": cache_measurements,
     "sglang_cache_controls": cache_control_measurements,
+    "sglang_prefetch_query": prefetch_measurements,
     "sglang_regions": region_measurements,
     "sglang_scheduler": scheduler_measurements,
     "ascend_tensor": tensor_measurements,

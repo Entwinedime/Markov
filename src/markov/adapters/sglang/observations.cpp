@@ -77,6 +77,10 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
+    if (event.name == "prefetch.query") {
+        observe_prefetch_query(event);
+        return;
+    }
     if (event.name == "runtime.scheduler.request_broadcast") {
         const auto & args = event.args;
         if (args.at("status") != "returned") throw std::runtime_error("Cannot interpret a failed source request broadcast");
@@ -311,6 +315,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
 }
 
 void ProbeReader::finish() {
+    finish_prefetch_queries();
     for (const auto & collective : output_.collectives) {
         auto & frame = output_.compute_frames[collective.frame];
         if (frame.participant && *frame.participant != collective.rank)

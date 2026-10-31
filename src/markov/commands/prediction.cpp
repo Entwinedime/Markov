@@ -129,7 +129,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                     {          "issued_ns",                   prefetch.issued_ns ? Json(*prefetch.issued_ns) : Json(nullptr) },
                     {     "first_check_ns",         prefetch.first_check_ns ? Json(*prefetch.first_check_ns) : Json(nullptr) },
                     {        "accepted_ns",               prefetch.accepted_ns ? Json(*prefetch.accepted_ns) : Json(nullptr) },
-                    { "worker_finished_ns", prefetch.worker_finished_ns ? Json(*prefetch.worker_finished_ns) : Json(nullptr) }
+                    { "worker_finished_ns", prefetch.worker_finished_ns ? Json(*prefetch.worker_finished_ns) : Json(nullptr) },
+                    {  "query_finished_ns",   prefetch.query_finished_ns ? Json(*prefetch.query_finished_ns) : Json(nullptr) }
                 };
             }
         }
@@ -179,19 +180,19 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             const auto & stats = storage->stats();
             cells.back()["host_evicted_pages"] = program.host_evicted_pages();
             cells.back()["storage"] = {
-                {              "queries",     stats.queries                                         },
-                {           "prefetches",                                           stats.prefetches },
-                {      "rank_read_pages",                                      stats.rank_read_pages },
-                {    "rank_copied_pages",                                    stats.rank_copied_pages },
-                { "rank_rejected_copies",                                 stats.rank_rejected_copies },
-                {       "write_enqueues",                                               stats.writes },
-                {       "rank_new_pages",                                       stats.rank_new_pages },
-                {  "rank_existing_pages",                                  stats.rank_existing_pages },
-                {                 "idle",                                            storage->idle() },
+                {              "queries",stats.queries                                         },
+                {           "prefetches",           stats.prefetches },
+                {      "rank_read_pages",      stats.rank_read_pages },
+                {    "rank_copied_pages",    stats.rank_copied_pages },
+                { "rank_rejected_copies", stats.rank_rejected_copies },
+                {       "write_enqueues",               stats.writes },
+                {       "rank_new_pages",       stats.rank_new_pages },
+                {  "rank_existing_pages",  stats.rank_existing_pages },
+                {                 "idle",            storage->idle() },
                 {        "qualification",
                  "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control reuses the source "
-                 "residual. Hash queries and earliest "
-                 "event-driven checks omit measured scheduler polling and changed control service." }
+                 "residual. Background query groups and measured idle scheduler turns are separate; frontend issue/accept and concurrent file changes remain "
+                 "approximate."                                     }
             };
         }
     }
@@ -228,7 +229,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             "First-phase initialization remains an estimate. New input preparations use the adapter's specialization rules, not raw token lengths.",
             "Modeled parent waits use target readiness ports. Other source frontend/control intervals retain their opaque work and waits; unidentified "
             "probe overhead and changed control behavior remain uncertain.",
-            "Cache query CPU retains the source residual approximation; state-dependent tree overhead and competing I/O/compute need further validation.",
+            "Background file queries use a shared group-response lane and warm metadata costs; rank-return skew and file changes during a query remain "
+            "approximate. Frontend issue/accept and radix lookup retain source residuals; competing I/O/compute needs further validation.",
             "Serial client pacing retains the source interval between requests, outside each request's HTTP. Changed client behavior is not modeled.",
             "HTTP send and post-send CPU are separate; unconsumed overlapped computation and background I/O still drain after HTTP.",
             "No normal E2E accuracy or complete device-causality qualification is implied by execution." } }

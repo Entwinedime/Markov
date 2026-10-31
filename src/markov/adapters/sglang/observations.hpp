@@ -40,6 +40,8 @@ private:
     void observe_regenerated_control(const ProbeEvent & event);
     void observe_response(const ProbeEvent & event);
     void observe_storage(const ProbeEvent & event);
+    void observe_prefetch_query(const ProbeEvent & event);
+    void finish_prefetch_queries();
     std::optional<std::filesystem::path> configuration_;
     std::string result_implementation_;
     std::optional<bool> deterministic_sampling_;
@@ -60,6 +62,13 @@ private:
         std::vector<trace_graph::source::Index> members;
     };
     std::map<BatchIdentity, RequestBroadcast> request_broadcasts_;
+    struct PrefetchQuery {
+        trace_graph::source::ObservedRegion region;
+        trace_graph::source::Index participant, participants;
+        trace_graph::source::Time queued_at_ns;
+        trace_graph::planning::Features features;
+    };
+    std::map<trace_graph::source::Index, std::vector<PrefetchQuery>> prefetch_queries_;
     std::map<trace_graph::source::Index, std::vector<trace_graph::source::Index>> pending_controls_;
     std::map<std::pair<trace_graph::source::Index, trace_graph::source::Index>, trace_graph::source::ObservedRegion> prefetch_waits_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;

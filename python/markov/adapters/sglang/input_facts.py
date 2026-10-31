@@ -95,10 +95,12 @@ def install() -> None:
     measurements = os.environ.get("MARKOV_REGION_MEASUREMENTS")
     region_writer = None
     if measurements:
+        from markov.adapters.sglang.prefetch_probe import PrefetchProbe
         from markov.adapters.sglang.region_probe import RegionProbe
 
         region_writer = EventWriter(Path(measurements))
         RegionProbe(region_writer, record_scheduler=not os.environ.get("MARKOV_INPUT_FACTS")).install()
+        PrefetchProbe(region_writer).install()
 
     output = os.environ.get("MARKOV_INPUT_FACTS")
     writer = None
