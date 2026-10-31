@@ -50,14 +50,11 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
     }
 }
 
-void HiCacheLoads::rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members) {
-    const auto & graph = source.graph();
+void HiCacheLoads::bind_stream_positions(const source_dag::SourceDagIndex & source) {
     for (auto & [index, insertion] : insertions_) {
         const auto & record = loads_[index].record;
         rebind_host_stream_positions(source, insertion.positions, record.pid, record.tid, record.source_start_us);
     }
-
-    for (auto & [key, program] : generated_submissions_) program.worker = members.at(graph.node(program.worker).lane_id);
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

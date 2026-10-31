@@ -149,6 +149,8 @@ HiCacheWindowResult HiCacheExecution::run() {
     output_.performance["compact_programs"] = compact_programs_;
     output_.performance["executed_nodes"] = output_.simulation.processed_nodes;
     output_.performance["expansion_callbacks"] = output_.simulation.expansion_callbacks;
+    output_.performance["source_queue_program_tasks_reused"] = output_.simulation.source_queue_program_tasks_reused;
+    output_.performance["declared_worker_resources"] = output_.simulation.declared_worker_resources;
     output_.performance["source_replacement_phases"] = std::move(replacement_phases);
     output_.performance["operator_queries_nested"] = operator_provider_.performance();
     return std::move(output_);
@@ -224,17 +226,15 @@ nlohmann::json HiCacheExecution::replace_source_regions() {
     metrics.checkpoint("phase_call_regions");
     allocator_calls_.bind(graph_, prepared_, replay_.facts(), compute_resources_.schedule, begin_us_, end_us_);
     metrics.checkpoint("allocator_call_regions");
-    // No source regions are replaced after this point. Every generated host
-    // operation binds against the same surviving worker queues.
+    // Source resources survive work replacement. Only graph insertion cuts
+    // need refreshing after all source regions have been removed.
     {
         const source_dag::SourceDagIndex retained(graph_);
-        const auto workers = observe_host_worker_members(graph_);
-        loads_.rebind_retained_resources(retained, workers);
-        layer_calls_.rebind_retained_resources(retained, workers);
-        phase_calls_.rebind_retained_resources(retained, workers);
-        allocator_calls_.rebind_resources(retained, workers);
-        writes_.rebind_retained_resources(retained, workers);
-        write_confirmations_.rebind_resources(workers);
+        loads_.bind_stream_positions(retained);
+        layer_calls_.bind_stream_positions(retained);
+        phase_calls_.bind_stream_positions(retained);
+        allocator_calls_.bind_stream_positions(retained);
+        writes_.bind_stream_positions(retained);
     }
     metrics.checkpoint("retained_resource_binding");
     for (const auto & [node, ids] : facts_at_)

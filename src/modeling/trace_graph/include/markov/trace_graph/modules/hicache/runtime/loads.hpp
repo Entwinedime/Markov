@@ -40,7 +40,7 @@ public:
     // Layer consumers must first detach from the old completion records.
     void replace_source_submissions(core::DagGraph & graph);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
-    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
+    void bind_stream_positions(const source_dag::SourceDagIndex & source);
     [[nodiscard]] size_t source_submissions() const { return loads_.size(); }
     [[nodiscard]] size_t completed_batches() const { return completed_; }
     [[nodiscard]] size_t shared_cost_batches() const { return shared_cost_batches_; }

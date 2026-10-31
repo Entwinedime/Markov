@@ -34,7 +34,7 @@ public:
     void bind(core::DagGraph & graph, const core::DagGraph & original, std::span<const adapters::sglang::AttentionCall> calls,
               std::span<const adapters::sglang::AttentionMetadataCall> metadata, std::span<const adapters::sglang::DenseCall> dense, uint64_t begin_us,
               uint64_t end_us);
-    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers);
+    void bind_stream_positions(const source_dag::SourceDagIndex & source);
     void set_work(structure::hicache::PhaseCallPlan work);
     void advance(core::DagGraph & graph, size_t node, const HiCacheLayerCalls::Consumer & consumer, simulation::FutureDag & future);
     [[nodiscard]] bool owns(size_t source_node) const { return owned_.contains(source_node); }

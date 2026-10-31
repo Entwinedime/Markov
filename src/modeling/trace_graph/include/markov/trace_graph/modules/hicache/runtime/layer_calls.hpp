@@ -25,7 +25,7 @@ public:
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end);
     // Called after all source replacements: queue membership and stream cuts
     // must refer to the same retained graph used by the executor.
-    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
+    void bind_stream_positions(const source_dag::SourceDagIndex & source);
     void advance(size_t node, const Consumer & consumer, simulation::FutureDag & future);
     struct NestedCall {
         size_t anchor;
@@ -52,7 +52,7 @@ public:
     void handoff_replaced_calls(const core::DagGraph & graph, std::span<const NestedCall> calls);
     /** Move callbacks onto an unchanged call's copied anchors. Rebind internal
      * successors and stream neighbors using source_nodes, while external cuts
-     * use rebind_retained_resources. Target state still selects active/inactive
+     * use bind_stream_positions. Target state still selects active/inactive
      * checks; an observed device wait is never migrated as elapsed time. Returns
      * the retained gap outside the enclosing interval for its caller to attach
      * after the replacement; nested callbacks retain only their inside gaps.

@@ -67,7 +67,7 @@ public:
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end, size_t opening_node);
     void replace_active_load_branches(core::DagGraph & graph);
     // Finalize resource and consumer bindings after all source replacements.
-    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
+    void bind_stream_positions(const source_dag::SourceDagIndex & source);
     void applied(const model::HiCacheReplayFact & input) const;
     /** Returns facts whose allocations completed at this boundary. */
     std::vector<size_t> advance(size_t node, uint64_t time, simulation::FutureDag & future);
@@ -98,7 +98,6 @@ private:
     // Candidate load/capacity resources are required only when target work uses
     // them. Other calls fail immediately if their observed resource is unbound.
     void bind_call_resources(const source_dag::SourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
-    [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
     void bind_capacity_calls(const adapters::sglang::HiCacheSourceIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void replace_source_write_calls(core::DagGraph & graph);

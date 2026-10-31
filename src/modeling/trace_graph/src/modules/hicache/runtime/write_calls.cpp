@@ -88,26 +88,6 @@ void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const si
     }
 }
 
-std::vector<HiCacheHostExpansion *> HiCacheWriteCalls::host_plans() {
-    std::vector<HiCacheHostExpansion *> plans;
-    // Observed write/eviction fragments now serve only removal and resource
-    // identification. Only programs that will actually execute need worker
-    // rebinding; an obsolete source worker is not a target cost requirement.
-
-    for (auto & donor : load_admissions_) {
-        if (donor.clone) plans.push_back(&donor.clone->program.plan);
-        for (auto & step : donor.allocation) plans.push_back(&step.program.plan);
-        plans.push_back(&donor.prefix_concat.program.plan);
-        if (allocator_need_sort_) {
-            plans.push_back(&donor.merge_concat.program.plan);
-            plans.push_back(&donor.merge_sort.program.plan);
-        }
-    }
-
-    for (auto & [id, plan] : load_failure_templates_) plans.push_back(&plan);
-    return plans;
-}
-
 HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources & resources, const HiCacheFact & fact,
                                                             const model::HiCacheDeviceWrite & operation, HiCacheHostSequence & sequence,
                                                             simulation::FutureDag & future) {

@@ -134,9 +134,6 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, regions));
 }
 
-void HiCacheWriteConfirmations::rebind_resources(const std::map<size_t, size_t> & workers) {
-    for (auto & [lane, member] : worker_members_) member = workers.at(graph_->node(member).lane_id);
-}
 
 size_t HiCacheWriteConfirmations::expand(const WriteConfirmationWork & work, model::HiCacheState & state, const HiCacheWriteCalls & writes,
                                          simulation::FutureDag & future) {

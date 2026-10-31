@@ -47,13 +47,6 @@ void bind_cpu_control(HiCacheHostExpansion & plan, double cpu_us, double residua
     plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
 }
 
-std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph) {
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    std::map<size_t, size_t> members;
-    for (const auto & task : queues.tasks) members.emplace(graph.node(task.first).lane_id, task.first);
-    return members;
-}
-
 void rebind_host_stream_position(const source_dag::SourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
                                  const std::string & tid, uint64_t at_us) {
     const auto & graph = source.graph();
@@ -66,18 +59,6 @@ void rebind_host_stream_position(const source_dag::SourceDagIndex & source, HiCa
 void rebind_host_stream_positions(const source_dag::SourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions, const std::string & pid,
                                   const std::string & tid, uint64_t at_us) {
     for (auto & [lane, position] : positions) rebind_host_stream_position(source, position, pid, tid, at_us);
-}
-
-void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members, std::span<HiCacheHostExpansion *> plans) {
-    std::vector<std::pair<HiCacheHostExpansion::Node *, size_t>> bindings;
-    for (auto * plan : plans)
-        for (auto & node : plan->nodes) {
-            if (!node.queue_member) continue;
-            const auto member = members.find(graph.node(*node.queue_member).lane_id);
-            if (member == members.end()) throw std::runtime_error("Host template has no surviving task on its original worker queue");
-            bindings.emplace_back(&node, member->second);
-        }
-    for (const auto & [node, member] : bindings) node->queue_member = member;
 }
 
 HiCacheHostSequence::HiCacheHostSequence(const std::map<size_t, HiCacheWriteStreamPosition> & positions, HiCacheWriteStreamInsertions & insertions,
@@ -178,7 +159,7 @@ HiCacheExpandedHost expand_host_work(HiCacheHostExpansion & plan, std::span<cons
         auto & node = plan.nodes[i];
         const bool observe = observers[i] || node.observe_start;
         if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(std::move(node.work), nodes.at(*node.task_predecessor), observe);
-        else if (node.submission) nodes[i] = future.append_cpu_task(std::move(node.work), nodes.at(*node.submission), *node.queue_member, observe);
+        else if (node.submission) nodes[i] = future.append_cpu_task(std::move(node.work), nodes.at(*node.submission), observe);
         else nodes[i] = future.append(std::move(node.work), simulation::BoundaryOrder::Ordinary, std::nullopt, observe);
     }
 

@@ -188,7 +188,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     }
 }
 
-void HiCacheWriteCalls::rebind_retained_resources(const source_dag::SourceDagIndex & retained, const std::map<size_t, size_t> & members) {
+void HiCacheWriteCalls::bind_stream_positions(const source_dag::SourceDagIndex & retained) {
     // Bind after all source regions have been replaced, including load
     // submissions whose compute Records can be the next stream endpoint.
     const auto & graph = retained.graph();
@@ -232,12 +232,6 @@ void HiCacheWriteCalls::rebind_retained_resources(const source_dag::SourceDagInd
     }
     for (auto & [node, calls] : lifecycle_writes_at_)
         for (auto & call : calls) refresh(call);
-    auto plans = host_plans();
-    rebind_host_worker_queues(graph, members, plans);
-    for (auto & [key, resources] : write_resources_) {
-        const auto lane = graph.node(resources.worker).lane_id;
-        resources.worker = members.at(lane);
-    }
 }
 
 

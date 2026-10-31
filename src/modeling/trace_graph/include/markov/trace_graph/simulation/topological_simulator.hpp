@@ -23,6 +23,8 @@ struct SimulationResult {
     uint64_t e2e_us = 0;
     size_t processed_nodes = 0;
     size_t expansion_callbacks = 0;
+    size_t source_queue_program_tasks_reused = 0;
+    size_t declared_worker_resources = 0;
     size_t cpu_queue_count = 0;
     size_t cpu_task_count = 0;
     size_t max_cpu_queue_depth = 0;
@@ -80,10 +82,10 @@ public:
     // and queue execution are unchanged. Exported state boundaries must observe.
     virtual size_t append(core::DagSyntheticNodeSpec node, BoundaryOrder order = BoundaryOrder::Ordinary, std::optional<size_t> owner = std::nullopt,
                           bool observe_start = true) = 0;
-    /** Add one measured task to an existing recognized worker FIFO. The unique
-     * cross-thread submission must not have completed. queue_member proves
-     * the worker identity; no observed task or queue order is overwritten. */
-    virtual size_t append_cpu_task(core::DagSyntheticNodeSpec node, size_t submission, size_t queue_member, bool observe_start = true) = 0;
+    /** Add one measured task to the declared worker named by node.lane_key.
+     * The unique cross-thread submission must not have completed. Resource
+     * identity does not require any surviving source task or worker node. */
+    virtual size_t append_cpu_task(core::DagSyntheticNodeSpec node, size_t submission, bool observe_start = true) = 0;
     /** Extend an unstarted generated task after its current last member.
      * Keeps the same submission/FIFO ownership; only the first member carries
      * dispatch delay. The queue is released after the new last member, allowing

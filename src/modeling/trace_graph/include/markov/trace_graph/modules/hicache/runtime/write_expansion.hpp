@@ -99,18 +99,12 @@ struct HiCacheWriteExpansion : HiCacheHostExpansion {
  * fractional microseconds are carried by the caller across related calls. */
 void bind_cpu_control(HiCacheHostExpansion & plan, double cpu_us, double residual_us, std::pair<double, double> & remainders);
 
-/** Observe surviving worker lanes once after all source replacements.
- * Values are queue-member node IDs, not task costs or dispatch estimates. */
-[[nodiscard]] std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph);
 /** Refresh insertion endpoints disabled by another source-region replacement.
  * Empty positions describe target-only streams and remain empty. */
 void rebind_host_stream_position(const source_dag::SourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
                                  const std::string & tid, uint64_t at_us);
 void rebind_host_stream_positions(const source_dag::SourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions, const std::string & pid,
                                   const std::string & tid, uint64_t at_us);
-/** Rebind copied tasks using the final source graph's exact worker lanes. */
-void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members, std::span<HiCacheHostExpansion *> plans);
-
 /** Semantic resources observed inside a write call, independent of numeric
  * lane ids. Worker roles are identified by the calls submitting their tasks. */
 [[nodiscard]] std::map<std::string, size_t> write_resource_roles(const core::DagGraph & graph, const HiCacheWriteExpansion & plan, size_t compute_record);

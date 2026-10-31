@@ -270,6 +270,11 @@ public:
     /** @brief Returns an event by event-vector index. */
     [[nodiscard]] const TraceEvent & event(size_t event_index) const;
 
+    /** Whether source task facts can still use the original event fields.
+     * Target event overrides are resolved by queue binding, not by discarding
+     * the entire immutable source task inventory. */
+    [[nodiscard]] bool source_event_unchanged(size_t event_index) const;
+
     /** @brief Returns a mutable event by event-vector index. */
     TraceEvent & mutable_event(size_t event_index);
 

@@ -169,7 +169,9 @@ public:
         if (mode_ == ReplayMode::Full) {
             graph_.set_e2e_time(e2e_);
             queues_.materialize(graph_, task_order_);
-            result_.cpu_queue_count = queues_.queue_count;
+            result_.cpu_queue_count = std::ranges::count_if(task_order_, [](const auto & order) { return !order.empty(); });
+            result_.declared_worker_resources = queues_.queue_count;
+            result_.source_queue_program_tasks_reused = queues_.source_program_tasks_reused;
             result_.cpu_task_count = queues_.tasks.size();
             for (const auto & task : queues_.tasks) {
                 result_.submission_overlap_count += task.submission_overlap_us != 0;
@@ -357,14 +359,14 @@ private:
         return id;
     }
 
-    size_t append_cpu_task(core::DagSyntheticNodeSpec spec, size_t submission, size_t queue_member, bool observe_start) override {
-        if (expanding_node_ == kInvalidNode || !spec.is_cpu || spec.cpu_gap_after || submission >= nodes_.size() || queue_member >= nodes_.size()
-            || !nodes_[submission].active || !nodes_[submission].is_cpu || execution_[node_slot(submission)] == Execution::Done
-            || queues_.submitted_task[submission] != kInvalidNode || queues_.node_task[queue_member] == kInvalidNode || !spec.cpu_task_ready_delay_us)
+    size_t append_cpu_task(core::DagSyntheticNodeSpec spec, size_t submission, bool observe_start) override {
+        const auto resource = queues_.worker_queues.find(spec.lane_key);
+        if (expanding_node_ == kInvalidNode || !spec.is_cpu || spec.cpu_gap_after || submission >= nodes_.size() || !nodes_[submission].active
+            || !nodes_[submission].is_cpu || execution_[node_slot(submission)] == Execution::Done || queues_.submitted_task[submission] != kInvalidNode
+            || resource == queues_.worker_queues.end() || !spec.cpu_task_ready_delay_us)
             throw std::invalid_argument("New CPU task requires one unfinished submission and a recognized worker");
-        const auto queue = queues_.tasks[queues_.node_task[queue_member]].queue;
-        if (graph_.node_lane_key(queue_member) != spec.lane_key || nodes_[submission].lane_id == nodes_[queue_member].lane_id
-            || nodes_[submission].gpu_id != nodes_[queue_member].gpu_id)
+        const auto queue = resource->second.queue;
+        if (graph_.node_lane_key(submission) == spec.lane_key || nodes_[submission].gpu_id != resource->second.logical_input)
             throw std::invalid_argument("New CPU task must join the declared cross-thread worker on the same rank");
         const auto ready_delay = *spec.cpu_task_ready_delay_us;
         spec.cpu_task_ready_delay_us.reset();

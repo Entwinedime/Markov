@@ -152,11 +152,8 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, removals));
 }
 
-void HiCacheAllocatorCalls::rebind_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers) {
-    std::vector<HiCacheHostExpansion *> retained;
+void HiCacheAllocatorCalls::bind_stream_positions(const source_dag::SourceDagIndex & source) {
     for (auto & [entry, call] : calls_) {
-        retained.push_back(&call.retained);
-        call.resources.worker = workers.at(source.graph().node(call.resources.worker).lane_id);
         auto resources = call.retained.resource_nodes();
         resources.push_back(call.resources.compute);
         for (const auto resource : resources) {
@@ -165,7 +162,6 @@ void HiCacheAllocatorCalls::rebind_resources(const source_dag::SourceDagIndex & 
                 call.positions.emplace(lane, observe_write_stream_position(source, resource, call.pid, call.tid, call.begin_us));
         }
     }
-    rebind_host_worker_queues(source.graph(), workers, retained);
 }
 
 void HiCacheAllocatorCalls::set_work(const model::HiCacheAllocatorWorkItem & work, const adapters::sglang::AllocatorPreparation & preparation) {

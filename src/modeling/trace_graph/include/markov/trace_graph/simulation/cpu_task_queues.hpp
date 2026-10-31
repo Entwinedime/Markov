@@ -2,11 +2,10 @@
  * Queue order is resolved during full simulation, never copied from a donor. */
 #pragma once
 #include "markov/trace_graph/core/dag_graph.hpp"
-#include <vector>
-#ifdef DEBUG
+#include <functional>
 #include <map>
 #include <string>
-#endif
+#include <vector>
 
 namespace markov::trace_graph::simulation::detail {
 
@@ -17,9 +16,16 @@ struct CpuTask {
 };
 
 struct CpuTaskQueues {
+    struct WorkerResource {
+        size_t queue;
+        int logical_input;
+    };
+
     std::vector<CpuTask> tasks;
     std::vector<size_t> node_task, submitted_task;
+    std::map<std::string, WorkerResource, std::less<>> worker_queues;
     size_t queue_count = 0;
+    size_t source_program_tasks_reused = 0;
 #ifdef DEBUG
     std::map<size_t, std::string> unavailable_lanes;
 #endif

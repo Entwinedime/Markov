@@ -249,7 +249,7 @@ const TraceEvent & DagGraph::event(size_t event_index) const {
 TraceEvent & DagGraph::mutable_event(size_t event_index) {
     cpu_intervals_.reset();
     if (source_cpu_intervals_ && event_index < source_cpu_intervals_->event_count) source_cpu_intervals_.reset();
-    if (cpu_task_observations_ && event_index < cpu_task_observations_->event_count) cpu_task_observations_.reset();
+    if (!source_events_ && cpu_task_observations_ && event_index < cpu_task_observations_->event_count) cpu_task_observations_.reset();
     const auto shared = source_events_ ? source_events_->size() : 0;
     if (event_index < shared) {
         const auto found = event_overrides_.find(event_index);
@@ -260,6 +260,10 @@ TraceEvent & DagGraph::mutable_event(size_t event_index) {
 }
 
 const TraceEvent & DagGraph::event_for_node(size_t node_id) const { return event(node(node_id).event_index); }
+
+bool DagGraph::source_event_unchanged(size_t event_index) const {
+    return source_events_ && event_index < source_events_->size() && !event_overrides_.contains(event_index);
+}
 
 TraceEvent & DagGraph::mutable_event_for_node(size_t node_id) { return mutable_event(node(node_id).event_index); }
 

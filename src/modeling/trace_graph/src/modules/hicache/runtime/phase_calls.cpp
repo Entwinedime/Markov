@@ -143,22 +143,16 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     }
 }
 
-void HiCachePhaseCalls::rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers) {
-    std::vector<HiCacheHostExpansion *> retained;
+void HiCachePhaseCalls::bind_stream_positions(const source_dag::SourceDagIndex & source) {
     for (auto & [entry, call] : calls_) {
-        retained.push_back(&call.retained);
         auto resources = call.retained.resource_nodes();
-        if (call.resources) {
-            call.resources->worker = workers.at(source.graph().node(call.resources->worker).lane_id);
-            resources.push_back(call.resources->compute);
-        }
+        if (call.resources) { resources.push_back(call.resources->compute); }
         for (const auto resource : resources) {
             const auto lane = source.graph().node(resource).lane_id;
             if (!call.positions.contains(lane))
                 call.positions.emplace(lane, observe_write_stream_position(source, resource, call.pid, call.tid, call.begin_us));
         }
     }
-    rebind_host_worker_queues(source.graph(), workers, retained);
 }
 
 void HiCachePhaseCalls::set_work(structure::hicache::PhaseCallPlan work) { work_.insert_or_assign(work.source_observation, std::move(work)); }

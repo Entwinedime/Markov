@@ -7,9 +7,58 @@
 #include <memory>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace markov::trace_graph::core {
+
+CpuTaskObservations::QueueProgram compile_cpu_queue_program(const DagGraph & graph, std::span<const CpuTaskObservations::Member> observed,
+                                                            std::span<const size_t> submissions) {
+    constexpr auto absent = DagNode::kNoNode;
+    CpuTaskObservations::QueueProgram program;
+    std::vector<size_t> identities;
+    std::vector<uint64_t> previous_ends;
+    uint64_t previous_end = 0;
+    for (const auto & member : observed) {
+        const auto & node = graph.node(member.node);
+        if (node.explicit_cpu_task) continue;
+        if (node.active) {
+            program.members.push_back(member.node);
+            identities.push_back(member.identity);
+            previous_ends.push_back(previous_end);
+        }
+        previous_end = member.end_us;
+    }
+
+    std::vector<size_t> producers;
+    producers.reserve(identities.size());
+    for (size_t index = 0; index < identities.size(); ++index) {
+        const auto identity = identities[index];
+        const auto submit = identity == absent ? absent : submissions[identity];
+        if (submit >= graph.node_count() || graph.node(submit).lane_id == graph.node(program.members[index]).lane_id) {
+            program.missing_submission = program.members[index];
+            return program;
+        }
+        producers.push_back(submit);
+    }
+
+    std::unordered_set<size_t> seen;
+    for (size_t begin = 0; begin < program.members.size();) {
+        size_t stop = begin + 1;
+        while (stop < program.members.size() && producers[stop] == producers[begin]) ++stop;
+        const auto submit = producers[begin], first = program.members[begin], last = program.members[stop - 1];
+        const auto & submission = graph.event_for_node(submit);
+        const auto start = graph.event_for_node(first).ts;
+        if (!seen.insert(submit).second || submission.ts > start || previous_ends[begin] > start) return program;
+        const auto submitted = checked_add_u64(submission.ts, submission.dur, "CPU submission end overflow");
+        const auto ready = std::max(submitted, previous_ends[begin]);
+        program.tasks.push_back(
+            { first, last, submit, identities[begin], begin, stop, submitted, start > ready ? start - ready : 0, ready > start ? ready - start : 0 });
+        begin = stop;
+    }
+    program.complete = true;
+    return program;
+}
 
 std::shared_ptr<const DagAdjacency> DagGraph::adjacency() const {
     if (adjacency_) return adjacency_;
@@ -129,6 +178,33 @@ std::shared_ptr<const CpuTaskObservations> DagGraph::cpu_task_observations() con
     // Endpoints may later move; retain every edge of these kinds, not just current cross-lane edges.
     for (size_t id = 0; id < edge_count(); ++id)
         if (edge(id).kind == DagEdgeKind::Sequential || edge(id).kind == DagEdgeKind::Correlation) index.task_edges.push_back(id);
+
+    constexpr auto absent = DagNode::kNoNode;
+    std::vector<size_t> submissions(index.identities.size(), absent);
+    for (const auto & [identity, node] : index.submissions) {
+        if (!this->node(node).active) continue;
+        auto & unique = submissions[identity];
+        unique = unique == absent ? node : absent - 1;
+    }
+    std::unordered_set<size_t> cross_lane_delays;
+    for (const auto id : index.task_edges) {
+        const auto & dependency = edge(id);
+        if (dependency.active && dependency.kind == DagEdgeKind::Sequential && node(dependency.src).lane_id != node(dependency.dst).lane_id)
+            cross_lane_delays.insert(node(dependency.src).lane_id);
+    }
+    std::vector<bool> assigned(node_count());
+    for (const auto & [lane, members] : index.lanes) {
+        if (cross_lane_delays.contains(lane)) continue;
+        auto program = compile_cpu_queue_program(*this, members, submissions);
+        if (!program.complete || program.tasks.empty()) continue;
+        const bool unavailable = std::ranges::any_of(program.tasks, [&](const auto & task) {
+            const auto & last = node(task.last);
+            return assigned[task.submission] || scope_gap_duration(task.last) || (last.cpu_gap_after && last.cpu_gap_after != last.original_cpu_gap_after);
+        });
+        if (unavailable) continue;
+        for (const auto & task : program.tasks) assigned[task.submission] = true;
+        index.queue_programs.emplace(lane, std::move(program));
+    }
 
     return cpu_task_observations_ = std::make_shared<const CpuTaskObservations>(std::move(index));
 }

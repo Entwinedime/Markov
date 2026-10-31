@@ -40,7 +40,6 @@ public:
     void prepare(core::DagGraph & graph, uint64_t begin, uint64_t end, const std::vector<core::TraceEvent> & replaced,
                  std::optional<uint64_t> idle_since_us = std::nullopt);
     void replace_source_tails(core::DagGraph & graph);
-    void rebind_resources(const std::map<size_t, size_t> & workers);
     size_t expand(const WriteConfirmationWork & work, model::HiCacheState & state, const HiCacheWriteCalls & writes, simulation::FutureDag & future);
     void advance(size_t node, uint64_t time_us, model::HiCacheState & state);
 

@@ -93,15 +93,12 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     }
 }
 
-void HiCacheLayerCalls::rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members) {
+void HiCacheLayerCalls::bind_stream_positions(const source_dag::SourceDagIndex & source) {
     const auto & graph = source.graph();
-    std::vector<HiCacheHostExpansion *> templates;
     for (auto & [node, call] : calls_) {
-        templates.push_back(&call.program.plan);
         const auto & event = graph.event_for_node(node);
         rebind_host_stream_position(source, call.position, call.pid, event.tid, call.source_start_ns / 1'000);
     }
-    rebind_host_worker_queues(graph, members, templates);
 }
 
 std::vector<HiCacheLayerCalls::NestedCall> HiCacheLayerCalls::nested_calls(const core::DagGraph & graph, const std::string & pid, const std::string & tid,
