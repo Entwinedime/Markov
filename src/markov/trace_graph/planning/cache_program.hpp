@@ -27,6 +27,7 @@ struct CacheBackend {
     // Targets share one immutable native recipe, not mutable cache state.
     std::shared_ptr<const CallSequence> backup_calls;
     StorageBackend storage;
+    WorkKind scheduler_idle;
 };
 
 struct CacheRequestResult {
@@ -34,6 +35,7 @@ struct CacheRequestResult {
     std::size_t deferred_kv_pages = 0;
     std::size_t released_device_pages = 0;
     std::size_t query_index_copies = 0, query_operations = 0;
+    std::size_t prefetch_poll_rounds = 0;
     std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
     std::optional<graph::NodeId> start, arrived, received, prefill_prefix_published, response, kv_published, pages_released, work_completed;
@@ -93,9 +95,11 @@ private:
         ReleasedPages,
         QuerySubmitted,
         QueryDone,
-        ClientReady
+        ClientReady,
+        PollGranted,
+        PollReturned
     };
-    enum class RequestStage { BeforeStart, ClientPacing, Ingress, Waiting, Admitting, Active, Querying, Response };
+    enum class RequestStage { BeforeStart, ClientPacing, Ingress, Waiting, Admitting, Active, Querying, PrefetchPolling, PrefetchFinalizing, Response };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -126,6 +130,8 @@ private:
         std::vector<std::size_t> callers;
         std::vector<graph::NodeId> admission;
         std::vector<graph::NodeId> query_submissions;
+        std::vector<graph::NodeId> poll_returns;
+        graph::Time poll_started_ns = 0;
         std::map<std::size_t, std::size_t> admission_gaps;
         bool queried = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
@@ -155,6 +161,7 @@ private:
     void advance(ProgramRuntime & runtime);
     void begin_request(ProgramRuntime & runtime, bool drain);
     void wait_for_progress(ProgramRuntime & runtime);
+    void poll_prefetch(ProgramRuntime & runtime);
     void respond(ProgramRuntime & runtime, std::size_t request);
     void compute(ProgramRuntime & runtime);
     void query(ProgramRuntime & runtime, std::span<const PrefixId> lookup, const CacheMatch & matched);

@@ -9,6 +9,7 @@
 namespace markov::trace_graph::planning {
 
 enum class PrefetchPolicy { Complete, BestEffort, Timeout };
+enum class PrefetchCheck { Ready, Pending, Finalizing };
 
 struct StorageConfig {
     std::optional<std::size_t> capacity_pages;

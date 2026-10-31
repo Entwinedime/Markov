@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <functional>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::planning {
@@ -217,6 +218,22 @@ void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
     request_stage_ = RequestStage::Waiting;
 }
 
+void CacheProgram::poll_prefetch(ProgramRuntime & runtime) {
+    auto & running = running_[request_];
+    running.poll_returns.clear();
+    running.poll_started_ns = runtime.now_ns();
+    running.admission.clear();
+    ++requests_[request_].prefetch_poll_rounds;
+    request_stage_ = RequestStage::PrefetchPolling;
+    waiting_ = false;
+
+    // Let older result/backup calls use their CPU turn before another idle
+    // iteration. Worker progress never grants a fresh scheduler turn itself.
+    for (const auto caller : running.callers) queues_.callers.release(runtime, caller, 0, *cause_);
+    for (std::size_t rank = 0; rank < running.callers.size(); ++rank)
+        queues_.callers.acquire(runtime, running.callers[rank], 0, action(ActionKind::PollGranted, request_ * backend_.participants + rank), cause_);
+}
+
 void CacheProgram::advance(ProgramRuntime & runtime) {
     if (issue_ || eviction_wait_ || request_ == requests_.size()) return;
     waiting_ = true;
@@ -256,8 +273,13 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     }
     if (storage_) {
         storage_->begin_prefetch(runtime, request_, lookup, matched, cause_);
-        if (!storage_->check_prefetch(runtime, request_, cause_)) {
-            wait_for_progress(runtime);
+        const auto progress = storage_->check_prefetch(runtime, request_, cause_);
+        if (progress == PrefetchCheck::Pending) {
+            poll_prefetch(runtime);
+            return;
+        }
+        if (progress == PrefetchCheck::Finalizing) {
+            request_stage_ = RequestStage::PrefetchFinalizing;
             return;
         }
     }
@@ -535,6 +557,11 @@ bool CacheProgram::complete() const {
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
     if (event.owner == Storage::owner) {
         const auto changed = storage_->on_event(runtime, event);
+        if (request_stage_ == RequestStage::PrefetchFinalizing && request_ < requests_.size()) {
+            if (!storage_->results()[request_].ready) return;
+            running_[request_].queried = false;
+            request_stage_ = RequestStage::Active;
+        }
         if (changed && waiting_) {
             cause_ = event.origin == simulation::EventOrigin::Completion ? std::optional(event.identity) : std::nullopt;
             advance(runtime);
@@ -601,6 +628,32 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
         finish_compute(runtime, group.request);
         if (waiting_) advance(runtime);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::PollGranted)) {
+        const auto request = event.action.subject / backend_.participants;
+        const auto rank = event.action.subject % backend_.participants;
+        auto & running = running_[request];
+        running.admission.push_back(event.identity);
+        const Work work{ backend_.scheduler_idle, { { "participants", backend_.participants } } };
+        PlannedMutation mutation{ 0,
+                                  { { running.callers[rank], std::cref(work), action(ActionKind::PollReturned, request), true } },
+                                  { { event.identity, runtime.next_node(), graph::EdgeKind::ResourceOrder } } };
+        if (runtime.records_graph())
+            mutation.operations.front().position = OperationPosition{ request, requests_[request].prefetch_poll_rounds - 1, std::nullopt, "scheduler_idle" };
+        submit(runtime, std::move(mutation));
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::PollReturned)) {
+        auto & running = running_[event.action.subject];
+        running.poll_returns.push_back(event.identity);
+        if (running.poll_returns.size() == backend_.participants) {
+            // Zero NodeScale can otherwise create infinitely many idle turns
+            // at one timestamp while an I/O completion waits in the future.
+            if (runtime.now_ns() == running.poll_started_ns) throw std::runtime_error("A scheduler idle turn must advance simulation time");
+            const auto end = runtime.next_node();
+            PlannedMutation mutation{ 0, { { 0, Boundary{}, action(ActionKind::Admitted, event.action.subject) } }, {} };
+            for (const auto returned : running.poll_returns) mutation.dependencies.push_back({ returned, end, graph::EdgeKind::Synchronization });
+            submit(runtime, std::move(mutation));
+        }
     }
     else if (event.action.kind == std::to_underlying(ActionKind::QueryDone)) { --pending_queries_; }
     else if (event.action.kind == std::to_underlying(ActionKind::QuerySubmitted)) {

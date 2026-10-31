@@ -40,7 +40,7 @@ execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
 流程先使用现有模型，按整组缺少的工作生成小型独立采样，维护模型后继续预测；不会采集 target trace 或按误差补参数。
 当前自动采样覆盖 SGLang/Ascend 串行区域响应、批量备份、整批回载和 buffered 文件读写 worker。
-文件预取区分入队发起与准入检查；控制时间仍沿用 source 残余，查询和轮询尚有近似，不能据此比较策略的真实优劣。
+文件预取区分入队、后台推进和调度回合检查；等待回合使用独立采样，查询与接受外围仍有 source 残余近似，不能据此认证策略排名。
 采样与 base 分别累计预算；中断后重跑同一命令会接管原容器、保留用量，完成任务直接复用。
 
 平台维护者也可显式维护独立数据：

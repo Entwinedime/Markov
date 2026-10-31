@@ -29,7 +29,7 @@ public:
     // published by the worker. Completion alone cannot insert a host prefix.
     void begin_prefetch(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
                         std::optional<graph::NodeId> cause);
-    bool check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause);
+    PrefetchCheck check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause);
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
     bool idle() const { return prefetches_.empty() && writes_.empty(); }

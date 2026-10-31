@@ -39,7 +39,8 @@ prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max 四
 文件 worker 按独立正常采样估计，发起与准入检查分开。首轮准备前的 source 控制残余在准入前支付一次，
 预取可在其间推进；这不是源控制已完成正常校正或 target 查询成本的独立预测。
 best_effort 在首次准入检查时停止，timeout 从发起计时，截止到达不直接接受缓存页。
-后续检查按可推进事件尽早唤醒，尚无原生调度器轮询延迟和变化查询成本；不能据此认证这两个策略的精度或排名。
+后续检查按独立测得的空闲调度回合推进，报告 `prefetch.poll_rounds`；缺这项成本时由整组共享补采，未允许采集则明确缺成本。
+查询与接受外围仍有 source 残余近似，不能据此认证这两个策略的精度或排名。
 
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
@@ -320,8 +321,8 @@ capacity_pages 可为正整数或 null，分别表示每参与进程的文件页
 prefetch_stop_policy 支持 wait_complete、best_effort、timeout；prefetch_threshold_tokens 可省略，使用当前原生默认值。
 prefetch_timeout 可声明 base_sec、per_ki_token_sec、max_sec，按原生线性预算计算，从操作入队开始计时。
 报告分别列出查询、工作进度、控制端接受、新增主机页、被拒绝发布的复制和最终 worker 状态，不能把它们都叫作命中。
-当前只覆盖对称参与进程下的 I/O 与已有计算子集。查询及准入 CPU 尚未绑定，因此 best_effort 按即时准入停止，
-timeout 也基于最早 deadline，未还原调度轮询；不能拿这些运行结果当作完整 HTTP 精度。
+当前只覆盖对称参与进程下的 I/O 与已有计算子集。best_effort 在首次准入检查时停止；timeout 在下一调度检查中使用已经到达的 deadline。
+等待回合通过独立响应推进，查询及准入外围 CPU 仍有缺项；不能拿这些运行结果当作完整 HTTP 精度。
 
 缓存组件报告另列 query_index_copies 和 query_operations，分别表示目标查询产生的索引复制描述数和成功提交的原生操作数。
 它们不包含查询外围的全部 Python/CPU 工作，也不代表 KV 内容传输或完整请求覆盖。旧来源缺少匹配段数时，合法目标工作仍会生成，但不能授权对应源成本迁移；查询缺口与之后的插入缺口分别按实际遇到的位置报告。

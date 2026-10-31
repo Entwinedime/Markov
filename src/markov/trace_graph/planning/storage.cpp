@@ -140,16 +140,19 @@ void Storage::begin_prefetch(ProgramRuntime & runtime, std::size_t request, std:
     }
 }
 
-bool Storage::check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause) {
+PrefetchCheck Storage::check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause) {
     auto & result = results_[request];
     if (!result.first_check_ns) result.first_check_ns = runtime.now_ns();
-    if (result.ready) return true;
+    if (result.ready) return PrefetchCheck::Ready;
 
     const auto & operation = prefetches_.at(request);
     const auto complete =
         result.published_pages == operation.keys.size() || std::ranges::any_of(operation.workers, [](const ReadCursor & worker) { return worker.terminated; });
-    if (complete || config_.policy == PrefetchPolicy::BestEffort || operation.deadline_cause) stop(runtime, request, cause);
-    return false;
+    if (operation.stopping || complete || config_.policy == PrefetchPolicy::BestEffort || operation.deadline_cause) {
+        stop(runtime, request, cause);
+        return PrefetchCheck::Finalizing;
+    }
+    return PrefetchCheck::Pending;
 }
 
 void Storage::start_read(ProgramRuntime & runtime, std::size_t request, std::size_t rank, std::optional<graph::NodeId> cause) {

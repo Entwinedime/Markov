@@ -98,7 +98,7 @@ def install() -> None:
         from markov.adapters.sglang.region_probe import RegionProbe
 
         region_writer = EventWriter(Path(measurements))
-        RegionProbe(region_writer).install()
+        RegionProbe(region_writer, record_scheduler=not os.environ.get("MARKOV_INPUT_FACTS")).install()
 
     output = os.environ.get("MARKOV_INPUT_FACTS")
     if not output:

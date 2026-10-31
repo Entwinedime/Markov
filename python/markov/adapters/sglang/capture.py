@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 from contextlib import ExitStack
 import os
+import shutil
 from pathlib import Path
 import sys
 import time
@@ -183,12 +184,17 @@ class Capture(SerialHttpClient):
                     <= roles
                 ):
                     raise RuntimeError(f"Independent region ports are incomplete: {path}")
+            storage = self.directory / "storage"
+            temporary_storage_bytes = sum(path.stat().st_size for path in storage.rglob("*") if path.is_file())
+            if storage.is_dir():
+                shutil.rmtree(storage)
             write_json(
                 self.directory / "region_measurements.json",
                 {
                     "kind": "independent_region_measurements",
                     "status": "completed",
                     "profiling": False,
+                    "temporary_storage_bytes": temporary_storage_bytes,
                     "deployment": self.plan["deployment"],
                     "configuration": self.plan["server"],
                     "formal_begin_index": self.plan["workload"]["formal_begin_index"],

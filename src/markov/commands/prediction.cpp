@@ -118,6 +118,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             if (const auto * storage = program.storage()) {
                 const auto & prefetch = storage->results()[id];
                 requests.back()["prefetch"] = {
+                    {        "poll_rounds",                                                     request.prefetch_poll_rounds },
                     {    "requested_pages",                                                         prefetch.requested_pages },
                     {      "queried_pages",                                                           prefetch.queried_pages },
                     {    "published_pages",                                                         prefetch.published_pages },

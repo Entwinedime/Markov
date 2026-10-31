@@ -1,6 +1,7 @@
 """Import small independent region captures; never read target scores or base traces."""
 
 from dataclasses import asdict
+from collections.abc import Iterator
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -76,7 +77,7 @@ def recipes(captured: dict) -> dict:
     return result
 
 
-def measurements(path: Path, captured: dict):
+def events(path: Path, captured: dict) -> Iterator[tuple[int, dict, bool]]:
     position = 0
     formal_begin = captured["formal_begin_index"]
     for relative in captured["files"]:
@@ -93,58 +94,64 @@ def measurements(path: Path, captured: dict):
                 if fields["implementation"] != IMPLEMENTATION or fields["phase"] not in ("prefill", "decode"):
                     raise ValueError(f"Unsupported region implementation: {source}, line {position}")
                 warmup = all(int(rid.removeprefix("request_")) < formal_begin for rid in fields["request_ids"])
-                name = event["name"].removeprefix("region.")
-                if name in ("stream", "prepare_stream"):
-                    kind = ("batch" if name == "stream" else "prepare", "current_stream_interval")
-                    duration = fields["stream_interval_ns"]
-                elif name in ("prepare", "batch", "result"):
-                    kind = (name, "thread_cpu")
-                    duration = fields["thread_cpu_ns"]
-                else:
-                    raise ValueError(f"Unknown region measurement: {event['name']}")
-                if type(duration) is not int or duration < 0:
-                    raise ValueError(f"Invalid region duration in {source}, line {position}")
-                features = {**fields["features"]}
-                if kind[0] != "prepare":
-                    features.pop("new_preparations")
-                if kind[0] == "result":
-                    features.pop("first_phase")
-                implementation = result_implementation(captured) if name == "result" else IMPLEMENTATION
+                yield position, event, warmup
+
+
+def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
+    for position, event, warmup in events(path, captured):
+        if event["name"] == "region.scheduler_idle":
+            continue
+        fields = event["args"]
+        name = event["name"].removeprefix("region.")
+        if name in ("stream", "prepare_stream"):
+            kind = ("batch" if name == "stream" else "prepare", "current_stream_interval")
+            duration = fields["stream_interval_ns"]
+        elif name in ("prepare", "batch", "result"):
+            kind = (name, "thread_cpu")
+            duration = fields["thread_cpu_ns"]
+        else:
+            raise ValueError(f"Unknown region measurement: {event['name']}")
+        if type(duration) is not int or duration < 0:
+            raise ValueError(f"Invalid region duration in {path}, record {position}")
+        features = {**fields["features"]}
+        if kind[0] != "prepare":
+            features.pop("new_preparations")
+        if kind[0] == "result":
+            features.pop("first_phase")
+        implementation = result_implementation(captured) if name == "result" else IMPLEMENTATION
+        yield Measurement(
+            position,
+            kind[1],
+            f"{kind[0]}.{fields['phase']}",
+            implementation,
+            kind[1],
+            features,
+            duration,
+            warmup,
+        )
+        if name in ("prepare", "batch"):
+            wall = int(Decimal(str(event["dur"])) * 1000)
+            yield Measurement(
+                position,
+                "caller_interval_ns",
+                f"{name}.{fields['phase']}",
+                IMPLEMENTATION,
+                "caller_blocking_interval",
+                features,
+                wall,
+                warmup,
+            )
+        if name == "result" and "send_cpu_ns" in fields:
+            for part, cost in (("send", fields["send_cpu_ns"]), ("tail", duration - fields["send_cpu_ns"])):
+                if cost < 0:
+                    raise ValueError(f"Result CPU ports exceed their parent interval: {path}, record {position}")
                 yield Measurement(
                     position,
-                    kind[1],
-                    f"{kind[0]}.{fields['phase']}",
+                    part + "_thread_cpu",
+                    f"result_{part}.{fields['phase']}",
                     implementation,
-                    kind[1],
+                    "thread_cpu",
                     features,
-                    duration,
+                    cost,
                     warmup,
                 )
-                if name in ("prepare", "batch"):
-                    wall = int(Decimal(str(event["dur"])) * 1000)
-                    yield Measurement(
-                        position,
-                        "caller_interval_ns",
-                        f"{name}.{fields['phase']}",
-                        IMPLEMENTATION,
-                        "caller_blocking_interval",
-                        features,
-                        wall,
-                        warmup,
-                    )
-                if name == "result" and "send_cpu_ns" in fields:
-                    for part, cost in (("send", fields["send_cpu_ns"]), ("tail", duration - fields["send_cpu_ns"])):
-                        if cost < 0:
-                            raise ValueError(
-                                f"Result CPU ports exceed their parent interval: {source}, line {position}"
-                            )
-                        yield Measurement(
-                            position,
-                            part + "_thread_cpu",
-                            f"result_{part}.{fields['phase']}",
-                            implementation,
-                            "thread_cpu",
-                            features,
-                            cost,
-                            warmup,
-                        )

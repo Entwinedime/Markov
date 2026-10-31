@@ -12,7 +12,7 @@ from statistics import median
 from markov.artifacts.performance import PerformanceData, encoded
 from markov.artifacts.request import Deployment, read_json, reject_unknown, resolve_path
 from markov.artifacts.writing import write_json
-from markov.adapters.sglang import cache_measurements, region_measurements
+from markov.adapters.sglang import cache_measurements, region_measurements, scheduler_measurements
 from markov.adapters.ascend import tensor_device_measurements, tensor_measurements, tensor_queue_measurements
 from markov.adapters.ktransformers import measurements as ktransformers_measurements
 
@@ -21,6 +21,7 @@ ADAPTERS = {
     "ktransformers_phases": ktransformers_measurements,
     "sglang_cache_io": cache_measurements,
     "sglang_regions": region_measurements,
+    "sglang_scheduler": scheduler_measurements,
     "ascend_tensor": tensor_measurements,
     "ascend_tensor_device": tensor_device_measurements,
     "ascend_tensor_queue": tensor_queue_measurements,

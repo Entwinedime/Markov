@@ -1,15 +1,27 @@
 """Measure eager semantic regions, without native hooks or profiler exports."""
 
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from markov.instrumentation.events import EventWriter
 
 
 IMPLEMENTATION = "sglang.ascend.eager"
+IDLE_SAMPLE_LIMIT = 128  # Bound optional observations, never native execution.
+
+
+@dataclass(frozen=True)
+class IdlePoll:
+    request: str
+    begin_ns: int
+    timer_ns: int
 
 
 class RegionProbe:
-    def __init__(self, writer: EventWriter):
+    def __init__(self, writer: EventWriter, *, record_scheduler: bool = False) -> None:
         self.writer = writer
         self.running = None
         self.forward_event = None
@@ -21,6 +33,59 @@ class RegionProbe:
         self.pending = []
         self.processing = None
         self.iterations = {}
+        self.record_scheduler = record_scheduler
+        self.poll_scheduler = None
+        self.previous_poll: IdlePoll | None = None
+        self.idle_intervals: list[tuple[IdlePoll, int]] = []
+        self.idle_sample_count = 0
+
+    def select_batch(self, original: Callable, scheduler: Any) -> Any:
+        if self.idle_sample_count >= IDLE_SAMPLE_LIMIT and not self.idle_intervals:
+            return original(scheduler)
+
+        self.poll_scheduler = scheduler
+        try:
+            batch = original(scheduler)
+        finally:
+            self.poll_scheduler = None
+
+        # Buffer observations while polling: writing each turn would change
+        # the very cadence being measured. Execution is never truncated.
+        if batch is not None and self.idle_intervals:
+            from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+            for prior, duration in self.idle_intervals:
+                self.writer.write(
+                    "region.scheduler_idle",
+                    prior.begin_ns,
+                    prior.begin_ns + duration,
+                    {
+                        "implementation": IMPLEMENTATION,
+                        "phase": "prefill",
+                        "request_ids": [prior.request],
+                        "features": {"participants": get_tensor_model_parallel_world_size()},
+                        "idle_interval_ns": duration,
+                        "status": "returned",
+                    },
+                )
+            self.idle_intervals.clear()
+        return batch
+
+    def prefetch_progress(self, original: Callable, cache: Any, req_id: str) -> bool:
+        scheduler = self.poll_scheduler
+        if scheduler is None or not cache.enable_storage or cache.cache_controller.storage_backend_type != "file":
+            return original(cache, req_id)
+
+        idle = scheduler.last_batch is None and scheduler.running_batch.is_empty()
+        begin, timer = time.time_ns(), time.perf_counter_ns()
+        prior = self.previous_poll
+        if idle and prior is not None and prior.request == req_id and self.idle_sample_count < IDLE_SAMPLE_LIMIT:
+            self.idle_intervals.append((prior, timer - prior.timer_ns))
+            self.idle_sample_count += 1
+
+        ready = original(cache, req_id)
+        self.previous_poll = IdlePoll(req_id, begin, timer) if idle and not ready else None
+        return ready
 
     @staticmethod
     def variables(batch) -> dict:
@@ -193,5 +258,12 @@ class RegionProbe:
             "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation": self.forward,
             "sglang.srt.managers.scheduler.Scheduler.process_batch_result": self.process_result,
         }
+        if self.record_scheduler:
+            bindings.update(
+                {
+                    "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run": self.select_batch,
+                    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.check_prefetch_progress": self.prefetch_progress,
+                }
+            )
         for target, observer in bindings.items():
             HookRegistry.register(target, observer, HookType.AROUND)

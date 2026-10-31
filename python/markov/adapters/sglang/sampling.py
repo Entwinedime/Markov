@@ -2,11 +2,38 @@
 
 from dataclasses import asdict
 import math
+import json
 from pathlib import Path
 
 from markov.artifacts.capture import DeviceCommand
 from markov.artifacts.request import Deployment
 from markov.adapters.sglang.capture import CAPTURE_OWNED_ARGUMENTS, capture_environment, server_arguments
+
+
+def _region_capture_command(deployment: Deployment, configuration: dict, workload: dict, adapter: str) -> DeviceCommand:
+    environment = capture_environment(False, True)
+    payload = {
+        "deployment": asdict(deployment),
+        "server": server_arguments(deployment, configuration),
+        "environment": environment,
+        "profiling": False,
+        "calibration": True,
+        "workload": workload,
+    }
+    return DeviceCommand(
+        "markov.adapters.sglang.capture",
+        ("collect", "--input", "/capture/capture_input.json"),
+        payload,
+        "region_measurements.json",
+        "calibration",
+        ((Path(deployment.model), "/model", False),),
+        environment,
+        len(workload["requests"]),
+        sum(len(row["input_ids"]) for row in workload["requests"]),
+        sum(row["max_new_tokens"] for row in workload["requests"]),
+        "workload_report.json",
+        adapter,
+    )
 
 
 def region_workload(maximum: int, page: int, final_phases: list[str]) -> dict:
@@ -72,13 +99,16 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     regions = {}
     io_cases = set()
     io_operations = set()
+    scheduler_pages = set()
     geometry = context["geometry"]
     for requirement in requirements:
         work = requirement.get("work")
         if work is None:
             continue
         operation = work["operation"]
-        if operation.split(".", 1)[0] in ("prepare", "batch", "result", "result_send", "result_tail"):
+        if operation == "scheduler.idle_turn":
+            scheduler_pages.update(int(cells[name]["configuration"]["page_size"]) for name in requirement["targets"])
+        elif operation.split(".", 1)[0] in ("prepare", "batch", "result", "result_send", "result_tail"):
             for name in requirement["targets"]:
                 configuration = cells[name]["configuration"]
                 regions[(int(configuration["page_size"]), bool(configuration["enable_hierarchical_cache"]))] = (
@@ -113,8 +143,6 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     commands = []
     for (page, enabled), target in sorted(regions.items()):
         workload = region_workload(math.ceil(context["max_context_tokens"]), page, context["final_phases"])
-        inputs = sum(len(row["input_ids"]) for row in workload["requests"])
-        outputs = sum(row["max_new_tokens"] for row in workload["requests"])
         capacity = sum(
             math.ceil((len(row["input_ids"]) + row["max_new_tokens"]) / page) * page for row in workload["requests"]
         )
@@ -133,31 +161,36 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             max_total_tokens=capacity,
             max_prefill_tokens=math.ceil(context["max_context_tokens"] / page) * page,
         )
-        environment = capture_environment(False, True)
-        payload = {
-            "deployment": asdict(deployment),
-            "server": server_arguments(deployment, configuration),
-            "environment": environment,
-            "profiling": False,
-            "calibration": True,
-            "workload": workload,
+        commands.append(_region_capture_command(deployment, configuration, workload, "sglang_regions"))
+    if scheduler_pages:
+        page = min(scheduler_pages)
+        # Two alternating prefixes exceed both small pools; later requests
+        # exercise real pending file prefetch, rather than an artificial sleep.
+        workload = {
+            "requests": [
+                {
+                    "prompt": None,
+                    "input_ids": [index % 2] * (7 * page + 1),
+                    "max_new_tokens": 1,
+                    "ignore_eos": True,
+                    "return_logprob": False,
+                }
+                for index in range(4)
+            ],
+            "formal_begin_index": 0,
         }
-        commands.append(
-            DeviceCommand(
-                "markov.adapters.sglang.capture",
-                ("collect", "--input", "/capture/capture_input.json"),
-                payload,
-                "region_measurements.json",
-                "calibration",
-                ((Path(deployment.model), "/model", False),),
-                environment,
-                len(workload["requests"]),
-                inputs,
-                outputs,
-                "workload_report.json",
-                "sglang_regions",
-            )
-        )
+        configuration = {
+            "page_size": page,
+            "max_total_tokens": 10 * page,
+            "max_prefill_tokens": 8 * page,
+            "enable_hierarchical_cache": True,
+            "hicache_ratio": 1.1,
+            "hicache_write_policy": "write_through",
+            "hicache_storage_backend": "file",
+            "hicache_storage_prefetch_policy": "wait_complete",
+            "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
+        }
+        commands.append(_region_capture_command(deployment, configuration, workload, "sglang_scheduler"))
     if io_cases:
         if geometry["key_dim"] != geometry["value_dim"]:
             raise ValueError("The current independent I/O sampler requires equal K/V head dimensions")

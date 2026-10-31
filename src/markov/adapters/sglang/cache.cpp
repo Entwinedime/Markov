@@ -198,7 +198,8 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
           { "cache.storage_write.gather", "file.materialize_then_batch_set", "storage_worker_service" },
           { "cache.storage_write.batch_prepare", "file.materialize_then_batch_set", "storage_worker_service" },
           { "cache.storage_write.new_page", "file.materialize_then_batch_set", "storage_worker_service" },
-          { "cache.storage_write.existing_page", "file.materialize_then_batch_set", "storage_worker_service" } }
+          { "cache.storage_write.existing_page", "file.materialize_then_batch_set", "storage_worker_service" } },
+        { "scheduler.idle_turn", "sglang.scheduler.file_prefetch", "caller_blocking_interval" }
     };
 }
 
