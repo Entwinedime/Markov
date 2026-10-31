@@ -167,6 +167,9 @@ HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用�
 
 workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_ids 二选一，以及 max_new_tokens；
 可选 ignore_eos、return_logprob 是布尔值。formal_begin_index 之前的请求用于准备，仍连续采集；其后为正式请求。
+workload 可设 drain_before_formal=true，在首个正式请求前等待 SGLang HiCache 和服务队列排空；默认 false，KTransformers 不支持。
+这一控制沿用原生服务状态口径，查询返回的轻量 pending 计数和服务空闲状态，不读取缓存树或 tensor snapshot；受同一采集墙钟预算约束。
+屏障单列在客户端报告中，不计作请求或 tokens；预测必须使用与 base 相同的准备屏障，并按目标自身后台完成决定何时继续。
 文本先用本地 tokenizer 编码并核对预算，再启动模型。预览列出请求数与输出上限；文本未经编码时输入 token 总量为未知。
 客户端时间覆盖实际 HTTP 发送到响应读取，不包括本地 JSON 编解码、写报告或 profiler 导出。
 

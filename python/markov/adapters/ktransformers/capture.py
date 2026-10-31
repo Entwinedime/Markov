@@ -160,6 +160,9 @@ class Capture(SerialHttpClient):
         )
 
     def run(self) -> None:
+        if self.plan["workload"].get("drain_before_formal", False):
+            raise ValueError("drain_before_formal requires SGLang HiCache")
+
         rows = self.plan["workload"]["requests"]
         if any(row["return_logprob"] for row in rows):
             raise ValueError("The dense KTransformers adapter does not yet collect logprob output")

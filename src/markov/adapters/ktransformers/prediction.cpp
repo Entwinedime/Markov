@@ -28,6 +28,7 @@ std::vector<SerialPredictionTarget> prepare_targets(const Json & request, const 
         throw std::runtime_error("Dense KTransformers prediction supports single-device float16/bfloat16");
     const auto & workload = request.at("workload");
     const auto & captured_workload = capture.at("workload");
+    if (workload.value("drain_before_formal", false)) throw std::runtime_error("KTransformers has no HiCache preparation gate");
     const auto & observed = source.observations();
     if (workload.at("requests").size() != observed.requests.size() || captured_workload.at("requests").size() != observed.requests.size()
         || workload.at("formal_begin_index") != captured_workload.at("formal_begin_index"))

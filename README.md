@@ -61,6 +61,7 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 
 当前实际输入为 Qwen3-32B/BF16/TP2、Ascend 910B3、SGLang eager/FIA，串行固定输出。
 预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
+需要在准备结束后清空后台工作时，workload 设置 drain_before_formal=true；SGLang 以轻量状态等待 HiCache 空闲，预测保留同一控制语义。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
 CPU 返回、流进度和结果可读分别保留；gap、未归属控制、Prefill/Decode 不从完整 HTTP 中扣除。
 首次使用条件、源控制残余与竞争仍有近似，执行成功不表示结构完整或正常精度已验收。

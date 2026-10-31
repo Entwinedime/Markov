@@ -15,6 +15,9 @@ from markov.artifacts.writing import write_json
 from markov.instrumentation.http import SerialHttpClient, encode_inputs, inference_server
 
 
+HICACHE_IDLE_POLL_SEC = 0.1
+
+
 CAPTURE_OWNED_ARGUMENTS = {
     "model_path",
     "dtype",
@@ -85,6 +88,35 @@ class Capture(SerialHttpClient):
             time.monotonic() + self.plan["budget"]["wall_sec"],
         )
 
+    def wait_hicache_idle(self) -> None:
+        row = {"kind": "barrier", "scope": "hicache_idle", "measure": False, "status": "running"}
+        self.rows.append(row)
+        write_json(self.directory / "workload_report.json", {"requests": self.rows})
+        begin = time.time_ns()
+        polls = 0
+        try:
+            while True:
+                payload, _, _ = self.http("/server_info")
+                states = json.loads(payload)["internal_states"]
+                polls += 1
+                if states and all(state["hicache_diagnostic"]["hicache_idle"] for state in states):
+                    break
+                time.sleep(min(HICACHE_IDLE_POLL_SEC, self.remaining_sec()))
+        except Exception as error:
+            row.update(status="error", error=str(error))
+            write_json(self.directory / "workload_report.json", {"requests": self.rows})
+            raise
+
+        row.update(
+            status="ok",
+            start_time_ms=self.milliseconds(begin),
+            end_time_ms=self.milliseconds(time.time_ns()),
+            polls=polls,
+            pending=[state["hicache_diagnostic"]["pending"] for state in states],
+            last_response_bytes=len(payload),
+        )
+        write_json(self.directory / "workload_report.json", {"requests": self.rows})
+
     def prepare_inputs(self) -> list[dict]:
         requests = self.plan["workload"]["requests"]
         encode_inputs(
@@ -95,6 +127,11 @@ class Capture(SerialHttpClient):
         )
 
         server = self.plan["server"]
+        if self.plan["workload"].get("drain_before_formal", False) and not server.get(
+            "enable_hierarchical_cache", False
+        ):
+            raise ValueError("drain_before_formal requires SGLang HiCache")
+
         if "max_total_tokens" in server and "page_size" in server and not server.get("disable_radix_cache", False):
             # Match Scheduler.init_req_max_new_tokens. Smaller pools can silently
             # reduce the requested output, or leave the request unable to enter.
@@ -151,6 +188,10 @@ class Capture(SerialHttpClient):
                         profiling = True
                         gate.write(b"\1")
                     for ordinal, row in enumerate(requests):
+                        if ordinal == self.formal_begin_index and self.plan["workload"].get(
+                            "drain_before_formal", False
+                        ):
+                            self.wait_hicache_idle()
                         self.request(ordinal, row)
                     if profiling_requested:
                         self.http("/stop_profile", {})
@@ -248,7 +289,7 @@ class Capture(SerialHttpClient):
             "runtime.response.process_result",
         }
         ports = {name: Counter() for name in ("runtime.request.socket_received", "runtime.response.scheduler_send")}
-        expected = {row["logical_request_id"] for row in self.rows}
+        expected = {row["logical_request_id"] for row in self.rows if row["kind"] == "request"}
         anchors = {}
         for path in probes:
             roles = set()

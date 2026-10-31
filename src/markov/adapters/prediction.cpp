@@ -102,6 +102,11 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
         throw std::runtime_error("Regional prediction currently supports plain eager inputs without speculative, multimodal or logprob branches");
     const auto & workload = raw.at("workload");
     if (workload.at("requests").size() != observations.requests.size()) throw std::runtime_error("Requested workload differs from the base capture");
+    const auto drain = workload.value("drain_before_formal", false);
+    if (observations.workload_barriers.size() != (drain ? 1u : 0u)
+        || (drain && observations.workload_barriers.front().before_request != workload.at("formal_begin_index").get<std::size_t>()))
+        throw std::runtime_error("Requested HiCache preparation gate differs from the base capture");
+
     for (auto & target : targets) {
         const auto capacity = target.cache.device_pages * target.page_tokens;
         for (std::size_t id = 0; id < observations.requests.size(); ++id) {

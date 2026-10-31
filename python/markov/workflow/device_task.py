@@ -105,6 +105,7 @@ class DeviceTask:
         attempt.update(exit_code=code, wall_sec=wall_sec)
         usage = output / attempt["usage_file"] if attempt["usage_file"] is not None else None
         rows = read_json(usage)["requests"] if usage is not None and usage.exists() else []
+        rows = [row for row in rows if row["kind"] == "request"]
         attempt["requests"] = len(rows)
         attempt["input_tokens"] = sum(row["input_tokens"] for row in rows)
         attempt["output_tokens"] = sum(row.get("generated_tokens", row["max_new_tokens"]) for row in rows)

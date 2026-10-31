@@ -47,6 +47,7 @@ class RequestInput:
 class Workload:
     requests: tuple[RequestInput, ...]
     formal_begin_index: int
+    drain_before_formal: bool = False
 
     @classmethod
     def load(cls, path: Path):
@@ -54,11 +55,15 @@ class Workload:
 
     @classmethod
     def parse(cls, raw: dict) -> Workload:
-        reject_unknown(raw, {"requests", "arrival", "formal_begin_index"}, "workload")
+        reject_unknown(raw, {"requests", "arrival", "formal_begin_index", "drain_before_formal"}, "workload")
         if raw.get("arrival", "serial") != "serial":
             raise ValueError("Only serial request arrival is supported")
         requests = tuple(RequestInput.parse(row) for row in raw["requests"])
         begin = raw.get("formal_begin_index", 0)
         if not requests or type(begin) is not int or not 0 <= begin < len(requests):
             raise ValueError("formal_begin_index must select a request in a nonempty workload")
-        return cls(requests, begin)
+        drain = raw.get("drain_before_formal", False)
+        if type(drain) is not bool:
+            raise ValueError("drain_before_formal must be boolean")
+
+        return cls(requests, begin, drain)
