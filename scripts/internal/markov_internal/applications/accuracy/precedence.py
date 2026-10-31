@@ -74,6 +74,82 @@ class PrecedenceGraph:
             result[index] &= ~(1 << bit)
         return result
 
+    def reachable_chain(self, chain: list[int]) -> list[int] | None:
+        """Return earliest reachable ranks after proving every adjacent pair.
+
+        A proven chain's reachable endpoints form a suffix, even when paths
+        cross anonymous or unmatched operations. Resource names alone prove
+        no ordering; an invalid candidate must use the general comparison.
+        """
+
+        length = len(chain)
+        seeds = {self.endpoints[slot]: rank for rank, slot in enumerate(chain)}
+        earliest = [length] * len(self.successors)
+        for node in reversed(self.order):
+            first = length
+            for child in self.successors[node]:
+                if earliest[child] < first:
+                    first = earliest[child]
+
+            rank = seeds.get(node)
+            if rank is not None:
+                if rank + 1 < length and first != rank + 1:
+                    return None
+                first = min(first, rank)
+
+            earliest[node] = first
+
+        return [earliest[node] for node in self.endpoints]
+
+
+def _compare_serial_chains(
+    report: dict[str, Any], predicted: PrecedenceGraph, target: PrecedenceGraph, identities: list[str]
+) -> dict[str, int] | None:
+    """Count suffix differences only when both DAGs prove the same chains."""
+
+    if any(len(graph.order) != len(graph.successors) for graph in (predicted, target)):
+        return None
+
+    slots = {name: index for index, name in enumerate(identities)}
+    assigned: set[int] = set()
+    chains: list[list[int]] = []
+    for group in report["resource_groups"]:
+        members = {slots[name] for name in group["operators"] if name in slots} - assigned
+        if members:
+            chains.append(list(members))
+            assigned.update(members)
+
+    chains.extend([index] for index in range(len(identities)) if index not in assigned)
+
+    # Use chains only when they reduce the number of graph passes.
+    blocks = (len(identities) + REACHABILITY_BLOCK_BITS - 1) // REACHABILITY_BLOCK_BITS
+    if len(chains) >= blocks:
+        return None
+
+    endpoints = set(predicted.endpoints)
+    positions = {node: index for index, node in enumerate(predicted.order) if node in endpoints}
+    counts = {
+        "compared_prediction_relations": 0,
+        "compared_target_relations": 0,
+        "missing_relations": 0,
+        "extra_relations": 0,
+    }
+    for chain in chains:
+        chain.sort(key=lambda slot: positions[predicted.endpoints[slot]])
+        first = predicted.reachable_chain(chain)
+        second = target.reachable_chain(chain)
+        if first is None or second is None:
+            return None
+
+        length = len(chain)
+        # Each chain includes its own seeds; self-relations are not compared.
+        counts["compared_prediction_relations"] += sum(length - rank for rank in first) - length
+        counts["compared_target_relations"] += sum(length - rank for rank in second) - length
+        counts["missing_relations"] += sum(max(a - b, 0) for a, b in zip(first, second))
+        counts["extra_relations"] += sum(max(b - a, 0) for a, b in zip(first, second))
+
+    return counts
+
 
 def compare_precedence(
     predicted: dict[str, Any], target: dict[str, Any], common: set[str], *, details: bool
@@ -105,6 +181,11 @@ def compare_precedence(
     }
     if details:
         result.update(missing=[], extra=[], detail_example_limit=PRECEDENCE_DETAIL_LIMIT)
+    else:
+        counts = _compare_serial_chains(predicted, expected, observed, identities)
+        if counts is not None:
+            result.update(counts)
+            return result
 
     for begin in range(0, len(identities), REACHABILITY_BLOCK_BITS):
         end = min(begin + REACHABILITY_BLOCK_BITS, len(identities))
