@@ -71,7 +71,8 @@ private:
         ResultsReady,
         Sent,
         Done,
-        ControlReady
+        ControlReady,
+        ControlEntered
     };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
     struct Frame {
@@ -84,8 +85,10 @@ private:
         Work prepare_cpu, prepare_stream, prepare_return, batch_cpu, batch_stream, batch_return, result_cpu, result_tail;
         bool overlap, has_result, publishes, sends;
         bool next_started = false, result_requested = false;
+        bool control_response_started = false;
     };
     void begin_control(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
+    void enter_control(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
     void prepare(ProgramRuntime & runtime, std::size_t frame);
     void run_frame(ProgramRuntime & runtime, std::size_t frame, graph::NodeId cause);
     void launch_frame(ProgramRuntime & runtime, std::size_t frame, graph::NodeId entered);

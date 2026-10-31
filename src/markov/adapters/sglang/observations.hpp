@@ -54,6 +54,12 @@ private:
     std::map<BatchIdentity, trace_graph::source::Index> batch_results_;
     std::map<BatchIdentity, trace_graph::source::ResultCopy> result_copies_;
     std::map<BatchIdentity, std::vector<trace_graph::source::ResultSend>> result_sends_;
+    struct RequestBroadcast {
+        trace_graph::source::ObservedRegion region;
+        trace_graph::source::Index participant;
+        std::vector<trace_graph::source::Index> members;
+    };
+    std::map<BatchIdentity, RequestBroadcast> request_broadcasts_;
     std::map<trace_graph::source::Index, std::vector<trace_graph::source::Index>> pending_controls_;
     std::map<std::pair<trace_graph::source::Index, trace_graph::source::Index>, trace_graph::source::ObservedRegion> prefetch_waits_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;

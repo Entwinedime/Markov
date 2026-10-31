@@ -162,6 +162,13 @@ struct ObservedCallSequence {
     std::vector<planning::Work> source_work = {};
 };
 
+// Unchanged synchronous work: retain its observed response after every caller
+// entered, while target dependencies regenerate the arrival wait.
+struct CallerRendezvous {
+    ObservedRegion call;
+    Time all_entered_ns;
+};
+
 struct ComputeFrame {
     planning::Phase phase;
     std::vector<Index> requests; // Indices into Observations::names, not requests.
@@ -173,6 +180,7 @@ struct ComputeFrame {
     std::vector<ObservedCallSequence> lookups = {};
     std::optional<ObservedRegion> preparation_region = std::nullopt;
     std::optional<Index> participant = std::nullopt;
+    std::optional<CallerRendezvous> preparation_rendezvous = std::nullopt;
 };
 
 struct CollectiveGroup {

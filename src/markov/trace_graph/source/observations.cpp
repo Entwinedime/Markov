@@ -51,8 +51,10 @@ void Observations::normalize_resources() {
         call.execution.resource = canonical_resource(call.execution.resource);
     }
     for (auto & call : native_runtime_calls) call.region.resource = canonical_resource(call.region.resource);
-    for (auto & frame : compute_frames)
+    for (auto & frame : compute_frames) {
         for (auto & call : frame.preparations) call.region.resource = canonical_resource(call.region.resource);
+        if (frame.preparation_rendezvous) frame.preparation_rendezvous->call.resource = canonical_resource(frame.preparation_rendezvous->call.resource);
+    }
     for (auto & result : batch_results) {
         result.run.resource = canonical_resource(result.run.resource);
         if (result.copy) result.copy->region.resource = canonical_resource(result.copy->region.resource);

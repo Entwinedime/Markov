@@ -45,6 +45,22 @@ Regions::Regions(const SourceContext & source) : frames_(source.observations().c
     for (const auto & control : observed.regenerated_controls) exclusions[control.resource].push_back(control);
     for (auto & [resource, intervals] : exclusions) std::ranges::sort(intervals, {}, &ObservedRegion::begin_ns);
 
+    const auto add_residual = [&](ObservedRegion region) {
+        ResidualRegion gap{ region, {} };
+        auto cursor = region.begin_ns;
+        for (const auto & excluded : exclusions[region.resource]) {
+            if (excluded.end_ns <= cursor) continue;
+            if (excluded.begin_ns >= region.end_ns) break;
+            const auto first = std::max(cursor, excluded.begin_ns);
+            const auto last = std::min(region.end_ns, excluded.end_ns);
+            if (first < last) gap.excluded.push_back({ region.resource, first, last, excluded.record });
+            cursor = std::max(cursor, last);
+        }
+        const auto id = residuals_.size();
+        residuals_.push_back(std::move(gap));
+        return id;
+    };
+
     for (Index frame = 0; frame < frames_.size(); ++frame) {
         const auto & facts = observed.compute_frames[frame];
         const auto * result = source.frame_result(frame);
@@ -62,23 +78,16 @@ Regions::Regions(const SourceContext & source) : frames_(source.observations().c
         for (const auto & segment : segments) {
             const auto begin = std::max(previous, segment.received_ns);
             if (begin <= segment.interval.begin_ns) {
-                ResidualRegion gap{
-                    { resource, begin, segment.interval.begin_ns, segment.interval.record },
-                    {}
-                };
-                auto cursor = begin;
-                for (const auto & excluded : exclusions[resource]) {
-                    if (excluded.end_ns <= cursor) continue;
-                    if (excluded.begin_ns >= gap.observation.end_ns) break;
-                    const auto first = std::max(cursor, excluded.begin_ns);
-                    const auto last = std::min(gap.observation.end_ns, excluded.end_ns);
-                    if (first < last) gap.excluded.push_back({ resource, first, last, excluded.record });
-                    cursor = std::max(cursor, last);
-                }
                 auto & ports = frames_[segment.frame];
                 auto & reference = segment.step == 0 ? ports.before_preparation : segment.step == 1 ? ports.before_run : ports.before_result;
-                reference = residuals_.size();
-                residuals_.push_back(std::move(gap));
+                reference = add_residual({ resource, begin, segment.interval.begin_ns, segment.interval.record });
+                const auto & control = observed.compute_frames[segment.frame].preparation_rendezvous;
+                if (segment.step == 0 && control && begin <= control->call.begin_ns && control->call.end_ns <= segment.interval.begin_ns) {
+                    const auto & call = control->call;
+                    ports.control = ControlRegions{ add_residual({ resource, begin, call.begin_ns, call.record }),
+                                                    add_residual({ resource, control->all_entered_ns, call.end_ns, call.record }),
+                                                    add_residual({ resource, call.end_ns, segment.interval.begin_ns, call.record }) };
+                }
             }
             previous = std::max(previous, segment.interval.end_ns);
         }

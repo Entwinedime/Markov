@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -76,6 +77,22 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
+    if (event.name == "runtime.scheduler.request_broadcast") {
+        const auto & args = event.args;
+        if (args.at("status") != "returned") throw std::runtime_error("Cannot interpret a failed source request broadcast");
+        if (args.at("empty").get<bool>()) {
+            const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+            request_broadcasts_.emplace(
+                BatchIdentity{
+                    event.process,
+                    args.at("batch_id").get<Index>()
+            },
+                RequestBroadcast{ { resource, event.begin_ns, event.end_ns, event.record },
+                                  args.at("participant").get<Index>(),
+                                  args.at("members").get<std::vector<Index>>() });
+        }
+        return;
+    }
     if (event.name == "runtime.hicache.file.prefetch_progress" || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading") {
         observe_regenerated_control(event);
         return;
@@ -299,6 +316,38 @@ void ProbeReader::finish() {
             throw std::runtime_error("One source frame contains conflicting collective participants");
         frame.participant = collective.rank;
     }
+    std::map<Index, std::vector<std::pair<Index, const RequestBroadcast *>>> broadcast_groups;
+    for (const auto & [identity, call] : request_broadcasts_) {
+        const auto result = batch_results_.find(identity);
+        if (result == batch_results_.end()) continue;
+        broadcast_groups[identity.second].emplace_back(output_.batch_results[result->second].frame, &call);
+    }
+    for (const auto & [identity, calls] : broadcast_groups) {
+        const auto & members = calls.front().second->members;
+        std::set<Index> participants;
+        Time all_entered = calls.front().second->region.begin_ns;
+        for (const auto & [frame, call] : calls) {
+            const auto & observed = output_.compute_frames[frame];
+            if (call->members != members || observed.requests != output_.compute_frames[calls.front().first].requests
+                || observed.participant != call->participant)
+                throw std::runtime_error("Request broadcast and compute participants disagree");
+            participants.insert(call->participant);
+            all_entered = std::max(all_entered, call->region.begin_ns);
+        }
+        if (participants != std::set<Index>(members.begin(), members.end()) || participants.size() != calls.size()) {
+            ++output_.counts["request_broadcast_participants_incomplete"];
+            continue;
+        }
+        if (std::ranges::any_of(calls, [&](const auto & value) { return value.second->region.end_ns < all_entered; })) {
+            ++output_.counts["request_broadcast_without_common_response"];
+            continue;
+        }
+        for (const auto & [frame, call] : calls) {
+            output_.compute_frames[frame].preparation_rendezvous = CallerRendezvous{ call->region, all_entered };
+            ++output_.counts["request_broadcast_rendezvous"];
+        }
+    }
+    request_broadcasts_.clear();
     output_.counts["result_copy_without_batch_run"] += result_copies_.size();
     output_.counts["result_send_without_processing"] += result_sends_.size();
     result_copies_.clear();

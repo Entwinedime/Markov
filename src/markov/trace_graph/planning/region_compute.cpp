@@ -91,6 +91,16 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
             issue_ = "semantic_frame_participants_incomplete";
             return;
         }
+        std::optional<bool> rendezvous;
+        for (const auto id : group) {
+            const auto & frame = frames_[id];
+            const bool present = frame.previous && source.regions().frame(frame.description.source_frame).control.has_value();
+            if (rendezvous && *rendezvous != present) {
+                issue_ = "semantic_control_participants_incomplete";
+                return;
+            }
+            rendezvous = present;
+        }
     }
 }
 
@@ -105,6 +115,18 @@ void RegionCompute::start(ProgramRuntime & runtime, std::optional<graph::NodeId>
 
 void RegionCompute::begin_control(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
     auto & frame = frames_[id];
+    const auto & regions = source_.regions().frame(frame.description.source_frame);
+    if (frame.previous && regions.control) {
+        const auto node = runtime.next_node();
+        PlannedMutation mutation{ owner_,
+                                  { { frame.caller, SourceRegionGap{ regions.control->before }, action(ActionKind::ControlEntered, id) } },
+                                  { { cause, node, graph::EdgeKind::ResourceOrder } } };
+        if (runtime.records_graph())
+            mutation.operations.front().position =
+                OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "before_control" };
+        runtime.submit(std::move(mutation));
+        return;
+    }
     frame.control_started = cause;
     const auto node = runtime.next_node();
     PlannedMutation mutation{ owner_,
@@ -123,6 +145,40 @@ void RegionCompute::begin_control(ProgramRuntime & runtime, std::size_t id, grap
     if (!runtime.submit(std::move(mutation))) return;
     if (frame.previous) ++stats_.source_cpu_gaps;
     for (const auto peer : groups_[frame.group]) prepare(runtime, peer);
+}
+
+void RegionCompute::enter_control(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
+    auto & frame = frames_[id];
+    frame.control_started = cause;
+    std::vector<graph::NodeId> arrivals;
+    for (const auto peer : groups_[frame.group]) {
+        if (!frames_[peer].control_started) return;
+        arrivals.push_back(*frames_[peer].control_started);
+    }
+
+    // Only the unchanged response after all callers entered is transferred.
+    // The target's own arrivals generate its wait, while callers remain held.
+    for (const auto peer : groups_[frame.group]) {
+        auto & target = frames_[peer];
+        if (target.control_response_started) continue;
+        target.control_response_started = true;
+        const auto & regions = *source_.regions().frame(target.description.source_frame).control;
+        const auto node = runtime.next_node();
+        PlannedMutation mutation{
+            owner_,
+            { { target.caller, SourceRegionGap{ regions.response } },
+              { target.caller, SourceRegionGap{ regions.after }, action(ActionKind::ControlReady, peer) } },
+            { { node, node + 1, graph::EdgeKind::ResourceOrder } }
+        };
+        for (const auto arrival : arrivals) mutation.dependencies.push_back({ arrival, node, graph::EdgeKind::DataDependency });
+        if (runtime.records_graph()) {
+            const auto participant = source_.observations().compute_frames[target.description.source_frame].participant;
+            mutation.operations[0].position = OperationPosition{ request_, target.group, participant, "control_response" };
+            mutation.operations[1].position = OperationPosition{ request_, target.group, participant, "after_control" };
+        }
+        if (!runtime.submit(std::move(mutation))) return;
+        stats_.source_cpu_gaps += 3;
+    }
 }
 
 void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id) {
@@ -364,6 +420,7 @@ void RegionCompute::on_event(ProgramRuntime & runtime, const simulation::Event &
     const auto kind = static_cast<ActionKind>(event.action.kind);
     const auto id = event.action.subject;
     if (kind == ActionKind::Granted) begin_control(runtime, id, event.identity);
+    else if (kind == ActionKind::ControlEntered) enter_control(runtime, id, event.identity);
     else if (kind == ActionKind::ControlReady) {
         frames_[id].control_ready = event.identity;
         prepare(runtime, id);

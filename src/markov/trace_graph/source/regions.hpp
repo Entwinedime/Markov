@@ -9,8 +9,13 @@ namespace markov::trace_graph::source {
 
 class SourceContext;
 
+struct ControlRegions {
+    Index before, response, after;
+};
+
 struct FrameRegions {
     std::optional<Index> before_preparation, before_run, before_result;
+    std::optional<ControlRegions> control;
 };
 
 struct ResidualRegion {
