@@ -6,6 +6,7 @@
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -235,7 +236,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
 }
 
 void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     struct Tail {
         size_t entry, exit;

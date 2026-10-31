@@ -1,8 +1,8 @@
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <set>
 #include <stdexcept>
@@ -12,8 +12,8 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-core::DagNodeRef append_host_entry_gate(const adapters::sglang::HiCacheSourceIndex & source, size_t first, core::DagObservedPoint point, std::string id,
-                                        std::string name, core::DagMutationPlan & plan) {
+core::DagNodeRef append_host_entry_gate(const source_dag::SourceDagIndex & source, size_t first, core::DagObservedPoint point, std::string id, std::string name,
+                                        core::DagMutationPlan & plan) {
     const auto & graph = source.graph();
     const auto gate = core::DagNodeRef::synthetic(std::move(id));
     plan.synthetic_nodes.push_back({
@@ -27,18 +27,22 @@ core::DagNodeRef append_host_entry_gate(const adapters::sglang::HiCacheSourceInd
     return gate;
 }
 
-core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheHostRegion> regions,
+core::DagMutationPlan plan_host_removal(const source_dag::SourceDagIndex & source, std::span<const HiCacheHostRegion> regions,
                                         std::span<const size_t> collective_handoffs, std::span<const core::DagRedirectEdgeMutation> submission_handoffs) {
+    if (regions.empty() && collective_handoffs.empty() && submission_handoffs.empty()) return { .component = "hicache_host_replacement" };
+
     const auto queues = simulation::detail::discover_cpu_task_queues(source.graph());
     return plan_host_removal(source, queues, regions, collective_handoffs, submission_handoffs);
 }
 
-core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+core::DagMutationPlan plan_host_removal(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                         std::span<const HiCacheHostRegion> regions, std::span<const size_t> collective_handoffs,
                                         std::span<const core::DagRedirectEdgeMutation> submission_handoffs) {
     using Kind = core::DagEdgeKind;
     const auto & graph = source.graph();
     core::DagMutationPlan plan{ .component = "hicache_host_replacement" };
+    if (regions.empty() && collective_handoffs.empty() && submission_handoffs.empty()) return plan;
+
     std::set<size_t> removed, workers, gates, opening_submissions;
     const std::set<size_t> transferred_collectives(collective_handoffs.begin(), collective_handoffs.end());
     std::set<size_t> transferred_submissions;

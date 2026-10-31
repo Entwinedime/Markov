@@ -1,9 +1,9 @@
 #pragma once
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -93,7 +93,7 @@ struct GeneratedTransferSubmission {
 /** Bind a worker FIFO to an explicitly identified compute stream using this
  * main lane's submission -> worker -> device evidence. The target operation
  * itself need not have occurred in base; the caller supplies the compute role. */
-[[nodiscard]] std::optional<HostDeviceResources> observe_host_device_resources(const adapters::sglang::HiCacheSourceIndex & source,
+[[nodiscard]] std::optional<HostDeviceResources> observe_host_device_resources(const source_dag::SourceDagIndex & source,
                                                                                const simulation::detail::CpuTaskQueues & queues, size_t main_node,
                                                                                size_t compute_node);
 

@@ -1,7 +1,7 @@
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -17,7 +17,7 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
         inactive.push_back(&call);
         groups[{ *call.before, *call.after }].push_back(&call);
     }
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto positions = patch::observe_inactive_layer_positions(source, waits, inactive);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<std::pair<size_t, size_t>, std::optional<HostDeviceResources>> resources;

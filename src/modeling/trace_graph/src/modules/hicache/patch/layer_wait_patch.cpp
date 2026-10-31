@@ -25,7 +25,7 @@ struct RequestLoadbacks {
 
 // Keep stream order and downstream synchronizations, but not the removed
 // wait's Record dependency. Adjacent removed waits are traversed together.
-void bypass_device_waits(const adapters::sglang::HiCacheSourceIndex & source, const std::set<size_t> & removed, core::DagMutationPlan & plan) {
+void bypass_device_waits(const source_dag::SourceDagIndex & source, const std::set<size_t> & removed, core::DagMutationPlan & plan) {
     const auto & graph = source.graph();
     std::set<std::tuple<size_t, size_t, Kind>> additions;
     for (const auto id : removed) {
@@ -270,7 +270,7 @@ static HiCacheLayerWaitPatch build_layer_wait_plan(const adapters::sglang::HiCac
     return audit;
 }
 
-HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
+HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const source_dag::SourceDagIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
                                                          core::DagMutationPlan & plan) {
     HiCacheLayerWaitPatch audit;
     const auto & graph = source.graph();

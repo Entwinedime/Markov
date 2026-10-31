@@ -1,5 +1,5 @@
 #include "markov/trace_graph/modules/hicache/cpu_collectives.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -15,7 +15,7 @@ bool same_signature(const core::TraceEvent & a, const core::TraceEvent & b) {
     return true;
 }
 
-void observe_local(const adapters::sglang::HiCacheSourceIndex & source, const std::vector<size_t> & workers, CpuCollectiveCall & call) {
+void observe_local(const source_dag::SourceDagIndex & source, const std::vector<size_t> & workers, CpuCollectiveCall & call) {
     const auto & graph = source.graph();
     const auto & event = graph.runtime_observations()[call.observation];
     if (event.arg("async_op") != "false" || event.arg("status") != "returned" || event.arg_u64("sequence_after") <= event.arg_u64("sequence_before")) {
@@ -70,7 +70,7 @@ void observe_local(const adapters::sglang::HiCacheSourceIndex & source, const st
 }
 } // namespace
 
-CpuCollectiveObservation observe_cpu_collectives(const adapters::sglang::HiCacheSourceIndex & source) {
+CpuCollectiveObservation observe_cpu_collectives(const source_dag::SourceDagIndex & source) {
     CpuCollectiveObservation result;
     const auto & graph = source.graph();
     std::vector<size_t> workers;

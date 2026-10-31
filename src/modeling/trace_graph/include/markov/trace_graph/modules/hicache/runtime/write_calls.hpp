@@ -67,7 +67,7 @@ public:
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end, size_t opening_node);
     void replace_active_load_branches(core::DagGraph & graph);
     // Finalize resource and consumer bindings after all source replacements.
-    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
     void applied(const model::HiCacheReplayFact & input) const;
     /** Returns facts whose allocations completed at this boundary. */
     std::vector<size_t> advance(size_t node, uint64_t time, simulation::FutureDag & future);
@@ -97,7 +97,7 @@ private:
     };
     // Candidate load/capacity resources are required only when target work uses
     // them. Other calls fail immediately if their observed resource is unbound.
-    void bind_call_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
+    void bind_call_resources(const source_dag::SourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
     [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
     void bind_capacity_calls(const adapters::sglang::HiCacheSourceIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
@@ -108,7 +108,7 @@ private:
     void bind_load_attempts(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void bind_load_branches(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void prepare_empty_load_branches(core::DagGraph & graph);
-    void prepare_generated_load_admissions(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues);
+    void prepare_generated_load_admissions(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
     void start_load_branch(size_t node, uint64_t time, simulation::FutureDag & future);
     std::optional<size_t> expand_capacity(Call & call, const HiCacheFact & fact, simulation::FutureDag & future, std::optional<size_t> previous = std::nullopt);
     model::HiCacheModelReplay & replay_;
@@ -173,7 +173,7 @@ private:
     std::vector<LoadAdmissionProgram> load_admissions_;
     // Cost selection never changes allocation or clone execution rules.
     [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid) const;
-    void bind_load_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, const LoadAdmissionProgram & program);
+    void bind_load_resources(const source_dag::SourceDagIndex & source, Call & call, const LoadAdmissionProgram & program);
     [[nodiscard]] HiCacheHostExpansion cost_load_step(const LoadStep & step, uint64_t pages, bool first_clone = false) const;
     [[nodiscard]] HiCacheHostExpansion bind_load_operation(const LoadStep & step, structure::OperationWork work) const;
     [[nodiscard]] HiCacheHostExpansion load_prefix_concat(const LoadAdmissionProgram & program, const model::HiCacheLoadAdmissionWork & work) const;

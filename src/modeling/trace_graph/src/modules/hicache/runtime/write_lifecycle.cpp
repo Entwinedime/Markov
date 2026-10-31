@@ -1,6 +1,6 @@
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -48,7 +48,7 @@ void HiCacheWriteCalls::bind_lifecycle_writes(core::DagGraph & graph, uint64_t b
         append(std::move(end));
     }
     const auto nodes = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     for (size_t i = 0; i < points.size(); ++i) {
         if (!nodes[i]) throw std::runtime_error("Lifecycle write lacks an exact ready boundary");
         Call call{ .owner = owners[i], .pid = points[i].pid, .tid = points[i].tid, .at_us = points[i].ts, .entry_node = *nodes[i] };

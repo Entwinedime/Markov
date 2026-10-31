@@ -1,10 +1,10 @@
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/collective_services.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "modules/hicache/runtime/source_preparation.hpp"
 
 #include <stdexcept>
@@ -38,7 +38,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<HiCacheHostRegion> regions;
     std::vector<core::DagSyntheticNodeMutation> nodes;

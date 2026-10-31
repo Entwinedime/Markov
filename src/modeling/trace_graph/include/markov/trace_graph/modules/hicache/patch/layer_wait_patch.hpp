@@ -21,7 +21,7 @@ struct HiCacheLayerWaitRemoval {
 
 /** Remove only observed call-owned work; preserve surrounding gaps and stream order.
  * A zero return leaves a submission anchor for later dynamic expansion. */
-HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const adapters::sglang::HiCacheSourceIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
+HiCacheLayerWaitPatch append_hicache_layer_wait_removals(const source_dag::SourceDagIndex & source, std::span<const HiCacheLayerWaitRemoval> changes,
                                                          core::DagMutationPlan & plan);
 
 /** Appends only a complete call transition plan; source observations never supply target state. */

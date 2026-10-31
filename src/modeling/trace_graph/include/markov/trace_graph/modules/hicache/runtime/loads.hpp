@@ -1,5 +1,4 @@
 #pragma once
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
@@ -9,6 +8,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/load_consumers.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/io_completion.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include <set>
@@ -40,7 +40,7 @@ public:
     // Layer consumers must first detach from the old completion records.
     void replace_source_submissions(core::DagGraph & graph);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
-    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
     [[nodiscard]] size_t source_submissions() const { return loads_.size(); }
     [[nodiscard]] size_t completed_batches() const { return completed_; }
     [[nodiscard]] size_t shared_cost_batches() const { return shared_cost_batches_; }

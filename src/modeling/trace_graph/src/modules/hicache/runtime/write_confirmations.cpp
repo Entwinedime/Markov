@@ -1,10 +1,10 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/confirmation.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
@@ -114,7 +114,7 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
         points.push_back(boundary(tail.pid, tail.tid, tail.end));
     }
     const auto bound = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(tails_.size());

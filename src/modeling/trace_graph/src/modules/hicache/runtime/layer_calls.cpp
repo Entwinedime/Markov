@@ -1,7 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_patch.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/ascend_event.hpp"
 #include <algorithm>
 #include <set>
@@ -11,7 +11,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t end) {
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto waits = observe_hicache_layer_waits(source);
     if (waits.status != "ready") throw std::runtime_error("Dynamic layer calls need complete base wait observations");
     std::vector<patch::HiCacheLayerWaitRemoval> removals;
@@ -93,7 +93,7 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     }
 }
 
-void HiCacheLayerCalls::rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members) {
+void HiCacheLayerCalls::rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members) {
     const auto & graph = source.graph();
     std::vector<HiCacheHostExpansion *> templates;
     for (auto & [node, call] : calls_) {

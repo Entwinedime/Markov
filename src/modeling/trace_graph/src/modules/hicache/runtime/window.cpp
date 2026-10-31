@@ -21,6 +21,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/storage_writes.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
@@ -177,7 +178,7 @@ void HiCacheExecution::prepare_source() {
 nlohmann::json HiCacheExecution::replace_source_regions() {
     core::ExecutionMetrics metrics;
     stream_insertions_.bind_synchronizations(graph_);
-    compute_resources_ = adapters::sglang::observe_scheduler_compute_resources(adapters::sglang::HiCacheSourceIndex(graph_));
+    compute_resources_ = adapters::sglang::observe_scheduler_compute_resources(source_dag::SourceDagIndex(graph_));
     queries_.bind(graph_, replay_, operator_provider_, facts_at_, io_completion_);
     const HiCacheQueueConfirmations::WriteWork confirmation_work = [this](const WriteConfirmationWork & work, simulation::FutureDag & future) {
         return write_confirmations_.expand(work, replay_.state(), writes_, future);
@@ -207,7 +208,7 @@ nlohmann::json HiCacheExecution::replace_source_regions() {
     loads_.replace_source_submissions(graph_);
     metrics.checkpoint("load_submissions_and_confirmations");
     {
-        const adapters::sglang::HiCacheSourceIndex source(graph_);
+        const source_dag::SourceDagIndex source(graph_);
         core::DagMutationPlan plan{ .component = "cpu_collective" };
         output_.cpu_collectives = patch::append_retained_cpu_collectives(source, observe_cpu_collectives(source), plan);
         if (output_.cpu_collectives.status == "blocked") throw std::runtime_error("CPU collective composition failed");
@@ -226,7 +227,7 @@ nlohmann::json HiCacheExecution::replace_source_regions() {
     // No source regions are replaced after this point. Every generated host
     // operation binds against the same surviving worker queues.
     {
-        const adapters::sglang::HiCacheSourceIndex retained(graph_);
+        const source_dag::SourceDagIndex retained(graph_);
         const auto workers = observe_host_worker_members(graph_);
         loads_.rebind_retained_resources(retained, workers);
         layer_calls_.rebind_retained_resources(retained, workers);

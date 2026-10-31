@@ -25,7 +25,7 @@ struct HiCacheHostTemplate {
  * association when the source records only call identities. */
 [[nodiscard]] std::map<std::pair<std::string, std::string>, std::string> observe_controller_scopes(const adapters::sglang::HiCacheSourceIndex & source);
 
-[[nodiscard]] HiCacheHostTemplate observe_host_template(const adapters::sglang::HiCacheSourceIndex & source, const std::string & pid, const std::string & tid,
+[[nodiscard]] HiCacheHostTemplate observe_host_template(const source_dag::SourceDagIndex & source, const std::string & pid, const std::string & tid,
                                                         uint64_t begin, uint64_t end);
 [[nodiscard]] HiCacheHostTemplate observe_write_host_template(const adapters::sglang::HiCacheSourceIndex & source,
                                                               const patch::HiCacheIoOperationRecord & write);

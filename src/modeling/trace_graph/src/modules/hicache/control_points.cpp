@@ -1,7 +1,7 @@
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <tuple>
 
@@ -9,29 +9,36 @@ namespace markov::trace_graph::modules::hicache {
 
 std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & graph, std::span<const core::TraceEvent> points) {
     using Coordinate = std::tuple<std::string, std::string, uint64_t>;
-    std::map<Coordinate, std::vector<size_t>> existing;
-    for (const auto & node : graph.nodes()) {
-        if (!node.active || !node.is_cpu || node.duration) continue;
-        const auto & event = graph.event_for_node(node.id);
-        if (event.cat == "observed_boundary") existing[{ event.pid, event.tid, event.ts }].push_back(node.id);
-    }
     std::vector<std::optional<size_t>> result(points.size());
+    if (points.empty()) return result;
+
     std::vector<core::TraceEvent> missing;
     std::vector<size_t> positions;
-    for (size_t i = 0; i < points.size(); ++i) {
-        const auto & point = points[i];
-        const auto found = existing.find({ point.pid, point.tid, point.ts });
-        if (found != existing.end()) {
-            if (found->second.size() == 1) result[i] = found->second.front();
-        }
-        else {
-            positions.push_back(i);
-            missing.push_back(point);
+    {
+        const source_dag::SourceDagIndex original(graph);
+        for (size_t i = 0; i < points.size(); ++i) {
+            const auto & point = points[i];
+            const auto lane = original.cpu_nodes_on_lane(point.pid, point.tid);
+            auto at = std::ranges::lower_bound(lane, point.ts, {}, [&](size_t id) { return graph.event_for_node(id).ts; });
+            size_t matches = 0;
+            for (; at != lane.end(); ++at) {
+                const auto & event = graph.event_for_node(*at);
+                if (event.ts != point.ts) break;
+                if (graph.node(*at).duration || event.cat != "observed_boundary") continue;
+
+                result[i] = *at;
+                ++matches;
+            }
+            if (matches > 1) result[i].reset();
+            if (!matches) {
+                positions.push_back(i);
+                missing.push_back(point);
+            }
         }
     }
     const auto gaps = core::insert_cpu_gap_points(graph, missing);
     for (size_t i = 0; i < gaps.size(); ++i) result[positions[i]] = gaps[i];
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     std::map<size_t, std::map<uint64_t, std::vector<size_t>>> splits;
     std::map<Coordinate, std::vector<size_t>> entries;
     for (const auto i : positions) {
@@ -108,7 +115,7 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
     // the suffix. Preserve all arrival dependencies at the new zero-cost gate
     // and leave the actual CPU work and its outgoing dependencies untouched.
     if (!entries.empty()) {
-        const adapters::sglang::HiCacheSourceIndex split_source(graph);
+        const source_dag::SourceDagIndex split_source(graph);
         core::DagMutationPlan entry_plan{ .component = "hicache_control_boundaries" };
         std::map<std::string, std::vector<size_t>> entry_results;
         for (const auto & [coordinate, indices] : entries) {

@@ -1,8 +1,8 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -54,7 +54,7 @@ std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & grap
     return members;
 }
 
-void rebind_host_stream_position(const adapters::sglang::HiCacheSourceIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
+void rebind_host_stream_position(const source_dag::SourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
                                  const std::string & tid, uint64_t at_us) {
     const auto & graph = source.graph();
     if ((!position.before || graph.node(*position.before).active) && (!position.after || graph.node(*position.after).active)) return;
@@ -63,8 +63,8 @@ void rebind_host_stream_position(const adapters::sglang::HiCacheSourceIndex & so
     position = observe_write_stream_position(source, sample, pid, tid, at_us);
 }
 
-void rebind_host_stream_positions(const adapters::sglang::HiCacheSourceIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
-                                  const std::string & pid, const std::string & tid, uint64_t at_us) {
+void rebind_host_stream_positions(const source_dag::SourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions, const std::string & pid,
+                                  const std::string & tid, uint64_t at_us) {
     for (auto & [lane, position] : positions) rebind_host_stream_position(source, position, pid, tid, at_us);
 }
 

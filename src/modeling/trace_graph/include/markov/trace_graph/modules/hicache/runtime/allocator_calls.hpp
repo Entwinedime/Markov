@@ -2,10 +2,10 @@
 
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_preparation.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 
 #include <map>
@@ -37,7 +37,7 @@ public:
 
     void bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const model::HiCacheReplayFact> facts,
               const structure::hicache::SchedulerComputeResources & resources, uint64_t begin_us, uint64_t end_us);
-    void rebind_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers);
+    void rebind_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers);
     void set_work(const model::HiCacheAllocatorWorkItem & work, const adapters::sglang::AllocatorPreparation & preparation);
     void advance(core::DagGraph & graph, size_t node, simulation::FutureDag & future);
     [[nodiscard]] bool owns(size_t source_node) const { return owned_.contains(source_node); }

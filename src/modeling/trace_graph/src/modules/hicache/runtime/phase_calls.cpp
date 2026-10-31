@@ -1,7 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/phase_calls.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
@@ -79,7 +79,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<Call> replacements;
@@ -143,7 +143,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     }
 }
 
-void HiCachePhaseCalls::rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers) {
+void HiCachePhaseCalls::rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers) {
     std::vector<HiCacheHostExpansion *> retained;
     for (auto & [entry, call] : calls_) {
         retained.push_back(&call.retained);

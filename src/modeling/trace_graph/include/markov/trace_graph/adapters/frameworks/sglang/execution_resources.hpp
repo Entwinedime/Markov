@@ -1,6 +1,6 @@
 #pragma once
 
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 
 namespace markov::trace_graph::adapters::sglang {
@@ -11,6 +11,6 @@ namespace markov::trace_graph::adapters::sglang {
  * not costs or target work templates. Missing/ambiguous forward placements are
  * not fabricated; conflicting proven identities on one scheduler fail clearly.
  */
-[[nodiscard]] structure::hicache::SchedulerDeviceResources observe_scheduler_compute_resources(const adapters::sglang::HiCacheSourceIndex & source);
+[[nodiscard]] structure::hicache::SchedulerDeviceResources observe_scheduler_compute_resources(const source_dag::SourceDagIndex & source);
 
 } // namespace markov::trace_graph::adapters::sglang

@@ -1,7 +1,7 @@
 #pragma once
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 
 namespace markov::trace_graph::modules::hicache::patch {
 
@@ -18,7 +18,7 @@ struct HiCacheLayerWaitPosition {
 
 /** Locate inactive calls on the current graph, including after active-wait
  * removal. Build submission indices once rather than scanning per call. */
-std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(const adapters::sglang::HiCacheSourceIndex & source,
+std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(const source_dag::SourceDagIndex & source,
                                                                                                   const HiCacheLayerWaitObservation & waits,
                                                                                                   std::span<const HiCacheLayerWaitCall * const> calls);
 
@@ -34,7 +34,7 @@ struct HiCacheLayerWaitInsertionPlan {
  * layer_ready must be the caller's predicted per-layer readiness, never a target trace.
  * This returns a separate transaction; the caller combines it atomically with I/O.
  */
-HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
+HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const source_dag::SourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
                                                                  const std::vector<HiCacheLayerWaitInsertion> & insertions);
 
 } // namespace markov::trace_graph::modules::hicache::patch

@@ -1,8 +1,14 @@
 /** Source-supported CPU communication calls used by HiCache scheduling. */
 #pragma once
 
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/source_dag/index.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache {
 
@@ -28,7 +34,7 @@ struct CpuCollectiveObservation {
 };
 
 /** Read-only identity and containment checks; missing roles remain missing. */
-[[nodiscard]] CpuCollectiveObservation observe_cpu_collectives(const adapters::sglang::HiCacheSourceIndex & source);
+[[nodiscard]] CpuCollectiveObservation observe_cpu_collectives(const source_dag::SourceDagIndex & source);
 
 
 } // namespace markov::trace_graph::modules::hicache

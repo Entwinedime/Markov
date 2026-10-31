@@ -1,8 +1,8 @@
 /** Dependency replay for observed synchronous Gloo/TCP collectives. */
 #pragma once
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/cpu_collectives.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <cstddef>
 #include <map>
 #include <string>
@@ -21,11 +21,11 @@ struct CpuCollectiveWaitPlan {
  */
 class CpuCollectiveWaitPlanner {
 public:
-    explicit CpuCollectiveWaitPlanner(const adapters::sglang::HiCacheSourceIndex & source);
+    explicit CpuCollectiveWaitPlanner(const source_dag::SourceDagIndex & source);
     [[nodiscard]] CpuCollectiveWaitPlan plan(const std::vector<const CpuCollectiveRound *> & rounds) const;
 
 private:
-    const adapters::sglang::HiCacheSourceIndex & source_;
+    const source_dag::SourceDagIndex & source_;
     std::map<std::string, std::map<std::string, size_t>> caller_order_issues_;
 };
 
@@ -33,7 +33,7 @@ private:
  * Broadcast uses entry lower bounds from the binomial tree, not per-hop timings.
  * All requested rounds are planned atomically; unsupported rounds are not skipped.
  */
-[[nodiscard]] CpuCollectiveWaitPlan plan_cpu_collective_waits(const adapters::sglang::HiCacheSourceIndex & source,
+[[nodiscard]] CpuCollectiveWaitPlan plan_cpu_collective_waits(const source_dag::SourceDagIndex & source,
                                                               const std::vector<const CpuCollectiveRound *> & rounds);
 
 struct CpuCollectivePatch {
@@ -46,6 +46,6 @@ struct CpuCollectivePatch {
 /** Append only whole rounds independent of the existing transaction. Intersecting
  * rounds remain source observations until their target loop is planned jointly.
  */
-[[nodiscard]] CpuCollectivePatch append_retained_cpu_collectives(const adapters::sglang::HiCacheSourceIndex & source,
-                                                                 const CpuCollectiveObservation & observation, core::DagMutationPlan & plan);
+[[nodiscard]] CpuCollectivePatch append_retained_cpu_collectives(const source_dag::SourceDagIndex & source, const CpuCollectiveObservation & observation,
+                                                                 core::DagMutationPlan & plan);
 } // namespace markov::trace_graph::modules::hicache::patch

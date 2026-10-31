@@ -1,9 +1,9 @@
 #pragma once
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -25,7 +25,7 @@ public:
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end);
     // Called after all source replacements: queue membership and stream cuts
     // must refer to the same retained graph used by the executor.
-    void rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & members);
     void advance(size_t node, const Consumer & consumer, simulation::FutureDag & future);
     struct NestedCall {
         size_t anchor;

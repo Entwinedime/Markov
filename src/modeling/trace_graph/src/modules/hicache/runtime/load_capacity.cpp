@@ -2,6 +2,7 @@
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -47,7 +48,7 @@ void HiCacheWriteCalls::bind_load_attempts(core::DagGraph & graph, uint64_t begi
         }
     }
     const auto bound = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex bounded(graph);
+    const source_dag::SourceDagIndex bounded(graph);
     core::DagMutationPlan entries{ .component = "hicache_load_allocation" };
     for (size_t i = 0; i < load_attempts_.size(); ++i) {
         if (!bound[2 * i] || !bound[2 * i + 1]) throw std::runtime_error("Load attempt lacks exact entry/return boundaries");
@@ -71,7 +72,7 @@ void HiCacheWriteCalls::bind_load_attempts(core::DagGraph & graph, uint64_t begi
 }
 
 void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<std::pair<const HiCacheLoadBranch *, HiCacheHostTemplate>> hosts;
     for (const auto & branch : load_branches_) {
@@ -129,7 +130,7 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
 }
 
 void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     std::vector<const HiCacheLoadBranch *> branches;
     std::vector<HiCacheHostTemplate> hosts;
     std::set<size_t> owners;
@@ -161,7 +162,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
         capacity_position_errors_.erase(owner);
         load_failure_templates_.erase(owner);
     }
-    const adapters::sglang::HiCacheSourceIndex retained(graph);
+    const source_dag::SourceDagIndex retained(graph);
     for (const auto * branch : branches) {
         const auto key = std::pair{ branch->envelope.pid, branch->envelope.tid };
         HiCacheHostExpansion empty;
@@ -187,7 +188,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     }
 }
 
-void HiCacheWriteCalls::rebind_retained_resources(const adapters::sglang::HiCacheSourceIndex & retained, const std::map<size_t, size_t> & members) {
+void HiCacheWriteCalls::rebind_retained_resources(const source_dag::SourceDagIndex & retained, const std::map<size_t, size_t> & members) {
     // Bind after all source regions have been replaced, including load
     // submissions whose compute Records can be the next stream endpoint.
     const auto & graph = retained.graph();

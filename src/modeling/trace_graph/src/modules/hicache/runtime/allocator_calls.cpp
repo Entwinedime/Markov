@@ -1,7 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/allocator_calls.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include "modules/hicache/runtime/source_preparation.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
@@ -99,7 +99,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(selected.size());
@@ -152,7 +152,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, removals));
 }
 
-void HiCacheAllocatorCalls::rebind_resources(const adapters::sglang::HiCacheSourceIndex & source, const std::map<size_t, size_t> & workers) {
+void HiCacheAllocatorCalls::rebind_resources(const source_dag::SourceDagIndex & source, const std::map<size_t, size_t> & workers) {
     std::vector<HiCacheHostExpansion *> retained;
     for (auto & [entry, call] : calls_) {
         retained.push_back(&call.retained);

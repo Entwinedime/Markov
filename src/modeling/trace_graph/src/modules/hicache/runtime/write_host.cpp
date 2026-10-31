@@ -87,7 +87,7 @@ HiCacheHostTemplate observe_write_host_template(const adapters::sglang::HiCacheS
     return host;
 }
 
-HiCacheHostTemplate observe_host_template(const adapters::sglang::HiCacheSourceIndex & source, const std::string & pid, const std::string & tid, uint64_t begin,
+HiCacheHostTemplate observe_host_template(const source_dag::SourceDagIndex & source, const std::string & pid, const std::string & tid, uint64_t begin,
                                           uint64_t end) {
     if (end <= begin) throw std::invalid_argument("Host template requires a nonempty interval");
     HiCacheHostTemplate result{ .main = source.call_interval_ownership(pid, tid, begin, end - begin) };
@@ -175,7 +175,7 @@ std::vector<HiCacheEvictionRegion> observe_eviction_regions(const adapters::sgla
     return regions;
 }
 
-HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+HiCacheHostExpansion prepare_host_expansion(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             const HiCacheHostTemplate & host, std::string_view prefix, HostExpansionOptions options) {
     const auto callback_points = options.callback_points;
     const auto retain_collective_completions = options.retain_collective_completions;
@@ -395,7 +395,7 @@ HiCacheHostExpansion prepare_host_expansion(const adapters::sglang::HiCacheSourc
     return plan;
 }
 
-HiCacheWriteExpansion prepare_write_expansion(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
+HiCacheWriteExpansion prepare_write_expansion(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                               const patch::HiCacheIoOperationRecord & write, const HiCacheHostTemplate & host, size_t completion) {
     HiCacheWriteExpansion plan{ prepare_host_expansion(source, queues, host, "target write: ") };
     if (!plan.event_waits.empty()) throw std::runtime_error("Write template needs an explicit event-completion binding");

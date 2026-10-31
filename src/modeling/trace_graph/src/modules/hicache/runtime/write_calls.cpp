@@ -2,13 +2,13 @@
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::bind_call_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, std::span<const size_t> resources,
-                                            bool candidate) {
+void HiCacheWriteCalls::bind_call_resources(const source_dag::SourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate) {
     for (const auto node : resources) {
         const auto lane = source.graph().node(node).lane_id;
         if (call.positions.contains(lane)) continue;
@@ -33,7 +33,7 @@ void HiCacheWriteCalls::bind_call_resources(const adapters::sglang::HiCacheSourc
 }
 
 void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues) {
-    const adapters::sglang::HiCacheSourceIndex source(graph);
+    const source_dag::SourceDagIndex source(graph);
     const auto bind = [&](const std::string & pid, const std::string & tid, size_t main, size_t compute, std::optional<size_t> transfer) {
         const auto key = std::pair{ pid, tid };
         if (write_resources_.contains(key)) return;

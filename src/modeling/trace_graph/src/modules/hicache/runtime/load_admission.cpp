@@ -1,8 +1,8 @@
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -12,8 +12,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 
-void HiCacheWriteCalls::prepare_generated_load_admissions(const adapters::sglang::HiCacheSourceIndex & source,
-                                                          const simulation::detail::CpuTaskQueues & queues) {
+void HiCacheWriteCalls::prepare_generated_load_admissions(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
     const auto & graph = source.graph();
     for (const auto & branch : load_branches_) {
         const auto key = std::pair{ branch.envelope.pid, branch.envelope.tid };
@@ -56,7 +55,7 @@ size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const s
     throw std::runtime_error("Generated allocation lacks proven scheduler compute/worker resources");
 }
 
-void HiCacheWriteCalls::bind_load_resources(const adapters::sglang::HiCacheSourceIndex & source, Call & call, const LoadAdmissionProgram & program) {
+void HiCacheWriteCalls::bind_load_resources(const source_dag::SourceDagIndex & source, Call & call, const LoadAdmissionProgram & program) {
     if (program.clone) bind_call_resources(source, call, program.clone->program.plan.resource_nodes(), true);
     for (const auto & step : program.allocation) bind_call_resources(source, call, step.program.plan.resource_nodes(), true);
     if (allocator_need_sort_) {

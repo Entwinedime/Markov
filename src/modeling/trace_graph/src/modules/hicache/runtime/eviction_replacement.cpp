@@ -3,6 +3,7 @@
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -18,7 +19,7 @@ void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
             if (action == Action::Submit) submissions.push_back(call);
     if (submissions.empty()) return;
 
-    const adapters::sglang::HiCacheSourceIndex observed(graph);
+    const source_dag::SourceDagIndex observed(graph);
     std::vector<HiCacheHostTemplate> hosts;
     std::vector<std::vector<size_t>> opening_nodes;
     hosts.reserve(submissions.size());
@@ -56,7 +57,7 @@ void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
     // Resolve against the surviving stream order, not the removed payload's
     // observed GPU timestamps. Generated host returns delay the original
     // continuation; asynchronous completion does not block it unnecessarily.
-    const adapters::sglang::HiCacheSourceIndex surviving(graph);
+    const source_dag::SourceDagIndex surviving(graph);
     for (const auto id : submissions) {
         auto & call = calls_[id];
         call.successors = { call.return_node };
@@ -165,7 +166,7 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
             if (action == Action::Submit) source_owners_.insert(calls_[index].owner);
             if (action == Action::Wait) wait_owners_.insert(calls_[index].owner);
         }
-    const adapters::sglang::HiCacheSourceIndex surviving(graph);
+    const source_dag::SourceDagIndex surviving(graph);
     for (auto & call : replacements) {
         for (const auto & [id, donor] : observed_write_fragments_)
             if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.resources);

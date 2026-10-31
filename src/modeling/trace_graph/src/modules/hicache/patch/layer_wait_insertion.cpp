@@ -1,6 +1,6 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <array>
 #include <set>
@@ -23,7 +23,7 @@ struct CallTemplate {
 };
 
 // CPU program order is the insertion clock, even when the device is far behind.
-std::optional<size_t> main_submission(const adapters::sglang::HiCacheSourceIndex & source, size_t id, size_t lane) {
+std::optional<size_t> main_submission(const source_dag::SourceDagIndex & source, size_t id, size_t lane) {
     const auto & graph = source.graph();
     if (graph.node(id).is_cpu && graph.node(id).lane_id == lane) return id;
     std::set<size_t> found;
@@ -52,7 +52,7 @@ struct DeviceSubmission {
     size_t device = 0;
 };
 
-std::optional<DevicePlacement> placement(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitCall & call, const CallTemplate & sample,
+std::optional<DevicePlacement> placement(const source_dag::SourceDagIndex & source, const HiCacheLayerWaitCall & call, const CallTemplate & sample,
                                          const std::vector<DeviceSubmission> & submissions, std::string & issue) {
     const auto & graph = source.graph();
     const auto next = std::ranges::lower_bound(submissions, call.end_ns, {}, &DeviceSubmission::begin);
@@ -104,7 +104,7 @@ std::optional<DevicePlacement> placement(const adapters::sglang::HiCacheSourceIn
 }
 } // namespace
 
-std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(const adapters::sglang::HiCacheSourceIndex & source,
+std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactive_layer_positions(const source_dag::SourceDagIndex & source,
                                                                                                   const HiCacheLayerWaitObservation & waits,
                                                                                                   std::span<const HiCacheLayerWaitCall * const> calls) {
     const auto & graph = source.graph();
@@ -189,7 +189,7 @@ std::map<const HiCacheLayerWaitCall *, HiCacheLayerWaitPosition> observe_inactiv
     return result;
 }
 
-HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const adapters::sglang::HiCacheSourceIndex & source, const HiCacheLayerWaitObservation & waits,
+HiCacheLayerWaitInsertionPlan plan_hicache_layer_wait_insertions(const source_dag::SourceDagIndex & source, const HiCacheLayerWaitObservation & waits,
                                                                  const std::vector<HiCacheLayerWaitInsertion> & insertions) {
     HiCacheLayerWaitInsertionPlan result;
     if (insertions.empty()) {

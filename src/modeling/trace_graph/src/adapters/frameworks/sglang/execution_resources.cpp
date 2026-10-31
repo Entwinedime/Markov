@@ -8,7 +8,7 @@
 
 namespace markov::trace_graph::adapters::sglang {
 
-structure::hicache::SchedulerDeviceResources observe_scheduler_compute_resources(const adapters::sglang::HiCacheSourceIndex & source) {
+structure::hicache::SchedulerDeviceResources observe_scheduler_compute_resources(const source_dag::SourceDagIndex & source) {
     const auto & graph = source.graph();
     const auto waits = modules::hicache::observe_hicache_layer_waits(source);
     structure::hicache::SchedulerDeviceResources resources;

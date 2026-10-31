@@ -1,6 +1,6 @@
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
-#include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
+#include "markov/trace_graph/source_dag/index.hpp"
 #include <algorithm>
 #include <set>
 #include <tuple>
@@ -44,7 +44,7 @@ CallerOrderIssues observe_caller_order(const core::DagGraph & graph) {
 
 class Planner {
 public:
-    Planner(const adapters::sglang::HiCacheSourceIndex & source, const CallerOrderIssues & caller_order)
+    Planner(const source_dag::SourceDagIndex & source, const CallerOrderIssues & caller_order)
         : source(source),
           graph(source.graph()),
           caller_order(caller_order) {}
@@ -59,7 +59,7 @@ public:
     }
 
 private:
-    const adapters::sglang::HiCacheSourceIndex & source;
+    const source_dag::SourceDagIndex & source;
     const core::DagGraph & graph;
     const CallerOrderIssues & caller_order;
     CpuCollectiveWaitPlan result;
@@ -268,7 +268,7 @@ private:
 };
 } // namespace
 
-CpuCollectiveWaitPlanner::CpuCollectiveWaitPlanner(const adapters::sglang::HiCacheSourceIndex & source)
+CpuCollectiveWaitPlanner::CpuCollectiveWaitPlanner(const source_dag::SourceDagIndex & source)
     : source_(source),
       caller_order_issues_(observe_caller_order(source.graph())) {}
 
@@ -276,7 +276,7 @@ CpuCollectiveWaitPlan CpuCollectiveWaitPlanner::plan(const std::vector<const Cpu
     return Planner(source_, caller_order_issues_).run(rounds);
 }
 
-CpuCollectiveWaitPlan plan_cpu_collective_waits(const adapters::sglang::HiCacheSourceIndex & source, const std::vector<const CpuCollectiveRound *> & rounds) {
+CpuCollectiveWaitPlan plan_cpu_collective_waits(const source_dag::SourceDagIndex & source, const std::vector<const CpuCollectiveRound *> & rounds) {
     return CpuCollectiveWaitPlanner(source).plan(rounds);
 }
 } // namespace markov::trace_graph::modules::hicache::patch
