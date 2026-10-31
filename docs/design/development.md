@@ -154,6 +154,16 @@ scripts/model.sh cost-db inspect \
 
 逐行事实库需要转换时使用 `cost-db migrate --database <old.sqlite> --output <new.sqlite> --summary <migration.json>`。该命令将已分离部署、采集和来源的逐行事实转换为工作点与精确分布，不重新打开原始 trace 或物理测量文件，不从历史系数反造事实。更早的其他存储布局不能直接输入此命令。旧库只读，输出必须不存在；普通导入和训练不暗中转换。维护和训练顺序进行，不假定有跨进程在线更新协议。
 
+预测读取带共享坐标与来源表的成本包，训练会自动生成该布局。已有展开包可显式转换：
+
+```bash
+scripts/model.sh cost-db migrate \
+  --package <expanded-cost-package.json> \
+  --output <cost-package.json> --summary <package-migration.json>
+```
+
+转换保留参数、范围、全部联合工作点和逐模型来源，原文件保留，新输出必须不存在。成本包采用紧凑JSON，维护摘要与普通报告继续保留排版。发布替换文件前结束引用该文件的会话，再从新会话预测；历史结果保持原样。
+
 ## 直接预测与并发
 
 ```bash
