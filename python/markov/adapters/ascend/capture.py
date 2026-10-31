@@ -18,7 +18,7 @@ class AscendDevices:
         return state
 
     def container_arguments(self) -> list[str]:
-        result = []
+        result = ["--runtime", "ascend"]
         for device in (*[f"davinci{device}" for device in self.devices], "davinci_manager", "devmm_svm", "hisi_hdc"):
             result += ["--device", f"/dev/{device}"]
         result += [
@@ -26,7 +26,9 @@ class AscendDevices:
             "type=bind,source=/usr/local/Ascend/driver,target=/usr/local/Ascend/driver,readonly",
             "-e",
             "ASCEND_VISIBLE_DEVICES=" + ",".join(map(str, self.devices)),
+            "-e",
+            "HCCL_NPU_SOCKET_PORT_RANGE=auto",
         ]
-        # Mounted devices are renumbered in the container; native code uses
-        # their observed logical indices, not host IDs as another visibility mask.
+        # Ascend's container runtime maps selected host devices to local IDs.
+        # HCCL allocates ports rather than sharing its fixed default with peers.
         return result
