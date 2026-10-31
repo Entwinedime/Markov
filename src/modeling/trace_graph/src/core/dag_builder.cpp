@@ -211,19 +211,19 @@ EventLaneIdentity resolve_event_lane(const TraceEvent & event, bool collect_alia
 
 DagBuilder::DagBuilder(size_t threads) : threads_(std::max<size_t>(1, threads)) {}
 
-DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
+DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id, SourceObservations observations) const {
     auto parsed_count = events.size();
     auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
     auto exclusions = dag_builder_detail::control_exclusion_intervals(events, phase_markers, gpu_id);
     auto split = dag_builder_detail::split_observation_events(std::move(events));
     dag_builder_detail::retain_modeled_operator_envelopes(split);
     auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
-    DagGraph graph(std::move(normalized), gpu_id);
+    observations.hicache_fact_events = std::move(split.hicache_fact_events);
+    observations.runtime_observations = std::move(split.runtime_observations);
+    observations.control_exclusion_intervals = std::move(exclusions);
+    observations.phase_marker_events = std::move(phase_markers);
+    DagGraph graph(std::move(normalized), gpu_id, std::move(observations));
     graph.set_parsed_record_count(parsed_count);
-    graph.set_hicache_fact_events(std::move(split.hicache_fact_events));
-    graph.set_runtime_observations(std::move(split.runtime_observations));
-    graph.set_control_exclusion_intervals(std::move(exclusions));
-    graph.set_phase_marker_events(std::move(phase_markers));
     graph.reserve(DagGraphCapacity{ .nodes = graph.event_count(), .edges = 0 });
 
     auto index = create_node_index(graph);

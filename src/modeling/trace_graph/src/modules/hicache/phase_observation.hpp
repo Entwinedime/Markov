@@ -13,7 +13,9 @@
 
 namespace markov::trace_graph::core {
 class DagGraph;
-}
+struct SourceObservations;
+struct TraceEvent;
+} // namespace markov::trace_graph::core
 
 namespace markov::trace_graph::modules::hicache {
 
@@ -94,14 +96,31 @@ struct HiCachePhaseObservationAudit {
     [[nodiscard]] bool ready() const { return status == "ready"; }
 };
 
-/**
- * @brief Joins request-bearing cache-extend facts to Torch phase markers.
- *
- * The join is based on rank-local semantic order. It has no config/cell table and
- * does not use a fixed time tolerance. Marker intervals remain observations, not
- * ownership windows for Direct I/O or residual CPU gaps.
- * Post-forward greedy sampling uses its exact call envelope and a unique
- * enclosing request batch containing that forward, not timestamp proximity.
+enum class HiCachePhaseKind : uint8_t { Prefill, Decode };
+
+/** Borrowed envelopes and thread names remain valid while SourceObservations lives. */
+struct HiCachePhaseInterval {
+    const core::TraceEvent * envelope = nullptr;
+    int logical_input = 0;
+    std::string_view pid, tid;
+    uint64_t start_us = 0, end_us = 0;
+    size_t observation_index = 0;
+    HiCachePhaseKind kind = HiCachePhaseKind::Prefill;
+    uint64_t decode_iteration = 0;
+};
+
+struct HiCachePhaseInputs {
+    HiCachePhaseObservationAudit audit;
+    std::vector<HiCachePhaseInterval> intervals;
+};
+
+/** Join source facts, request markers and exact call envelopes, without graph topology or costs.
+ * Rank-local semantic order supplies request identity. Overlapping owners remain ambiguous.
+ */
+[[nodiscard]] HiCachePhaseInputs observe_hicache_phase_inputs(const core::SourceObservations & source);
+
+/** Attach device/submission ownership through source correlations and worker containment.
+ * Marker windows do not own HiCache I/O or residual gaps. Sampling uses its unique request batch.
  */
 [[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits = nullptr);
 

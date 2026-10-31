@@ -25,7 +25,7 @@ using CallerOrderIssues = std::map<std::string, std::map<std::string, size_t>>;
 
 CallerOrderIssues observe_caller_order(const core::DagGraph & graph) {
     std::map<std::pair<std::string, std::string>, std::vector<const core::TraceEvent *>> calls;
-    for (const auto & event : graph.runtime_observations())
+    for (const auto & event : graph.source_observations().runtime_observations)
         if (event.name == "runtime.cpu_collective") calls[{ event.arg("group"), event.arg("rank") }].push_back(&event);
 
     CallerOrderIssues issues;
@@ -137,7 +137,7 @@ private:
             for (const auto peer : timing.calls.at(call.rank).entry_ranks) connect(ref(arrivals.at(peer)), Ref::existing(*call.worker));
     }
     std::optional<size_t> add_call(const CpuCollectiveCall & call, const CpuCollectiveCallTiming & timing) {
-        const auto & event = graph.runtime_observations()[call.observation];
+        const auto & event = graph.source_observations().runtime_observations[call.observation];
         const auto & submit = graph.event_for_node(*call.submission);
         const auto & worker = graph.event_for_node(*call.worker);
         const auto finish = event.ts + event.dur, submit_end = submit.ts + submit.dur;

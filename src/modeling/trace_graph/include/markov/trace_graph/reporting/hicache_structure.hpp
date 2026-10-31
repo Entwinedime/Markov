@@ -3,8 +3,8 @@
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #include <nlohmann/json_fwd.hpp>
 #include <span>
 #include <utility>

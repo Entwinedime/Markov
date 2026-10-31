@@ -27,7 +27,7 @@ struct SynchronousReadback {
                                                                               const source_dag::SubmittedCallRegion & region);
 
 /** Match semantic tensor operations to original Torch call envelopes.
- * Keys are indices in program; values address graph.runtime_observations().
+ * Keys are indices in program; values address graph.source_observations().runtime_observations.
  * Missing or non-unique lowering is omitted, never paired by proximity.
  */
 [[nodiscard]] std::map<size_t, size_t> match_tensor_operators(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,

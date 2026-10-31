@@ -21,7 +21,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     std::vector<const adapters::sglang::DeviceCollectiveCall *> selected;
     std::vector<core::TraceEvent> points;
     for (const auto & call : calls) {
-        const auto & event = original.runtime_observations().at(call.region.observation);
+        const auto & event = original.source_observations().runtime_observations.at(call.region.observation);
         const auto end = core::checked_add_u64(event.ts, event.dur, "Collective caller end overflow");
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
         if (!call.caller_intervals) throw std::runtime_error("Collective caller needs a supported event protocol with proven stream handoffs");
@@ -49,7 +49,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     for (size_t i = 0; i < selected.size(); ++i) {
         const auto & call = *selected[i];
         const auto steps = structure::hicache::ordinary_collective_caller_steps(call.transfer);
-        const auto & event = original.runtime_observations().at(call.region.observation);
+        const auto & event = original.source_observations().runtime_observations.at(call.region.observation);
         if (!boundaries[2 * i] || !boundaries[2 * i + 1]) throw std::runtime_error("Collective caller replacement lacks exact source entry/exit boundaries");
         const auto entry = *boundaries[2 * i], exit = *boundaries[2 * i + 1];
         hosts.push_back({ .main = source.call_interval_ownership(event.pid, event.tid, event.ts, event.dur) });

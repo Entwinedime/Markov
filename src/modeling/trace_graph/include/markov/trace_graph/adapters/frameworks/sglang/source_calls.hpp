@@ -2,12 +2,12 @@
 
 #include "markov/trace_graph/adapters/frameworks/sglang/allocator_program.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
-#include "markov/trace_graph/source_dag/decode_allocation.hpp"
 #include "markov/trace_graph/structure/hicache/collective.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
+#include "modules/hicache/phase_observation.hpp"
+#include "source_dag/decode_allocation.hpp"
 
 #include <cstddef>
 #include <cstdint>

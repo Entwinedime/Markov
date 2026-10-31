@@ -105,30 +105,30 @@ std::map<size_t, size_t> match_submitted_operator_envelopes(const source_dag::So
     };
     std::vector<Candidate> candidates;
     for (const auto observation : observations) {
-        if (!schemas.contains(graph.runtime_observations().at(observation).name)) continue;
+        if (!schemas.contains(graph.source_observations().runtime_observations.at(observation).name)) continue;
         const auto region = source_dag::observe_submitted_call_region(source, queues, observation);
         if (region.caller.has_node_overlap) continue;
-        const auto & schema = graph.runtime_observations().at(observation).name;
+        const auto & schema = graph.source_observations().runtime_observations.at(observation).name;
         const bool readback = (schema == "aten::_local_scalar_dense" || schema == "aten::_to_copy") && observe_synchronous_readback(source, region).has_value();
         std::set<size_t> devices;
         for (const auto node : region.submitted_nodes)
             if (!graph.node(node).is_cpu) devices.insert(node);
         if (!readback && devices.empty()) continue;
 
-        const auto & event = graph.runtime_observations().at(observation);
+        const auto & event = graph.source_observations().runtime_observations.at(observation);
         candidates.push_back({ observation, event.start_ns(), event.end_ns(), std::move(devices) });
     }
 
     std::vector<size_t> submitted;
     for (const auto & candidate : candidates) {
-        const auto & event = graph.runtime_observations().at(candidate.observation);
+        const auto & event = graph.source_observations().runtime_observations.at(candidate.observation);
         // Composite calls (stack -> cat) and backend redispatch (argmax ->
         // argmax) can expose nested envelopes for exactly the same device
         // work. Keep its enclosing operation once. Strict containment and
         // identical device ownership are required, not just matching names;
         // equal envelopes and calls with different work remain unresolved.
         const bool nested_alias = !candidate.devices.empty() && std::ranges::any_of(candidates, [&](const auto & parent) {
-            const auto & outer = graph.runtime_observations().at(parent.observation);
+            const auto & outer = graph.source_observations().runtime_observations.at(parent.observation);
             return outer.pid == event.pid && outer.tid == event.tid && parent.begin_ns <= candidate.begin_ns && parent.end_ns >= candidate.end_ns
                    && (parent.begin_ns < candidate.begin_ns || parent.end_ns > candidate.end_ns) && parent.devices == candidate.devices;
         });

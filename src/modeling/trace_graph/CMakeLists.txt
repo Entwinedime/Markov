@@ -163,6 +163,7 @@ target_link_libraries(trace_graph_hicache_rules PUBLIC trace_graph_core trace_gr
 
 # Concrete source observations depend inward on graph and work contracts.
 add_library(trace_graph_sglang_observations STATIC
+    src/modules/hicache/phase_inputs.cpp
     src/modules/hicache/phase_observation.cpp
     src/adapters/frameworks/sglang/source_calls.cpp
     src/adapters/frameworks/sglang/allocator_observations.cpp

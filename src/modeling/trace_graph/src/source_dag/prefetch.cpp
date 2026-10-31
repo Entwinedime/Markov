@@ -31,7 +31,7 @@ PrefetchSchedulerBody observe_prefetch_scheduler_body(const adapters::sglang::Hi
     for (const auto & c : next) {
         if (!c.issue.empty() || !c.rank || c.cpu.empty() || !following.emplace(*c.rank, &c).second) return fail("scheduler_body_invalid_next_progress");
     }
-    const auto & events = source.graph().runtime_observations();
+    const auto & events = source.graph().source_observations().runtime_observations;
     std::map<int, const Fact *> facts;
     std::vector<size_t> rounds;
     std::set<size_t> included_events;

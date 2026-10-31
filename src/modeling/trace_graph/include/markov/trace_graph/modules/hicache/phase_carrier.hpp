@@ -8,8 +8,8 @@
 #include "markov/trace_graph/modules/hicache/diagnostics/static_phase.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
 #ifdef DEBUG
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/module.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #endif
 
 #include <cstddef>

@@ -338,7 +338,7 @@ nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const
                                             bool include_caller_scopes, std::span<const structure::OperationWork> device_launches) {
     const auto & graph = source.graph();
     nlohmann::json rows = nlohmann::json::array();
-    const auto position = measurement_position(graph.runtime_observations().at(index));
+    const auto position = measurement_position(graph.source_observations().runtime_observations.at(index));
     if (!position) return rows;
 
     const auto region = observe_submitted_call_region(source, queues, index);
@@ -349,7 +349,7 @@ nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const
         if (!include_caller_scopes) return rows;
         const auto readback = adapters::ascend::observe_synchronous_readback(source, region);
         if (!readback) return rows;
-        const auto & envelope = graph.runtime_observations().at(index);
+        const auto & envelope = graph.source_observations().runtime_observations.at(index);
         const auto & sync = graph.event_for_node(readback->synchronization);
         const auto end = core::checked_add_u64(envelope.ts, envelope.dur, "Readback envelope end overflow");
         for (const auto node : region.submitted_nodes)
@@ -496,7 +496,7 @@ nlohmann::json tensor_operator_observations(const SourceDagIndex & source, const
     }
     if (!include_caller_scopes) return rows;
 
-    const auto & envelope = graph.runtime_observations().at(index);
+    const auto & envelope = graph.source_observations().runtime_observations.at(index);
     const auto boundary = submitted_at.value();
     const auto end = core::checked_add_u64(envelope.ts, envelope.dur, "tensor envelope end overflow");
     if (boundary < envelope.ts || boundary > end) return rows;
@@ -555,7 +555,7 @@ nlohmann::json tensor_program_outer_observations(const SourceDagIndex & source, 
                                                  std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
                                                  bool cpu_service_applied, std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits) {
     const auto & graph = source.graph();
-    const auto & outer = graph.runtime_observations().at(region.observation);
+    const auto & outer = graph.source_observations().runtime_observations.at(region.observation);
     nlohmann::json rows = nlohmann::json::array();
     // A program rooted at its own Torch envelope already exports caller
     // scopes. Only an explicit CPU tail establishes additional outer work.
@@ -587,7 +587,7 @@ nlohmann::json tensor_program_outer_observations(const SourceDagIndex & source, 
         else {
             const auto found = matched.find(i + 1);
             if (found == matched.end()) return nlohmann::json::array();
-            const auto & event = graph.runtime_observations().at(found->second);
+            const auto & event = graph.source_observations().runtime_observations.at(found->second);
             begin = event.ts;
             end = core::checked_add_u64(begin, event.dur, "Tensor operator end overflow");
         }

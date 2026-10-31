@@ -21,17 +21,18 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const source_da
     for (const auto & call : preparations.calls)
         if (call.allocator_observation) extend_calls.emplace(*call.allocator_observation, &call);
     std::map<std::pair<std::string, std::string>, std::vector<size_t>> launches;
-    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
-        const auto & event = graph.runtime_observations()[i];
+    for (size_t i = 0; i < graph.source_observations().runtime_observations.size(); ++i) {
+        const auto & event = graph.source_observations().runtime_observations[i];
         if (event.name == "runtime.allocator.kernel" && event.arg("status") == "returned") launches[{ event.pid, event.tid }].push_back(i);
     }
-    for (auto & [lane, indices] : launches) std::ranges::sort(indices, {}, [&](size_t index) { return graph.runtime_observations()[index].ts; });
+    for (auto & [lane, indices] : launches)
+        std::ranges::sort(indices, {}, [&](size_t index) { return graph.source_observations().runtime_observations[index].ts; });
 
     for (const auto & region : observe_allocator_regions(source, queues)) {
         calls.push_back({ .region = region });
         auto & result = calls.back();
         if (region.allocated != true) continue;
-        const auto & event = graph.runtime_observations().at(region.work.observation);
+        const auto & event = graph.source_observations().runtime_observations.at(region.work.observation);
         const auto deployment = observed_allocator_inputs(event);
         if (!deployment) continue;
 
@@ -98,9 +99,11 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const source_da
             const auto lane = launches.find({ event.pid, event.tid });
             const auto finish = core::checked_add_u64(event.ts, event.dur, "Allocator call end overflow");
             if (lane != launches.end()) {
-                auto at = std::ranges::lower_bound(lane->second, event.ts, {}, [&](size_t index) { return graph.runtime_observations()[index].ts; });
+                auto at = std::ranges::lower_bound(lane->second, event.ts, {}, [&](size_t index) {
+                    return graph.source_observations().runtime_observations[index].ts;
+                });
                 for (; at != lane->second.end(); ++at) {
-                    const auto & launch = graph.runtime_observations()[*at];
+                    const auto & launch = graph.source_observations().runtime_observations[*at];
                     if (launch.ts >= finish) break;
                     if (core::checked_add_u64(launch.ts, launch.dur, "Allocator kernel call end overflow") <= finish) contained.push_back(*at);
                 }

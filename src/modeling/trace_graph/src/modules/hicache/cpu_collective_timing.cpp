@@ -11,7 +11,7 @@ CpuCollectiveTiming observe_cpu_collective_timing(const core::DagGraph & graph, 
         result.issue = "incomplete_round";
         return result;
     }
-    const auto & first = graph.runtime_observations()[round.calls.front().observation];
+    const auto & first = graph.source_observations().runtime_observations[round.calls.front().observation];
     const auto operation = first.arg("operation");
     const auto size = round.members.size();
     size_t root = 0;
@@ -39,7 +39,7 @@ CpuCollectiveTiming observe_cpu_collective_timing(const core::DagGraph & graph, 
         timing.entry_ranks = dependencies.at(call.rank);
         uint64_t latest = 0;
         for (const auto rank : timing.entry_ranks) latest = std::max(latest, entries.at(rank));
-        const auto & event = graph.runtime_observations()[call.observation];
+        const auto & event = graph.source_observations().runtime_observations[call.observation];
         const auto & submit = graph.event_for_node(*call.submission);
         const auto & worker = graph.event_for_node(*call.worker);
         const auto submitted = submit.ts + submit.dur, worked = worker.ts + worker.dur, returned = event.ts + event.dur;
@@ -70,9 +70,9 @@ CpuCollectiveTiming observe_cpu_all_reduce_envelope(const core::DagGraph & graph
         timing.issue = "incomplete_envelope_round";
         return timing;
     }
-    const auto & first = graph.runtime_observations().at(round.calls.front().observation);
+    const auto & first = graph.source_observations().runtime_observations.at(round.calls.front().observation);
     for (const auto & call : round.calls) {
-        const auto & e = graph.runtime_observations().at(call.observation);
+        const auto & e = graph.source_observations().runtime_observations.at(call.observation);
         if (!seen.insert(call.rank).second || !expected.contains(call.rank) || e.arg("operation") != "all_reduce" || e.arg("async_op") != "false"
             || e.arg("status") != "returned" || e.arg_u64("sequence_after") <= e.arg_u64("sequence_before")) {
             timing.issue = "not_complete_synchronous_all_reduce";
@@ -87,7 +87,7 @@ CpuCollectiveTiming observe_cpu_all_reduce_envelope(const core::DagGraph & graph
     }
     const auto dependencies = structure::cpu_collective_entries(structure::CpuCollectiveKind::AllReduce, round.members);
     for (const auto & call : round.calls) {
-        const auto & e = graph.runtime_observations().at(call.observation);
+        const auto & e = graph.source_observations().runtime_observations.at(call.observation);
         if (e.ts + e.dur < e.ts || e.ts + e.dur < latest) {
             timing.calls.clear();
             timing.issue = "envelope_return_before_peer_entry";

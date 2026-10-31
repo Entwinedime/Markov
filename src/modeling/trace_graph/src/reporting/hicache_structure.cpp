@@ -626,14 +626,14 @@ Json observed_allocator_summary(const core::DagGraph & graph, const modules::hic
     // is not evidence of ownership, nor is the outer entry's free-page count.
     using Lane = std::pair<std::string, std::string>;
     std::map<Lane, std::vector<const core::TraceEvent *>> allocators;
-    for (const auto & event : graph.runtime_observations())
+    for (const auto & event : graph.source_observations().runtime_observations)
         if (event.name == "runtime.hicache.extend_allocator" || event.name == "runtime.hicache.decode_allocator")
             allocators[{ event.pid, event.tid }].push_back(&event);
     for (auto & [lane, events] : allocators) std::ranges::stable_sort(events, {}, [](const auto * event) { return event->ts; });
 
     Json calls = Json::array();
     size_t unobservable = 0, unobservable_queues = 0;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.extend_allocation" && event.name != "runtime.hicache.decode_allocation") continue;
         const bool decode = event.name == "runtime.hicache.decode_allocation";
         const bool complete = std::ranges::all_of(std::initializer_list<const char *>{ "request_ids",
@@ -715,15 +715,16 @@ Json observed_allocator_summary(const core::DagGraph & graph, const modules::hic
         if (queue.is_null()) ++unobservable_queues;
 
         calls.push_back({
-            { "source_observation", nested.size() == 1 ? Json(static_cast<size_t>(nested.front() - graph.runtime_observations().data())) : Json(nullptr) },
-            {      "logical_input",                                                                                                  ranks.at(event.pid) },
-            {   "page_size_tokens",                                                                                                            page_size },
-            {         "batch_size",                                                                                                           ids.size() },
-            {              "phase",                                                                                        decode ? "decode" : "prefill" },
-            {      "extend_tokens",                                                                                       event.arg_u64("extend_tokens") },
-            {          "new_pages",                                                                                           event.arg_u64("new_pages") },
-            {           "requests",                                                                                                  std::move(requests) },
-            {        "queue_state",                                                                                                     std::move(queue) },
+            { "source_observation",
+             nested.size() == 1 ? Json(static_cast<size_t>(nested.front() - graph.source_observations().runtime_observations.data())) : Json(nullptr) },
+            {      "logical_input",                                                                                               ranks.at(event.pid) },
+            {   "page_size_tokens",                                                                                                         page_size },
+            {         "batch_size",                                                                                                        ids.size() },
+            {              "phase",                                                                                     decode ? "decode" : "prefill" },
+            {      "extend_tokens",                                                                                    event.arg_u64("extend_tokens") },
+            {          "new_pages",                                                                                        event.arg_u64("new_pages") },
+            {           "requests",                                                                                               std::move(requests) },
+            {        "queue_state",                                                                                                  std::move(queue) },
         });
     }
     return {

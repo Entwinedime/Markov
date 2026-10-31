@@ -59,7 +59,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
     std::vector<core::TraceEvent> points;
     std::set<size_t> paired;
     for (const auto & region : regions) {
-        const auto & event = original.runtime_observations().at(region.work.observation);
+        const auto & event = original.source_observations().runtime_observations.at(region.work.observation);
         const auto finish = core::checked_add_u64(event.ts, event.dur, "Allocator end overflow");
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
 
@@ -107,7 +107,7 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
     std::map<std::pair<size_t, size_t>, std::optional<HostDeviceResources>> observed_resources;
     for (size_t i = 0; i < selected.size(); ++i) {
         const auto & region = *selected[i].region;
-        const auto & event = original.runtime_observations().at(region.work.observation);
+        const auto & event = original.source_observations().runtime_observations.at(region.work.observation);
         if (!boundaries[2 * i] || !boundaries[2 * i + 1]) throw std::runtime_error("Allocator requires exact entry and exit boundaries");
         const auto compute = resources.find({ event.pid, event.tid });
         const auto deployment = adapters::sglang::observed_allocator_inputs(event);

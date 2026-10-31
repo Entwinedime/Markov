@@ -62,12 +62,12 @@ std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(const core::DagGra
         // the first formal HTTP request does not make that work prelude-only.
         return end_ns(event) >= begin * 1'000 && start_ns(event) <= end * 1'000;
     };
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         const bool retained_tail = event.arg("formal_window_context") == "causal_tail" && start_ns(event) > end * 1'000;
         if (event.name != "runtime.hicache.radix_insert" || (!in_window(event) && !retained_tail)) continue;
         if (event.arg("status") != "returned") throw std::runtime_error("Radix insert observation did not return");
         const core::TraceEvent * enclosing = nullptr;
-        for (const auto * collection : { &graph.hicache_fact_events(), &graph.tail_context_events() })
+        for (const auto * collection : { &graph.source_observations().hicache_fact_events, &graph.source_observations().tail_context_events })
             for (const auto & raw : *collection) {
                 if (raw.arg("phase") != "end" || !contains(raw, event) || parse_hicache_fact_metadata(raw).role != "cache_lifecycle_commit") continue;
                 if (enclosing) throw std::runtime_error("Radix insert has multiple enclosing lifecycles");
@@ -89,7 +89,7 @@ std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(const core::DagGra
             throw std::runtime_error("Radix insert and lifecycle disagree on chunked state");
         result.push_back({ owner->fact.source_node_id, event, count(event, "path_tokens"), {} });
     }
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if ((event.name != "runtime.hicache.write_policy_check" && event.name != "runtime.hicache.node_publish"
              && event.name != "runtime.hicache.device_restore"))
             continue;
@@ -103,7 +103,7 @@ std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(const core::DagGra
             if (!in_window(event)) continue;
             // A formal-window cut may retain an inner event but not its whole
             // insertion. Do not turn that partial call into a new target site.
-            const bool partial = std::ranges::any_of(graph.runtime_observations(), [&](const auto & outer) {
+            const bool partial = std::ranges::any_of(graph.source_observations().runtime_observations, [&](const auto & outer) {
                 return outer.name == "runtime.hicache.radix_insert" && !in_window(outer) && contains(outer, event);
             });
             if (partial) continue;

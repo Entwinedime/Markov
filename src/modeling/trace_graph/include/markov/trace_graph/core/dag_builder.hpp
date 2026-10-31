@@ -12,8 +12,8 @@
 namespace markov::trace_graph::core {
 
 /** Stream/device barriers include newly inserted prior work; event synchronization does not. */
-[[nodiscard]] bool synchronizes_device_frontier(const TraceEvent& event);
-[[nodiscard]] bool synchronizes_recorded_event(const TraceEvent& event);
+[[nodiscard]] bool synchronizes_device_frontier(const TraceEvent & event);
+[[nodiscard]] bool synchronizes_recorded_event(const TraceEvent & event);
 
 /**
  * @brief Converts normalized trace events into a simulatable base DAG.
@@ -34,7 +34,7 @@ public:
     explicit DagBuilder(size_t threads = 1);
 
     /** @brief Builds the base DAG for one rank and one logical trace input. */
-    [[nodiscard]] DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
+    [[nodiscard]] DagGraph build(std::vector<TraceEvent> events, int gpu_id, SourceObservations observations = {}) const;
 
 private:
     size_t threads_ = 1;

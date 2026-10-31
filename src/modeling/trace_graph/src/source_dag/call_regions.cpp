@@ -59,7 +59,7 @@ std::map<size_t, size_t> match_operator_envelopes(const core::DagGraph & graph, 
     std::map<std::string, std::vector<size_t>> expected, observed;
     for (const auto & [position, name] : schemas) expected[name].push_back(position);
     for (const auto index : observations) {
-        const auto & event = graph.runtime_observations().at(index);
+        const auto & event = graph.source_observations().runtime_observations.at(index);
         if (expected.contains(event.name)) observed[event.name].push_back(index);
     }
 
@@ -105,7 +105,7 @@ std::optional<DeviceChain> observe_serial_device_chain(const SourceDagIndex & so
 
 SubmittedCallRegion observe_submitted_call_region(const SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues, size_t observation) {
     const auto & graph = source.graph();
-    const auto & event = graph.runtime_observations().at(observation);
+    const auto & event = graph.source_observations().runtime_observations.at(observation);
     SubmittedCallRegion region{ .observation = observation, .caller = source.call_interval_ownership(event.pid, event.tid, event.ts, event.dur) };
     // A partial CPU boundary is not enough to claim downstream work.
     if (region.caller.status != "ready" && region.caller.status != "zero_duration") return region;

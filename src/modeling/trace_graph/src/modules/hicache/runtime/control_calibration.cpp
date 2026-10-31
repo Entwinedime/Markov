@@ -35,11 +35,11 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
         }
     };
     if (!release_only) {
-        for (const auto & branch : graph.runtime_observations()) {
+        for (const auto & branch : graph.source_observations().runtime_observations) {
             if (branch.name != "hicache.control.host_load_branch" || branch.ts < begin || branch.ts + branch.dur > end) continue;
 
             const core::TraceEvent * condition = nullptr;
-            for (const auto & event : graph.runtime_observations()) {
+            for (const auto & event : graph.source_observations().runtime_observations) {
                 if (event.name != "runtime.hicache.host_load_check" || event.pid != branch.pid || event.tid != branch.tid || event.ts < branch.ts
                     || event.ts + event.dur > branch.ts + branch.dur)
                     continue;
@@ -169,7 +169,7 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
         if (region.kind == HiCacheEvictionRegion::Kind::Control) row["control_operation"] = eviction_control_name(region.control_phase);
         if (region.kind == HiCacheEvictionRegion::Kind::ReleaseRegular || region.kind == HiCacheEvictionRegion::Kind::ReleaseBackup) {
             const core::TraceEvent * allocation = nullptr;
-            for (const auto & event : graph.runtime_observations()) {
+            for (const auto & event : graph.source_observations().runtime_observations) {
                 if (event.name != "runtime.hicache.allocator_free" || event.pid != fact.pid || event.tid != fact.tid || event.ts < region.begin
                     || event.ts + event.dur > region.end)
                     continue;

@@ -18,7 +18,7 @@ namespace markov::trace_graph::adapters::sglang {
 std::vector<AllocatorRegion> observe_allocator_regions(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
     const auto & graph = source.graph();
     std::vector<AllocatorRegion> regions;
-    const auto & observations = graph.runtime_observations();
+    const auto & observations = graph.source_observations().runtime_observations;
     const auto & operators = source.operator_envelopes();
     for (size_t i = 0; i < observations.size(); ++i) {
         const auto & event = observations[i];
@@ -61,7 +61,7 @@ std::optional<adapters::sglang::AscendAllocatorInputs> observed_allocator_inputs
 std::map<std::string, adapters::sglang::AscendAllocatorInputs> observe_allocator_inputs(const core::DagGraph & graph) {
     std::map<std::string, adapters::sglang::AscendAllocatorInputs> result;
     std::set<std::string> ambiguous;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.decode_allocator") continue;
         const auto observed = observed_allocator_inputs(event);
         if (!observed) {
@@ -122,10 +122,11 @@ std::vector<AttentionRegion> observe_attention_regions(const source_dag::SourceD
         if (event.name == "runtime.phase.attention" && event.arg("descriptor_present") == "true")
             descriptors.emplace(Key{ event.pid, event.arg("phase"), event.arg("descriptor_id") }, position);
     };
-    for (size_t i = 0; i < graph.prelude_context_events().size(); ++i) remember(graph.prelude_context_events()[i], { true, i });
+    for (size_t i = 0; i < graph.source_observations().prelude_context_events.size(); ++i)
+        remember(graph.source_observations().prelude_context_events[i], { true, i });
 
     std::vector<AttentionRegion> regions;
-    const auto & events = graph.runtime_observations();
+    const auto & events = graph.source_observations().runtime_observations;
     const auto & operators = source.operator_envelopes();
     for (size_t i = 0; i < events.size(); ++i) { remember(events[i], { false, i }); }
 
@@ -148,7 +149,7 @@ std::vector<AttentionRegion> observe_attention_regions(const source_dag::SourceD
 
 std::vector<AttentionMetadataRegion> observe_attention_metadata_regions(const source_dag::SourceDagIndex & source,
                                                                         const simulation::detail::CpuTaskQueues & queues) {
-    const auto & events = source.graph().runtime_observations();
+    const auto & events = source.graph().source_observations().runtime_observations;
     const auto & operators = source.operator_envelopes();
     std::vector<AttentionMetadataRegion> regions;
     for (size_t i = 0; i < events.size(); ++i) {
@@ -446,7 +447,7 @@ AttentionMetadataAudit observe_attention_metadata_calls(const source_dag::Source
     for (const auto & [node, position] : positions.nodes)
         if (position) call_counts.try_emplace({ position->phase_index, position->decode_iteration }, 0);
     for (auto & region : observe_attention_metadata_regions(source, queues)) {
-        const auto & descriptor = source.graph().runtime_observations().at(region.work.observation);
+        const auto & descriptor = source.graph().source_observations().runtime_observations.at(region.work.observation);
         // Capture is outside application replay; do not demand a target
         // execution replacement for its initialization-only operations.
         if (descriptor.arg("in_capture") == "true") continue;
@@ -493,7 +494,7 @@ AttentionCallAudit observe_attention_calls(const source_dag::SourceDagIndex & so
             if (!graph.node(node).is_cpu && adapters::sglang::is_attention_kernel(graph.event_for_node(node).name)) required_attention_nodes.insert(node);
         }
     }
-    const auto contexts = source_dag::decode_operator_contexts(phases, source_dag::observe_decode_contexts(graph, phases));
+    const auto contexts = source_dag::decode_operator_contexts(phases, source_dag::observe_decode_contexts(graph.source_observations(), phases));
     std::set<size_t> covered_nodes;
     for (auto & region : observe_attention_regions(source, queues)) {
         if (region.status != "returned" || region.sampling != "every_call" || !region.descriptor) {
@@ -512,8 +513,8 @@ AttentionCallAudit observe_attention_calls(const source_dag::SourceDagIndex & so
             continue;
         }
 
-        const auto & descriptor = region.descriptor->prelude ? graph.prelude_context_events().at(region.descriptor->observation)
-                                                             : graph.runtime_observations().at(region.descriptor->observation);
+        const auto & descriptor = region.descriptor->prelude ? graph.source_observations().prelude_context_events.at(region.descriptor->observation)
+                                                             : graph.source_observations().runtime_observations.at(region.descriptor->observation);
         // Parse the source descriptor once. Each semantic projection uses
         // these same recorded fields, never target timing or a guessed layout.
         const auto fields = nlohmann::json::parse(descriptor.args_json_view());

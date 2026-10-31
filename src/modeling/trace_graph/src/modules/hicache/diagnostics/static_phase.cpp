@@ -3,8 +3,8 @@
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <algorithm>
 #include <cmath>

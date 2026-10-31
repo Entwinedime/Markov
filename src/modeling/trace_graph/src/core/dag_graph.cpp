@@ -69,7 +69,10 @@ std::string_view DagEdge::effect_id() const { return provenance ? std::string_vi
 
 std::string_view DagEdge::reason() const { return provenance ? std::string_view(provenance->reason) : std::string_view{}; }
 
-DagGraph::DagGraph(std::vector<TraceEvent> events, int gpu_id) : events_(std::move(events)), gpu_id_(gpu_id) {}
+DagGraph::DagGraph(std::vector<TraceEvent> events, int gpu_id, SourceObservations observations)
+    : events_(std::move(events)),
+      gpu_id_(gpu_id),
+      observations_(std::make_shared<SourceObservations>(std::move(observations))) {}
 
 void DagGraph::reserve(const DagGraphCapacity & capacity) {
     nodes_.reserve(capacity.nodes);
@@ -221,8 +224,8 @@ void DagGraph::materialize_events() {
     source_events_.reset();
 }
 
-DagGraph::ObservedTables & DagGraph::own_observations() {
-    if (!observations_.unique()) observations_ = std::make_shared<ObservedTables>(*observations_);
+SourceObservations & DagGraph::own_observations() {
+    if (!observations_.unique()) observations_ = std::make_shared<SourceObservations>(*observations_);
     return *observations_;
 }
 

@@ -19,8 +19,8 @@ std::map<std::pair<std::string, std::string>, std::string> observe_controller_sc
         const auto [at, inserted] = scopes.emplace(std::pair{ pid, controller }, tree);
         if (!inserted && at->second != tree) throw std::runtime_error("Controller maps to multiple cache trees");
     };
-    for (const auto events : { std::span<const core::TraceEvent>(source.graph().hicache_fact_events()),
-                               std::span<const core::TraceEvent>(source.graph().prelude_context_events()) }) {
+    for (const auto events : { std::span<const core::TraceEvent>(source.graph().source_observations().hicache_fact_events),
+                               std::span<const core::TraceEvent>(source.graph().source_observations().prelude_context_events) }) {
         for (const auto & event : events) {
             const auto controller = event.arg("controller_scope");
             if (controller.empty()) continue;
@@ -41,7 +41,7 @@ std::map<std::pair<std::string, std::string>, std::string> observe_controller_sc
     for (const auto & fact : source.fact_nodes())
         if (fact.phase == "end" && relevant(fact.fact_role))
             calls.push_back({ fact.fact_role, fact.pid, fact.tid, fact.cache_scope, fact.timestamp_us, fact.timestamp_us + fact.duration_us });
-    for (const auto & event : source.graph().prelude_context_events()) {
+    for (const auto & event : source.graph().source_observations().prelude_context_events) {
         if (event.arg("phase") != "end") continue;
         const auto role = parse_hicache_fact_metadata(event).role;
         if (relevant(role)) calls.push_back({ role, event.pid, event.tid, event.arg("cache_scope"), event.ts, event.ts + event.dur });
@@ -137,7 +137,7 @@ std::vector<HiCacheEvictionRegion> observe_eviction_regions(const adapters::sgla
     for (const auto & fact : source.fact_nodes())
         if (fact.fact_role == "commit_device_to_host_enqueue_observed" && fact.phase == "end")
             add(Kind::WriteBackup, fact.pid, fact.tid, fact.timestamp_us, fact.duration_us);
-    for (const auto & event : source.graph().runtime_observations()) {
+    for (const auto & event : source.graph().source_observations().runtime_observations) {
         if (event.name == "runtime.hicache.write_completion" && event.arg("blocking") == "true")
             add(Kind::BlockingCheck, event.pid, event.tid, event.ts, event.dur);
         if (event.name != "runtime.hicache.device_release_backup" && event.name != "runtime.hicache.device_release_regular") continue;

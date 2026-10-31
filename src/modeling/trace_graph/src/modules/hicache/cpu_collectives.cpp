@@ -17,7 +17,7 @@ bool same_signature(const core::TraceEvent & a, const core::TraceEvent & b) {
 
 void observe_local(const source_dag::SourceDagIndex & source, const std::vector<size_t> & workers, CpuCollectiveCall & call) {
     const auto & graph = source.graph();
-    const auto & event = graph.runtime_observations()[call.observation];
+    const auto & event = graph.source_observations().runtime_observations[call.observation];
     if (event.arg("async_op") != "false" || event.arg("status") != "returned" || event.arg_u64("sequence_after") <= event.arg_u64("sequence_before")) {
         call.issue = "not_completed_synchronous_call";
         return;
@@ -81,8 +81,8 @@ CpuCollectiveObservation observe_cpu_collectives(const source_dag::SourceDagInde
     }
     std::ranges::sort(workers, {}, [&](size_t id) { return graph.event_for_node(id).ts; });
     std::map<Key, size_t> rounds;
-    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
-        const auto & event = graph.runtime_observations()[i];
+    for (size_t i = 0; i < graph.source_observations().runtime_observations.size(); ++i) {
+        const auto & event = graph.source_observations().runtime_observations[i];
         if (event.name != "runtime.cpu_collective") continue;
         if (event.arg("group").empty() || event.arg("members").empty() || event.arg("collective_index").empty() || event.arg("rank").empty()) {
             ++result.issues["missing_collective_identity"];
@@ -107,10 +107,10 @@ CpuCollectiveObservation observe_cpu_collectives(const source_dag::SourceDagInde
             for (auto * call : calls) call->issue = "worker_claimed_by_multiple_calls";
     for (auto & round : result.rounds) {
         std::set<int> ranks;
-        const auto & first = graph.runtime_observations()[round.calls.front().observation];
+        const auto & first = graph.source_observations().runtime_observations[round.calls.front().observation];
         for (const auto & call : round.calls) {
             ranks.insert(call.rank);
-            if (!same_signature(first, graph.runtime_observations()[call.observation])) round.issue = "collective_signature_mismatch";
+            if (!same_signature(first, graph.source_observations().runtime_observations[call.observation])) round.issue = "collective_signature_mismatch";
             if (!call.issue.empty()) ++result.issues[call.issue];
         }
         const std::set<int> expected(round.members.begin(), round.members.end());

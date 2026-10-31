@@ -29,7 +29,7 @@ std::optional<ReceiveGroup> observe_receive_group(const core::DagGraph & graph, 
     std::optional<ReceiveGroup> result;
     for (const auto & round : collectives.rounds) {
         if (round.calls.empty()) continue;
-        const auto & event = graph.runtime_observations().at(round.calls.front().observation);
+        const auto & event = graph.source_observations().runtime_observations.at(round.calls.front().observation);
         if (event.arg("role") != "request_receive" || event.arg("operation") != "broadcast") continue;
 
         auto ordered = round.members;

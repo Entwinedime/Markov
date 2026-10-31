@@ -15,7 +15,7 @@ bool min_call(const core::TraceEvent & e, uint64_t numel) {
 
 PrefetchWorkerObservations observe_prefetch_workers(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives) {
     PrefetchWorkerObservations out;
-    const auto & events = source.graph().runtime_observations();
+    const auto & events = source.graph().source_observations().runtime_observations;
     using Lane = std::pair<std::string, std::string>;
     std::map<Lane, std::vector<size_t>> lanes;
     std::map<std::pair<std::string, std::string>, std::vector<size_t>> enqueues;

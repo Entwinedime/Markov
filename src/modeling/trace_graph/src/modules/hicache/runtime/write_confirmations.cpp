@@ -69,7 +69,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
 void HiCacheWriteConfirmations::prepare(core::DagGraph & graph, uint64_t begin, uint64_t end, const std::vector<core::TraceEvent> & replaced,
                                         std::optional<uint64_t> idle_since_us) {
     graph_ = &graph;
-    const auto & observations = graph.runtime_observations();
+    const auto & observations = graph.source_observations().runtime_observations;
     std::map<Lane, std::vector<const core::TraceEvent *>> reductions;
     for (const auto & item : observations)
         if (item.name == "runtime.cpu_collective" && item.arg("role") == "write_completion_check") reductions[{ item.pid, item.tid }].push_back(&item);

@@ -1,10 +1,10 @@
 #include "modules/hicache/model/source_input.hpp"
 
-#include "markov/trace_graph/core/dag_graph.hpp"
+#include "core/source_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/router.hpp"
-#include "markov/trace_graph/source_dag/decode_allocation.hpp"
 #include "markov/trace_graph/source_dag/load_admission.hpp"
+#include "source_dag/decode_allocation.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -13,11 +13,11 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph) {
+HiCacheSourceInput observe_hicache_source_input(const core::SourceObservations & source, HiCachePhaseObservationAudit phases) {
     HiCacheSourceInput result;
-    result.phases = observe_hicache_phases(graph);
+    result.phases = std::move(phases);
     HiCacheFactParser parser;
-    for (const auto * events : { &graph.context_events(), &graph.prelude_context_events(), &graph.hicache_fact_events(), &graph.tail_context_events() })
+    for (const auto * events : { &source.context_events, &source.prelude_context_events, &source.hicache_fact_events, &source.tail_context_events })
         for (const auto & event : *events) parser.observe_token_dictionaries(event);
     struct Input {
         const core::TraceEvent * event;
@@ -26,7 +26,7 @@ HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph) {
     };
     std::vector<Input> input;
     const auto append = [&](const auto & events, bool prelude, bool tail) {
-        const auto offset = tail ? hicache_tail_fact_offset(graph.hicache_fact_events()) : 0;
+        const auto offset = tail ? hicache_tail_fact_offset(source.hicache_fact_events) : 0;
         for (const auto & event : events) {
             if (!parser.is_hicache_event(event)) continue;
             const auto id =
@@ -34,9 +34,9 @@ HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph) {
             input.push_back({ &event, id, prelude, tail });
         }
     };
-    append(graph.prelude_context_events(), true, false);
-    append(graph.hicache_fact_events(), false, false);
-    append(graph.tail_context_events(), false, true);
+    append(source.prelude_context_events, true, false);
+    append(source.hicache_fact_events, false, false);
+    append(source.tail_context_events, false, true);
     std::ranges::sort(input, [](const auto & a, const auto & b) {
         const auto & x = *a.event;
         const auto & y = *b.event;
@@ -60,8 +60,8 @@ HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph) {
         (item.prelude ? prelude : result.formal).push_back({ std::move(fact), route.role });
     }
 
-    result.prelude_lookups = source_dag::observe_prelude_load_lookups(graph.prelude_context_events(), prelude);
-    result.prelude_decodes = source_dag::observe_prelude_decode_allocations(graph.prelude_context_events(), prelude);
+    result.prelude_lookups = source_dag::observe_prelude_load_lookups(source.prelude_context_events, prelude);
+    result.prelude_decodes = source_dag::observe_prelude_decode_allocations(source.prelude_context_events, prelude);
     result.prelude = std::move(prelude);
     if (!result.formal.empty()) {
         uint64_t begin = result.formal.front().fact.source_ts, end = begin;
@@ -69,7 +69,7 @@ HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph) {
             begin = std::min(begin, item.fact.source_ts);
             end = std::max(end, core::checked_add_u64(item.fact.source_ts, item.fact.dur, "Admission observation window overflow"));
         }
-        for (const auto & branch : source_dag::observe_load_branches(graph.runtime_observations(), result.formal, begin, end))
+        for (const auto & branch : source_dag::observe_load_branches(source.runtime_observations, result.formal, begin, end))
             result.formal_lookups.push_back(branch.owner);
     }
     return result;

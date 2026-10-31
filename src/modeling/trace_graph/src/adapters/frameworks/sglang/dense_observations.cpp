@@ -58,7 +58,7 @@ std::optional<structure::InputBuffersShape> input_buffer_shape(const core::Trace
 
 std::vector<DenseRegion> observe_dense_regions(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                std::map<std::string, size_t> & issues) {
-    const auto & events = source.graph().runtime_observations();
+    const auto & events = source.graph().source_observations().runtime_observations;
     const auto & operators = source.operator_envelopes();
     std::map<std::string, std::set<std::string>> devices_by_pid;
     for (const auto & event : events)

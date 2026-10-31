@@ -3,10 +3,10 @@
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/hicache/collective.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/dag_index.hpp"
+#include "core/source_observations.hpp"
 #include "markov/trace_graph/core/cpu_service_cost.hpp"
 #include "markov/trace_graph/core/trace_event.hpp"
 
@@ -33,23 +34,6 @@ enum class DagEdgeKind : std::uint8_t { Sequential, Stream, Correlation, Sync, H
 
 /** @brief Distinguishes input trace events from model-created nodes. */
 enum class DagNodeKind : std::uint8_t { TraceEvent, Synthetic };
-
-/** @brief Source-observed wallclock spans excluded from control-only replay. */
-enum class DagControlExclusionKind : std::uint8_t { PrefillDecode, ProfilingSnapshot };
-
-/** @brief One absolute source-trace interval removed only by control-only replay. */
-struct DagControlExclusionInterval {
-    int gpu_id = 0;
-    uint64_t start_us = 0;
-    uint64_t end_us = 0;
-    DagControlExclusionKind kind = DagControlExclusionKind::PrefillDecode;
-};
-
-/** @brief One runtime phase marker retained outside executable leaf topology. */
-struct DagPhaseMarkerEvent {
-    int gpu_id = 0;
-    TraceEvent event;
-};
 
 /** @brief Sparse provenance allocated only for model-created dependencies. */
 struct DagEdgeProvenance {
@@ -220,14 +204,8 @@ struct DagTopologyValidationReport;
  * meaning. Node and edge indices stay stable; removals use tombstones.
  */
 class DagGraph {
-    struct ObservedTables {
-        std::vector<TraceEvent> hicache_fact_events, runtime_observations, context_events, prelude_context_events, tail_context_events;
-        std::vector<DagControlExclusionInterval> control_exclusion_intervals;
-        std::vector<DagPhaseMarkerEvent> phase_marker_events;
-    };
-
 public:
-    explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0);
+    explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0, SourceObservations observations = {});
 
     /** @brief Creates a node and interns its lane without adding dependencies. */
     size_t add_node(size_t event_index, bool is_cpu, std::string_view lane_key);
@@ -374,47 +352,8 @@ public:
     /** @brief Returns whether the profile manifest enabled one named input contract. */
     [[nodiscard]] bool has_input_contract(std::string_view contract) const;
 
-    /** @brief Replaces in-window HiCache facts excluded from executable DAG topology. */
-    void set_hicache_fact_events(std::vector<TraceEvent> events) { own_observations().hicache_fact_events = std::move(events); }
-
-    /** @brief Returns in-window HiCache facts retained for semantic modules only. */
-    [[nodiscard]] const std::vector<TraceEvent> & hicache_fact_events() const { return observations_->hicache_fact_events; }
-
-    /** Runtime preparation envelopes explain existing costs; never execution nodes. */
-    void set_runtime_observations(std::vector<TraceEvent> events) { own_observations().runtime_observations = std::move(events); }
-    [[nodiscard]] const std::vector<TraceEvent> & runtime_observations() const { return observations_->runtime_observations; }
-
-    /** @brief Replaces non-DAG side-table events retained from outside the timing window. */
-    void set_context_events(std::vector<TraceEvent> events) { own_observations().context_events = std::move(events); }
-
-    /** @brief Returns non-DAG side-table events available to semantic modules. */
-    [[nodiscard]] const std::vector<TraceEvent> & context_events() const { return observations_->context_events; }
-
-    /** @brief Replaces pre-window semantic facts used only to reconstruct model state. */
-    void set_prelude_context_events(std::vector<TraceEvent> events) { own_observations().prelude_context_events = std::move(events); }
-
-    /** @brief Returns pre-window semantic facts excluded from topology and simulation. */
-    [[nodiscard]] const std::vector<TraceEvent> & prelude_context_events() const { return observations_->prelude_context_events; }
-
-    /** @brief Replaces post-window facts used only to prove causal-tail closure. */
-    void set_tail_context_events(std::vector<TraceEvent> events) { own_observations().tail_context_events = std::move(events); }
-
-    /** @brief Returns post-window facts excluded from topology and E2E simulation. */
-    [[nodiscard]] const std::vector<TraceEvent> & tail_context_events() const { return observations_->tail_context_events; }
-
-    /** @brief Replaces source-derived intervals contracted by control-only replay. */
-    void set_control_exclusion_intervals(std::vector<DagControlExclusionInterval> intervals) {
-        own_observations().control_exclusion_intervals = std::move(intervals);
-    }
-
-    /** @brief Returns source-only timing intervals excluded from the control metric. */
-    [[nodiscard]] const std::vector<DagControlExclusionInterval> & control_exclusion_intervals() const { return observations_->control_exclusion_intervals; }
-
-    /** @brief Replaces source Torch phase markers removed by CPU-leaf normalization. */
-    void set_phase_marker_events(std::vector<DagPhaseMarkerEvent> events) { own_observations().phase_marker_events = std::move(events); }
-
-    /** @brief Returns semantic phase markers retained independently of executable leaves. */
-    [[nodiscard]] const std::vector<DagPhaseMarkerEvent> & phase_marker_events() const { return observations_->phase_marker_events; }
+    /** Source facts and envelopes remain usable without executable graph objects. */
+    [[nodiscard]] const SourceObservations & source_observations() const { return *observations_; }
 
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
@@ -492,8 +431,8 @@ private:
     /** @brief Small manifest-level contract set; never stores event or fact rows. */
     std::vector<std::string> input_contracts_;
 
-    std::shared_ptr<ObservedTables> observations_ = std::make_shared<ObservedTables>();
-    ObservedTables & own_observations();
+    std::shared_ptr<SourceObservations> observations_ = std::make_shared<SourceObservations>();
+    SourceObservations & own_observations();
     void materialize_events();
     void invalidate_topology();
     struct ActiveCounts {

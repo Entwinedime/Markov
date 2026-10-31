@@ -23,7 +23,7 @@ uint64_t saturated_add(uint64_t start, uint64_t duration) {
 SourceDagIndex::SourceDagIndex(const core::DagGraph & graph) : graph_(graph) {}
 
 const detail::OperatorEnvelopeIndex & SourceDagIndex::operator_envelopes() const {
-    if (!operator_envelopes_) operator_envelopes_ = std::make_shared<const detail::OperatorEnvelopeIndex>(graph_.runtime_observations());
+    if (!operator_envelopes_) operator_envelopes_ = std::make_shared<const detail::OperatorEnvelopeIndex>(graph_.source_observations().runtime_observations);
     return *operator_envelopes_;
 }
 

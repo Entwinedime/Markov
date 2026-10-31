@@ -14,7 +14,7 @@ namespace markov::trace_graph::source_dag {
 
 void prefetch_query_observations(const core::DagGraph & graph, const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers,
                                  uint64_t begin_us, uint64_t end_us, ObservationWriter & rows) {
-    const auto & events = graph.runtime_observations();
+    const auto & events = graph.source_observations().runtime_observations;
     const auto end = [](const core::TraceEvent & event) { return core::checked_add_u64(event.ts, event.dur, "Query observation end overflow"); };
     std::set<size_t> rounds;
     for (const auto & query : workers.queries)

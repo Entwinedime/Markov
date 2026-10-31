@@ -22,7 +22,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
     const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto collectives = observe_cpu_collectives(source);
     const auto workers = observe_prefetch_workers(source, collectives);
-    const auto & events = graph.runtime_observations();
+    const auto & events = graph.source_observations().runtime_observations;
     // Completion envelopes and cache identities are source facts. Index them
     // once instead of rescanning and copying every fact for each polling round.
     struct Envelopes {

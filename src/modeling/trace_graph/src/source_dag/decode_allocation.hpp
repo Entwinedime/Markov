@@ -9,7 +9,7 @@
 #include <vector>
 
 namespace markov::trace_graph::core {
-class DagGraph;
+struct SourceObservations;
 struct TraceEvent;
 } // namespace markov::trace_graph::core
 
@@ -45,16 +45,16 @@ using DecodeOperatorContexts = std::map<size_t, DecodeOperationContext>;
  * Only complete, unambiguous single-request non-speculative observations are
  * included. An absent request is unavailable, not a zero-length context.
  */
-[[nodiscard]] ObservedDecodeContexts observe_decode_contexts(const core::DagGraph & source_graph,
+[[nodiscard]] ObservedDecodeContexts observe_decode_contexts(const core::SourceObservations & source,
                                                              const modules::hicache::HiCachePhaseObservationAudit & phases);
 
 /** Source request/round boundaries from approved workload paths and scalar
- * observations. Reads the original DAG only, without target state or costs.
+ * observations. Reads selected-base observations only, without target state or costs.
  * Missing, speculative or ambiguous rounds fail rather than becoming empty
  * allocation actions. Timestamps are source microseconds, not target timing.
  */
 [[nodiscard]] std::vector<modules::hicache::model::HiCacheReplayFact>
-    observe_decode_allocations(const core::DagGraph & source_graph, std::span<const modules::hicache::model::HiCacheReplayFact> facts,
+    observe_decode_allocations(const core::SourceObservations & source, std::span<const modules::hicache::model::HiCacheReplayFact> facts,
                                const modules::hicache::HiCachePhaseObservationAudit & phases, uint64_t begin_us, uint64_t end_us);
 
 } // namespace markov::trace_graph::source_dag

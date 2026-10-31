@@ -4,7 +4,7 @@
  * @brief Source-supported phase operators with zero-cost request boundaries.
  */
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 

@@ -1,6 +1,6 @@
 #include "modules/hicache/runtime/source_preparation.hpp"
 
-#include "markov/trace_graph/source_dag/decode_allocation.hpp"
+#include "source_dag/decode_allocation.hpp"
 
 #include <utility>
 
@@ -8,8 +8,8 @@ namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
 
 std::shared_ptr<const model::HiCacheSourceInput> execution_input(const core::DagGraph & graph, uint64_t begin_us, uint64_t end_us) {
-    auto input = std::make_shared<model::HiCacheSourceInput>(model::observe_hicache_source_input(graph));
-    input->decode_allocations = source_dag::observe_decode_allocations(graph, input->formal, input->phases, begin_us, end_us);
+    auto input = std::make_shared<model::HiCacheSourceInput>(model::observe_hicache_source_input(graph.source_observations(), observe_hicache_phases(graph)));
+    input->decode_allocations = source_dag::observe_decode_allocations(graph.source_observations(), input->formal, input->phases, begin_us, end_us);
     return input;
 }
 

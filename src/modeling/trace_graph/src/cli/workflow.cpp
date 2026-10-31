@@ -36,10 +36,10 @@
 #endif
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/cost/missing_evidence.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/scope_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <algorithm>
 #include <fstream>

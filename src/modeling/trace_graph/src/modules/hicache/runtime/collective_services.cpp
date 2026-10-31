@@ -42,7 +42,7 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const HiCacheSource
     const auto & source = prepared.index;
     const auto & queues = prepared.queues;
     for (const auto & call : calls) {
-        const auto & event = original.runtime_observations().at(call.region.observation);
+        const auto & event = original.source_observations().runtime_observations.at(call.region.observation);
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
         if (call.communication_nodes.size() != 1)
             throw std::runtime_error("Target collective needs a lowering for its observed multi-node communication protocol");

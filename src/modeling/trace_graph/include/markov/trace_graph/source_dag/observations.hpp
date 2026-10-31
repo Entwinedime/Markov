@@ -2,9 +2,9 @@
 
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 #include "markov/trace_graph/source_dag/index.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 #include <optional>

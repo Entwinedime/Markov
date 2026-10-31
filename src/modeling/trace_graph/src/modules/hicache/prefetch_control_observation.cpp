@@ -20,7 +20,7 @@ struct ProcessEvidence {
 PrefetchControlObservation observe_call(const adapters::sglang::HiCacheSourceIndex & source, const CpuCollectiveObservation & collectives,
                                         const Fact & progress, std::string_view policy, const ProcessEvidence & process) {
     PrefetchControlObservation result{ .progress_fact = progress.node_id };
-    const auto & observations = source.graph().runtime_observations();
+    const auto & observations = source.graph().source_observations().runtime_observations;
     const auto finish = progress.timestamp_us + progress.duration_us;
     // The semantic fact excludes probe extraction/emission around the function.
     // Keep that work in the measured call; it is not pure framework CPU service.
@@ -145,7 +145,7 @@ std::vector<PrefetchControlObservation> observe_prefetch_control(const adapters:
                                                                  const CpuCollectiveObservation & collectives, std::string_view source_policy) {
     std::vector<PrefetchControlObservation> result;
     std::map<std::string, ProcessEvidence> processes;
-    const auto & observations = source.graph().runtime_observations();
+    const auto & observations = source.graph().source_observations().runtime_observations;
     for (const auto & event : observations)
         if (event.name == "runtime.hicache.prefetch_check" && event.arg("status") == "returned") processes[event.pid].check_probe = true;
     for (const auto & round : collectives.rounds)
@@ -175,7 +175,7 @@ PrefetchRequestObservations observe_prefetch_requests(const adapters::sglang::Hi
 
 
 std::vector<PrefetchServiceObservation> observe_prefetch_services(const adapters::sglang::HiCacheSourceIndex & source) {
-    const auto & observations = source.graph().runtime_observations();
+    const auto & observations = source.graph().source_observations().runtime_observations;
     std::vector<PrefetchServiceObservation> results;
     for (const auto & fact : source.fact_nodes()) {
         if (fact.fact_role != "storage_read_service_observed" || fact.phase != "end") continue;

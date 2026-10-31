@@ -22,7 +22,7 @@ uint64_t observed_service(const core::DagGraph & graph, const Event & event) {
 std::optional<bool> observe_compilation_context(const core::DagGraph & graph) {
     std::map<AllocatorSpecialization, std::vector<const Event *>> compiles;
     bool parallel = true;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (!adapters::sglang::is_allocator_preparation_event(event)) continue;
         const auto specialization = adapters::sglang::allocator_preparation_specialization(event);
         if (!specialization || event.arg("status") != "returned") {
@@ -52,7 +52,7 @@ std::optional<bool> observe_compilation_context(const core::DagGraph & graph) {
 auto observe_static_cost_samples(const core::DagGraph & graph) {
     std::map<std::string, std::map<std::string, std::vector<uint64_t>>> samples;
     std::map<std::string, std::vector<const Event *>> loads;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (!adapters::sglang::is_allocator_preparation_event(event) || !adapters::sglang::allocator_preparation_specialization(event)
             || event.arg("status") != "returned")
             continue;

@@ -99,7 +99,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
     // reached them. Never infer an owner from the nearest arbitrary CPU event.
     std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> batches;
     std::vector<std::string> batch_requests;
-    for (const auto & event : graph.hicache_fact_events()) {
+    for (const auto & event : graph.source_observations().hicache_fact_events) {
         if (event.arg("fact").empty() || modules::hicache::parse_hicache_fact_metadata(event).role != "cache_extend_input") continue;
         batches[{ event.pid, event.tid }].emplace_back(event.ts, result.calls.size());
         batch_requests.push_back(event.arg("request_ids"));
@@ -110,7 +110,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
         std::ranges::sort(boundaries);
         for (size_t i = 1; i < boundaries.size(); ++i) result.calls[boundaries[i - 1].second].end_us = boundaries[i].first;
     }
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.extend_allocation") continue;
         const auto lane = batches.find({ event.pid, event.tid });
         if (lane == batches.end()) continue;
@@ -157,7 +157,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
     // Prefer the allocator's own envelope when it was captured, so preparation
     // cannot acquire unrelated work from those surrounding operations.
     std::set<size_t> refined_calls;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.extend_allocator") continue;
         const auto lane = batches.find({ event.pid, event.tid });
         if (lane == batches.end()) continue;
@@ -181,7 +181,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
 
         call.begin_us = event.ts;
         call.end_us = end_us;
-        call.allocator_observation = static_cast<size_t>(&event - graph.runtime_observations().data());
+        call.allocator_observation = static_cast<size_t>(&event - graph.source_observations().runtime_observations.data());
         call.allocator_work = adapters::sglang::observed_allocator_work(event);
         if (event.has_arg_key_hint("prefix_dtype")) call.prefix_dtype = event.arg("prefix_dtype");
         // TraceEvent normalizes JSON null to an empty string; zero remains "0"
@@ -207,7 +207,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
             result.supported_pids.insert(event.pid);
     }
     std::map<std::string, uint64_t> first_load;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (!is_allocator_preparation_event(event)) continue;
         if (event.name == "runtime.triton.prepare" && allocator_preparation_specialization(event)) result.supported_pids.insert(event.pid);
         if (event.name == "runtime.triton.load") {
@@ -215,7 +215,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
             if (!added) entry->second = std::min(entry->second, event.ts);
         }
     }
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (!is_allocator_preparation_event(event)) continue;
         const auto lane = batches.find({ event.pid, event.tid });
         if (lane == batches.end()) continue;

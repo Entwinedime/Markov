@@ -1,8 +1,8 @@
 #include "markov/trace_graph/modules/hicache/scope_observation.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/source_dag/index.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #include <algorithm>
 
 namespace markov::trace_graph::modules::hicache {

@@ -13,7 +13,7 @@
 namespace markov::trace_graph::modules::hicache {
 
 struct CpuCollectiveCall {
-    size_t observation = 0; // Index in graph.runtime_observations(), not an executable node.
+    size_t observation = 0; // Index in graph.source_observations().runtime_observations, not an executable node.
     int rank = -1;
     source_dag::TimingIntervalOwnership cpu;
     std::optional<size_t> submission, worker;

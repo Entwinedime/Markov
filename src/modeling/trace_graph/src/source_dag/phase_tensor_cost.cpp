@@ -44,7 +44,7 @@ void phase_tensor_operator_observations(const SourceDagIndex & source, const sim
         const auto owner = adapters::sglang::call_phase_position(region.work, positions);
         if (!owner) continue;
 
-        const auto & descriptor = graph.runtime_observations().at(region.work.observation);
+        const auto & descriptor = graph.source_observations().runtime_observations.at(region.work.observation);
         const auto inputs = adapters::sglang::observed_attention_metadata_inputs(descriptor);
         if (!inputs) continue;
         const auto program = adapters::sglang::ascend_attention_metadata_program(owner->decode_iteration ? "decode" : "prefill", *inputs);
@@ -66,7 +66,7 @@ void phase_tensor_operator_observations(const SourceDagIndex & source, const sim
         const auto matched = adapters::ascend::match_tensor_operators(source, queues, region.operator_observations, program);
 
         const bool cold_preparation = std::ranges::any_of(region.operator_observations, [&](size_t index) {
-            const auto & event = graph.runtime_observations().at(index);
+            const auto & event = graph.source_observations().runtime_observations.at(index);
             return event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load";
         });
         // Compilation/loading is not steady-state caller service. Device and

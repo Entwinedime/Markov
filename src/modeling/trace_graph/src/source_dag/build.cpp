@@ -15,7 +15,12 @@ namespace {
 
 core::DagGraph build_one(io::ManifestTraceInput input, size_t index, size_t threads) {
     frontend::normalize_trace_events(input.events);
-    auto graph = core::DagBuilder(threads).build(std::move(input.events), static_cast<int>(index));
+    core::SourceObservations observations{
+        .context_events = std::move(input.context_events),
+        .prelude_context_events = std::move(input.prelude_context_events),
+        .tail_context_events = std::move(input.tail_context_events),
+    };
+    auto graph = core::DagBuilder(threads).build(std::move(input.events), static_cast<int>(index), std::move(observations));
 #ifdef DEBUG
     uint64_t begin = std::numeric_limits<uint64_t>::max(), end = 0;
     for (const auto & node : graph.nodes()) {
@@ -26,9 +31,6 @@ core::DagGraph build_one(io::ManifestTraceInput input, size_t index, size_t thre
     graph.set_real_e2e_time(end > begin ? end - begin : 0);
 #endif
     graph.set_input_contracts(std::move(input.input_contracts));
-    graph.set_context_events(std::move(input.context_events));
-    graph.set_prelude_context_events(std::move(input.prelude_context_events));
-    graph.set_tail_context_events(std::move(input.tail_context_events));
     return graph;
 }
 

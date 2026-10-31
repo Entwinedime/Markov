@@ -4,9 +4,9 @@
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #include <array>
 #include <span>
 #include <string_view>

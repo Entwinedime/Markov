@@ -1,8 +1,8 @@
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/router.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/router.hpp"
 
 #include <tuple>
 
@@ -11,7 +11,10 @@ namespace markov::trace_graph::modules::hicache {
 HiCacheExecutionBoundaries bind_hicache_execution_boundaries(core::DagGraph & graph, std::span<const model::HiCacheReplayFact> prepared) {
     HiCacheExecutionBoundaries result;
     HiCacheFactParser parser;
-    for (const auto * events : { &graph.context_events(), &graph.prelude_context_events(), &graph.hicache_fact_events(), &graph.tail_context_events() })
+    for (const auto * events : { &graph.source_observations().context_events,
+                                 &graph.source_observations().prelude_context_events,
+                                 &graph.source_observations().hicache_fact_events,
+                                 &graph.source_observations().tail_context_events })
         for (const auto & event : *events) parser.observe_token_dictionaries(event);
     using Point = std::tuple<std::string, std::string, uint64_t>;
     std::map<Point, std::vector<size_t>> existing;
@@ -52,10 +55,11 @@ HiCacheExecutionBoundaries bind_hicache_execution_boundaries(core::DagGraph & gr
         // Replay has validated inputs and joined derived decode actions. Bind
         // those same identities instead of independently rebuilding a fact list.
         for (const auto & item : prepared) append_fact(item.fact);
-    } else {
-        for (const auto & event : graph.hicache_fact_events()) append(event, event.index, false);
-        const auto tail_offset = hicache_tail_fact_offset(graph.hicache_fact_events());
-        for (const auto & event : graph.tail_context_events())
+    }
+    else {
+        for (const auto & event : graph.source_observations().hicache_fact_events) append(event, event.index, false);
+        const auto tail_offset = hicache_tail_fact_offset(graph.source_observations().hicache_fact_events);
+        for (const auto & event : graph.source_observations().tail_context_events)
             append(event, core::checked_add_u64(tail_offset, event.index, "HiCache tail fact identity overflow"), true);
     }
     const auto nodes = core::insert_cpu_gap_points(graph, points);

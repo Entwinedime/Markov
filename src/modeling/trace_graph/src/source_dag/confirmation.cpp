@@ -18,7 +18,7 @@ namespace markov::trace_graph::source_dag {
 void append_write_confirmation_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                             size_t observation, uint64_t begin_us, uint64_t confirmed_batches, bool corrected, nlohmann::json & rows) {
     const auto & graph = source.graph();
-    const auto & outer = graph.runtime_observations().at(observation);
+    const auto & outer = graph.source_observations().runtime_observations.at(observation);
     const bool blocking = outer.arg("blocking") == "true";
     const auto end = core::checked_add_u64(outer.ts, outer.dur, "Write confirmation end overflow");
     const auto region = observe_submitted_call_region(source, queues, observation);
@@ -36,7 +36,7 @@ void append_write_confirmation_observations(const adapters::sglang::HiCacheSourc
 
     std::vector<const core::TraceEvent *> acks, waits;
     std::vector<structure::hicache::WriteConfirmationBatch> batches;
-    for (const auto & ack : graph.runtime_observations()) {
+    for (const auto & ack : graph.source_observations().runtime_observations) {
         if (ack.name != "runtime.hicache.write_ack" || ack.pid != outer.pid || ack.tid != outer.tid || ack.ts < begin_us || ack.ts + ack.dur > end) continue;
         if (ack.arg("status") != "returned" || ack.arg("release_lock") != (blocking ? "false" : "true") || ack.arg("storage_enabled") != "true") return;
         acks.push_back(&ack);

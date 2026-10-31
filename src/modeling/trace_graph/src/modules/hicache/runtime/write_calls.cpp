@@ -198,7 +198,8 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     };
     bind_load_branches(graph, begin, end);
     bind_load_attempts(graph, begin, end);
-    capacity_guards_ = observe_capacity_guards(adapters::sglang::HiCacheSourceIndex(graph), replay_.facts(), graph.runtime_observations(), begin, end);
+    capacity_guards_ =
+        observe_capacity_guards(adapters::sglang::HiCacheSourceIndex(graph), replay_.facts(), graph.source_observations().runtime_observations, begin, end);
     std::vector<core::TraceEvent> guard_points;
     for (const auto & guard : capacity_guards_) {
         for (const auto at : { guard.begin, guard.end }) {
@@ -230,14 +231,14 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             host_boundaries.push_back(std::move(point));
         }
     };
-    for (const auto & event : graph.hicache_fact_events()) {
+    for (const auto & event : graph.source_observations().hicache_fact_events) {
         const auto role = parse_hicache_fact_metadata(event).role;
         if ((role != "commit_device_to_host_enqueue_observed" && role != "capacity_result_observed") || event.arg("phase") != "end"
             || !in_scope(event.pid, event.tid, event.ts, event.ts + event.dur) || !event.dur)
             continue;
         add_host_boundaries(event);
     }
-    for (const auto & event : graph.runtime_observations())
+    for (const auto & event : graph.source_observations().runtime_observations)
         if (event.name == "runtime.hicache.device_release_backup" || event.name == "runtime.hicache.device_release_regular") add_host_boundaries(event);
     // Only pure control-self remainders and gaps can be partitioned. The host
     // observer below still rejects boundaries that cut a real executable leaf.
@@ -267,7 +268,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         source_owners_.insert(owner);
         ++submissions_;
     }
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.write_completion" || event.arg("blocking") != "true" || event.ts < begin || event.ts + event.dur > end) continue;
         if (event.arg("status") != "returned") throw std::runtime_error("Blocking write check did not return");
         const auto owner = observe_write_call_owner(source, replay_.facts(), event.pid, event.tid, event.ts, event.ts + event.dur);

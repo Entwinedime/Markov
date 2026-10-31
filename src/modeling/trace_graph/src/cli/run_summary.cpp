@@ -16,8 +16,8 @@
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 #endif
 #include "markov/trace_graph/modules/hicache/hicache_module.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/node_scale/node_scale_module.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -360,10 +360,10 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
         root["scope_owned_node_duration_us"] = scope_node_duration_us;
         root["scope_owned_gap_duration_us"] = scope_gap_duration_us;
     }
-    root["control_exclusion_interval_count"] = graph.control_exclusion_intervals().size();
+    root["control_exclusion_interval_count"] = graph.source_observations().control_exclusion_intervals.size();
     size_t blackbox_exclusion_count = 0;
     size_t snapshot_exclusion_count = 0;
-    for (const auto & interval : graph.control_exclusion_intervals()) {
+    for (const auto & interval : graph.source_observations().control_exclusion_intervals) {
         if (interval.kind == core::DagControlExclusionKind::PrefillDecode) blackbox_exclusion_count++;
         else if (interval.kind == core::DagControlExclusionKind::ProfilingSnapshot) snapshot_exclusion_count++;
     }

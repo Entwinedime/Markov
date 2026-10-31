@@ -5,9 +5,9 @@
 #pragma once
 
 #include "markov/trace_graph/core/dag_graph.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/window.hpp"
 #include "markov/trace_graph/modules/module.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #include <nlohmann/json_fwd.hpp>
 
 #include <memory>

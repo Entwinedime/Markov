@@ -1,6 +1,6 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "modules/hicache/phase_observation.hpp"
 #include <map>
 #include <unordered_set>
 

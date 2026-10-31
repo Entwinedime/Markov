@@ -49,7 +49,7 @@ public:
     ControlExclusionIndex() = default;
 
     explicit ControlExclusionIndex(const core::DagGraph & graph) {
-        for (const auto & interval : graph.control_exclusion_intervals()) {
+        for (const auto & interval : graph.source_observations().control_exclusion_intervals) {
             if (interval.end_us > interval.start_us) by_logical_input_[interval.gpu_id].push_back({ interval.start_us, interval.end_us });
         }
         for (auto & intervals : by_logical_input_ | std::views::values) merge(intervals);

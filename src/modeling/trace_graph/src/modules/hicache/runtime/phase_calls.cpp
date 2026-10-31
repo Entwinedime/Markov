@@ -57,7 +57,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     std::vector<Boundary> selected;
     std::vector<core::TraceEvent> points;
     const auto select = [&](size_t observation, const adapters::sglang::AscendAttentionConditions * conditions) {
-        const auto & event = original.runtime_observations().at(observation);
+        const auto & event = original.source_observations().runtime_observations.at(observation);
         // Call ownership was resolved against admitted source phases. Keep
         // crossing calls and their explicitly retained causal tail together;
         // truncating either leaves source consumers of replaced operations.
@@ -78,7 +78,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     owned_.resize(original.node_count());
     for (const auto & call : dense) {
         const auto & region = call.region.work;
-        const auto & event = original.runtime_observations().at(region.observation);
+        const auto & event = original.source_observations().runtime_observations.at(region.observation);
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
         const auto & attention = calls[call.attention_call_index];
         const bool retain_native = compact_programs_ && !retained_source_nodes_ && !region.caller.owned_node_ids.empty()
@@ -109,7 +109,7 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     replacements.reserve(selected.size());
     for (size_t i = 0; i < selected.size(); ++i) {
         const auto observation = selected[i].observation;
-        const auto & event = original.runtime_observations().at(observation);
+        const auto & event = original.source_observations().runtime_observations.at(observation);
         if (!boundaries[2 * i] || !boundaries[2 * i + 1]) throw std::runtime_error("Phase replacement requires exact source call entry/exit boundaries");
 
         hosts.push_back(observe_host_template(source, event.pid, event.tid, event.ts, event.ts + event.dur));

@@ -140,7 +140,7 @@ int export_operation(core::DagGraph & graph, const std::string & manifest, uint6
             if (!measured.issue.empty()) throw std::runtime_error("Independent prefetch communication: " + measured.issue);
 
             for (const auto & call : round.calls) {
-                const auto & event = graph.runtime_observations().at(call.observation);
+                const auto & event = graph.source_observations().runtime_observations.at(call.observation);
                 if (event.arg("dtype") != "torch.int32") throw std::runtime_error("Prefetch check communication model requires int32 measurements");
                 const bool completion = event.arg("role") == "prefetch_completion";
                 const auto & timing = measured.calls.at(call.rank);
@@ -229,7 +229,7 @@ int export_operation(core::DagGraph & graph, const std::string & manifest, uint6
                         std::optional<int> root;
                         if (step.action == hc::model::PrefetchSchedulerAction::Receive) {
                             const auto & round = rounds.rounds.at(step.source_round);
-                            const auto & event = graph.runtime_observations().at(round.calls.front().observation);
+                            const auto & event = graph.source_observations().runtime_observations.at(round.calls.front().observation);
                             root = event.arg("group_src").empty() ? std::stoi(event.arg("src")) : round.members.at(std::stoul(event.arg("group_src")));
                         }
                         const auto & communication = measured.communication.calls.at(rank);
@@ -392,7 +392,7 @@ int export_operation(core::DagGraph & graph, const std::string & manifest, uint6
                     point.ts = at;
                     points.push_back(std::move(point));
                 }
-        for (const auto & attempt : graph.runtime_observations()) {
+        for (const auto & attempt : graph.source_observations().runtime_observations) {
             if (attempt.name != "runtime.hicache.load_allocation" && attempt.name != "runtime.hicache.load_admission"
                 && attempt.name != "hicache.control.host_load_branch")
                 continue;
@@ -421,7 +421,7 @@ int export_operation(core::DagGraph & graph, const std::string & manifest, uint6
             };
             try {
                 const core::TraceEvent * allocation = nullptr;
-                for (const auto & attempt : graph.runtime_observations()) {
+                for (const auto & attempt : graph.source_observations().runtime_observations) {
                     if (attempt.name != "runtime.hicache.load_allocation" || attempt.pid != fact.pid || attempt.tid != fact.tid
                         || attempt.ts < fact.timestamp_us || attempt.ts + attempt.dur > fact.timestamp_us + fact.duration_us)
                         continue;
@@ -432,7 +432,7 @@ int export_operation(core::DagGraph & graph, const std::string & manifest, uint6
                 if (!allocation || allocation->arg("status") != "returned" || allocation->arg("allocated") != "true"
                     || allocation->arg("allocator_need_sort") != "false" || allocation->arg_u64("requested_tokens") != fact.effective_token_count)
                     throw std::runtime_error("Index primitive measurements lack complete unsorted allocator work coordinates");
-                for (const auto & admission : graph.runtime_observations()) {
+                for (const auto & admission : graph.source_observations().runtime_observations) {
                     if (admission.name != "runtime.hicache.load_admission" || admission.pid != fact.pid || admission.tid != fact.tid
                         || admission.ts > allocation->ts || admission.ts + admission.dur < allocation->ts + allocation->dur
                         || admission.arg("status") != "returned")

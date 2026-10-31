@@ -1,7 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/modules/hicache/model/input.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <cstddef>
 #include <map>
@@ -9,7 +9,7 @@
 #include <vector>
 
 namespace markov::trace_graph::core {
-class DagGraph;
+struct SourceObservations;
 }
 
 namespace markov::trace_graph::modules::hicache::model {
@@ -22,6 +22,6 @@ struct HiCacheSourceInput {
     std::map<std::string, size_t> missing_facts;
 };
 
-HiCacheSourceInput observe_hicache_source_input(const core::DagGraph & graph);
+HiCacheSourceInput observe_hicache_source_input(const core::SourceObservations & source, HiCachePhaseObservationAudit phases);
 
 } // namespace markov::trace_graph::modules::hicache::model

@@ -8,7 +8,7 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 void HiCacheWriteCalls::bind_load_branches(core::DagGraph & graph, uint64_t begin, uint64_t end) {
-    load_branches_ = source_dag::observe_load_branches(graph.runtime_observations(), replay_.facts(), begin, end);
+    load_branches_ = source_dag::observe_load_branches(graph.source_observations().runtime_observations, replay_.facts(), begin, end);
     std::vector<core::TraceEvent> points;
     for (const auto & branch : load_branches_) {
         for (const auto * event : { &branch.condition, &branch.envelope }) {
@@ -31,7 +31,7 @@ void HiCacheWriteCalls::bind_load_branches(core::DagGraph & graph, uint64_t begi
 void HiCacheWriteCalls::bind_load_attempts(core::DagGraph & graph, uint64_t begin, uint64_t end) {
     const adapters::sglang::HiCacheSourceIndex source(graph);
     std::vector<core::TraceEvent> points;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.load_allocation" || event.ts < begin || event.ts + event.dur > end) continue;
         if (event.arg("status") != "returned" || !event.dur || (event.arg("allocated") != "true" && event.arg("allocated") != "false"))
             throw std::runtime_error("Load attempt lacks its completed allocation result");

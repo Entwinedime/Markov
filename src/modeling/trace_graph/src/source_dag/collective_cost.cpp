@@ -51,7 +51,7 @@ void collective_operator_observations(const SourceDagIndex & source, const simul
         if (call.queued_tasks) {
             if (call.caller_intervals) {
                 const auto steps = structure::hicache::ordinary_collective_caller_steps(call.transfer);
-                const auto & envelope = graph.runtime_observations().at(call.region.observation);
+                const auto & envelope = graph.source_observations().runtime_observations.at(call.region.observation);
                 for (const auto & interval : *call.caller_intervals) {
                     const auto caller_work = structure::hicache::collective_caller_work(work, steps[interval.step]);
                     auto measured = nlohmann::json::array();
@@ -91,7 +91,7 @@ void collective_operator_observations(const SourceDagIndex & source, const simul
             }
             const auto device = participant.communication_nodes.front();
             const auto interval = raw_interval_ns(graph, device);
-            const auto position = measurement_position(graph.runtime_observations().at(peer));
+            const auto position = measurement_position(graph.source_observations().runtime_observations.at(peer));
             if (!interval || !position) {
                 complete = false;
                 break;

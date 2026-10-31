@@ -63,7 +63,7 @@ public:
           final_cost_transform_(final_cost_transform),
           compact_programs_(compact_execution_programs(final_cost_transform)),
           io_completion_(runtime::io_completion_provider(config.io_cost)),
-          replay_(source_graph_, config, io_completion_, config.io_cost.storage_batch_pages, config.io_cost.resource_lanes, true, {}, prepared.input),
+          replay_(prepared.input, config, io_completion_, config.io_cost.storage_batch_pages, config.io_cost.resource_lanes, true),
           source_calls_(prepared.phase_calls),
           preparation_source_(prepared.allocator),
           operator_provider_(config.operator_models),

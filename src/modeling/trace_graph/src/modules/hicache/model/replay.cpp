@@ -10,9 +10,10 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-HiCacheModelReplay::HiCacheModelReplay(const core::DagGraph & graph, const frontend::HiCacheRules & config, structure::hicache::IoCompletionProvider completion,
-                                       uint64_t storage_batch_pages, frontend::HiCacheIoResourceLanesConfig resource_lanes, bool execution_prefetch_control,
-                                       const HiCacheFactClock & projected_clock, std::shared_ptr<const HiCacheSourceInput> source_input)
+HiCacheModelReplay::HiCacheModelReplay(std::shared_ptr<const HiCacheSourceInput> source_input, const frontend::HiCacheRules & config,
+                                       structure::hicache::IoCompletionProvider completion, uint64_t storage_batch_pages,
+                                       frontend::HiCacheIoResourceLanesConfig resource_lanes, bool execution_prefetch_control,
+                                       const HiCacheFactClock & projected_clock)
     : state_(config, std::move(completion), storage_batch_pages, std::move(resource_lanes)),
       source_input_(std::move(source_input)),
       execution_prefetch_control_(execution_prefetch_control) {
@@ -23,10 +24,8 @@ HiCacheModelReplay::HiCacheModelReplay(const core::DagGraph & graph, const front
     if (!result_.effect_decisions.missing_facts.empty()) {
         result_.effect_decisions.status = "needs_calibration";
         result_.phase_work.blockers = result_.effect_decisions.missing_facts;
-        if (!source_input_) source_input_ = std::make_shared<const HiCacheSourceInput>();
         return;
     }
-    if (!source_input_) source_input_ = std::make_shared<const HiCacheSourceInput>(observe_hicache_source_input(graph));
     for (size_t i = 0; i < source_input_->phases.observations.size(); ++i) {
         const auto & observation = source_input_->phases.observations[i];
         if (observation.request_ids.size() != 1) {

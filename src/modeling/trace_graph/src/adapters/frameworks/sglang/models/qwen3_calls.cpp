@@ -16,7 +16,7 @@ DenseCallAudit observe_dense_calls(const source_dag::SourceDagIndex & source, co
     const auto & graph = source.graph();
     std::set<uint64_t> qwen3_layers, start_layers, output_norm_layers, logits_layers;
     std::map<uint64_t, uint64_t> input_embedding_layers;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if ((event.name == "runtime.phase.linear" || event.name == "runtime.phase.gated_activation" || event.name == "runtime.phase.normalization"
              || event.name == "runtime.phase.qkv_norm_rope")
             && event.arg("model_layer_implementation") == "sglang.srt.models.qwen3.Qwen3DecoderLayer" && event.has_arg("model_layer_index")) {
@@ -31,14 +31,14 @@ DenseCallAudit observe_dense_calls(const source_dag::SourceDagIndex & source, co
     for (size_t i = 0; i < attention.calls.size(); ++i) {
         const auto & call = attention.calls[i];
         const auto & location = call.region.descriptor.value();
-        const auto & descriptor =
-            location.prelude ? graph.prelude_context_events().at(location.observation) : graph.runtime_observations().at(location.observation);
+        const auto & descriptor = location.prelude ? graph.source_observations().prelude_context_events.at(location.observation)
+                                                   : graph.source_observations().runtime_observations.at(location.observation);
         if (!descriptor.has_arg("layer_id")) continue;
         attention_by_layer[{ call.position.phase_index, call.position.decode_iteration, descriptor.arg_u64("layer_id") }].push_back(i);
     }
 
     for (auto & region : observe_dense_regions(source, queues, result.issues)) {
-        const auto & descriptor = graph.runtime_observations().at(region.descriptor_observation.value_or(region.work.observation));
+        const auto & descriptor = graph.source_observations().runtime_observations.at(region.descriptor_observation.value_or(region.work.observation));
         if (descriptor.arg("model_layer_implementation") != "sglang.srt.models.qwen3.Qwen3DecoderLayer") continue;
         const bool embedding_output_mask = std::holds_alternative<structure::EmbeddingOutputMaskShape>(region.shape);
         const auto role = embedding_output_mask ? "input_embedding_output_mask" : descriptor.arg("dense_role");
@@ -112,8 +112,8 @@ DenseCallAudit observe_dense_calls(const source_dag::SourceDagIndex & source, co
     // A declared greedy call that cannot identify its inner argmax is a
     // coverage gap, not permission to treat unknown work as cache-independent.
     // Do not require a sampler in phases that never declared one (e.g. scoring).
-    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
-        const auto & event = graph.runtime_observations()[i];
+    for (size_t i = 0; i < graph.source_observations().runtime_observations.size(); ++i) {
+        const auto & event = graph.source_observations().runtime_observations[i];
         if (event.name == "runtime.phase.greedy_sampling" && event.arg("model_layer_implementation") == "sglang.srt.models.qwen3.Qwen3DecoderLayer"
             && event.arg("formal_window_context") != "causal_head" && !sampling_descriptors.contains(i))
             ++result.issues["greedy_sampling_without_complete_call"];

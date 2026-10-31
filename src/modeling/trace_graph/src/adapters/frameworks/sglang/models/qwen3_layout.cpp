@@ -46,7 +46,7 @@ const core::TraceEvent * unique_producer(const Producers & producers, const std:
 void resolve_attention_cache_layouts(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                      const PhaseCallPositions & positions, AttentionCallAudit & attention) {
     const auto & graph = source.graph();
-    const auto & events = graph.runtime_observations();
+    const auto & events = graph.source_observations().runtime_observations;
     std::vector<std::pair<size_t, uint64_t>> unresolved;
     for (size_t index = 0; index < attention.calls.size(); ++index) {
         auto & call = attention.calls[index];
@@ -54,7 +54,8 @@ void resolve_attention_cache_layouts(const source_dag::SourceDagIndex & source, 
         if (!write.enabled) continue;
 
         const auto & position = *call.region.descriptor;
-        const auto & descriptor = position.prelude ? graph.prelude_context_events().at(position.observation) : events.at(position.observation);
+        const auto & descriptor =
+            position.prelude ? graph.source_observations().prelude_context_events.at(position.observation) : events.at(position.observation);
         const auto fields = nlohmann::json::parse(descriptor.args_json_view());
         const auto & cache = fields.at("cache_write");
         if (cache.contains("key_shape") || cache.contains("value_shape")) {

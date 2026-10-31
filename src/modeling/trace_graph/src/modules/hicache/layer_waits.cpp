@@ -94,7 +94,7 @@ void observe_call(const source_dag::SourceDagIndex & source, const core::TraceEv
 HiCacheLayerWaitObservation observe_hicache_layer_waits(const source_dag::SourceDagIndex & source) {
     HiCacheLayerWaitObservation result;
     std::map<std::pair<std::string, std::string>, std::vector<size_t>> precise_lanes;
-    for (const auto & batch : source.graph().runtime_observations()) {
+    for (const auto & batch : source.graph().source_observations().runtime_observations) {
         if (batch.name != "runtime.hicache.layer_waits") continue;
         // Opening-cut context lacks the pre-window leaves needed for full
         // call ownership and is not replaced by the target forward rules.

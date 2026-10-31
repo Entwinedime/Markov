@@ -1,8 +1,8 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/model/input.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "modules/hicache/model/source_input.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,9 +28,9 @@ class HiCacheModelReplay {
 public:
     // The coordinator supplies completion callbacks for prelude/static work.
     // Numerical models and their construction remain outside replay rules.
-    HiCacheModelReplay(const core::DagGraph & graph, const frontend::HiCacheRules & config, structure::hicache::IoCompletionProvider completion,
-                       uint64_t storage_batch_pages, frontend::HiCacheIoResourceLanesConfig resource_lanes, bool execution_prefetch_control,
-                       const HiCacheFactClock & projected_clock = {}, std::shared_ptr<const HiCacheSourceInput> source_input = {});
+    HiCacheModelReplay(std::shared_ptr<const HiCacheSourceInput> source_input, const frontend::HiCacheRules & config,
+                       structure::hicache::IoCompletionProvider completion, uint64_t storage_batch_pages, frontend::HiCacheIoResourceLanesConfig resource_lanes,
+                       bool execution_prefetch_control, const HiCacheFactClock & projected_clock = {});
     [[nodiscard]] const std::vector<HiCacheReplayFact> & facts() const { return facts_; }
     /** Formal identity lookup; borrowed until preparation changes the fact list. */
     [[nodiscard]] const HiCacheReplayFact & fact(size_t id) const { return facts_.at(fact_positions_.at(id)); }

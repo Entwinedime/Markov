@@ -178,10 +178,10 @@ HiCacheSourceIndex::HiCacheSourceIndex(const core::DagGraph & graph) : source_da
     }
 
     modules::hicache::HiCacheFactParser source_fact_parser;
-    for (const auto & event : graph.hicache_fact_events()) source_fact_parser.observe_token_dictionaries(event);
-    for (const auto & event : graph.tail_context_events()) source_fact_parser.observe_token_dictionaries(event);
+    for (const auto & event : graph.source_observations().hicache_fact_events) source_fact_parser.observe_token_dictionaries(event);
+    for (const auto & event : graph.source_observations().tail_context_events) source_fact_parser.observe_token_dictionaries(event);
 
-    for (const auto & event : graph.hicache_fact_events()) {
+    for (const auto & event : graph.source_observations().hicache_fact_events) {
         if (!hicache_source_detail::fact_candidate(event)) continue;
         try {
             const auto fact_id = event.index;
@@ -204,8 +204,8 @@ HiCacheSourceIndex::HiCacheSourceIndex(const core::DagGraph & graph) : source_da
         }
     }
 
-    const auto tail_offset = modules::hicache::hicache_tail_fact_offset(graph.hicache_fact_events());
-    for (const auto & event : graph.tail_context_events()) {
+    const auto tail_offset = modules::hicache::hicache_tail_fact_offset(graph.source_observations().hicache_fact_events);
+    for (const auto & event : graph.source_observations().tail_context_events) {
         if (!hicache_source_detail::fact_candidate(event)) continue;
         try {
             const auto tail_fact_index = tail_context_facts_.size();

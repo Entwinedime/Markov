@@ -30,7 +30,7 @@ void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelRep
     std::set<int> group_members;
     for (const auto & round : collectives.rounds)
         for (const auto & call : round.calls) {
-            const auto [at, added] = ranks.emplace(graph.runtime_observations()[call.observation].pid, call.rank);
+            const auto [at, added] = ranks.emplace(graph.source_observations().runtime_observations[call.observation].pid, call.rank);
             if (!added && at->second != call.rank) throw std::runtime_error("Query process has multiple observed ranks");
             group_members.insert(call.rank);
         }
@@ -39,7 +39,7 @@ void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelRep
     std::vector<std::pair<std::string, int>> keys;
     using EnqueueKey = std::tuple<std::string, std::string, std::string>;
     std::map<EnqueueKey, std::vector<const core::TraceEvent *>> enqueues;
-    for (const auto & event : graph.runtime_observations())
+    for (const auto & event : graph.source_observations().runtime_observations)
         if (event.name == "runtime.hicache.prefetch_enqueue") enqueues[{ event.pid, event.tid, event.arg("request_id") }].push_back(&event);
 
     for (const auto & item : replay.facts()) {

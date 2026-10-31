@@ -76,7 +76,7 @@ void phase_operator_observations(const core::DagGraph & graph, const modules::hi
     // ownership are known; a missing shape is not an inferred training point.
     const auto preparations = adapters::sglang::observe_allocator_preparations(graph);
     std::map<std::pair<std::string, size_t>, std::string> preparation_positions;
-    for (const auto & event : graph.hicache_fact_events()) {
+    for (const auto & event : graph.source_observations().hicache_fact_events) {
         if (const auto position = measurement_position(event)) preparation_positions.emplace(std::pair{ event.pid, event.index }, *position);
     }
     for (const auto & call : preparations.calls) {
@@ -88,7 +88,7 @@ void phase_operator_observations(const core::DagGraph & graph, const modules::hi
         // Compilation overlap is an observed outcome, not a deployment
         // feature that can be copied from a base run to target execution.
         const auto work = adapters::sglang::allocator_preparation_operation({ "required", call.specialization, call.path, call.first_load });
-        const auto & outer = graph.runtime_observations().at(*call.allocator_observation);
+        const auto & outer = graph.source_observations().runtime_observations.at(*call.allocator_observation);
         nlohmann::json intervals = nlohmann::json::array();
         bool complete = true;
         for (const auto & [begin, end] : call.intervals) {
@@ -119,7 +119,7 @@ void phase_operator_observations(const core::DagGraph & graph, const modules::hi
     // prove that the failed attempt did not execute Cat/Sort.
     // Thread CPU excludes descheduling, unlike the observed wall envelope.
     // Older captures without these scalar measurements remain unavailable.
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.load_allocation" || event.arg("status") != "returned" || event.arg("allocated") != "false"
             || !event.has_arg_key_hint("thread_cpu_ns"))
             continue;
@@ -162,7 +162,7 @@ void layer_wait_operator_observations(const adapters::sglang::HiCacheSourceIndex
                                       bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source_index.graph();
     std::map<std::pair<std::string, uint64_t>, std::string> layer_positions;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.layer_waits") continue;
         if (const auto position = measurement_position(event))
             layer_positions.emplace(std::pair{ event.pid, event.ts * 1'000 + event.ts_submicro_ns }, *position);
@@ -287,7 +287,7 @@ void append_blocking_write_observations(const adapters::sglang::HiCacheSourceInd
         return;
     }
 
-    const auto observation = static_cast<size_t>(&event - source.graph().runtime_observations().data());
+    const auto observation = static_cast<size_t>(&event - source.graph().source_observations().runtime_observations.data());
     append_write_confirmation_observations(source, queues, observation, event.ts, *before, corrected, rows);
 }
 
@@ -300,7 +300,7 @@ void confirmation_operator_observations(const adapters::sglang::HiCacheSourceInd
     // empty blocking calls separately measure fixed entry/return work.
     // Queue deltas describe actual work; neither the old tail's local node
     // count nor its event-wait layout becomes the target's execution program.
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name == "runtime.hicache.write_ack" && event.arg("status") == "returned") {
             const auto tokens = core::parse_u64(event.arg("backup_tokens"));
             const auto published = core::parse_u64(event.arg("published_nodes"));
@@ -353,7 +353,7 @@ void confirmation_operator_observations(const adapters::sglang::HiCacheSourceInd
         const auto role = write ? "write_completion_check" : "load_completion_check";
         const core::TraceEvent * reduction = nullptr;
         bool ambiguous = false;
-        for (const auto & item : graph.runtime_observations()) {
+        for (const auto & item : graph.source_observations().runtime_observations) {
             if (item.name != "runtime.cpu_collective" || item.arg("role") != role || item.pid != event.pid || item.tid != event.tid || item.ts < event.ts
                 || item.ts + item.dur > event.ts + event.dur)
                 continue;
@@ -366,7 +366,7 @@ void confirmation_operator_observations(const adapters::sglang::HiCacheSourceInd
         if (first_us >= end_us) continue;
 
         if (write && *before > *after) {
-            const auto observation = static_cast<size_t>(&event - graph.runtime_observations().data());
+            const auto observation = static_cast<size_t>(&event - graph.source_observations().runtime_observations.data());
             auto measured = nlohmann::json::array();
             append_write_confirmation_observations(source_index, queues, observation, first_us, *before - *after, cpu_service_applied, measured);
             rows.append(measured);
@@ -401,11 +401,11 @@ void load_admission_operator_observations(const core::DagGraph & input, bool cpu
             points.push_back(std::move(point));
         }
     };
-    for (const auto & event : input.runtime_observations())
+    for (const auto & event : input.source_observations().runtime_observations)
         if (event.name == "runtime.hicache.load_allocation" || event.name == "runtime.hicache.load_admission"
             || event.name == "hicache.control.host_load_branch")
             append_boundaries(event);
-    for (const auto & event : input.hicache_fact_events())
+    for (const auto & event : input.source_observations().hicache_fact_events)
         if (event.arg("phase") == "end" && modules::hicache::parse_hicache_fact_metadata(event).role == "loadback_decision_observed") append_boundaries(event);
     if (points.empty()) return;
 
@@ -416,7 +416,7 @@ void load_admission_operator_observations(const core::DagGraph & input, bool cpu
     (void)modules::hicache::bind_hicache_control_points(graph, points);
     const adapters::sglang::HiCacheSourceIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : graph.source_observations().runtime_observations) {
         if (event.name != "runtime.hicache.load_admission" || event.arg("status") != "returned") continue;
         const auto position = measurement_position(event);
         if (!position) continue;
@@ -427,7 +427,7 @@ void load_admission_operator_observations(const core::DagGraph & input, bool cpu
 
         const core::TraceEvent * first = nullptr;
         const core::TraceEvent * last = nullptr;
-        for (const auto & attempt : graph.runtime_observations()) {
+        for (const auto & attempt : graph.source_observations().runtime_observations) {
             if (attempt.name != "runtime.hicache.load_allocation" || attempt.pid != event.pid || attempt.tid != event.tid || attempt.ts < event.ts
                 || attempt.ts + attempt.dur > event.ts + event.dur)
                 continue;
@@ -535,7 +535,7 @@ void load_admission_operator_observations(const core::DagGraph & input, bool cpu
 void prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                          bool cpu_service_applied, ObservationWriter & rows) {
     const auto & graph = source.graph();
-    for (const auto & admission : graph.runtime_observations()) {
+    for (const auto & admission : graph.source_observations().runtime_observations) {
         if (admission.name != "runtime.hicache.load_admission" || admission.arg("status") != "returned") continue;
         const auto position = measurement_position(admission);
         const auto prefix_tokens = core::parse_u64(admission.arg("existing_prefix_tokens"));
@@ -544,7 +544,7 @@ void prefix_concat_operator_observations(const adapters::sglang::HiCacheSourceIn
 
         const core::TraceEvent * branch = nullptr;
         bool ambiguous = false;
-        for (const auto & event : graph.runtime_observations()) {
+        for (const auto & event : graph.source_observations().runtime_observations) {
             if (event.name != "hicache.control.host_load_branch" || event.pid != admission.pid || event.tid != admission.tid || event.ts > admission.ts
                 || event.ts + event.dur < admission.ts + admission.dur)
                 continue;

@@ -45,7 +45,7 @@ std::optional<std::vector<CollectiveCallerInterval>> observe_collective_caller_i
             if (edge.kind == core::DagEdgeKind::Sync && !graph.node(edge.src).is_cpu) return std::nullopt;
         }
     }
-    const auto & envelope = graph.runtime_observations().at(call.region.observation);
+    const auto & envelope = graph.source_observations().runtime_observations.at(call.region.observation);
     const auto end = core::checked_add_u64(envelope.ts, envelope.dur, "Collective caller end overflow");
     auto cursor = envelope.ts;
     std::vector<CollectiveCallerInterval> intervals;
@@ -179,8 +179,8 @@ DeviceCollectiveAudit observe_device_collectives(const source_dag::SourceDagInde
     std::vector<CollectiveCandidate> candidates;
     std::map<GroupIdentity, std::vector<size_t>> groups;
     std::map<size_t, size_t> device_owners;
-    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
-        const auto & event = graph.runtime_observations()[i];
+    for (size_t i = 0; i < graph.source_observations().runtime_observations.size(); ++i) {
+        const auto & event = graph.source_observations().runtime_observations[i];
         if (event.source_channel != core::TraceSourceChannel::PythonProbe || event.name != "runtime.phase.device_collective"
             || event.arg("formal_window_context") == "causal_head")
             continue;
@@ -278,7 +278,7 @@ DeviceCollectiveAudit observe_device_collectives(const source_dag::SourceDagInde
 
     std::set<std::pair<std::string, int64_t>> nonblocking_groups;
     for (const auto & call : audit.calls) {
-        const auto & envelope = graph.runtime_observations().at(call.region.observation);
+        const auto & envelope = graph.source_observations().runtime_observations.at(call.region.observation);
         const auto returned = core::checked_add_u64(envelope.ts, envelope.dur, "Collective return overflow");
         for (const auto node : call.communication_nodes) {
             const auto & device = graph.event_for_node(node);

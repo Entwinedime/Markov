@@ -1,19 +1,11 @@
-/**
- * @file
- * @brief Request-bound source observations for SGLang prefill and decode phases.
- */
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
-#include "markov/trace_graph/modules/hicache/layer_waits.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include "markov/trace_graph/adapters/frameworks/sglang/attention_program.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/fact.hpp"
-
-#include <nlohmann/json.hpp>
+#include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -24,101 +16,8 @@
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache {
-
 namespace {
-
-using Json = nlohmann::json;
 using core::TraceEvent;
-
-struct Marker {
-    int logical_input = 0;
-    const TraceEvent * event = nullptr;
-    uint64_t token_count = 0;
-};
-
-struct ExtendFact {
-    const TraceEvent * event = nullptr;
-    std::vector<std::string> request_ids;
-    std::vector<uint64_t> token_counts;
-    uint64_t batch_size = 0;
-    uint64_t source_page_size = 0;
-};
-
-enum class PhaseKind : uint8_t { Prefill, Decode };
-
-struct PhaseInterval {
-    const TraceEvent * envelope = nullptr;
-    int logical_input = 0;
-    std::string_view pid;
-    std::string_view tid;
-    uint64_t start_us = 0;
-    uint64_t end_us = 0;
-    size_t observation_index = 0;
-    PhaseKind kind = PhaseKind::Prefill;
-    uint64_t decode_iteration = 0;
-};
-
-Json array_arg(const TraceEvent & event, std::string_view key) {
-    if (!event.has_arg_key_hint(key)) return Json::array();
-    const auto value = event.arg(key);
-    if (value.empty()) return Json::array();
-    try {
-        auto parsed = Json::parse(value);
-        return parsed.is_array() ? std::move(parsed) : Json::array();
-    }
-    catch (const Json::exception &) {
-        return Json::array();
-    }
-}
-
-std::vector<std::string> string_array_arg(const TraceEvent & event, std::string_view key) {
-    std::vector<std::string> values;
-    for (const auto & item : array_arg(event, key)) {
-        if (item.is_string()) values.push_back(item.get<std::string>());
-    }
-    return values;
-}
-
-std::vector<uint64_t> u64_array_arg(const TraceEvent & event, std::string_view key) {
-    std::vector<uint64_t> values;
-    for (const auto & item : array_arg(event, key)) {
-        if (item.is_number_unsigned()) values.push_back(item.get<uint64_t>());
-        else if (item.is_number_integer()) {
-            const auto value = item.get<int64_t>();
-            if (value >= 0) values.push_back(static_cast<uint64_t>(value));
-        }
-    }
-    return values;
-}
-
-std::optional<uint64_t> marker_value(std::string_view name, std::string_view key) {
-    const auto begin = name.find(key);
-    if (begin == std::string_view::npos) return std::nullopt;
-    const auto value_begin = begin + key.size();
-    auto value_end = value_begin;
-    while (value_end < name.size() && name[value_end] >= '0' && name[value_end] <= '9') ++value_end;
-    if (value_end == value_begin) return std::nullopt;
-    uint64_t value = 0;
-    const auto [position, error] = std::from_chars(name.data() + value_begin, name.data() + value_end, value);
-    if (error != std::errc{} || position != name.data() + value_end) return std::nullopt;
-    return value;
-}
-
-bool marker_order(const Marker & left, const Marker & right) {
-    if (left.event->ts != right.event->ts) return left.event->ts < right.event->ts;
-    return left.event->index < right.event->index;
-}
-
-bool fact_order(const ExtendFact & left, const ExtendFact & right) {
-    if (left.event->ts != right.event->ts) return left.event->ts < right.event->ts;
-    return left.event->index < right.event->index;
-}
-
-uint64_t sum_tokens(const std::vector<uint64_t> & values) {
-    uint64_t total = 0;
-    for (const auto value : values) total = core::checked_add_u64(total, value, "HiCache phase prompt token count exceeds uint64 range");
-    return total;
-}
 
 bool is_device_control_anchor(std::string_view name) {
     return name == "EVENT_WAIT" || name == "EVENT_RECORD" || name == "NOTIFY_WAIT" || name == "NOTIFY_RECORD" || name == "MODEL_EXECUTE";
@@ -139,220 +38,30 @@ std::string phase_family_name(std::string_view name) {
 } // namespace
 
 HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits) {
-    HiCachePhaseObservationAudit audit;
+    auto input = observe_hicache_phase_inputs(graph.source_observations());
+    auto & audit = input.audit;
+    const auto & phase_intervals = input.intervals;
     HiCacheLayerWaitObservation local_waits;
     if (!layer_waits) {
-        if (std::ranges::any_of(graph.runtime_observations(), [](const auto & event) { return event.name == "runtime.hicache.layer_waits"; }))
+        if (std::ranges::any_of(graph.source_observations().runtime_observations,
+                                [](const auto & event) { return event.name == "runtime.hicache.layer_waits"; }))
             local_waits = observe_hicache_layer_waits(source_dag::SourceDagIndex(graph));
         layer_waits = &local_waits;
     }
     audit.layer_wait_status = layer_waits->status;
     audit.layer_wait_issues = layer_waits->issues;
-    std::vector<PhaseInterval> phase_intervals;
-    std::unordered_map<std::string, std::vector<ExtendFact>> facts_by_pid;
-    for (const auto & event : graph.hicache_fact_events()) {
-        try {
-            const auto metadata = parse_hicache_fact_metadata(event);
-            if (metadata.role != "cache_extend_input" || event.arg("phase") != "start") continue;
-            ExtendFact fact{
-                .event = &event,
-                .request_ids = string_array_arg(event, "request_ids"),
-                .token_counts = u64_array_arg(event, "token_counts"),
-                .batch_size = event.arg_u64("batch_size", 0),
-                .source_page_size = event.arg_u64("source_page_size", 0),
-            };
-            ++audit.cache_extend_fact_count;
-            if (!fact.request_ids.empty()) ++audit.request_bound_fact_count;
-            const auto expected_batch = fact.batch_size ? fact.batch_size : fact.request_ids.size();
-            if (fact.request_ids.empty() || fact.request_ids.size() != expected_batch || fact.token_counts.size() != expected_batch
-                || fact.source_page_size == 0) {
-                ++audit.invalid_fact_count;
-            }
-            facts_by_pid[event.pid].push_back(std::move(fact));
-        }
-        catch (const std::exception &) {
-            ++audit.invalid_fact_count;
-        }
-    }
-
-    std::unordered_map<std::string, std::vector<Marker>> prefills_by_pid;
-    std::unordered_map<std::string, std::vector<Marker>> decodes_by_pid;
-    for (const auto & marker_event : graph.phase_marker_events()) {
-        const auto & event = marker_event.event;
-        if (event.arg("formal_window_context") == "causal_head") {
-            ++audit.opening_context_marker_count;
-            continue;
-        }
-
-        if (event.name.starts_with("step[EXTEND")) {
-            const auto tokens = marker_value(event.name, "toks=");
-            if (!tokens) {
-                ++audit.invalid_fact_count;
-                continue;
-            }
-            prefills_by_pid[event.pid].push_back(Marker{ .logical_input = marker_event.gpu_id, .event = &event, .token_count = *tokens });
-        }
-        else if (event.name.starts_with("step[DECODE")) {
-            decodes_by_pid[event.pid].push_back(Marker{ .logical_input = marker_event.gpu_id, .event = &event });
-        }
-    }
-
-    std::unordered_set<const TraceEvent *> used_prefills;
-    std::unordered_set<const TraceEvent *> used_decodes;
-    for (auto & [pid, facts] : facts_by_pid) {
-        std::ranges::sort(facts, fact_order);
-        auto & prefills = prefills_by_pid[pid];
-        auto & decodes = decodes_by_pid[pid];
-        std::ranges::sort(prefills, marker_order);
-        std::ranges::sort(decodes, marker_order);
-        size_t prefill_cursor = 0;
-        size_t decode_cursor = 0;
-        for (size_t fact_index = 0; fact_index < facts.size(); ++fact_index) {
-            const auto & fact = facts[fact_index];
-            const auto next_fact_ts = fact_index + 1 < facts.size() ? facts[fact_index + 1].event->ts : std::numeric_limits<uint64_t>::max();
-            while (prefill_cursor < prefills.size() && prefills[prefill_cursor].event->ts < fact.event->ts) ++prefill_cursor;
-            if (prefill_cursor >= prefills.size() || prefills[prefill_cursor].event->ts >= next_fact_ts) continue;
-            const auto & prefill = prefills[prefill_cursor++];
-            used_prefills.insert(prefill.event);
-            ++audit.paired_prefill_count;
-
-            const auto prefill_end = core::checked_add_u64(prefill.event->ts, prefill.event->dur, "HiCache prefill marker end exceeds uint64 range");
-            const auto next_prefill_ts = prefill_cursor < prefills.size() ? prefills[prefill_cursor].event->ts : next_fact_ts;
-            const auto decode_end_boundary = std::min(next_fact_ts, next_prefill_ts);
-            while (decode_cursor < decodes.size() && decodes[decode_cursor].event->ts < prefill_end) ++decode_cursor;
-            uint64_t decode_iterations = 0;
-            uint64_t decode_duration = 0;
-            std::vector<const Marker *> owned_decodes;
-            while (decode_cursor < decodes.size() && decodes[decode_cursor].event->ts < decode_end_boundary) {
-                const auto & decode = decodes[decode_cursor++];
-                used_decodes.insert(decode.event);
-                decode_duration = core::checked_add_u64(decode_duration, decode.event->dur, "HiCache decode duration exceeds uint64 range");
-                owned_decodes.push_back(&decode);
-                ++decode_iterations;
-            }
-            audit.paired_decode_count += decode_iterations;
-            ++audit.decode_iterations_histogram[decode_iterations];
-
-            const auto prompt_tokens = sum_tokens(fact.token_counts);
-            if (prefill.token_count > prompt_tokens) ++audit.token_range_error_count;
-            const auto observation_index = audit.observations.size();
-            audit.observations.push_back(HiCachePhaseObservation{
-                .logical_input = prefill.logical_input,
-                .pid = pid,
-                .request_ids = fact.request_ids,
-                .batch_size = fact.batch_size ? fact.batch_size : fact.request_ids.size(),
-                .source_page_size = fact.source_page_size,
-                .prompt_token_count = prompt_tokens,
-                .prefill_token_count = prefill.token_count,
-                .prefill_start_us = prefill.event->ts,
-                .prefill_duration_us = prefill.event->dur,
-                .decode_iteration_count = decode_iterations,
-                .decode_duration_us = decode_duration,
-            });
-            phase_intervals.push_back(PhaseInterval{
-                .envelope = prefill.event,
-                .logical_input = prefill.logical_input,
-                .pid = pid,
-                .tid = prefill.event->tid,
-                .start_us = prefill.event->ts,
-                .end_us = core::checked_add_u64(prefill.event->ts, prefill.event->dur, "HiCache prefill interval exceeds uint64 range"),
-                .observation_index = observation_index,
-                .kind = PhaseKind::Prefill,
-            });
-            uint64_t iteration = 0;
-            for (const auto * decode : owned_decodes) {
-                phase_intervals.push_back(PhaseInterval{
-                    .envelope = decode->event,
-                    .logical_input = decode->logical_input,
-                    .pid = pid,
-                    .tid = decode->event->tid,
-                    .start_us = decode->event->ts,
-                    .end_us = core::checked_add_u64(decode->event->ts, decode->event->dur, "HiCache decode interval exceeds uint64 range"),
-                    .observation_index = observation_index,
-                    .kind = PhaseKind::Decode,
-                    .decode_iteration = iteration++,
-                });
-            }
-        }
-    }
-
-    // ModelRunner.sample runs after the Torch forward marker, but within the
-    // same request-bearing TpModelWorker batch. Attribute its exact envelope
-    // through that enclosing call, not the nearest forward or kernel launch.
-    // Keep original marker durations and unrelated post-forward work intact.
-    std::vector<const TraceEvent *> batches;
-    for (const auto & event : graph.runtime_observations())
-        if (event.name == "runtime.hicache.layer_waits" && event.arg("status") == "returned") batches.push_back(&event);
-
-    std::vector<PhaseInterval> sampling_intervals;
-    for (const auto & sample : graph.runtime_observations()) {
-        if (sample.name != "runtime.phase.greedy_sampling" || sample.arg("status") != "returned") continue;
-        const auto sample_end = core::checked_add_u64(sample.ts, sample.dur, "Sampling interval end overflow");
-        const PhaseInterval * owner = nullptr;
-        size_t matches = 0;
-        for (const auto * batch : batches) {
-            const auto batch_end = core::checked_add_u64(batch->ts, batch->dur, "Batch interval end overflow");
-            if (batch->pid != sample.pid || batch->tid != sample.tid || batch->ts > sample.ts || batch_end < sample_end) continue;
-            const auto requests = string_array_arg(*batch, "request_ids");
-            for (const auto & interval : phase_intervals) {
-                if (interval.pid != batch->pid || interval.tid != batch->tid || interval.start_us < batch->ts || interval.end_us > batch_end
-                    || audit.observations[interval.observation_index].request_ids != requests
-                    || batch->arg("phase") != (interval.kind == PhaseKind::Prefill ? "EXTEND" : "DECODE"))
-                    continue;
-                owner = &interval;
-                ++matches;
-            }
-        }
-        if (matches != 1) continue;
-        // Already marker-owned or intersecting boundaries require no second
-        // ownership interval. Partial overlap remains unresolved downstream.
-        if (sample.ts < owner->end_us) continue;
-
-        auto sampling = *owner;
-        sampling.envelope = &sample;
-        sampling.start_us = sample.ts;
-        sampling.end_us = sample_end;
-        sampling_intervals.push_back(sampling);
-    }
-    phase_intervals.insert(phase_intervals.end(), sampling_intervals.begin(), sampling_intervals.end());
-
-    // CPU-only views have no worker/device submission. Their
-    // exact framework envelope still belongs to a unique, joined forward on
-    // the same OS thread. This records call identity, not additional work.
     using FineTime = unsigned __int128;
     const auto fine_start = [](const TraceEvent & event) { return FineTime(event.ts) * 1'000 + event.ts_submicro_ns; };
     const auto fine_end = [&](const TraceEvent & event) { return fine_start(event) + FineTime(event.dur) * 1'000 + event.dur_submicro_ns; };
-    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
-        const auto & call = graph.runtime_observations()[i];
-        if (!call.name.starts_with("runtime.phase.") || call.arg("status") != "returned" || call.arg("formal_window_context") == "causal_head") continue;
-
-        const PhaseInterval * owner = nullptr;
-        size_t matches = 0;
-        for (const auto & interval : phase_intervals) {
-            if (interval.pid != call.pid || interval.tid != call.tid || fine_start(*interval.envelope) > fine_start(call)
-                || fine_end(*interval.envelope) < fine_end(call))
-                continue;
-
-            owner = &interval;
-            ++matches;
-        }
-        if (matches > 1) ++audit.phase_owner_conflict_count;
-        if (matches != 1) continue;
-
-        auto & observation = audit.observations[owner->observation_index];
-        if (owner->kind == PhaseKind::Prefill) observation.prefill_call_observations.push_back(i);
-        else observation.decode_call_iterations.emplace(i, owner->decode_iteration);
-    }
-
     struct PhaseOwnerIndex {
-        std::vector<const PhaseInterval *> intervals;
+        std::vector<const HiCachePhaseInterval *> intervals;
         std::vector<uint64_t> prefix_end_us;
     };
     std::map<int, PhaseOwnerIndex> phase_owners;
     for (const auto & interval : phase_intervals) phase_owners[interval.logical_input].intervals.push_back(&interval);
     for (auto & [input, index] : phase_owners) {
         (void)input;
-        std::ranges::sort(index.intervals, {}, &PhaseInterval::start_us);
+        std::ranges::sort(index.intervals, {}, &HiCachePhaseInterval::start_us);
         uint64_t end_us = 0;
         for (const auto * interval : index.intervals) {
             end_us = std::max(end_us, interval->end_us);
@@ -362,11 +71,11 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
 
     const auto find_owner = [&](const core::DagNode & node, uint64_t anchor_us) {
         const auto found = phase_owners.find(node.gpu_id);
-        if (found == phase_owners.end()) return static_cast<const PhaseInterval *>(nullptr);
+        if (found == phase_owners.end()) return static_cast<const HiCachePhaseInterval *>(nullptr);
 
         const auto & index = found->second;
-        auto at = std::ranges::upper_bound(index.intervals, anchor_us, {}, &PhaseInterval::start_us);
-        const PhaseInterval * owner = nullptr;
+        auto at = std::ranges::upper_bound(index.intervals, anchor_us, {}, &HiCachePhaseInterval::start_us);
+        const HiCachePhaseInterval * owner = nullptr;
         // Earlier intervals whose cumulative end has passed cannot contain
         // this anchor. Keep checking all overlapping candidates: overlap is
         // still an ownership conflict, not permission to choose the latest.
@@ -377,7 +86,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
 
             if (owner != nullptr) {
                 ++audit.phase_owner_conflict_count;
-                return static_cast<const PhaseInterval *>(nullptr);
+                return static_cast<const HiCachePhaseInterval *>(nullptr);
             }
             owner = *at;
         }
@@ -426,8 +135,8 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     // marker. Prefer the original Enqueue on the proven correlation chain, but
     // leave physical submit_ts and DAG dependencies untouched. An observed
     // producer outside all phases must not fall back to a coincident launch.
-    const auto device_owner = [&](const core::DagNode & node) -> const PhaseInterval * {
-        std::optional<const PhaseInterval *> producer;
+    const auto device_owner = [&](const core::DagNode & node) -> const HiCachePhaseInterval * {
+        std::optional<const HiCachePhaseInterval *> producer;
         std::vector<size_t> pending{ node.id };
         std::unordered_set<size_t> visited{ node.id };
         while (!pending.empty()) {
@@ -457,7 +166,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         }
         return producer ? *producer : find_owner(node, node.submit_ts);
     };
-    std::map<size_t, const PhaseInterval *> device_owners;
+    std::map<size_t, const HiCachePhaseInterval *> device_owners;
     for (const auto & node : graph.nodes()) {
         if (!node.active || node.is_cpu || node.kind != core::DagNodeKind::TraceEvent || node.submit_ts == 0) continue;
         const auto * owner = device_owner(node);
@@ -465,13 +174,13 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         device_owners.emplace(node.id, owner);
         const auto & event = graph.event_for_node(node.id);
         auto & observation = audit.observations[owner->observation_index];
-        if (owner->kind == PhaseKind::Decode) observation.decode_node_iterations.emplace(node.id, owner->decode_iteration);
+        if (owner->kind == HiCachePhaseKind::Decode) observation.decode_node_iterations.emplace(node.id, owner->decode_iteration);
         ++audit.phase_owned_device_node_count;
-        auto & family = owner->kind == PhaseKind::Prefill ? audit.prefill_device_families[phase_family_name(event.name)]
-                                                          : audit.decode_device_families[phase_family_name(event.name)];
+        auto & family = owner->kind == HiCachePhaseKind::Prefill ? audit.prefill_device_families[phase_family_name(event.name)]
+                                                                 : audit.decode_device_families[phase_family_name(event.name)];
         ++family.node_count;
         family.duration_us = core::checked_add_u64(family.duration_us, node.duration, "HiCache phase family duration exceeds uint64 range");
-        auto & phase = owner->kind == PhaseKind::Prefill ? observation.prefill : observation.decode;
+        auto & phase = owner->kind == HiCachePhaseKind::Prefill ? observation.prefill : observation.decode;
         ++phase.device_node_count;
         phase.device_duration_us = core::checked_add_u64(phase.device_duration_us, node.duration, "HiCache phase device duration exceeds uint64 range");
         if (is_device_control_anchor(event.name)) continue;
@@ -489,7 +198,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         ++kernel_family.node_count;
         kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us, node.duration, "HiCache kernel family duration exceeds uint64 range");
         phase.kernel_duration_us = core::checked_add_u64(phase.kernel_duration_us, node.duration, "HiCache phase kernel duration exceeds uint64 range");
-        if (owner->kind == PhaseKind::Decode) { observation.decode_kernel_node_ids.push_back(node.id); }
+        if (owner->kind == HiCachePhaseKind::Decode) { observation.decode_kernel_node_ids.push_back(node.id); }
         else if (adapters::sglang::is_attention_kernel(event.name)) {
             observation.prefill_prefix_attention_node_ids.push_back(node.id);
             observation.prefill_prefix_attention_duration_us = core::checked_add_u64(observation.prefill_prefix_attention_duration_us,
@@ -508,7 +217,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     // cleanup in the same process is not phase work merely because it overlaps
     // EXTEND/DECODE. Worker ownership is added below through correlation chains;
     // unowned work remains in the graph, with its cost and dependencies intact.
-    std::map<size_t, const PhaseInterval *> cpu_owners;
+    std::map<size_t, const HiCachePhaseInterval *> cpu_owners;
     for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || node.kind != core::DagNodeKind::TraceEvent) continue;
         if (layer_waits->cpu_node_ids.contains(node.id)) continue;
@@ -551,30 +260,15 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     for (const auto & [node_id, owner] : cpu_owners) {
         const auto & node = graph.node(node_id);
         auto & observation = audit.observations[owner->observation_index];
-        if (owner->kind == PhaseKind::Decode) observation.decode_node_iterations.emplace(node_id, owner->decode_iteration);
+        if (owner->kind == HiCachePhaseKind::Decode) observation.decode_node_iterations.emplace(node_id, owner->decode_iteration);
         ++audit.phase_owned_submit_cpu_node_count;
-        auto & phase = owner->kind == PhaseKind::Prefill ? observation.prefill : observation.decode;
+        auto & phase = owner->kind == HiCachePhaseKind::Prefill ? observation.prefill : observation.decode;
         phase.submit_cpu_node_ids.push_back(node_id);
         phase.submit_cpu_duration_us = core::checked_add_u64(phase.submit_cpu_duration_us, node.duration, "HiCache phase CPU duration exceeds uint64 range");
     }
 
-    for (const auto & markers : prefills_by_pid | std::views::values) {
-        audit.unmatched_prefill_marker_count += std::ranges::count_if(markers, [&](const auto & marker) { return !used_prefills.contains(marker.event); });
-    }
-    for (const auto & markers : decodes_by_pid | std::views::values) {
-        audit.unmatched_decode_marker_count += std::ranges::count_if(markers, [&](const auto & marker) { return !used_decodes.contains(marker.event); });
-    }
-    std::ranges::sort(audit.observations, [](const auto & left, const auto & right) {
-        if (left.prefill_start_us != right.prefill_start_us) return left.prefill_start_us < right.prefill_start_us;
-        if (left.logical_input != right.logical_input) return left.logical_input < right.logical_input;
-        return left.pid < right.pid;
-    });
-    const bool complete = audit.cache_extend_fact_count > 0 && audit.cache_extend_fact_count == audit.request_bound_fact_count
-                          && audit.cache_extend_fact_count == audit.paired_prefill_count && audit.invalid_fact_count == 0 && audit.token_range_error_count == 0
-                          && audit.unmatched_prefill_marker_count == 0 && audit.unmatched_decode_marker_count == 0 && audit.phase_owner_conflict_count == 0;
-    audit.status = complete ? "ready" : "not_ready";
-    return audit;
+    if (audit.phase_owner_conflict_count) audit.status = "not_ready";
+    return std::move(audit);
 }
-
 
 } // namespace markov::trace_graph::modules::hicache

@@ -1,9 +1,9 @@
-#include "markov/trace_graph/source_dag/decode_allocation.hpp"
-#include "markov/trace_graph/core/dag_graph.hpp"
+#include "source_dag/decode_allocation.hpp"
+#include "core/source_observations.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/model/input.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
+#include "modules/hicache/phase_observation.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -109,7 +109,7 @@ std::vector<HiCacheReplayFact> observe_prelude_decode_allocations(std::span<cons
     return derived;
 }
 
-ObservedDecodeContexts observe_decode_contexts(const core::DagGraph & graph, const HiCachePhaseObservationAudit & phases) {
+ObservedDecodeContexts observe_decode_contexts(const core::SourceObservations & source, const HiCachePhaseObservationAudit & phases) {
     using RequestKey = std::pair<std::string, std::string>;
     std::map<RequestKey, const modules::hicache::HiCachePhaseObservation *> requests_by_rank;
     std::set<RequestKey> ambiguous;
@@ -120,7 +120,7 @@ ObservedDecodeContexts observe_decode_contexts(const core::DagGraph & graph, con
         }
 
     ObservedDecodeContexts contexts;
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : source.runtime_observations) {
         if (event.name != "runtime.hicache.decode_allocation" || event.arg("status") != "returned" || event.arg("token_per_req") != "1") continue;
 
         const auto requests = nlohmann::json::parse(event.arg("requests"));
@@ -163,7 +163,7 @@ DecodeOperatorContexts decode_operator_contexts(const HiCachePhaseObservationAud
     return result;
 }
 
-std::vector<HiCacheReplayFact> observe_decode_allocations(const core::DagGraph & graph, std::span<const HiCacheReplayFact> facts,
+std::vector<HiCacheReplayFact> observe_decode_allocations(const core::SourceObservations & source, std::span<const HiCacheReplayFact> facts,
                                                           const HiCachePhaseObservationAudit & phases, uint64_t begin, uint64_t end) {
     using Json = nlohmann::json;
     using Key = std::pair<std::string, std::string>; // pid, request id
@@ -188,7 +188,7 @@ std::vector<HiCacheReplayFact> observe_decode_allocations(const core::DagGraph &
     }
     std::vector<const core::TraceEvent *> allocations;
     std::map<Key, std::vector<const core::TraceEvent *>> forwards; // pid, tid
-    for (const auto & event : graph.runtime_observations()) {
+    for (const auto & event : source.runtime_observations) {
         if (event.ts < begin || event.ts >= end) continue;
         if (event.name == "runtime.hicache.decode_allocation") allocations.push_back(&event);
         if (event.name == "runtime.hicache.layer_waits" && event.arg("phase") == "DECODE") forwards[{ event.pid, event.tid }].push_back(&event);

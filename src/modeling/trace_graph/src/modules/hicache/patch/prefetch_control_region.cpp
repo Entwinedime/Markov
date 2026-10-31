@@ -173,7 +173,7 @@ std::vector<PrefetchControlRegion> prepare_spans(core::DagGraph & graph, const s
         if (next == worker_round.end()) throw std::runtime_error("Control worker successor has no observed submission timing");
         const auto & calls = collectives.rounds[next->second].calls;
         const auto call = std::ranges::find(calls, after.front(), [](const auto & c) { return c.worker.value_or(core::DagNode::kNoNode); });
-        const auto & event = graph.runtime_observations().at(call->observation);
+        const auto & event = graph.source_observations().runtime_observations.at(call->observation);
         if (event.pid != points[2 * owner].pid || event.tid != points[2 * owner].tid)
             throw std::runtime_error("Control worker is shared by independent callers");
         successors.insert(next->second);
