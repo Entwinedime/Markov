@@ -47,6 +47,7 @@ examples/hicache_matrix/run.sh --model /path/to/Qwen3-32B \
 修改预算后重跑会保留累计用量和失败，不能通过重跑重置账本。
 设备等待计入墙钟预算；上限不足会明确失败，不无限采集。
 `retained_mib` 同时约束运行时临时文件峰值；成功导出后仅清理本会话的缓存页文件，保留 trace 和复现输入。
+正常测量也会产生 HiCache 文件缓存，默认空间上限为 32 GiB，允许原始长回访负载和一次失败后的续跑。
 失败会话保留证据，必要时人工确认后清理其无引用临时页。
 
 可用 `--phase prepare|predict|measure|report` 单独续跑对应步骤；输入依赖不足会正常报错。

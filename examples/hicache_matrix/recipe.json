@@ -23,7 +23,7 @@
   "normal_budget": {
     "starts": 2,
     "wall_sec": 900,
-    "retained_mib": 8192
+    "retained_mib": 32768
   },
   "sampling_budget": {
     "starts": 16,

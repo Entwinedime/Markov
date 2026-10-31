@@ -120,7 +120,8 @@ class SearchExample:
                 path = self.output / "requests" / f"normal_{target['name']}_{repetition}.json"
                 if path.exists():
                     normal = PredictionRequest.load(path)
-                    DeviceTask(normal.execution.capture, normal.execution.output / "normal").recover()
+                    settings = replace(normal.execution.capture, budget=self.settings["normal_budget"])
+                    DeviceTask(settings, normal.execution.output / "normal").recover()
 
     def confirm(self) -> None:
         result = read_json(self.output / "prediction_run/search/report.json")

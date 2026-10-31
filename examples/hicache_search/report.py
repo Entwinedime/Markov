@@ -69,11 +69,13 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         writer = csv.DictWriter(stream, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
+
+    selection = f"选择 {result['selected']}。" if result["selected"] else "未找到满足时间约束的候选。"
     lines = [
         "# 有限资源搜索结果",
         "",
         f"候选 {result['expected']} 个，已进入排名 {result['ranked']} 个；状态 {result['status']}。",
-        f"约束为默认配置预测耗时的 {result['maximum_time_ratio']:.0%}，选择 {result['selected']}。",
+        f"约束为默认配置预测耗时的 {result['maximum_time_ratio']:.0%}，{selection}",
         "",
         "资源档位使用声明的固定预留与原生 KV 池占用，报价为示例成本单位，不代表真实支出。",
         "",
@@ -88,6 +90,26 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         time = f"{best['predicted_sec']:.4f}" if best else "无候选"
         name = best["name"] if best else "—"
         lines.append(f"| {plan['name']} | {plan['host_gib']} | {plan['hourly_cost_units']} | {time} | {name} |")
+
+    records_by_name = {row["name"]: row for row in records}
+    lines += [
+        "",
+        "| 确认角色（条件） | 设备 KV tokens | 主机比例 | 页 tokens | 写策略 | 预取策略 / 门槛 tokens / 超时秒 |",
+        "| --- | ---: | ---: | ---: | --- | --- |",
+    ]
+    for row in confirmed:
+        name = row["name"]
+        configuration = records_by_name[name]
+        roles = "、".join(
+            label
+            for label, key in (("默认", "baseline"), ("预测最快", "fastest"), ("约束下最低成本", "selected"))
+            if result[key] == name
+        )
+        timeout = configuration["prefetch_timeout_sec"]
+        prefetch = f"{configuration['hicache_storage_prefetch_policy']} / {configuration['prefetch_threshold_tokens']} / {timeout if timeout is not None else '—'}"
+        lines.append(
+            f"| {roles}（{name}） | {configuration['max_total_tokens']} | {configuration['hicache_ratio']} | {configuration['page_size']} | {configuration['hicache_write_policy']} | {prefetch} |"
+        )
     lines += [
         "",
         "| 正常确认条件 | 预测秒 | 正常均值秒 | 重复数 | APE (%) | 相对默认耗时 | 实测满足约束 |",
