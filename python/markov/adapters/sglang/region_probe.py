@@ -20,13 +20,6 @@ class IdlePoll:
     timer_ns: int
 
 
-@dataclass
-class LoadAttempt:
-    failed_allocations: int = 0
-    delegated_cpu_ns: int = 0
-    backups: int = 0
-
-
 class RegionProbe:
     def __init__(self, writer: EventWriter, *, record_scheduler: bool = False) -> None:
         self.writer = writer
@@ -45,73 +38,6 @@ class RegionProbe:
         self.previous_poll: IdlePoll | None = None
         self.idle_intervals: list[tuple[IdlePoll, int]] = []
         self.idle_sample_count = 0
-        self.loading: LoadAttempt | None = None
-
-    def init_load_back(self, original: Callable, cache: Any, params: Any) -> Any:
-        if not params.best_match_node.evicted or params.req is None:
-            return original(cache, params)
-
-        pages, segments = 0, 0
-        node = params.best_match_node
-        while node.evicted:
-            pages += len(node.host_value) // cache.page_size
-            segments += 1
-            node = node.parent
-        attempt = LoadAttempt()
-        self.loading = attempt
-        begin, cpu = time.time_ns(), time.thread_time_ns()
-        try:
-            result = original(cache, params)
-        finally:
-            self.loading = None
-        elapsed_cpu = time.thread_time_ns() - cpu
-        end = time.time_ns()
-
-        # Only two failed native allocations identify capacity fallback;
-        # threshold/quota skips are different work and are not sampled here.
-        if attempt.failed_allocations == 2 and len(result[0]) == 0:
-            self.writer.write(
-                "region.load_failed",
-                begin,
-                end,
-                {
-                    "implementation": IMPLEMENTATION,
-                    "phase": "prefill",
-                    "request_ids": [params.req.rid],
-                    "features": {"pages": pages, "segments": segments, "page_tokens": cache.page_size},
-                    "thread_cpu_ns": elapsed_cpu,
-                    "delegated_cpu_ns": attempt.delegated_cpu_ns,
-                    "successful_backups": attempt.backups,
-                    "status": "returned",
-                },
-            )
-        return result
-
-    def cache_load(self, original: Callable, controller: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original(controller, *args, **kwargs)
-        if self.loading is not None and result is None:
-            self.loading.failed_allocations += 1
-        return result
-
-    def write_backup(self, original: Callable, cache: Any, node: Any, write_back: bool = False) -> int:
-        if self.loading is None:
-            return original(cache, node, write_back)
-
-        cpu = time.thread_time_ns()
-        result = original(cache, node, write_back)
-        if result > 0:
-            self.loading.delegated_cpu_ns += time.thread_time_ns() - cpu
-            self.loading.backups += 1
-        return result
-
-    def writing_check(self, original: Callable, cache: Any, write_back: bool = False) -> Any:
-        if self.loading is None or not write_back or self.loading.backups == 0:
-            return original(cache, write_back)
-
-        cpu = time.thread_time_ns()
-        result = original(cache, write_back)
-        self.loading.delegated_cpu_ns += time.thread_time_ns() - cpu
-        return result
 
     def select_batch(self, original: Callable, scheduler: Any) -> Any:
         if self.idle_sample_count >= IDLE_SAMPLE_LIMIT and not self.idle_intervals:
@@ -324,10 +250,6 @@ class RegionProbe:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         bindings = {
-            "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.init_load_back": self.init_load_back,
-            "sglang.srt.managers.cache_controller.HiCacheController.load": self.cache_load,
-            "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup": self.write_backup,
-            "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.writing_check": self.writing_check,
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_extend": self.allocate_extend,
             "zmq.Socket.send_pyobj": self.send,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend": self.prepare,

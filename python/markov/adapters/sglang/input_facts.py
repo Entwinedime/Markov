@@ -101,16 +101,22 @@ def install() -> None:
         RegionProbe(region_writer, record_scheduler=not os.environ.get("MARKOV_INPUT_FACTS")).install()
 
     output = os.environ.get("MARKOV_INPUT_FACTS")
+    writer = None
+    if output:
+        directory = Path(output)
+        if not directory.is_dir():
+            raise NotADirectoryError(directory)
+        writer = EventWriter(directory)
+
+    if writer is not None or region_writer is not None:
+        from markov.adapters.sglang.load_probe import LoadProbe
+
+        LoadProbe(writer, region_writer).install()
     if not output:
         return
 
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    directory = Path(output)
-    if not directory.is_dir():
-        raise NotADirectoryError(directory)
-
-    writer = EventWriter(directory)
     probe = InputFactsProbe(writer)
     HookRegistry.register(
         "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend", probe.extend, HookType.AROUND

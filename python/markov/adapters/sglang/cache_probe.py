@@ -137,13 +137,6 @@ class CacheProbe:
             fields["completed_tokens_after"] = operation.completed_tokens
             return result
 
-    def load_back(self, original: Callable, cache: Any, node: Any, mem_quota: int | None = None) -> Any:
-        fields = {}
-        with self.writer.span("runtime.hicache.load_back", fields):
-            result = original(cache, node, mem_quota)
-            fields["loaded_tokens"] = result.numel() if result is not None else 0
-            return result
-
     def start_loading(self, original: Callable, controller: Any) -> int:
         if not controller.load_queue:
             return original(controller)
@@ -192,7 +185,6 @@ class CacheProbe:
             "sglang.srt.mem_cache.radix_cache.RadixCache.cache_unfinished_req", self.unfinished, HookType.AROUND
         )
         for target, wrapper in (
-            ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.load_back", self.load_back),
             ("sglang.srt.managers.cache_controller.HiCacheController.start_loading", self.start_loading),
             ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.prefetch_from_storage", self.prefetch_issue),
             ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.check_prefetch_progress", self.prefetch_progress),

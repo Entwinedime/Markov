@@ -70,7 +70,7 @@ struct CopyStart {
     std::size_t pages;
 };
 
-enum class Eviction { Removed, Blocked, BackupRequired };
+enum class Eviction { Removed, Blocked, BackupRequired, Deferred };
 
 // One target owns one cache. This class manages capacity and data visibility;
 // it neither estimates costs nor advances time. Publication and acknowledgement
@@ -127,7 +127,9 @@ public:
     // Whole-segment LRU order, with parents becoming candidates only after
     // their resident children. Pinned or in-flight segments stay allocated.
     std::vector<RadixId> eviction_order(Tier tier) const;
-    Eviction evict_device(RadixId node);
+    // A batch may select parents after their selected children. Only copy pins
+    // owned by this batch are exempt; actual removal waits for their release.
+    Eviction evict_device(RadixId node, std::span<const RadixId> pending = {});
     bool evict_host(RadixId node);
 
 private:

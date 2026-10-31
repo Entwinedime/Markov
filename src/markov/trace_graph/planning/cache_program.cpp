@@ -122,23 +122,43 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
 }
 
 CacheProgram::RoomStatus CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages) {
+    if (eviction_) {
+        const auto requested = eviction_->requested_pages;
+        eviction_.reset();
+
+        // Native allocation retries once after this batch, without rescanning
+        // candidates that only became reclaimable while the copies finished.
+        return cache_.available_pages(Tier::Device) >= requested ? RoomStatus::Ready : RoomStatus::Unavailable;
+    }
+    if (cache_.available_pages(Tier::Device) >= pages) return RoomStatus::Ready;
     std::size_t reclaiming = 0;
     std::vector<graph::NodeId> backups;
+    std::vector<RadixId> selected;
     for (const auto node : cache_.eviction_order(Tier::Device)) {
-        if (cache_.available_pages(Tier::Device) + reclaiming >= pages) break;
-        const auto outcome = cache_.evict_device(node);
-        if (outcome == Eviction::Removed) ++device_evictions_;
+        // Native eviction receives the whole allocation request, not its deficit.
+        if (reclaiming >= pages) break;
+        const auto node_pages = cache_.tree().nodes()[node].pages.size();
+        const auto outcome = cache_.evict_device(node, selected);
+        if (outcome == Eviction::Removed) {
+            ++device_evictions_;
+            reclaiming += node_pages;
+        }
+        else if (outcome == Eviction::Deferred) {
+            selected.push_back(node);
+            reclaiming += node_pages;
+        }
         else if (outcome == Eviction::BackupRequired && make_host_room(cache_.tree().nodes()[node].pages.size())) {
             const auto started = cache_.begin_backup(node);
             if (started.status == CopyStatus::Started) {
                 if (!copy(runtime, *started.transfer, node, CopyKind::Backup, started.pages, true, request_)) return RoomStatus::Waiting;
                 reclaiming += started.pages;
+                selected.push_back(node);
                 backups.push_back(copies_.at(*started.transfer).completion.value());
             }
         }
     }
     if (!backups.empty()) {
-        eviction_wait_ = true;
+        eviction_ = EvictionBatch{ pages, std::move(selected) };
         const auto end = runtime.next_node();
         PlannedMutation batch{ 0, { { 0, Boundary{}, action(ActionKind::EvictionDone, request_) } }, {} };
         for (const auto completion : backups) batch.dependencies.push_back({ completion, end, graph::EdgeKind::DataDependency });
@@ -205,7 +225,7 @@ void CacheProgram::respond(ProgramRuntime & runtime, std::size_t request) {
 
 void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
     // Write-back eviction synchronizes its copies inside the caller turn.
-    if (eviction_wait_) return;
+    if (eviction_ && !eviction_->completed) return;
     // Retain admission until load submission can hand the caller to input setup.
     if (regions_ && std::ranges::any_of(copies_, [](const auto & copy) { return copy.second.kind == CopyKind::Load; })) return;
     // A blocked admission yields the caller so older results can release space.
@@ -232,7 +252,7 @@ void CacheProgram::poll_prefetch(ProgramRuntime & runtime) {
 }
 
 void CacheProgram::advance(ProgramRuntime & runtime) {
-    if (issue_ || eviction_wait_ || request_ == requests_.size()) return;
+    if (issue_ || (eviction_ && !eviction_->completed) || request_ == requests_.size()) return;
     waiting_ = true;
     if (request_stage_ == RequestStage::BeforeStart) {
         const auto & barriers = source_.observations().workload_barriers;
@@ -772,20 +792,16 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         if (storage_ && pending.kind == CopyKind::Backup) storage_->enqueue_write(runtime, pending.node, std::move(pending.storage_pages), event.identity);
         copies_.erase(transfer);
         if (pending.kind == CopyKind::Load) requests_[pending.request].loaded_pages += pending.pages;
-        if (pending.evict_after) {
-            pending_evictions_.push_back(pending.node);
-            return;
-        }
+        if (pending.evict_after) return;
         if (waiting_) advance(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::EvictionDone)) {
-        eviction_wait_ = false;
         // The explicit join preserves the whole backup batch in the DAG,
         // instead of depending only on whichever rank happened to finish last.
-        for (const auto node : pending_evictions_) {
+        for (const auto node : eviction_->nodes) {
             if (cache_.evict_device(node) == Eviction::Removed) ++device_evictions_;
         }
-        pending_evictions_.clear();
+        eviction_->completed = true;
         advance(runtime);
     }
 }

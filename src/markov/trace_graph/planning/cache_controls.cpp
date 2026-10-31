@@ -21,9 +21,11 @@ void CacheProgram::decline_load(ProgramRuntime & runtime, const CacheMatch & mat
     const auto begin = runtime.next_node();
     const auto done = begin + backend_.participants;
     PlannedMutation mutation{ 0, {}, {} };
-    for (const auto caller : running_[request_].callers) {
+    for (std::size_t rank = 0; rank < running_[request_].callers.size(); ++rank) {
         mutation.dependencies.push_back({ begin + mutation.operations.size(), done, graph::EdgeKind::DataDependency });
-        mutation.operations.push_back({ caller, std::cref(failed) });
+        PlannedOperation operation{ running_[request_].callers[rank], std::cref(failed) };
+        if (runtime.records_graph()) operation.position = OperationPosition{ request_, 0, rank, "load_failed" };
+        mutation.operations.push_back(std::move(operation));
     }
     mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::LoadFailed, request_) });
     request_stage_ = RequestStage::LoadFailure;

@@ -130,6 +130,11 @@ private:
         TransferId transfer;
         std::size_t request, rank;
     };
+    struct EvictionBatch {
+        std::size_t requested_pages;
+        std::vector<RadixId> nodes;
+        bool completed = false;
+    };
     struct RunningRequest {
         struct Insertion {
             RadixId leaf;
@@ -212,7 +217,7 @@ private:
     std::vector<RegionCopyTurn> region_copy_turns_;
     std::vector<CacheCopyResult> completed_copies_;
     std::array<std::optional<graph::NodeId>, 2> copy_frontier_;
-    std::vector<RadixId> pending_evictions_;
+    std::optional<EvictionBatch> eviction_;
     std::optional<RadixId> host_pin_;
     std::optional<std::string> issue_;
     std::optional<graph::NodeId> cause_;
@@ -222,7 +227,6 @@ private:
     std::size_t pending_queries_ = 0;
     RequestStage request_stage_ = RequestStage::BeforeStart;
     bool waiting_ = false;
-    bool eviction_wait_ = false;
 };
 
 } // namespace markov::trace_graph::planning

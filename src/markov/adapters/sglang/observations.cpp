@@ -93,7 +93,8 @@ void ProbeReader::observe(const ProbeEvent & event) {
         }
         return;
     }
-    if (event.name == "runtime.hicache.file.prefetch_progress" || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading") {
+    if (event.name == "runtime.hicache.file.prefetch_progress" || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading"
+        || event.name == "runtime.hicache.load_failed") {
         observe_regenerated_control(event);
         return;
     }
@@ -547,6 +548,7 @@ void ProbeReader::observe_regenerated_control(const ProbeEvent & event) {
         operation = "scheduler.idle_turn";
     }
     else if (event.name == "runtime.hicache.load_back" && args.at("loaded_tokens").get<std::size_t>() > 0) operation = "cache.load.prepare";
+    else if (event.name == "runtime.hicache.load_failed") operation = "cache.load.failed";
     else if (event.name == "runtime.hicache.start_loading" && args.at("producer").get<std::int64_t>() >= 0) operation = "cache.load.caller";
     else return;
 

@@ -336,13 +336,27 @@ void Cache::detach_empty_leaf(RadixId node) {
     if (!nodes_[node].device && !nodes_[node].host && tree_.nodes()[node].children.empty()) tree_.erase_leaf(node);
 }
 
-Eviction Cache::evict_device(RadixId node) {
-    if (node == 0 || !nodes_[node].device || nodes_[node].device->producer || nodes_[node].device_refs != 0) return Eviction::Blocked;
+Eviction Cache::evict_device(RadixId node, std::span<const RadixId> pending) {
+    if (node == 0 || !nodes_[node].device || nodes_[node].device->producer) return Eviction::Blocked;
+    std::size_t batch_refs = 0;
+    for (const auto selected : pending) {
+        const auto & host = nodes_[selected].host;
+        if (!host || !host->producer) continue;
+        const auto & copy = publications_.at(*host->producer).copy;
+        if (!copy || copy->kind != CopyKind::Backup) continue;
+        for (auto ancestor = selected; ancestor != 0; ancestor = tree_.nodes()[ancestor].parent)
+            if (ancestor == node) ++batch_refs;
+    }
+    if (nodes_[node].device_refs != batch_refs) return Eviction::Blocked;
+    bool deferred = batch_refs != 0;
     for (const auto & [key, child] : tree_.nodes()[node].children) {
-        if (nodes_[child].device) return Eviction::Blocked;
+        if (!nodes_[child].device) continue;
+        if (std::ranges::find(pending, child) == pending.end()) return Eviction::Blocked;
+        deferred = true;
     }
     if (!nodes_[node].host && !config_.backup_after_hits) return Eviction::BackupRequired;
     if (!nodes_[node].host && !tree_.nodes()[node].children.empty()) return Eviction::Blocked;
+    if (deferred) return Eviction::Deferred;
 
     return_pages(Tier::Device, tree_.nodes()[node].pages.size());
     nodes_[node].device.reset();

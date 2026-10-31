@@ -37,6 +37,22 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
     const auto iteration = fields.at("iteration").get<std::size_t>();
     const auto participant = fields.at("participant").get<std::size_t>();
     const auto resource = output_.resource(source::ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    if (operation == "load_failed") {
+        const auto cost = fields.at("thread_cpu_ns").get<source::Time>() - fields.at("delegated_cpu_ns").get<source::Time>();
+        if (cost < 0) throw std::runtime_error("Delegated backup CPU exceeds failed load CPU");
+        output_.cost_observations.push_back({
+            request,
+            iteration,
+            participant,
+            "load_failed",
+            { { "cache.load.failed", "sglang.HiRadixCache.init_load_back", "thread_cpu" }, std::move(features) },
+            cost,
+            { resource, event.begin_ns, event.end_ns, event.record },
+            std::nullopt,
+            false
+        });
+        return;
+    }
     const auto duration = fields.at(stream ? "stream_interval_ns" : "thread_cpu_ns").get<source::Time>();
     if (duration < 0) throw std::runtime_error("Regional response duration must be nonnegative");
     const auto add = [&](std::string name, std::string timing, source::Time cost) {
