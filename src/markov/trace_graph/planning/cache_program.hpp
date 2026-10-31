@@ -22,7 +22,7 @@ namespace markov::trace_graph::planning {
 
 struct CacheBackend {
     std::size_t layers, bytes_per_token, participants, minimum_load_tokens;
-    WorkKind load, backup, backup_caller, backup_completion, load_prepare, load_caller, load_completion;
+    WorkKind load, backup, backup_caller, backup_completion, load_prepare, load_caller, load_completion, load_failure;
 
     // Targets share one immutable native recipe, not mutable cache state.
     std::shared_ptr<const CallSequence> backup_calls;
@@ -35,6 +35,7 @@ struct CacheRequestResult {
     std::size_t deferred_kv_pages = 0;
     std::size_t released_device_pages = 0;
     std::size_t query_index_copies = 0, query_operations = 0;
+    std::size_t failed_load_attempts = 0;
     std::size_t prefetch_poll_rounds = 0;
     std::optional<std::size_t> device_pages_allocated_since_return;
     bool completed = false;
@@ -97,9 +98,23 @@ private:
         QueryDone,
         ClientReady,
         PollGranted,
-        PollReturned
+        PollReturned,
+        LoadFailed
     };
-    enum class RequestStage { BeforeStart, ClientPacing, Ingress, Waiting, Admitting, Active, Querying, PrefetchPolling, PrefetchFinalizing, Response };
+    enum class RequestStage {
+        BeforeStart,
+        ClientPacing,
+        Ingress,
+        Waiting,
+        Admitting,
+        Active,
+        Querying,
+        PrefetchPolling,
+        PrefetchFinalizing,
+        LoadFailure,
+        Response
+    };
+    enum class RoomStatus { Ready, Waiting, Unavailable };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct PendingCopy {
@@ -133,7 +148,7 @@ private:
         std::vector<graph::NodeId> poll_returns;
         graph::Time poll_started_ns = 0;
         std::map<std::size_t, std::size_t> admission_gaps;
-        bool queried = false;
+        bool queried = false, load_failed = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
         std::map<ResultControl, std::vector<TransferId>> backups;
@@ -170,7 +185,8 @@ private:
     void backup_prefix(ProgramRuntime & runtime, RadixId leaf, std::size_t request);
     void commit(ProgramRuntime & runtime, std::size_t request);
     void publish_result(ProgramRuntime & runtime, std::size_t request);
-    bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
+    RoomStatus make_device_room(ProgramRuntime & runtime, std::size_t pages);
+    void decline_load(ProgramRuntime & runtime, const CacheMatch & matched);
     bool make_host_room(std::size_t pages);
     bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages, std::size_t request);

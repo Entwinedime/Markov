@@ -102,14 +102,15 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                 formal_end = end;
             }
             requests.push_back({
-                {          "request",                 observations.requests[id].identity },
-                {           "formal",                   observations.requests[id].formal },
-                {         "start_ns",               start ? Json(*start) : Json(nullptr) },
-                {      "response_ns",                   end ? Json(*end) : Json(nullptr) },
-                {         "http_sec", done ? Json((*end - *start) / 1e9) : Json(nullptr) },
-                { "device_hit_pages",                           request.device_hit_pages },
-                {     "loaded_pages",                               request.loaded_pages },
-                {   "prefill_tokens",                             request.prefill_tokens }
+                {              "request",                 observations.requests[id].identity },
+                {               "formal",                   observations.requests[id].formal },
+                {             "start_ns",               start ? Json(*start) : Json(nullptr) },
+                {          "response_ns",                   end ? Json(*end) : Json(nullptr) },
+                {             "http_sec", done ? Json((*end - *start) / 1e9) : Json(nullptr) },
+                {     "device_hit_pages",                           request.device_hit_pages },
+                {         "loaded_pages",                               request.loaded_pages },
+                { "failed_load_attempts",                       request.failed_load_attempts },
+                {       "prefill_tokens",                             request.prefill_tokens }
             });
             if (result.graph) {
                 requests.back()["start_node"] = result.graph->operation_nodes[*request.start].value();

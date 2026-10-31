@@ -121,7 +121,7 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
     return submitted;
 }
 
-bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages) {
+CacheProgram::RoomStatus CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages) {
     std::size_t reclaiming = 0;
     std::vector<graph::NodeId> backups;
     for (const auto node : cache_.eviction_order(Tier::Device)) {
@@ -131,7 +131,7 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
         else if (outcome == Eviction::BackupRequired && make_host_room(cache_.tree().nodes()[node].pages.size())) {
             const auto started = cache_.begin_backup(node);
             if (started.status == CopyStatus::Started) {
-                if (!copy(runtime, *started.transfer, node, CopyKind::Backup, started.pages, true, request_)) return false;
+                if (!copy(runtime, *started.transfer, node, CopyKind::Backup, started.pages, true, request_)) return RoomStatus::Waiting;
                 reclaiming += started.pages;
                 backups.push_back(copies_.at(*started.transfer).completion.value());
             }
@@ -143,14 +143,10 @@ bool CacheProgram::make_device_room(ProgramRuntime & runtime, std::size_t pages)
         PlannedMutation batch{ 0, { { 0, Boundary{}, action(ActionKind::EvictionDone, request_) } }, {} };
         for (const auto completion : backups) batch.dependencies.push_back({ completion, end, graph::EdgeKind::DataDependency });
         submit(runtime, std::move(batch));
-        return false;
+        return RoomStatus::Waiting;
     }
-    if (cache_.available_pages(Tier::Device) >= pages) return true;
-    const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
-        return request.compute || request.final_publication || request.prefix_publication;
-    });
-    if (copies_.empty() && !pending_compute && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
-    return false;
+    if (cache_.available_pages(Tier::Device) >= pages) return RoomStatus::Ready;
+    return RoomStatus::Unavailable;
 }
 
 void CacheProgram::finish_compute(ProgramRuntime & runtime, std::size_t request) {
@@ -290,12 +286,21 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     // A pending host copy is not yet readable. Its completion re-enters this
     // decision; it cannot be converted into a zero-cost host hit.
     const auto host_pages = cache_.page_count(matched.host), device_pages = cache_.page_count(matched.device);
-    if (host_pages > device_pages && (host_pages - device_pages) * page_tokens_ >= backend_.minimum_load_tokens) {
+    if (!running_[request_].load_failed && host_pages > device_pages && (host_pages - device_pages) * page_tokens_ >= backend_.minimum_load_tokens) {
         // Protect the host source before device eviction can allocate another
         // backup and reclaim host pages. The transfer takes over this pin.
         host_pin_ = matched.host;
         cache_.pin_host(*host_pin_);
-        if (cache_.ready_layers(matched.host, Tier::Host) != backend_.layers || !make_device_room(runtime, host_pages - device_pages)) {
+        if (cache_.ready_layers(matched.host, Tier::Host) != backend_.layers) {
+            wait_for_progress(runtime);
+            return;
+        }
+        const auto room = make_device_room(runtime, host_pages - device_pages);
+        if (room == RoomStatus::Unavailable) {
+            decline_load(runtime, matched);
+            return;
+        }
+        if (room == RoomStatus::Waiting) {
             wait_for_progress(runtime);
             return;
         }
@@ -338,7 +343,12 @@ void CacheProgram::admit(ProgramRuntime & runtime, RadixId prefix, const Pending
     const auto device_pages = cache_.page_count(prefix);
     const auto committed_tokens = observed.token_paths.length(tokens.committed.value().path);
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
-    if (!make_device_room(runtime, active_pages - device_pages)) {
+    const auto room = make_device_room(runtime, active_pages - device_pages);
+    if (room != RoomStatus::Ready) {
+        const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
+            return request.compute || request.final_publication || request.prefix_publication;
+        });
+        if (room == RoomStatus::Unavailable && copies_.empty() && !pending_compute && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
         wait_for_progress(runtime);
         return;
     }
@@ -738,6 +748,13 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
     else if (event.action.kind == std::to_underlying(ActionKind::CopyParticipantDone)) {
         copies_.at(event.action.subject).copy_completions.push_back(event.identity);
         join_copy(runtime, event.action.subject);
+    }
+    else if (event.action.kind == std::to_underlying(ActionKind::LoadFailed)) {
+        // Release only after the failed caller finishes, never while planning.
+        cache_.unpin_host(*host_pin_);
+        host_pin_.reset();
+        request_stage_ = RequestStage::Active;
+        advance(runtime);
     }
     else if (event.action.kind == std::to_underlying(ActionKind::CopyGranted)) { submit_region_copy(runtime, event.action.subject, event.identity); }
     else if (event.action.kind == std::to_underlying(ActionKind::CopyReturned)) {

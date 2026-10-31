@@ -90,6 +90,38 @@ def region_workload(maximum: int, page: int, final_phases: list[str]) -> dict:
     return {"requests": requests, "formal_begin_index": 0}
 
 
+def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -> DeviceCommand:
+    # One prefix fits with admission headroom; two disjoint prefixes exceed
+    # the host pool even at the smaller size, so native write-back must fail.
+    maximum = max(7, needed_pages)
+    requests = []
+    for pages in (maximum - 1, maximum):
+        for segments in (1, 2):
+            identity = len(requests) + 1
+            first = [identity] * (pages * page + 1)
+            other = [identity + 2] * len(first)
+            if segments == 1:
+                prompts = (first, other, first, other)
+            else:
+                branched = first[: (pages - 1) * page] + [identity + 1] * (page + 1)
+                prompts = (first, branched, other, branched)
+            requests.extend(
+                {"prompt": None, "input_ids": tokens, "max_new_tokens": 1, "ignore_eos": True, "return_logprob": False}
+                for tokens in prompts
+            )
+    configuration = {
+        "page_size": page,
+        "max_total_tokens": (maximum + 3) * page,
+        "max_prefill_tokens": (maximum + 1) * page,
+        "enable_hierarchical_cache": True,
+        "hicache_ratio": 1.0,
+        "hicache_write_policy": "write_back",
+    }
+    return _region_capture_command(
+        deployment, configuration, {"requests": requests, "formal_begin_index": 0}, "sglang_cache_controls"
+    )
+
+
 def sampling_commands(deployment: Deployment, report: dict, requirements: list[dict]) -> list[DeviceCommand]:
     """Only work, supported implementation and source geometry determine recipes."""
     if (deployment.framework, deployment.runtime) != ("sglang", "ascend"):
@@ -100,6 +132,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     io_cases = set()
     io_operations = set()
     scheduler_pages = set()
+    failed_load_pages = {}
     geometry = context["geometry"]
     for requirement in requirements:
         work = requirement.get("work")
@@ -108,6 +141,10 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
         operation = work["operation"]
         if operation == "scheduler.idle_turn":
             scheduler_pages.update(int(cells[name]["configuration"]["page_size"]) for name in requirement["targets"])
+        elif operation == "cache.load.failed":
+            for name in requirement["targets"]:
+                page = int(cells[name]["configuration"]["page_size"])
+                failed_load_pages[page] = max(failed_load_pages.get(page, 0), int(work["features"]["pages"]))
         elif operation.split(".", 1)[0] in ("prepare", "batch", "result", "result_send", "result_tail"):
             for name in requirement["targets"]:
                 configuration = cells[name]["configuration"]
@@ -141,6 +178,8 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 io_cases.update((page, pages, 1) for pages in (1, max(2, int(work["features"]["pages"]))))
 
     commands = []
+    for page, pages in sorted(failed_load_pages.items()):
+        commands.append(_failed_load_capture(deployment, page, pages))
     for (page, enabled), target in sorted(regions.items()):
         workload = region_workload(math.ceil(context["max_context_tokens"]), page, context["final_phases"])
         capacity = sum(

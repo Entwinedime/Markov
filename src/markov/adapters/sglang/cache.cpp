@@ -189,6 +189,7 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
         { "cache.load.prepare", "sglang.HiRadixCache.load_back:kernel_ascend.page_first_direct", "caller_blocking_interval" },
         { "cache.load.caller", "sglang.HiCacheController.start_loading:kernel_ascend.page_first_direct", "caller_blocking_interval" },
         { "cache.load.completion", "sglang.HiCacheController.start_loading:kernel_ascend.page_first_direct", "completion_observation_upper_interval" },
+        { "cache.load.failed", "sglang.HiRadixCache.init_load_back", "thread_cpu" },
         cache_backup(),
         { 128,
           { "cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service" },

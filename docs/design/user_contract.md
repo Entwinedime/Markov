@@ -54,7 +54,8 @@ page-work 的 rank_disk_evictions 同样累计各 rank，peak_rank_stored_pages 
 issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一仿真时钟的发起、首次检查、接受与后台返回；
 相应操作未发生时为 null。后台读完并不自动插入缓存，接受仍依赖请求端检查及已发布的前缀。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
-自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载与 buffered 文件 worker。
+自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载、失败回载控制与 buffered 文件 worker。
+逐请求 failed_load_attempts 记录回载失败转重新计算的次数；失败不计为成功传输，loaded_pages 仍只计实际回载页。
 文件配方不加载模型权重，不运行 HTTP 请求；在采集输出下临时构造真实 K/V 页，读写核对后删除页文件，只保留轻量计时。
 这是暖文件缓存下的 buffered 响应，不保证冷介质、fsync 或争用时的性能。
 同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
@@ -368,6 +369,7 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 ```
 
 路径相对维护请求解析。sglang_cache_io 导入正常备份、主机克隆和回载准备/提交/完成观测；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
+sglang_cache_controls 从独立 region_measurements.json 仅导入失败回载的排他线程 CPU；不重训该文件的 Prefill/Decode 响应。
 只填 imports 可以单独入库；已有数据可省略 imports，只用 training 的原来源路径离线训练，不再打开原始采样。training 必须显式选择，不扫描整库；预热、未选择的采集及独立留出不参加训练。
 可选 models 指向已有选定模型；训练只替换相同操作/实现/口径，完整结果原子写到 output。输出与数据库、请求及原始采集目录分开。报告区分新增/复用记录与训练响应；单设备数据不绑定模型名或全局 TP，平台、runtime 和实际工作条件仍须相容。
 

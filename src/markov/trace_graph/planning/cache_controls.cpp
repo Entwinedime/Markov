@@ -6,6 +6,31 @@
 
 namespace markov::trace_graph::planning {
 
+void CacheProgram::decline_load(ProgramRuntime & runtime, const CacheMatch & matched) {
+    // Releasing the failed load's host pin can make a write-back eviction fit.
+    // Completed backups are retained; only the next load attempt is disabled.
+    running_[request_].load_failed = true;
+    ++requests_[request_].failed_load_attempts;
+    std::size_t segments = 0;
+    for (auto node = matched.host; node != matched.device; node = cache_.tree().nodes()[node].parent) ++segments;
+    const Work failed{
+        backend_.load_failure,
+        { { "pages", cache_.page_count(matched.host) - cache_.page_count(matched.device) }, { "segments", segments }, { "page_tokens", page_tokens_ } }
+    };
+
+    const auto begin = runtime.next_node();
+    const auto done = begin + backend_.participants;
+    PlannedMutation mutation{ 0, {}, {} };
+    for (const auto caller : running_[request_].callers) {
+        mutation.dependencies.push_back({ begin + mutation.operations.size(), done, graph::EdgeKind::DataDependency });
+        mutation.operations.push_back({ caller, std::cref(failed) });
+    }
+    mutation.operations.push_back({ 0, Boundary{}, action(ActionKind::LoadFailed, request_) });
+    request_stage_ = RequestStage::LoadFailure;
+    waiting_ = false;
+    submit(runtime, std::move(mutation));
+}
+
 bool CacheProgram::region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after,
                                std::size_t request) {
     copies_.emplace(transfer,
