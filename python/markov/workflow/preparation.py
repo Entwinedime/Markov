@@ -58,7 +58,7 @@ class PerformancePreparation:
             capture_sec = time.monotonic() - begin
             begin = time.monotonic()
             try:
-                training = self.approved_training(models, command.measurement_adapter, report["cost_requirements"])
+                training = self.approved_training(models, command.measurement_adapter)
                 raw = {
                     "database": str(self.request.database),
                     "deployment": asdict(self.request.deployment),
@@ -99,19 +99,10 @@ class PerformancePreparation:
                 return output / attempt["artifact"]
         return None
 
-    def approved_training(self, models: Path, adapter: str, requirements: list[dict]) -> set[Path]:
-        wanted = {
-            tuple(item["work"][key] for key in ("operation", "implementation", "timing_scope")): set(
-                item["work"]["features"]
-            )
-            for item in requirements
-            if "work" in item
-        }
-        sources = set()
-        for model in read_json(models)["models"]:
-            kind = tuple(model[key] for key in ("operation", "implementation", "timing_scope"))
-            if kind in wanted and set(model["ranges"]) <= wanted[kind]:
-                sources.update(Path(path) for path in model["sources"])
+    def approved_training(self, models: Path, adapter: str) -> set[Path]:
+        # A capture refits more than the missing kind; retain already selected
+        # evidence for the whole adapter, including other page-size anchors.
+        sources = {Path(path) for model in read_json(models)["models"] for path in model["sources"]}
         store = PerformanceData(self.request.database)
         try:
             selected = set()
