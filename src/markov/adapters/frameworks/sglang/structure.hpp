@@ -50,7 +50,7 @@ private:
         std::map<std::size_t, std::size_t> tokens;
     };
 
-    BatchProgram rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool handoff = false);
+    BatchProgram rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool retain_unfinished = false);
     BatchProgram pipeline_stage(const ServingAction & action, std::vector<RankWork> & work);
     BatchProgram read_result(const ServingAction & action, std::vector<RankWork> & work);
     BatchProgram pipeline_result(const ServingAction & action, std::vector<RankWork> & work);

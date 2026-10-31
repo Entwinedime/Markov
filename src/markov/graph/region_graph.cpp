@@ -22,7 +22,16 @@ std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
     for (const auto * root : roots.values) retain_value(*root);
 
     std::map<std::size_t, std::size_t> region_bindings;
-    for (const auto * root : roots.regions) region_bindings.try_emplace(*root, region_bindings.size());
+
+    // A retained child still names its enclosing calls, including callers that have already returned.
+    const auto retain_region = [&](std::size_t region) {
+        while (region_bindings.try_emplace(region, region_bindings.size()).second) {
+            const auto & parent = regions.at(region).at("parent");
+            if (parent.is_null()) break;
+            region = parent.get<std::size_t>();
+        }
+    };
+    for (const auto * root : roots.regions) retain_region(*root);
 
     // Pending messages retain only their operands and enclosing calls, not the completed batch history.
     std::map<std::size_t, std::size_t> operation_bindings;
@@ -31,13 +40,7 @@ std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
         const auto & operation = operations.at(*root);
         for (const auto value : operation.inputs) retain_value(value);
         for (const auto value : operation.outputs) retain_value(value);
-        auto region = operation.region;
-        while (true) {
-            region_bindings.try_emplace(region, region_bindings.size());
-            const auto & parent = regions.at(region).at("parent");
-            if (parent.is_null()) break;
-            region = parent.get<std::size_t>();
-        }
+        retain_region(operation.region);
     }
     std::vector<nlohmann::json> kept_regions(region_bindings.size());
     for (const auto & [old_region, new_region] : region_bindings) {

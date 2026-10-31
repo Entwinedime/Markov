@@ -16,6 +16,7 @@ from sglang.srt.managers import schedule_batch
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
 from sglang.srt.model_executor import model_runner
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -36,7 +37,7 @@ class PublishedRequests:
         trace = self.allocator.trace
         if trace is not None and trace.result_tail is not None:
             tail["index_tail"], trace.result_tail = trace.result_tail, None
-        return peer.call(
+        peer.call(
             kind,
             members=[
                 {
@@ -128,7 +129,8 @@ class NativeScheduler(Scheduler):
             replace(self.request_receiver, recv_from_tokenizer=self.request_input)
         )
         self.model_worker.forward_batch_generation = self.model_result
-        ChunkIndices(self.tree_cache, peer)
+        if isinstance(self.tree_cache, ChunkCache):
+            ChunkIndices(self.tree_cache, peer)
         self.published = PublishedRequests(self.ps.pp_rank == 0, self.token_to_kv_pool_allocator)
         self.output_streamer.send_to_detokenizer = self.published
 
@@ -142,7 +144,11 @@ class NativeScheduler(Scheduler):
 
     def get_next_batch_to_run(self):
         self.begin_iteration()
-        return self.prepare(super().get_next_batch_to_run())
+        previous = self.last_batch if self.last_batch and self.last_batch.forward_mode.is_extend() else None
+
+        # The previous Prefill is filtered and joined before native prefix lookup and admission.
+        with NativeBatch.report_selection(previous, "previous"):
+            return self.prepare(super().get_next_batch_to_run())
 
     def prepare(self, batch):
         if batch is not None:
@@ -169,11 +175,12 @@ class NativeScheduler(Scheduler):
         return batch
 
     def update_running_batch(self, batch):
-        batch.control_selection = True
-        try:
+        with NativeBatch.report_selection(batch):
             return super().update_running_batch(batch)
-        finally:
-            batch.control_selection = False
+
+    def get_new_batch_prefill(self):
+        with NativeBatch.report_selection(self.running_batch):
+            return super().get_new_batch_prefill()
 
     def model_result(self, batch, **kwargs):
         self.peer.call("model")
@@ -199,8 +206,7 @@ class NativeScheduler(Scheduler):
         try:
             self.published.identities.clear()
             super().process_batch_result(batch, result)
-            completion = self.published.complete(self.peer, batch, "result")
-            self.gracefully_exit = completion["done"]
+            self.published.complete(self.peer, batch, "result")
             if self.ps.pp_size == 1:
                 self.peer.call("release_work")
         finally:

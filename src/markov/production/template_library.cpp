@@ -587,9 +587,9 @@ void SourceTemplates::compile(std::size_t identity) {
     region.frame = nlohmann::json::object();
     const auto host = host_resource(identity, items);
     region.frame["host_resource"] = host ? nlohmann::json(*host) : nlohmann::json(nullptr);
-    for (const auto & key : { "bindings", "parameters", "effects", "requests", "generated_tokens", "input_groups" }) {
-        if (metadata.contains(key)) region.frame[key] = metadata.at(key);
-    }
+
+    // Only fixed bindings travel with the template; observed dynamic state stays in the source recording.
+    if (metadata.contains("bindings")) region.frame["bindings"] = metadata.at("bindings");
 
     for (const auto & key : { "bindings", "parameters" }) {
         if (!metadata.contains(key)) continue;
@@ -725,32 +725,19 @@ nlohmann::json SourceTemplates::document() {
         {    "runtime_coverage",  source_.at("runtime_coverage") },
         { "execution_resources",          execution_.resources() },
         {             "entries",         nlohmann::json::array() },
-        {         "entrypoints",         nlohmann::json::array() },
-        {              "inputs",         nlohmann::json::array() }
+        {         "entrypoints",         nlohmann::json::array() }
     };
 
-    std::set<std::size_t> inputs;
     for (const auto root : roots_) {
         auto & region = regions_[root];
         auto entry = std::move(region.frame);
         entry.update({
-            { "source_region",             root },
-            {        "layout",    region.layout },
-            {        "inputs",    region.inputs },
-            {       "outputs",   region.outputs },
-            {     "resources", region.resources }
+            { "source_region",          root },
+            {        "layout", region.layout }
         });
-        const auto & metadata = source_.at("regions")[root].at("metadata");
-        if (metadata.contains("batch")) {
-            const auto & batch = source_.at("batches").at(metadata.at("batch").get<std::size_t>());
-            entry["batch"] = batch;
-        }
-
         result["entries"].push_back(std::move(entry));
-        inputs.insert(region.inputs.begin(), region.inputs.end());
     }
     result["execution_variants"] = execution_.finalize(result["entries"]);
-    for (const auto input : inputs) result["inputs"].push_back(*values_.at(input));
 
     // Entrypoints retain a call path into the shared layout instead of duplicating nested templates.
     for (std::size_t identity = 0; identity < regions_.size(); ++identity) {

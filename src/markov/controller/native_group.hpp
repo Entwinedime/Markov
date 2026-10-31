@@ -22,7 +22,7 @@ enum class NativeRole { Model, Prefill, Decode };
 // One native participant group owns its work; the borrowed pool is its only resource ledger.
 class NativeGroup {
 public:
-    NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role);
+    NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role, bool pipeline);
     NativeGroup(const NativeGroup &) = delete;
     NativeGroup & operator=(const NativeGroup &) = delete;
 
@@ -37,9 +37,10 @@ public:
     std::size_t free_pages() const;
 
 private:
+    std::vector<std::size_t> resident_requests(const nlohmann::json & requests, std::size_t delivered) const;
     Batch resident_batch(const nlohmann::json & requests, std::size_t delivered) const;
     struct Preparation {
-        std::vector<Batch> allocations;
+        std::vector<BatchPreparation> operations;
         std::size_t lane;
     };
     struct Frame {
@@ -61,6 +62,7 @@ private:
     std::string group_;
     std::size_t stage_;
     NativeRole role_;
+    bool pipeline_;
     std::map<std::size_t, Preparation> preparations_;
     std::map<std::size_t, Frame> frames_;
     std::map<std::size_t, std::shared_ptr<const BatchWork>> reservations_;

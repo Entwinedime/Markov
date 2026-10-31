@@ -58,16 +58,14 @@ class KvStorage:
 class ChunkIndices:
     def __init__(self, cache, peer: ControlPeer) -> None:
         self.native_retain = cache.cache_unfinished_req
-        self.trace = getattr(cache, "trace", None)
         self.peer = peer
         cache.cache_unfinished_req = self.retain
 
     def retain(self, request, chunked=False):
         result = self.native_retain(request, chunked=chunked)
 
-        # Preserve native call timing; a saved chunk is consumed by the following scheduling decision.
-        if chunked and self.trace is None:
-            self.peer.call("retain", request=int(request.rid))
+        # Preserve the call boundary both before the next chunk and before a completed Prefill's KV send.
+        self.peer.call("retain", request=int(request.rid))
         return result
 
 

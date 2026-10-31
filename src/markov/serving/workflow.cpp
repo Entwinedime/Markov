@@ -129,38 +129,43 @@ nlohmann::json ServingWorkflow::run(bool details) {
 }
 
 nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, const BatchProgram & program) const {
-    if (action.step == ServingStep::Indices)
-        return {
-            {             "step",                                                       action.step_name() },
-            {     "scheduled_ns",                                                      action.scheduled_ns },
-            {             "flow",                                                              action.flow },
-            {             "lane",                                                              action.lane },
-            {            "stage",   action.stage ? nlohmann::json(*action.stage) : nlohmann::json(nullptr) },
-            { "commits_requests",                                                                    false },
-            {             "task", { { "group", action.task.group }, { "sequence", action.task.sequence } } },
-            { "index_operations",                                    action.index_work().operations.size() },
-            {  "execution_ports",   { { "publication", nullptr }, { "completions", program.completions } } }
-        };
-    const auto & batch = action.batch_work().batch;
     nlohmann::json decision{
-        {                 "phase",                                                                 phase_name(batch.phase)                                  },
-        {                     "M",                                                                                                        batch.new_tokens() },
-        {                     "B",                                                                                                      batch.members.size() },
-        {                     "R",                                                                                                    batch.request_capacity },
-        {     "free_pages_before",                                                                                                   batch.free_pages_before },
-        { "deferred_pages_before",                                                                                               batch.deferred_pages_before },
-        {       "allocated_pages",                                                                                                     batch.allocated_pages },
-        {               "members",                                                                                                   nlohmann::json::array() },
-        {          "scheduled_ns",                                                                                                       action.scheduled_ns },
-        {                  "flow",                                                                                                               action.flow },
-        {                  "lane",                                                                                                               action.lane },
-        {                 "stage",                                                    action.stage ? nlohmann::json(*action.stage) : nlohmann::json(nullptr) },
-        {                  "step",                                                                                                        action.step_name() },
-        {      "commits_requests",                                                                                                 action.commits_requests() },
-        {                  "task",                                                  { { "group", action.task.group }, { "sequence", action.task.sequence } } },
-        {       "execution_ports",
+        {             "step",                                                                                action.step_name()                             },
+        {     "scheduled_ns",                                                                                                            action.scheduled_ns },
+        {             "flow",                                                                                                                    action.flow },
+        {             "lane",                                                                                                                    action.lane },
+        {            "stage",                                                         action.stage ? nlohmann::json(*action.stage) : nlohmann::json(nullptr) },
+        { "commits_requests",                                                                                                      action.commits_requests() },
+        {             "task",                                                       { { "group", action.task.group }, { "sequence", action.task.sequence } } },
+        {  "execution_ports",
          { { "publication", program.publication ? nlohmann::json(*program.publication) : nlohmann::json(nullptr) }, { "completions", program.completions } } }
     };
+    if (action.step == ServingStep::Indices) {
+        decision["index_operations"] = action.index_work().operations.size();
+        return decision;
+    }
+    if (action.step == ServingStep::Select) {
+        const auto & selection = action.selection();
+        decision["view"] = selection.view == BatchView::Previous ? "previous" : "running";
+        decision["members"] = nlohmann::json::array();
+        for (const auto request : selection.requests)
+            decision["members"].push_back({
+                { "id", controller_.request(request).id }
+            });
+        return decision;
+    }
+
+    const auto & batch = action.batch_work().batch;
+    decision.update({
+        {                 "phase",     phase_name(batch.phase) },
+        {                     "M",          batch.new_tokens() },
+        {                     "B",        batch.members.size() },
+        {                     "R",      batch.request_capacity },
+        {     "free_pages_before",     batch.free_pages_before },
+        { "deferred_pages_before", batch.deferred_pages_before },
+        {       "allocated_pages",       batch.allocated_pages },
+        {               "members",     nlohmann::json::array() }
+    });
     for (const auto & member : batch.members) {
         decision["members"].push_back({
             {             "id",                                                 controller_.request(member.request).id },
@@ -213,7 +218,7 @@ void ServingWorkflow::record_publication(nlohmann::json & result, const BatchEff
 
 void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json & decision, const ServingAction & action, std::int64_t time_ns,
                                         bool details) const {
-    if (action.step == ServingStep::Indices) return;
+    if (action.step == ServingStep::Indices || action.step == ServingStep::Select) return;
     const auto & effects = action.batch_work().effects;
     for (std::size_t index = 0; index < effects.members.size(); ++index) {
         const auto & member = effects.members[index];

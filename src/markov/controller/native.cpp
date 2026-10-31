@@ -16,7 +16,8 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         auto bindings = nlohmann::json::array();
         for (const auto & participant : instance.participants) {
             groups_.emplace(participant.group,
-                            std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage, instance.role));
+                            std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage, instance.role,
+                                                          instance.participants.size() > 1));
             instances_.emplace(participant.group, instance.id);
             bindings.push_back({
                 {    "id", participant.group },
@@ -82,10 +83,10 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
         if (transfer_) {
             if (auto action = transfer_->plan(now_ns)) return action;
         }
-        if (!shutdown_ && (groups_.size() == 1 || idle_.size() == groups_.size())
-            && std::ranges::all_of(groups_, [](const auto & entry) { return entry.second->done(); }) && (!transfer_ || transfer_->settled())) {
+        if (!shutdown_ && idle_.size() == groups_.size() && std::ranges::all_of(groups_, [](const auto & entry) { return entry.second->done(); })
+            && (!transfer_ || transfer_->settled())) {
 
-            // Workers leave at control receive boundaries and drain the native handles they still own.
+            // Every group finishes native batch cleanup before leaving at its control receive boundary.
             peer_.send({
                 { "kind", "shutdown" }
             });
@@ -176,7 +177,6 @@ void NativeController::finish(const ServingAction & action, const BatchProgram &
     reply(running_calls_.at(action.task),
           {
               { "completed_ns",   completed_ns },
-              {         "done",   group.done() },
               {       "values", program.values }
     });
     running_calls_.erase(action.task);

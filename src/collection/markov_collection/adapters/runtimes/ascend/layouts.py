@@ -88,9 +88,9 @@ class AscendLayouts:
         return guards, storage
 
     @staticmethod
-    def guards(tensor: dict[str, Any]) -> list[dict[str, Any]]:
-        shape, relation = tensor["shape"], tensor["shape_relation"]
-        if tensor["device"] != "npu" or relation is None or not shape:
+    def guards(tensor: dict[str, Any], relation: list[Any] | None) -> list[dict[str, Any]]:
+        shape = tensor["shape"]
+        if relation is None or not shape:
             return []
 
         actual_expected = 1
@@ -100,8 +100,14 @@ class AscendLayouts:
             strided |= stride != actual_expected
             contiguous &= size == 1 or stride == actual_expected
             actual_expected *= size
-        if not strided:
-            return []
+        if not strided or tensor["device"] != "npu":
+
+            # Empty operands can skip device work even with contiguous storage, including host-to-device copies.
+            return (
+                [{"condition": ["or", *(["eq", axis, 0] for axis in relation)], "expected": 0 in shape}]
+                if any(not isinstance(axis, int) for axis in relation)
+                else []
+            )
 
         strides = tensor["stride_relation"]
         if strides is None:
@@ -135,7 +141,12 @@ class AscendLayouts:
         return guards
 
     @staticmethod
-    def declare(regions: list[dict[str, Any]], operations: list[dict[str, Any]], values: list[dict[str, Any]]) -> None:
+    def declare(
+        regions: list[dict[str, Any]],
+        operations: list[dict[str, Any]],
+        values: list[dict[str, Any]],
+        geometries: list[dict[int, Any]],
+    ) -> None:
         owners: list[int | None] = []
         device_interfaces = set()
         candidates = []
@@ -152,22 +163,33 @@ class AscendLayouts:
                 continue
             owner = owners[operation["region"]]
             if owner is None:
-                candidates.append(operation)
+                candidates.append((operation, geometries[operation["region"]]))
             else:
                 device_interfaces.add(owner)
-        candidates.extend(regions[owner]["metadata"] for owner in sorted(device_interfaces))
+        candidates.extend((regions[owner]["metadata"], geometries[owner]) for owner in sorted(device_interfaces))
 
-        for candidate in candidates:
+        for candidate, geometry in candidates:
             previous = [
                 guard for guard in candidate.get("execution_guards", []) if guard.get("basis") != "operand_layout"
             ]
+            private = set(candidate.get("opaque_inputs", []))
+            private.update(
+                member["value"] for group in candidate.get("input_groups", {}).values() for member in group["members"]
+            )
             guards = {}
             for value in candidate["inputs"]:
+
+                # Opaque ports and repeated group members have their own interface contract and parameter scope.
+                if value in private:
+                    continue
 
                 # The native selector already declares this operand's complete layout classification.
                 if "contiguous_storage" in candidate and value == candidate["inputs"][0]:
                     continue
-                for guard in AscendLayouts.guards(values[value]):
+
+                # Reused tensors have call-local geometry; their earlier producer may use different symbols.
+                tensor = values[value]
+                for guard in AscendLayouts.guards(tensor, geometry.get(value, tensor["shape_relation"])):
                     guard["basis"] = "operand_layout"
                     guards[json.dumps(guard["condition"])] = guard
 

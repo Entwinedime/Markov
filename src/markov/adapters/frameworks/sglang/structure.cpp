@@ -81,7 +81,8 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute
                        || (action.step == ServingStep::Send && !action.channel.empty()) || action.step == ServingStep::Wait
                        || (action.step == ServingStep::Receive && !action.channel.empty())
-                       || ((action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
+                       || ((action.step == ServingStep::PrepareResult || action.step == ServingStep::ReadResult || action.step == ServingStep::Result)
+                           && action.stage);
     if (local) {
         for (const auto rank : group.members) {
             auto program = rank_step(action, rank, work);
@@ -149,7 +150,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     return result;
 }
 
-BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool handoff) {
+BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool retain_unfinished) {
     const auto begin = graph_.operations.size();
     const auto & batch = action.batch_work().batch;
     auto & builder = *ranks_.at(rank);
@@ -216,11 +217,21 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
         if (messages.empty()) flow.messages.erase(rank);
         break;
     }
-    case ServingStep::ReadResult: {
-        const auto tokens = topology_.stage_count(instance_.id) == 1 ? flow.outputs.at(rank).at("sampled_tokens")
-                                                                     : builder.receive_result(batch, flow.payloads.at(rank).at("output").at("next_token_ids"));
+    case ServingStep::PrepareResult: {
+        const auto tokens = flow.payloads.at(rank).at("output").at("next_token_ids");
+
+        // Preparation updates the shared token relay; the received output itself is unchanged.
         flow.tokens[rank] = tokens;
-        result.completions.push_back(builder.begin_result(batch, tokens).value());
+        result.completions.push_back(builder.prepare_result(batch, tokens));
+        break;
+    }
+    case ServingStep::ReadResult: {
+        if (topology_.stage_count(instance_.id) == 1) {
+            const auto tokens = flow.outputs.at(rank).at("sampled_tokens");
+            flow.tokens[rank] = tokens;
+            result.completions.push_back(builder.begin_result(batch, tokens).value());
+        }
+        else result.completions.push_back(builder.read_pipeline_result(batch, flow.tokens.at(rank)));
         break;
     }
     case ServingStep::Result: {
@@ -230,7 +241,7 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
                                               flow.outputs.at(rank),
                                               flow.tokens.at(rank),
                                               action.batch_work().metadata_slots,
-                                              handoff || instance_.id == "prefill",
+                                              retain_unfinished,
                                               action.batch_work().index_tail);
         result.publication = program.publication;
         result.returned_pages = program.returned_pages;
@@ -306,13 +317,15 @@ BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std
             if (stages > 1) {
                 step.step = ServingStep::Receive;
                 rank_step(step, rank, work);
+                step.step = ServingStep::PrepareResult;
+                rank_step(step, rank, work);
             }
-            if (!flows_.at(action.flow).tokens.contains(rank)) {
+            if (stages > 1 || !flows_.at(action.flow).tokens.contains(rank)) {
                 step.step = ServingStep::ReadResult;
                 rank_step(step, rank, work);
             }
             step.step = ServingStep::Result;
-            auto program = rank_step(step, rank, work, action.step == ServingStep::Model);
+            auto program = rank_step(step, rank, work, true);
             if (program.publication) {
                 if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
                 result.publication = program.publication;

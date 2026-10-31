@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
@@ -17,6 +18,14 @@ class AttentionCall(NativeCall):
         super().__init__(*args, **kwargs)
         self.layer = self.original.__self__
         self.signature = inspect.signature(self.original)
+
+    @staticmethod
+    def bind_cache(values: Any, pool: Any) -> None:
+        pages = values.bounded_parameter("kv_pages", 1, sys.maxsize)
+
+        # Ascend reserves page zero; changing pool capacity also changes each layer's contiguous stride.
+        for buffer in (pool.k_buffer, pool.v_buffer):
+            values.shapes.bind_contiguous(buffer, (buffer.shape[0], pages + 1, *buffer.shape[2:]))
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend

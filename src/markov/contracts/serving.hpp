@@ -108,6 +108,15 @@ struct KvPageCopy {
     std::size_t destination;
 };
 
+enum class BatchView { Running, Previous };
+
+struct BatchSelection {
+    BatchView view;
+    std::vector<std::size_t> requests;
+};
+
+using BatchPreparation = std::variant<Batch, BatchSelection>;
+
 // One immutable model iteration can be shared by its stage decisions and unfinished feedback.
 struct BatchWork {
     Batch batch;
@@ -116,8 +125,8 @@ struct BatchWork {
     std::map<std::size_t, std::size_t> metadata_slots{};
     bool final_transfer = true;
 
-    // Separate native preparations feed one model call; empty means the batch was prepared as a whole.
-    std::vector<Batch> preparations{};
+    // Native preparation and row selection retain their order before one model call.
+    std::vector<BatchPreparation> preparations{};
 
     // Decode's grouped index release follows native output publication inside result processing.
     std::optional<IndexWork> index_tail{};
@@ -133,6 +142,7 @@ enum class ServingStep {
     Send,
     Receive,
     Wait,
+    PrepareResult,
     ReadResult,
     Result,
     Reserve,
@@ -153,7 +163,7 @@ struct TransferBinding {
 // Task identifies one decision; flow links continued model work or a transfer to its source send.
 struct ServingAction {
     TaskIdentity task;
-    std::variant<std::shared_ptr<const BatchWork>, std::shared_ptr<const IndexWork>> work;
+    std::variant<std::shared_ptr<const BatchWork>, std::shared_ptr<const IndexWork>, BatchSelection> work;
     std::int64_t scheduled_ns;
     std::size_t flow;
     std::size_t lane;
@@ -164,6 +174,7 @@ struct ServingAction {
 
     const BatchWork & batch_work() const { return *std::get<std::shared_ptr<const BatchWork>>(work); }
     const IndexWork & index_work() const { return *std::get<std::shared_ptr<const IndexWork>>(work); }
+    const BatchSelection & selection() const { return std::get<BatchSelection>(work); }
 
     bool commits_requests() const { return step == ServingStep::Batch || step == ServingStep::Result || step == ServingStep::Accept; }
     std::string_view step_name() const;

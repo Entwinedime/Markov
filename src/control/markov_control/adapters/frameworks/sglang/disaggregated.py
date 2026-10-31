@@ -193,6 +193,12 @@ class DisaggregatedScheduler(NativeScheduler):
     def get_next_disagg_decode_batch_to_run(self):
         return self.prepare(super().get_next_disagg_decode_batch_to_run())
 
+    def process_prefill_chunk(self):
+
+        # Both PD loops filter the preceding Prefill here, including unchanged membership.
+        with NativeBatch.report_selection(self.last_batch, "previous"):
+            return super().process_prefill_chunk()
+
 
 class PipelineDisaggregatedScheduler(DisaggregatedScheduler, PipelineScheduler):
     def get_new_batch_prefill(self):

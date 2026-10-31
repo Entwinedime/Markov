@@ -47,11 +47,12 @@ public:
     TargetRegion model(const Batch & batch, const std::map<std::string, std::size_t> & inputs);
     std::optional<std::size_t> begin_result(const Batch & batch, std::optional<std::size_t> sampled_tokens);
     RankProgram complete(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & model_columns,
-                         std::optional<std::size_t> sampled_tokens, const std::map<std::size_t, std::size_t> & metadata_slots, bool handoff = false,
+                         std::optional<std::size_t> sampled_tokens, const std::map<std::size_t, std::size_t> & metadata_slots, bool retain_unfinished,
                          const std::optional<IndexWork> & index_tail = std::nullopt);
     RankMessage message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending);
     std::vector<std::size_t> wait_message(const std::string & channel, const Batch & batch, const RankMessage & message);
-    std::size_t receive_result(const Batch & batch, std::size_t sampled_tokens);
+    std::size_t prepare_result(const Batch & batch, std::size_t sampled_tokens);
+    std::size_t read_pipeline_result(const Batch & batch, std::size_t sampled_tokens);
     std::optional<std::size_t> idle();
 
     void live_state(GraphRoots & roots);
@@ -60,7 +61,7 @@ private:
     RankProgram indices(const IndexWork & work);
     TargetRegion prepare_part(const Batch & batch, std::size_t lane);
     void begin_schedule(Phase phase, std::size_t members);
-    RankProgram select(const Batch & batch, std::size_t lane);
+    RankProgram select(const BatchSelection & selection, std::size_t lane);
     RankProgram retain(const Batch & batch);
     RankProgram reserve(const Batch & batch);
     TargetRegion send_kv(const Batch & batch, const BatchMember & member, std::size_t metadata_slot, bool final);

@@ -1,10 +1,26 @@
 """Keep native batch decisions while reporting the selected rows and allocations."""
 
+from contextlib import contextmanager
+
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class NativeBatch(ScheduleBatch):
-    control_selection = False
+    control_selection = None
+
+    @staticmethod
+    @contextmanager
+    def report_selection(batch, view="running"):
+        if batch is None:
+            yield
+            return
+
+        previous = getattr(batch, "control_selection", None)
+        batch.control_selection = view
+        try:
+            yield
+        finally:
+            batch.control_selection = previous
 
     def prepare_for_prebuilt(self):
         super().prepare_for_prebuilt()
@@ -13,11 +29,16 @@ class NativeBatch(ScheduleBatch):
         peer.call("prebuilt", requests=[int(req.rid) for req in self.reqs])
 
     def filter_batch(self, *args, **kwargs):
+
+        # PP can revisit an already empty last batch; acquisition excludes that no-work call too.
+        selection = self.control_selection if self.reqs else None
         result = super().filter_batch(*args, **kwargs)
-        if self.control_selection:
+        if selection:
 
             # Report the native result, including retraction order; do not reproduce its selection policy.
-            self.token_to_kv_pool_allocator.peer.call("select", requests=[int(req.rid) for req in self.reqs])
+            self.token_to_kv_pool_allocator.peer.call(
+                "select", view=selection, requests=[int(req.rid) for req in self.reqs]
+            )
         return result
 
 

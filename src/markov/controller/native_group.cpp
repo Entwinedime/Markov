@@ -4,6 +4,7 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 
 namespace markov {
 namespace {
@@ -22,12 +23,13 @@ nlohmann::json prefix_path(std::span<const PrefixStep> path) {
 
 } // namespace
 
-NativeGroup::NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role)
+NativeGroup::NativeGroup(const std::vector<Request> & requests, KvPool & resources, std::string group, std::size_t stage, NativeRole role, bool pipeline)
     : requests_(requests),
       resources_(resources),
       group_(std::move(group)),
       stage_(stage),
-      role_(role) {}
+      role_(role),
+      pipeline_(pipeline) {}
 
 void NativeGroup::begin_iteration(std::size_t flow, std::size_t lane) {
     if (const auto previous = lanes_.find(lane); previous != lanes_.end()) {
@@ -112,9 +114,29 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
     }
     const auto frame = frames_.find(flow);
     const bool preparing = frame == frames_.end() || frame->second.next == ServingStep::Prepare;
-    if (kind == "select" || kind == "retain" || (kind == "release_request" && (preparing || role_ == NativeRole::Prefill))) {
-        if ((kind == "select" || kind == "retain") && !preparing) throw std::invalid_argument("native scheduling action is outside batch preparation");
-        auto batch = resident_batch(kind == "select" ? message.at("requests") : nlohmann::json::array({ message.at("request") }), delivered);
+
+    // Prebuilt admission already owns its member retention inside the Accept operation.
+    if (kind == "retain" && frame != frames_.end() && frame->second.next == ServingStep::Accept) return std::nullopt;
+    if (kind == "select") {
+        if (!preparing) throw std::invalid_argument("native selection is outside batch preparation");
+        const auto view = message.at("view").get<std::string>();
+        if (view != "running" && view != "previous") throw std::invalid_argument("unknown native batch selection view");
+        BatchSelection selection{ view == "previous" ? BatchView::Previous : BatchView::Running, resident_requests(message.at("requests"), delivered) };
+        if (preparations_.contains(flow)) {
+
+            // Selection after an allocation belongs between that preparation and the next one.
+            preparations_.at(flow).operations.emplace_back(std::move(selection));
+            return std::nullopt;
+        }
+        return ServingAction{
+            { group_, sequence_ },
+            std::move(selection), now_ns, flow, lane, stage_, ServingStep::Select
+        };
+    }
+    if (kind == "retain" || (kind == "release_request" && (preparing || role_ == NativeRole::Prefill))) {
+        if (kind == "retain" && !preparing && frame->second.next != ServingStep::Result)
+            throw std::invalid_argument("native retention requires batch preparation or a readable result");
+        auto batch = resident_batch(nlohmann::json::array({ message.at("request") }), delivered);
         if (kind == "retain") {
             batch.phase = Phase::Prefill;
             batch.members.front().phase = Phase::Prefill;
@@ -144,47 +166,47 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
             flow,
             lane,
             stage_,
-            kind == "select"   ? ServingStep::Select
-            : kind == "retain" ? ServingStep::Retain
-                               : ServingStep::Release
+            kind == "retain" ? ServingStep::Retain : ServingStep::Release
         };
     }
     if (kind == "release_request") return std::nullopt;
     if (kind == "prepare") {
         auto & preparation = preparations_.at(flow);
-        auto batch = preparation.allocations.front();
-        for (std::size_t index = 1; index < preparation.allocations.size(); ++index) {
-            const auto & part = preparation.allocations[index];
-            if (part.phase != batch.phase) batch.phase = Phase::Mixed;
-            batch.members.insert(batch.members.end(), part.members.begin(), part.members.end());
-            batch.allocated_pages += part.allocated_pages;
+        auto batch = std::get<Batch>(preparation.operations.front());
+        for (std::size_t index = 1; index < preparation.operations.size(); ++index) {
+            if (const auto * part = std::get_if<Batch>(&preparation.operations[index])) {
+                if (part->phase != batch.phase) batch.phase = Phase::Mixed;
+                batch.members.insert(batch.members.end(), part->members.begin(), part->members.end());
+                batch.allocated_pages += part->allocated_pages;
+            }
         }
         if (lane != preparation.lane || message.at("phase") != phase_name(batch.phase))
             throw std::invalid_argument("native prepared batch differs from its allocation phase or lane");
 
         // Allocation reserves resources; only the final native batch publishes immutable model work.
         auto work = std::make_shared<BatchWork>(std::move(batch), BatchEffects{});
-        if (preparation.allocations.size() > 1) work->preparations = std::move(preparation.allocations);
+        if (preparation.operations.size() > 1) work->preparations = std::move(preparation.operations);
         Frame prepared{ std::move(work), lane, ServingStep::Prepare, {}, {}, {} };
         observe_progress(prepared, message.at("members"));
         frames_.emplace(flow, std::move(prepared));
         preparations_.erase(flow);
     }
     static const std::map<std::string, ServingStep> steps{
-        {     "prepare",    ServingStep::Prepare },
-        {       "model",    ServingStep::Compute },
-        {        "send",       ServingStep::Send },
-        {     "receive",    ServingStep::Receive },
-        {        "wait",       ServingStep::Wait },
-        { "read_result", ServingStep::ReadResult },
-        {      "result",     ServingStep::Result },
-        {      "accept",     ServingStep::Accept }
+        {        "prepare",       ServingStep::Prepare },
+        {          "model",       ServingStep::Compute },
+        {           "send",          ServingStep::Send },
+        {        "receive",       ServingStep::Receive },
+        {           "wait",          ServingStep::Wait },
+        { "prepare_result", ServingStep::PrepareResult },
+        {    "read_result",    ServingStep::ReadResult },
+        {         "result",        ServingStep::Result },
+        {         "accept",        ServingStep::Accept }
     };
     const auto step = steps.at(kind);
     auto & current = frames_.at(flow);
     const bool message_step = step == ServingStep::Send || step == ServingStep::Receive || step == ServingStep::Wait;
     if (lane != current.lane || (!message_step && step != current.next))
-        throw std::invalid_argument("native work does not follow its own preparation/model/read completion");
+        throw std::invalid_argument("native work does not follow its own preparation/model/result completion");
     auto work = current.work;
     if (step == ServingStep::Result || step == ServingStep::Accept) {
         auto result = std::make_shared<BatchWork>(current.work->batch, result_effects(current, message.at("members")));
@@ -199,6 +221,7 @@ std::optional<ServingAction> NativeGroup::plan(const nlohmann::json & message, s
 
 nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::size_t delivered) {
     const auto kind = message.at("kind").get<std::string>();
+    if (kind == "select" || kind == "retain") return nullptr;
     if (kind == "prefix") {
         auto & index = resources_.prefixes();
         const auto operation = message.at("operation").get<std::string>();
@@ -278,7 +301,7 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
             const auto flow = message.at("flow").get<std::size_t>();
             const auto lane = message.at("lane").get<std::size_t>();
             auto & preparation = preparations_.try_emplace(flow, Preparation{ {}, lane }).first->second;
-            preparation.allocations.push_back(std::move(allocation));
+            preparation.operations.emplace_back(std::move(allocation));
         }
         if (kind == "reserve_pages") {
             const auto request = allocation.members.front().request;
@@ -338,15 +361,19 @@ nlohmann::json NativeGroup::resource_call(const nlohmann::json & message, std::s
     throw std::invalid_argument("unknown native control message: " + kind);
 }
 
-Batch NativeGroup::resident_batch(const nlohmann::json & requests, std::size_t delivered) const {
-    std::vector<KvDemand> demands;
+std::vector<std::size_t> NativeGroup::resident_requests(const nlohmann::json & requests, std::size_t delivered) const {
+    auto selected = requests.get<std::vector<std::size_t>>();
     std::set<std::size_t> members;
-    for (const auto & value : requests) {
-        const auto identity = value.get<std::size_t>();
+    for (const auto identity : selected) {
         if (identity >= delivered || !members.insert(identity).second || !resources_.residence(identity).slot)
             throw std::invalid_argument("native selection requires unique resident requests");
-        demands.push_back({ identity, 0 });
     }
+    return selected;
+}
+
+Batch NativeGroup::resident_batch(const nlohmann::json & requests, std::size_t delivered) const {
+    std::vector<KvDemand> demands;
+    for (const auto identity : resident_requests(requests, delivered)) demands.push_back({ identity, 0 });
     return resources_.plan(Phase::Decode, demands);
 }
 
@@ -454,7 +481,8 @@ void NativeGroup::finish(const ServingAction & action, std::span<const std::size
     }
     auto & frame = frames_.at(action.flow);
     if (action.step == ServingStep::Prepare) frame.next = ServingStep::Compute;
-    else if (action.step == ServingStep::Compute) frame.next = ServingStep::ReadResult;
+    else if (action.step == ServingStep::Compute) frame.next = pipeline_ ? ServingStep::PrepareResult : ServingStep::ReadResult;
+    else if (action.step == ServingStep::PrepareResult) frame.next = ServingStep::ReadResult;
     else if (action.step == ServingStep::ReadResult) frame.next = ServingStep::Result;
     else if (action.step == ServingStep::Send) {
         if (!frame.messages.insert(action.channel).second) throw std::invalid_argument("native send replaced an unconsumed work handle");

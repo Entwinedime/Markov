@@ -48,6 +48,12 @@ class NativeRuntimeCalls:
             for identity, call in enumerate(json.loads(path.read_text())):
                 call["source"] = {"process": process, "callback": identity}
                 call["queue_scope"] = self.queue_scope(call)
+
+                # This torch_npu caller emits the device callback only after ACL_SUCCESS; stream callbacks precede it.
+                if call["kind"] == "device" and any(
+                    name.startswith("c10_npu::npuSynchronizeDevice(") for name in call["callers"]
+                ):
+                    call["result"] = 0
                 call["kind"] = {
                     "stream": "wait_stream",
                     "device": "wait_device",
@@ -168,26 +174,40 @@ class NativeRuntimeCalls:
                 calls[key], key=lambda action: event_time_ns(events[self.callback_origin(action)])
             )
             identities.sort(key=lambda identity: event_time_ns(events[identity]))
-            if len(identities) != len(actions_in_scope):
-                continue
+            if key[1] == "wait_device":
 
-            ordered = []
-            for identity, action in zip(identities, actions_in_scope, strict=True):
-                pair = sorted([events[identity], events[self.callback_origin(action)]], key=event_time_ns)
-                ordered.extend(pair)
+                # Device callbacks follow their API; a missing callback must not erase earlier completed pairs.
+                ordered = [(identity, None) for identity in identities]
+                ordered.extend((self.callback_origin(action), action) for action in actions_in_scope)
+                ordered.sort(key=lambda item: event_time_ns(events[item[0]]))
+                pairs = [
+                    (identity, action)
+                    for (_, action), (identity, next_action) in pairwise(ordered)
+                    if action is not None and next_action is None
+                ]
+                ordered = [events[identity] for identity, _ in ordered]
+            else:
+                if len(identities) != len(actions_in_scope):
+                    continue
+                pairs = list(zip(identities, actions_in_scope, strict=True))
+                ordered = []
+                for identity, action in pairs:
+                    ordered.extend(sorted([events[identity], events[self.callback_origin(action)]], key=event_time_ns))
 
-            # One callback belongs to each call, in thread order; stripped caller symbols cannot erase its arguments.
+            # One callback belongs to each call, in thread order; overlapping observations stay unbound.
             if any(
                 event_time_ns(left) + event_time_ns(left, "dur") > event_time_ns(right)
                 for left, right in pairwise(ordered)
             ):
                 continue
 
-            for identity, action in zip(identities, actions_in_scope, strict=True):
+            for identity, action in pairs:
                 callback = self.callbacks[events[identity]["name"]]
                 parameters = self.parameters(callback)
                 direct = action["native_call"]
                 if direct is not None:
+                    if parameters["result"] is not None and direct["result"] != parameters["result"]:
+                        raise ValueError("native synchronization callback disagrees with the API result")
                     for resource in ("device", "stream"):
                         status = f"{resource}_status"
                         if direct[status] == parameters[status] == 0 and direct[resource] != parameters[resource]:

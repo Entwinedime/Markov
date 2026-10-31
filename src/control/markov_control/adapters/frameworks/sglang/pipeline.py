@@ -134,6 +134,9 @@ class PipelineScheduler(NativeScheduler):
             next_first_rank_mb_id, next_mb_id, mbs, *args
         )
         if event is not None:
+
+            # Preparation precedes other native work; the event consumer waits later.
+            self.peer.call("prepare_result", **mbs[next_mb_id].control_work)
             event = ResultReady(self.peer, mbs[next_mb_id].control_work)
         return outputs, result, event, work
 

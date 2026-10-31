@@ -31,6 +31,12 @@ class SGLangSource:
 
         directory = path.parent
         source = json.loads(path.read_text())
+        grouped = source["environment"]["source_transport"] != "physical_group_of_one"
+        physical_path = directory / (f"physical-{path.name}" if grouped else "physical.json")
+        if profile:
+
+            # A failed reinterpretation must not leave an older physical result marked as complete.
+            physical_path.unlink(missing_ok=True)
 
         # Interpretation can be repeated from the captured facts without another native session.
         SGLangSource.declare_execution_domain(source, directory)
@@ -49,7 +55,7 @@ class SGLangSource:
         ModelPaddingCall.declare(source["regions"], source["values"], geometries)
         TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
         AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
-        AscendLayouts.declare(source["regions"], source["operations"], source["values"])
+        AscendLayouts.declare(source["regions"], source["operations"], source["values"], geometries)
         AllReduceGeometry.declare(source["operations"], source["values"])
         DisaggregatedTemplates.declare(source)
         PoolPorts.declare(source["regions"], source["values"])
@@ -61,17 +67,11 @@ class SGLangSource:
         if not profile:
             return
 
-        grouped = source["environment"]["source_transport"] != "physical_group_of_one"
-        name = f"physical-{path.name}" if grouped else "physical.json"
-
-        # Physical mapping belongs to immutable trace identities; declaration fixes can reuse the completed export.
-        if (directory / name).exists():
-            return
         traces = directory / "native" / path.stem if grouped else directory / "native"
         trace = AscendTrace.exported_trace(traces)
         observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
         physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
-        write_json(directory / name, physical)
+        write_json(physical_path, physical)
 
     @staticmethod
     def declare_execution_domain(source: dict[str, Any], directory: Path) -> None:

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace markov::sglang {
@@ -103,6 +104,7 @@ RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settin
 
 RankProgram RankStructure::expand(const ServingAction & action) {
     if (action.step == ServingStep::Indices) return indices(action.index_work());
+    if (action.step == ServingStep::Select) return select(action.selection(), action.lane);
     const auto & batch = action.batch_work().batch;
     const auto & effects = action.batch_work().effects;
     switch (action.step) {
@@ -110,16 +112,8 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     case ServingStep::Model: {
         const auto inputs = prepare(batch, action.lane);
         const auto output = model(batch, inputs.ports.outputs);
-        return complete(batch,
-                        effects,
-                        action.lane,
-                        output.ports.outputs,
-                        output.ports.outputs.at("sampled_tokens"),
-                        action.batch_work().metadata_slots,
-                        action.step == ServingStep::Model);
+        return complete(batch, effects, action.lane, output.ports.outputs, output.ports.outputs.at("sampled_tokens"), action.batch_work().metadata_slots, true);
     }
-    case ServingStep::Select:
-        return select(batch, action.lane);
     case ServingStep::Retain:
         return retain(batch);
     case ServingStep::Send: {
@@ -152,14 +146,14 @@ void RankStructure::begin_schedule(Phase phase, std::size_t members) {
                              state);
 }
 
-RankProgram RankStructure::select(const Batch & batch, std::size_t lane) {
+RankProgram RankStructure::select(const BatchSelection & selection, std::size_t lane) {
     const auto begin = shared_.regions.size();
     auto & views = views_.at(lane);
-    if (!graph_.composition()) begin_schedule(batch.phase, batch.members.size());
-    views.join_prefill(batch.phase);
-    const auto filtered = views.select(batch.members);
+    const auto phase = selection.view == BatchView::Previous ? Phase::Prefill : Phase::Decode;
+    if (!graph_.composition()) begin_schedule(phase, selection.requests.size());
+    const auto filtered = views.select(selection);
     auto completion = shared_.execution.region_call(filtered).returned;
-    if (batch.members.empty()) {
+    if (selection.view == BatchView::Running && selection.requests.empty()) {
         const auto schedule = graph_.composition().value();
         graph_.end_composition({});
         completion = shared_.execution.region_call(schedule).returned;
@@ -201,7 +195,7 @@ TargetRegion RankStructure::prepare(const Batch & batch, std::size_t lane) {
     const auto schedule = graph_.composition().value();
     graph_.end_composition(prepared.outputs);
 
-    // Preparation owns model inputs; a P-only rank may never expose a batch-filter template.
+    // Model inputs come from preparation, independently of columns retained for later filtering.
     auto inputs = prepared.outputs;
     inputs.erase("free_pages");
     inputs.erase("request_map");
@@ -215,20 +209,31 @@ TargetRegion RankStructure::prepare(const Batch & batch, std::size_t lane) {
 
 TargetRegion RankStructure::prepare(const BatchWork & work, std::size_t lane) {
     if (work.preparations.empty()) return prepare(work.batch, lane);
-    if (work.batch.phase != Phase::Mixed || work.preparations.size() != 2 || work.preparations[0].phase != Phase::Prefill
-        || work.preparations[1].phase != Phase::Decode)
+    const bool mixed = work.batch.phase == Phase::Mixed;
+    const auto & first = std::get<Batch>(work.preparations.front());
+    const auto parts = std::ranges::count_if(work.preparations, [](const auto & part) { return std::holds_alternative<Batch>(part); });
+    if (mixed && (parts != 2 || first.phase != Phase::Prefill || std::get<Batch>(work.preparations.back()).phase != Phase::Decode))
         throw LayoutMismatch("SGLang mixed preparation requires Prefill followed by Decode");
 
     const auto begin = shared_.regions.size();
-    merge_pages(work.preparations.front());
-    if (!graph_.composition()) begin_schedule(Phase::Mixed, work.batch.members.size());
+    merge_pages(first);
+    if (!graph_.composition()) begin_schedule(work.batch.phase, work.batch.members.size());
     else shared_.regions.at(*graph_.composition())["parameters"]["scheduled_members"] = work.batch.members.size();
 
     std::map<std::string, std::size_t> inputs;
     for (std::size_t index = 0; index < work.preparations.size(); ++index) {
-        const auto & part = work.preparations[index];
+        if (const auto * selection = std::get_if<BatchSelection>(&work.preparations[index])) {
+            views_.at(lane).select(*selection);
+            continue;
+        }
+
+        const auto & part = std::get<Batch>(work.preparations[index]);
         if (index != 0) merge_pages(part);
         const auto prepared = prepare_part(part, lane);
+        if (!mixed) {
+            inputs = prepared.ports.outputs;
+            continue;
+        }
         for (const auto & [name, value] : prepared.ports.outputs) {
 
             // Mixed input staging reads token IDs from the relay, not the pure-Decode column.
@@ -237,25 +242,30 @@ TargetRegion RankStructure::prepare(const BatchWork & work, std::size_t lane) {
         }
     }
 
-    // The native merge owns mixed columns; neither independent model graph is appended here.
-    auto call = invocation(work.batch);
-    call.parameters.erase("B");
-    call.parameters.erase("M");
-    const auto mixed = graph_.append("batch_mix", "mixed", call, inputs);
-    auto columns = batch_operands(work.batch, settings_.page_size);
-    columns["original_lengths"] = columns.at("sequence_lengths");
-    bind_columns(graph_, mixed.ports.outputs, columns);
-    views_.at(lane).consume_running();
-    if (coordinates_) graph_.append("batch_coordination", "mixed", {});
+    if (mixed) {
+
+        // The native merge owns mixed columns; neither independent model graph is appended here.
+        auto call = invocation(work.batch);
+        call.parameters.erase("B");
+        call.parameters.erase("M");
+        inputs = graph_.append("batch_mix", "mixed", call, inputs).ports.outputs;
+        auto columns = batch_operands(work.batch, settings_.page_size);
+        columns["original_lengths"] = columns.at("sequence_lengths");
+        bind_columns(graph_, inputs, columns);
+        views_.at(lane).consume_running();
+    }
+    if (coordinates_) graph_.append("batch_coordination", phase_name(work.batch.phase), {});
     const auto schedule = graph_.composition().value();
-    auto outputs = mixed.ports.outputs;
+    auto outputs = inputs;
     outputs.emplace("free_pages", *free_pages_);
     outputs.emplace("request_map", *request_map_);
     graph_.end_composition(outputs);
+    inputs.erase("free_pages");
+    inputs.erase("request_map");
     stamp(begin);
     return {
         schedule,
-        { {}, mixed.ports.outputs },
+        { {}, std::move(inputs) },
         {}
     };
 }
@@ -404,7 +414,8 @@ TargetRegion RankStructure::send_kv(const Batch & batch, const BatchMember & mem
 
 RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & effects, std::size_t lane,
                                     const std::map<std::string, std::size_t> & model_columns, std::optional<std::size_t> sampled_tokens,
-                                    const std::map<std::size_t, std::size_t> & metadata_slots, bool handoff, const std::optional<IndexWork> & index_tail) {
+                                    const std::map<std::size_t, std::size_t> & metadata_slots, bool retain_unfinished,
+                                    const std::optional<IndexWork> & index_tail) {
 
     // Native control resumes the caller opened at its read boundary; lightweight control expands it in one step.
     if (!graph_.composition()) begin_result(batch, sampled_tokens);
@@ -413,7 +424,7 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
 
     auto columns = model_columns;
     if (sampled_tokens) columns["model_tokens"] = *sampled_tokens;
-    if (!handoff) views_.at(lane).remember(batch.phase, columns, effects);
+    views_.at(lane).remember(batch.phase, columns, effects);
     const bool immediate = batch.phase != Phase::Decode;
     const auto phase = phase_name(batch.phase);
     Invocation group;
@@ -432,7 +443,9 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
         chunks_.erase(member.request);
         if (prefix_cache_) continue;
         const auto & input = *std::ranges::find(batch.members, member.request, &BatchMember::request);
-        if (!member.finished && (input.phase == Phase::Decode || !sampled_tokens)) continue;
+
+        // Native retention already ran at its call boundary; combined lightweight work emits it here.
+        if (!member.finished && (!retain_unfinished || input.phase == Phase::Decode)) continue;
 
         const auto cache = cache_member(member, immediate, pending_tokens, phase, batch.slot_capacity);
         if (!member.finished) continue;
@@ -627,7 +640,7 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     graph_.end_composition(outputs);
     graph_.end_composition(outputs);
     stamp(begin);
-    return complete(batch, effects, lane, outputs, std::nullopt, {});
+    return complete(batch, effects, lane, outputs, std::nullopt, {}, false);
 }
 
 RankProgram RankStructure::release(const Batch & batch, const BatchEffects & effects) {
@@ -697,6 +710,7 @@ Invocation RankStructure::invocation(const Batch & batch) const {
         {                   "B",                                                                static_cast<std::int64_t>(batch.members.size()) },
         {                   "R",                                                                                 settings_.max_running_requests },
         {       "slot_capacity",                                                                                            batch.slot_capacity },
+        {            "kv_pages",                                                               settings_.max_total_tokens / settings_.page_size },
         {   "free_pages_before",
          batch.allocated_pages > batch.free_pages_before - batch.deferred_pages_before ? batch.free_pages_before
          : batch.free_pages_before - batch.deferred_pages_before                                                                               },
@@ -772,10 +786,11 @@ std::vector<std::size_t> RankStructure::wait_message(const std::string & channel
     return completions;
 }
 
-std::size_t RankStructure::receive_result(const Batch & batch, std::size_t sampled_tokens) {
+std::size_t RankStructure::prepare_result(const Batch & batch, std::size_t sampled_tokens) {
     const auto begin = shared_.regions.size();
     const auto phase = phase_name(batch.phase);
     const auto arguments = invocation(batch);
+
     graph_.append("pipeline_event_record", phase, arguments);
     const auto result = graph_.append("pipeline_result_tokens",
                                       phase,
@@ -785,10 +800,17 @@ std::size_t RankStructure::receive_result(const Batch & batch, std::size_t sampl
                                           {    "token_relay", token_relay_.value() }
     });
     token_relay_ = result.ports.outputs.at("token_relay");
-    graph_.append("pipeline_ready_record", phase, arguments);
-    graph_.append("pipeline_ready_synchronize", phase, arguments);
+    const auto ready = graph_.append("pipeline_ready_record", phase, arguments);
+
     stamp(begin);
-    return result.ports.outputs.at("sampled_tokens");
+    return shared_.execution.region_call(ready.region).returned;
+}
+
+std::size_t RankStructure::read_pipeline_result(const Batch & batch, std::size_t sampled_tokens) {
+    const auto begin = shared_.regions.size();
+    graph_.append("pipeline_ready_synchronize", phase_name(batch.phase), invocation(batch));
+    stamp(begin);
+    return begin_result(batch, sampled_tokens).value();
 }
 
 void RankStructure::return_pages(std::size_t output, std::span<const std::size_t> pages) {

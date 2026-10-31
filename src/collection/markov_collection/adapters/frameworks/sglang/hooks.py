@@ -181,6 +181,8 @@ class SGLangObservation:
                     "prefill_tokens": sum(item["new_tokens"] for item in members if item["phase"] == "prefill"),
                     "R": scheduler.req_to_token_pool.size,
                     "slot_capacity": scheduler.req_to_token_pool.req_to_token.shape[0] - 1,
+                    "kv_pages": scheduler.token_to_kv_pool_allocator.size
+                    // scheduler.token_to_kv_pool_allocator.page_size,
                     "max_sequence_tokens": max(
                         (item["context_tokens"] + item["new_tokens"] for item in members), default=0
                     ),
@@ -294,6 +296,7 @@ class SGLangObservation:
             with self.operators.values.metadata():
                 for name in ("M", "B"):
                     self.operators.values.bounded_parameter(name, 1, sys.maxsize)
+                AttentionCall.bind_cache(self.operators.values, scheduler.token_to_kv_pool_allocator.get_kvcache())
                 for tensor in BatchTensors.read(batch).values():
                     self.operators.values.bind(tensor, {0: "B"})
                 if phase == "mixed":
@@ -547,6 +550,9 @@ class SGLangObservation:
             self.materializations.warmup()
         self.indexed_writes.warmup()
 
+        # Pool reset enqueues device work even when reusable warmup helpers have already returned early.
+        torch.npu.synchronize()
+
         boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
         self.workspace_states[boundary] = self.workspaces.snapshot()
 
@@ -655,6 +661,10 @@ class SGLangObservation:
             )
             target = f"sglang.srt.managers.scheduler.Scheduler.{method}"
             targets[target] = self.schedule
+            if self.pipeline is not None and role == "prefill":
+
+                # PP filters and retains the previous chunk before entering its admission method.
+                targets["sglang.srt.managers.scheduler.Scheduler.process_prefill_chunk"] = self.schedule
         for target, observer in targets.items():
             HookRegistry.register(target, observer, HookType.AROUND)
 

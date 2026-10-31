@@ -1,5 +1,6 @@
 #include "markov/adapters/frameworks/sglang/batch_record.hpp"
 
+#include <cstdint>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -41,19 +42,19 @@ void BatchRecord::append(const nlohmann::json & source, const nlohmann::json & s
         auto members = nlohmann::json::array();
         for (const auto & member : batch.at("members")) {
             const auto & id = identities.at(member.at("id").get<std::string>());
-            auto context = member.at("context_tokens");
-            auto tokens = member.at("new_tokens");
+            auto context = member.at("context_tokens").get<std::int64_t>();
+            auto tokens = member.at("new_tokens").get<std::int64_t>();
             if (found->second) {
 
-                // Prebuilt installs the transferred prompt and first token without another model iteration.
+                // Prebuilt seq_lens contains the prompt; observation splits it into context and one input token.
                 if (tokens != 1) throw std::invalid_argument("prebuilt batch has an unsupported token transition");
-                tokens = context;
+                tokens += context;
                 context = 0;
             }
             members.push_back({
-                {        "request",                 id },
-                { "context_tokens", std::move(context) },
-                {     "new_tokens",  std::move(tokens) }
+                {        "request",      id },
+                { "context_tokens", context },
+                {     "new_tokens",  tokens }
             });
         }
         if (environment.at("logical_pp") != 1 && !batch.contains("lane"))

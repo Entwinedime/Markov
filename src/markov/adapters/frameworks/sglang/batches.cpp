@@ -5,7 +5,9 @@
 
 namespace markov::sglang {
 
-BatchViews::BatchViews(TargetGraph & graph, const TemplateAsset & asset) : graph_(graph) {
+BatchViews::BatchViews(TargetGraph & graph, const TemplateAsset & asset)
+    : graph_(graph),
+      prefill_only_(asset.environment().at("implementation").at("disaggregation_mode") == "prefill") {
     for (const auto & entry : asset.entrypoints()) {
         if (entry.role != "batch_filter") continue;
         for (const auto & [name, _] : asset.layout(asset.frame(entry).layout).ports.inputs) fields_.insert(name);
@@ -22,29 +24,34 @@ std::map<std::string, std::size_t> BatchViews::columns(const std::map<std::strin
 }
 
 std::size_t BatchViews::admission_members() const {
+    if (prefill_only_) return 0;
 
     // Native admission precedes Decode filtering, while the preceding Prefill is filtered first.
     return (running_ ? running_->requests.size() : 0) + (prefill_ ? prefill_->kept_rows.size() : 0);
 }
 
 void BatchViews::advance(Phase phase) {
-    join_prefill(phase);
+
+    // Explicit native selection already performed this iteration's filtering and joining.
+    if (!selected_) join_prefill(phase);
     if (phase == Phase::Decode && !selected_) filter(running_.value(), "decode");
     selected_ = false;
 }
 
-void BatchViews::join_prefill(Phase phase) {
+std::optional<std::size_t> BatchViews::join_prefill(Phase phase) {
     const std::string name = phase_name(phase);
+    std::optional<std::size_t> completion;
 
     // Native scheduling filters the preceding Prefill before joining it to the running view.
     if (prefill_) {
-        filter(*prefill_, name);
-        if (!prefill_->requests.empty()) {
-            if (running_) merge(*running_, *prefill_, name);
+        completion = filter(*prefill_, name);
+        if (!prefill_only_ && !prefill_->requests.empty()) {
+            if (running_) completion = merge(*running_, *prefill_, name);
             else running_ = std::move(prefill_);
         }
         prefill_.reset();
     }
+    return completion;
 }
 
 void BatchViews::consume_running() {
@@ -52,17 +59,21 @@ void BatchViews::consume_running() {
     selected_ = false;
 }
 
-std::size_t BatchViews::select(std::span<const BatchMember> members) {
-    auto & view = running_.value();
+std::size_t BatchViews::select(const BatchSelection & selection) {
+    if (selection.view == BatchView::Running) join_prefill(Phase::Decode);
+    auto & view = (selection.view == BatchView::Previous ? prefill_ : running_).value();
     view.kept_rows.clear();
-    for (const auto & member : members) {
-        const auto row = std::ranges::find(view.requests, member.request);
-        if (row == view.requests.end()) throw LayoutMismatch("selected request has no running batch column");
+    for (const auto request : selection.requests) {
+        const auto row = std::ranges::find(view.requests, request);
+        if (row == view.requests.end()) throw LayoutMismatch("selected request has no retained batch column");
         view.kept_rows.push_back(row - view.requests.begin());
     }
-    const auto filtered = filter(view, "decode");
+    if (selection.view == BatchView::Previous && !prefill_only_) return join_prefill(Phase::Prefill).value();
+
+    // PD can revisit the same previous batch while its transfer is pending; keep the surviving columns.
+    const auto filtered = filter(view, selection.view == BatchView::Previous ? "prefill" : "decode");
     selected_ = true;
-    if (view.requests.empty()) running_.reset();
+    if (view.requests.empty()) (selection.view == BatchView::Previous ? prefill_ : running_).reset();
     return filtered;
 }
 
@@ -76,7 +87,7 @@ std::map<std::string, std::size_t> BatchViews::decode_inputs() const {
 }
 
 std::optional<std::size_t> BatchViews::idle() {
-    const bool finished_prefill = prefill_ && prefill_->kept_rows.empty();
+    const bool finished_prefill = prefill_ && !selected_ && (prefill_only_ || prefill_->kept_rows.empty());
     const bool finished_running = running_ && running_->kept_rows.empty();
     if (!finished_prefill && !finished_running) return std::nullopt;
 
@@ -85,7 +96,7 @@ std::optional<std::size_t> BatchViews::idle() {
 
     // Native idle scheduling filters the last Prefill before clearing the running view.
     for (auto * view : { &prefill_, &running_ }) {
-        if (*view && view->value().kept_rows.empty()) {
+        if (*view && (prefill_only_ || view->value().kept_rows.empty())) {
             filter(view->value(), "control");
             view->reset();
         }
@@ -149,7 +160,7 @@ std::size_t BatchViews::filter(View & view, const std::string & phase) {
     return filtered.region;
 }
 
-void BatchViews::merge(View & left, const View & right, const std::string & phase) {
+std::size_t BatchViews::merge(View & left, const View & right, const std::string & phase) {
     Invocation invocation;
     invocation.parameters = {
         { "before_members",  static_cast<std::int64_t>(left.requests.size()) },
@@ -175,6 +186,7 @@ void BatchViews::merge(View & left, const View & right, const std::string & phas
     for (const auto row : right.kept_rows) left.kept_rows.push_back(static_cast<std::int64_t>(left.requests.size()) + row);
     left.requests.insert(left.requests.end(), right.requests.begin(), right.requests.end());
     left.columns = std::move(outputs);
+    return merged.region;
 }
 
 } // namespace markov::sglang

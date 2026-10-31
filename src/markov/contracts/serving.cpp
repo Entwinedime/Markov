@@ -88,6 +88,8 @@ std::string_view ServingAction::step_name() const {
         return "receive";
     case ServingStep::Wait:
         return "wait";
+    case ServingStep::PrepareResult:
+        return "prepare_result";
     case ServingStep::ReadResult:
         return "read_result";
     case ServingStep::Result:
