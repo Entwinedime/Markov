@@ -147,6 +147,7 @@ HiCacheWindowResult HiCacheExecution::run() {
     metrics.checkpoint("execution_accounting");
     output_.performance = metrics.report();
     output_.performance["compact_programs"] = compact_programs_;
+    output_.performance["source_calls_retained_in_place"] = phase_calls_.retained_in_place();
     output_.performance["executed_nodes"] = output_.simulation.processed_nodes;
     output_.performance["expansion_callbacks"] = output_.simulation.expansion_callbacks;
     output_.performance["source_queue_program_tasks_reused"] = output_.simulation.source_queue_program_tasks_reused;
@@ -333,9 +334,9 @@ void HiCacheExecution::bind_phase_migrations(std::map<size_t, structure::CostMig
 }
 
 uint64_t HiCacheExecution::estimate_node_cost(size_t node, uint64_t start_us, uint64_t duration) {
-    // Dynamic programs already carry bound costs; collective/source overrides
-    // address only nodes prepared before execution. NodeScale still visits all.
-    if (node >= prepared_node_count_ && !final_cost_transform_) return duration;
+    // Generated work is bound; phase-owned source work is either replaced or
+    // proven invariant. Neither needs unrelated collective/source lookups.
+    if (!final_cost_transform_ && (node >= prepared_node_count_ || phase_calls_.owns(node))) return duration;
 
     if (operator_costs_.contains(node)) duration = operator_costs_.at(node);
     if (const auto cost = collective_services_.caller_cost(graph_, node, operator_provider_)) duration = *cost;

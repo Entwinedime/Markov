@@ -181,6 +181,16 @@ PhaseCallPlan plan_attention_metadata_call(const adapters::sglang::AttentionMeta
     return result;
 }
 
+bool dense_layout_supported(const adapters::sglang::AttentionCall & attention) {
+    return attention.batch.requests.size() == 1 && attention.padding && !attention.padding->mlp_sync && !attention.padding->allow_input_scattered
+           && !attention.conditions.context_parallel;
+}
+
+bool last_token_dense(const adapters::sglang::DenseCall & source) {
+    return source.role == "logits_projection" || source.role == "logits_output" || source.role == "greedy_sampling";
+}
+
+
 PhaseCallPlan plan_dense_call(const adapters::sglang::DenseCall & source, const adapters::sglang::AttentionCall & attention,
                               const modules::hicache::model::HiCachePrefillWorkItem & prefill) {
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
@@ -189,8 +199,7 @@ PhaseCallPlan plan_dense_call(const adapters::sglang::DenseCall & source, const 
                           .decode_iteration = source.position.decode_iteration,
                           .layer_index = source.layer_index,
                           .call_kind = "dense." + source.role };
-    if (prefill.batch_size != 1 || attention.batch.requests.size() != 1 || !attention.padding || attention.padding->mlp_sync
-        || attention.padding->allow_input_scattered || attention.conditions.context_parallel) {
+    if (prefill.batch_size != 1 || !dense_layout_supported(attention)) {
         result.reason = "target_dense_distributed_token_layout_unavailable";
         return result;
     }
@@ -201,7 +210,7 @@ PhaseCallPlan plan_dense_call(const adapters::sglang::DenseCall & source, const 
     // Ordinary single-request logits without input logprobs have already
     // selected the last token. The source descriptor proves that branch;
     // a changed Prefill length does not change the projection's row count.
-    const bool logits = source.role == "logits_projection" || source.role == "logits_output" || source.role == "greedy_sampling";
+    const bool logits = last_token_dense(source);
     const auto source_rows = logits ? 1 : core::checked_multiply_u64(attention.batch.padded_query_tokens, source.rows_per_token, "Dense source rows overflow");
     if (dense_rows(source.region.shape) != source_rows) {
         result.reason = "source_dense_rows_disagree_with_declared_dense_token_layout";
@@ -285,6 +294,14 @@ DeviceCollectivePlan plan_device_collective_call(const adapters::sglang::DeviceC
 }
 
 } // namespace
+
+bool dense_work_invariant_under_hicache(const adapters::sglang::DenseCall & source, const adapters::sglang::AttentionCall & attention) {
+    if (!dense_layout_supported(attention) || (!source.position.decode_iteration && !last_token_dense(source))) return false;
+
+    const auto rows =
+        last_token_dense(source) ? 1 : core::checked_multiply_u64(attention.batch.padded_query_tokens, source.rows_per_token, "Dense source rows overflow");
+    return dense_rows(source.region.shape) == rows;
+}
 
 PhaseCallWork plan_phase_calls(const adapters::sglang::PhaseCallAudit & source, size_t source_phase,
                                const modules::hicache::model::HiCachePrefillWorkItem & prefill, const modules::hicache::model::HiCacheDecodeWorkItem & decode) {

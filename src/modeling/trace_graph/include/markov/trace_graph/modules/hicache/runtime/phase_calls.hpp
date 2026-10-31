@@ -9,7 +9,6 @@
 
 #include <map>
 #include <optional>
-#include <set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -37,9 +36,10 @@ public:
     void bind_stream_positions(const source_dag::SourceDagIndex & source);
     void set_work(structure::hicache::PhaseCallPlan work);
     void advance(core::DagGraph & graph, size_t node, const HiCacheLayerCalls::Consumer & consumer, simulation::FutureDag & future);
-    [[nodiscard]] bool owns(size_t source_node) const { return owned_.contains(source_node); }
-    [[nodiscard]] size_t prepared() const { return calls_.size() + executed_; }
+    [[nodiscard]] bool owns(size_t source_node) const { return source_node < owned_.size() && owned_[source_node]; }
+    [[nodiscard]] size_t prepared() const { return calls_.size() + native_calls_.size() + executed_; }
     [[nodiscard]] size_t executed() const { return executed_; }
+    [[nodiscard]] size_t retained_in_place() const { return retained_in_place_; }
 
 private:
     struct Call {
@@ -58,9 +58,10 @@ private:
     bool compact_programs_;
     std::vector<std::pair<size_t, size_t>> * retained_source_nodes_;
     std::map<size_t, Call> calls_;
+    std::map<size_t, size_t> native_calls_;
     std::map<size_t, structure::hicache::PhaseCallPlan> work_;
-    std::set<size_t> owned_;
-    size_t executed_ = 0;
+    std::vector<bool> owned_;
+    size_t executed_ = 0, retained_in_place_ = 0;
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

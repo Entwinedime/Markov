@@ -75,7 +75,28 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     };
     for (const auto & call : calls) select(call.region.work.observation, &call.conditions);
     for (const auto & call : metadata) select(call.region.work.observation, nullptr);
-    for (const auto & call : dense) select(call.region.work.observation, nullptr);
+    owned_.resize(original.node_count());
+    for (const auto & call : dense) {
+        const auto & region = call.region.work;
+        const auto & event = original.runtime_observations().at(region.observation);
+        if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
+        const auto & attention = calls[call.attention_call_index];
+        const bool retain_native = compact_programs_ && !retained_source_nodes_ && !region.caller.owned_node_ids.empty()
+                                   && structure::hicache::dense_work_invariant_under_hicache(call, attention);
+        if (!retain_native) {
+            select(region.observation, nullptr);
+            continue;
+        }
+
+        // Unchanged work already has its submission, stream and caller edges.
+        // Keep them instead of deleting the region and rebuilding its clone.
+        const auto first = region.caller.owned_node_ids.front();
+        if (!graph.node(first).active || !native_calls_.emplace(first, region.observation).second)
+            throw std::runtime_error("Invariant source calls require distinct active CPU entries");
+        graph.mutable_node(first).observe_start = true;
+        for (const auto node : region.caller.owned_node_ids) owned_.at(node) = true;
+        for (const auto node : region.submitted_nodes) owned_.at(node) = true;
+    }
     if (selected.empty()) return;
 
     const auto boundaries = bind_hicache_control_points(graph, points);
@@ -138,7 +159,8 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, queues, regions, collective_handoffs));
 
     for (auto & call : replacements) {
-        for (const auto & [original_node, local] : call.retained.source_nodes) owned_.insert(original_node);
+        for (const auto & [original_node, local] : call.retained.source_nodes)
+            if (original_node < owned_.size()) owned_[original_node] = true;
         if (!calls_.emplace(call.entry, std::move(call)).second) throw std::runtime_error("Phase calls share a replacement entry");
     }
 }
@@ -158,6 +180,20 @@ void HiCachePhaseCalls::bind_stream_positions(const source_dag::SourceDagIndex &
 void HiCachePhaseCalls::set_work(structure::hicache::PhaseCallPlan work) { work_.insert_or_assign(work.source_observation, std::move(work)); }
 
 void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCacheLayerCalls::Consumer & consumer, simulation::FutureDag & future) {
+    if (const auto native = native_calls_.find(node); native != native_calls_.end()) {
+        const auto & work = work_.at(native->second);
+        if (work.action != structure::hicache::PhaseCallPlan::Action::RetainCompute)
+            throw structure::MissingWork("Target invalidates invariant source work",
+                                         {
+                                             { "source_observation", work.source_observation },
+                                             {             "reason",             work.reason }
+            });
+        work_.erase(native->second);
+        native_calls_.erase(native);
+        ++retained_in_place_;
+        ++executed_;
+        return;
+    }
     const auto found = calls_.find(node);
     if (found == calls_.end()) return;
     auto & call = found->second;

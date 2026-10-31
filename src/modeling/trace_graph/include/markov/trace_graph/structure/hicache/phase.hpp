@@ -51,6 +51,10 @@ struct PhaseCallWork {
     std::vector<DeviceCollectivePlan> collectives;
 };
 
+/** Dense Decode and last-token output preserve their work under HiCache changes
+ * in the supported single-request layout. Admission still checks the full plan. */
+[[nodiscard]] bool dense_work_invariant_under_hicache(const adapters::sglang::DenseCall & call, const adapters::sglang::AttentionCall & attention);
+
 /** Plan all calls for one admitted request/rank. source_phase is the exact
  * index established by request identity, not an execution-time guess.
  * Attention, metadata and dense retain their source order within each family;
