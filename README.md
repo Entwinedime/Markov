@@ -9,7 +9,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 ```
 
 当前正式入口已运行限定范围的 SGLang 主机/文件回访，以及 KTransformers dense 的 self、分块 Prefill 和 SDPA。
-这证明两框架的完整请求预测已接通，整体精度与泛化尚未验收；矩阵实验和搜索仍在恢复。
+这证明两框架的完整请求预测已接通，整体精度与泛化尚未验收；矩阵实验已启动，搜索仍在恢复。
 
 ## 怎样运行
 
@@ -56,6 +56,8 @@ capture 用 base.configuration、实际推理镜像、设备与累计预算采�
 calibrate 用另一个小型 workload 记录语义区域，不开 profiler 或 snapshot；maintain 显式导入、选择训练并发布库中的现行模型。
 predict 从数据库导出本组的只读选择，用户无需手拼模型文件；未选中的历史记录不会自动参加训练。
 正常对照单独运行 measure，关闭 profiler 与 Markov 探针；它只用于独立评价，不用于预测或训练。
+批量研究例子在 [HiCache 矩阵](examples/hicache_matrix/README.md)：声明原始 60 和完整 186 cross，复用正式接口，失败与缺成本保留。
+这些数字是实验布局，当前实际完成范围以运行结果为准。
 
 ## 已验证范围与限制
 

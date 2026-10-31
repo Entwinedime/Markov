@@ -67,7 +67,8 @@ base 的 runtime.hicache.load_failed 只在实际两次设备分配失败后记�
 同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
 preparation 中单列 base/performance 时间、sampling_rounds 和累计状态路径；这些不计入预测的 HTTP。
 
-预测容器无设备、无网络，仅挂载可执行文件、所选 base 采集目录、模型、准备输入与结果目录。
+预测及评价容器显式使用 runc，不继承宿主的设备 runtime；无设备、无网络，仅挂载可执行文件及各自明确选择的输入与结果目录。
+预测的输入仅包括所选 base 采集目录、模型和准备输入。
 不挂载项目/data 根目录或 evaluator 的正常测量。输出须与 base/模型输入分离；已有活跃容器时拒绝复用其输出。
 一次进程共享 source 和只读模型，当前 targets 顺序执行，jobs 尚未用于预测并发。
 execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}]；默认空列表，按声明顺序取首个子串匹配。
@@ -163,7 +164,10 @@ HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用�
 镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令在已有 SDK 环境中安装项目并构建原生观察库，需有 C++23 工具链、CMake 和 CANN 头文件。
 预算六项均为正整数：starts、wall_sec、requests、input_tokens、output_tokens、retained_mib。它们分别约束累计启动、墙钟秒、
 请求、输入/输出 tokens 和当前保留 MiB；失败消耗不清零，输出失败未取得实际 token 数时按请求上限保守计入。
-采集前检查声明设备空闲，并与同一入口的其他采集任务串行；只挂载所选设备、只读模型与驱动、本任务输出，容器无网络。
+采集前等待声明设备空闲，等待计入累计墙钟预算，耗尽时不启动新采集；同一入口的设备任务串行。
+只挂载所选设备、只读模型与驱动、本任务输出，容器无网络。
+成功导出后回收该会话运行时生成的缓存页文件，元数据记录 temporary_storage_bytes；这些页不是回放输入。
+失败会话保留证据，不自动清理。retained_mib 也约束运行中的临时页峰值，不只是最终小型测量文件。
 
 workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_ids 二选一，以及 max_new_tokens；
 可选 ignore_eos、return_logprob 是布尔值。formal_begin_index 之前的请求用于准备，仍连续采集；其后为正式请求。
