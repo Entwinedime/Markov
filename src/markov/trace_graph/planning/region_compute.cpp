@@ -34,7 +34,7 @@ Features RegionPreparation::enter(std::size_t caller, Phase phase, const FrameIn
 
 RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<RegionFrame> frames, RegionBackend backend, std::size_t first_resource,
                              RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request,
-                             std::span<const graph::NodeId> caller_ready, std::optional<graph::NodeId> data_ready)
+                             std::span<const graph::NodeId> caller_ready, std::span<const graph::NodeId> data_ready)
     : source_(source),
       backend_(std::move(backend)),
       first_resource_(first_resource),
@@ -77,7 +77,7 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
         frame.phase = phase;
         if (phase == Phase::Prefill) {
             if (!caller_ready.empty()) frame.caller_ready = caller_ready[rank];
-            frame.data_ready = data_ready;
+            if (!data_ready.empty()) frame.data_ready = data_ready[rank];
         }
         frame.previous = before;
         frame.overlap = result.overlap;

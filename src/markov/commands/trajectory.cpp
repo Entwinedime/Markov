@@ -165,6 +165,13 @@ nlohmann::json trajectory_replay_report(const adapters::PreparedReplay & input) 
     simulation::Execution execution(graph, roots);
     execution.run();
     const auto & result = execution.result();
+    for (auto & item : inspected) {
+        const auto id = item.at("node").get<graph::NodeId>();
+        item["original_start_ns"] = nodes[id].at("start_ns");
+        item["original_completion_ns"] = nodes[id].at("completion_ns");
+        item["replay_start_ns"] = result.starts_ns[id];
+        item["replay_completion_ns"] = result.completions_ns[id];
+    }
     std::size_t changed = 0;
     for (std::size_t id = 0; id < nodes.size(); ++id) {
         if (nodes[id].at("origin").at("type") == "relative_deadline") continue;

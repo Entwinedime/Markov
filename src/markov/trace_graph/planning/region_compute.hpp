@@ -44,10 +44,11 @@ private:
 // runtime executes them in parallel; result CPU waits for the group's copies.
 class RegionCompute final : public RequestComputation {
 public:
-    // Producer IDs are copied; the caller readiness span is borrowed only here.
+    // Readiness spans use caller order and are borrowed only here; producer IDs
+    // are copied. Each stream waits for its own data, not a cross-rank join.
     RegionCompute(const source::SourceContext & source, std::vector<RegionFrame> frames, RegionBackend backend, std::size_t first_resource,
                   RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request,
-                  std::span<const graph::NodeId> caller_ready = {}, std::optional<graph::NodeId> data_ready = std::nullopt);
+                  std::span<const graph::NodeId> caller_ready = {}, std::span<const graph::NodeId> data_ready = {});
     void start(ProgramRuntime & runtime) override { start(runtime, std::nullopt); }
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt) override;
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;

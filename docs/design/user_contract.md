@@ -158,6 +158,8 @@ scripts/markov.sh capture --request /path/to/request.json
 对应原生环境随调用输入和 base 配置保存。非 FIA 来源仍可构图，但现有注意力变换与独立成本不授予其支持资格；其他采集组合尚未恢复。
 
 execution.capture 另声明推理镜像 image、独占设备数组 devices、容器 memory_limit_gib/cpus，以及 budget。
+Ascend 采集显式使用已注册的 ascend Docker runtime，由它将所选宿主设备映射为容器内逻辑编号；不依赖 Docker 的默认 runtime。
+HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用固定端口；这一环境随实际调用保存。依据为 [CANN 端口环境说明](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/envvar/envref_07_0144.html)。
 镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令在已有 SDK 环境中安装项目并构建原生观察库，需有 C++23 工具链、CMake 和 CANN 头文件。
 预算六项均为正整数：starts、wall_sec、requests、input_tokens、output_tokens、retained_mib。它们分别约束累计启动、墙钟秒、
 请求、输入/输出 tokens 和当前保留 MiB；失败消耗不清零，输出失败未取得实际 token 数时按请求上限保守计入。
@@ -308,6 +310,7 @@ source_cpu_gaps 另计帧内相邻调用间的残余近似数量；它们有独�
 另列的 cache_execution 根据有限两级缓存状态运行备份、回载及计算子集，报告实际复用、回载、Prefill 工作和容量峰值。
 回载等全部参与进程完成整批跨层 DMA 后才发布；写回式淘汰等待所选备份批次，传输前保护来源，完成确认后释放引用。
 cache_execution.copy_ports 逐逻辑复制列出页数、各参与者的 cache_control_returned_ns、completion_observed_ns 与 published_ns。控制返回包含后续主机索引克隆；发布等待两个端口的全部参与者。completion_basis 区分 modeled_observation_upper_interval 和 device_service，前者包含同步观察开销，不能当作精确设备完成。写回淘汰也使用这组响应并在复制汇合前保留 caller 调用权；淘汰选择、ACK、同步就绪服务和页池归还的外围 CPU 尚未覆盖。缺少结果观察的旧非淘汰备份仍使用设备传输口径。
+区域回载的输入准备等待本地 caller 返回，GPU Prefill 等待本地完成观测；全局发布和保护释放仍等待所有参与者。这里仍以整层组完成为界，不表示已经建模逐层复制与计算重叠。
 不同参与进程的计算用显式汇合边界衔接，串行请求依赖前一响应完成；实验响应端口仍只覆盖部分路径，入口和尾部沿用同请求/前端的源残余近似。
 partial_request_ports 区分 start_ns、arrived_ns、received_ns 与响应开始/完成；received_ns 为首次取得参与 caller 的准入端口，准入等待不计作 CPU 服务。
 有同次最终发送观察时，响应从 modeled_send_ns 接出；缺少该事实则保留全部所选工作完成的屏障。
@@ -456,6 +459,7 @@ scripts/markov.sh replay --request /path/to/replay.json
 路径相对请求文件解析。示例请求为 {"manifest": "/path/to/profile_manifest.json", "output": "/path/to/replay"}；
 默认沿用源观测成本，完整细图只在该诊断命令中构建，不进入普通预测。
 inspect_name 为空字符串时列出服务名字及数量；填入名字子串后列出匹配节点的 ID、原成本和绑定后成本。
+目标路径回放还列出匹配节点的原起止及回放起止，均为同一预测会话内的纳秒坐标，可检查成本改变后依赖是否正确传递。
 默认不生成名字统计或逐节点数据。
 overrides 例如 [{"node": 123, "duration_ns": 456}]，只替换明确节点，随后再应用 node_scale；
 边界只能为零，重复 ID、负耗时和越界 ID 会拒绝。缩放只作用于服务，gap、等待和边保持原样。

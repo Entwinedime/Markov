@@ -519,7 +519,7 @@ void CacheProgram::compute(ProgramRuntime & runtime, const PendingCopy * load) {
 
     auto & compute = running_[request_].compute;
     const auto caller_ready = load ? std::span<const graph::NodeId>(load->caller_returns) : std::span<const graph::NodeId>{};
-    const auto data_ready = load ? load->completion : std::nullopt;
+    const auto data_ready = load ? std::span<const graph::NodeId>(load->copy_completions) : std::span<const graph::NodeId>{};
     if (regions_)
         compute = std::make_unique<RegionCompute>(source_,
                                                   std::move(region_frames),

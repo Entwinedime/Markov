@@ -68,11 +68,12 @@ def recipes(captured: dict) -> dict:
     for phase in final_phases:
         for part in ("send", "tail"):
             result[(f"result_{part}.{phase}", result_implementation(captured), "thread_cpu")] = {
-                "feature": "attention_pairs",
+                "feature": None,
                 "curve": "page_tokens",
                 "nonnegative": True,
-                "coverage_features": ["context_tokens", "batch_size", "query_tokens", "finished"],
-                "limitations": captured["limitations"],
+                "coverage_features": ["attention_pairs", "context_tokens", "batch_size", "query_tokens", "finished"],
+                "limitations": captured["limitations"]
+                + ["Typical serial small-output CPU response; payload-size scaling is not modeled."],
             }
     return result
 
