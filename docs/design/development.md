@@ -100,6 +100,15 @@ scripts/model.sh prepare-cpu-service \
 
 只有已证明的采集 CPU 开销才可校正，不扣设备工作、所有 wall−CPU 差或未解释的 gap。改变实际工作和采集通道后重新匹配；仅调高 profiler API 等待上限不自动使完整输入失效。
 
+CPU文件按线程集中保存整数区间，新准备会直接生成这一布局。历史展开文件需要显式转换，不必重新采集或打开trace：
+
+```bash
+scripts/model.sh prepare-cpu-service \
+  --convert-input <expanded-cpu-service.json> --output-dir <new-cpu-output>
+```
+
+新目录中的`cpu_service.json`供预测和独立观测提取共同使用，`conversion_summary.json`记录规模；输出文件必须不存在，旧输入保留。转换保持原manifest、配对依据、测量窗口及全部整数坐标和服务成本，不重新做开销校正。
+
 ### 中断与恢复
 
 检查 `group_summary.json`、准备摘要、预算账本及失败日志，确认实际进程/容器是否已结束。`running` 字段、路径存在或 manifest completed 都不是运行仍在继续或数据完整的证明。
