@@ -64,7 +64,7 @@ ShareGPT 来自[公开数据集](https://huggingface.co/datasets/anon8231489123/
 
 `progress.json` 显示本次遍历的步骤和处理数量，恢复时会重新遍历并复用；处理过一组不等于预测成功，用量不会重置。
 `preparation.json`、`predictions.json`、`measurements.json` 分别保留准备、预测、正常采集状态。
-结果写入 `results.md`、`results.json`、`cells.csv`：包含完整 HTTP、逐格误差、总体及逐 base 指标、正常波动和预测开销。
+结果写入 `results.md`、`results.json`、`cells.csv`：包含完整 HTTP、逐格误差、总体及逐 base/workload/target 指标、正常波动和预测开销，并与直接沿用 base 正常耗时比较。
 计时从第一个正式 HTTP 发出至最后一个正式响应结束，包含请求间隔、gap、未归属控制和 Prefill/Decode。
 缺成本或失败保留原格数，完整矩阵缺项时不公布完整 WAPE；已评分子集另外标注。
 

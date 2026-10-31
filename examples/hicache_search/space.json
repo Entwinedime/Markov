@@ -1,0 +1,75 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B3",
+    "framework": "sglang",
+    "runtime": "ascend",
+    "dtype": "bfloat16",
+    "tensor_parallel": 2
+  },
+  "capture": {
+    "image": "markov-sglang:ubuntu22.04",
+    "devices": [0, 1],
+    "memory_limit_gib": 64,
+    "cpus": 8
+  },
+  "base_configuration": {
+    "page_size": 64,
+    "max_total_tokens": 3072,
+    "max_prefill_tokens": 4096,
+    "enable_hierarchical_cache": true,
+    "hicache_io_backend": "kernel_ascend",
+    "hicache_mem_layout": "page_first_direct",
+    "hicache_storage_backend": "file",
+    "hicache_ratio": 1.32,
+    "hicache_write_policy": "write_through_selective",
+    "hicache_storage_prefetch_policy": "wait_complete",
+    "hicache_storage_backend_extra_config": "{\"prefetch_threshold\": 256}"
+  },
+  "axes": {
+    "device_tokens": [3072, 8192, 24576],
+    "host_ratios": [1.32, 4.49],
+    "page_tokens": [64, 128],
+    "write_policies": ["write_through", "write_through_selective", "write_back"],
+    "prefetch_threshold_tokens": [256, 512],
+    "prefetch_policies": ["wait_complete", "best_effort", "timeout"],
+    "timeout_sec": [0.005, 0.05]
+  },
+  "source_budget": {
+    "starts": 2,
+    "wall_sec": 2400,
+    "requests": 256,
+    "input_tokens": 262144,
+    "output_tokens": 4096,
+    "retained_mib": 32768
+  },
+  "sampling_budget": {
+    "starts": 32,
+    "wall_sec": 7200,
+    "requests": 512,
+    "input_tokens": 750000,
+    "output_tokens": 2048,
+    "retained_mib": 1024
+  },
+  "normal_budget": {
+    "starts": 2,
+    "wall_sec": 900,
+    "requests": 256,
+    "input_tokens": 262144,
+    "output_tokens": 4096,
+    "retained_mib": 8192
+  },
+  "policy": {
+    "baseline": "baseline",
+    "fixed_device_gib_per_rank": 48,
+    "fixed_host_gib": 64,
+    "maximum_time_ratio": 0.9,
+    "resource_plans": [
+      {"name": "compact", "device_gib_per_rank": 64, "host_gib": 66, "hourly_cost_units": 194},
+      {"name": "balanced", "device_gib_per_rank": 64, "host_gib": 70, "hourly_cost_units": 198},
+      {"name": "roomy", "device_gib_per_rank": 64, "host_gib": 80, "hourly_cost_units": 208},
+      {"name": "large", "device_gib_per_rank": 64, "host_gib": 96, "hourly_cost_units": 224}
+    ]
+  },
+  "normal_repetitions": 3,
+  "prediction_memory_limit_gib": 4
+}

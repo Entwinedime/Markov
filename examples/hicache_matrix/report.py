@@ -4,57 +4,25 @@ from __future__ import annotations
 
 from collections import Counter
 import csv
-from decimal import Decimal
 import math
 from pathlib import Path
-from statistics import mean, pstdev
 
 from markov.artifacts.request import read_json
 from markov.artifacts.writing import write_json
-
-
-def normal_statistics(paths: list[str]) -> dict:
-    samples = []
-    for name in dict.fromkeys(paths):
-        path = Path(name)
-        observation = read_json(path)
-        if (
-            observation["kind"] != "normal_http_observation"
-            or observation["profiling"] is not False
-            or observation["status"] != "completed"
-        ):
-            raise ValueError(f"Expected an unprofiled normal observation: {path}")
-        rows = [
-            row
-            for row in read_json(path.parent / observation["workload_report"])["requests"]
-            if row["kind"] == "request" and row["measure"]
-        ]
-        duration = (Decimal(rows[-1]["end_time_ms"]) - Decimal(rows[0]["start_time_ms"])) / 1000
-        if duration <= 0 or any(row["status"] != "ok" for row in rows):
-            raise ValueError(f"Invalid formal normal HTTP window: {path}")
-        samples.append(float(duration))
-
-    return {
-        "samples_sec": samples,
-        "n": len(samples),
-        "mean_sec": mean(samples) if samples else None,
-        "minimum_sec": min(samples) if samples else None,
-        "maximum_sec": max(samples) if samples else None,
-        "stddev_sec": pstdev(samples) if len(samples) > 1 else None,
-    }
+from markov.workflow.evaluation import normal_statistics
 
 
 def metrics(rows: list[dict]) -> dict:
     scored = [row for row in rows if row["status"] == "scored"]
     complete = bool(rows) and len(scored) == len(rows)
+    total_normal_sec = sum(row["normal_sec"] for row in scored)
     wape = (
-        100
-        * sum(abs(row["predicted_sec"] - row["normal_sec"]) for row in scored)
-        / sum(row["normal_sec"] for row in scored)
+        100 * sum(abs(row["predicted_sec"] - row["normal_sec"]) for row in scored) / total_normal_sec
         if scored
         else None
     )
     errors = sorted(row["ape_percent"] for row in scored)
+    baseline_complete = complete and all(row["base_constant_ape_percent"] is not None for row in scored)
     return {
         "expected": len(rows),
         "predicted": sum(row["predicted_sec"] is not None for row in rows),
@@ -63,7 +31,18 @@ def metrics(rows: list[dict]) -> dict:
         "scored_subset_wape_percent": wape,
         "p90_ape_percent": errors[math.ceil(0.9 * len(errors)) - 1] if complete else None,
         "maximum_ape_percent": max(errors) if complete else None,
+        "signed_error_percent": 100 * sum(row["predicted_sec"] - row["normal_sec"] for row in scored) / total_normal_sec
+        if complete
+        else None,
+        "base_constant_wape_percent": sum(row["base_constant_ape_percent"] * row["normal_sec"] for row in scored)
+        / total_normal_sec
+        if baseline_complete
+        else None,
     }
+
+
+def grouped_metrics(rows: list[dict], field: str) -> dict[str, dict]:
+    return {name: metrics([row for row in rows if row[field] == name]) for name in sorted({row[field] for row in rows})}
 
 
 def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], set[str]]) -> dict:
@@ -129,14 +108,10 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
     summary = {
         "cross": metrics(cross),
         "self": metrics([row for row in rows if row["panel"] == "self"]),
-        "panels": {
-            name: metrics([row for row in cross if row["panel"] == name])
-            for name in sorted({row["panel"] for row in cross})
-        },
-        "bases": {
-            name: metrics([row for row in cross if row["base"] == name])
-            for name in sorted({row["base"] for row in cross})
-        },
+        "panels": grouped_metrics(cross, "panel"),
+        "bases": grouped_metrics(cross, "base"),
+        "workloads": grouped_metrics(cross, "workload"),
+        "targets": grouped_metrics(cross, "target"),
         "statuses": dict(Counter(row["status"] for row in cross)),
         "models": predictions["models"],
         "formal_prediction_overhead": overhead,
@@ -169,9 +144,16 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         )
     if summary["cross"]["scored"] != summary["cross"]["expected"]:
         lines += ["", "仍有缺项，完整矩阵精度尚不能给出；JSON 中另列已评分子集指标，失败没有记为零或从格数中删除。"]
-    lines += ["", "| Base | 应有 cross | 已评分 | WAPE (%) |", "| --- | ---: | ---: | ---: |"]
-    for base, values in summary["bases"].items():
-        lines.append(f"| {base} | {values['expected']} | {values['scored']} | {number(values['wape_percent'])} |")
+    for label, field in (("Base", "bases"), ("Workload", "workloads"), ("Target", "targets")):
+        lines += [
+            "",
+            f"| {label} | 应有 cross | 已评分 | WAPE (%) | P90 APE (%) | 沿用 base 的 WAPE (%) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for name, values in summary[field].items():
+            lines.append(
+                f"| {name} | {values['expected']} | {values['scored']} | {number(values['wape_percent'])} | {number(values['p90_ape_percent'])} | {number(values['base_constant_wape_percent'])} |"
+            )
     lines += [
         "",
         "误差最大的已评分 cross：",
