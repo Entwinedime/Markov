@@ -460,7 +460,8 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
              { "full_cost_coverage", false },
              { "final_cost_transform_applied", result.final_cost_transform_enabled },
              { "scope",
-             "All active executed nodes, including background work; durations are after final cost transform. Sums are not HTTP or critical-path time." },
+             "All active executed nodes, including background work; service is after final cost transform, CPU gaps and ready delays use the same source "
+             "correction as execution. Sums are not HTTP or critical-path time." },
              { "limitations",
              "Phase, generated tensor, page-first payload/submission, storage-write batches, paged-release, load-index and generated CPU-control bindings "
              "are classified. Other retained/generated nodes, including boundaries, remain unclassified. Worker duration can include residual intervals. "

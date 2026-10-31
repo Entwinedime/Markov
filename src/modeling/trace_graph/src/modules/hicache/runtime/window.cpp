@@ -436,8 +436,8 @@ void HiCacheExecution::finish() {
         auto & totals = output_.executed_cost_sources[origin];
         ++totals.nodes;
         totals.node_duration_us += node.duration;
-        totals.sequential_gap_us += node.cpu_gap_after;
-        totals.ready_delay_us += node.cpu_ready_delay_before;
+        totals.sequential_gap_us += graph_.cpu_service_gap_duration(id);
+        totals.ready_delay_us += graph_.cpu_service_ready_delay(id, node.cpu_ready_delay_before);
     }
 
 #ifdef DEBUG
