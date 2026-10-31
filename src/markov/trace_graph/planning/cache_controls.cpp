@@ -8,9 +8,14 @@ namespace markov::trace_graph::planning {
 
 bool CacheProgram::region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after,
                                std::size_t request) {
-    copies_.emplace(
-        transfer,
-        PendingCopy{ node, evict_after, kind, pages, std::nullopt, kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
+    copies_.emplace(transfer,
+                    PendingCopy{ node,
+                                 evict_after,
+                                 kind,
+                                 pages,
+                                 request,
+                                 std::nullopt,
+                                 kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
     kind == CopyKind::Load ? ++loads_ : ++backups_;
     for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
         const auto turn = region_copy_turns_.size();
@@ -97,7 +102,7 @@ bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn
     return true;
 }
 
-bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages) {
+bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages, std::size_t request) {
     const Features features{
         {           "pages",                                   pages },
         {      "page_bytes", page_tokens_ * backend_.bytes_per_token },
@@ -124,7 +129,7 @@ bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer
                     std::nullopt,
                     0
                 };
-        const auto caller = running_[request_].callers[rank];
+        const auto caller = running_[request].callers[rank];
 
         // This closed host recipe has no separate worker or compute stream.
         if (!plans[rank].extend(calls, { caller, caller, caller }, preparations_)) {
@@ -135,7 +140,7 @@ bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer
 
     const auto begin = runtime.next_node();
     PlannedMutation mutation{ 0, {}, {} };
-    PendingCopy pending{ node, true, CopyKind::Backup, pages, std::nullopt, cache_.tree().nodes()[node].pages };
+    PendingCopy pending{ node, true, CopyKind::Backup, pages, request, std::nullopt, cache_.tree().nodes()[node].pages };
     NativeFrontier frontier;
     for (std::size_t rank = 0; rank < plans.size(); ++rank) {
         const auto base = begin + mutation.operations.size();
@@ -208,7 +213,8 @@ std::optional<ControlWork> CacheProgram::begin_result_control(std::size_t reques
             const auto started = cache_.begin_backup(*node);
             if (started.status != CopyStatus::Started) continue;
             transfers.push_back(*started.transfer);
-            copies_.emplace(*started.transfer, PendingCopy{ *node, false, CopyKind::Backup, started.pages, std::nullopt, cache_.tree().nodes()[*node].pages });
+            copies_.emplace(*started.transfer,
+                            PendingCopy{ *node, false, CopyKind::Backup, started.pages, request, std::nullopt, cache_.tree().nodes()[*node].pages });
             ++backups_;
         }
         at = running.backups.emplace(operation, std::move(transfers)).first;

@@ -81,6 +81,16 @@ std::size_t Cache::ready_layers(RadixId node, Tier tier) const {
     return allocation->producer ? publications_.at(*allocation->producer).published_layers : config_.layers;
 }
 
+std::size_t Cache::prefix_ready_layers(RadixId node, Tier tier) const {
+    auto layers = config_.layers;
+    while (node != 0) {
+        layers = std::min(layers, ready_layers(node, tier));
+        node = tree_.nodes()[node].parent;
+    }
+
+    return layers;
+}
+
 bool Cache::take_pages(Tier tier, std::size_t pages) {
     if (pages > available_pages(tier)) return false;
     occupy_pages(tier, pages);

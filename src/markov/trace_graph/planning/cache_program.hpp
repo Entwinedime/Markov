@@ -106,7 +106,7 @@ private:
         RadixId node;
         bool evict_after;
         CopyKind kind;
-        std::size_t pages;
+        std::size_t pages, request;
         std::optional<graph::NodeId> completion;
         std::vector<PrefixId> storage_pages;
         std::vector<graph::NodeId> copy_completions = {}, caller_returns = {};
@@ -163,7 +163,8 @@ private:
     void wait_for_progress(ProgramRuntime & runtime);
     void poll_prefetch(ProgramRuntime & runtime);
     void respond(ProgramRuntime & runtime, std::size_t request);
-    void compute(ProgramRuntime & runtime);
+    void compute(ProgramRuntime & runtime, const PendingCopy * load = nullptr);
+    void admit(ProgramRuntime & runtime, RadixId prefix, const PendingCopy * load = nullptr);
     void query(ProgramRuntime & runtime, std::span<const PrefixId> lookup, const CacheMatch & matched);
     void publish_prefill_prefix(ProgramRuntime & runtime, std::size_t request);
     void backup_prefix(ProgramRuntime & runtime, RadixId leaf, std::size_t request);
@@ -172,7 +173,7 @@ private:
     bool make_device_room(ProgramRuntime & runtime, std::size_t pages);
     bool make_host_room(std::size_t pages);
     bool copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
-    bool eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages);
+    bool eviction_backup(ProgramRuntime & runtime, TransferId transfer, RadixId node, std::size_t pages, std::size_t request);
     bool region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);

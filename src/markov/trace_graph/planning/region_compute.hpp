@@ -44,8 +44,10 @@ private:
 // runtime executes them in parallel; result CPU waits for the group's copies.
 class RegionCompute final : public RequestComputation {
 public:
+    // Producer IDs are copied; the caller readiness span is borrowed only here.
     RegionCompute(const source::SourceContext & source, std::vector<RegionFrame> frames, RegionBackend backend, std::size_t first_resource,
-                  RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request);
+                  RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request,
+                  std::span<const graph::NodeId> caller_ready = {}, std::optional<graph::NodeId> data_ready = std::nullopt);
     void start(ProgramRuntime & runtime) override { start(runtime, std::nullopt); }
     void start(ProgramRuntime & runtime, std::optional<graph::NodeId> cause, std::optional<simulation::Component> previous_owner = std::nullopt) override;
     void on_event(ProgramRuntime & runtime, const simulation::Event & event) override;
@@ -81,6 +83,7 @@ private:
         Phase phase;
         std::optional<std::size_t> previous, next;
         std::optional<graph::NodeId> control_started, control_ready, input_ready, result_control;
+        std::optional<graph::NodeId> caller_ready, data_ready;
         Features features;
         Work prepare_cpu, prepare_stream, prepare_return, batch_cpu, batch_stream, batch_return, result_cpu, result_tail;
         bool overlap, has_result, publishes, sends;

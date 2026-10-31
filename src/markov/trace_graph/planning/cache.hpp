@@ -89,6 +89,8 @@ public:
     std::size_t free_device_pages() const { return config_.device_pages - used_device_pages_; }
     std::size_t device_pages_allocated_since_return() const { return device_allocation_run_; }
     std::size_t ready_layers(RadixId node, Tier tier) const;
+    // A prefix consumer also waits for every ancestor, not just the leaf slot.
+    std::size_t prefix_ready_layers(RadixId node, Tier tier) const;
 
     // A buffer remains allocated until its owner commits pages or releases it.
     // Prefetch callers commit only the accepted prefix and retain any in-flight

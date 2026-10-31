@@ -87,7 +87,7 @@ bool CacheProgram::submit(ProgramRuntime & runtime, PlannedMutation mutation) {
 
 bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request) {
     if (regions_) return region_copy(runtime, transfer, node, kind, pages, evict_after, request);
-    if (kind == CopyKind::Backup && evict_after) return eviction_backup(runtime, transfer, node, pages);
+    if (kind == CopyKind::Backup && evict_after) return eviction_backup(runtime, transfer, node, pages, request);
     const double page_bytes = page_tokens_ * backend_.bytes_per_token;
     const Work work{
         kind == CopyKind::Load ? backend_.load : backend_.backup,
@@ -99,6 +99,7 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
                                  evict_after,
                                  kind,
                                  pages,
+                                 request,
                                  begin + backend_.participants,
                                  kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
     PlannedMutation mutation{ 0, {}, {} };
@@ -209,7 +210,7 @@ void CacheProgram::respond(ProgramRuntime & runtime, std::size_t request) {
 void CacheProgram::wait_for_progress(ProgramRuntime & runtime) {
     // Write-back eviction synchronizes its copies inside the caller turn.
     if (eviction_wait_) return;
-    // A regional load keeps its admission turn until the source is readable.
+    // Retain admission until load submission can hand the caller to input setup.
     if (regions_ && std::ranges::any_of(copies_, [](const auto & copy) { return copy.second.kind == CopyKind::Load; })) return;
     // A blocked admission yields the caller so older results can release space.
     for (const auto caller : running_[request_].callers) queues_.callers.release(runtime, caller, 0, *cause_);
@@ -306,26 +307,51 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
         if (started.status == CopyStatus::Started) {
             cache_.unpin_host(*host_pin_);
             host_pin_.reset();
-            copy(runtime, *started.transfer, matched.host, CopyKind::Load, started.pages, false, request_);
+            if (!copy(runtime, *started.transfer, matched.host, CopyKind::Load, started.pages, false, request_)) return;
+
+            auto ancestor = matched.host;
+            while (ancestor != 0 && cache_.node(ancestor).device->producer == *started.transfer) ancestor = cache_.tree().nodes()[ancestor].parent;
+            const auto active_pages = (observed.token_paths.length(tokens.committed.value().path) + page_tokens_ - 1) / page_tokens_;
+
+            // Existing capacity permits CPU setup after each local return;
+            // reclamation or another unpublished prefix keeps the waiting path.
+            if (regions_ && cache_.available_pages(Tier::Device) >= active_pages - host_pages
+                && cache_.prefix_ready_layers(ancestor, Tier::Device) == backend_.layers) {
+                admit(runtime, matched.host, &copies_.at(*started.transfer));
+                return;
+            }
             wait_for_progress(runtime);
             return;
         }
     }
-    if (cache_.ready_layers(matched.device, Tier::Device) != backend_.layers) {
+    if (cache_.prefix_ready_layers(matched.device, Tier::Device) != backend_.layers) {
         wait_for_progress(runtime);
         return;
     }
+    admit(runtime, matched.device);
+}
+
+void CacheProgram::admit(ProgramRuntime & runtime, RadixId prefix, const PendingCopy * load) {
+    auto & running = running_[request_];
+    const auto & observed = source_.observations();
+    const auto & tokens = observed.request_tokens.at(observed.requests[request_].identity);
+    const auto device_pages = cache_.page_count(prefix);
     const auto committed_tokens = observed.token_paths.length(tokens.committed.value().path);
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
     if (!make_device_room(runtime, active_pages - device_pages)) {
         wait_for_progress(runtime);
         return;
     }
-    running_[request_].buffer = cache_.reserve_request(active_pages - device_pages).value();
+    if (running.pin != prefix) {
+        cache_.unpin_device(*running.pin);
+        cache_.pin_device(prefix);
+        running.pin = prefix;
+    }
+    running.buffer = cache_.reserve_request(active_pages - device_pages).value();
     requests_[request_].device_hit_pages = device_pages;
     requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
     waiting_ = false;
-    compute(runtime);
+    compute(runtime, load);
 }
 
 void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> lookup, const CacheMatch & matched) {
@@ -424,7 +450,7 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
     }
 }
 
-void CacheProgram::compute(ProgramRuntime & runtime) {
+void CacheProgram::compute(ProgramRuntime & runtime, const PendingCopy * load) {
     const auto & observed = source_.observations();
     const auto & request = observed.requests[request_];
     const auto frames = source_.request_frames(request.identity);
@@ -458,6 +484,8 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
     }
 
     auto & compute = running_[request_].compute;
+    const auto caller_ready = load ? std::span<const graph::NodeId>(load->caller_returns) : std::span<const graph::NodeId>{};
+    const auto data_ready = load ? load->completion : std::nullopt;
     if (regions_)
         compute = std::make_unique<RegionCompute>(source_,
                                                   std::move(region_frames),
@@ -466,7 +494,9 @@ void CacheProgram::compute(ProgramRuntime & runtime) {
                                                   region_preparation_,
                                                   queues_,
                                                   *this,
-                                                  request_);
+                                                  request_,
+                                                  caller_ready,
+                                                  data_ready);
     else
         compute = std::make_unique<ComputeProgram>(source_,
                                                    std::move(plans),
@@ -724,7 +754,7 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         completed_copies_.push_back({ pending.kind, pending.pages, std::move(pending.caller_returns), std::move(pending.copy_completions), event.identity });
         if (storage_ && pending.kind == CopyKind::Backup) storage_->enqueue_write(runtime, pending.node, std::move(pending.storage_pages), event.identity);
         copies_.erase(transfer);
-        if (pending.kind == CopyKind::Load) requests_[request_].loaded_pages += pending.pages;
+        if (pending.kind == CopyKind::Load) requests_[pending.request].loaded_pages += pending.pages;
         if (pending.evict_after) {
             pending_evictions_.push_back(pending.node);
             return;

@@ -219,6 +219,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         { "cells", std::move(cells) },
         { "limitations",
          { "Serial fixed-token eager requests on the declared deployment; target observations are not read.",
+            "Input setup follows rank-local load returns when capacity is ready; GPU prefill retains a conservative whole-load data fence.",
             "Observed unchanged empty CPU broadcasts transfer post-arrival responses; local work/communication overlap remains approximate. Unobserved "
             "control retains its source residual.",
             "CPU and opaque stream responses overlap. Each rank starts at its own ready input; scheduler control rendezvous precedes preparation. Stream "

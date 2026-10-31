@@ -33,7 +33,8 @@ Features RegionPreparation::enter(std::size_t caller, Phase phase, const FrameIn
 }
 
 RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<RegionFrame> frames, RegionBackend backend, std::size_t first_resource,
-                             RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request)
+                             RegionPreparation & preparation, ExecutionQueues & queues, RequestControls & controls, std::size_t request,
+                             std::span<const graph::NodeId> caller_ready, std::optional<graph::NodeId> data_ready)
     : source_(source),
       backend_(std::move(backend)),
       first_resource_(first_resource),
@@ -74,6 +75,10 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
         frame.rank = rank;
         frame.group = group->second;
         frame.phase = phase;
+        if (phase == Phase::Prefill) {
+            if (!caller_ready.empty()) frame.caller_ready = caller_ready[rank];
+            frame.data_ready = data_ready;
+        }
         frame.previous = before;
         frame.overlap = result.overlap;
         frame.has_result = result.processed.has_value();
@@ -108,8 +113,9 @@ void RegionCompute::start(ProgramRuntime & runtime, std::optional<graph::NodeId>
     if (issue_) return;
     for (const auto root : roots_) {
         const auto caller = frames_[root].caller;
-        if (previous_owner) queues_.callers.handoff(runtime, caller, *previous_owner, owner_, action(ActionKind::Granted, root), *cause);
-        else queues_.callers.acquire(runtime, caller, owner_, action(ActionKind::Granted, root), cause);
+        const auto ready = frames_[root].caller_ready ? frames_[root].caller_ready : cause;
+        if (previous_owner) queues_.callers.handoff(runtime, caller, *previous_owner, owner_, action(ActionKind::Granted, root), *ready);
+        else queues_.callers.acquire(runtime, caller, owner_, action(ActionKind::Granted, root), ready);
     }
 }
 
@@ -187,13 +193,14 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id) {
 
     std::vector<graph::NodeId> controls{ *frame.control_ready };
 
-    // recv_requests broadcasts once per scheduler iteration. Each peer must
-    // enter that control turn; its opaque residual need not finish first.
-    for (const auto peer : groups_[frame.group]) {
-        if (peer == id) continue;
-        if (!frames_[peer].control_started) return;
-        controls.push_back(*frames_[peer].control_started);
-    }
+    // Admission already joined the initial scheduler turn, before any load.
+    // Later turns rendezvous here; rank-local load returns do not add a barrier.
+    if (frame.previous)
+        for (const auto peer : groups_[frame.group]) {
+            if (peer == id) continue;
+            if (!frames_[peer].control_started) return;
+            controls.push_back(*frames_[peer].control_started);
+        }
 
     frame.description.input = controls_.begin_frame(request_, frame.description.source_frame, frame.description.input);
     const auto & observed = source_.observations().compute_frames[frame.description.source_frame];
@@ -301,6 +308,7 @@ void RegionCompute::launch_frame(ProgramRuntime & runtime, std::size_t id, graph
         { { entered, node, graph::EdgeKind::Submission }, { *frame.input_ready, node, graph::EdgeKind::DataDependency } }
     };
     if (frame.previous) mutation.dependencies.push_back({ *stats_.frames[*frame.previous].completed, node, graph::EdgeKind::DataDependency });
+    if (frame.data_ready) mutation.dependencies.push_back({ *frame.data_ready, node, graph::EdgeKind::DataDependency });
     if (runtime.records_graph())
         mutation.operations.front().position =
             OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "batch" };
