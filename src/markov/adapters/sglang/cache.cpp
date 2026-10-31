@@ -36,6 +36,11 @@ std::size_t minimum_device_tokens(std::size_t prompt_tokens, std::size_t output_
     return paged + output_tokens + page_tokens + 1;
 }
 
+CachePoolBytes cache_pool_bytes(const CacheSettings & settings, std::size_t page_tokens, std::size_t bytes_per_token) {
+    const auto page_bytes = static_cast<double>(page_tokens) * bytes_per_token;
+    return { (static_cast<double>(settings.device_pages) + 1) * page_bytes, static_cast<double>(settings.host_pages) * page_bytes };
+}
+
 namespace {
 
 trace_graph::planning::StorageConfig read_storage(const nlohmann::json & raw, std::size_t device_pages, std::size_t host_pages) {

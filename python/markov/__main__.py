@@ -22,6 +22,8 @@ def main() -> int:
         "predict", help="Predict all targets from one base and selected independent models."
     )
     prediction.add_argument("--request", type=Path, required=True)
+    search_command = commands.add_parser("search", help="Rank a finite prediction set under declared resource plans.")
+    search_command.add_argument("--request", type=Path, required=True)
     capture = commands.add_parser("capture", help="Capture the declared base using its runtime and cumulative budget.")
     capture.add_argument("--request", type=Path, required=True)
     capture.add_argument("--recapture", action="store_true", help="Collect again without resetting prior budget use.")
@@ -57,7 +59,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "evaluate":
+        if args.command == "search":
+            from markov.workflow.search import search
+
+            result = search(args.request)
+        elif args.command == "evaluate":
             from markov.workflow.evaluation import evaluate
 
             result = evaluate(args.request)

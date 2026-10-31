@@ -53,11 +53,17 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             { "device", target.cache.device_pages },
             {   "host",   target.cache.host_pages }
         };
+        const auto pool_bytes = adapters::sglang::cache_pool_bytes(target.cache, target.page_tokens, backend.bytes_per_token);
+        const Json reservation{
+            { "device_kv_bytes_per_rank", pool_bytes.device_per_rank },
+            {   "host_kv_bytes_per_rank",   pool_bytes.host_per_rank }
+        };
         if (target.infeasible) {
             cells.push_back({
                 {                  "name",           target.name },
                 {         "configuration",  target.configuration },
                 {  "cache_capacity_pages",              capacity },
+                {  "resource_reservation",           reservation },
                 {                "status", "resource_infeasible" },
                 {                 "issue",    *target.infeasible },
                 {             "cost_gaps",         Json::array() },
@@ -158,6 +164,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {                  "name",                                                  target.name                                      },
             {         "configuration",                                                                               target.configuration },
             {  "cache_capacity_pages",                                                                                           capacity },
+            {  "resource_reservation",                                                                                        reservation },
             {                "status",
              complete          ? "predicted"
              : program.issue() ? "structure_unavailable"

@@ -30,6 +30,14 @@ struct CacheSettings {
     std::optional<trace_graph::planning::StorageConfig> storage;
 };
 
+struct CachePoolBytes {
+    double device_per_rank, host_per_rank;
+};
+
+// Native allocated pools, including the NPU dummy page; in-pool I/O buffers
+// are already reserved here. Weights, workspace and external buffers are separate.
+CachePoolBytes cache_pool_bytes(const CacheSettings & settings, std::size_t page_tokens, std::size_t bytes_per_token);
+
 CacheSettings read_cache_settings(const nlohmann::json & raw);
 std::optional<trace_graph::planning::StorageConfig> configured_storage(const nlohmann::json & configuration, std::size_t device_pages, std::size_t host_pages);
 trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::SourceContext & source);
