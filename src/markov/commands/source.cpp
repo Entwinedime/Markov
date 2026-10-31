@@ -23,6 +23,79 @@ using namespace trace_graph;
 using Clock = std::chrono::steady_clock;
 using Json = nlohmann::json;
 
+const char * resource_kind(source::ResourceKind kind) {
+    switch (kind) {
+    case source::ResourceKind::CpuThread:
+        return "cpu_thread";
+    case source::ResourceKind::DeviceStream:
+        return "device_stream";
+    case source::ResourceKind::Client:
+        return "client";
+    }
+    std::unreachable();
+}
+
+Json dependency_timing(const source::Observations & observed) {
+    struct Summary {
+        std::size_t count = 0, violations = 0;
+        source::Time max_delta_ns = 0;
+        const source::ObservedDependency * largest = nullptr;
+    };
+    std::map<std::tuple<source::DependencyKind, source::ResourceKind, source::ResourceKind>, Summary> summaries;
+    for (const auto & edge : observed.dependencies) {
+        const auto & producer = observed.points[edge.before];
+        const auto & consumer = observed.points[edge.after];
+        auto & summary = summaries[{ edge.kind, observed.resources[producer.resource].kind, observed.resources[consumer.resource].kind }];
+        ++summary.count;
+        const auto delta = producer.time_ns - consumer.time_ns;
+        if (delta <= 0) continue;
+
+        ++summary.violations;
+        if (delta > summary.max_delta_ns) {
+            summary.max_delta_ns = delta;
+            summary.largest = &edge;
+        }
+    }
+
+    auto groups = Json::array();
+    for (const auto & [key, summary] : summaries) {
+        const auto [kind, producer_kind, consumer_kind] = key;
+        Json example = nullptr;
+        if (summary.largest) {
+            const auto point = [&](source::Index id) -> Json {
+                const auto & value = observed.points[id];
+                return {
+                    {     "file",                           value.record.file },
+                    {   "record",                       value.record.position },
+                    {     "name",                  observed.names[value.name] },
+                    { "resource", observed.resources[value.resource].identity },
+                    {  "time_ns",                               value.time_ns }
+                };
+            };
+            example = {
+                { "producer", point(summary.largest->before) },
+                { "consumer",  point(summary.largest->after) }
+            };
+        }
+        const auto label = kind == source::DependencyKind::Flow ? "flow" : kind == source::DependencyKind::Submission ? "submission" : "synchronization";
+        groups.push_back({
+            {                   "kind",                        label },
+            { "producer_resource_kind", resource_kind(producer_kind) },
+            { "consumer_resource_kind", resource_kind(consumer_kind) },
+            {           "dependencies",                summary.count },
+            { "clock_order_violations",           summary.violations },
+            {       "max_violation_ns",         summary.max_delta_ns },
+            {      "largest_violation",           std::move(example) }
+        });
+    }
+    return {
+        {        "groups", std::move(groups)                         },
+        { "qualification",
+         "Observed timestamp conflicts are not proof of wrong pairing or clock drift. Dependencies and raw coordinates remain unchanged; "
+         "cross-resource timing requires independent clock evidence." }
+    };
+}
+
 Json cpu_interval_summary(const source::SourceContext & source) {
     struct Summary {
         std::size_t calls = 0;
@@ -339,17 +412,19 @@ Json timing_alignment(const source::Observations & observations, const source::S
                 example["duration_ns"] = operation.duration_ns;
             }
         }
-        const auto label = kind == source::ResourceKind::CpuThread ? "cpu_thread" : kind == source::ResourceKind::DeviceStream ? "device_stream" : "client";
         result.push_back({
-            {                     "resource",                                                                                  label },
-            {                    "cost_role", node_kind == graph::NodeKind::ProfilerOverhead ? "profiler_overhead" : "observed_work" },
-            {                    "node_kind",                                                               node_kinds.at(node_kind) },
-            {                        "nodes",                                                                            group.nodes },
-            {                "earlier_nodes",                                                                          group.earlier },
-            {                  "later_nodes",                                                                            group.later },
-            {  "max_absolute_start_delta_ns",                                                            group.max_absolute_delta_ns },
-            {     "largest_interval_example",                                                                     std::move(example) },
-            { "mean_absolute_start_delta_ns",                                                 group.absolute_delta_sum / group.nodes }
+            {                     "resource",resource_kind(kind)                                             },
+            {                    "cost_role",
+             node_kind == graph::NodeKind::ProfilerOverhead ? "profiler_overhead"
+             : node_kind == graph::NodeKind::ResidualGap    ? "unclassified_gap"
+             : "observed_work"                                                      },
+            {                    "node_kind",               node_kinds.at(node_kind) },
+            {                        "nodes",                            group.nodes },
+            {                "earlier_nodes",                          group.earlier },
+            {                  "later_nodes",                            group.later },
+            {  "max_absolute_start_delta_ns",            group.max_absolute_delta_ns },
+            {     "largest_interval_example",                     std::move(example) },
+            { "mean_absolute_start_delta_ns", group.absolute_delta_sum / group.nodes }
         });
     }
     return result;
@@ -558,70 +633,53 @@ nlohmann::json source_report(const adapters::PreparedSource & source) {
         });
     Json dependency_audit = captured.flow_audit;
     dependency_audit.update(built_source.audit);
-    auto dependency_issues = Json::array();
-    for (const auto & issue : built_source.dependency_timing_issues) {
-        const auto & producer = captured.points[issue.before];
-        const auto & consumer = captured.points[issue.after];
-        dependency_issues.push_back({
-            { "producer",
-             { { "file", producer.record.file },
-             { "record", producer.record.position },
-             { "name", captured.names[producer.name] },
-             { "time_ns", producer.time_ns } }   },
-            { "consumer",
-             { { "file", consumer.record.file },
-             { "record", consumer.record.position },
-             { "name", captured.names[consumer.name] },
-             { "time_ns", consumer.time_ns } }   },
-            { "delta_ns",          issue.delta_ns }
-        });
-    }
+    auto dependency_report = dependency_timing(captured);
     return {
-        {                         "status",                                                       "source_graph_replayed"                                           },
-        {                       "manifest",                                                                                                   manifest.path.string() },
-        {                  "configuration",                                manifest.configuration_path ? Json(manifest.configuration_path->string()) : Json(nullptr) },
-        {        "capture_origin_manifest",                      manifest.capture_origin_manifest ? Json(manifest.capture_origin_manifest->string()) : Json(nullptr) },
-        {    "capture_completeness_proven",                                                                                                                    false },
-        {                     "cost_basis",                                                            "observed_exclusive_wall_intervals_and_unclassified_cpu_gaps" },
-        {                         "inputs",                                                                                                        std::move(inputs) },
-        {                 "observed_spans",                                                                                                    captured.spans.size() },
-        {                "observed_points",                                                                                                   captured.points.size() },
-        {                    "graph_nodes",                                                                                        built_source.graph.nodes().size() },
-        {                    "graph_edges",                                                                                        built_source.graph.edges().size() },
-        {       "native_observation_roles",                                                                                                      source.native_roles },
-        {              "work_descriptions",                                                                                             std::move(work_descriptions) },
-        {         "work_description_scope",                                                                                         "observed_compute_recipe_subset" },
-        {                 "compute_frames",                                                                                                        std::move(frames) },
-        {                  "batch_results",                                                                                                       std::move(results) },
-        {                  "host_controls",                                                                                                      std::move(controls) },
-        {          "result_processing_cpu",                                                                                         source_result_cpu_report(source) },
+        {                         "status",                                             "source_graph_replayed"                                           },
+        {                       "manifest",                                                                                         manifest.path.string() },
+        {                  "configuration",                      manifest.configuration_path ? Json(manifest.configuration_path->string()) : Json(nullptr) },
+        {        "capture_origin_manifest",            manifest.capture_origin_manifest ? Json(manifest.capture_origin_manifest->string()) : Json(nullptr) },
+        {    "capture_completeness_proven",                                                                                                          false },
+        {                     "cost_basis",                                             "observed_exclusive_wall_intervals_and_unclassified_resource_gaps" },
+        {                         "inputs",                                                                                              std::move(inputs) },
+        {                 "observed_spans",                                                                                          captured.spans.size() },
+        {                "observed_points",                                                                                         captured.points.size() },
+        {                    "graph_nodes",                                                                              built_source.graph.nodes().size() },
+        {                    "graph_edges",                                                                              built_source.graph.edges().size() },
+        {       "native_observation_roles",                                                                                            source.native_roles },
+        {              "work_descriptions",                                                                                   std::move(work_descriptions) },
+        {         "work_description_scope",                                                                               "observed_compute_recipe_subset" },
+        {                 "compute_frames",                                                                                              std::move(frames) },
+        {                  "batch_results",                                                                                             std::move(results) },
+        {                  "host_controls",                                                                                            std::move(controls) },
+        {          "result_processing_cpu",                                                                               source_result_cpu_report(source) },
         {     "host_control_qualification",
          "Observed cache/allocator envelopes can nest and are not additive CPU services. Thread CPU and shape counters are raw source observations; "
-         "result-processing membership uses the same caller and complete temporal containment. These controls are not yet executed in target prediction."           },
-        {              "collective_groups",                                                                                                        std::move(groups) },
-        {        "collective_observations",                                                                                              std::move(collective_calls) },
-        {      "source_compute_projection",                                                                                        source_compute_alignment(context) },
-        {         "device_service_binding",                                                                                          device_service_summary(context) },
-        {             "cpu_work_intervals",                                                                                            cpu_interval_summary(context) },
-        {               "source_cpu_costs",                                                                                           source_cpu_cost_report(source) },
-        {                 "request_tokens",                                                                                          request_token_summary(captured) },
-        {         "logical_token_prefixes",                                                                                              captured.token_paths.size() },
-        {        "work_observation_counts",                                                                                                   std::move(work_counts) },
-        {              "work_observations",                                                                                        captured.work_observations.size() },
-        {          "work_observation_unit",                                                                                              "native_compute_probe_call" },
-        {                  "record_counts",                                                                                                          captured.counts },
-        {               "dependency_audit",                                                                                              std::move(dependency_audit) },
-        {       "unresolved_flow_examples",                                                                                                 std::move(flow_examples) },
-        {              "dependency_timing", { { "max_violation_ns", built_source.max_dependency_clock_violation_ns }, { "examples", std::move(dependency_issues) } } },
-        {                         "replay",                                                                                                 std::move(replay_report) },
-        {               "timing_alignment",                                                                                              std::move(alignment_report) },
+         "result-processing membership uses the same caller and complete temporal containment. These controls are not yet executed in target prediction." },
+        {              "collective_groups",                                                                                              std::move(groups) },
+        {        "collective_observations",                                                                                    std::move(collective_calls) },
+        {      "source_compute_projection",                                                                              source_compute_alignment(context) },
+        {         "device_service_binding",                                                                                device_service_summary(context) },
+        {             "cpu_work_intervals",                                                                                  cpu_interval_summary(context) },
+        {               "source_cpu_costs",                                                                                 source_cpu_cost_report(source) },
+        {                 "request_tokens",                                                                                request_token_summary(captured) },
+        {         "logical_token_prefixes",                                                                                    captured.token_paths.size() },
+        {        "work_observation_counts",                                                                                         std::move(work_counts) },
+        {              "work_observations",                                                                              captured.work_observations.size() },
+        {          "work_observation_unit",                                                                                    "native_compute_probe_call" },
+        {                  "record_counts",                                                                                                captured.counts },
+        {               "dependency_audit",                                                                                    std::move(dependency_audit) },
+        {       "unresolved_flow_examples",                                                                                       std::move(flow_examples) },
+        {              "dependency_timing",                                                                                   std::move(dependency_report) },
+        {                         "replay",                                                                                       std::move(replay_report) },
+        {               "timing_alignment",                                                                                    std::move(alignment_report) },
         {                     "timing_sec",
          { { "read_and_interpret", source.read_and_interpret_sec },
          { "build", source.build_sec + context.detailed_preparation_sec() },
          { "replay", std::chrono::duration<double>(finished - begin).count() },
-         { "summary", std::chrono::duration<double>(summarized - finished).count() } }                                                                              },
-        {  "dependency_correctness_proven",                                                                                                                    false },
-        { "normal_runtime_accuracy_proven",                                                                                                                    false }
+         { "summary", std::chrono::duration<double>(summarized - finished).count() } }                                                                    },
+        {  "dependency_correctness_proven",                                                                                                          false },
+        { "normal_runtime_accuracy_proven",                                                                                                          false }
     };
 }
 

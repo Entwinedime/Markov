@@ -21,13 +21,20 @@ void ProbeReader::observe(const ProbeEvent & event) {
     if (event.name != "runtime.ktransformers.phase" && event.name != "runtime.ktransformers.generate") return;
 
     const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
-    output_.span({ event.begin_ns, event.end_ns, resource, output_.name(event.name), event.record });
+    const auto name = output_.name(event.name);
+    const ObservedRegion region{ resource, event.begin_ns, event.end_ns, event.record };
+    output_.span({ event.begin_ns, event.end_ns, resource, name, event.record });
     const auto & args = event.args;
     const auto requests = args.at("request_ids").get<std::vector<std::string>>();
     if (requests.size() != 1) throw std::runtime_error("Synchronous KTransformers regions require one request");
     const auto & identity = requests.front();
     const auto request = output_.name(identity);
     const auto duration = event.end_ns - event.begin_ns;
+    if (event.name == "runtime.ktransformers.phase") {
+        // Dense phases explicitly call torch.npu.synchronize before recording
+        // their end. The source DAG must retain that observed return dependency.
+        output_.device_completion_fences.push_back({ region, output_.point({ event.end_ns, resource, name, event.record }) });
+    }
     if (event.name == "runtime.ktransformers.phase" && configuration_) {
         auto work = phase_work(*configuration_,
                                args.at("phase").get<std::string>(),
@@ -35,22 +42,11 @@ void ProbeReader::observe(const ProbeEvent & event) {
                                args.at("context_tokens").get<Index>(),
                                args.at("first_phase").get<bool>(),
                                args.at("emit_token").get<bool>());
-        output_.cost_observations.push_back({
-            request,
-            iterations_[identity]++,
-            0,
-            "phase",
-            std::move(work),
-            duration,
-            { resource, event.begin_ns, event.end_ns, event.record }
-        });
+        output_.cost_observations.push_back({ request, iterations_[identity]++, 0, "phase", std::move(work), duration, region });
         phase_durations_[identity] += duration;
     }
     if (event.name == "runtime.ktransformers.generate") {
-        output_.request_executions.push_back({
-            request,
-            { resource, event.begin_ns, event.end_ns, event.record }
-        });
+        output_.request_executions.push_back({ request, region });
         if (!configuration_) return;
         const auto remainder = duration - phase_durations_.at(identity);
         if (remainder < 0) throw std::runtime_error("Generate phases exceed their enclosing interval");
@@ -59,15 +55,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
                                  args.at("prefill_steps").get<Index>(),
                                  args.at("decode_steps").get<Index>(),
                                  args.at("first_request").get<bool>());
-        output_.cost_observations.push_back({
-            request,
-            0,
-            0,
-            "control",
-            std::move(work),
-            remainder,
-            { resource, event.begin_ns, event.end_ns, event.record }
-        });
+        output_.cost_observations.push_back({ request, 0, 0, "control", std::move(work), remainder, region });
     }
 }
 

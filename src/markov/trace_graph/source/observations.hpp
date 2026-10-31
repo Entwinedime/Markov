@@ -116,6 +116,13 @@ struct ObservedRegion {
     RecordRef record;
 };
 
+struct DeviceCompletionFence {
+    // The adapter observed a synchronized region: device services submitted by
+    // this caller inside the region must finish before its completion point.
+    ObservedRegion submissions;
+    Index completion;
+};
+
 struct RequestExecutionRegion {
     Index request;
     ObservedRegion region;
@@ -268,6 +275,7 @@ public:
     std::vector<ObservedPoint> points;
     std::vector<ObservedFlow> flows;
     std::vector<ObservedDependency> dependencies;
+    std::vector<DeviceCompletionFence> device_completion_fences;
     std::vector<NativeQueueCall> native_queue_calls;
     std::vector<NativeRuntimeCall> native_runtime_calls;
     std::vector<ObservedDeviceControl> device_controls;

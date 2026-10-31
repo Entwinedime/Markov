@@ -17,13 +17,6 @@ struct SourceGraph {
     std::vector<NodeOrigin> node_origins;
     std::vector<graph::NodeId> point_nodes;
     std::map<std::string, std::size_t> audit;
-    struct DependencyTimingIssue {
-        Index before;
-        Index after;
-        Time delta_ns;
-    };
-    Time max_dependency_clock_violation_ns = 0;
-    std::vector<DependencyTimingIssue> dependency_timing_issues;
     struct HttpEndpoint {
         RequestWindow request;
         graph::NodeId start;
@@ -37,7 +30,9 @@ struct SourceGraph {
 
 // Partition observed CPU wall intervals without charging both parent and child.
 // Their waiting portions are not yet proof of transferable CPU service costs.
-// Preserve named boundaries and explicit flow edges; retain CPU gaps separately.
+// Preserve named boundaries, explicit flow edges and unobserved resource gaps.
+// An independent lane entry retains its initial observed availability.
+// Device gaps retain source coordinates; they are not transferable service costs.
 SourceGraph build_source_graph(const Observations & observations);
 
 } // namespace markov::trace_graph::source

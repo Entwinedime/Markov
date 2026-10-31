@@ -1,4 +1,5 @@
 #include "markov/trace_graph/source/build.hpp"
+#include "markov/trace_graph/source/services.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -42,6 +43,11 @@ public:
             const auto point_time = point < input_.points.size() ? observations_.points[input_.points[point]].time_ns : std::numeric_limits<Time>::max();
             const auto time = std::min(boundary_time, point_time);
             if (previous && time > *previous) observe_interval(*previous, time);
+            else if (!previous) {
+                // An incoming flow must not erase this lane's first observed
+                // availability. Later nodes still follow costs and dependencies.
+                frontier_ = { append({ time, 0, no_span, graph::NodeKind::Boundary }) };
+            }
 
             if (point < input_.points.size() && observations_.points[input_.points[point]].time_ns == time) {
                 flush_interval();
@@ -91,10 +97,6 @@ private:
     }
 
     void observe_interval(Time begin, Time end) {
-        if (active_.empty() && observations_.resources[resource_].kind != ResourceKind::CpuThread) {
-            flush_interval();
-            return;
-        }
         const auto span = active_.empty() ? no_span : std::get<2>(*active_.begin());
         auto kind = graph::NodeKind::ResidualGap;
         if (span != no_span) {
@@ -166,11 +168,28 @@ SourceGraph build_source_graph(const Observations & observations) {
         if (dependency.kind == DependencyKind::Submission) kind = graph::EdgeKind::Submission;
         if (dependency.kind == DependencyKind::Synchronization) kind = graph::EdgeKind::Synchronization;
         result.graph.connect(result.point_nodes[dependency.before], result.point_nodes[dependency.after], kind);
-        const auto delta = observations.points[dependency.before].time_ns - observations.points[dependency.after].time_ns;
-        if (dependency.kind != DependencyKind::Flow && delta > 0) {
-            ++result.audit["native_dependency_clock_order_violations"];
-            result.max_dependency_clock_violation_ns = std::max(result.max_dependency_clock_violation_ns, delta);
-            if (result.dependency_timing_issues.size() < 5) result.dependency_timing_issues.push_back({ dependency.before, dependency.after, delta });
+    }
+    if (!observations.device_completion_fences.empty()) {
+        std::vector<ObservedRegion> regions;
+        for (const auto & fence : observations.device_completion_fences) regions.push_back(fence.submissions);
+        const auto bindings = bind_device_services(observations, result, regions);
+        result.audit["observed_device_completion_fences"] = regions.size();
+        for (Index id = 0; id < bindings.size(); ++id) {
+            if (!bindings[id].available()) {
+                ++result.audit["device_completion_fences_without_unique_service"];
+                continue;
+            }
+            std::map<Index, graph::NodeId> frontiers;
+            for (const auto node : bindings[id].nodes) frontiers[result.graph.nodes()[node].resource] = node;
+            const auto completed = result.point_nodes[observations.device_completion_fences[id].completion];
+            for (const auto & [resource, producer] : frontiers) {
+                // Lane order already contains earlier services. Gate the
+                // region's return, never its start or its observed wait cost.
+                result.graph.connect(producer, completed, graph::EdgeKind::Synchronization);
+                ++result.audit["device_completion_fence_frontiers"];
+                if (result.node_origins[producer].begin_ns + result.graph.nodes()[producer].duration_ns > result.node_origins[completed].begin_ns)
+                    ++result.audit["device_completion_fence_clock_order_violations"];
+            }
         }
     }
     std::optional<graph::NodeId> previous_http;

@@ -44,6 +44,7 @@ void Observations::normalize_resources() {
     for (auto & execution : request_executions) execution.region.resource = canonical_resource(execution.region.resource);
     for (auto & span : spans) span.resource = canonical_resource(span.resource);
     for (auto & point : points) point.resource = canonical_resource(point.resource);
+    for (auto & fence : device_completion_fences) fence.submissions.resource = canonical_resource(fence.submissions.resource);
     for (auto & work : work_observations) work.resource = canonical_resource(work.resource);
     for (auto & call : collectives) call.resource = canonical_resource(call.resource);
     for (auto & call : native_queue_calls) {
@@ -107,7 +108,6 @@ void Observations::resolve_flows() {
         // occurrences require native disambiguation before reaching this layer.
         if (pair.ends.size() > 1) ++flow_audit["fanout_flows"];
         for (const auto end : pair.ends) {
-            if (points[pair.start->point].time_ns > points[end].time_ns) ++flow_audit["flow_clock_order_violations"];
             dependencies.push_back({ pair.start->point, end, pair.start->kind });
             ++flow_audit["paired_flows"];
         }
