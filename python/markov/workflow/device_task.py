@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import fcntl
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -32,14 +33,21 @@ class DeviceTask:
         self.runtime = AscendDevices(settings.devices)
 
     def retained_bytes(self) -> int:
+        def handle_walk_error(error: OSError) -> None:
+            if not isinstance(error, FileNotFoundError):
+                raise error
+
         total = 0
-        for path in self.directory.rglob("*"):
-            try:
-                if path.is_file():
-                    total += path.stat().st_size
-            except FileNotFoundError:
-                # Exporters may retire temporary files while counted.
-                continue
+
+        # Exporters retire both files and directories while the budget is checked.
+        for directory, _, names in os.walk(self.directory, onerror=handle_walk_error):
+            for name in names:
+                path = Path(directory) / name
+                try:
+                    if path.is_file():
+                        total += path.stat().st_size
+                except FileNotFoundError:
+                    continue
         return total
 
     def remaining(self) -> dict:
