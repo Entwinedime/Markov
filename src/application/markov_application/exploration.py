@@ -9,7 +9,6 @@ import shutil
 import stat
 import subprocess
 import time
-from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,19 +17,13 @@ from typing import Any
 from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
 from markov_collection.artifacts import write_json
 
+from markov_application.command import CommandFailed, terminate
 from markov_application.environment import DockerEnvironment
 from markov_application.specification import read_specification
 
 
 class BudgetExceeded(RuntimeError):
     pass
-
-
-class CommandFailed(RuntimeError):
-    def __init__(self, returncode: int, stderr: str, log: Path) -> None:
-        super().__init__(f"command failed ({returncode}): {stderr}\nlog: {log}")
-        self.returncode = returncode
-        self.stderr = stderr
 
 
 class Exploration:
@@ -99,7 +92,7 @@ class Exploration:
     def step(self, command: list[str], category: str) -> None:
         reserved = self.available(category)
 
-        # An interrupted launcher keeps its reservation charged; only a known return refunds the unused time.
+        # A lost launcher or unconfirmed cleanup keeps the reserved allocation charged.
         self.state["charged_ns"][category] += reserved
         self.state["pending"] = category
         if category == "native":
@@ -108,30 +101,34 @@ class Exploration:
         started = time.monotonic_ns()
         log_path = self.directory / "logs/run.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        process = None
+        completed = False
         try:
             with log_path.open("a") as log:
                 log.write(json.dumps({"category": category, "command": command}) + "\n")
                 log.flush()
                 output_begin = log.tell()
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
-                try:
-                    while process.poll() is None:
-                        current_bytes = self.storage_bytes()
-                        self.state["peak_run_bytes"] = max(self.state["peak_run_bytes"], current_bytes)
-                        if current_bytes > self.specification["budget"]["temporary_bytes"]:
-                            raise BudgetExceeded("temporary storage budget exceeded")
-                        if time.monotonic_ns() - started > reserved:
-                            raise BudgetExceeded(f"{category} time budget exhausted")
-                        try:
-                            process.wait(timeout=1)
-                        except subprocess.TimeoutExpired:
-                            pass
-                except BaseException:
-                    self.environment.cleanup()
-                    process.terminate()
-                    process.wait()
-                    raise
+                while process.poll() is None:
+                    current_bytes = self.storage_bytes()
+                    self.state["peak_run_bytes"] = max(self.state["peak_run_bytes"], current_bytes)
+                    if current_bytes > self.specification["budget"]["temporary_bytes"]:
+                        raise BudgetExceeded("temporary storage budget exceeded")
+                    if time.monotonic_ns() - started > reserved:
+                        raise BudgetExceeded(f"{category} time budget exhausted")
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+            completed = process.returncode == 0
         finally:
+            try:
+                if process is not None:
+                    terminate(process)
+            finally:
+                if not completed:
+                    self.environment.cleanup()
+
             elapsed = time.monotonic_ns() - started
             self.state["charged_ns"][category] += elapsed - reserved
             self.state["pending"] = None
@@ -143,14 +140,7 @@ class Exploration:
         if process.returncode == 137:
             self.available(category)
         if process.returncode:
-            with log_path.open() as log:
-                log.seek(output_begin)
-                lines = (line.strip() for line in log)
-                lines = (line for line in lines if line)
-                first = next(lines, "")
-                tail = deque(lines, maxlen=12)
-            message = "\n".join(line[:600] for line in (first, *tail))
-            raise CommandFailed(process.returncode, message, log_path)
+            raise CommandFailed(process.returncode, log_path, output_begin)
 
     def build_tool(self) -> None:
 
@@ -307,6 +297,25 @@ class Exploration:
         assets.parent.mkdir(parents=True, exist_ok=True)
         draft.replace(assets)
 
+    def simulate(self, asset: Path, target: Path, result: Path, details: bool) -> None:
+        arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(result)]
+        if details:
+            arguments.append("--details")
+        remaining = self.available("processing")
+        if self.specification.get("control", "lightweight") == "native":
+            command = [
+                "bash",
+                str(self.root / "scripts/markov-control.sh"),
+                *arguments[1:],
+                "--timeout-seconds",
+                str(remaining / 1e9),
+                "--task-directory",
+                str(self.directory),
+            ]
+        else:
+            command = self.environment.tool_command(arguments, [asset, target], result, remaining)
+        self.step(command, "processing")
+
     def predict(self) -> None:
         for configuration in self.specification["configurations"]:
             domain = self.configurations[configuration["id"]]
@@ -350,22 +359,8 @@ class Exploration:
                 write_json(target, inputs)
                 base = "diagnostics" if self.details else "results"
                 result = self.directory / base / (key + ".json")
-                arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(result)]
-                if self.details:
-                    arguments.append("--details")
                 try:
-                    remaining = self.available("processing")
-                    if self.specification.get("control", "lightweight") == "native":
-                        command = [
-                            "bash",
-                            str(self.root / "scripts/markov-control.sh"),
-                            *arguments[1:],
-                            "--timeout-seconds",
-                            str(remaining / 1e9),
-                        ]
-                    else:
-                        command = self.environment.tool_command(arguments, [asset, target], result, remaining)
-                    self.step(command, "processing")
+                    self.simulate(asset, target, result, self.details)
                     self.state["results"][key] = str(result.relative_to(self.directory))
                     self.state["failures"].pop(key, None)
                     self.save()
@@ -479,14 +474,20 @@ class Exploration:
             self.state["failures"]["task"] = str(error)
             raise
         finally:
-            self.environment.cleanup()
-            work = self.directory / "work"
+            try:
+                self.environment.cleanup()
+                work = self.directory / "work"
 
-            # Published sources no longer need the SDK or observer build, including a partial target result.
-            if work.exists() and all((self.directory / "assets" / name).exists() for name in domains):
-                shutil.rmtree(work)
-            self.save()
-            self.report()
+                # Published sources no longer need the SDK or observer build, including a partial target result.
+                if work.exists() and all((self.directory / "assets" / name).exists() for name in domains):
+                    shutil.rmtree(work)
+            except BaseException as error:
+                self.state["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+                self.state["failures"]["cleanup"] = str(error)
+                raise
+            finally:
+                self.save()
+                self.report()
 
 
 def main() -> None:
@@ -520,17 +521,21 @@ def main() -> None:
             if old_fixed != new_fixed:
                 raise ValueError("resume keeps the model, configurations, workloads and deployment fixed")
             changed_durations = old["node_durations_ns"] != specification["node_durations_ns"]
-        if old != specification:
-            write_json(previous, specification, indent=2)
         task = Exploration(root, directory, specification, arguments.details)
         print(directory, flush=True)
         if changed_durations:
-            for path in task.state["results"].values():
+            results = task.state["results"]
+            task.state["results"] = {}
+            task.state["status"] = "pending"
+
+            # Invalidate every published result before changing input or deleting any file.
+            task.save()
+            for path in results.values():
                 owned = (directory / path).resolve()
                 owned.relative_to(directory)
                 owned.unlink(missing_ok=True)
-            task.state["results"] = {}
-            task.state["status"] = "pending"
+        if old != specification:
+            write_json(previous, specification, indent=2)
         task.run()
         print(directory / "results/summary.md")
         if task.state["status"] != "complete":

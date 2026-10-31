@@ -5,30 +5,38 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+from markov_application.command import CommandFailed, terminate
+
 
 class NativeExecution:
-    def __init__(self, root: Path, output: Path, timeout_seconds: float) -> None:
+    def __init__(self, root: Path, output: Path, timeout_seconds: float, task_directory: Path | None = None) -> None:
         self.binary = root / "build/automatic-graph/markov"
         self.lock = self.binary.parent.with_suffix(".lock")
         self.output = output.resolve()
         self.logs = self.output.with_suffix(".logs")
         self.timeout_seconds = timeout_seconds
         self.label = f"markov.control={uuid4().hex}"
+        self.task_directory = task_directory
         self.prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
 
     def run(self, templates: Path, workload: Path, details: bool) -> None:
         templates, workload = (path.resolve(strict=True) for path in (templates, workload))
+        logs = [self.logs / (role + ".log") for role in ("core", "native")]
+        outputs = {path.resolve() for path in (self.output, *logs)}
+
+        # Log streams truncate in place, including through a hard link to an input.
         for path in (self.binary, self.lock, templates, workload):
             if not path.is_file():
                 raise FileNotFoundError(f"Prediction input is not a file: {path}")
-        if self.output in (self.binary, self.lock, templates, workload):
-            raise ValueError("Prediction output must not overwrite an input")
+            if path.resolve() in outputs or any(log.exists() and log.samefile(path) for log in logs):
+                raise ValueError("Prediction output and logs must not overwrite an input")
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(exist_ok=True)
         staging = TemporaryDirectory(prefix=f".{self.output.name}.", dir=self.output.parent)
@@ -98,6 +106,10 @@ class NativeExecution:
             "--entrypoint",
             "timeout",
         ]
+        if self.task_directory is not None:
+
+            # The task can recover both workers even if its prediction launcher was lost.
+            command += ["--label", f"markov.run={self.task_directory}"]
         for source, (destination, access) in mounts.items():
             command += ["-v", f"{source}:{destination}:{access}"]
         return [
@@ -134,20 +146,24 @@ class NativeExecution:
                 for role, process in zip(("core", "native"), processes, strict=True):
                     code = process.wait(timeout=max(0, deadline - time.monotonic()))
                     if code:
-                        raise RuntimeError(f"{role} exited with status {code}; see {self.logs / (role + '.log')}")
+
+                        # Core EOF can follow a native failure; preserve both causes through the task's excerpt.
+                        sys.stderr.write(CommandFailed.context(self.logs / "core.log") + "\n")
+                        native_context = CommandFailed.context(self.logs / "native.log")
+                        raise RuntimeError(
+                            f"{role} exited with status {code}; logs: {self.logs}\nnative: {native_context}"
+                        )
         finally:
             try:
-                self.cleanup()
-            finally:
                 for process in processes:
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                signal.signal(signal.SIGTERM, previous_signal)
+                    terminate(process)
+            finally:
+                try:
+
+                    # Stop launchers before the final Docker snapshot so they cannot create another worker.
+                    self.cleanup()
+                finally:
+                    signal.signal(signal.SIGTERM, previous_signal)
 
     def cleanup(self) -> None:
         identities = subprocess.check_output(
@@ -167,13 +183,14 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=300)
+    parser.add_argument("--task-directory", type=Path, help="associate prediction workers with their owning task")
     parser.add_argument("--details", action="store_true")
     arguments = parser.parse_args()
     if arguments.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
 
     root = Path(__file__).resolve().parents[3]
-    NativeExecution(root, arguments.output, arguments.timeout_seconds).run(
+    NativeExecution(root, arguments.output, arguments.timeout_seconds, arguments.task_directory).run(
         arguments.templates, arguments.input, arguments.details
     )
 
