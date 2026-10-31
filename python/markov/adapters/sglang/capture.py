@@ -168,12 +168,14 @@ class Capture(SerialHttpClient):
             if len(files) != self.plan["deployment"]["tensor_parallel"]:
                 raise RuntimeError("Independent region measurement did not report every TP worker")
             phases = set()
+            measurement_ports = set()
             for path in files:
                 with path.open(encoding="utf-8") as stream:
                     roles = set()
                     for line in stream:
                         event = json.loads(line)
                         roles.add(event["name"])
+                        measurement_ports.add(event["name"])
                         if any(
                             int(rid.removeprefix("request_")) >= self.plan["workload"]["formal_begin_index"]
                             for rid in event["args"]["request_ids"]
@@ -199,6 +201,7 @@ class Capture(SerialHttpClient):
                     "configuration": self.plan["server"],
                     "formal_begin_index": self.plan["workload"]["formal_begin_index"],
                     "phases": sorted(phases),
+                    "measurement_ports": sorted(measurement_ports),
                     "output_counts": [row["generated_tokens"] for row in self.rows if row["measure"]],
                     "files": [str(path.relative_to(self.directory)) for path in files],
                     "limitations": [

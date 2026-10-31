@@ -59,6 +59,7 @@ add_library(markov_prediction
     src/markov/trace_graph/planning/cache_controls.cpp
     src/markov/trace_graph/planning/storage.cpp
     src/markov/trace_graph/planning/storage_query.cpp
+    src/markov/trace_graph/planning/storage_control.cpp
     src/markov/trace_graph/planning/compute_program.cpp
     src/markov/trace_graph/planning/region_compute.cpp
     src/markov/trace_graph/simulation/program_execution.cpp

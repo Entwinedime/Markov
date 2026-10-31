@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -27,8 +28,8 @@ public:
 
     // Issue once at enqueue; admission checks consume only the progress already
     // published by the worker. Completion alone cannot insert a host prefix.
-    void begin_prefetch(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
-                        std::optional<graph::NodeId> cause);
+    std::optional<graph::NodeId> begin_prefetch(ProgramRuntime & runtime, std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched,
+                                                std::span<const std::size_t> callers, std::optional<graph::NodeId> cause);
     PrefetchCheck check_prefetch(ProgramRuntime & runtime, std::size_t request, std::optional<graph::NodeId> cause);
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
@@ -38,7 +39,20 @@ public:
     const StorageStats & stats() const { return stats_; }
 
 private:
-    enum class ActionKind : std::uint32_t { Allocated, PageRead, PageCopied, ReadReturned, Accept, Queried, Gathered, Prepared, PageWritten, PageTouched };
+    enum class ActionKind : std::uint32_t {
+        Allocated,
+        PageRead,
+        PageCopied,
+        ReadReturned,
+        Accept,
+        Queried,
+        Gathered,
+        Prepared,
+        PageWritten,
+        PageTouched,
+        Issued,
+        Checked
+    };
     static simulation::Action action(ActionKind kind, std::size_t subject) { return { std::to_underlying(kind), subject }; }
 
     struct ReadCursor {
@@ -73,11 +87,20 @@ private:
         std::deque<WriteCursor> writes;
         std::optional<graph::NodeId> read_completion, write_completion;
     };
+    struct Foreground {
+        std::vector<std::size_t> callers;
+        std::size_t candidate_pages = 0;
+        bool active = false;
+    };
 
     bool service(ProgramRuntime & runtime, const WorkKind & kind, std::size_t pages, std::size_t rank, bool writer, simulation::Action action,
                  std::optional<graph::NodeId> cause);
     graph::NodeId join(ProgramRuntime & runtime, std::span<const graph::NodeId> causes);
     std::optional<graph::NodeId> queued_cause(ProgramRuntime & runtime, std::optional<graph::NodeId> enqueue, std::optional<graph::NodeId> previous);
+    void allocate_prefetch(std::size_t request, std::span<const PrefixId> lookup, const CacheMatch & matched);
+    std::optional<graph::NodeId> control_response(ProgramRuntime & runtime, std::size_t request, const WorkKind & kind, Features features,
+                                                  ActionKind completion, std::string_view port, std::optional<graph::NodeId> cause);
+    bool finish_check(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause);
     void start_query(ProgramRuntime & runtime, std::size_t request);
     bool finish_query(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause);
     void trim_buffer(std::size_t request, std::size_t remaining_pages);
@@ -101,6 +124,7 @@ private:
     std::vector<PrefetchResult> results_;
     StorageStats stats_;
     std::vector<Worker> workers_;
+    std::vector<Foreground> foreground_;
     std::size_t access_ = 0, occupied_pages_ = 0, reserved_pages_ = 0;
     std::map<std::size_t, Prefetch> prefetches_;
     std::deque<std::size_t> queries_;

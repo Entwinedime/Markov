@@ -23,14 +23,14 @@ struct StorageBackend {
     std::size_t batch_pages;
     WorkKind allocate, read_page, copy_publish, read_return;
     WorkKind gather, batch_prepare, new_page, existing_page;
-    WorkKind query;
+    WorkKind query, issue, check, accept;
 };
 
 struct PrefetchResult {
     bool examined = false, ready = false;
     std::size_t requested_pages = 0, queried_pages = 0, published_pages = 0, accepted_pages = 0, inserted_pages = 0;
     bool stopped_early = false, worker_done = false, rebased_suffix = false;
-    std::optional<graph::Time> issued_ns, first_check_ns, accepted_ns, worker_finished_ns, query_finished_ns;
+    std::optional<graph::Time> issued_ns, first_check_ns, accepted_ns, worker_finished_ns, query_finished_ns, issue_finished_ns, stopped_ns;
 };
 
 struct StorageStats {

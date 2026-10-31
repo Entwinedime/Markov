@@ -289,7 +289,10 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
         return;
     }
     if (storage_) {
-        storage_->begin_prefetch(runtime, request_, lookup, matched, cause_);
+        if (storage_->begin_prefetch(runtime, request_, lookup, matched, running_[request_].callers, cause_)) {
+            request_stage_ = RequestStage::PrefetchIssuing;
+            return;
+        }
         const auto progress = storage_->check_prefetch(runtime, request_, cause_);
         if (progress == PrefetchCheck::Pending) {
             poll_prefetch(runtime);
@@ -404,7 +407,7 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
     request_stage_ = RequestStage::Querying;
     requests_[request_].query_index_copies += copies.size();
     if (regions_) {
-        if (storage_) storage_->begin_prefetch(runtime, request_, lookup, matched, cause_);
+        const auto issued = storage_ ? storage_->begin_prefetch(runtime, request_, lookup, matched, running.callers, cause_) : std::nullopt;
         const auto begin = runtime.next_node();
         PlannedMutation mutation{ 0, {}, {} };
         for (const auto caller : running.callers) {
@@ -422,6 +425,7 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
                 }
             }
             mutation.operations.push_back(std::move(control));
+            if (issued) mutation.dependencies.push_back({ *issued, node, graph::EdgeKind::DataDependency });
             mutation.operations.push_back({ caller, Boundary{}, action(ActionKind::QueryDone, request_) });
             mutation.dependencies.push_back({ node, node + 1, graph::EdgeKind::DataDependency });
         }
@@ -617,6 +621,7 @@ bool CacheProgram::complete() const {
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
     if (event.owner == Storage::owner) {
         const auto changed = storage_->on_event(runtime, event);
+        if (request_stage_ == RequestStage::PrefetchIssuing && storage_->results()[request_].issue_finished_ns) request_stage_ = RequestStage::Active;
         if (request_stage_ == RequestStage::PrefetchFinalizing && request_ < requests_.size()) {
             if (!storage_->results()[request_].ready) return;
             running_[request_].queried = false;

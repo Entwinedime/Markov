@@ -41,7 +41,8 @@ prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max 四
 best_effort 在首次准入检查时停止，timeout 从发起计时，在实际检查回合比较已用时间与当前命中页数对应的预算。
 后台查询有自己的共享队列和成本，查询完成前不暴露命中页；取消请求仍须归还后台查询/读取占用的缓冲。
 后续检查按独立测得的空闲调度回合推进，报告 `prefetch.poll_rounds`；缺这项成本时由整组共享补采，未允许采集则明确缺成本。
-请求发起与接受外围仍有 source 残余近似，不能据此认证这两个策略的精度或排名。
+发起返回后才进入查询队列，最终检查后停止并固定完成页数，接受响应结束后主机前缀才可见。
+未解释的前台控制和竞争仍有 source 残余近似，不能据此认证这两个策略的精度或排名。
 
 结果写入 execution.output/prediction/report.json。完整正式 HTTP 按首个正式请求开始到最后响应结束，
 保留 gap、未归属控制、Prefill/Decode；后台排空另报。每个目标给出状态、逐请求端口、成本缺口、覆盖、图规模与仿真时间。
@@ -49,6 +50,7 @@ best_effort 在首次准入检查时停止，timeout 从发起计时，在实际
 报告另列共享来源准备、读取记录、按需细图状态、模型来源和测量限制。缺成本为 null，完成状态不等于精度通过。
 cache_capacity_pages 按参与进程报告 device/host 页容量；文件目标另报 host_evicted_pages，是实际回收页数而非淘汰次数。
 逐请求 prefetch 区分申请、查询命中、发布和最终接受页数，storage 汇总实际读写工作，不能只用接受页数代表 I/O 量。
+issue_finished_ns 是发起响应结束，stopped_ns 是固定停止快照，accepted_ns 是接受/就绪完成；它们都是预测时钟，不是 source 观测坐标。
 storage 中的 rank_read_pages、rank_copied_pages、rank_rejected_copies、rank_new_pages、rank_existing_pages
 累计所有 rank 的文件 worker 工作量；请求级页数仍表示逻辑 KV 页。例如 TP2 的同一逻辑页读两份，计为两个 rank_read_pages。
 page-work 的 rank_disk_evictions 同样累计各 rank，peak_rank_stored_pages 则是单 rank 文件驻留的峰值。

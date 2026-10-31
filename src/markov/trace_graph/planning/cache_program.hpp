@@ -109,6 +109,7 @@ private:
         Admitting,
         Active,
         Querying,
+        PrefetchIssuing,
         PrefetchPolling,
         PrefetchFinalizing,
         LoadFailure,

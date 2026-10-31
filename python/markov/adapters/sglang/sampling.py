@@ -122,7 +122,7 @@ def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -
     )
 
 
-def _prefetch_query_capture(deployment: Deployment, page: int) -> DeviceCommand:
+def _prefetch_capture(deployment: Deployment, page: int, policy: str) -> DeviceCommand:
     # Fixed small anchors keep calibration independent of base trace size.
     # Larger hash/check counts remain declared extrapolation, not larger captures.
     maximum = 7
@@ -145,7 +145,7 @@ def _prefetch_query_capture(deployment: Deployment, page: int) -> DeviceCommand:
         "hicache_ratio": 1.0,
         "hicache_write_policy": "write_through",
         "hicache_storage_backend": "file",
-        "hicache_storage_prefetch_policy": "wait_complete",
+        "hicache_storage_prefetch_policy": policy,
         "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
     }
     return _region_capture_command(
@@ -165,6 +165,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     scheduler_pages = set()
     failed_load_pages = {}
     query_pages = set()
+    control_pages = set()
     geometry = context["geometry"]
     for requirement in requirements:
         work = requirement.get("work")
@@ -203,6 +204,8 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
                 if segments > 1:
                     io_cases.add((page, max(needed, segments), segments))
+        elif operation in ("cache.prefetch.issue", "cache.prefetch.check", "cache.prefetch.accept"):
+            control_pages.update(int(cells[name]["configuration"]["page_size"]) for name in requirement["targets"])
         elif operation == "cache.prefetch.query":
             for name in requirement["targets"]:
                 query_pages.add(int(cells[name]["configuration"]["page_size"]))
@@ -215,8 +218,10 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     commands = []
     for page, pages in sorted(failed_load_pages.items()):
         commands.append(_failed_load_capture(deployment, page, pages))
-    for page in sorted(query_pages):
-        commands.append(_prefetch_query_capture(deployment, page))
+    for page in sorted(query_pages | control_pages):
+        commands.append(_prefetch_capture(deployment, page, "wait_complete"))
+        if page in control_pages:
+            commands.append(_prefetch_capture(deployment, page, "best_effort"))
     for (page, enabled), target in sorted(regions.items()):
         workload = region_workload(math.ceil(context["max_context_tokens"]), page, context["final_phases"])
         capacity = sum(

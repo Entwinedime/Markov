@@ -130,7 +130,9 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                     {     "first_check_ns",         prefetch.first_check_ns ? Json(*prefetch.first_check_ns) : Json(nullptr) },
                     {        "accepted_ns",               prefetch.accepted_ns ? Json(*prefetch.accepted_ns) : Json(nullptr) },
                     { "worker_finished_ns", prefetch.worker_finished_ns ? Json(*prefetch.worker_finished_ns) : Json(nullptr) },
-                    {  "query_finished_ns",   prefetch.query_finished_ns ? Json(*prefetch.query_finished_ns) : Json(nullptr) }
+                    {  "query_finished_ns",   prefetch.query_finished_ns ? Json(*prefetch.query_finished_ns) : Json(nullptr) },
+                    {  "issue_finished_ns",   prefetch.issue_finished_ns ? Json(*prefetch.issue_finished_ns) : Json(nullptr) },
+                    {         "stopped_ns",                 prefetch.stopped_ns ? Json(*prefetch.stopped_ns) : Json(nullptr) }
                 };
             }
         }
@@ -191,7 +193,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                 {                 "idle",            storage->idle() },
                 {        "qualification",
                  "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control reuses the source "
-                 "residual. Background query groups and measured idle scheduler turns are separate; frontend issue/accept and concurrent file changes remain "
+                 "residual outside replaced controls. Issue/check/accept responses retain caller ownership; background query groups and idle turns are "
+                 "separate. Concurrent file changes remain "
                  "approximate."                                     }
             };
         }
@@ -230,7 +233,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             "Modeled parent waits use target readiness ports. Other source frontend/control intervals retain their opaque work and waits; unidentified "
             "probe overhead and changed control behavior remain uncertain.",
             "Background file queries use a shared group-response lane and warm metadata costs; rank-return skew and file changes during a query remain "
-            "approximate. Frontend issue/accept and radix lookup retain source residuals; competing I/O/compute needs further validation.",
+            "approximate. File issue/check/accept use closed group responses; other frontend and radix lookup retain source residuals. Competing I/O/compute "
+            "needs further validation.",
             "Serial client pacing retains the source interval between requests, outside each request's HTTP. Changed client behavior is not modeled.",
             "HTTP send and post-send CPU are separate; unconsumed overlapped computation and background I/O still drain after HTTP.",
             "No normal E2E accuracy or complete device-causality qualification is implied by execution." } }

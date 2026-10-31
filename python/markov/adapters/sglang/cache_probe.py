@@ -72,45 +72,6 @@ class CacheProbe:
             )
             return values, last_node
 
-    def prefetch_issue(
-        self,
-        original: Callable,
-        cache: Any,
-        req_id: str,
-        last_host_node: Any,
-        new_input_tokens: list[int],
-        last_hash: str | None = None,
-        prefix_keys: list[str] | None = None,
-    ) -> None:
-        if not cache.enable_storage or cache.cache_controller.storage_backend_type != "file":
-            return original(cache, req_id, last_host_node, new_input_tokens, last_hash, prefix_keys)
-
-        fields = {"request_id": req_id, "requested_tokens": len(new_input_tokens)}
-        with self.writer.span("runtime.hicache.file.prefetch_issue", fields):
-            result = original(cache, req_id, last_host_node, new_input_tokens, last_hash, prefix_keys)
-            pending = cache.ongoing_prefetch.get(req_id)
-            operation = pending[3] if pending is not None else None
-            fields["allocated_host_tokens"] = (
-                len(operation.host_indices) if operation is not None and operation.host_indices is not None else None
-            )
-            return result
-
-    def prefetch_progress(self, original: Callable, cache: Any, req_id: str) -> bool:
-        if not cache.enable_storage or cache.cache_controller.storage_backend_type != "file":
-            return original(cache, req_id)
-
-        pending = cache.ongoing_prefetch.get(req_id)
-        operation = pending[3] if pending is not None else None
-        fields = {"request_id": req_id, "operation_present": operation is not None}
-        with self.writer.span("runtime.hicache.file.prefetch_progress", fields):
-            ready = original(cache, req_id)
-            fields.update(
-                ready=ready,
-                completed_tokens=operation.completed_tokens if operation is not None else None,
-                accepted_tokens=cache.prefetch_loaded_tokens_by_reqid.get(req_id),
-            )
-            return ready
-
     def file_read(
         self,
         original: Callable,
@@ -186,8 +147,6 @@ class CacheProbe:
         )
         for target, wrapper in (
             ("sglang.srt.managers.cache_controller.HiCacheController.start_loading", self.start_loading),
-            ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.prefetch_from_storage", self.prefetch_issue),
-            ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.check_prefetch_progress", self.prefetch_progress),
             ("sglang.srt.managers.cache_controller.HiCacheController._generic_page_get", self.file_read),
             ("sglang.srt.managers.cache_controller.HiCacheController._generic_page_set", self.file_write),
         ):

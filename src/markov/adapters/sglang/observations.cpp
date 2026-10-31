@@ -77,8 +77,8 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
-    if (event.name == "prefetch.query") {
-        observe_prefetch_query(event);
+    if (event.name == "prefetch.query" || event.name == "prefetch.issue" || event.name == "prefetch.check" || event.name == "prefetch.accept") {
+        observe_prefetch_response(event);
         return;
     }
     if (event.name == "runtime.scheduler.request_broadcast") {
@@ -97,8 +97,8 @@ void ProbeReader::observe(const ProbeEvent & event) {
         }
         return;
     }
-    if (event.name == "runtime.hicache.file.prefetch_progress" || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading"
-        || event.name == "runtime.hicache.load_failed") {
+    if (event.name == "runtime.hicache.file.prefetch_issue" || event.name == "runtime.hicache.file.prefetch_progress"
+        || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading" || event.name == "runtime.hicache.load_failed") {
         observe_regenerated_control(event);
         return;
     }
@@ -315,7 +315,7 @@ void ProbeReader::observe(const ProbeEvent & event) {
 }
 
 void ProbeReader::finish() {
-    finish_prefetch_queries();
+    finish_prefetch_responses();
     for (const auto & collective : output_.collectives) {
         auto & frame = output_.compute_frames[collective.frame];
         if (frame.participant && *frame.participant != collective.rank)
@@ -532,25 +532,24 @@ void ProbeReader::observe_regenerated_control(const ProbeEvent & event) {
     const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
     ObservedRegion region{ resource, event.begin_ns, event.end_ns, event.record };
     std::string operation;
-    if (event.name == "runtime.hicache.file.prefetch_progress") {
+    if (event.name == "runtime.hicache.file.prefetch_issue") operation = "cache.prefetch.issue";
+    else if (event.name == "runtime.hicache.file.prefetch_progress") {
         const auto key = std::pair(resource, output_.name(args.at("request_id").get<std::string>()));
         if (!args.at("ready").get<bool>()) {
             prefetch_waits_.try_emplace(key, region);
             return;
         }
         const auto waiting = prefetch_waits_.find(key);
-        if (waiting == prefetch_waits_.end()) return;
-
-        // Only a completed native acceptance identifies the replaced loop.
-        // Query misses/revocations remain opaque rather than silently removed.
-        if (!args.at("operation_present").get<bool>() || args.at("accepted_tokens").is_null()) {
+        if (waiting != prefetch_waits_.end()) {
+            auto loop = waiting->second;
+            loop.end_ns = event.begin_ns;
+            output_.regenerated_controls.push_back(loop);
+            ++output_.counts["regenerated_control.scheduler.idle_turn"];
             prefetch_waits_.erase(waiting);
-            return;
         }
-        region = waiting->second;
-        region.end_ns = event.begin_ns;
-        prefetch_waits_.erase(waiting);
-        operation = "scheduler.idle_turn";
+        // The final ready call is replaced by check and acceptance responses;
+        // a revoked query also has an explicit target path, never a zero wait.
+        operation = "cache.prefetch.check";
     }
     else if (event.name == "runtime.hicache.load_back" && args.at("loaded_tokens").get<std::size_t>() > 0) operation = "cache.load.prepare";
     else if (event.name == "runtime.hicache.load_failed") operation = "cache.load.failed";

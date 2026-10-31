@@ -200,7 +200,10 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
           { "cache.storage_write.batch_prepare", "file.materialize_then_batch_set", "storage_worker_service" },
           { "cache.storage_write.new_page", "file.materialize_then_batch_set", "storage_worker_service" },
           { "cache.storage_write.existing_page", "file.materialize_then_batch_set", "storage_worker_service" },
-          { "cache.prefetch.query", "sglang.file.prefetch_query", "query_group_response" } },
+          { "cache.prefetch.query", "sglang.file.prefetch_query", "query_group_response" },
+          { "cache.prefetch.issue", "sglang.HiRadixCache.prefetch", "controller_group_response" },
+          { "cache.prefetch.check", "sglang.HiRadixCache.prefetch", "controller_group_response" },
+          { "cache.prefetch.accept", "sglang.HiRadixCache.prefetch", "controller_group_response" } },
         { "scheduler.idle_turn", "sglang.scheduler.file_prefetch", "caller_blocking_interval" }
     };
 }
