@@ -1,137 +1,97 @@
 # 全量重构当前状态
 
-更新日期：2026-10-31。Goal 继续，R3 实施中；完整精度验收未通过，整体重构未完成。
-工作目录 /home/markov-rebuild，分支 rebuild；本批起点 44c2881，联合核对回载端口、跨请求后台与终止阶段 CPU 响应。本批操作仅限本项目，数据重新采集。
-本文件只保留当前资格、资产和恢复起点；已发生的实验过程与历史数值保留在原日志及对应数据中。
+更新日期：2026-10-31。Goal 继续；R3 在声明范围内收口，下一阶段先恢复完整 60 cross。全局精度、完整面板和资源搜索尚未验收。
+工作目录 /home/markov-rebuild，分支 rebuild；本批起点 3eac758。本批只操作重构项目，未复制老项目数据或修改 markov-next。
+本文件保留当前资格和恢复起点，历史过程仍由原日志及运行资产记录。
 
 ## 阶段资格
 
-| 阶段 | 当前资格 | 尚未完成 |
+| 阶段 | 当前资格 | 边界或下一步 |
 | --- | --- | --- |
-| 既有 0/A 底座、R0 复盘 | 已交付 | 完整请求优先、大 base、小校准、粗粒度程序的方针保持 |
-| R1 完整 SGLang 预测 | 限定范围交付 | 有 self/cross 和正常对照，不表示整体精度通过 |
-| R2 用户流程与共享准备 | 限定范围交付 | 新 base、空库、整组补采、恢复和复用已运行，不能推广到未采服务 |
-| R3 保留框架与关键分支 | 实施中 | 两框架及诊断已贯通，回载本地依赖已修；配额、必要释放边界及其余近似仍待收口 |
-| R4 实验与资源搜索 | 未开始 | 共用预测器的矩阵和有实际取舍的有限搜索 |
-| R5 完整验收与清理 | 未开始 | 自有 60/186 格、三类报告、正常精度和同口径效率 |
+| 既有 0/A 底座、R0 复盘 | 已交付 | 完整请求优先、大 base、小校准、粗粒度程序 |
+| R1 完整 SGLang 预测 | 限定范围交付 | 有 self/cross 和正常对照，不等于整体精度通过 |
+| R2 用户流程与共享准备 | 限定范围交付 | 新 base、空库、整组补采、恢复与复用；现补齐跨工作域的数据保留 |
+| R3 框架与关键分支 | 限定范围交付 | 两框架、缓存路径、NodeScale、回放及准备屏障有真实证据；近似见下 |
+| R4 实验与资源搜索 | 待开始 | 先接薄矩阵编排并取得原始 60 格，再做有实际取舍的有限搜索 |
+| R5 完整验收与清理 | 待开始 | 扩展 72、留出 54、三类报告、正常精度和受控全流程效率 |
 
 ## 当前正式流程
 
-用户声明 deployment、workload、base、targets 和性能来源，使用 scripts/markov.sh predict。
-普通预测只读 manifest 指定的语义观察和必要同步/客户端记录，不建立源细图、不读取大型设备 trace。
-目标规则生成工作、依赖和时间条件，独立模型绑定变化工作，已证明不变的成本才从 base 迁移；同一执行器推进全部状态。
-完整正式 HTTP 包含 gap、未归属控制、Prefill/Decode；后台排空单列，缺成本或不可行保留 null，不用零补齐。
-预测容器只挂载程序、指定 base、只读选择模型、准备输入及输出；正常真值和独立评价器不进入预测或训练。
+用户声明 deployment、workload、base、targets 和性能来源，经 scripts/markov.sh predict 准备来源、整组成本并预测。
+普通预测只读 manifest 指定的必要观察，不建源细图、不读大型设备 trace；同次 C++ 会话共享源上下文和只读模型，各 target 独立维护状态。
+目标规则生成工作与依赖，变化工作查独立模型，已证明未变的成本才迁移。完整正式 HTTP 保留 gap、未知控制和 Prefill/Decode；后台排空单列，缺项保留 null。
+预测容器只挂载程序、指定 base、选定模型、准备输入和输出；正常真值、数据库和 evaluator 不进入 predictor。
 
-R2 已实际从新文本和空库自动完成两种页大小的区域/物理补采、四目标预测及重复复用；中断恢复按实际 Docker 状态接管，历史用量保留。
-当前自动补采扩展到成功/失败回载、文件 worker、空闲调度回合、后台查询及前台预取控制；按整组工作归并，不按 cell 身份或目标误差拟合。
-用户不必手拼离线模型；显式 models 仍优先，database 模式导出本组只读选择，准备与 base 分别累计预算。
+workload 现可声明 drain_before_formal：首个正式请求前等待 HiCache 和原生服务空闲，按轻量 pending 计数判断，不读缓存树或 tensor snapshot。
+屏障单列，实际请求/token 用量不增加；预测必须与 source 的控制一致。KTransformers 不支持 HiCache 屏障，不静默忽略。
+自动补采按整个采样器保留此前已选中的合格独立来源，防止补一类成本时覆盖掉其他页大小；不把库中未选的历史采集加入训练。
 
-## 已实现且有真实证据的能力
+## 已保留的框架与执行范围
 
-### SGLang
+SGLang 已实际运行 Qwen3-32B/BF16/TP2、Ascend 910B3、eager/FIA、串行固定输出，覆盖有限容量、选择性/直写/写回、回载及失败回退、文件预取、逐页发布和取消。
+CPU 返回、流进度、输出可读分开；回载的本地完成推进本 rank GPU，整组汇合保留缓存发布和保护释放。
+一次淘汰扫描一轮候选，结束后只重试分配；部分备份后失败保留已做工作，释放主机保护并沿设备前缀重新计算。
+后台查询、发起、最终检查、停止和接受有独立边界；检查期间可发布，停止后固定页数，取消不提前归还 worker 仍持有的缓冲。
 
-实际部署为 Qwen3-32B/BF16/TP2、Ascend 910B3、eager/FIA，串行固定输出；预测使用与 base 相同的实际输入与输出数量。
-页几何、有限容量、写策略、主机回载、文件读写、逐页发布和取消已接通。帧内 CPU 返回、流进度和输出可读分开，GPU Prefill 等待本 rank 的回载完成；逐层复制/计算仍采用保守整批近似。
+配额核对以当前串行入口为限：原生调度调用没有传入 load quota，原面板的正预取额度在前一请求继续计算前归还；在途缓冲另按真实生命周期占用容量。
+现有高阈值跳过、失败回载、取消后后台继续、跨请求文件写入及保护释放均有实际输入或给定成本诊断证据，不把不可达的并发占用当作已实测能力。
 
-已观察的来源预取循环、回载包络及空请求广播到齐等待，由 target 自身工作和依赖替代；未知 CPU residual 保留。
-广播保留到齐后的本地响应，不能将整个通信调用清零。非空广播或缺少共同区间的来源不具有同样资格。
-一次淘汰只扫描一轮候选、完成后只重试一次分配；不能重复扫描直至成功。失败回载保留已做备份，释放保护后回退设备前缀重新计算。
-新部分备份反例中，两 rank 均先备份两个子段再失败；self 从错误回载的 7.833632 秒改为重新计算的 5.136946 秒，正常单次为 5.082273 秒，误差 1.076%。
-这是开发条件，不是独立 cross 或面板精度；失败 CPU 独立样本没有成功子备份，部分备份的排他 CPU 外推仍不确定。
+KTransformers 已实际运行完整 Llama-2-7B/float16、单 Ascend、Torch/dense 来源和独立采样，self、分块 Prefill、SDPA 进入共同执行器；仅 empty 初始化。
+该范围的原正常开发对照约 2.6%—3.8%；本批三个既有目标连同图保持不变，不能推广到其他后端或并发。
+NodeScale 默认关闭；源/目标固定路径回放保留成本归属与依赖，不重新选择时间分支，也不将诊断参数用于拟合。
 
-后台查询现在单独排队、归约完成后才公开命中，再读取或撤销；取消前已排队的工作继续到原生停止点，缓冲归还按实际持有量计数。
-超时只在调度检查回合判断，查询完成前命中页数为零，不能预知命中数来固定截止时间。
-查询为一个共享组响应，含唤醒、哈希、元数据和归约，不是排他 CPU；单组 lane 对 rank 偏差和查询期间文件变化仍有近似。
+## 本批原始 workload 的实际结果
 
-### KTransformers、NodeScale 与静态诊断
+原 W1 重新编码为 47 请求/102,272 输入/47 输出，前 35 请求准备，后 12 请求正式计时；准备结束后排空后台。
+配置仍为原 C2/C4 声明，未缩短原 workload 或复制旧采集资产。
 
-完整 Llama-2-7B/float16、单 Ascend、32 层、原生 Torch/dense 路径已接通来源、独立采样、完整请求和正常对照；不套用 HiCache。
-self、16-token 分块、SDPA 当前预测分别为 0.543504、0.900540、0.482321 秒，本批保持不变；原正常开发对照约 2.6%—3.8%。
-分块由目标规则主动生成，初始化只支持 empty；并非其他 KTransformers 后端、并发或模型的资格。
+| W1 条件 | 完整正式窗口预测 | 正常单次实测 | APE |
+| --- | ---: | ---: | ---: |
+| C2 → C2，self | 8.647043 秒 | 8.427619 秒 | 2.604% |
+| C2 → C4，cross | 5.480101 秒 | 5.519728 秒 | 0.718% |
 
-NodeScale 默认关闭，缩放已绑定工作并保留计费和依赖，零倍率不补缺失成本。当前规则的源/目标固定路径回放已可使用。
-目标执行图只在 record_graph 开启时保存；原成本回放核对全部操作和请求端口，不只比较总时间。
-独立 evaluate 按请求/迭代/rank/工作/作用域对应 target 成本，未对应项保留原估计；分组余量不能用于认证墙钟顺序。
-静态回放不会重选时间分支，不能代替完整结构或正常精度报告。
+窗口含客户端间隔；正常关闭 profiler 和探针，保留同一准备屏障。这里只是 1 个 cross 和 1 个 self，各一次正常观察，不是 60 格成绩。
+source 一次 477.693 秒、7,106,674,771 bytes；两次共享补采累计 194.339 秒，其中 12 个模型请求/16,329 输入/30 输出，另一次是无模型请求的原生物理采样。
+补采组最终保留量快照为 705,216 bytes，现行仍为 38 类响应；原已选来源全部保留。两个正常条件分别另用 169.193、161.366 秒，均不训练。
+默认两目标复用 7.401 秒，source 解释 5.855 秒，C++ 峰值 97.99 MiB、报告 93,672 bytes；不建立源细图、不读两份设备 trace。
+当前自有源码 193 文件/25,206 行，含空行，本批净增 91 行，无独立检查源码。
 
-## 源回放与同步返回
+Docker Release/Debug 与改动文件静态检查通过；新两目标连同完整图一致，11 个既有条件不变，两条原成本回放的全部操作/请求零差。
+同源独立评价替换 2,408/3,910 项，1,502 项保留估计；1,384 条可检查顺序零违例，固定路径 partial oracle 11.660712 对 profiled 11.788559 秒。
+该评价不认证全部设备/缓存因果，也不是正常精度。完整证据为 data/r3/preparation_gate/checks.json。
 
-证据位于 data/r3/source_causality。只复核本项目既有来源，没有启动设备采集、增加模型或调整系数。
-源细图保留 CPU 与设备各自的事件间隔，每条资源流独立保留首次可用；后续仍由成本和依赖推进，不按每个节点的观测时间锁定。
-SGLang 的 3,183,129 节点和 KTransformers 的 390,850 节点均全部执行，提前节点为零，原成本 HTTP 回放仍为零差；CPU 成本划分和设备服务对应不变。
+## 仍然存在的近似
 
-敏感性回放暴露 KTransformers 缺少设备返回依赖：原先 2,025 个 MatMul 服务放大 1,000 倍，HTTP 仍是 0.744492 秒。
-现有 dense 入口每阶段已执行设备同步，适配器据此声明完成端口，共用实际 flow 服务对应连接前沿；9 个阶段全部唯一对应，没有新增原生 hook。
-补齐后原成本仍是 0.744492 秒，同一放大回放变为 75.541516 秒。这是固定路径诊断，不是目标精度或正常耗时。
+- GPU 回载仍等本地全部层完成，逐层复制/计算重叠、资源竞争和冷介质没有精确资格。
+- 未知 CPU residual、客户端间隔、首次使用与其他外围控制仍有 source 迁移或区域响应近似；部分备份失败的排他 CPU 还存在外推不确定性。
+- 源细图曾修复资源首次可用、设备空白及 KTransformers 同步返回；SGLang/KTransformers 仍有最大 3.755486 ms/9.849 μs 的跨 CPU/设备坐标冲突，没有据此校时或改系数。
+- 源/目标固定路径诊断和可观察的 CPU 顺序不能替代完整结构比较；单次正常误差不授予全局或任意部署的精度。
 
-14 个现行目标预测连同全部操作图、请求和后台边界不变，普通预测仍不构造源细图。
-两框架当前 Release/Debug 报告除计时开销外完全一致；公开源回放及目标固定路径回放通过，详细证据在 checks.json。
-该批源码为 192 文件/25,104 行（含空行），业务净增 68 行，无独立检查源码。
-
-剩余时间冲突只出现在这两份来源的 CPU/设备关系：SGLang 最大 3.755486 ms，设备返回主机的三条逆序最大 0.592679 ms；KTransformers 最大 9.849 μs。
-SGLang 的 78,942 条 CPU 提交关系、10,446 条设备间同步没有逆序。计数不证明时钟漂移，也不授予全部依赖正确性；保留原坐标和原关系，不按告警调时间或成本。
-没有新增正常精度、完整面板或效率验收成绩。
-
-## 回载端口与跨请求后台
-
-当前证据为 data/r3/copy_boundaries/checks.json。回载的本地 caller 返回、本地数据完成与全局缓存发布分开；全局汇合仍负责发布和释放保护。
-固定路径中只将一个 rank 的复制增加 5 秒，另一个 rank 的 GPU 比它早 2.293 秒开始；改动前两个 rank 均等待最慢复制。完整 HTTP 在这一诊断中相同，不能当作提速成绩。
-既有 17 条完整预测和全部节点成本/时刻不变，4 份图只调整必要依赖；18 条 Release/Debug 连同执行图一致，两条原成本回放逐操作及请求零差。
-
-新四请求来源将每请求输出缩至 1 token，实际观察到两段文件写入跨越下一请求到达。它证明在途后台真实存在，不证明全部跨请求页生命周期。
-首次采集因 HCCL 固定端口冲突失败，保留 86.942 秒用量；显式 Ascend runtime 和自动端口后，在空闲设备成功采集 190.267 秒。正常对照另采 144.409 秒，均不进入训练。
-整组仅一次轻量补采，147.515 秒、12 请求/3,399 输入/30 输出、355,871 bytes；现行 38 类模型。发送与尾部用独立工作点中位数的中位数，不再按注意力工作量外推，其他 34 类数值不变。
-新 self 完整正式窗口预测 6.698334 秒、正常单次 6.622140 秒，误差 1.151%，包含窗口内客户端间隔；这是开发条件，不是面板或独立 cross 验收。
-同源固定路径评价替换 215/341 项，126 项保留估计；116 条可检查顺序零违例。默认四目标复用为 0.847 秒、C++ 峰值 12.13 MiB、报告 23,951 bytes，不建源细图、不读两份设备 trace。
-本批当前源码 192 文件/25,115 行（含空行），净增 11 行，无独立检查源码；最终检查通过，实现与窗口证据分层交付。
-
-## 前台控制与查询证据
-
-证据集中在 data/r3/prefetch_control/checks.json，正式请求、命令、输出和累计用量保留在同目录。
-
-- 发起、最终检查和停止后接受分别建模；发起结束后才入查询队列，检查期间仍可发布，停止后固定页数，接受结束后才公开主机树状态。
-- CacheProbe 中的重复观察归入同一 PrefetchProbe。来源中对应发起、完整等待回合和最终 ready 包络由目标工作替代，原始 DAG 不改；未知外围控制保留。
-- 两份共享独立采样为 wait_complete/best_effort，各 8 请求，累计 290.874 秒、16 请求/6,672 输入/16 输出；完工账本保留 539,404 bytes，临时页文件由各自会话删除。
-- 同两份数据维护查询及三段控制，共 4 类响应；该批 SGLang 达到 36 类，其他 32 类逐项不变。三个控制模型分别使用候选/分配页、操作存在/归约数、停止完成页数；不按 target 身份或残差拟合。
-- 配方固定六/七页前缀，不随 base 扩张；实际页数锚点之外明确外推。累计上限两启动/720 秒/16 请求/512 MiB，用量未清零。
-- 新文件 base 另一次 226.890 秒、4 请求/1,796 输入/16 输出、1,168,342,255 bytes，只用于来源与独立评价。
-- 新 profile 的发起 4、最终检查 4、接受 1、查询 3 个节点全部匹配。评价替换 383/631 项，248 项沿用原估计；188 条可检查顺序零违例。
-- 同源 self 固定路径 partial oracle 为 10.200681 秒，profiled HTTP 为 10.230356 秒；没有新增正常对照，不是正常或独立 cross 精度。
-- 22 个 Release/Debug cell 包含完整执行图逐项一致，8 条公开回放全部操作/请求时间零差；10 个不涉及本次修改的既有预测不变。
-- 缺控制模型时四个文件目标均保留 HTTP=null，归并为一个共享需求；旧查询数据和两份新数据重导入均 0 新增，共 64 条复用，重复预测零采样。
-- NodeScale 放慢最终检查时，best_effort 从接受 0 页变为 6 页、Prefill 从 452 变为 68 tokens；只放慢接受阶段仍固定 0 页，后台在接受返回前完成也不能改变快照。
-- 放慢查询仍保留先取消后完成的 I/O；高于输入长度的预取阈值明确跳过查询/读取，前台短调用继续计费。这些是语义诊断，不是新正常精度。
-
-当前无文件 base 的 8 目标均执行完成：wait_complete 7.813912 秒、best_effort 5.087396 秒、零超时 5.087652 秒、有 token 预算的 timeout 5.104313 秒。
-默认简报工作流约 1.527 秒，来源准备 1.111 秒，C++ 峰值 20.68 MiB，8 目标报告 40,914 bytes；跳过两份设备 trace，不建立源细图。
-前台控制批次收尾为 192 文件/25,036 行（含空行），该批净增 267 行，无独立检查工程或脚本。
+这些限制进入完整面板报告与后续误差分析，不从 HTTP 中删除相关成本。原始 60、扩展 72、留出 54、资源搜索和受控 10× 比较仍是未完成范围。
 
 ## 恢复工作所需资产
 
-| 资产 | 当前入口与用途 |
+| 资产 | 当前入口 |
 | --- | --- |
-| R1/R2 来源、补采与恢复证据 | data/r1、data/r2；保留失败和累计预算，历史成绩不当成现行精度 |
-| SGLang 性能库 | data/r3/performance.sqlite；当前 38 类选择由共享准备导出 |
-| 当前只读 SGLang 模型 | data/r3/copy_boundaries/frontier_prediction/performance/selected_models.json；不要把库或 evaluator 挂进 predictor |
-| 四请求 workload | data/r3/workload.json；1,796 输入/16 输出，首请求预热 |
-| 无文件来源 | data/r3/cpu_broadcast/source_no_file/base/captures/1/profile_manifest.json |
-| 新文件来源 | data/r3/prefetch_control/source_file/base/captures/1/profile_manifest.json；含三段控制、查询和区域观察 |
-| 跨请求后台来源/正常对照 | data/r3/copy_boundaries/frontier_source/base/captures/2/profile_manifest.json；normal 在同批 frontier_normal，输出 1 token |
-| 部分备份后失败来源/正常对照 | data/r3/load_failure_followup/source_partial、normal_partial；workload 与上述普通四请求不同 |
-| 当前控制批次 | data/r3/prefetch_control/request.json、checks.json；shared、fresh_file、evaluation、compact 及 replays |
-| KTransformers | data/r3/ktransformers/capture/base/captures/3/profile_manifest.json、end_to_end、normal_evaluation.json；当前不变性在 data/r3/prefetch_control/ktransformers |
-| 当前来源细图与回放 | data/r3/source_causality/sg_fenced.json、k_fenced.json 及 replays；早先报告保留作修复前对照，不作为当前结果 |
+| 性能库与当前选择 | data/r3/performance.sqlite；data/r3/preparation_gate/prediction/performance/selected_models.json |
+| 原三个 workload | data/r3/preparation_gate/w1_device_spill_qualification_ring.json、w2_writeback_dual_tier_cascade.json、w3_prefetch_admission_ladder_and_survival.json；分别 47/39/87 请求 |
+| 原五配置 | data/r3/preparation_gate/original_configurations.json；后续移入独立的可复现 example 声明 |
+| W1/C2 source | data/r3/preparation_gate/source/base/captures/1/profile_manifest.json；可复用为原 15 份来源中的一份 |
+| W1/C2、W1/C4 正常对照 | data/r3/preparation_gate/normal、normal_cross；各一次样本，独立评分时读取 |
+| 当前预测/回放/评价 | data/r3/preparation_gate/prediction、debug、compact、replay_self、replay_cross、evaluation |
+| 真实跨请求后台来源 | data/r3/copy_boundaries/frontier_source/base/captures/2/profile_manifest.json；对应检查在同目录 checks.json |
+| 其他缓存与控制证据 | data/r3/prefetch_control、prefetch_query、load_failure、load_failure_followup、cpu_broadcast 各 checks.json |
+| 无文件、文件与部分备份来源 | data/r3/cpu_broadcast/source_no_file、prefetch_control/source_file、load_failure_followup/source_partial；原资产保留 |
+| 两框架源细图诊断 | data/r3/source_causality/checks.json、sg_fenced.json、k_fenced.json |
+| KTransformers 真来源与正常对照 | data/r3/ktransformers/capture/base/captures/3/profile_manifest.json、normal_evaluation.json、checks.json |
+| R1/R2 准备与恢复 | data/r1、data/r2；失败、预算、原始独立数据继续保留 |
 
-前台控制批次初始缺模型的 incomplete 是预期结果；其静态检查发现端口列表误写入另两段 manifest 读取，在首次构建前修正。本批固定端口启动失败已保留，重试没有重置预算。
-当前建模镜像 markov-modeling:ubuntu24.04，SGLang 采集 markov-sglang:ubuntu22.04，KTransformers markov-ktransformers:ubuntu22.04。
+当前镜像为 markov-modeling:ubuntu24.04、markov-sglang:ubuntu22.04、markov-ktransformers:ubuntu22.04。
+R3 按准备屏障、共享数据保留及窗口证据分层交付；下一阶段从交付提交继续。
 
-## R3 恢复起点与剩余工作
+## 下一步
 
-1. 源细图提前和 KTransformers 同步返回已修正，剩余跨时钟冲突保留来源与范围。后续只对影响必要外部端口的矛盾补证，不能为了全部告警清零而扩充原生词条、删依赖或调时间。
-2. 本地复制/计算端口已修正，真实跨请求后台已观察；继续核对在途页、配额和释放的必要边界。整批本地完成及暖文件响应不代表逐层重叠、冷介质或成本竞争。
-3. 继续明确阈值/配额及部分备份的适用范围：高阈值跳过已有预测证据，配额重叠未实测；失败 CPU 样本仍没有成功子备份，不能当作完整覆盖。
-4. 其他前台控制、客户端间隔及首次阶段仍有 source 残余近似；不按剩余误差逐函数建模或调系数。当前停止端口按控制器入口近似，内部锁/rank 偏差不授予精确资格。
-
-R3 未完成，不以放宽范围收口。随后仍需 R4 的矩阵/资源搜索、R5 自有 60 cross+72 扩展+54 留出、三类报告、正常精度与同口径全流程 10× 验收。
-精度目标 WAPE≤3%、P90≤5%，单格尽量≤6%；执行完成不是精度通过。不得复制旧资产或自动恢复用户已终止的大空间研究。
+先在 examples 建立薄矩阵编排和独立输入声明，复用上述已完成来源与正常样本，补齐原 5 配置×3 workload 的来源和评分。
+整组准备成本后，正式预测使用共同的现行选择；输出全部 60 cross，self 单列，失败和缺项保留。
+随后接有限资源成本搜索，再完成其余 126 格和全局精度、三份报告、效率与清理；不重新启动已终止的大空间研究。
+完整精度仍按总体及逐 base 的 WAPE≤3%、P90≤5% 评价，逐格尽量≤6%；不得按正常误差逐格补参数。
