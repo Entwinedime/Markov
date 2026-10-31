@@ -202,8 +202,10 @@ class Capture(SerialHttpClient):
                         gate.write(b"\0")
         if profiling:
             raise RuntimeError("Profiler did not finish exporting")
+        storage = self.directory / "storage"
+        temporary_storage_bytes = sum(path.stat().st_size for path in storage.rglob("*") if path.is_file())
         if profiling_requested:
-            self.publish_manifest()
+            self.publish_manifest(temporary_storage_bytes)
         elif self.plan["calibration"]:
             files = sorted((self.directory / "regions").glob("*.jsonl"))
             if len(files) != self.plan["deployment"]["tensor_parallel"]:
@@ -227,10 +229,6 @@ class Capture(SerialHttpClient):
                     <= roles
                 ):
                     raise RuntimeError(f"Independent region ports are incomplete: {path}")
-            storage = self.directory / "storage"
-            temporary_storage_bytes = sum(path.stat().st_size for path in storage.rglob("*") if path.is_file())
-            if storage.is_dir():
-                shutil.rmtree(storage)
             write_json(
                 self.directory / "region_measurements.json",
                 {
@@ -261,12 +259,18 @@ class Capture(SerialHttpClient):
                     "status": "completed",
                     "profiling": False,
                     "framework": "sglang",
+                    "temporary_storage_bytes": temporary_storage_bytes,
                     "config_path": "config.json",
                     "workload_report": "workload_report.json",
                 },
             )
 
-    def publish_manifest(self):
+        # Runtime page files belong to this fresh session, not the replay input.
+        # Retire them only after successful export; failed captures keep evidence.
+        if storage.is_dir():
+            shutil.rmtree(storage)
+
+    def publish_manifest(self, temporary_storage_bytes: int) -> None:
         from markov.adapters.ascend.clock import trace_clock
 
         traces = sorted((self.directory / "trace").rglob("trace_view.json"))
@@ -331,6 +335,7 @@ class Capture(SerialHttpClient):
             self.directory / "profile_manifest.json",
             {
                 "framework": "sglang",
+                "temporary_storage_bytes": temporary_storage_bytes,
                 "run_dir": str(self.directory),
                 "config_path": "config.json",
                 "status": "completed",

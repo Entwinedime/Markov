@@ -138,7 +138,17 @@ class DeviceTask:
 
         with (Path(tempfile.gettempdir()) / "markov-device-capture.lock").open("a") as lease:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            devices = self.runtime.require_idle()
+            waiting = time.monotonic()
+            try:
+                devices = self.runtime.wait_idle(waiting + remaining["wall_sec"])
+            finally:
+                self.record_processing(time.monotonic() - waiting)
+            remaining = self.remaining()
+            if remaining["wall_sec"] <= 0:
+                raise CaptureBudgetExceeded(
+                    "The cumulative wall-time budget was reached while waiting for idle devices"
+                )
+
             output = self.directory / "captures" / str(len(self.state["attempts"]) + 1)
             output.mkdir(parents=True, exist_ok=False)
             (output / "device_before.txt").write_text(devices, encoding="utf-8")

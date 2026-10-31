@@ -2,6 +2,10 @@
 
 import re
 import subprocess
+import time
+
+
+MAX_IDLE_POLL_SEC = 15.0
 
 
 class AscendDevices:
@@ -11,11 +15,18 @@ class AscendDevices:
     def snapshot(self) -> str:
         return subprocess.check_output(["npu-smi", "info"], text=True, timeout=20)
 
-    def require_idle(self) -> str:
-        state = self.snapshot()
-        if any(not re.search(rf"No running processes found in NPU {device}\b", state) for device in self.devices):
-            raise ValueError("The declared devices are not confirmed idle; no capture was started")
-        return state
+    def wait_idle(self, deadline_sec: float) -> str:
+        delay_sec = 1.0
+        while True:
+            state = self.snapshot()
+            if all(re.search(rf"No running processes found in NPU {device}\b", state) for device in self.devices):
+                return state
+
+            remaining_sec = deadline_sec - time.monotonic()
+            if remaining_sec <= 0:
+                raise ValueError("The device-idle wait exhausted the remaining budget; no capture was started")
+            time.sleep(min(delay_sec, remaining_sec))
+            delay_sec = min(2 * delay_sec, MAX_IDLE_POLL_SEC)
 
     def container_arguments(self) -> list[str]:
         result = ["--runtime", "ascend"]

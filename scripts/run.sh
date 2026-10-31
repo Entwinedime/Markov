@@ -12,7 +12,7 @@ if [[ "${1:-}" == -- ]]; then
     shift
 fi
 
-args=(run --rm --network none --pids-limit 256)
+args=(run --runtime runc --rm --network none --pids-limit 256)
 args+=(--memory "${MARKOV_MODELING_MEMORY:-4g}" --memory-swap "${MARKOV_MODELING_MEMORY:-4g}")
 args+=(--mount "type=bind,source=${ROOT_DIR},target=${ROOT_DIR}" --workdir "$ROOT_DIR")
 args+=(-e "PYTHONPATH=${ROOT_DIR}/python")
