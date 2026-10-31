@@ -6,10 +6,12 @@
 #include <cmath>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::frontend {
 namespace {
@@ -18,7 +20,36 @@ using model_config_detail::number_value;
 using model_config_detail::read_json_file;
 using model_config_detail::u64_value;
 
-std::shared_ptr<const cost::OperatorModels> parse_operator_models(const Json & items) {
+std::vector<std::shared_ptr<const cost::OperatorWorkPoints>> parse_work_point_sets(const Json & sets) {
+    if (!sets.is_array()) throw std::runtime_error("work_point_sets must be an array");
+    std::vector<std::shared_ptr<const cost::OperatorWorkPoints>> result;
+    result.reserve(sets.size());
+    for (const auto & item : sets) {
+        auto work = std::make_shared<cost::OperatorWorkPoints>();
+        work->coordinates = item.at("features").get<std::vector<std::string>>();
+        if (!std::ranges::is_sorted(work->coordinates) || std::adjacent_find(work->coordinates.begin(), work->coordinates.end()) != work->coordinates.end())
+            throw std::runtime_error("Work-point coordinates must be distinct and ordered");
+        work->bounds.assign(work->coordinates.size(), { std::numeric_limits<double>::max(), std::numeric_limits<double>::lowest() });
+        const auto & points = item.at("points");
+        if (!points.is_array() || points.empty()) throw std::runtime_error("Work-point set needs at least one measured point");
+        work->measured.reserve(points.size());
+        for (const auto & raw : points) {
+            auto point = raw.get<cost::OperatorPoint>();
+            if (point.size() != work->coordinates.size()) throw std::runtime_error("Work point must cover every declared coordinate");
+            for (size_t i = 0; i < point.size(); ++i) {
+                if (!std::isfinite(point[i])) throw std::runtime_error("Work-point coordinates must be finite");
+                work->bounds[i].first = std::min(work->bounds[i].first, point[i]);
+                work->bounds[i].second = std::max(work->bounds[i].second, point[i]);
+            }
+            work->measured.insert(std::move(point));
+        }
+        result.push_back(std::move(work));
+    }
+    return result;
+}
+
+std::shared_ptr<const cost::OperatorModels> parse_operator_models(const Json & items,
+                                                                  const std::vector<std::shared_ptr<const cost::OperatorWorkPoints>> & work_sets) {
     if (!items.is_array()) throw std::runtime_error("operator_models must be an array");
     std::vector<cost::OperatorModel> models;
     models.reserve(items.size());
@@ -33,7 +64,11 @@ std::shared_ptr<const cost::OperatorModels> parse_operator_models(const Json & i
         model.allow_extrapolation = item.at("allow_extrapolation").get<bool>();
         model.extrapolation_features = item.value("extrapolation_features", std::vector<std::string>{});
         model.feature_ranges = item.at("feature_ranges").get<decltype(model.feature_ranges)>();
-        model.measured_feature_points = item.at("measured_feature_points").get<decltype(model.measured_feature_points)>();
+        const auto & reference = item.at("work_point_set");
+        if (!reference.is_number_integer()) throw std::runtime_error("Operator work-point set reference must be an integer");
+        const auto work_set = reference.get<int64_t>();
+        if (work_set < 0 || static_cast<size_t>(work_set) >= work_sets.size()) throw std::runtime_error("Invalid operator work-point set reference");
+        model.work_points = work_sets[static_cast<size_t>(work_set)];
         if (model.form == "piecewise_linear") {
             model.coordinate = item.at("coordinate").get<std::string>();
             model.points = item.at("points").get<decltype(model.points)>();
@@ -66,14 +101,13 @@ std::shared_ptr<const cost::OperatorModels> parse_operator_models(const Json & i
         for (const auto & [feature, value] : model.coefficients)
             if (!std::isfinite(value) || !model.feature_ranges.contains(feature))
                 throw std::runtime_error("Operator coefficient needs a finite value and measured coverage: " + feature);
-        if (model.measured_feature_points.empty()) throw std::runtime_error("Operator model needs at least one measured work point");
-        for (const auto & point : model.measured_feature_points) {
-            if (point.size() != model.feature_ranges.size()) throw std::runtime_error("Operator work point must cover its declared coordinates");
-            for (const auto & [feature, range] : model.feature_ranges) {
-                const auto coordinate = point.at(feature);
-                if (!std::isfinite(coordinate) || coordinate < range.first || coordinate > range.second)
-                    throw std::runtime_error("Operator work point lies outside its declared coverage");
-            }
+        const auto & work = *model.work_points;
+        if (work.coordinates.size() != model.feature_ranges.size()) throw std::runtime_error("Operator model must declare every work-point coordinate");
+        size_t coordinate = 0;
+        for (const auto & [feature, range] : model.feature_ranges) {
+            if (work.coordinates[coordinate] != feature || work.bounds[coordinate].first < range.first || work.bounds[coordinate].second > range.second)
+                throw std::runtime_error("Operator work-point set contradicts its declared coverage");
+            ++coordinate;
         }
         if (!identities.emplace(model.operation, model.implementation, model.timing_scope).second)
             throw std::runtime_error("Operator cost package contains overlapping model identities");
@@ -140,12 +174,13 @@ const CostPackage & CostPackages::get(const std::string & filename) {
                                               { "storage_batch_pages", "kv_bytes_per_token_per_rank", "resource_lanes", "service_models" });
     const auto kv_bytes = u64_value(io, "kv_bytes_per_token_per_rank", 0);
     if (kv_bytes == 0) throw std::runtime_error("Cost package kv_bytes_per_token_per_rank must be positive");
+    const auto work_sets = parse_work_point_sets(raw.at("work_point_sets"));
     CostPackage package{
         .kv_bytes_per_token = kv_bytes,
         .io = { { "storage_batch_pages", io.at("storage_batch_pages") },
                { "resource_lanes", io.at("resource_lanes") },
                { "service_models", io.at("service_models") } },
-        .operators = parse_operator_models(raw.at("operator_models")),
+        .operators = parse_operator_models(raw.at("operator_models"), work_sets),
     };
     for (const auto & [kind, model] : package.io.at("service_models").items()) {
         const bool existing_write = kind == "write_host_to_storage";

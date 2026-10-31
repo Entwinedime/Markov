@@ -1,7 +1,7 @@
 #pragma once
 
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/core/client_requests.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/cost/source_migration.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"

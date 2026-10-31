@@ -1,7 +1,7 @@
 #include "markov/trace_graph/cost/host_operation.hpp"
 
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 
 #include <cstddef>

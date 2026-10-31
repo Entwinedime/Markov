@@ -1,6 +1,6 @@
 #pragma once
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/core/client_requests.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/modules/hicache/model/prefetch_wait_execution.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/patch/prefetch_control_region.hpp"

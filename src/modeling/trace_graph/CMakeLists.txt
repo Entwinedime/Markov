@@ -105,6 +105,7 @@ add_library(trace_graph_work STATIC
 target_link_libraries(trace_graph_work PUBLIC trace_graph_core)
 
 add_library(trace_graph_cost STATIC
+    src/cost/operator_model.hpp
     src/cost/operator_model.cpp
     src/cost/host_operation.cpp
     src/cost/io_service.cpp

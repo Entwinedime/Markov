@@ -1,6 +1,6 @@
 #pragma once
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_program.hpp"

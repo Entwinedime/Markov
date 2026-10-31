@@ -24,19 +24,22 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
             yield json.loads(line)
 
 
-def write_json(path: Path, value: Any) -> None:
-    """Write deterministic indented JSON after creating the parent directory."""
+def write_json(path: Path, value: Any, *, compact: bool = False) -> None:
+    """Write UTF-8 JSON; machine handoffs can omit report formatting."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    encoded = json.dumps(
+        value, ensure_ascii=False, indent=None if compact else 2, separators=(",", ":") if compact else None
+    )
+    path.write_text(encoded + "\n", encoding="utf-8")
 
 
-def write_json_atomic(path: Path, value: Any) -> None:
+def write_json_atomic(path: Path, value: Any, *, compact: bool = False) -> None:
     """Publish a progress report without exposing a half-written JSON on interruption."""
 
     pending = path.with_name(path.name + ".pending")
     try:
-        write_json(pending, value)
+        write_json(pending, value, compact=compact)
         pending.replace(path)
     finally:
         pending.unlink(missing_ok=True)

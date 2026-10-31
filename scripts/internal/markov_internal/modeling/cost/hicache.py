@@ -8,6 +8,7 @@ from typing import Any
 
 from ...common.paths import require_repo_path
 from ..deployment import require_cost_environment
+from .package_storage import validate_package_references
 from .io_contract import positive_u64
 from .io_validation import required_resource_lanes, required_service_models
 
@@ -29,6 +30,7 @@ class HiCacheCostModels:
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> HiCacheCostModels:
+        validate_package_references(raw)
         require_cost_environment(raw["deployment"])
         io = raw["hicache"]
         if io.get("control_models") or io.get("phase_cost") is not None or "empty_write_check_us" in io:

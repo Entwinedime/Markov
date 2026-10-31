@@ -8,8 +8,8 @@
 
 #include "markov/trace_graph/cli/file_output.hpp"
 
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"

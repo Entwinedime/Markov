@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include "markov/trace_graph/cost/operator_model.hpp"
+#include "cost/operator_model.hpp"
 
 #include <cstdint>
 #include <map>

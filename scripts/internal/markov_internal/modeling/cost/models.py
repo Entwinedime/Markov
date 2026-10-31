@@ -354,7 +354,7 @@ def _train_model(spec: ModelSpec, operation_rows: list[OperationSamples]) -> dic
     return _with_training_fit(result, measurements, spec.features)
 
 
-def estimate(model: dict[str, Any], features: dict[str, float]) -> dict[str, Any]:
+def estimate(model: dict[str, Any], features: dict[str, float], work_points: dict[str, Any]) -> dict[str, Any]:
     """Inspect a trained response and its range with the same policy as C++."""
 
     if model["status"] != "ready":
@@ -377,10 +377,10 @@ def estimate(model: dict[str, Any], features: dict[str, float]) -> dict[str, Any
     if duration < 0 or not math.isfinite(duration):
         return {"status": "missing_data", "reason": "invalid_predicted_duration"}
 
-    point = {name: features[name] for name in model["feature_ranges"]}
+    point = [features[name] for name in work_points["features"]]
     return {
         "status": "ready",
         "duration_us": math.floor(duration + 0.5),
         "outside_measured_range": outside,
-        "unseen_feature_combination": point not in model["measured_feature_points"],
+        "unseen_feature_combination": point not in work_points["points"],
     }

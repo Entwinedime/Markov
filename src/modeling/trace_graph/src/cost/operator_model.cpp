@@ -1,4 +1,4 @@
-#include "markov/trace_graph/cost/operator_model.hpp"
+#include "cost/operator_model.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/missing_evidence.hpp"
@@ -26,26 +26,20 @@ OperatorModels::OperatorModels(std::vector<OperatorModel> models) : definitions_
     for (size_t id = 0; id < definitions_.size(); ++id) {
         const auto & model = definitions_[id];
         Entry entry{ .id = id };
-        for (const auto & [name, range] : model.feature_ranges) {
-            entry.coordinates.push_back(name);
+        const auto & coordinates = model.work_points->coordinates;
+        for (const auto & name : coordinates) {
             entry.extrapolatable.push_back(model.allow_extrapolation
                                            || std::ranges::find(model.extrapolation_features, name) != model.extrapolation_features.end());
         }
 
         for (const auto & [name, value] : model.coefficients) {
-            const auto at = std::ranges::lower_bound(entry.coordinates, name);
-            entry.coefficients.emplace_back(static_cast<size_t>(at - entry.coordinates.begin()), value);
+            const auto at = std::ranges::lower_bound(coordinates, name);
+            entry.coefficients.emplace_back(static_cast<size_t>(at - coordinates.begin()), value);
         }
 
         if (model.form == "piecewise_linear")
-            entry.curve_coordinate = static_cast<size_t>(std::ranges::lower_bound(entry.coordinates, model.coordinate) - entry.coordinates.begin());
+            entry.curve_coordinate = static_cast<size_t>(std::ranges::lower_bound(coordinates, model.coordinate) - coordinates.begin());
 
-        for (const auto & observed : model.measured_feature_points) {
-            OperatorPoint point;
-            point.reserve(entry.coordinates.size());
-            for (const auto & name : entry.coordinates) point.push_back(observed.at(name));
-            entry.measured.insert(std::move(point));
-        }
 
         index_.emplace(ModelKey{ model.operation, model.implementation, model.timing_scope }, id);
         entries_.push_back(std::move(entry));
@@ -117,28 +111,29 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
     };
     const auto entry = models_ ? models_->find(work) : nullptr;
     if (!entry) {
-        auto coordinates = describe();
+        auto detail = describe();
         auto scopes = nlohmann::json::array();
         if (models_)
             for (size_t id = 0; id < models_->size(); ++id) {
                 const auto & model = models_->definition(id);
                 if (model.operation == work.operation && model.implementation == work.implementation) scopes.push_back(model.timing_scope);
             }
-        coordinates["available_timing_scopes"] = std::move(scopes);
+        detail["available_timing_scopes"] = std::move(scopes);
         throw MissingCostEvidence(work.component + "/operator",
-                                  coordinates,
+                                  detail,
                                   "No applicable database model for " + work.operation + ":" + work.implementation + ":" + work.timing_scope);
     }
 
     const auto & model = models_->definition(entry->id);
+    const auto & coordinates = model.work_points->coordinates;
     OperatorPoint point;
-    point.reserve(entry->coordinates.size());
-    for (const auto & name : entry->coordinates) {
+    point.reserve(coordinates.size());
+    for (const auto & name : coordinates) {
         const auto feature = work.features.find(name);
         if (feature == work.features.end()) {
-            auto coordinates = describe();
-            coordinates["missing_feature"] = name;
-            throw MissingCostEvidence(work.component + "/feature", coordinates, "Missing declared operator feature: " + std::string(name));
+            auto detail = describe();
+            detail["missing_feature"] = name;
+            throw MissingCostEvidence(work.component + "/feature", detail, "Missing declared operator feature: " + std::string(name));
         }
         point.push_back(feature->second);
     }
@@ -151,13 +146,13 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
     else {
         bool outside = false;
         for (size_t i = 0; i < point.size(); ++i) {
-            const auto range = model.feature_ranges.at(entry->coordinates[i]);
+            const auto range = model.feature_ranges.at(coordinates[i]);
             const bool feature_outside = point[i] < range.first || point[i] > range.second;
             outside |= feature_outside;
             if (feature_outside && !entry->extrapolatable[i]) {
-                auto coordinates = describe();
-                coordinates["measured_feature_ranges"] = model.feature_ranges;
-                throw MissingCostEvidence(work.component + "/coverage", coordinates, "Operator work is outside measured coverage");
+                auto detail = describe();
+                detail["measured_feature_ranges"] = model.feature_ranges;
+                throw MissingCostEvidence(work.component + "/coverage", detail, "Operator work is outside measured coverage");
             }
         }
 
@@ -175,7 +170,7 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
         const auto rounded = core::truncate_to_u64(value + 0.5);
         if (!std::isfinite(value) || value < 0.0 || !rounded)
             throw MissingCostEvidence(work.component + "/model", describe(), "Database operator cost is not a finite non-negative duration");
-        result = { *rounded, outside, !entry->measured.contains(point) };
+        result = { *rounded, outside, !model.work_points->measured.contains(point) };
         responses.emplace(std::move(point), result);
     }
 

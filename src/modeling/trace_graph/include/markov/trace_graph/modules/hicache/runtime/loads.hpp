@@ -1,5 +1,5 @@
 #pragma once
-#include "markov/trace_graph/cost/operator_model.hpp"
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"

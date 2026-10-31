@@ -35,6 +35,7 @@ Individual stages and diagnostics:
   scripts/model.sh cost-db import --database <database.sqlite> --profile-manifest <history-manifest> --output-dir <import-output>
   scripts/model.sh cost-db train --database <database.sqlite> --request <training-request.json> --output <cost-package.json>
   scripts/model.sh cost-db migrate --database <previous-database.sqlite> --output <new-database.sqlite> --summary <migration.json>
+  scripts/model.sh cost-db migrate --package <expanded-cost-package.json> --output <cost-package.json> --summary <migration.json>
   scripts/model.sh predict --source-manifest <manifest> --target-config <config> --cost-model <cost-package.json> --output-dir <prediction-output>
   scripts/model.sh evaluate --prediction-dir <prediction-output> --target-profile-manifest <score-manifest> --output-dir <score-output>
   scripts/model.sh prepare-cpu-service --light-manifest <manifest> --profile-manifest <manifest> --tp-size <n> --output-dir <dir>

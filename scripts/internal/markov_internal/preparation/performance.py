@@ -156,7 +156,7 @@ def missing_sampling_work(package: dict[str, Any], points: list[dict[str, Any]])
     for point in points:
         model = indexed.get(tuple(point[key] for key in ("operation", "implementation", "timing_scope")))
         result = (
-            estimate(model, point["features"])
+            estimate(model, point["features"], package["work_point_sets"][model["work_point_set"]])
             if model is not None
             else {"status": "missing_data", "reason": "missing_model"}
         )

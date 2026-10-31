@@ -1,7 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_queries.hpp"
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/hicache_observations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/structure/hicache/query.hpp"
 #include <algorithm>
 #include <map>

@@ -14,6 +14,7 @@ from .measurements import read_observations
 from .migration import migrate_database
 from .models import estimate
 from .package import import_evidence, import_profiles, train
+from .package_storage import compact_package, validate_package_references
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,11 +56,13 @@ def main(argv: list[str] | None = None) -> int:
     trainer.add_argument("--output", type=Path, required=True)
 
     migration = actions.add_parser(
-        "migrate", help="convert the previous database layout to a new path; source stays read-only"
+        "migrate", help="convert a database or expanded package to a new path; source stays read-only"
     )
-    migration.add_argument("--database", type=Path, required=True)
+    migration_input = migration.add_mutually_exclusive_group(required=True)
+    migration_input.add_argument("--database", type=Path)
+    migration_input.add_argument("--package", type=Path)
     migration.add_argument(
-        "--output", type=Path, required=True, help="new database path; never replaces an existing file"
+        "--output", type=Path, required=True, help="new output path; never replaces an existing file"
     )
     migration.add_argument("--summary", type=Path, required=True)
 
@@ -103,21 +106,43 @@ def main(argv: list[str] | None = None) -> int:
         write_json(output / "import_summary.json", result)
     elif args.action == "train":
         result = train(CostDatabase(require_repo_path(args.database)), load_json(require_repo_path(args.request)))
-        write_json(require_repo_path(args.output), result)
+        write_json(require_repo_path(args.output), result, compact=True)
     elif args.action == "migrate":
-        result = migrate_database(require_repo_path(args.database), require_repo_path(args.output))
+        if args.database:
+            result = migrate_database(require_repo_path(args.database), require_repo_path(args.output))
+        else:
+            source = require_repo_path(args.package)
+            output = require_repo_path(args.output)
+            if output.exists():
+                raise FileExistsError(output)
+            package = compact_package(load_json(source))
+            validate_package_references(package)
+            write_json(output, package, compact=True)
+            result = {
+                "status": "completed",
+                "source": str(source),
+                "output": str(output),
+                "source_bytes": source.stat().st_size,
+                "output_bytes": output.stat().st_size,
+                "operator_models": len(package["operator_models"]),
+                "work_point_sets": len(package["work_point_sets"]),
+                "source_sets": len(package["source_sets"]),
+                "scope": "Lossless package layout conversion; no fitting or new measurements",
+            }
         write_json(require_repo_path(args.summary), result)
     else:
         if args.database:
             result = CostDatabase(require_repo_path(args.database)).summary()
         elif args.model and args.work:
-            models = load_json(require_repo_path(args.model))["operator_models"]
+            package = load_json(require_repo_path(args.model))
+            validate_package_references(package)
+            models = package["operator_models"]
             indexed = {(model["operation"], model["implementation"], model["timing_scope"]): model for model in models}
             results = []
             for work in load_json(require_repo_path(args.work))["operations"]:
                 model = indexed.get((work["operation"], work["implementation"], work["timing_scope"]))
                 if model is not None:
-                    inspection = estimate(model, work["features"])
+                    inspection = estimate(model, work["features"], package["work_point_sets"][model["work_point_set"]])
                 else:
                     scopes = sorted(
                         item["timing_scope"]

@@ -18,6 +18,7 @@ from .measurements import OperationObservation, operation_rows
 from .io import service_cost_evidence
 from .models import ModelSpec, parse_model_specs, train_models
 from .physical import read_physical_measurements
+from .package_storage import compact_package
 
 
 def import_profiles(
@@ -202,7 +203,7 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
                 training_sources=sorted(training_captures),
                 training_source_manifests=sorted(database.manifests_for_captures(training_captures)),
             )
-            return result
+            return compact_package(result)
         captures = [dict(row["payload"], role="history") for row in evidence if row["kind"] == "runtime_io"]
         io = service_cost_evidence(physical[0]["payload"], captures)
         if io["missing"]:
@@ -240,7 +241,7 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
     result["training_sources"] = sorted(training_captures)
     result["training_source_manifests"] = sorted(database.manifests_for_captures(training_captures))
 
-    return result
+    return compact_package(result)
 
 
 def import_evidence(

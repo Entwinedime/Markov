@@ -18,6 +18,19 @@
 
 namespace markov::trace_graph::cost {
 
+using OperatorPoint = std::vector<double>;
+
+struct OperatorPointHash {
+    size_t operator()(const OperatorPoint & point) const;
+};
+
+/** Joint measured coordinates are immutable and shared across response scopes. */
+struct OperatorWorkPoints {
+    std::vector<std::string> coordinates;
+    std::vector<std::pair<double, double>> bounds;
+    std::unordered_set<OperatorPoint, OperatorPointHash> measured;
+};
+
 /** Offline-trained operator response. Inference does not read trace databases.
  * Linear features and duration are in the units declared in OperationWork/us.
  * Constant models have no variable coefficients. Coverage describes measured
@@ -33,7 +46,7 @@ struct OperatorModel {
     double intercept_us = 0.0;
     std::map<std::string, double> coefficients;
     std::map<std::string, std::pair<double, double>> feature_ranges;
-    std::vector<std::map<std::string, double>> measured_feature_points;
+    std::shared_ptr<const OperatorWorkPoints> work_points;
     bool allow_extrapolation = false;
     // Named coordinates may extrapolate while all other measured ranges stay
     // hard constraints. The bool above explicitly permits every coordinate.
@@ -51,21 +64,13 @@ struct OperatorQuerySummary {
     uint64_t queried_duration_sum_us = 0;
 };
 
-using OperatorPoint = std::vector<double>;
-
-struct OperatorPointHash {
-    size_t operator()(const OperatorPoint & point) const;
-};
-
 /** Immutable responses and numeric coverage indexes, shared by all targets. */
 class OperatorModels {
 public:
     struct Entry {
         size_t id;
-        std::vector<std::string> coordinates;
         std::vector<std::pair<size_t, double>> coefficients;
         std::vector<bool> extrapolatable;
-        std::unordered_set<OperatorPoint, OperatorPointHash> measured;
         size_t curve_coordinate = 0;
     };
 

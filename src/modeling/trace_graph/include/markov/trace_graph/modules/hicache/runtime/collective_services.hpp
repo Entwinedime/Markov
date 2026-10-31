@@ -1,7 +1,7 @@
 #pragma once
 
+#include "cost/operator_model.hpp"
 #include "markov/trace_graph/adapters/frameworks/sglang/source_calls.hpp"
-#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 
 #include <cstddef>
