@@ -326,9 +326,6 @@ std::optional<uint64_t> HiCacheCollectiveServices::worker_cost(core::DagGraph & 
     const auto estimates = provider.estimate_all(requests);
     auto & event = graph.mutable_event_for_node(node);
     event.set_arg("cost_binding_source", "collective_worker_independent_model");
-    event.set_arg("cost_operation", work.operation);
-    event.set_arg("cost_implementation", work.implementation);
-    event.set_arg("cost_timing_scope", work.timing_scope);
     event.set_arg("worker_service_us", std::to_string(estimates[0].duration_us));
     event.set_arg("worker_residual_us", std::to_string(estimates[1].duration_us));
     return core::checked_add_u64(estimates[0].duration_us, estimates[1].duration_us, "Collective worker interval overflow");

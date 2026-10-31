@@ -130,7 +130,8 @@ ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph, const de
 
 class TopologicalSimulation : private FutureDag {
 public:
-    explicit TopologicalSimulation(core::DagGraph & graph, ReplayMode mode, NodeCostAtStart cost_at_start = {}, ExpandAtStart expand_at_start = {})
+    explicit TopologicalSimulation(core::DagGraph & graph, ReplayMode mode, NodeCostAtStart cost_at_start = {}, ExpandAtStart expand_at_start = {},
+                                   bool registered_boundaries_only = false)
         : graph_(graph),
           nodes_(graph.nodes()),
           active_node_count_(graph.active_node_count()),
@@ -146,11 +147,12 @@ public:
           cost_at_start_(std::move(cost_at_start)),
           expand_at_start_(std::move(expand_at_start)),
           execution_(storage_.node_ids.size(), Execution::Pending),
-          observe_start_(storage_.node_ids.size(), true),
+          observe_start_(storage_.node_ids.size(), !registered_boundaries_only),
           ready_generation_(storage_.node_ids.size(), 0),
           chronological_(!queues_.tasks.empty() || static_cast<bool>(cost_at_start_) || static_cast<bool>(expand_at_start_)) {
         ready_.reserve(active_node_count_);
         for (const auto & node : nodes_) {
+            if (registered_boundaries_only && node.active) observe_start_[node_slot(node.id)] = node.observe_start;
             if (node.active && storage_.indegree[node_slot(node.id)] == 0) make_ready(node.id);
         }
     }
@@ -336,6 +338,7 @@ private:
         if (origin >= nodes_.size() || !nodes_[origin].active) throw std::invalid_argument("Future work owner must be an active node");
         const auto rank = nodes_[origin].gpu_id;
         const auto id = graph_.add_synthetic_node(std::move(spec));
+        graph_.mutable_node(id).observe_start = observe_start;
         if (order == BoundaryOrder::AfterConcurrentStarts) deferred_boundaries_.insert(id);
         graph_.mutable_node(id).gpu_id = rank;
         graph_.mutable_event_for_node(id).pid = graph_.event_for_node(origin).pid;
@@ -534,9 +537,15 @@ SimulationResult run_control_topological_simulation(core::DagGraph & graph) {
     return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::ControlOnly).run();
 }
 
-SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start, const ExpandAtStart & expand_at_start) {
+SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start, const ExpandAtStart & expand_at_start,
+                                            bool registered_boundaries_only) {
     graph.release_topological_order();
-    return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::Full, cost_at_start, expand_at_start).run();
+    return topological_simulator_detail::TopologicalSimulation(graph,
+                                                               topological_simulator_detail::ReplayMode::Full,
+                                                               cost_at_start,
+                                                               expand_at_start,
+                                                               registered_boundaries_only)
+        .run();
 }
 
 SimulationResult run_gap_excluded_topological_simulation(core::DagGraph & graph) {

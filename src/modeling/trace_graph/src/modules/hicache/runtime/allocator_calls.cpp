@@ -11,6 +11,7 @@
 #include "markov/trace_graph/source_dag/call_regions.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <utility>
@@ -215,22 +216,30 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
             throw std::runtime_error("Target allocator has no implemented program for its device/dtype/execution inputs; device_name="
                                      + (call.inputs.device_name.empty() ? std::string("unknown") : call.inputs.device_name));
 
-        auto generated = generate_tensor_program(graph, node, call.resources.worker, call.resources.compute, *program, "allocator");
+        auto generated = generate_tensor_program(graph,
+                                                 node,
+                                                 call.resources.worker,
+                                                 call.resources.compute,
+                                                 *program,
+                                                 "allocator",
+                                                 false,
+                                                 retained_source_nodes_ != nullptr);
         bind_host_operations(generated.plan, generated.operations, provider_, "tensor_independent_model");
         plan = std::move(generated.plan);
     }
-    nlohmann::json requests = nlohmann::json::array();
-    for (const auto & request : work.requests)
-        requests.push_back({
-            { "request_id",                                                                             request.request_id },
-            {  "iteration", request.decode_iteration ? nlohmann::json(*request.decode_iteration) : nlohmann::json(nullptr) }
+    if (retained_source_nodes_) {
+        nlohmann::json requests = nlohmann::json::array();
+        for (const auto & request : work.requests)
+            requests.push_back({
+                { "request_id",                                                                             request.request_id },
+                {  "iteration", request.decode_iteration ? nlohmann::json(*request.decode_iteration) : nlohmann::json(nullptr) }
+            });
+        const auto description = std::make_shared<const core::TraceArgMap>(core::TraceArgMap{
+            { "allocator_requests",              requests.dump() },
+            {      "allocator_pid",                     call.pid },
+            {    "allocator_phase", decode ? "decode" : "extend" }
         });
-    const auto request_identity = requests.dump();
-    for (auto & item : plan.nodes) {
-        item.work.attrs["allocator_requests"] = request_identity;
-        item.work.attrs["allocator_pid"] = call.pid;
-        item.work.attrs["allocator_phase"] = decode ? "decode" : "extend";
-        item.work.attrs["allocator_action"] = unchanged ? "retained" : "generated";
+        for (auto & item : plan.nodes) item.work.shared_attrs = description;
     }
 
     HiCacheHostSequence sequence(call.positions, insertions_, future, node);

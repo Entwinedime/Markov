@@ -122,6 +122,7 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
         auto & [branch, call] = entry;
         const auto gate = applied.synthetic_node_ids.at(id);
         call.entry_node = gate;
+        graph.mutable_node(gate).observe_start = true;
         empty_load_branches_.emplace(gate, std::move(branch));
         if (!capacity_calls_.emplace(call.owner, std::move(call)).second) throw std::runtime_error("Inactive load branch overlaps another capacity entry");
     }
@@ -167,6 +168,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
         // This request did not observe the inactive branch. Keep its cost
         // unbound until target state selects it; another request is not a
         // corresponding source operation and cannot donate its envelope.
+        graph.mutable_node(branch->entry_node).observe_start = true;
         empty_load_branches_.emplace(branch->entry_node, EmptyLoadBranch{ branch->owner, branch->return_node, std::move(empty) });
         const auto & event = graph.event_for_node(branch->entry_node);
         Call call{ .owner = branch->owner,

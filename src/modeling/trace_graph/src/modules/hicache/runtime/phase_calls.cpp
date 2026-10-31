@@ -182,7 +182,7 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
     size_t host_return;
     uint64_t outside_us = 0;
     if (work.action == Action::RetainCompute) {
-        describe_phase_call(call.retained, work);
+        if (retained_source_nodes_) describe_phase_call(call.retained, work);
         const auto lanes = call.retained.resource_lanes(graph);
         const auto expanded = sequence.append(std::move(call.retained), lanes);
         outside_us = layers_.rebind_copied_calls(graph, call.layers, expanded);
@@ -194,11 +194,17 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
         if (!call.resources) throw std::runtime_error("Target phase work lacks a proven compute stream and worker resource");
         const std::vector<size_t> no_load;
         const auto & records = call.layers.empty() ? no_load : consumer(call.pid, call.layers.front().batch_start_ns);
-        auto generated =
-            generate_tensor_program(graph, node, call.resources->worker, call.resources->compute, work.operations, "phase_tensor", !records.empty());
+        auto generated = generate_tensor_program(graph,
+                                                 node,
+                                                 call.resources->worker,
+                                                 call.resources->compute,
+                                                 work.operations,
+                                                 "phase_tensor",
+                                                 !records.empty(),
+                                                 retained_source_nodes_ != nullptr);
         inherit_collective_completions(graph, call.retained, generated.plan);
         bind_host_operations(generated.plan, generated.operations, provider_, "tensor_independent_model");
-        describe_phase_call(generated.plan, work);
+        if (retained_source_nodes_) describe_phase_call(generated.plan, work);
 
         size_t check = 0;
         for (size_t i = 0; i < work.operations.size(); ++i) {

@@ -12,8 +12,8 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                               std::span<const structure::TensorOperation> operations, const std::string & identity_prefix,
-                                               bool has_layer_load) {
+                                               std::span<const structure::TensorOperation> operations, const std::string & identity_prefix, bool has_layer_load,
+                                               bool report_structure) {
     GeneratedTensorProgram result;
     auto & plan = result.plan;
     std::optional<size_t> previous_host, previous_device, first_device;
@@ -148,38 +148,20 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
             if (node.submission) *node.submission += offset;
             if (node.task_predecessor) *node.task_predecessor += offset;
             node.work.category = "phase_patch";
-            node.work.attrs["component"] = operation.work.component;
-            node.work.attrs["operation"] = operation.work.operation;
-            node.work.attrs["implementation"] = operation.work.implementation;
-            node.work.attrs[identity_prefix + "_operation_index"] = std::to_string(result.operations.size());
-            node.work.attrs[identity_prefix + "_execution"] = structure::tensor_execution_name(operation.execution);
-            if (operation.request_index) node.work.attrs[identity_prefix + "_request_index"] = std::to_string(*operation.request_index);
-            const auto local = offset + i;
-            std::string scope;
-            if (local == slots.main || (slots.tail && local == *slots.tail)) scope = "cpu_service";
-            else if (slots.worker && local == *slots.worker) scope = "worker_launch_service";
-            else if (slots.worker_return && local == *slots.worker_return) scope = "worker_return_service";
-            else if (slots.device && local == *slots.device) scope = "device_service";
-            if (!scope.empty()) {
-                if (slots.tail && local == *slots.tail) scope = tail_scope;
-                node.work.attrs["cost_operation"] = slots.tail && local == *slots.tail ? tail_operation : request.work.operation;
-                node.work.attrs["cost_implementation"] = request.work.implementation;
-                node.work.attrs["cost_timing_scope"] = scope;
-            }
-            for (size_t launch_index = 0; launch_index < slots.device_launches.size(); ++launch_index) {
-                const auto & launch = slots.device_launches[launch_index];
-                if (local != launch.worker && local != launch.device) continue;
+            if (report_structure) {
+                node.work.attrs["component"] = operation.work.component;
+                node.work.attrs["operation"] = operation.work.operation;
+                node.work.attrs["implementation"] = operation.work.implementation;
+                node.work.attrs[identity_prefix + "_operation_index"] = std::to_string(result.operations.size());
+                node.work.attrs[identity_prefix + "_execution"] = structure::tensor_execution_name(operation.execution);
+                if (operation.request_index) node.work.attrs[identity_prefix + "_request_index"] = std::to_string(*operation.request_index);
+                const auto local = offset + i;
+                for (const auto & launch : slots.device_launches)
+                    if (local == launch.device && local != *slots.device) node.work.attrs["tensor_intermediate_device"] = "true";
 
-                const auto & launch_work = request.device_launches[launch_index];
-                node.work.attrs["cost_operation"] = launch_work.operation;
-                node.work.attrs["cost_implementation"] = launch_work.implementation;
-                node.work.attrs["cost_timing_scope"] = local == launch.worker ? "worker_launch_service" : "device_service";
-                if (local == launch.device && local != *slots.device) node.work.attrs["tensor_intermediate_device"] = "true";
+                if (local == slots.main) node.work.attrs["work_features"] = nlohmann::json(operation.work.features).dump();
+                if (operation.execution == Kind::BlockingContextReadback && local == host_return) node.work.attrs["tensor_completion"] = "true";
             }
-            // Store geometry once per operation, not on every worker, device
-            // and boundary node. Call identity is attached by the coordinator.
-            if (local == slots.main) node.work.attrs["work_features"] = nlohmann::json(operation.work.features).dump();
-            if (operation.execution == Kind::BlockingContextReadback && local == host_return) node.work.attrs["tensor_completion"] = "true";
             plan.nodes.push_back(std::move(node));
         }
         for (const auto & edge : segment.edges) plan.edges.push_back({ offset + edge.from, offset + edge.to, edge.kind });

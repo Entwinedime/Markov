@@ -47,7 +47,22 @@ std::shared_ptr<const CpuIntervalIndex> DagGraph::cpu_intervals() const {
     if (cpu_intervals_) return cpu_intervals_;
 
     CpuIntervalIndex index;
-    for (const auto & node : nodes()) {
+    index.node_count = node_count();
+    index.event_count = event_count();
+    if (source_cpu_intervals_) {
+        // Activity narrows the source order; raw-coordinate edits invalidate this seed.
+        for (const auto & [lane, members] : source_cpu_intervals_->nodes) {
+            auto & retained = index.nodes[lane];
+            retained.reserve(members.size());
+            for (const auto id : members)
+                if (node(id).active) retained.push_back(id);
+        }
+    }
+    const auto first_added = source_cpu_intervals_ ? source_cpu_intervals_->node_count : 0;
+    std::unordered_map<std::string, size_t, TraceArgHash, std::equal_to<>> retained_counts;
+    for (const auto & [lane, members] : index.nodes) retained_counts.emplace(lane, members.size());
+    for (size_t id = first_added; id < node_count(); ++id) {
+        const auto & node = this->node(id);
         if (!node.active || !node.is_cpu) continue;
 
         const auto & event = event_for_node(node.id);
@@ -57,14 +72,19 @@ std::shared_ptr<const CpuIntervalIndex> DagGraph::cpu_intervals() const {
     for (auto & [lane_key, nodes] : index.nodes) {
         // Sort compact coordinates instead of repeatedly visiting large trace
         // storage. Entry points still precede nonempty leaves at the same tick.
-        std::vector<std::tuple<uint64_t, bool, size_t>> order;
-        order.reserve(nodes.size());
-        for (const auto id : nodes) {
-            const auto & event = event_for_node(id);
-            order.emplace_back(event.ts, event.dur != 0, id);
+        const auto retained = retained_counts.contains(lane_key) ? retained_counts.at(lane_key) : 0;
+        if (retained < nodes.size()) {
+            const auto coordinates = [&](size_t id) {
+                const auto & event = event_for_node(id);
+                return std::tuple{ event.ts, event.dur != 0, id };
+            };
+            std::vector<std::tuple<uint64_t, bool, size_t>> order;
+            order.reserve(nodes.size() - retained);
+            for (size_t i = retained; i < nodes.size(); ++i) order.push_back(coordinates(nodes[i]));
+            if (!std::ranges::is_sorted(order)) std::ranges::sort(order);
+            for (size_t i = 0; i < order.size(); ++i) nodes[retained + i] = std::get<2>(order[i]);
+            if (retained) std::ranges::inplace_merge(nodes, nodes.begin() + retained, std::ranges::less{}, coordinates);
         }
-        std::ranges::sort(order);
-        for (size_t i = 0; i < nodes.size(); ++i) nodes[i] = std::get<2>(order[i]);
 
         auto & prefix_ends = index.prefix_end_us[lane_key];
         prefix_ends.reserve(nodes.size());
@@ -78,7 +98,9 @@ std::shared_ptr<const CpuIntervalIndex> DagGraph::cpu_intervals() const {
         }
     }
 
-    return cpu_intervals_ = std::make_shared<const CpuIntervalIndex>(std::move(index));
+    cpu_intervals_ = std::make_shared<const CpuIntervalIndex>(std::move(index));
+    if (!source_cpu_intervals_) source_cpu_intervals_ = cpu_intervals_;
+    return cpu_intervals_;
 }
 
 std::shared_ptr<const CpuTaskObservations> DagGraph::cpu_task_observations() const {
@@ -100,9 +122,9 @@ std::shared_ptr<const CpuTaskObservations> DagGraph::cpu_task_observations() con
         }
         index.lanes[node.lane_id].push_back({ node.id, identity, event.ts, checked_add_u64(event.ts, event.dur, "CPU task observation end overflow") });
     }
+    const auto before = [](const auto & left, const auto & right) { return std::tie(left.start_us, left.node) < std::tie(right.start_us, right.node); };
     for (auto & [lane, members] : index.lanes)
-        std::ranges::sort(members,
-                          [](const auto & left, const auto & right) { return std::tie(left.start_us, left.node) < std::tie(right.start_us, right.node); });
+        if (!std::ranges::is_sorted(members, before)) std::ranges::sort(members, before);
 
     // Endpoints may later move; retain every edge of these kinds, not just current cross-lane edges.
     for (size_t id = 0; id < edge_count(); ++id)

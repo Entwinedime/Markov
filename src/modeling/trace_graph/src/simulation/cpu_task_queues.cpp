@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -104,6 +105,7 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph) {
         std::vector<size_t> ids, identities;
         std::vector<uint64_t> observed_previous_ends;
         ids.reserve(observed.size());
+        identities.reserve(observed.size());
         observed_previous_ends.reserve(observed.size());
         uint64_t previous_end = 0;
         for (const auto & member : observed) {

@@ -79,7 +79,10 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     }
     bind_inactive(graph, waits, begin, end);
 
-    for (const auto & [anchor, call] : calls_) source_calls_[{ call.pid, graph.event_for_node(anchor).tid }].push_back({ anchor, 0 });
+    for (const auto & [anchor, call] : calls_) {
+        graph.mutable_node(anchor).observe_start = true;
+        source_calls_[{ call.pid, graph.event_for_node(anchor).tid }].push_back({ anchor, 0 });
+    }
     for (auto & [lane, entries] : source_calls_) {
         std::ranges::sort(entries, {}, [&](const auto & entry) { return calls_.at(entry.anchor).source_start_ns; });
         uint64_t latest_end_ns = 0;

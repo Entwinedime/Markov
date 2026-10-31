@@ -39,12 +39,13 @@ namespace chrome_trace_io_detail {
 using Json = nlohmann::json;
 
 bool contains_validation_marker(std::string_view text) {
+    const auto lowercase = [](unsigned char value) { return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value; };
     constexpr std::string_view kStateSnapshot = "state_snapshot";
     constexpr std::string_view kOracleState = "oracle_state";
     constexpr std::string_view kValidationDiff = "validation_diff";
     for (size_t offset = 0; offset < text.size(); ++offset) {
         std::string_view marker;
-        switch (static_cast<char>(std::tolower(static_cast<unsigned char>(text[offset])))) {
+        switch (lowercase(static_cast<unsigned char>(text[offset]))) {
         case 's':
             marker = kStateSnapshot;
             break;
@@ -60,7 +61,7 @@ bool contains_validation_marker(std::string_view text) {
         if (marker.size() > text.size() - offset) continue;
         bool matched = true;
         for (size_t index = 1; index < marker.size(); ++index) {
-            const auto actual = static_cast<char>(std::tolower(static_cast<unsigned char>(text[offset + index])));
+            const auto actual = lowercase(static_cast<unsigned char>(text[offset + index]));
             if (actual != marker[index]) {
                 matched = false;
                 break;

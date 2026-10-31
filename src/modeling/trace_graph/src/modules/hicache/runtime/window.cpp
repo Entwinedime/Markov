@@ -138,7 +138,8 @@ HiCacheWindowResult HiCacheExecution::run() {
     output_.simulation = simulation::run_topological_simulation(
         graph_,
         [this](size_t node, uint64_t start_us, uint64_t duration) { return estimate_node_cost(node, start_us, duration); },
-        [this](size_t node, uint64_t elapsed_us, simulation::FutureDag & future) { expand_at_start(node, elapsed_us, future); });
+        [this](size_t node, uint64_t elapsed_us, simulation::FutureDag & future) { expand_at_start(node, elapsed_us, future); },
+        compact_programs_);
     metrics.checkpoint("execution_including_dynamic_structure_and_cost_queries");
 
     finish();
@@ -235,6 +236,12 @@ nlohmann::json HiCacheExecution::replace_source_regions() {
         write_confirmations_.rebind_resources(workers);
     }
     metrics.checkpoint("retained_resource_binding");
+    for (const auto & [node, ids] : facts_at_)
+        if (!ids.empty()) graph_.mutable_node(node).observe_start = true;
+    for (const auto & request : chain_.requests) {
+        graph_.mutable_node(request.start).observe_start = true;
+        graph_.mutable_node(request.completion).observe_start = true;
+    }
     return metrics.phases();
 }
 
@@ -338,9 +345,6 @@ uint64_t HiCacheExecution::estimate_node_cost(size_t node, uint64_t start_us, ui
         auto & event = graph_.mutable_event_for_node(node);
         event.set_arg("cost_binding_source",
                       work->timing_scope == "device_service" ? "collective_event_independent_model" : "device_collective_independent_model");
-        event.set_arg("cost_operation", work->operation);
-        event.set_arg("cost_implementation", work->implementation);
-        event.set_arg("cost_timing_scope", work->timing_scope);
     }
 
     return final_cost_transform_ ? final_cost_transform_(node, start_us, duration) : duration;

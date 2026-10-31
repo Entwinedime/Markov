@@ -43,12 +43,12 @@ struct GeneratedTensorProgram {
 };
 
 /** Lower the shared work description without translating operation types.
- * identity_prefix names report attributes, not a cost or execution policy.
+ * identity_prefix names optional report attributes, not a cost or execution policy.
  * Allocator callers leave has_layer_load false; phase callers provide the
  * target readiness condition. Optional request_index remains report metadata.
  */
 [[nodiscard]] GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
                                                              std::span<const structure::TensorOperation> operations, const std::string & identity_prefix,
-                                                             bool has_layer_load = false);
+                                                             bool has_layer_load = false, bool report_structure = false);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

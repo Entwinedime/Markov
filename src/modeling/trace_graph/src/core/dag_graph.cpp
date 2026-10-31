@@ -248,6 +248,7 @@ const TraceEvent & DagGraph::event(size_t event_index) const {
 
 TraceEvent & DagGraph::mutable_event(size_t event_index) {
     cpu_intervals_.reset();
+    if (source_cpu_intervals_ && event_index < source_cpu_intervals_->event_count) source_cpu_intervals_.reset();
     if (cpu_task_observations_ && event_index < cpu_task_observations_->event_count) cpu_task_observations_.reset();
     const auto shared = source_events_ ? source_events_->size() : 0;
     if (event_index < shared) {

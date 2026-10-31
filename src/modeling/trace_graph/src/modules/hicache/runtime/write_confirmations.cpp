@@ -9,7 +9,6 @@
 #include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
 #include <map>
-#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -36,15 +35,6 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
     for (const auto & step : steps) {
         std::optional<size_t> call_previous;
         const auto main = plan.append_main(lane, "target " + step.work.operation, call_previous);
-        plan.nodes[main].work.attrs = {
-            {           "component",                       step.work.component },
-            {           "operation",                       step.work.operation },
-            {      "implementation",                  step.work.implementation },
-            {      "cost_operation",                       step.work.operation },
-            { "cost_implementation",                  step.work.implementation },
-            {   "cost_timing_scope",                             "cpu_service" },
-            {       "work_features", nlohmann::json(step.work.features).dump() }
-        };
         const auto returned = plan.append_main(lane, "after " + step.work.operation, call_previous, "");
         if (previous) plan.edges.push_back({ *previous, main, core::DagEdgeKind::Sequential });
         if (step.completed_batch) {
@@ -64,15 +54,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
             const auto task = structure::hicache::event_destruction_work();
             request.worker_work = task;
             plan.nodes.push_back({
-                { .name = "target event destruction",
-                 .category = "hicache_patch",
-                 .lane_key = std::string(graph.node_lane_key(*worker)),
-                 .attrs = { { "component", task.component },
-                             { "operation", task.operation },
-                             { "implementation", task.implementation },
-                             { "cost_operation", task.operation },
-                             { "cost_implementation", task.implementation },
-                             { "cost_timing_scope", task.timing_scope } } },
+                { .name = "target event destruction", .category = "hicache_patch", .lane_key = std::string(graph.node_lane_key(*worker)) },
                 returned,
                 *worker
             });

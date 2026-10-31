@@ -214,6 +214,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
             throw std::runtime_error("Queue confirmation boundary unresolved: " + points[i].name + " pid=" + points[i].pid + " tid=" + points[i].tid
                                      + " at_us=" + std::to_string(points[i].ts));
         at_[*bound].push_back(actions[i]);
+        graph.mutable_node(*bound).observe_start = true;
         if (actions[i].phase == Phase::Apply) checks_[actions[i].check].return_nodes[actions[i].rank] = *bound;
         else if (actions[i].phase == Phase::Sample) checks_[actions[i].check].sample_nodes[actions[i].rank] = *bound;
         else checks_[actions[i].check].work_nodes[actions[i].rank] = *bound;

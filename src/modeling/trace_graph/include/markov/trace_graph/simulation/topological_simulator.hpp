@@ -101,9 +101,11 @@ using ExpandAtStart = std::function<void(size_t node_id, uint64_t start_us, Futu
  * Expansion runs before cost_at_start. All topology changes go through future;
  * callbacks must not mutate graph storage themselves. The resulting graph keeps
  * the generated work and can be replayed without expansion for verification.
+ * registered_boundaries_only observes marked prepared nodes; appended work
+ * still follows its explicit observe_start setting. Costs visit every node.
  */
 [[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start = {},
-                                                          const ExpandAtStart & expand_at_start = {});
+                                                          const ExpandAtStart & expand_at_start = {}, bool registered_boundaries_only = false);
 
 /**
  * @brief Replays the active DAG while contracting source snapshot and model blackbox spans.

@@ -138,7 +138,11 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
             replaced_.push_back(std::move(interval));
         }
         for (const auto & region : regions)
-            if (source.fact_node(region.progress_fact)->request_id == request.request_id) wait->regions.push_back(region);
+            if (source.fact_node(region.progress_fact)->request_id == request.request_id) {
+                graph.mutable_node(region.entry).observe_start = true;
+                graph.mutable_node(region.exit).observe_start = true;
+                wait->regions.push_back(region);
+            }
         auto * stable = wait.get();
         wait->execution = std::make_unique<model::HiCachePrefetchWaitExecution>(
             *state_,

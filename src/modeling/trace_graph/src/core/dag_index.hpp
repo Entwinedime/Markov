@@ -11,6 +11,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::core {
@@ -34,6 +35,7 @@ struct CpuIntervalIndex {
     static std::string lane_key(std::string_view pid, std::string_view tid) { return std::string(pid) + "\x1f" + std::string(tid); }
     NodeMap nodes;
     std::unordered_map<std::string, std::vector<uint64_t>, TraceArgHash, std::equal_to<>> prefix_end_us;
+    size_t node_count = 0, event_count = 0;
 };
 
 /** Observed queue coordinates and identities, independent of target activity and costs. */

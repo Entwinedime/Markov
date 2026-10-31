@@ -115,7 +115,6 @@ HiCacheHostExpansion HiCacheWriteCalls::load_prefix_concat(const LoadAdmissionPr
     operation.implementation = "torch_npu.cat.empty";
     operation.timing_scope = "control_interval";
     plan.nodes.front().work.duration = operator_provider_.estimate(operation).duration_us;
-    plan.nodes.front().work.attrs["cost_timing_scope"] = "control_interval";
     plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
     return plan;
 }
@@ -136,7 +135,6 @@ HiCacheHostExpansion HiCacheWriteCalls::load_admission_tail(const LoadAdmissionP
         // interval. Its wall time is not a measurement of pure CPU service.
         work.timing_scope = "control_interval";
         plan.nodes.front().work.duration = operator_provider_.estimate(work).duration_us;
-        plan.nodes.front().work.attrs["cost_timing_scope"] = "control_interval";
         plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
         return plan;
     }

@@ -135,6 +135,8 @@ struct DagNode {
     /** Final execution cost, after source correction and the start-time cost
      * provider. Replaying this graph must not correct this duration again. */
     bool execution_cost_bound = false;
+    /** Prepared rule boundary; ordinary source computation does not observe shared state. */
+    bool observe_start = false;
 
     /** @brief Index into the owning graph's event vector. */
     size_t event_index = 0;
@@ -498,6 +500,7 @@ private:
     std::unordered_map<size_t, TraceEvent> event_overrides_;
     mutable std::shared_ptr<const DagAdjacency> adjacency_;
     mutable std::shared_ptr<const CpuIntervalIndex> cpu_intervals_;
+    mutable std::shared_ptr<const CpuIntervalIndex> source_cpu_intervals_;
     mutable std::shared_ptr<const CpuTaskObservations> cpu_task_observations_;
     // Proven prefix; direct edits are resolved before returning a current order.
     mutable std::shared_ptr<const DagTopologicalOrder> topological_order_;
