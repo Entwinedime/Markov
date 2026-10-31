@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace markov::adapters::sglang {
@@ -36,6 +37,7 @@ private:
     void observe_collective(const ProbeEvent & event);
     void observe_result(const ProbeEvent & event);
     void observe_control(const ProbeEvent & event);
+    void observe_regenerated_control(const ProbeEvent & event);
     void observe_response(const ProbeEvent & event);
     void observe_storage(const ProbeEvent & event);
     std::optional<std::filesystem::path> configuration_;
@@ -53,6 +55,7 @@ private:
     std::map<BatchIdentity, trace_graph::source::ResultCopy> result_copies_;
     std::map<BatchIdentity, std::vector<trace_graph::source::ResultSend>> result_sends_;
     std::map<trace_graph::source::Index, std::vector<trace_graph::source::Index>> pending_controls_;
+    std::map<std::pair<trace_graph::source::Index, trace_graph::source::Index>, trace_graph::source::ObservedRegion> prefetch_waits_;
     std::map<std::string, trace_graph::source::ObservedCallSequence> pending_decode_allocations_;
     struct InputWindow {
         trace_graph::source::ObservedRegion allocator;

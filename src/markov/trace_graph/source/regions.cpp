@@ -38,11 +38,11 @@ Regions::Regions(const SourceContext & source) : frames_(source.observations().c
     std::map<Index, std::vector<Segment>> lanes;
     std::map<Index, std::vector<ObservedRegion>> exclusions;
     for (const auto & span : observed.spans) {
-        // Waits inside modeled parents have explicit target producers. Outside
-        // those parents, control work is still opaque: retain its source wait
-        // rather than deleting time without a replacement dependency.
+        // Unknown waits remain source residuals. Only observed instrumentation
+        // and controls with explicit target replacements can leave this cost.
         if (span.role == SpanRole::ProfilerOverhead) exclusions[span.resource].push_back({ span.resource, span.begin_ns, span.end_ns, span.record });
     }
+    for (const auto & control : observed.regenerated_controls) exclusions[control.resource].push_back(control);
     for (auto & [resource, intervals] : exclusions) std::ranges::sort(intervals, {}, &ObservedRegion::begin_ns);
 
     for (Index frame = 0; frame < frames_.size(); ++frame) {

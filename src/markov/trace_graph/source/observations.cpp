@@ -60,6 +60,7 @@ void Observations::normalize_resources() {
         for (auto & send : result.final_sends) send.region.resource = canonical_resource(send.region.resource);
     }
     for (auto & control : host_controls) control.region.resource = canonical_resource(control.region.resource);
+    for (auto & control : regenerated_controls) control.resource = canonical_resource(control.resource);
 }
 
 Index Observations::describe_work(std::vector<planning::Work> work, std::vector<planning::ComputePart> recipe, std::string caller,

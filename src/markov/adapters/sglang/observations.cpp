@@ -76,6 +76,10 @@ std::optional<std::vector<ComputeOperation>> attention_writes(const nlohmann::js
 } // namespace
 
 void ProbeReader::observe(const ProbeEvent & event) {
+    if (event.name == "runtime.hicache.file.prefetch_progress" || event.name == "runtime.hicache.load_back" || event.name == "runtime.hicache.start_loading") {
+        observe_regenerated_control(event);
+        return;
+    }
     if (event.name.starts_with("storage.file.")) {
         observe_storage(event);
         return;
@@ -464,6 +468,41 @@ void ProbeReader::observe_result(const ProbeEvent & event) {
         value.final_sends = std::move(final_send->second);
         result_sends_.erase(final_send);
     }
+}
+
+void ProbeReader::observe_regenerated_control(const ProbeEvent & event) {
+    const auto & args = event.args;
+    if (args.at("status") != "returned") throw std::runtime_error("Cannot normalize a failed source cache control");
+
+    const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    ObservedRegion region{ resource, event.begin_ns, event.end_ns, event.record };
+    std::string operation;
+    if (event.name == "runtime.hicache.file.prefetch_progress") {
+        const auto key = std::pair(resource, output_.name(args.at("request_id").get<std::string>()));
+        if (!args.at("ready").get<bool>()) {
+            prefetch_waits_.try_emplace(key, region);
+            return;
+        }
+        const auto waiting = prefetch_waits_.find(key);
+        if (waiting == prefetch_waits_.end()) return;
+
+        // Only a completed native acceptance identifies the replaced loop.
+        // Query misses/revocations remain opaque rather than silently removed.
+        if (!args.at("operation_present").get<bool>() || args.at("accepted_tokens").is_null()) {
+            prefetch_waits_.erase(waiting);
+            return;
+        }
+        region = waiting->second;
+        region.end_ns = event.begin_ns;
+        prefetch_waits_.erase(waiting);
+        operation = "scheduler.idle_turn";
+    }
+    else if (event.name == "runtime.hicache.load_back" && args.at("loaded_tokens").get<std::size_t>() > 0) operation = "cache.load.prepare";
+    else if (event.name == "runtime.hicache.start_loading" && args.at("producer").get<std::int64_t>() >= 0) operation = "cache.load.caller";
+    else return;
+
+    ++output_.counts["regenerated_control." + operation];
+    output_.regenerated_controls.push_back(region);
 }
 
 void ProbeReader::observe_control(const ProbeEvent & event) {
