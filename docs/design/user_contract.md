@@ -83,6 +83,27 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 中断后的采集先核对原容器：仍在运行就等待，正常退出则记账后复用，句柄缺失记失败及保守用量。
 容器自身也有时间上限；只有退出和用量写入状态后才移除容器，不凭产物存在推断成功。
 
+## 有限资源搜索
+
+`search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名）、maximum_time_ratio、
+fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以搜索请求所在目录为起点。
+每个资源档位声明 name、device_gib_per_rank、host_gib 和 hourly_cost_units；GiB 配额为正整数，其余量为有限正数，名字不重复。
+候选组合由调用方提供，搜索不重写结构规则、不读取 target 真值，也不比较多套搜索算法。
+
+HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、host_kv_bytes_per_rank，单位为 bytes。
+它来自原生池布局，包括设备 dummy 页、主机池对齐及池内缓冲；浮点表示避免外部极大配额的整数乘法溢出，正常硬件范围的字节量仍可精确表示。
+固定设备预留按 rank，固定主机预留按整个 TP 组，分别覆盖权重、workspace、运行时与池外缓冲；它们是部署合同，不是拟合系数或自动测量值。
+未提供这种资源表示的框架明确为 resource_accounting_unavailable，不借用 HiCache 公式或填零。
+档位须使用相同设备、runtime 与 I/O 条件，只改变可用配额和声明报价；接口不模拟单独改变硬件带宽或竞争。
+
+流程调用同一 predict，选择能容纳各候选的最低报价档位，列出时间/报价 Pareto，再在 baseline 预测耗时乘 maximum_time_ratio 的约束内选最低报价。
+同价按耗时、名字稳定排序，Pareto 保留并列；没有满足时间约束的候选时 selected=null，不降低要求。
+缺成本或结构保留缺项并标记 incomplete；即使有暂定选择，也不能声称全部候选已比较。明确资源不可行者可排除，仍保留原预测状态。
+报价只在调用方提供的价格情景内有效，不代表真实采购支出；完整有限集合的预测最优也不表示真实全局最优。
+
+结果位于预测 output/search/report.json。正常确认属于调用方的实验步骤，在预测完成后运行，不回写参数或 readiness。
+示例声明、整组成本预算和正常确认见 [搜索例子](../../examples/hicache_search/README.md)。
+
 ## 独立 target 评价
 
 运行 evaluate --request 时提供 prediction、target（报告中的条件名）、manifest（真实 target profile）、output，
