@@ -533,6 +533,15 @@ AttentionCallAudit observe_attention_calls(const source_dag::SourceDagIndex & so
         if (!covered_nodes.contains(node)) ++result.issues["attention_device_work_without_call"];
     if (result.calls.empty()) ++result.issues["no_complete_attention_calls"];
     resolve_attention_cache_layouts(source, queues, positions, result);
+    for (size_t i = 0; i < result.calls.size(); ++i) {
+        const auto & call = result.calls[i];
+        if (!call.conditions.cache_layer_index) continue;
+
+        const auto [at, inserted] =
+            result.cache_layer_calls.try_emplace(std::tuple{ call.position.phase_index, call.position.decode_iteration, *call.conditions.cache_layer_index },
+                                                 i);
+        if (!inserted) at->second.reset();
+    }
     return result;
 }
 

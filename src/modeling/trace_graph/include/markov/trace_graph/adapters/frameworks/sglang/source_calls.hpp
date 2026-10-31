@@ -16,6 +16,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace markov::trace_graph::adapters::sglang {
@@ -125,6 +126,8 @@ struct AttentionCall {
 struct AttentionCallAudit {
     std::vector<AttentionCall> calls;
     std::map<std::string, size_t> issues;
+    // Phase/iteration/cache-layer correspondence; null preserves ambiguity.
+    std::map<std::tuple<size_t, std::optional<uint64_t>, uint64_t>, std::optional<size_t>> cache_layer_calls;
 };
 
 /** Resolve packed-row K/V layouts from direct metadata or the same source
@@ -192,6 +195,12 @@ struct AttentionMetadataAudit {
  * names remain unknown and cannot be pooled into reduction CPU overhead. */
 [[nodiscard]] std::optional<structure::hicache::CollectiveTaskKind> collective_task_kind(std::string_view submission_name);
 
+struct CollectiveCallerInterval {
+    size_t step;
+    uint64_t begin_us, end_us;
+    std::optional<size_t> submission;
+};
+
 /** One rank's observed ordinary all-reduce. Shape is a packed token-major
  * matrix, not a target shape. Phase/layer ownership and all peer descriptors
  * have been corroborated; no communication duration is a service estimate. */
@@ -209,27 +218,16 @@ struct DeviceCollectiveCall {
     // completion. WorkHCCL's group-level blocking-wait option is immutable.
     bool nonblocking_group = false;
     structure::hicache::CollectiveTaskKind transfer = structure::hicache::CollectiveTaskKind::Reduce;
+    // Source-local task identities and enqueue cuts; absence retains an
+    // unsupported protocol, not empty work. No target state or costs.
+    std::optional<std::vector<source_dag::QueuedCallTask>> queued_tasks;
+    std::optional<std::vector<CollectiveCallerInterval>> caller_intervals;
 };
 
 struct DeviceCollectiveAudit {
     std::vector<DeviceCollectiveCall> calls;
     std::map<std::string, size_t> issues;
 };
-
-struct CollectiveCallerInterval {
-    size_t step;
-    uint64_t begin_us, end_us;
-    std::optional<size_t> submission;
-};
-
-/** Corroborate the ordinary caller rule with complete queued-task ownership
- * and native submission order, then partition its observation at enqueue
- * completion boundaries. Unknown protocols yield no partial role assignment.
- * Boundaries describe CPU measurement intervals, not target timestamps. */
-[[nodiscard]] std::optional<std::vector<CollectiveCallerInterval>> observe_collective_caller_intervals(const source_dag::SourceDagIndex & source,
-                                                                                                       const simulation::detail::CpuTaskQueues & queues,
-                                                                                                       const DeviceCollectiveCall & call,
-                                                                                                       std::span<const source_dag::QueuedCallTask> tasks);
 
 /** Source-only attribution for the current ordinary Qwen3 TP path. Unknown
  * layouts, missing peers and ambiguous submission ownership are issues, not

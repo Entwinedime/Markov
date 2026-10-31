@@ -199,7 +199,17 @@ core::DagMutationPlan plan_host_removal(const adapters::sglang::HiCacheSourceInd
             }
         }
     };
-    for (size_t edge_id = 0; edge_id < graph.edges().size(); ++edge_id) {
+    // The current index already owns adjacency. Only edges crossing this
+    // removal can affect retained work; retain graph order for validation.
+    std::vector<size_t> boundary_edges;
+    for (const auto node : plan.disable_nodes) {
+        for (const auto id : source.incoming_edge_ids(node))
+            if (!removed_nodes[graph.edge(id).src]) boundary_edges.push_back(id);
+        for (const auto id : source.outgoing_edge_ids(node))
+            if (!removed_nodes[graph.edge(id).dst]) boundary_edges.push_back(id);
+    }
+    std::ranges::sort(boundary_edges);
+    for (const auto edge_id : boundary_edges) {
         const auto & edge = graph.edge(edge_id);
         if (!edge.active || removed_nodes[edge.src] == removed_nodes[edge.dst]) continue;
         const bool outgoing = removed_nodes[edge.src];

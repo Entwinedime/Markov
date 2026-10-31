@@ -48,11 +48,11 @@ void collective_operator_observations(const SourceDagIndex & source, const simul
         // ProcessGroupHCCL surrounds the reduction with separate event
         // tasks. Caller intervals end at each enqueue, not at the last
         // enqueue of the whole call; worker/device work is measured separately.
-        if (const auto tasks = observe_queued_call_tasks(source, queues, call.region)) {
-            if (const auto caller = adapters::sglang::observe_collective_caller_intervals(source, queues, call, *tasks)) {
+        if (call.queued_tasks) {
+            if (call.caller_intervals) {
                 const auto steps = structure::hicache::ordinary_collective_caller_steps(call.transfer);
                 const auto & envelope = graph.runtime_observations().at(call.region.observation);
-                for (const auto & interval : *caller) {
+                for (const auto & interval : *call.caller_intervals) {
                     const auto caller_work = structure::hicache::collective_caller_work(work, steps[interval.step]);
                     auto measured = nlohmann::json::array();
                     (void)append_cpu_interval_observations(source,
@@ -67,7 +67,7 @@ void collective_operator_observations(const SourceDagIndex & source, const simul
                 }
             }
 
-            for (const auto & task : *tasks) {
+            for (const auto & task : *call.queued_tasks) {
                 const auto & submit = graph.event_for_node(queues.tasks.at(task.task).submission);
                 const auto primitive = adapters::sglang::collective_task_kind(submit.name);
                 if (!primitive) continue;

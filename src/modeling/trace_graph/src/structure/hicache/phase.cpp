@@ -235,17 +235,17 @@ PhaseCallPlan plan_dense_call(const adapters::sglang::DenseCall & source, const 
 }
 
 DeviceCollectivePlan plan_device_collective_call(const adapters::sglang::DeviceCollectiveCall & source,
-                                                 std::span<const adapters::sglang::AttentionCall> attention_calls,
+                                                 const adapters::sglang::AttentionCallAudit & attention_calls,
                                                  const modules::hicache::model::HiCachePrefillWorkItem & prefill) {
     DeviceCollectivePlan result{ source.region.observation, source.peer_observations, std::nullopt, {} };
     const adapters::sglang::AttentionCall * attention = nullptr;
-    for (const auto & call : attention_calls) {
-        if (call.position != source.position || call.conditions.cache_layer_index != source.layer_index) continue;
-        if (attention) {
+    if (const auto at = attention_calls.cache_layer_calls.find({ source.position.phase_index, source.position.decode_iteration, source.layer_index });
+        at != attention_calls.cache_layer_calls.end()) {
+        if (!at->second) {
             result.reason = "collective_forward_layout_ambiguous";
             return result;
         }
-        attention = &call;
+        attention = &attention_calls.calls.at(*at->second);
     }
     if (!attention || !attention->padding || prefill.batch_size != 1 || attention->batch.requests.size() != 1 || attention->padding->mlp_sync
         || attention->padding->allow_input_scattered || attention->conditions.context_parallel) {
@@ -302,7 +302,7 @@ PhaseCallWork plan_phase_calls(const adapters::sglang::PhaseCallAudit & source, 
     }
 
     for (const auto & call : source.collectives.calls)
-        if (call.position.phase_index == source_phase) result.collectives.push_back(plan_device_collective_call(call, source.attention.calls, prefill));
+        if (call.position.phase_index == source_phase) result.collectives.push_back(plan_device_collective_call(call, source.attention, prefill));
 
     return result;
 }

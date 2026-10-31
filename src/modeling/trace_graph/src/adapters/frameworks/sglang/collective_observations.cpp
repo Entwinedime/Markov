@@ -27,6 +27,8 @@ std::optional<structure::hicache::CollectiveTaskKind> collective_task_kind(std::
     return std::nullopt;
 }
 
+namespace {
+
 std::optional<std::vector<CollectiveCallerInterval>> observe_collective_caller_intervals(const source_dag::SourceDagIndex & source,
                                                                                          const simulation::detail::CpuTaskQueues & queues,
                                                                                          const DeviceCollectiveCall & call,
@@ -75,8 +77,6 @@ std::optional<std::vector<CollectiveCallerInterval>> observe_collective_caller_i
     intervals.push_back({ steps.size() - 1, cursor, end, std::nullopt });
     return intervals;
 }
-
-namespace {
 
 using GroupIdentity = std::tuple<std::string, std::string, uint64_t>;
 
@@ -288,7 +288,11 @@ DeviceCollectiveAudit observe_device_collectives(const source_dag::SourceDagInde
             if (returned < completed) nonblocking_groups.emplace(call.group, call.global_rank);
         }
     }
-    for (auto & call : audit.calls) call.nonblocking_group = nonblocking_groups.contains({ call.group, call.global_rank });
+    for (auto & call : audit.calls) {
+        call.nonblocking_group = nonblocking_groups.contains({ call.group, call.global_rank });
+        call.queued_tasks = source_dag::observe_queued_call_tasks(source, queues, call.region);
+        if (call.queued_tasks) call.caller_intervals = observe_collective_caller_intervals(source, queues, call, *call.queued_tasks);
+    }
 
     std::set<size_t> attributed;
     for (const auto & call : audit.calls) attributed.insert(call.region.submitted_nodes.begin(), call.region.submitted_nodes.end());

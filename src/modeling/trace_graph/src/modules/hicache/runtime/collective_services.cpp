@@ -80,7 +80,7 @@ void HiCacheCollectiveServices::bind(core::DagGraph & graph, const HiCacheSource
         peers_.emplace(call.region.observation, call.peer_observations);
         plan.disable_nodes.push_back(node);
 
-        const auto tasks = source_dag::observe_queued_call_tasks(source, queues, call.region);
+        const auto & tasks = call.queued_tasks;
         if (!tasks) throw std::runtime_error("Collective CPU replacement lacks complete queued-task attribution");
         const auto task = std::ranges::find_if(*tasks, [&](const auto & candidate) { return candidate.devices.contains(node); });
         if (task == tasks->end() || task->devices.size() != 1)

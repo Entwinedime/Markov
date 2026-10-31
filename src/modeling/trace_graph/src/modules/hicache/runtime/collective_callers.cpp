@@ -18,22 +18,14 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     const auto & original = prepared.index.graph();
     using Ref = core::DagNodeRef;
     using Kind = core::DagEdgeKind;
-    struct Selected {
-        const adapters::sglang::DeviceCollectiveCall * call;
-        std::vector<adapters::sglang::CollectiveCallerInterval> intervals;
-    };
-    std::vector<Selected> selected;
+    std::vector<const adapters::sglang::DeviceCollectiveCall *> selected;
     std::vector<core::TraceEvent> points;
-    const auto & original_index = prepared.index;
-    const auto & queues = prepared.queues;
     for (const auto & call : calls) {
         const auto & event = original.runtime_observations().at(call.region.observation);
         const auto end = core::checked_add_u64(event.ts, event.dur, "Collective caller end overflow");
         if (!is_admitted_execution_call(event, begin_us, end_us)) continue;
-        const auto tasks = source_dag::observe_queued_call_tasks(original_index, queues, call.region);
-        const auto intervals = tasks ? adapters::sglang::observe_collective_caller_intervals(original_index, queues, call, *tasks) : std::nullopt;
-        if (!intervals) throw std::runtime_error("Collective caller needs a supported event protocol with proven stream handoffs");
-        selected.push_back({ &call, *intervals });
+        if (!call.caller_intervals) throw std::runtime_error("Collective caller needs a supported event protocol with proven stream handoffs");
+        selected.push_back(&call);
         for (const auto at : { event.ts, end }) {
             core::TraceEvent point;
             point.name = "collective.caller";
@@ -55,8 +47,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     std::map<std::string, CallerSegment> segments;
     hosts.reserve(selected.size());
     for (size_t i = 0; i < selected.size(); ++i) {
-        const auto & selected_call = selected[i];
-        const auto & call = *selected_call.call;
+        const auto & call = *selected[i];
         const auto steps = structure::hicache::ordinary_collective_caller_steps(call.transfer);
         const auto & event = original.runtime_observations().at(call.region.observation);
         if (!boundaries[2 * i] || !boundaries[2 * i + 1]) throw std::runtime_error("Collective caller replacement lacks exact source entry/exit boundaries");
@@ -65,7 +56,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
         regions.push_back({ entry, exit, &hosts.back() });
         const auto lane = std::string(graph.node_lane_key(entry));
         auto previous = Ref::existing(entry);
-        for (const auto & interval : selected_call.intervals) {
+        for (const auto & interval : *call.caller_intervals) {
             const auto & step = steps[interval.step];
             const auto identity = "collective:" + std::to_string(call.region.observation) + ":caller:" + std::string(step.name);
             const auto service = Ref::synthetic(identity);
@@ -110,7 +101,7 @@ void HiCacheCollectiveServices::bind_callers(core::DagGraph & graph, const HiCac
     plan.add_edges.insert(plan.add_edges.end(), edges.begin(), edges.end());
     const auto mutation = core::apply_dag_mutation_plan(graph, plan);
     owned_.insert(plan.disable_nodes.begin(), plan.disable_nodes.end());
-    for (const auto & item : selected) owned_.insert(item.call->region.caller.owned_node_ids.begin(), item.call->region.caller.owned_node_ids.end());
+    for (const auto * call : selected) owned_.insert(call->region.caller.owned_node_ids.begin(), call->region.caller.owned_node_ids.end());
     for (const auto & [identity, segment] : segments) caller_segments_.emplace(mutation.synthetic_node_ids.at(identity), segment);
 }
 
