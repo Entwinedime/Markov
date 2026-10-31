@@ -153,11 +153,12 @@ struct HiCacheExpandedWrite {
 struct HiCacheExpandedHost {
     size_t host_return;
     std::vector<size_t> stream_tails, nodes;
+    std::map<size_t, size_t> source_nodes;
 };
 
-[[nodiscard]] HiCacheExpandedHost expand_host(const HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions,
-                                              simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt,
-                                              std::span<const size_t> event_completions = {});
+/** Consume owned work; pass a reusable source template by value to retain it. */
+[[nodiscard]] HiCacheExpandedHost expand_host(HiCacheHostExpansion plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+                                              std::optional<size_t> previous_host_return = std::nullopt, std::span<const size_t> event_completions = {});
 
 /** Distribute independent payload service across declared byte-weighted slots.
  * Prefix rounding preserves total microseconds. Only duration/provenance are
@@ -165,9 +166,9 @@ struct HiCacheExpandedHost {
  */
 void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us);
 
-/** Emit an already cost-bound plan. Caller resolves each stream at the new
+/** Consume an already cost-bound plan. Caller resolves each stream at the new
  * CPU insertion point; emission does not estimate or redistribute costs. */
-[[nodiscard]] HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions,
+[[nodiscard]] HiCacheExpandedWrite expand_write(HiCacheWriteExpansion plan, std::span<const HiCacheWriteStreamPosition> positions,
                                                 simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt);
 
 /** One CPU insertion callback can emit several calls on shared device streams.
@@ -176,8 +177,8 @@ class HiCacheHostSequence {
 public:
     HiCacheHostSequence(const std::map<size_t, HiCacheWriteStreamPosition> & positions, HiCacheWriteStreamInsertions & insertions,
                         simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt);
-    HiCacheExpandedHost append(const HiCacheHostExpansion & plan, std::span<const size_t> lanes, std::span<const size_t> event_completions = {});
-    HiCacheExpandedWrite append(const HiCacheWriteExpansion & plan, std::span<const size_t> lanes);
+    HiCacheExpandedHost append(HiCacheHostExpansion plan, std::span<const size_t> lanes, std::span<const size_t> event_completions = {});
+    HiCacheExpandedWrite append(HiCacheWriteExpansion plan, std::span<const size_t> lanes);
 
 private:
     std::vector<HiCacheWriteStreamPosition> resolve(std::span<const size_t> lanes) const;

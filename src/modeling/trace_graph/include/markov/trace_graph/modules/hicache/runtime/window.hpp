@@ -10,6 +10,8 @@
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #include <nlohmann/json.hpp>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -32,6 +34,8 @@ struct HiCacheWindowResult {
     QueueConfirmationCoverage confirmations;
     cost::SourceCostCoverage phase_operator_costs;
     std::map<std::string, ExecutedCostTotals> executed_cost_sources;
+    // Original-to-emitted identities exist only when an experimental structure report is requested.
+    std::vector<std::pair<size_t, size_t>> retained_source_nodes;
     // Full tensor plans belong to pending calls; reports need only these totals.
     size_t phase_migration_candidates = 0, phase_generated_plans = 0;
     std::map<std::string, size_t> phase_plan_issues;
@@ -77,6 +81,6 @@ struct HiCacheWindowResult {
 [[nodiscard]] HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const HiCacheSourcePreparation & prepared,
                                                          const frontend::HiCacheConfig & config, std::string_view source_policy,
                                                          const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us,
-                                                         const simulation::NodeCostAtStart & final_cost_transform = {});
+                                                         const simulation::NodeCostAtStart & final_cost_transform = {}, bool report_structure = false);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

@@ -151,6 +151,7 @@ PreparedSource prepare_source(const CliOptions & options, bool include_preparati
     if (prepare_execution) {
         (void)graph.adjacency();
         (void)graph.cpu_intervals();
+        (void)graph.cpu_task_observations();
         (void)core::validate_active_dag(graph);
     }
     auto migration = prepare_execution ? std::make_unique<const DagGraph>(graph) : nullptr;
@@ -246,7 +247,7 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
     const auto begin = client_input.status == "ready" ? client_input.requests.front().start_us : 0;
     const auto end = client_input.status == "ready" ? client_input.requests.back().end_us : 0;
     try {
-        modules.apply(graph, source.hicache.get(), logger, client_chain, begin, end);
+        modules.apply(graph, source.hicache.get(), logger, client_chain, begin, end, !options.outputs.structure_report.empty());
     }
     catch (const structure::MissingWork & error) {
         if (!options.outputs.run_summary.empty())
@@ -300,8 +301,11 @@ int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, 
                       source.replay_report_path);
     if (!options.outputs.structure_report.empty()) {
         if (!execution) throw std::invalid_argument("Executed structure report requires HiCache execution prediction");
-        auto structure =
-            reporting::execution_structure_report(graph, execution->model.effect_decisions, execution->model.phase_work, execution->collective_work);
+        auto structure = reporting::execution_structure_report(graph,
+                                                               execution->model.effect_decisions,
+                                                               execution->model.phase_work,
+                                                               execution->collective_work,
+                                                               execution->retained_source_nodes);
         structure["request_context"] = request_context;
         write_json_file(options.outputs.structure_report, structure);
     }

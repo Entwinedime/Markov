@@ -123,9 +123,8 @@ CpuRankNodes CpuCollectiveExecution::prepare(const CpuRankNodes & entries, simul
             {
                 .name = "collective return gate",
                 .category = "execution_gate",
-                .attrs = call.envelope_remainder_us
-                             ? std::unordered_map<std::string, std::string>{ { "timing_evidence", "call_envelope" }, { "includes_residual_cpu", "true" } }
-                             : std::unordered_map<std::string, std::string>{}
+                .attrs = call.envelope_remainder_us ? core::TraceArgMap{ { "timing_evidence", "call_envelope" }, { "includes_residual_cpu", "true" } }
+                                                    : core::TraceArgMap{}
         },
             simulation::BoundaryOrder::Ordinary,
             owner);

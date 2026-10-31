@@ -103,14 +103,14 @@ void HiCacheHostSequence::advance(std::span<const size_t> lanes, std::span<const
     }
 }
 
-HiCacheExpandedHost HiCacheHostSequence::append(const HiCacheHostExpansion & plan, std::span<const size_t> lanes, std::span<const size_t> event_completions) {
-    auto result = expand_host(plan, resolve(lanes), future_, host_return_, event_completions);
+HiCacheExpandedHost HiCacheHostSequence::append(HiCacheHostExpansion plan, std::span<const size_t> lanes, std::span<const size_t> event_completions) {
+    auto result = expand_host(std::move(plan), resolve(lanes), future_, host_return_, event_completions);
     advance(lanes, result.stream_tails, result.host_return);
     return result;
 }
 
-HiCacheExpandedWrite HiCacheHostSequence::append(const HiCacheWriteExpansion & plan, std::span<const size_t> lanes) {
-    auto result = expand_write(plan, resolve(lanes), future_, host_return_);
+HiCacheExpandedWrite HiCacheHostSequence::append(HiCacheWriteExpansion plan, std::span<const size_t> lanes) {
+    auto result = expand_write(std::move(plan), resolve(lanes), future_, host_return_);
     advance(lanes, result.stream_tails, result.host_return);
     return result;
 }
@@ -157,7 +157,7 @@ void HiCacheWriteStreamInsertions::constrain_synchronizations(size_t lane, const
 
 
 namespace {
-HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+HiCacheExpandedHost expand_host_work(HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
                                      std::optional<size_t> previous_host_return, std::span<const size_t> event_completions,
                                      std::span<const size_t> extra_observers = {}) {
     if (event_completions.size() != plan.event_waits.size()) throw std::invalid_argument("Host expansion requires explicit target event completions");
@@ -175,16 +175,16 @@ HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::spa
 
     std::vector<size_t> nodes(plan.nodes.size(), core::DagNode::kNoNode);
     for (size_t i = 0; i < plan.nodes.size(); ++i) {
-        const auto & node = plan.nodes[i];
+        auto & node = plan.nodes[i];
         const bool observe = observers[i] || node.observe_start;
-        if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(node.work, nodes.at(*node.task_predecessor), observe);
-        else if (node.submission) nodes[i] = future.append_cpu_task(node.work, nodes.at(*node.submission), *node.queue_member, observe);
-        else nodes[i] = future.append(node.work, simulation::BoundaryOrder::Ordinary, std::nullopt, observe);
+        if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(std::move(node.work), nodes.at(*node.task_predecessor), observe);
+        else if (node.submission) nodes[i] = future.append_cpu_task(std::move(node.work), nodes.at(*node.submission), *node.queue_member, observe);
+        else nodes[i] = future.append(std::move(node.work), simulation::BoundaryOrder::Ordinary, std::nullopt, observe);
     }
 
     for (const auto & edge : plan.edges) future.depend(nodes.at(edge.from), nodes.at(edge.to), edge.kind);
     if (previous_host_return) future.depend(*previous_host_return, nodes.front());
-    HiCacheExpandedHost result{ nodes.at(plan.host_return), {}, {} };
+    HiCacheExpandedHost result{ nodes.at(plan.host_return), {}, {}, std::move(plan.source_nodes) };
     for (size_t i = 0; i < plan.streams.size(); ++i) {
         if (positions[i].before) future.depend(*positions[i].before, nodes.at(plan.streams[i].first));
         if (positions[i].after) future.depend(nodes.at(plan.streams[i].last), *positions[i].after);
@@ -199,7 +199,7 @@ HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::spa
 }
 } // namespace
 
-HiCacheExpandedHost expand_host(const HiCacheHostExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+HiCacheExpandedHost expand_host(HiCacheHostExpansion plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
                                 std::optional<size_t> previous_host_return, std::span<const size_t> event_completions) {
     return expand_host_work(plan, positions, future, previous_host_return, event_completions);
 }
@@ -219,7 +219,7 @@ void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us) {
     }
 }
 
-HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+HiCacheExpandedWrite expand_write(HiCacheWriteExpansion plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
                                   std::optional<size_t> previous_host_return) {
     const size_t observers[]{ plan.write_start, plan.completion };
     auto host = expand_host_work(plan, positions, future, previous_host_return, {}, observers);

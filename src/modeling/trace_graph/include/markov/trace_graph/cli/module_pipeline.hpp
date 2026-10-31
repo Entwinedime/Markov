@@ -38,7 +38,7 @@ public:
 
     /** @brief Applies every owned module exactly once in configuration order. */
     void apply(core::DagGraph & graph, const modules::hicache::runtime::HiCacheSourcePreparation * prepared, core::Logger & logger,
-               const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us);
+               const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us, bool report_structure);
 
     [[nodiscard]] bool uses_hicache_execution() const { return execution_config_.has_value(); }
     /** @brief Static HiCache models and score-only carriers need source component observations. */

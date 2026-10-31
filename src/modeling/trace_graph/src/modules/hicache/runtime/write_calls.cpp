@@ -129,7 +129,7 @@ HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources
     const auto lanes = generated.plan.resource_lanes(*graph_);
     const auto service_us = io_completion_.duration("write_device_to_host", page_bytes_, bytes / page_bytes_, 0);
     bind_transfer_payload(generated.plan, service_us);
-    auto expanded = sequence.append(generated.plan, lanes);
+    auto expanded = sequence.append(std::move(generated.plan), lanes);
     const auto completion = writes_.submit_expanded(fact, operation, expanded.write_start, expanded.completion, future);
 
     completions_.emplace(std::pair{ operation.header.cache_scope, operation.header.operation_id }, completion);
@@ -533,9 +533,10 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
             // as a proxy for the post-return cleanup.
             returned = suffix.append(load_admission_tail(program, work->requested_pages, false), {}).host_return;
         }
-        const auto prefix = load_prefix_concat(program, *work);
+        auto prefix = load_prefix_concat(program, *work);
         const bool device_prefix = work->allocated || work->existing_prefix_pages > 0;
-        returned = suffix.append(prefix, device_prefix ? std::span<const size_t>{ program.prefix_concat.lanes } : std::span<const size_t>{}).host_return;
+        returned =
+            suffix.append(std::move(prefix), device_prefix ? std::span<const size_t>{ program.prefix_concat.lanes } : std::span<const size_t>{}).host_return;
         future.depend(returned, branch.continuation);
     }
     return resumed;

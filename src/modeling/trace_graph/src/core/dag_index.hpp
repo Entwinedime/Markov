@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -32,6 +34,20 @@ struct CpuIntervalIndex {
     static std::string lane_key(std::string_view pid, std::string_view tid) { return std::string(pid) + "\x1f" + std::string(tid); }
     NodeMap nodes;
     std::unordered_map<std::string, std::vector<uint64_t>, TraceArgHash, std::equal_to<>> prefix_end_us;
+};
+
+/** Observed queue coordinates and identities, independent of target activity and costs. */
+struct CpuTaskObservations {
+    using Identity = std::tuple<int, std::string, std::string>;
+    struct Member {
+        size_t node, identity;
+        uint64_t start_us, end_us;
+    };
+    size_t node_count = 0, edge_count = 0, event_count = 0;
+    std::map<Identity, size_t> identities;
+    std::map<size_t, std::vector<Member>> lanes;
+    std::vector<std::pair<size_t, size_t>> submissions;
+    std::vector<size_t> task_edges;
 };
 
 struct DagTopologicalOrder {

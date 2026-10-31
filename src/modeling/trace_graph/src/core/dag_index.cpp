@@ -1,5 +1,6 @@
 #include "core/dag_index.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -78,6 +79,36 @@ std::shared_ptr<const CpuIntervalIndex> DagGraph::cpu_intervals() const {
     }
 
     return cpu_intervals_ = std::make_shared<const CpuIntervalIndex>(std::move(index));
+}
+
+std::shared_ptr<const CpuTaskObservations> DagGraph::cpu_task_observations() const {
+    if (cpu_task_observations_) return cpu_task_observations_;
+
+    CpuTaskObservations index;
+    index.node_count = node_count();
+    index.edge_count = edge_count();
+    index.event_count = event_count();
+    for (const auto & node : nodes()) {
+        if (!node.is_cpu || node.explicit_cpu_task) continue;
+
+        const auto & event = event_for_node(node.id);
+        const auto correlation = event.arg("correlation_id");
+        size_t identity = DagNode::kNoNode;
+        if (!correlation.empty()) {
+            identity = index.identities.try_emplace({ node.gpu_id, event.pid, correlation }, index.identities.size()).first->second;
+            if (event.cat == "enqueue") index.submissions.emplace_back(identity, node.id);
+        }
+        index.lanes[node.lane_id].push_back({ node.id, identity, event.ts, checked_add_u64(event.ts, event.dur, "CPU task observation end overflow") });
+    }
+    for (auto & [lane, members] : index.lanes)
+        std::ranges::sort(members,
+                          [](const auto & left, const auto & right) { return std::tie(left.start_us, left.node) < std::tie(right.start_us, right.node); });
+
+    // Endpoints may later move; retain every edge of these kinds, not just current cross-lane edges.
+    for (size_t id = 0; id < edge_count(); ++id)
+        if (edge(id).kind == DagEdgeKind::Sequential || edge(id).kind == DagEdgeKind::Correlation) index.task_edges.push_back(id);
+
+    return cpu_task_observations_ = std::make_shared<const CpuTaskObservations>(std::move(index));
 }
 
 } // namespace markov::trace_graph::core

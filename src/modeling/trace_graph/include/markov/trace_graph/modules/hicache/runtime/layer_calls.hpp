@@ -58,8 +58,7 @@ public:
      * after the replacement; nested callbacks retain only their inside gaps.
      * Invoke after atomic source removal and expansion, before cloned nodes run.
      */
-    [[nodiscard]] uint64_t rebind_copied_calls(const core::DagGraph & graph, std::span<const NestedCall> calls, const HiCacheHostExpansion & plan,
-                                               const HiCacheExpandedHost & expanded);
+    [[nodiscard]] uint64_t rebind_copied_calls(const core::DagGraph & graph, std::span<const NestedCall> calls, const HiCacheExpandedHost & expanded);
     [[nodiscard]] size_t prepared_calls() const { return calls_.size(); }
     [[nodiscard]] size_t active_calls() const { return active_; }
     [[nodiscard]] size_t inactive_calls() const { return inactive_; }

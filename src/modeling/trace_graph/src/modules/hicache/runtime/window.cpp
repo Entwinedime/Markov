@@ -49,7 +49,8 @@ bool compact_execution_programs(const simulation::NodeCostAtStart & transform) {
 class HiCacheExecution {
 public:
     HiCacheExecution(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, const frontend::HiCacheConfig & config, std::string_view source_policy,
-                     const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us, const simulation::NodeCostAtStart & final_cost_transform)
+                     const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us, const simulation::NodeCostAtStart & final_cost_transform,
+                     bool report_structure)
         : graph_(graph),
           source_graph_(prepared.index.graph()),
           prepared_(prepared),
@@ -67,8 +68,9 @@ public:
           operator_provider_(config.operator_models),
           loads_(stream_insertions_, config, compute_resources_.schedule, operator_provider_, io_completion_, compact_programs_),
           layer_calls_(stream_insertions_, operator_provider_),
-          phase_calls_(layer_calls_, stream_insertions_, compute_resources_.forward, operator_provider_, compact_programs_),
-          allocator_calls_(stream_insertions_, operator_provider_, compact_programs_),
+          phase_calls_(layer_calls_, stream_insertions_, compute_resources_.forward, operator_provider_, compact_programs_,
+                       report_structure ? &output_.retained_source_nodes : nullptr),
+          allocator_calls_(stream_insertions_, operator_provider_, compact_programs_, report_structure ? &output_.retained_source_nodes : nullptr),
           confirmations_(operator_provider_),
           writes_(replay_, config, stream_insertions_, compute_resources_.schedule, operator_provider_, io_completion_, compact_programs_),
           write_confirmations_(operator_provider_, config.page_size, compute_resources_.schedule),
@@ -451,11 +453,11 @@ void HiCacheExecution::finish() {
 
 HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, const frontend::HiCacheConfig & config,
                                            std::string_view source_policy, const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us,
-                                           const simulation::NodeCostAtStart & final_cost_transform) {
+                                           const simulation::NodeCostAtStart & final_cost_transform, bool report_structure) {
     if (chain.status != "connected" || chain.requests.empty() || end_us <= begin_us)
         throw std::invalid_argument("HiCache execution requires a connected serial HTTP window");
 
-    return HiCacheExecution(graph, prepared, config, source_policy, chain, begin_us, end_us, final_cost_transform).run();
+    return HiCacheExecution(graph, prepared, config, source_policy, chain, begin_us, end_us, final_cost_transform, report_structure).run();
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

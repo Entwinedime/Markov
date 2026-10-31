@@ -160,13 +160,12 @@ void HiCacheLayerCalls::handoff_replaced_calls(const core::DagGraph & graph, std
     for (const auto & call : calls) calls_.erase(call.anchor);
 }
 
-uint64_t HiCacheLayerCalls::rebind_copied_calls(const core::DagGraph & graph, std::span<const NestedCall> calls, const HiCacheHostExpansion & plan,
-                                                const HiCacheExpandedHost & expanded) {
+uint64_t HiCacheLayerCalls::rebind_copied_calls(const core::DagGraph & graph, std::span<const NestedCall> calls, const HiCacheExpandedHost & expanded) {
     std::map<size_t, Call> replacements;
     uint64_t outside_us = 0;
     const auto copied = [&](size_t source) -> std::optional<size_t> {
-        const auto found = plan.source_nodes.find(source);
-        if (found == plan.source_nodes.end()) return std::nullopt;
+        const auto found = expanded.source_nodes.find(source);
+        if (found == expanded.source_nodes.end()) return std::nullopt;
         return expanded.nodes.at(found->second);
     };
     const auto successor = [&](size_t source) {
@@ -243,7 +242,7 @@ void HiCacheLayerCalls::expand_call(size_t entry, const Call & call, const Consu
         bind_host_operation(plan, { call.program.submit, call.program.worker, call.program.device, call.program.worker_return }, submit);
         bind_host_operation(plan, { .main = call.program.tail }, tail);
 
-        const auto expanded = expand_host(plan, std::span(&position, 1), future, entry, std::span(&record, 1));
+        const auto expanded = expand_host(std::move(plan), std::span(&position, 1), future, entry, std::span(&record, 1));
         returned = expanded.host_return;
         insertions_.advance(call.device_lane, call.position, expanded.stream_tails.front());
         for (const auto successor : call.synchronizations) future.depend(expanded.stream_tails.front(), successor);

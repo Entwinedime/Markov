@@ -101,7 +101,7 @@ struct DagSyntheticNodeSpec {
     std::string lane_key = "SYNTHETIC";
     uint64_t duration = 0;
     bool counts_toward_e2e = false;
-    std::unordered_map<std::string, std::string> attrs;
+    TraceArgMap attrs;
     /** Single CPU task: unique incoming Correlation is its submission; lane is its FIFO resource. */
     std::optional<uint64_t> cpu_task_ready_delay_us;
     /** Residual sequential delay after a model-created CPU boundary, not service time. */
@@ -231,7 +231,7 @@ public:
     size_t add_node(size_t event_index, bool is_cpu, std::string_view lane_key);
 
     /** @brief Creates a model node with an independent synthetic event identity. */
-    size_t add_synthetic_node(const DagSyntheticNodeSpec & spec);
+    size_t add_synthetic_node(DagSyntheticNodeSpec spec);
     /** Register a device-lane identity, not an executable zero-cost operation.
      * The inactive node may identify a resource for later generated work; it
      * must not be used as a dependency endpoint. No source timestamp is implied.
@@ -255,6 +255,7 @@ public:
 
     std::shared_ptr<const DagAdjacency> adjacency() const;
     std::shared_ptr<const CpuIntervalIndex> cpu_intervals() const;
+    std::shared_ptr<const CpuTaskObservations> cpu_task_observations() const;
     std::shared_ptr<const DagTopologicalOrder> topological_order() const;
     void release_topological_order();
 
@@ -497,6 +498,7 @@ private:
     std::unordered_map<size_t, TraceEvent> event_overrides_;
     mutable std::shared_ptr<const DagAdjacency> adjacency_;
     mutable std::shared_ptr<const CpuIntervalIndex> cpu_intervals_;
+    mutable std::shared_ptr<const CpuTaskObservations> cpu_task_observations_;
     // Proven prefix; direct edits are resolved before returning a current order.
     mutable std::shared_ptr<const DagTopologicalOrder> topological_order_;
     mutable std::vector<size_t> edited_edges_;

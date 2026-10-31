@@ -327,7 +327,7 @@ private:
 
     bool can_bind_cost(size_t id) const override { return !graph_.node(id).active || id == expanding_node_ || execution_[node_slot(id)] == Execution::Pending; }
 
-    size_t append(const core::DagSyntheticNodeSpec & spec, BoundaryOrder order, std::optional<size_t> owner, bool observe_start) override {
+    size_t append(core::DagSyntheticNodeSpec spec, BoundaryOrder order, std::optional<size_t> owner, bool observe_start) override {
         if (expanding_node_ == kInvalidNode || spec.cpu_task_ready_delay_us)
             throw std::invalid_argument("Future work requires an active expansion and explicit dependencies, not a new native CPU task");
         if (order == BoundaryOrder::AfterConcurrentStarts && (spec.duration || spec.cpu_gap_after))
@@ -335,7 +335,7 @@ private:
         const auto origin = owner.value_or(expanding_node_);
         if (origin >= nodes_.size() || !nodes_[origin].active) throw std::invalid_argument("Future work owner must be an active node");
         const auto rank = nodes_[origin].gpu_id;
-        const auto id = graph_.add_synthetic_node(spec);
+        const auto id = graph_.add_synthetic_node(std::move(spec));
         if (order == BoundaryOrder::AfterConcurrentStarts) deferred_boundaries_.insert(id);
         graph_.mutable_node(id).gpu_id = rank;
         graph_.mutable_event_for_node(id).pid = graph_.event_for_node(origin).pid;
@@ -354,7 +354,7 @@ private:
         return id;
     }
 
-    size_t append_cpu_task(const core::DagSyntheticNodeSpec & spec, size_t submission, size_t queue_member, bool observe_start) override {
+    size_t append_cpu_task(core::DagSyntheticNodeSpec spec, size_t submission, size_t queue_member, bool observe_start) override {
         if (expanding_node_ == kInvalidNode || !spec.is_cpu || spec.cpu_gap_after || submission >= nodes_.size() || queue_member >= nodes_.size()
             || !nodes_[submission].active || !nodes_[submission].is_cpu || execution_[node_slot(submission)] == Execution::Done
             || queues_.submitted_task[submission] != kInvalidNode || queues_.node_task[queue_member] == kInvalidNode || !spec.cpu_task_ready_delay_us)
@@ -363,13 +363,13 @@ private:
         if (graph_.node_lane_key(queue_member) != spec.lane_key || nodes_[submission].lane_id == nodes_[queue_member].lane_id
             || nodes_[submission].gpu_id != nodes_[queue_member].gpu_id)
             throw std::invalid_argument("New CPU task must join the declared cross-thread worker on the same rank");
-        auto plain = spec;
-        plain.cpu_task_ready_delay_us.reset();
-        const auto id = append(plain, BoundaryOrder::Ordinary, submission, observe_start);
+        const auto ready_delay = *spec.cpu_task_ready_delay_us;
+        spec.cpu_task_ready_delay_us.reset();
+        const auto id = append(std::move(spec), BoundaryOrder::Ordinary, submission, observe_start);
         graph_.mutable_node(id).explicit_cpu_task = true;
-        graph_.mutable_node(id).cpu_ready_delay_before = *spec.cpu_task_ready_delay_us;
+        graph_.mutable_node(id).cpu_ready_delay_before = ready_delay;
         const auto task = queues_.tasks.size();
-        queues_.tasks.push_back({ id, id, submission, queue, *spec.cpu_task_ready_delay_us, 0 });
+        queues_.tasks.push_back({ id, id, submission, queue, ready_delay, 0 });
         queues_.node_task[id] = task;
         queues_.submitted_task[submission] = task;
         task_ready_.push_back(false);
@@ -377,7 +377,7 @@ private:
         return id;
     }
 
-    size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & spec, size_t previous, bool observe_start) override {
+    size_t append_cpu_task_part(core::DagSyntheticNodeSpec spec, size_t previous, bool observe_start) override {
         if (previous >= nodes_.size() || !nodes_[previous].active || !nodes_[previous].explicit_cpu_task
             || execution_[node_slot(previous)] != Execution::Pending || !spec.is_cpu || spec.cpu_gap_after || spec.cpu_task_ready_delay_us
             || graph_.node_lane_key(previous) != spec.lane_key)
@@ -387,7 +387,7 @@ private:
             throw std::invalid_argument("CPU task continuation must extend the current last member");
 
         const auto submission = queues_.tasks[task_id].submission;
-        const auto id = append(spec, BoundaryOrder::Ordinary, submission, observe_start);
+        const auto id = append(std::move(spec), BoundaryOrder::Ordinary, submission, observe_start);
         graph_.mutable_node(id).explicit_cpu_task = true;
         queues_.node_task[id] = task_id;
         queues_.tasks[task_id].last = id;

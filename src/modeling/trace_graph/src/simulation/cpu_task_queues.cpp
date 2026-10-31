@@ -10,21 +10,21 @@
 namespace markov::trace_graph::simulation::detail {
 namespace {
 constexpr auto none = core::DagNode::kNoNode;
-using Identity = std::tuple<int, std::string, std::string>;
 } // namespace
 
 CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph) {
     CpuTaskQueues result;
     result.node_task.assign(graph.node_count(), none);
     result.submitted_task.assign(graph.node_count(), none);
-    std::map<Identity, std::vector<size_t>> submissions;
-    std::map<size_t, std::vector<std::pair<uint64_t, size_t>>> lanes;
+    const auto observed_source = graph.cpu_task_observations();
+    const auto & source = *observed_source;
+    std::map<core::CpuTaskObservations::Identity, size_t> added_identities;
+    std::vector<std::pair<size_t, size_t>> added_submissions;
+    std::map<size_t, std::vector<core::CpuTaskObservations::Member>> added_members;
+    std::set<size_t> lanes;
+    for (const auto & [lane, members] : source.lanes) lanes.insert(lane);
     std::map<size_t, std::vector<size_t>> modeled_tasks, modeled_submissions;
     std::map<size_t, std::vector<size_t>> modeled_successors;
-    const auto identity = [&](size_t id) {
-        const auto & event = graph.event_for_node(id);
-        return Identity{ graph.node(id).gpu_id, event.pid, event.arg("correlation_id") };
-    };
     const auto end = [&](size_t id) {
         const auto & event = graph.event_for_node(id);
         return core::checked_add_u64(event.ts, event.dur, "CPU task observation end overflow");
@@ -33,20 +33,44 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph) {
         if (!node.is_cpu) continue;
         if (node.explicit_cpu_task) {
             if (node.active) {
-                lanes.try_emplace(node.lane_id);
+                lanes.insert(node.lane_id);
                 modeled_tasks[node.lane_id].push_back(node.id);
             }
             continue; // No source timestamps: do not change observed predecessors.
         }
+        if (node.id < source.node_count) continue;
+
         const auto & event = graph.event_for_node(node.id);
-        lanes[node.lane_id].emplace_back(event.ts, node.id);
-        if (!node.active) continue;
-        if (event.cat == "enqueue" && !event.arg("correlation_id").empty()) submissions[identity(node.id)].push_back(node.id);
+        size_t identity = none;
+        const auto correlation = event.arg("correlation_id");
+        if (!correlation.empty()) {
+            const core::CpuTaskObservations::Identity key{ node.gpu_id, event.pid, correlation };
+            const auto found = source.identities.find(key);
+            identity = found != source.identities.end() ? found->second
+                                                        : added_identities.try_emplace(key, source.identities.size() + added_identities.size()).first->second;
+            if (event.cat == "enqueue") added_submissions.emplace_back(identity, node.id);
+        }
+        lanes.insert(node.lane_id);
+        added_members[node.lane_id].push_back({ node.id, identity, event.ts, end(node.id) });
     }
+    // Only observed facts are shared. Active submissions, costs and edited dependencies belong to this graph.
+    constexpr auto ambiguous = none - 1;
+    std::vector<size_t> submissions(source.identities.size() + added_identities.size(), none);
+    const auto submit = [&](const auto & entries) {
+        for (const auto & [identity, node] : entries) {
+            if (!graph.node(node).active || graph.node(node).explicit_cpu_task) continue;
+            auto & unique = submissions[identity];
+            unique = unique == none ? node : ambiguous;
+        }
+    };
+    submit(source.submissions);
+    submit(added_submissions);
+
     // Inspect dependencies once, not once per CPU lane in a potentially large DAG.
     std::set<size_t> cross_lane_delays;
-    for (const auto & edge : graph.edges()) {
-        if (!edge.active) continue;
+    const auto inspect_edge = [&](size_t edge_id) {
+        const auto & edge = graph.edge(edge_id);
+        if (!edge.active) return;
 
         if (edge.kind == core::DagEdgeKind::Sequential && graph.node(edge.src).lane_id != graph.node(edge.dst).lane_id)
             cross_lane_delays.insert(graph.node(edge.src).lane_id);
@@ -57,37 +81,47 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph) {
         if (edge.kind == core::DagEdgeKind::Sequential && graph.node(edge.src).explicit_cpu_task && graph.node(edge.dst).explicit_cpu_task
             && graph.node(edge.src).active && graph.node(edge.dst).active)
             modeled_successors[edge.src].push_back(edge.dst);
-    }
+    };
+    for (const auto edge : source.task_edges) inspect_edge(edge);
+    for (size_t edge = source.edge_count; edge < graph.edge_count(); ++edge) inspect_edge(edge);
 
-    for (auto & [lane, observed] : lanes) {
+    for (const auto lane : lanes) {
+        std::span<const core::CpuTaskObservations::Member> observed;
+        if (const auto found = source.lanes.find(lane); found != source.lanes.end()) observed = found->second;
+        if (const auto found = added_members.find(lane); found != added_members.end()) {
+            auto & merged = found->second;
+            merged.insert(merged.end(), observed.begin(), observed.end());
+            std::ranges::sort(merged,
+                              [](const auto & left, const auto & right) { return std::tie(left.start_us, left.node) < std::tie(right.start_us, right.node); });
+            observed = merged;
+        }
         const auto & additions = modeled_tasks[lane];
         const auto reject_insertion = [&] {
             if (!additions.empty()) throw std::runtime_error("cannot insert CPU task into an unrecognized worker queue");
         };
-        // Sort compact coordinates rather than dereferencing the full trace
-        // for every comparison. Timestamp/ID ordering is unchanged.
-        if (!std::ranges::is_sorted(observed)) std::ranges::sort(observed);
-
         // Task removal changes the queue, not the source-measured ready delay.
         // Otherwise a removed task's service is charged again as its successor's gap.
-        std::vector<size_t> ids;
+        std::vector<size_t> ids, identities;
         std::vector<uint64_t> observed_previous_ends;
         ids.reserve(observed.size());
         observed_previous_ends.reserve(observed.size());
         uint64_t previous_end = 0;
-        for (const auto & [at, id] : observed) {
+        for (const auto & member : observed) {
+            const auto id = member.node;
+            if (graph.node(id).explicit_cpu_task) continue;
             if (graph.node(id).active) {
                 ids.push_back(id);
+                identities.push_back(member.identity);
                 observed_previous_ends.push_back(previous_end);
             }
-            previous_end = end(id);
+            previous_end = member.end_us;
         }
         if (ids.empty() && additions.empty()) continue;
         std::vector<size_t> producers;
-        for (const auto id : ids) {
-            const auto found = submissions.find(identity(id));
-            if (found == submissions.end() || found->second.size() != 1 || graph.node(found->second.front()).lane_id == lane) break;
-            producers.push_back(found->second.front());
+        for (const auto identity : identities) {
+            const auto producer = identity == none ? none : submissions[identity];
+            if (producer == none || producer == ambiguous || graph.node(producer).lane_id == lane) break;
+            producers.push_back(producer);
         }
         if (producers.size() != ids.size()) {
 #ifdef DEBUG

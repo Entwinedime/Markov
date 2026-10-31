@@ -13,7 +13,7 @@ namespace {
 
 size_t add_boundary(DagGraph & graph, const TraceEvent & observation, const std::string & lane, int rank, std::string_view suffix, uint64_t timestamp,
                     uint64_t gap) {
-    std::unordered_map<std::string, std::string> attrs(observation.args_map().begin(), observation.args_map().end());
+    TraceArgMap attrs = observation.args_map();
     attrs["observed_interval"] = observation.name;
     attrs["interval_boundary"] = suffix;
     const auto id = graph.add_synthetic_node({

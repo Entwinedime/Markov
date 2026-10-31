@@ -67,7 +67,7 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
         const auto original = graph.node(id);
         const auto event = graph.event_for_node(id);
         const auto lane = std::string(graph.node_lane_key(id));
-        const std::unordered_map<std::string, std::string> attrs(event.args_map().begin(), event.args_map().end());
+        const core::TraceArgMap attrs = event.args_map();
         uint64_t cursor = event.ts;
         std::optional<size_t> previous;
         for (const auto & [at, indices] : cuts) {

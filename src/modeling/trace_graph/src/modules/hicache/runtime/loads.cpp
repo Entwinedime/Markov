@@ -129,7 +129,7 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                     std::pair<double, double> remainder{};
                     bind_cpu_control(plan, estimate.main_us, estimate.main_residual_us, remainder);
                 }
-                const auto empty = expand_host(plan, {}, future);
+                const auto empty = expand_host(std::move(plan), {}, future);
                 future.depend(empty.host_return, insertion.continuation);
             }
             else {
@@ -155,7 +155,7 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                 HiCacheHostSequence sequence(insertion.positions, stream_insertions_, future);
                 const auto service_us = io_completion_.duration("load", page_bytes_, bytes / page_bytes_, 0);
                 bind_transfer_payload(built.plan, service_us);
-                const auto expanded = sequence.append(built.plan, lanes);
+                const auto expanded = sequence.append(std::move(built.plan), lanes);
                 future.depend(expanded.host_return, insertion.continuation);
                 for (const auto record : built.completion_records) load.layers.push_back({ load.layers.size(), 0, 0, expanded.nodes.at(record) });
                 complete_at_.emplace(expanded.completion, at->second);

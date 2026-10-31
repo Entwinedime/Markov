@@ -121,7 +121,7 @@ size_t DagGraph::add_device_resource(std::string lane_key, int gpu_id) {
     return node;
 }
 
-size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
+size_t DagGraph::add_synthetic_node(DagSyntheticNodeSpec spec) {
     if (spec.name.empty()) throw std::invalid_argument("synthetic DAG node name must not be empty");
     if (spec.cpu_task_ready_delay_us && !spec.is_cpu) throw std::invalid_argument("explicit CPU task must use a CPU node");
     if (spec.cpu_gap_after && (!spec.is_cpu || spec.cpu_task_ready_delay_us)) throw std::invalid_argument("residual gap requires a non-worker CPU boundary");
@@ -129,8 +129,8 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     event.index = event_count();
     event.source_channel = TraceSourceChannel::Synthetic;
     event.event_id = "synthetic_" + std::to_string(nodes_.size());
-    event.name = spec.name;
-    event.cat = spec.category;
+    event.name = std::move(spec.name);
+    event.cat = std::move(spec.category);
     event.ph = 'X';
     event.dur = spec.duration;
     event.pid = std::to_string(gpu_id_);
@@ -140,10 +140,8 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
         event.tid = spec.observed_point->tid;
         event.ts = spec.observed_point->timestamp_us;
     }
-    if (spec.shared_attrs) event.share_args(spec.shared_attrs);
-    event.set_arg("node_kind", "synthetic");
-    event.set_arg("counts_toward_e2e", spec.counts_toward_e2e ? "true" : "false");
-    for (const auto & [key, value] : spec.attrs) event.set_arg(key, value);
+    if (spec.shared_attrs) event.share_args(std::move(spec.shared_attrs));
+    event.set_arg_overrides(std::move(spec.attrs));
     events_.push_back(std::move(event));
 
     const auto node_id = add_node(event_count() - 1, spec.is_cpu, spec.lane_key);
@@ -250,6 +248,7 @@ const TraceEvent & DagGraph::event(size_t event_index) const {
 
 TraceEvent & DagGraph::mutable_event(size_t event_index) {
     cpu_intervals_.reset();
+    if (cpu_task_observations_ && event_index < cpu_task_observations_->event_count) cpu_task_observations_.reset();
     const auto shared = source_events_ ? source_events_->size() : 0;
     if (event_index < shared) {
         const auto found = event_overrides_.find(event_index);

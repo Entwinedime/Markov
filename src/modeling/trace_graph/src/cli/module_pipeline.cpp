@@ -82,7 +82,7 @@ bool ModulePipeline::needs_hicache_observations() const {
 }
 
 void ModulePipeline::apply(core::DagGraph & graph, const modules::hicache::runtime::HiCacheSourcePreparation * prepared, core::Logger & logger,
-                           const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us) {
+                           const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us, bool report_structure) {
     for (const auto & module : modules_) {
         logger.info() << "Applying module: " << module->name();
         module->apply(graph);
@@ -104,7 +104,8 @@ void ModulePipeline::apply(core::DagGraph & graph, const modules::hicache::runti
                                                                               chain,
                                                                               begin_us,
                                                                               end_us,
-                                                                              final_cost);
+                                                                              final_cost,
+                                                                              report_structure);
     }
 }
 

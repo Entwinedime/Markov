@@ -134,10 +134,6 @@ void HiCacheAllocatorCalls::bind(core::DagGraph & graph, const HiCacheSourcePrep
             }
         }
         auto retained = prepare_host_expansion(source, queues, hosts.back(), "retained allocator: ", { .compact = compact_programs_ });
-        std::map<size_t, std::vector<size_t>> original_nodes;
-        for (const auto & [original_node, copied_node] : retained.source_nodes) original_nodes[copied_node].push_back(original_node);
-        for (const auto & [copied_node, members] : original_nodes)
-            retained.nodes.at(copied_node).work.attrs["retained_allocator_source_nodes"] = nlohmann::json(members).dump();
         Call call{ exit, event.pid, event.tid, event.ts, *execution, *deployment, std::move(source_work), std::move(retained), {}, std::nullopt };
         if (observed_preparation) {
             call.prefix_dtype = observed_preparation->prefix_dtype;
@@ -239,7 +235,9 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
 
     HiCacheHostSequence sequence(call.positions, insertions_, future, node);
     const auto lanes = plan.resource_lanes(graph);
-    const auto expanded = sequence.append(plan, lanes);
+    const auto expanded = sequence.append(std::move(plan), lanes);
+    if (unchanged && retained_source_nodes_)
+        for (const auto & [original, local] : expanded.source_nodes) retained_source_nodes_->emplace_back(original, expanded.nodes.at(local));
     future.depend(expanded.host_return, call.exit, core::DagEdgeKind::Sequential);
     ++executed_;
 }

@@ -7,6 +7,7 @@
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #include <nlohmann/json_fwd.hpp>
 #include <span>
+#include <utility>
 
 namespace markov::trace_graph::reporting {
 
@@ -17,7 +18,8 @@ namespace markov::trace_graph::reporting {
 [[nodiscard]] nlohmann::json effect_rows(const modules::hicache::model::HiCacheEffectDecisionLedger & ledger);
 [[nodiscard]] nlohmann::json execution_structure_report(const core::DagGraph & graph, const modules::hicache::model::HiCacheEffectDecisionLedger & effects,
                                                         const modules::hicache::model::HiCachePhaseWorkLedger & phases,
-                                                        std::span<const structure::hicache::DeviceCollectivePlan> collectives);
+                                                        std::span<const structure::hicache::DeviceCollectivePlan> collectives,
+                                                        std::span<const std::pair<size_t, size_t>> retained_source_nodes);
 
 /** Observed single-request phase operators and projected precedence.
  * Uses the same semantic correspondence as the executed report, never costs.

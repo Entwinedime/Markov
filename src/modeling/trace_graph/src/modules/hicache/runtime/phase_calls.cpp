@@ -110,10 +110,6 @@ void HiCachePhaseCalls::bind(core::DagGraph & graph, const core::DagGraph & orig
                                                hosts.back(),
                                                "retained phase work: ",
                                                { .callback_points = callbacks, .retain_collective_completions = true, .compact = compact_programs_ });
-        std::map<size_t, std::vector<size_t>> source_members;
-        for (const auto & [original_node, copied_node] : retained.source_nodes) source_members[copied_node].push_back(original_node);
-        for (const auto & [copied_node, members] : source_members)
-            retained.nodes.at(copied_node).work.attrs["retained_phase_source_nodes"] = nlohmann::json(members).dump();
         std::optional<HostDeviceResources> resources;
         if (const auto compute = resources_.find({ event.pid, event.tid }); compute != resources_.end()) {
             const auto key = std::pair{ graph.node(*boundaries[2 * i]).lane_id, graph.node(compute->second).lane_id };
@@ -182,13 +178,16 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
                                          {      "logical_input",      work.logical_input }
         });
     HiCacheHostSequence sequence(call.positions, insertions_, future, node);
+    auto caller_lane = call.retained.nodes.front().work.lane_key;
     size_t host_return;
     uint64_t outside_us = 0;
     if (work.action == Action::RetainCompute) {
         describe_phase_call(call.retained, work);
         const auto lanes = call.retained.resource_lanes(graph);
-        const auto expanded = sequence.append(call.retained, lanes);
-        outside_us = layers_.rebind_copied_calls(graph, call.layers, call.retained, expanded);
+        const auto expanded = sequence.append(std::move(call.retained), lanes);
+        outside_us = layers_.rebind_copied_calls(graph, call.layers, expanded);
+        if (retained_source_nodes_)
+            for (const auto & [original, local] : expanded.source_nodes) retained_source_nodes_->emplace_back(original, expanded.nodes.at(local));
         host_return = expanded.host_return;
     }
     else {
@@ -214,12 +213,11 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
         std::vector<size_t> completions;
         for (const auto layer : generated.event_layers) completions.push_back(records.at(layer));
         const auto lanes = generated.plan.resource_lanes(graph);
-        const auto expanded = sequence.append(generated.plan, lanes, completions);
+        const auto expanded = sequence.append(std::move(generated.plan), lanes, completions);
         layers_.handoff_replaced_calls(graph, call.layers);
         host_return = expanded.host_return;
     }
-    const auto returned =
-        future.append({ .name = "after target phase call", .lane_key = call.retained.nodes.front().work.lane_key, .cpu_gap_after = outside_us });
+    const auto returned = future.append({ .name = "after target phase call", .lane_key = std::move(caller_lane), .cpu_gap_after = outside_us });
     future.depend(host_return, returned);
     future.depend(returned, call.exit, core::DagEdgeKind::Sequential);
 

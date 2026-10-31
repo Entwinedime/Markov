@@ -174,7 +174,7 @@ size_t HiCacheWriteConfirmations::expand(const WriteConfirmationWork & work, mod
     const auto program = structure::hicache::write_confirmation_program(batches);
     auto generated = generate_write_confirmation(*graph_, anchor, worker, program);
     bind_host_operations(generated.plan, generated.operations, operator_provider_, "confirmation_independent_model");
-    const auto expanded = expand_host(generated.plan, {}, future, anchor, events);
+    const auto expanded = expand_host(std::move(generated.plan), {}, future, anchor, events);
     for (const auto returned : generated.acknowledgements) acknowledgements_.emplace(expanded.nodes.at(returned), work.fact);
     return expanded.host_return;
 }

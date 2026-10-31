@@ -78,17 +78,17 @@ public:
     // it does not add an execution dependency. The current boundary still does.
     // Private program steps may skip expansion observation; costs, dependencies
     // and queue execution are unchanged. Exported state boundaries must observe.
-    virtual size_t append(const core::DagSyntheticNodeSpec & node, BoundaryOrder order = BoundaryOrder::Ordinary, std::optional<size_t> owner = std::nullopt,
+    virtual size_t append(core::DagSyntheticNodeSpec node, BoundaryOrder order = BoundaryOrder::Ordinary, std::optional<size_t> owner = std::nullopt,
                           bool observe_start = true) = 0;
     /** Add one measured task to an existing recognized worker FIFO. The unique
      * cross-thread submission must not have completed. queue_member proves
      * the worker identity; no observed task or queue order is overwritten. */
-    virtual size_t append_cpu_task(const core::DagSyntheticNodeSpec & node, size_t submission, size_t queue_member, bool observe_start = true) = 0;
+    virtual size_t append_cpu_task(core::DagSyntheticNodeSpec node, size_t submission, size_t queue_member, bool observe_start = true) = 0;
     /** Extend an unstarted generated task after its current last member.
      * Keeps the same submission/FIFO ownership; only the first member carries
      * dispatch delay. The queue is released after the new last member, allowing
      * device launches from earlier members without releasing the worker. */
-    virtual size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & node, size_t previous, bool observe_start = true) = 0;
+    virtual size_t append_cpu_task_part(core::DagSyntheticNodeSpec node, size_t previous, bool observe_start = true) = 0;
     virtual void depend(size_t predecessor, size_t successor, core::DagEdgeKind kind = core::DagEdgeKind::Mutation) = 0;
 };
 using ExpandAtStart = std::function<void(size_t node_id, uint64_t start_us, FutureDag & future)>;

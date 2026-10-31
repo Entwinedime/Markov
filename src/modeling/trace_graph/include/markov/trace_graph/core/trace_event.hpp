@@ -143,6 +143,9 @@ struct TraceEvent {
     /** @brief Writes a synthetic override without materializing raw args. */
     void set_arg(std::string_view key, std::string_view value);
 
+    /** Take owned overrides; existing defaults keep lower precedence. */
+    void set_arg_overrides(TraceArgMap args);
+
     /** @brief Merges another event's materialized args for torch/LD in-memory channel joins. */
     void merge_args_from(const TraceEvent & other);
 

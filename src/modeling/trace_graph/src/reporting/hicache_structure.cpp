@@ -862,7 +862,8 @@ Json effect_rows(const model::HiCacheEffectDecisionLedger & ledger) {
 }
 
 Json execution_structure_report(const core::DagGraph & graph, const model::HiCacheEffectDecisionLedger & effects, const model::HiCachePhaseWorkLedger & phases,
-                                std::span<const structure::hicache::DeviceCollectivePlan> collectives) {
+                                std::span<const structure::hicache::DeviceCollectivePlan> collectives,
+                                std::span<const std::pair<size_t, size_t>> retained_source_nodes) {
     Json prefills = Json::array(), decodes = Json::array(), allocations = Json::array();
     std::vector<PhaseOperator> work;
     for (const auto & item : phases.prefills) {
@@ -887,16 +888,16 @@ Json execution_structure_report(const core::DagGraph & graph, const model::HiCac
     // region. Local source references establish this within-run mapping only;
     // cross-trace comparison still uses semantic request/operator identity.
     std::map<size_t, size_t> retained_operators;
+    for (const auto & [original, emitted] : retained_source_nodes) {
+        if (!graph.node(emitted).active) continue;
+        const auto [at, inserted] = retained_operators.try_emplace(original, emitted);
+        if (!inserted) at->second = std::min(at->second, emitted);
+    }
     std::map<size_t, size_t> collective_operators;
     for (const auto & node : graph.nodes()) {
         if (!node.active) continue;
         const auto & event = graph.event_for_node(node.id);
         if (event.has_arg_key_hint("collective_source_node")) collective_operators.emplace(event.arg_u64("collective_source_node"), node.id);
-
-        for (const auto * field : { "retained_phase_source_nodes", "retained_allocator_source_nodes" }) {
-            if (!event.has_arg_key_hint(field)) continue;
-            for (const auto original : Json::parse(event.arg(field)).get<std::vector<size_t>>()) retained_operators.emplace(original, node.id);
-        }
     }
     for (auto & item : work) {
         if (const auto collective = collective_operators.find(item.node); collective != collective_operators.end()) {

@@ -308,6 +308,13 @@ void TraceEvent::set_arg(std::string_view key, std::string_view value) {
     }
 }
 
+void TraceEvent::set_arg_overrides(TraceArgMap args) {
+    commit_arg_overrides();
+    arg_overrides_ = args.empty() ? nullptr : std::make_unique<TraceArgMap>(std::move(args));
+    args_materialized_ = false;
+    args_.reset();
+}
+
 void TraceEvent::commit_arg_overrides() {
     if (!arg_overrides_ || arg_overrides_->empty()) {
         arg_overrides_.reset();

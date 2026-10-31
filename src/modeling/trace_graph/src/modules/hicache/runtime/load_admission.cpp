@@ -166,7 +166,7 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
             std::pair<double, double> remainder{};
             bind_cpu_control(inactive, costs.main_us, costs.main_residual_us, remainder);
         }
-        const auto restored = expand_host(inactive, {}, future);
+        const auto restored = expand_host(std::move(inactive), {}, future);
         future.depend(restored.host_return, branch.continuation);
         return;
     }
@@ -192,7 +192,7 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
         std::pair<double, double> remainder{};
         bind_cpu_control(skipped, costs.main_us, costs.main_residual_us, remainder);
         HiCacheHostSequence sequence(call.positions, stream_insertions_, future, node);
-        (void)sequence.append(skipped, {});
+        (void)sequence.append(std::move(skipped), {});
         const auto prefix = sequence.append(load_prefix_concat(program, *work),
                                             work->existing_prefix_pages ? std::span<const size_t>{ program.prefix_concat.lanes } : std::span<const size_t>{});
         future.depend(prefix.host_return, branch.continuation);
@@ -220,7 +220,7 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
     std::pair<double, double> preparation_remainder{};
     bind_cpu_control(preparation_plan, preparation_cost.main_us, preparation_cost.main_residual_us, preparation_remainder);
     HiCacheHostSequence entry(call.positions, stream_insertions_, future, node);
-    const auto prepared = entry.append(preparation_plan, {}).host_return;
+    const auto prepared = entry.append(std::move(preparation_plan), {}).host_return;
     std::optional<size_t> previous = prepared;
 
     const auto merge = [&](const model::HiCacheLoadAllocatorAttempt & attempt) {
@@ -250,7 +250,7 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
         const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
         std::pair<double, double> remainder{};
         bind_cpu_control(cleared, costs.main_us, costs.main_residual_us, remainder);
-        previous = sequence.append(cleared, {}).host_return;
+        previous = sequence.append(std::move(cleared), {}).host_return;
     };
     merge(attempts.front());
 

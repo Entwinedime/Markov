@@ -12,6 +12,8 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::cost {
 class OperatorCostProvider;
@@ -26,10 +28,12 @@ struct HiCacheSourcePreparation;
  * the inner entry executes that work with independently estimated costs. */
 class HiCacheAllocatorCalls {
 public:
-    HiCacheAllocatorCalls(HiCacheWriteStreamInsertions & insertions, cost::OperatorCostProvider & provider, bool compact_programs)
+    HiCacheAllocatorCalls(HiCacheWriteStreamInsertions & insertions, cost::OperatorCostProvider & provider, bool compact_programs,
+                          std::vector<std::pair<size_t, size_t>> * retained_source_nodes)
         : insertions_(insertions),
           provider_(provider),
-          compact_programs_(compact_programs) {}
+          compact_programs_(compact_programs),
+          retained_source_nodes_(retained_source_nodes) {}
 
     void bind(core::DagGraph & graph, const HiCacheSourcePreparation & prepared, std::span<const model::HiCacheReplayFact> facts,
               const structure::hicache::SchedulerComputeResources & resources, uint64_t begin_us, uint64_t end_us);
@@ -60,6 +64,7 @@ private:
     HiCacheWriteStreamInsertions & insertions_;
     cost::OperatorCostProvider & provider_;
     bool compact_programs_;
+    std::vector<std::pair<size_t, size_t>> * retained_source_nodes_;
     std::map<size_t, Call> calls_;
     std::map<size_t, size_t> fact_entries_;
     std::set<size_t> owned_;

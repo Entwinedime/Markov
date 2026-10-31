@@ -307,7 +307,7 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
                 // The sampled prefix is already complete. Estimate the whole
                 // bookkeeping tail, not an invented per-batch source average.
                 bind_cpu_control(plan, estimate.main_us, estimate.main_residual_us, remainder);
-                const auto last = expand_host(plan, {}, future, node).host_return;
+                const auto last = expand_host(std::move(plan), {}, future, node).host_return;
                 future.depend(last, check.return_nodes.at(action.rank));
             }
             continue;
