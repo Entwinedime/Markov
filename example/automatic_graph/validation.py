@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import json
 import shutil
@@ -74,9 +75,21 @@ class NativeValidation:
     resumable = {"interrupted", "budget_exhausted", "resource_blocked"}
 
     def __init__(
-        self, task: Exploration, configuration: str, workload: str, capture: Path, minimum_members: int = 1
+        self,
+        task: Exploration,
+        configuration: str,
+        workload: str,
+        capture: Path,
+        minimum_members: int = 1,
+        control: str | None = None,
     ) -> None:
-        self.task = task
+        published_control = task.specification.get("control", "lightweight")
+        self.control = control or published_control
+        self.reuse_published = self.control == published_control
+
+        # Only backend selection differs; both comparisons charge the same task and own the same containers.
+        self.task = copy.copy(task)
+        self.task.specification = {**task.specification, "control": self.control}
         self.key = f"{configuration}/{workload}"
         domain = task.configurations[configuration]
         if workload not in {item["id"] for item in task.specification["workloads"]}:
@@ -87,26 +100,34 @@ class NativeValidation:
         self.capture = capture.resolve()
         self.capture.relative_to(task.directory / "captures")
         self.initial_capture = self.capture
-        self.work = task.directory / "work/validation" / self.capture.name
-        self.report = task.directory / "results/validation" / self.key / (self.capture.name + ".json")
+        self.work = task.directory / "work/validation" / self.capture.name / self.control
+        self.report = task.directory / "results/validation" / self.key / self.control / (self.capture.name + ".json")
         self.resuming = False
         self.minimum_members = minimum_members
         self.outcome: dict[str, Any] = {}
 
     def simulate(self, details: bool) -> Path:
+        published = self.task.state["results"].get(self.key)
+        if self.reuse_published and details == self.task.details and published is not None:
+            result = self.task.directory / published
+            if result.is_file():
+                return result
+
         output = self.work / ("details.json" if details else "default.json")
         if self.resuming and output.is_file():
             return output
-        arguments = ["simulate", "--templates", str(self.asset), "--input", str(self.input), "--output", str(output)]
-        if details:
-            arguments.append("--details")
-        self.task.step(
-            self.task.environment.tool_command(
-                arguments, [self.asset, self.input], output, self.task.available("processing")
-            ),
-            "processing",
-        )
+        self.task.simulate(self.asset, self.input, output, details)
         return output
+
+    @staticmethod
+    def summary(detailed: dict[str, Any]) -> dict[str, Any]:
+        diagnostic = {"graph", "decisions", "outputs", "controls", "execution_timeline", "resource_history"}
+        result = {key: value for key, value in detailed.items() if key not in diagnostic}
+        result["resources"] = {
+            pool: {key: value for key, value in resources.items() if key != "ownership"}
+            for pool, resources in detailed["resources"].items()
+        }
+        return result
 
     def observe(self, target: dict[str, Any]) -> None:
         if (
@@ -277,6 +298,7 @@ class NativeValidation:
         else:
             self.outcome = {
                 "case": self.key,
+                "control": self.control,
                 "capture": str(self.capture.relative_to(self.task.directory)),
                 "ranks": [],
             }
@@ -290,10 +312,7 @@ class NativeValidation:
                 plain = json.loads(self.simulate(False).read_text())
                 prediction = self.simulate(True)
                 detailed = json.loads(prediction.read_text())
-                diagnostic = {"graph", "decisions", "outputs", "controls", "execution_timeline"}
-                outcome["same_default_details"] = plain == {
-                    key: value for key, value in detailed.items() if key not in diagnostic
-                }
+                outcome["same_default_details"] = plain == self.summary(detailed)
                 outcome["completion"] = completion_checks(target, plain)
                 del detailed
                 outcome["execution_evidence"] = self.evidence("execution", ["--prediction", str(prediction)])
@@ -352,6 +371,8 @@ class NativeValidation:
                 outcome["status"] = "differences"
             else:
                 outcome["status"] = "matched" if statuses == {"matched"} else "partial"
+            if self.task.storage_bytes(retained=True) > self.task.specification["budget"]["retained_bytes"]:
+                raise BudgetExceeded("retained storage budget exceeded after native validation")
         except BaseException as error:
             status = "error"
             if isinstance(error, KeyboardInterrupt):

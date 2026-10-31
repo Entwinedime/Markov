@@ -15,6 +15,54 @@ from request_state import IndexWorkEvidence, RequestStateEvidence, ResourceState
 from resource_history import ResourceHistoryEvidence
 
 
+class BatchCoverage:
+    """Count exercised model work; enabled configuration flags are not execution evidence."""
+
+    def __init__(self, requests: list[dict]) -> None:
+        self.prompts = {request["id"]: request["prompt_tokens"] for request in requests}
+        self.actors = {}
+        self.seen = set()
+
+    def observe(self, actor: str, members: list[dict]) -> None:
+        counts = self.actors.setdefault(
+            actor,
+            dict(
+                batch_members=0,
+                prefill_members=0,
+                decode_members=0,
+                chunked_batches=0,
+                mixed_batches=0,
+                reused_prefix_tokens=0,
+            ),
+        )
+        counts["batch_members"] = max(counts["batch_members"], len(members))
+        phases = Counter(member["phase"] for member in members)
+        for phase in ("prefill", "decode"):
+            counts[phase + "_members"] = max(counts[phase + "_members"], phases[phase])
+        counts["mixed_batches"] += bool(phases["prefill"] and phases["decode"])
+        counts["chunked_batches"] += any(
+            member["phase"] == "prefill"
+            and member["context_tokens"] + member["new_tokens"] < self.prompts[member["id"]]
+            for member in members
+        )
+
+        # Later chunk contexts and a PD receiver's Decode context are not prefix-cache hits.
+        for member in members:
+            key = actor, member["id"]
+            if key not in self.seen and member["phase"] == "prefill":
+                counts["reused_prefix_tokens"] += member["context_tokens"]
+            self.seen.add(key)
+
+    def report(self) -> dict:
+        return {
+            "by_actor": self.actors,
+            "observed": {
+                name: max(counts[name] for counts in self.actors.values())
+                for name in next(iter(self.actors.values()), {})
+            },
+        }
+
+
 class ExecutionEvidence:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
@@ -148,8 +196,7 @@ class ExecutionEvidence:
         )
 
         ownership = RequestStateEvidence(self.result)
-        cross = {(owner[edge["source"]], owner[edge["target"]]) for edge in execution["dependencies"]}
-        handoffs = self.handoffs(ownership, cross, owner)
+        handoffs = self.handoffs(ownership)
         checks.update(handoffs["checks"])
         state = ownership.check()
         checks["request_state"] = state["status"] == "matched"
@@ -163,6 +210,17 @@ class ExecutionEvidence:
             checks["cache_rank_bindings"] = index_work["status"] == "matched"
         failures = [name for name, passed in checks.items() if not passed]
         status = "matched" if not failures else "differences"
+        coverage = BatchCoverage(self.result["requests"])
+        for region in graph["regions"]:
+            if region["role"] in {"Prefill", "Decode", "Mixed"}:
+                task = region["task"]
+                action = boundaries["action", task["group"], task["sequence"]]
+                coverage.observe(str(region["rank"]), action["members"])
+        exercised = coverage.report()
+        exercised["observed"].update(state["scheduling"])
+        exercised["observed"]["cache_evictions"] = sum(
+            event["kind"] == "prefix_evict" for event in self.result["resource_history"]
+        )
         report = {
             "status": status,
             "scope": "recorded execution consistency; not independent native equivalence or KV content correctness",
@@ -172,9 +230,11 @@ class ExecutionEvidence:
             "actions": len(decisions),
             "controls": len(self.result["controls"]),
             "handoffs": handoffs["requests"],
+            "handoff_missing_paths": handoffs["missing_paths"],
             "request_state": state,
             "resource_history": history,
             "resource_state": resources,
+            "coverage": exercised,
             "value_production": {
                 "scope": "host descriptor return before consumption; device contents and storage hazards are separate",
                 "required_links": len(required),
@@ -186,9 +246,9 @@ class ExecutionEvidence:
             report["cache_rank_bindings"] = index_work
         return report
 
-    def handoffs(self, ownership: RequestStateEvidence, cross: set, owners: dict) -> dict:
+    def handoffs(self, ownership: RequestStateEvidence) -> dict:
         if "pd" not in self.result["configuration"]:
-            return {"requests": 0, "checks": {"handoff_steps": True, "handoff_readiness": True}}
+            return {"requests": 0, "missing_paths": [], "checks": {"handoff_steps": True, "handoff_readiness": True}}
 
         requests = set(ownership.requests)
         sources = {name for name, role in ownership.instances.items() if role == "prefill"}
@@ -266,18 +326,25 @@ class ExecutionEvidence:
                 )
                 required.extend(pairwise(rows))
 
-        ready = complete
+        links = {
+            (source, target)
+            for first, last in required
+            for source in first["execution_ports"]["completions"]
+            for target in last["execution_ports"]["completions"]
+        }
+        missing = DependencyPaths(self.result["graph"]["execution"]).missing(links)
 
-        # Submission may overlap prior copies; the graph must enforce their actual readiness.
-        for first, last in required:
-            before = ("action", first["task"]["group"], first["task"]["sequence"])
-
-            # Slot release may reuse the preceding cache action's completion without adding graph work.
-            after = {owners[port] for port in last["execution_ports"]["completions"]}
-            ready &= any((before, target) in cross for target in after)
+        # The callback waits for all receiving ports; every producer must reach at least one of them.
+        gaps = [
+            {"source": first["task"], "destination": last["task"], "producer_completion": source}
+            for first, last in required
+            for source in first["execution_ports"]["completions"]
+            if all((source, target) in missing for target in last["execution_ports"]["completions"])
+        ]
         return {
             "requests": len({key[0] for key in actions}),
-            "checks": {"handoff_steps": complete, "handoff_readiness": ready},
+            "missing_paths": gaps[:8],
+            "checks": {"handoff_steps": complete, "handoff_readiness": complete and not gaps},
         }
 
 
@@ -287,7 +354,7 @@ class NativeEvidence:
         self.target = target
         self.minimum_members = minimum_members
         self.groups = defaultdict(dict)
-        self.maximum_members = {}
+        self.coverage = BatchCoverage(target["requests"])
         self.mismatches = []
         self.difference_count = 0
         self.unobserved = 0
@@ -305,7 +372,6 @@ class NativeEvidence:
         instance = environment["implementation"]["disaggregation_mode"]
         instance = "model" if instance == "null" else instance
         batches = {batch["id"]: batch for batch in source["batches"] if batch["observation"] == "source"}
-        self.maximum_members[environment["rank"]] = 0
         labels = []
         occurrences = Counter()
         for region in source["regions"]:
@@ -315,8 +381,9 @@ class NativeEvidence:
                 batch = labels[region["parent"]]
             labels.append(batch)
             if region["role"] in {"Prefill", "Decode", "Mixed"}:
-                self.maximum_members[environment["rank"]] = max(
-                    self.maximum_members[environment["rank"]], len(batches[batch]["members"])
+                self.coverage.observe(
+                    str(environment["rank"]),
+                    [{**member, "id": names[member["id"]]} for member in batches[batch]["members"]],
                 )
             if metadata.get("entrypoint") != "expert_layer":
                 continue
@@ -404,15 +471,16 @@ class NativeEvidence:
             padding += len(actual) - real
         if "ep_routes" in self.target and not self.groups:
             self.unobserved += 1
-        batch_covered = max(self.maximum_members.values(), default=0) >= self.minimum_members
+        coverage = self.coverage.report()
+        batch_covered = coverage["observed"].get("batch_members", 0) >= self.minimum_members
         status = (
             "differences" if self.difference_count or not batch_covered else "partial" if self.unobserved else "matched"
         )
         return {
             "status": status,
             "minimum_batch_members": self.minimum_members,
-            "maximum_batch_members_by_rank": self.maximum_members,
             "batch_size_covered": batch_covered,
+            "coverage": coverage,
             "routing_calls": calls,
             "routing_rows": rows,
             "padding_rows": padding,

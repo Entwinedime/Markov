@@ -68,8 +68,15 @@ class ExecutionComparison:
         "unclassified",
     }
 
-    def __init__(self, native: list[dict[str, Any]], target: list[dict[str, Any]], execution: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        native: list[dict[str, Any]],
+        target: list[dict[str, Any]],
+        execution: dict[str, Any],
+        physical: dict[str, Any],
+    ) -> None:
         self.native = native
+        self.physical = physical
         self.positions = {operation["id"]: position for position, operation in enumerate(target)}
         self.execution = execution
         self.nodes = [node for node in execution["nodes"] if node.get("operation") in self.positions]
@@ -338,6 +345,7 @@ class ExecutionComparison:
 
         required = set()
         initial = set()
+        drained = set()
         frontiers = set()
         native_waits = 0
         kinds = Counter()
@@ -387,7 +395,10 @@ class ExecutionComparison:
                     if visible:
                         required.add((mapped[stream, visible[-1]], node["id"]))
                     else:
-                        initial.add((bindings[stream], node["id"]))
+                        frontier = (bindings[stream], node["id"])
+                        initial.add(frontier)
+                        if self.drained_before(stream, action):
+                            drained.add(frontier)
 
         wait_ids = {node["id"] for items in target_waits.values() for node in items}
         actual = {
@@ -415,9 +426,9 @@ class ExecutionComparison:
         extra = internal - required
         same = not missing and not extra and not unexpected
 
-        # A cropped flow cannot certify earlier work or the drained initial state of its streams.
+        # Outside-window synchronization can prove initial work drained; unresolved boundaries remain partial.
         return {
-            "same": None if same and (initial or boundary) else same,
+            "same": None if same and (initial - drained or boundary) else same,
             "same_stream_order": same_stream_order,
             "streams": len(bindings),
             "native_waits": native_waits,
@@ -427,10 +438,72 @@ class ExecutionComparison:
             "extra": list(sorted(extra))[:3],
             "transitive_completion_links": len(transitive),
             "initial_frontiers": len(initial),
+            "drained_initial_frontiers": len(drained),
             "external_completion_links": len(external),
             "unresolved_initial_frontiers": len(incoming),
             "unexpected_boundary_frontiers": list(sorted(unexpected))[:3],
         }
+
+    def drained_before(self, stream: int, wait: dict[str, Any]) -> bool:
+        before = wait["submission"]["order"]
+        fences = [
+            action
+            for action in self.physical["runtime_actions"]
+            if action["kind"] in ("wait_stream", "wait_device")
+            and action["wait_frontiers"] is not None
+            and stream in action["wait_frontiers"]["streams"]
+            and action["native_call"] is not None
+            and action["native_call"]["result"] == 0
+            and action["submission"]["completion_order"] < before
+        ]
+        if not fences:
+            return False
+        fence = max(fences, key=lambda action: action["submission"]["completion_order"])
+        commands = [item for item in self.physical["work"] if item["stream"] == stream]
+        commands += [
+            action
+            for action in self.physical["runtime_actions"]
+            if action["kind"] in ("copy_async", "record_event", "wait_event")
+            and action["target"] is not None
+            and action["target"]["identity"] == stream
+        ]
+
+        for item in commands:
+            submission = item["submission"]
+            if submission is None:
+                return False
+            if self.issue(item)[1] >= before or submission["completion_order"] < fence["submission"]["order"]:
+                continue
+
+            # A later wait on an already completed event introduces no unfinished outside-window work.
+            if submission["completion_order"] >= before or not self.event_completed_before(item, fence):
+                return False
+        return True
+
+    def event_completed_before(self, wait: dict[str, Any], fence: dict[str, Any]) -> bool:
+        parameters = wait.get("native_call") or {}
+        if wait["kind"] != "wait_event" or "event" not in parameters:
+            return False
+        records = []
+        for action in self.physical["runtime_actions"]:
+            if action["kind"] != "record_event" or self.issue(action)[1] >= self.issue(wait)[1]:
+                continue
+            identity = (action["native_call"] or {}).get("event")
+            if identity is None:
+
+                # An unidentified record after the fence could have reused the event being waited on.
+                if action["submission"]["completion_order"] >= fence["submission"]["order"]:
+                    return False
+            elif identity == parameters["event"]:
+                records.append(action)
+        if not records or any(self.issue(record)[0] != self.issue(wait)[0] for record in records):
+            return False
+        record = max(records, key=lambda action: self.issue(action)[1])
+        return (
+            record["submission"]["completion_order"] < fence["submission"]["order"]
+            and record["target"] is not None
+            and record["target"]["identity"] in fence["wait_frontiers"]["streams"]
+        )
 
     def events(self) -> dict[str, Any]:
         expected = Counter()

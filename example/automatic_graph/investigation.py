@@ -1,4 +1,4 @@
-"""Run the S8 investigation with a frozen core and reviewed adapter scopes."""
+"""Run an independent investigation with a frozen core and reviewed adapter scopes."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from markov_application.exploration import BudgetExceeded, CommandFailed, Exploration
+from markov_application.command import CommandFailed
+from markov_application.exploration import BudgetExceeded, Exploration
 from markov_application.specification import read_specification
 from markov_collection.artifacts import write_json
 from validation import NativeDeviceUnavailable, NativeValidation, analyze, completion_checks
@@ -94,11 +95,7 @@ class Investigation:
         self.jobs = {job["id"]: job for job in self.manifest["jobs"]}
         self.case_tasks = {"workflow/" + job["id"]: job["task"] for job in self.jobs.values()}
         self.case_tasks.update(
-            {
-                f"native/{job['id']}/{case['configuration']}/{case['workload']}": job["task"]
-                for job in self.jobs.values()
-                for case in job["native_cases"]
-            }
+            {self.native_key(job, case): job["task"] for job in self.jobs.values() for case in job["native_cases"]}
         )
         for kind in ("conditional", "lifecycle"):
             self.case_tasks.update(
@@ -111,8 +108,13 @@ class Investigation:
         self.outcomes = json.loads(self.output.read_text()) if self.output.exists() else []
 
     def states(self) -> list[dict[str, Any]]:
-        paths = list(self.directory.glob("runs/*/state.json")) + list(self.directory.glob("lifecycle/*/state.json"))
-        return [json.loads(path.read_text()) for path in paths]
+        tasks = {job["task"] for job in self.jobs.values()}
+        tasks.update(case["task"] for case in self.manifest["lifecycle_cases"] if "task" in case)
+
+        # Reviewed adapter updates can replace a task path; its recorded attempts remain charged.
+        tasks.update(outcome["source_task"] for outcome in self.outcomes if outcome["source_task"] is not None)
+        paths = {(self.directory / task).resolve().parent.parent / "state.json" for task in tasks}
+        return [json.loads(path.read_text()) for path in sorted(paths) if path.is_file()]
 
     def available(self, category: str) -> int:
         charged = sum(state["charged_ns"][category] for state in self.states())
@@ -178,7 +180,7 @@ class Investigation:
         ).strip():
             raise ValueError("untracked code was added after freezing")
         prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
-        names = [f"{prefix}-sglang:ubuntu22.04", f"{prefix}-modeling:ubuntu24.04"]
+        names = [f"{prefix}-sglang:ubuntu22.04", f"{prefix}-control:ubuntu22.04", f"{prefix}-modeling:ubuntu24.04"]
         images = json.loads(subprocess.check_output(["docker", "image", "inspect", *names], text=True))
         if dict(zip(names, (image["Id"] for image in images), strict=True)) != self.manifest["images"]:
             raise ValueError("execution images changed after freezing")
@@ -271,6 +273,11 @@ class Investigation:
             raise FileNotFoundError(f"source library was not published: {job_id}")
         return task
 
+    @staticmethod
+    def native_key(job: dict[str, Any], case: dict[str, Any]) -> str:
+        key = f"native/{job['id']}/{case['configuration']}/{case['workload']}"
+        return key + "/" + case["control"] if "control" in case else key
+
     def native(self, job: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
         try:
             task = self.task(job["id"])
@@ -281,14 +288,35 @@ class Investigation:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 validation = NativeValidation(
-                    task, case["configuration"], case["workload"], capture, case.get("minimum_batch_members", 1)
+                    task,
+                    case["configuration"],
+                    case["workload"],
+                    capture,
+                    case.get("minimum_batch_members", 1),
+                    case.get("control"),
                 )
+                if not validation.reuse_published:
+
+                    # A second backend consumes the first observation, including its resumed capture path.
+                    primary = NativeValidation(task, case["configuration"], case["workload"], capture)
+                    if primary.report.is_file():
+                        observation = json.loads(primary.report.read_text())
+                        primary.capture = task.directory / observation["capture"]
+                    if not primary.interpreted():
+                        return {
+                            "status": "blocked",
+                            "depends_on": self.native_key(job, {**case, "control": primary.control}),
+                            "reason": "the shared native target has not been fully interpreted",
+                        }
+                    validation.capture = primary.capture
                 previous = json.loads(validation.report.read_text()) if validation.report.exists() else None
                 outcome = (
                     previous
                     if previous and previous["status"] not in NativeValidation.resumable
                     else validation.run(resume=True)
                 )
+                for subject, minimum in case.get("minimum_coverage", {}).items():
+                    self.coverage(outcome, subject, minimum, outcome.get(subject + "_evidence", {}))
                 outcome["report"] = str(validation.report.relative_to(self.directory))
                 self.check_storage(retained=True)
                 return outcome
@@ -297,33 +325,36 @@ class Investigation:
                 task.report()
 
     @staticmethod
+    def coverage(outcome: dict, subject: str, minimum: dict, evidence: dict) -> None:
+        observed = evidence.get("coverage", {}).get("observed", {})
+        checks = {
+            name: {"minimum": value, "observed": observed.get(name), "covered": observed.get(name, 0) >= value}
+            for name, value in minimum.items()
+        }
+        outcome.setdefault("coverage", {})[subject] = checks
+        if outcome["status"] in ("complete", "matched") and not all(item["covered"] for item in checks.values()):
+            outcome["status"] = "partial"
+
+    @staticmethod
     def completed(target: dict[str, Any], result: dict[str, Any]) -> bool:
         return all(completion_checks(target, result).values())
 
     @staticmethod
-    def prediction(task: Exploration, target: Path, output: Path, expected: str) -> dict[str, Any]:
+    def prediction(
+        task: Exploration, target: Path, output: Path, expected: str, error_terms: list[str]
+    ) -> dict[str, Any]:
         asset = task.directory / "assets/domain-0/templates.json"
         detailed = task.directory / "work/investigation" / output.parent.name / "prediction.json"
-        arguments = [
-            "simulate",
-            "--templates",
-            str(asset),
-            "--input",
-            str(target),
-            "--output",
-            str(detailed),
-            "--details",
-        ]
         try:
-            task.step(
-                task.environment.tool_command(arguments, [asset, target], detailed, task.available("processing")),
-                "processing",
-            )
+            task.simulate(asset, target, detailed, True)
         except CommandFailed as error:
+
+            # A worker crash is not a successful negative case; require the declared input error.
             rejected = (
                 expected == "rejected"
                 and error.returncode == 1
-                and error.stderr.startswith("markov: ")
+                and bool(error_terms)
+                and all(term in error.stderr for term in error_terms)
                 and not detailed.exists()
             )
             return {
@@ -350,10 +381,11 @@ class Investigation:
             task = self.task(case["job"])
         except FileNotFoundError as error:
             return {"status": "blocked", "depends_on": "workflow/" + case["job"], "reason": str(error)}
+        task.specification = {**task.specification, "control": case["control"]}
         output = self.directory / "cases" / case["id"] / "result.json"
         with (task.directory / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return self.prediction(task, self.directory / case["input"], output, case["expected"])
+            return self.prediction(task, self.directory / case["input"], output, case["expected"], case["error_terms"])
 
     def public(
         self, arguments: list[str], output: Path, timeout: int = 30, owner: Exploration | None = None
@@ -425,6 +457,7 @@ class Investigation:
                 if process.poll() is None and not stopped:
                     process.send_signal(signal.SIGINT)
                 process.wait(timeout=30)
+                released_after_interrupt = self.released(task)
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -432,7 +465,7 @@ class Investigation:
                 task.environment.cleanup()
         before = json.loads((directory / "state.json").read_text())
         interrupted = (
-            stopped and before["status"] == "interrupted" and before["pending"] is None and self.released(task)
+            stopped and before["status"] == "interrupted" and before["pending"] is None and released_after_interrupt
         )
         result = self.public(
             ["--resume", str(directory)],
@@ -450,6 +483,7 @@ class Investigation:
         monotonic = after["charged_ns"]["processing"] >= before["charged_ns"]["processing"]
         return {
             "status": "complete" if interrupted and completed and monotonic else "differences",
+            "workers_released_after_interrupt": released_after_interrupt,
             "interrupted_state": before,
             "resumed_state": after,
         }
@@ -509,21 +543,35 @@ class Investigation:
                 return {"status": "complete" if not missing.exists() and not result.parent.exists() else "differences"}
             return {"status": "differences"}
         if kind == "protect-input":
+            task.specification = {**task.specification, "control": case.get("control", task.specification["control"])}
             target = self.directory / case["input"]
             original = target.read_bytes()
             asset = task.directory / "assets/domain-0/templates.json"
-            arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(target)]
-            try:
-                task.step(
-                    task.environment.tool_command(arguments, [asset, target], target, task.available("processing")),
-                    "processing",
-                )
-            except CommandFailed as error:
-                passed = (
-                    error.returncode == 1 and error.stderr.startswith("markov: ") and target.read_bytes() == original
-                )
-                return {"status": "complete" if passed else "differences", "error": str(error)}
-            return {"status": "differences"}
+            paths = [(target, target)]
+            if task.specification["control"] == "native":
+                for role in ("core", "native"):
+                    result = output.parent / role / "prediction.json"
+                    source = result.with_suffix(".logs") / (role + ".log")
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_bytes(original)
+                    paths.append((source, result))
+            checks = []
+            for source, result in paths:
+                try:
+                    task.simulate(asset, source, result, False)
+                except CommandFailed as error:
+                    passed = (
+                        error.returncode == 1
+                        and "must not overwrite an input" in error.stderr
+                        and source.read_bytes() == original
+                    )
+                    checks.append({"passed": passed, "error": str(error)})
+                else:
+                    checks.append({"passed": False})
+            return {
+                "status": "complete" if all(check["passed"] for check in checks) else "differences",
+                "checks": checks,
+            }
         raise ValueError(f"unsupported lifecycle case: {kind}")
 
     def run(self) -> None:
@@ -532,7 +580,7 @@ class Investigation:
             self.execute("workflow/" + job["id"], self.workflow, job)
         for job in self.manifest["jobs"]:
             for case in job["native_cases"]:
-                self.execute(f"native/{job['id']}/{case['configuration']}/{case['workload']}", self.native, job, case)
+                self.execute(self.native_key(job, case), self.native, job, case)
         for case in self.manifest["conditional_cases"]:
             self.execute("conditional/" + case["id"], self.conditional, case)
         for case in self.manifest["lifecycle_cases"]:

@@ -147,6 +147,9 @@ class RequestStateEvidence:
         self.requests = {item["id"]: item for item in result["requests"]}
         self.generated = Counter()
         self.resident = {}
+        self.mixed = self.native and result["configuration"].get("mixed_batches", False)
+        self.ready_decode = defaultdict(set)
+        self.scheduling = Counter(ready_decode_batches=0, chunk_budget_batches=0)
         self.failures = Counter()
         self.examples = []
 
@@ -172,6 +175,8 @@ class RequestStateEvidence:
 
     def start(self, action: dict) -> None:
         pool = self.pool(action)
+        if self.mixed and action["step"] == "prepare":
+            self.selection(action, pool)
         for member in action["members"]:
             request = member["id"]
             key = pool, request
@@ -193,6 +198,23 @@ class RequestStateEvidence:
             if key in self.resident:
                 self.require(context == self.resident[key], "context_continuity", action, request)
             self.resident[key] = context + member["new_tokens"]
+
+    def selection(self, action: dict, pool: str) -> None:
+
+        # Each PP lane advances its own running batch; unfinished model work is not ready Decode.
+        ready = self.ready_decode[pool, action["lane"]]
+        decoding = {member["id"] for member in action["members"] if member["phase"] == "decode"}
+        for request in sorted(ready ^ decoding):
+            self.require(False, "ready_decode_selection", action, request)
+        self.scheduling["ready_decode_batches"] += bool(ready)
+        ready.difference_update(decoding)
+
+        prefill = [member for member in action["members"] if member["phase"] == "prefill"]
+        if prefill:
+            tokens = sum(member["new_tokens"] for member in prefill) + len(decoding)
+            chunk = self.result["configuration"]["prefill_chunk_tokens"]
+            self.require(tokens <= chunk, "decode_reserved_chunk_budget", action, prefill[0]["id"])
+            self.scheduling["chunk_budget_batches"] += 1
 
     def finish(self, action: dict) -> None:
         pool = self.pool(action)
@@ -220,10 +242,14 @@ class RequestStateEvidence:
                     request,
                 )
                 self.generated[key] = member["generated_tokens"]
+                if self.mixed and not member["finished"] and not continues:
+                    self.ready_decode[pool, action["lane"]].add(request)
 
             # PP completion snapshots must not overwrite a range already reserved for the next chunk.
             if (action["commits_requests"] or action["step"] == "release") and member["finished"]:
                 del self.resident[key]
+                if self.mixed:
+                    self.ready_decode[pool, action["lane"]].discard(request)
 
     def check(self) -> dict:
         actions = self.result["decisions"]
@@ -238,7 +264,7 @@ class RequestStateEvidence:
             and all(action["submitted_order"] < action["completed_order"] for action in actions)
         )
         if not ordered:
-            return {"status": "differences", "failures": {"state_event_order": 1}}
+            return {"status": "differences", "failures": {"state_event_order": 1}, "scheduling": dict(self.scheduling)}
 
         for _, _, event, index in events:
             action = actions[index]
@@ -261,9 +287,10 @@ class RequestStateEvidence:
         completed = progress == expected and not self.resident
         return {
             "status": "matched" if not self.failures and completed else "differences",
-            "scope": "request arrival, contiguous input ranges, recomputation and committed output progress",
+            "scope": "request progress; mixed native control also checks lane-local Decode readiness and chunk budget",
             "state_events": len(events),
             "completed_requests": completed,
+            "scheduling": dict(self.scheduling),
             "failures": dict(self.failures),
             "examples": self.examples,
         }

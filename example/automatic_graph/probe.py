@@ -156,7 +156,7 @@ class MechanismProbe:
         }
         geometries = TensorAssignmentCall.input_geometries(self.recording.regions)
         TensorAssignmentCall.declare(self.recording.regions, self.recording.values, geometries)
-        AscendLayouts.declare(self.recording.regions, self.recording.operations, self.recording.values)
+        AscendLayouts.declare(self.recording.regions, self.recording.operations, self.recording.values, geometries)
         self.recording.write(self.output / "observations.json", environment)
         self.synchronization.write(self.output / "runtime")
         summary = {

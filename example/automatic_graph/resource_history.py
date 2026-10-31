@@ -27,6 +27,11 @@ class ResourceHistoryEvidence:
 
         # Host return can precede device completion; retain the actual device intervals for each action.
         graph = result["graph"]
+        model_regions = {region["id"] for models in self.operands.models.values() for region in models}
+        for region in graph["regions"]:
+            if region["parent"] in model_regions:
+                model_regions.add(region["id"])
+        transfers = {key for key, action in self.actions.items() if action["step"] == "transfer"}
         timeline = {item["node"]: item for item in result["execution_timeline"]}
         self.work = {}
         nodes = [
@@ -42,6 +47,10 @@ class ResourceHistoryEvidence:
             task = graph["regions"][region].get("task")
             if task is not None:
                 key = task["group"], task["sequence"]
+
+                # Combined actions also contain pool maintenance; only model and KV transfer work consume KV pages.
+                if region not in model_regions and key not in transfers:
+                    continue
                 self.work.setdefault(key, []).append(timeline[node["id"]])
                 streams = self.frontiers.setdefault(key, {})
                 resource = node["resource"]
@@ -53,6 +62,12 @@ class ResourceHistoryEvidence:
             return
         pool = self.ownership.pool(action)
         event = {"pool": pool, "kind": action["step"], "order": action["submitted_order"]}
+        if action["step"] == "select":
+            for member in action["members"]:
+                request = self.pools[pool]["requests"][self.request_ids[member["id"]]]
+                self.require(request["slot"] is not None, "selection_residence", event)
+            return
+
         allocate = self.ownership.allocates(action)
         for member in action["members"]:
             request = self.pools[pool]["requests"][self.request_ids[member["id"]]]

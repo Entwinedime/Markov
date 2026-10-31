@@ -49,6 +49,15 @@ class MatrixInputs:
             result.append({"id": f"request-{index}", "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output})
         return result
 
+    def vary_outputs(self, requests):
+        generator = random.Random(self.manifest["request_seed"])
+
+        # Keep prompt/member boundaries and one-token endings fixed across reserved seeds.
+        for request in requests:
+            if request["output_tokens"] > 1:
+                request["output_tokens"] += generator.randint(1, 3)
+        return requests
+
     def routes(self, model, requests, size, mode):
         layers, experts, top_k = (model[key] for key in ("num_hidden_layers", "num_experts", "num_experts_per_tok"))
         assignments = []
@@ -121,13 +130,14 @@ class MatrixInputs:
         native_cases = [{"configuration": "wide", "workload": "varying" if moe else "boundaries"}]
         task = {
             "framework": "sglang",
+            "control": "lightweight",
             "model": {"path": model["path"], "dtype": dtype},
             "deployment": {"physical_devices": list(range(devices))},
             "budget": {
-                "native_seconds": 600 * source_sessions + 700,
-                "processing_seconds": 3600 if pd else 2400 if moe else 1800,
-                "temporary_bytes": (20 if moe or pd else 12) * 1024**3,
-                "retained_bytes": (8 if moe or pd else 4) * 1024**3,
+                "native_seconds": max(1800, 600 * source_sessions + 700),
+                "processing_seconds": 5400,
+                "temporary_bytes": (64 if moe or pd else 32) * 1024**3,
+                "retained_bytes": (48 if moe or pd else 24) * 1024**3,
             },
             "configurations": configurations,
             "workloads": workloads,
@@ -183,19 +193,55 @@ class MatrixInputs:
                 entry["native_cases"][0]["configuration"] = "small"
         self.extended_inputs()
         self.capacity_and_route_inputs()
+        self.scheduling_inputs()
         self.lifecycle_inputs()
         for entry in self.manifest["jobs"]:
-            self.write(entry["task"], self.tasks[entry["id"]])
-        self.manifest["round_budget"] = {
+            task = self.tasks[entry["id"]]
+            controls = ("native",) if task["control"] == "native" else ("lightweight", "native")
+            entry["native_cases"] = [
+                {**case, "control": control} for case in entry["native_cases"] for control in controls
+            ]
+            if task["control"] == "lightweight":
+                for configuration in task["configurations"]:
+                    for workload in task["workloads"]:
+                        self.conditional(
+                            f"prediction-{entry['id']}-{configuration['id']}-{workload['id']}",
+                            entry["id"],
+                            self.target(configuration, workload, self.durations),
+                            "complete",
+                            entry["groups"],
+                            controls=("native",),
+                        )
+            self.write(entry["task"], task)
+        base_budget = {
             "native_attempts": sum(entry["native_attempt_cap"] for entry in self.manifest["jobs"]),
-            "native_seconds": 24000,
-            "processing_seconds": 28800,
-            "temporary_bytes": 120 * 1024**3,
-            "retained_bytes": 96 * 1024**3,
+            "native_seconds": sum(task["budget"]["native_seconds"] for task in self.tasks.values()),
+            "processing_seconds": sum(task["budget"]["processing_seconds"] for task in self.tasks.values()) + 600,
+            "temporary_bytes": 512 * 1024**3,
+            "retained_bytes": 384 * 1024**3,
             "concurrent_jobs": 1,
         }
+        reserves = len(self.manifest["reserved_request_seeds"])
+        allowance = {
+            "native_attempts": reserves * max(entry["native_attempt_cap"] for entry in self.manifest["jobs"]),
+            **{
+                field: reserves * max(task["budget"][field] for task in self.tasks.values())
+                for field in ("native_seconds", "processing_seconds", "temporary_bytes", "retained_bytes")
+            },
+        }
+
+        # Each reserved input set funds one largest-domain rebuild; old attempts remain charged.
+        self.manifest["adaptation_allowance"] = {
+            "budget": allowance,
+            "purpose": "Reviewed affected-domain rebuilds and reserved holdouts; all old attempts remain charged",
+            "reserved_request_seeds_in_order": self.manifest["reserved_request_seeds"],
+            "stop": "Reserve exhaustion or a broader rebuild leaves the round incomplete; no automatic extension",
+        }
+        self.manifest["round_budget"] = {key: value + allowance.get(key, 0) for key, value in base_budget.items()}
         self.manifest["preparation_remaining"] = [
-            "Complete development preflight of budgeted execution, recovery and reporting",
+            "Qualify shared observations, backend-specific reports, negative causes and lifecycle recovery",
+            "Check that scheduling cases actually exercise mixed work, cache reuse, eviction and pressure",
+            "Review native eligibility, reserved targets, per-job budgets and all previous coverage mappings",
             "Complete final code/document/data checks",
             "Record and freeze the reviewed code and all case inputs before execution",
         ]
@@ -213,22 +259,17 @@ class MatrixInputs:
                 {"id": f"member-{index}", "arrival_ns": 0, "prompt_tokens": 1 + index % 3, "output_tokens": 3}
                 for index in range(count)
             ]
+            self.vary_outputs(requests)
             task["workloads"].append({"id": f"members-{count}", "requests": requests})
         for count, seed in ((64, 2701), (128, 2702), (256, 2703)):
             requests = self.requests(128, count, seed)
             for index, request in enumerate(requests):
                 request["arrival_ns"] = (index // 7) * 37000 + (900000 if index >= count // 2 else 0)
             task["workloads"].append({"id": f"seed-{count}", "requests": requests})
-        task["workloads"].append(
-            {
-                "id": "long-outputs",
-                "requests": [
-                    {"id": "long-first", "arrival_ns": 0, "prompt_tokens": 23, "output_tokens": 32},
-                    {"id": "one-step", "arrival_ns": 0, "prompt_tokens": 137, "output_tokens": 1},
-                    {"id": "long-last", "arrival_ns": 0, "prompt_tokens": 263, "output_tokens": 64},
-                ],
-            }
-        )
+        requests = self.requests(128, count=3)
+        for request, output in zip(requests, (32, 1, 64), strict=True):
+            request["output_tokens"] = output
+        task["workloads"].append({"id": "long-outputs", "requests": requests})
         entry["native_cases"] = [
             {"configuration": "small", "workload": "boundaries"},
             {"configuration": "r32", "workload": "members-32", "minimum_batch_members": 32},
@@ -236,8 +277,12 @@ class MatrixInputs:
             {"configuration": "r128", "workload": "members-128", "minimum_batch_members": 128},
             {"configuration": "wide", "workload": "long-outputs"},
         ]
+        for case in entry["native_cases"]:
+            if "minimum_batch_members" in case:
+                minimum = {phase + "_members": case["minimum_batch_members"] for phase in ("prefill", "decode")}
+                case["minimum_coverage"] = {"native": minimum, "execution": minimum}
         entry["native_attempt_cap"] = 1 + len(entry["native_cases"])
-        task["budget"].update(native_seconds=4500, processing_seconds=5400, retained_bytes=8 * 1024**3)
+        task["budget"]["native_seconds"] = 4500
 
         # Keep broad request/capacity boundaries without multiplying every single-axis case.
         for running in (1, 2, 31, 64, 101):
@@ -273,10 +318,12 @@ class MatrixInputs:
 
         long_context = {
             "id": "context-boundaries",
-            "requests": [
-                {"id": f"context-{length}", "arrival_ns": 0, "prompt_tokens": length, "output_tokens": 2}
-                for length in (2047, 2048, 2049, 2305)
-            ],
+            "requests": self.vary_outputs(
+                [
+                    {"id": f"context-{length}", "arrival_ns": 0, "prompt_tokens": length, "output_tokens": 2}
+                    for length in (2047, 2048, 2049, 2305)
+                ]
+            ),
         }
         for identifier in ("qwen3-tp2", "llama31-tp1", "llama31-tp2", "glm4-tp1", "glm4-tp2"):
             self.tasks[identifier]["workloads"].append(copy.deepcopy(long_context))
@@ -303,20 +350,51 @@ class MatrixInputs:
         negative = copy.deepcopy(target)
         negative["configuration"].update(max_running_requests=1, max_total_tokens=128)
         negative["requests"] = [{"id": "too-large", "arrival_ns": 0, "prompt_tokens": 257, "output_tokens": 2}]
-        self.conditional("E-request-exceeds-pool", "qwen3-tp1", negative, "rejected", ["E"])
-        for identifier, field, value in (("A-zero-prompt", "prompt_tokens", 0), ("A-type", "prompt_tokens", "5")):
+        self.conditional(
+            "E-request-exceeds-pool",
+            "qwen3-tp1",
+            negative,
+            "rejected",
+            ["E"],
+            ["markov: request exceeds the native input length limit: too-large"],
+        )
+        for identifier, field, value, reason in (
+            ("A-zero-prompt", "prompt_tokens", 0, "request needs nonnegative arrival and positive token lengths"),
+            ("A-type", "prompt_tokens", "5", "serving fields must be integers"),
+        ):
             negative = copy.deepcopy(target)
             negative["requests"][0][field] = value
-            self.conditional(identifier, "qwen3-tp1", negative, "rejected", ["A"])
+            self.conditional(identifier, "qwen3-tp1", negative, "rejected", ["A"], ["markov: " + reason])
         negative = copy.deepcopy(target)
         negative["requests"][1]["id"] = negative["requests"][0]["id"]
-        self.conditional("A-duplicate-request", "qwen3-tp1", negative, "rejected", ["A"])
+        self.conditional(
+            "A-duplicate-request",
+            "qwen3-tp1",
+            negative,
+            "rejected",
+            ["A"],
+            ["markov: request IDs must be nonempty and unique"],
+        )
         negative = copy.deepcopy(target)
         negative["configuration"]["page_size"] = 64
-        self.conditional("C-wrong-page-asset", "qwen3-tp1", negative, "rejected", ["C"])
+        self.conditional(
+            "C-wrong-page-asset",
+            "qwen3-tp1",
+            negative,
+            "rejected",
+            ["C"],
+            ["markov: no region layout matches", '["eq","page_size",128] requires true'],
+        )
         negative = copy.deepcopy(target)
         negative["configuration"].update(pp=3, microbatch_requests=2)
-        self.conditional("A-wrong-topology-asset", "qwen3-tp1", negative, "rejected", ["A", "H"])
+        self.conditional(
+            "A-wrong-topology-asset",
+            "qwen3-tp1",
+            negative,
+            "rejected",
+            ["A", "H"],
+            ["markov: target PP differs from its source topology"],
+        )
 
     @staticmethod
     def target(configuration, workload, durations):
@@ -327,17 +405,128 @@ class MatrixInputs:
             "requests": copy.deepcopy(workload["requests"]),
             "node_durations_ns": copy.deepcopy(durations),
         }
-        if "ep_routes" in workload:
-            target["ep_routes"] = copy.deepcopy(workload["ep_routes"])
+        for field in ("ep_routes", "prefixes"):
+            if field in workload:
+                target[field] = copy.deepcopy(workload[field])
         return target
+
+    def scheduling_inputs(self):
+        cases = (
+            ("single", "qwen3-8b", 1, 1, 1, None, True, False),
+            ("tp2", "qwen3-8b", 2, 1, 1, None, True, True),
+            ("ep2", "qwen3-moe", 2, 1, 2, None, False, True),
+            ("pp3", "qwen3-8b", 1, 3, 1, None, True, True),
+            ("pd", "qwen3-8b", 1, 1, 1, ((1, 1, 1), (1, 1, 1)), False, True),
+            ("pd-tp", "qwen3-8b", 1, 1, 1, ((2, 1, 1), (4, 1, 1)), False, True),
+            ("pd-ep", "qwen3-moe", 1, 1, 1, ((2, 1, 2), (2, 1, 2)), False, True),
+            ("pd-pp", "qwen3-8b", 1, 1, 1, ((1, 3, 1), (1, 3, 1)), False, True),
+        )
+        for name, model, tp, pp, ep, pd, mixed, cache in cases:
+            task, entry = self.job(f"scheduling-{name}", model, tp, pp, ep, pd=pd, groups=["G", "K", "L"])
+            task["control"] = "native"
+            task["configurations"] = task["configurations"][:2]
+            for configuration, chunk in zip(task["configurations"], (128, 256), strict=True):
+                configuration["id"] = f"chunk-{chunk}"
+                pools = configuration["pd"].values() if pd else (configuration,)
+                for pool in pools:
+                    pool.update(max_running_requests=3 if chunk == 128 else 6, max_total_tokens=4096)
+                prefill = configuration["pd"]["prefill"] if pd else configuration
+                prefill.update(max_prefill_tokens=1024, prefill_chunk_tokens=chunk, prefix_cache=cache)
+                if not pd:
+                    prefill["mixed_batches"] = mixed
+            task["workloads"] = []
+            for staggered in (False, True):
+                requests = [
+                    {
+                        "id": f"scheduled-{index}",
+                        "arrival_ns": index * 37000 if staggered else 0,
+                        "prompt_tokens": length,
+                        "output_tokens": output,
+                    }
+                    for index, (length, output) in enumerate(((391, 5), (271, 2), (527, 4), (143, 3)))
+                ]
+                self.vary_outputs(requests)
+                workload = {"id": "arrivals" if staggered else "shared", "requests": requests}
+                if cache:
+                    workload["prefixes"] = [
+                        {"id": "common", "tokens": 128},
+                        {"id": "extended", "parent": "common", "tokens": 128},
+                    ]
+                    for index, request in enumerate(requests):
+                        request["prefix_id"] = "extended" if index in (0, 2) else "common"
+                if "num_experts" in self.models[model]:
+                    roles = (("prefill", pd[0][2]), ("decode", pd[1][2])) if pd else (("model", ep),)
+
+                    # Shared text can reuse KV only when its expert choices also match.
+                    mode = "varying" if staggered else "hotspot"
+                    workload["ep_routes"] = {
+                        f"{role}-experts": self.routes(self.models[model], requests, size, mode) for role, size in roles
+                    }
+                task["workloads"].append(workload)
+            entry["mechanisms"] = ["chunk"]
+            if mixed:
+                entry["mechanisms"].extend(("decode-priority", "mixed"))
+            if cache:
+                entry["mechanisms"].append("prefix-cache")
+            minimum = {"chunked_batches": 1}
+            if mixed:
+                minimum["mixed_batches"] = 1
+            if cache:
+                minimum["reused_prefix_tokens"] = 128
+            entry["native_cases"] = [
+                {
+                    "configuration": "chunk-256",
+                    "workload": "shared",
+                    "minimum_coverage": {"native": minimum, "execution": minimum},
+                }
+            ]
+            if mixed:
+                entry["native_cases"][0]["minimum_coverage"]["execution"] = {
+                    **minimum,
+                    "ready_decode_batches": 1,
+                    "chunk_budget_batches": 1,
+                }
+
+            # Isolate cache pressure from mixed batching; each request fits, but their retained prefixes do not.
+            if name in ("tp2", "pd"):
+                configuration = copy.deepcopy(task["configurations"][1])
+                configuration["id"] = "cache-pressure"
+                for pool in configuration["pd"].values() if pd else (configuration,):
+                    pool.update(max_running_requests=1, max_total_tokens=1024)
+                task["configurations"].append(configuration)
+                workload = copy.deepcopy(task["workloads"][0])
+                workload["id"] = "cache-pressure"
+                workload["requests"] = [
+                    {"id": f"cache-{index}", "arrival_ns": 0, "prompt_tokens": length, "output_tokens": 2}
+                    for index, length in enumerate((401, 269, 417, 545, 145, 433))
+                ]
+                self.vary_outputs(workload["requests"])
+                for index, prefix in ((0, "extended"), (1, "common"), (2, "extended"), (4, "common"), (5, "extended")):
+                    workload["requests"][index]["prefix_id"] = prefix
+                task["workloads"].append(workload)
+                minimum = {"chunked_batches": 1, "reused_prefix_tokens": 128}
+                entry["native_cases"].append(
+                    {
+                        "configuration": "cache-pressure",
+                        "workload": "cache-pressure",
+                        "minimum_coverage": {
+                            "native": minimum,
+                            "execution": {**minimum, "cache_evictions": 1},
+                        },
+                    }
+                )
+                entry["native_attempt_cap"] += 1
+                task["budget"]["native_seconds"] += 700
 
     def capacity_and_route_inputs(self):
         common = {
             "id": "unit-capacity",
-            "requests": [
-                {"id": f"unit-{length}", "arrival_ns": 0, "prompt_tokens": length, "output_tokens": 2}
-                for length in (5, 129, 257)
-            ],
+            "requests": self.vary_outputs(
+                [
+                    {"id": f"unit-{length}", "arrival_ns": 0, "prompt_tokens": length, "output_tokens": 2}
+                    for length in (5, 129, 257)
+                ]
+            ),
         }
         for page in (1, 16, 64, 128, 256):
             identifier = "qwen3-tp1" if page == 128 else f"qwen3-page{page}"
@@ -350,10 +539,12 @@ class MatrixInputs:
             configuration["max_total_tokens"] = 32 * page
             workload = {
                 "id": "equal-pages",
-                "requests": [
-                    {"id": "page-before", "arrival_ns": 0, "prompt_tokens": max(1, page - 1), "output_tokens": 2},
-                    {"id": "page-after", "arrival_ns": 0, "prompt_tokens": page + 1, "output_tokens": 3},
-                ],
+                "requests": self.vary_outputs(
+                    [
+                        {"id": "page-before", "arrival_ns": 0, "prompt_tokens": max(1, page - 1), "output_tokens": 2},
+                        {"id": "page-after", "arrival_ns": 0, "prompt_tokens": page + 1, "output_tokens": 3},
+                    ]
+                ),
             }
             self.conditional(
                 f"C-equal-pages-{page}",
@@ -367,14 +558,35 @@ class MatrixInputs:
         target = self.target(task["configurations"][0], task["workloads"][0], self.durations)
         missing = copy.deepcopy(target)
         del missing["ep_routes"]
-        self.conditional("A-missing-routes", "qwen3-moe-ep2", missing, "rejected", ["A", "I"])
+        self.conditional(
+            "A-missing-routes",
+            "qwen3-moe-ep2",
+            missing,
+            "rejected",
+            ["A", "I"],
+            ["markov: [json.exception.out_of_range.403] key 'ep_routes' not found"],
+        )
         duplicate = copy.deepcopy(target)
         experts = duplicate["ep_routes"]["model-experts"]["assignments"][0]["experts"]
         experts[1] = experts[0]
-        self.conditional("A-duplicate-expert", "qwen3-moe-ep2", duplicate, "rejected", ["A", "I"])
+        self.conditional(
+            "A-duplicate-expert",
+            "qwen3-moe-ep2",
+            duplicate,
+            "rejected",
+            ["A", "I"],
+            ["markov: one token cannot select the same expert twice"],
+        )
         gap = copy.deepcopy(target)
         gap["ep_routes"]["model-experts"]["assignments"].pop(0)
-        self.conditional("A-route-gap", "qwen3-moe-ep2", gap, "rejected", ["A", "I"])
+        self.conditional(
+            "A-route-gap",
+            "qwen3-moe-ep2",
+            gap,
+            "rejected",
+            ["A", "I"],
+            ["markov: incomplete route for"],
+        )
 
     def lifecycle_inputs(self):
         base = copy.deepcopy(self.tasks["qwen3-tp1"])
@@ -420,12 +632,42 @@ class MatrixInputs:
             {"id": "L-bind-input", "kind": "missing-input", "job": "qwen3-tp1", "groups": ["L"]},
             {"id": "L-protect-input", "kind": "protect-input", "job": "qwen3-tp1", "input": guarded, "groups": ["L"]},
         ]
+        interrupted["control"] = "native"
+        native_path = self.write("lifecycle/interrupted-native/inputs/task.json", interrupted)
+        self.manifest["lifecycle_cases"] += [
+            {
+                "id": "L-interrupt-resume-native",
+                "kind": "interrupt",
+                "job": "qwen3-tp1",
+                "task": native_path,
+                "groups": ["L"],
+            },
+            {
+                "id": "L-protect-input-native",
+                "kind": "protect-input",
+                "job": "qwen3-tp1",
+                "control": "native",
+                "input": guarded,
+                "groups": ["L"],
+            },
+        ]
 
-    def conditional(self, identifier, job, target, expected, groups):
+    def conditional(
+        self, identifier, job, target, expected, groups, error_terms=(), controls=("lightweight", "native")
+    ):
         name = self.write(f"inputs/cases/{identifier}.json", target)
-        self.manifest["conditional_cases"].append(
-            {"id": identifier, "job": job, "input": name, "expected": expected, "groups": groups}
-        )
+        for control in controls:
+            self.manifest["conditional_cases"].append(
+                {
+                    "id": identifier + "-" + control,
+                    "job": job,
+                    "input": name,
+                    "control": control,
+                    "expected": expected,
+                    "groups": groups,
+                    "error_terms": error_terms,
+                }
+            )
 
 
 if __name__ == "__main__":
