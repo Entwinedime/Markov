@@ -1,5 +1,6 @@
 #include "markov/trace_graph/source_dag/index.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/source_dag/operator_envelopes.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -20,6 +21,11 @@ uint64_t saturated_add(uint64_t start, uint64_t duration) {
 } // namespace index_detail
 
 SourceDagIndex::SourceDagIndex(const core::DagGraph & graph) : graph_(graph) {}
+
+const detail::OperatorEnvelopeIndex & SourceDagIndex::operator_envelopes() const {
+    if (!operator_envelopes_) operator_envelopes_ = std::make_shared<const detail::OperatorEnvelopeIndex>(graph_.runtime_observations());
+    return *operator_envelopes_;
+}
 
 const core::DagAdjacency & SourceDagIndex::adjacency() const {
     if (!adjacency_) adjacency_ = graph_.adjacency();

@@ -19,7 +19,7 @@ std::vector<AllocatorRegion> observe_allocator_regions(const source_dag::SourceD
     const auto & graph = source.graph();
     std::vector<AllocatorRegion> regions;
     const auto & observations = graph.runtime_observations();
-    const source_dag::detail::OperatorEnvelopeIndex operators(observations);
+    const auto & operators = source.operator_envelopes();
     for (size_t i = 0; i < observations.size(); ++i) {
         const auto & event = observations[i];
         if (event.name != "runtime.hicache.extend_allocator" && event.name != "runtime.hicache.decode_allocator") continue;
@@ -126,7 +126,7 @@ std::vector<AttentionRegion> observe_attention_regions(const source_dag::SourceD
 
     std::vector<AttentionRegion> regions;
     const auto & events = graph.runtime_observations();
-    const source_dag::detail::OperatorEnvelopeIndex operators(events);
+    const auto & operators = source.operator_envelopes();
     for (size_t i = 0; i < events.size(); ++i) { remember(events[i], { false, i }); }
 
     for (size_t i = 0; i < events.size(); ++i) {
@@ -149,7 +149,7 @@ std::vector<AttentionRegion> observe_attention_regions(const source_dag::SourceD
 std::vector<AttentionMetadataRegion> observe_attention_metadata_regions(const source_dag::SourceDagIndex & source,
                                                                         const simulation::detail::CpuTaskQueues & queues) {
     const auto & events = source.graph().runtime_observations();
-    const source_dag::detail::OperatorEnvelopeIndex operators(events);
+    const auto & operators = source.operator_envelopes();
     std::vector<AttentionMetadataRegion> regions;
     for (size_t i = 0; i < events.size(); ++i) {
         const auto & event = events[i];

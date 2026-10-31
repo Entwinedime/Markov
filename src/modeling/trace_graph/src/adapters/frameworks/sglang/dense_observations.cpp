@@ -59,7 +59,7 @@ std::optional<structure::InputBuffersShape> input_buffer_shape(const core::Trace
 std::vector<DenseRegion> observe_dense_regions(const source_dag::SourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                std::map<std::string, size_t> & issues) {
     const auto & events = source.graph().runtime_observations();
-    const source_dag::detail::OperatorEnvelopeIndex operators(events);
+    const auto & operators = source.operator_envelopes();
     std::map<std::string, std::set<std::string>> devices_by_pid;
     for (const auto & event : events)
         if (event.name == "runtime.phase.attention_metadata" && !event.arg("device_name").empty()) devices_by_pid[event.pid].insert(event.arg("device_name"));

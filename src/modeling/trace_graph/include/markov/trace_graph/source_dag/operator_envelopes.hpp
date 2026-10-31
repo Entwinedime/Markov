@@ -17,16 +17,16 @@ namespace markov::trace_graph::source_dag::detail {
 // boundaries rather than letting rounded envelopes claim nearby submissions.
 class OperatorEnvelopeIndex {
 public:
-    explicit OperatorEnvelopeIndex(const std::vector<core::TraceEvent> & events) : events_(events) {
+    explicit OperatorEnvelopeIndex(const std::vector<core::TraceEvent> & events) {
         for (size_t i = 0; i < events.size(); ++i) {
             const auto & event = events[i];
             if ((event.source_channel == core::TraceSourceChannel::Torch && event.cat == "cpu_op" && event.ph == 'X')
                 || (event.source_channel == core::TraceSourceChannel::PythonProbe
                     && ((event.name == "runtime.phase.kernel" && event.arg("status") == "returned") || event.name == "runtime.triton.prepare"
                         || event.name == "runtime.triton.load")))
-                lanes_[{ event.pid, event.tid }].push_back(i);
+                lanes_[{ event.pid, event.tid }].push_back({ i, begin_ns(event), end_ns(event) });
         }
-        for (auto & [lane, indices] : lanes_) std::ranges::stable_sort(indices, {}, [&](size_t i) { return begin_ns(events_[i]); });
+        for (auto & [lane, envelopes] : lanes_) std::ranges::stable_sort(envelopes, {}, &Envelope::begin_ns);
     }
 
     [[nodiscard]] std::vector<size_t> inside(const core::TraceEvent & call) const {
@@ -35,9 +35,9 @@ public:
 
         std::vector<size_t> result;
         const auto finish = end_ns(call);
-        auto op = std::ranges::lower_bound(lane->second, begin_ns(call), {}, [&](size_t i) { return begin_ns(events_[i]); });
-        for (; op != lane->second.end() && begin_ns(events_[*op]) < finish; ++op)
-            if (end_ns(events_[*op]) <= finish) result.push_back(*op);
+        auto op = std::ranges::lower_bound(lane->second, begin_ns(call), {}, &Envelope::begin_ns);
+        for (; op != lane->second.end() && op->begin_ns < finish; ++op)
+            if (op->end_ns <= finish) result.push_back(op->observation);
         return result;
     }
 
@@ -55,8 +55,11 @@ private:
         return core::checked_add_u64(begin_ns(event), duration, "operator end timestamp overflow");
     }
 
-    const std::vector<core::TraceEvent> & events_;
-    std::map<std::pair<std::string, std::string>, std::vector<size_t>> lanes_;
+    struct Envelope {
+        size_t observation;
+        uint64_t begin_ns, end_ns;
+    };
+    std::map<std::pair<std::string, std::string>, std::vector<Envelope>> lanes_;
 };
 
 } // namespace markov::trace_graph::source_dag::detail

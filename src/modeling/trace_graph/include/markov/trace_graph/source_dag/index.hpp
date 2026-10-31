@@ -17,6 +17,10 @@
 
 namespace markov::trace_graph::source_dag {
 
+namespace detail {
+class OperatorEnvelopeIndex;
+}
+
 /** Observed overlap with a same-thread gap, not an additional service cost. */
 struct CpuGapSlice {
     size_t owner_node_id = 0;
@@ -71,6 +75,7 @@ struct DeviceSubmissionCut {
 class SourceDagIndex {
 public:
     explicit SourceDagIndex(const core::DagGraph & graph);
+    [[nodiscard]] const detail::OperatorEnvelopeIndex & operator_envelopes() const;
 
     [[nodiscard]] const core::DagGraph & graph() const { return graph_; }
     [[nodiscard]] std::span<const size_t> incoming_edge_ids(size_t node_id) const;
@@ -109,6 +114,7 @@ protected:
 
 private:
     const core::DagGraph & graph_;
+    mutable std::shared_ptr<const detail::OperatorEnvelopeIndex> operator_envelopes_;
     mutable std::shared_ptr<const core::DagAdjacency> adjacency_;
     mutable std::shared_ptr<const core::CpuIntervalIndex> cpu_index_;
     mutable std::map<std::pair<int, size_t>, DeviceStreamOrder> device_stream_orders_;
