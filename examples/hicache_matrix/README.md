@@ -55,7 +55,41 @@ examples/hicache_matrix/run.sh --model /path/to/Qwen3-32B \
 可用 `--phase prepare|predict|measure|report` 单独续跑对应步骤；输入依赖不足会正常报错。
 每次 `predict` 使用当时的共同模型选择，既有正常样本不参与模型维护。
 `--database` 可以指定本项目已有性能库，默认使用输出目录自己的 SQLite。
+`--models /path/to/selected_models.json` 则固定使用现有离线模型，跳过性能补采和训练；新 base 只用于来源解释及允许迁移的成本。
+正常测量先按配方的 `measurement_seed` 打乱条件，逐轮运行并隔轮反转顺序；每次重复仍独立启动服务。
 `--reuse` 接受显式的 source、normal 请求路径映射，不扫描目录猜输入；跨项目不复制或链接实验资产。
+
+## 新配置与新请求验证
+
+`generalization.py` 仅生成实验输入：保留 C2/C5 两个 base 锚点，以参数值对覆盖选择 22 个新组合；
+排除明确列出的历史选样会话，生成独立短/长输出、多轮和回访四组请求。
+短/长输出使用同一批输入，每组 12 个正式请求加一个准备请求，实际 tokens 和选择身份保存在输出中。
+它不采设备、不训练模型，也不读取预测或评分；不代表完整 ShareGPT 分布的均匀抽样。
+
+在现有推理镜像的 CPU 环境中生成输入。先创建输出目录，替换模型、语料和历史选择文件路径；
+可在 `--exclude-selection` 后列出多份历史选择文件，并对应增加只读挂载：
+
+```bash
+mkdir -p data/hicache_generalization
+docker run --rm --runtime runc --network none --memory 8g --cpus 2 \
+  -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 -e PYTHONPATH=/opt/markov/python \
+  --mount "type=bind,source=$PWD/python,target=/opt/markov/python,readonly" \
+  --mount "type=bind,source=$PWD/examples/hicache_matrix,target=/example,readonly" \
+  --mount "type=bind,source=/path/to/Qwen3-32B,target=/model,readonly" \
+  --mount "type=bind,source=/path/to/corpus.json,target=/corpus.json,readonly" \
+  --mount "type=bind,source=/path/to/sharegpt_selection.json,target=/history.json,readonly" \
+  --mount "type=bind,source=$PWD/data/hicache_generalization,target=/output" \
+  --entrypoint python3 markov-sglang:ubuntu22.04 /example/generalization.py \
+  --model /model --dataset /corpus.json --output /output --exclude-selection /history.json
+
+examples/hicache_matrix/run.sh --model /path/to/Qwen3-32B \
+  --output data/hicache_generalization --recipe data/hicache_generalization/recipe.json \
+  --models /path/to/selected_models.json --panel generalization --phase plan
+```
+
+预览为 184 cross＋8 self、8 份 base、96 个正常条件各三次；`--panel` 使用所选配方声明的面板名。
+输入与模型确定后，可按上述固定模型参数分步运行 `prepare`、`predict`、`measure`、`report`。
+配方限制各任务的累计预算；整个实验的设备时间与空间总额仍由执行者在开始任务前核对，不能将单任务预算当成总预算。
 
 ## 输入与结果
 

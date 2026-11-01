@@ -20,6 +20,11 @@ class Conversation:
     prompts: list[list[int]]
 
 
+def conversation_identity(record_id: str) -> str:
+    identity, separator, suffix = record_id.rpartition("_")
+    return identity if separator and suffix.isdigit() else record_id
+
+
 def conversation_prefix(stream: TextIO, limit: int) -> list[dict]:
     """Read a bounded prefix of the public JSON array without loading the corpus."""
     decoder = json.JSONDecoder()
@@ -84,8 +89,7 @@ def conversations(dataset: Path, policy: dict, tokenizer) -> list[Conversation]:
     random.Random(policy["seed"]).shuffle(records)
     result, seen = [], set()
     for record in records:
-        identity, separator, suffix = str(record["id"]).rpartition("_")
-        identity = identity if separator and suffix.isdigit() else str(record["id"])
+        identity = conversation_identity(str(record["id"]))
         if identity in seen:
             continue
         seen.add(identity)

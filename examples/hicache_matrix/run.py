@@ -9,6 +9,7 @@ import fcntl
 import io
 import json
 from pathlib import Path
+import random
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,7 @@ class Matrix:
         self.deployment = Deployment.parse({**self.recipe["deployment"], "model": str(args.model.absolute())})
         self.output = args.output.resolve()
         self.database = args.database.resolve() if args.database else self.output / "performance.sqlite"
+        self.models = args.models.resolve() if args.models else None
         self.reuse = read_json(args.reuse) if args.reuse else {"source": {}, "normal": {}}
         self.reuse_directory = args.reuse.resolve().parent if args.reuse else self.output
         self.capture = dict(self.recipe["capture"])
@@ -90,6 +92,8 @@ class Matrix:
             "deployment": asdict(self.deployment),
             "devices": self.capture["devices"],
             "database": str(self.database),
+            "models": str(self.models) if self.models else None,
+            "automatic_sampling": self.models is None,
             "output": str(self.output),
             "qualification": "Declared tasks only; no hardware or input-domain qualification.",
         }
@@ -172,7 +176,7 @@ class Matrix:
                 "base": {"configuration": self.configurations[base]},
                 "workload": str(self.output / "inputs" / f"{workload}.json"),
                 "targets": [{"name": base, "configuration": {}}],
-                "performance": {"database": str(self.database)},
+                "performance": {"models": str(self.models)} if self.models else {"database": str(self.database)},
                 "execution": {
                     "output": str(output),
                     "kernel_cache_initial_state": "empty",
@@ -240,7 +244,7 @@ class Matrix:
             try:
                 source = InferenceCapture(request, record_regions=True).run(reuse=True)
                 entry["source"] = source
-                if source["status"] in {"completed", "reused"}:
+                if source["status"] in {"completed", "reused"} and self.models is None:
                     prepared = predict(self.prediction_request(base, workload, source["manifest"], None))
                     entry["preparation"] = {
                         "status": prepared["status"],
@@ -287,7 +291,7 @@ class Matrix:
         prepared = read_json(self.output / "preparation.json")["entries"]
         by_group = {(row["base"], row["workload"]): row for row in prepared}
         models = select_models(
-            self.deployment, None, self.database, self.output / "shared_performance", allow_empty=True
+            self.deployment, self.models, self.database, self.output / "shared_performance", allow_empty=True
         )
         entries = []
         begin = time.monotonic()
@@ -314,21 +318,29 @@ class Matrix:
         self.progress("predicted", len(entries), len(self.groups))
 
     def measure(self) -> None:
-        conditions = {(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups)
-        entries = []
-        begin = time.monotonic()
-        for base, workload in sorted(conditions):
-            entry = {
+        conditions = sorted({(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups))
+        random.Random(self.recipe.get("measurement_seed", 0)).shuffle(conditions)
+        entries = {
+            (base, workload): {
                 "configuration": base,
                 "workload": workload,
                 "observations": [],
                 "capture_states": [],
                 "errors": [],
             }
-            for repetition in range(self.repetitions):
+            for base, workload in conditions
+        }
+        begin = time.monotonic()
+        completed = 0
+        for repetition in range(self.repetitions):
+            # Independent service lifetimes remain unchanged; spread repeats
+            # across the panel and reverse each other round to expose drift.
+            order = conditions if repetition % 2 == 0 else list(reversed(conditions))
+            for base, workload in order:
+                entry = entries[(base, workload)]
                 self.progress(
                     "measure",
-                    len(entries) * self.repetitions + repetition,
+                    completed,
                     len(conditions) * self.repetitions,
                     f"{workload}/{base}/{repetition + 1}",
                 )
@@ -347,9 +359,9 @@ class Matrix:
                     entry["errors"].append(str(error))
                 write_json(
                     self.output / "measurements.json",
-                    {"entries": entries + [entry], "wall_sec": time.monotonic() - begin},
+                    {"entries": list(entries.values()), "wall_sec": time.monotonic() - begin},
                 )
-            entries.append(entry)
+                completed += 1
         self.progress("measured", len(conditions) * self.repetitions, len(conditions) * self.repetitions)
 
     def diagnostics(self) -> None:
@@ -416,9 +428,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--devices", type=int, nargs="+")
     parser.add_argument("--database", type=Path)
+    parser.add_argument(
+        "--models", type=Path, help="Use fixed offline models and skip all performance sampling/training."
+    )
     parser.add_argument("--reuse", type=Path, help="Explicit source/normal request paths; no directory discovery.")
     parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--panel", choices=("original", "expanded", "confirmation", "all"), default="original")
+    parser.add_argument("--panel", default="original", help="Panel declared by the recipe, or all.")
     parser.add_argument("--phase", choices=("plan", "prepare", "predict", "measure", "report", "all"), default="all")
     parser.add_argument("--repetitions", type=int)
     parser.add_argument(
