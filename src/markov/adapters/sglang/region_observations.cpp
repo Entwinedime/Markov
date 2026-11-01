@@ -1,5 +1,6 @@
 #include "markov/adapters/sglang/observations.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
 #include <utility>
@@ -37,6 +38,12 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
     const auto iteration = fields.at("iteration").get<std::size_t>();
     const auto participant = fields.at("participant").get<std::size_t>();
     const auto resource = output_.resource(source::ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
+    auto region = source::ObservedRegion{ resource, event.begin_ns, event.end_ns, event.record };
+    const auto identity = std::tuple(request, iteration, participant);
+    if (operation == "batch" && !stream) {
+        if (fields.contains("input_metadata")) region_batches_.emplace(identity, region);
+        return;
+    }
     if (operation == "load_failed") {
         const auto cost = fields.at("thread_cpu_ns").get<source::Time>() - fields.at("delegated_cpu_ns").get<source::Time>();
         if (cost < 0) throw std::runtime_error("Delegated backup CPU exceeds failed load CPU");
@@ -55,22 +62,22 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
     }
     const auto duration = fields.at(stream ? "stream_interval_ns" : "thread_cpu_ns").get<source::Time>();
     if (duration < 0) throw std::runtime_error("Regional response duration must be nonnegative");
-    const auto add = [&](std::string name, std::string timing, source::Time cost) {
+    const auto add = [&](std::string name, std::string timing, source::Time cost, bool contiguous = true) {
         planning::Work work{
             { name + "." + phase, implementation, timing },
             features
         };
-        output_.cost_observations.push_back({
-            request,
-            iteration,
-            participant,
-            operation == "result"  ? "result"
-            : operation == "batch" ? "batch"
-                                   : "prepare",
-            std::move(work),
-            cost,
-            { resource, event.begin_ns, event.end_ns, event.record }
-        });
+        output_.cost_observations.push_back({ request,
+                                              iteration,
+                                              participant,
+                                              operation == "result"  ? "result"
+                                              : operation == "batch" ? "batch"
+                                                                     : "prepare",
+                                              std::move(work),
+                                              cost,
+                                              region,
+                                              std::nullopt,
+                                              contiguous });
     };
     if (operation == "result" && fields.contains("send_cpu_ns")) {
         const auto send = fields.at("send_cpu_ns").get<source::Time>();
@@ -80,6 +87,25 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
     }
     else add(operation, scope, duration);
     if (!stream && operation != "result") add(operation, "caller_blocking_interval", event.end_ns - event.begin_ns);
+    if (operation == "batch" && stream) {
+        const auto batch = region_batches_.find(identity);
+        if (batch == region_batches_.end()) return;
+        region = batch->second;
+        region_batches_.erase(batch);
+        if (!fields.contains("input_metadata") || !fields.at("input_metadata").contains("stream_interval_ns")) return;
+
+        const auto & metadata = fields.at("input_metadata");
+        const auto device = metadata.at("stream_interval_ns").get<source::Time>();
+        const auto cpu =
+            fields.at("thread_cpu_ns").get<source::Time>() - std::max(source::Time{ 0 }, metadata.at("thread_cpu_ns").get<source::Time>() - device);
+        const auto caller = region.end_ns - region.begin_ns - std::max(source::Time{ 0 }, metadata.at("wall_ns").get<source::Time>() - device);
+        if (device < 0 || cpu < 0 || caller < 0) throw std::runtime_error("Input metadata exceeds its batch interval");
+
+        // The enclosing batch bounds order the response, but removed waits
+        // leave noncontiguous CPU work, not a newly observed service interval.
+        add("batch", "input_ready_thread_cpu", cpu, false);
+        add("batch", "input_ready_caller_interval", caller, false);
+    }
 }
 
 } // namespace markov::adapters::sglang

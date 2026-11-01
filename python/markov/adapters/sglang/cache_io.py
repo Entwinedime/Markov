@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 
+from markov.artifacts.capture import capture_origin
 from markov.artifacts.request import positive_integer, read_json, reject_unknown
 
 
@@ -203,6 +204,7 @@ def main() -> None:
             raise ValueError("Each load segment must contain at least one page")
 
     args.output.mkdir(parents=True, exist_ok=False)
+    origin = capture_origin(args.output)
     os.environ["SGLANG_STEP_TIMING_DIR"] = ""
     sampler = CacheIOSampler(device, geometry)
     with (args.output / "measurements.jsonl").open("x", encoding="utf-8", buffering=1) as stream:
@@ -240,6 +242,7 @@ def main() -> None:
         json.dumps(
             {
                 "status": "completed",
+                "capture_origin": origin,
                 "recipe": recipe,
                 "torch": sampler.torch.__version__,
                 "dtype": "bfloat16",

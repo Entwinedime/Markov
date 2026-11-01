@@ -33,6 +33,7 @@ def _region_capture_command(deployment: Deployment, configuration: dict, workloa
         sum(row["max_new_tokens"] for row in workload["requests"]),
         "workload_report.json",
         adapter,
+        ("region.stream.input_metadata",) if adapter == "sglang_regions" else (),
     )
 
 

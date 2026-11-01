@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -20,6 +21,14 @@ class Measurement:
     warmup: bool
 
 
+@dataclass(frozen=True)
+class CaptureRecord:
+    identity: str
+    adapter: str
+    context: dict
+    metadata: dict
+
+
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -34,7 +43,13 @@ class PerformanceData:
                 identity TEXT PRIMARY KEY,
                 adapter TEXT NOT NULL,
                 context TEXT NOT NULL,
-                metadata TEXT NOT NULL
+                metadata TEXT NOT NULL,
+                origin TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS capture_origins ON captures(origin);
+            CREATE TABLE IF NOT EXISTS capture_locations (
+                path TEXT PRIMARY KEY,
+                capture TEXT NOT NULL REFERENCES captures(identity)
             );
             CREATE TABLE IF NOT EXISTS measurements (
                 capture TEXT NOT NULL REFERENCES captures(identity),
@@ -72,25 +87,41 @@ class PerformanceData:
                 (encoded(deployment), encoded(models)),
             )
 
-    def capture_metadata(self, path: Path) -> dict | None:
+    def capture_metadata(self, path: Path) -> CaptureRecord | None:
         row = self.connection.execute(
-            "SELECT adapter, context, metadata FROM captures WHERE identity = ?", (str(path),)
+            "SELECT c.identity, c.adapter, c.context, c.metadata FROM capture_locations l "
+            "JOIN captures c ON c.identity = l.capture WHERE l.path = ?",
+            (str(path),),
         ).fetchone()
         if row is None:
             return None
-        return {"adapter": row[0], "context": json.loads(row[1]), "metadata": json.loads(row[2])}
+        return CaptureRecord(row[0], row[1], json.loads(row[2]), json.loads(row[3]))
 
-    def import_capture(self, path, adapter, context, metadata, measurements):
-        identity = str(path)
+    def import_capture(
+        self, path: Path, adapter: str, context: dict, metadata: dict, measurements: Iterable[Measurement]
+    ) -> dict:
+        origin = encoded(metadata["capture_origin"])
         capture = (adapter, encoded(context), encoded(metadata))
         inserted = reused = 0
         with self.connection:
             existing = self.connection.execute(
-                "SELECT adapter, context, metadata FROM captures WHERE identity = ?", (identity,)
+                "SELECT identity, adapter, context, metadata FROM captures WHERE origin = ?", (origin,)
             ).fetchone()
-            if existing is not None and existing != capture:
+            identity = existing[0] if existing is not None else str(path)
+            if existing is not None and existing[1:] != capture:
                 raise ValueError(f"Capture identity conflicts with stored metadata: {identity}")
-            self.connection.execute("INSERT OR IGNORE INTO captures VALUES (?, ?, ?, ?)", (identity, *capture))
+            location = self.connection.execute(
+                "SELECT capture FROM capture_locations WHERE path = ?", (str(path),)
+            ).fetchone()
+            if location is not None and location[0] != identity:
+                raise ValueError(f"Capture location already belongs to another collection: {path}")
+
+            if existing is None:
+                self.connection.execute(
+                    "INSERT INTO captures(identity, adapter, context, metadata, origin) VALUES (?, ?, ?, ?, ?)",
+                    (identity, *capture, origin),
+                )
+            self.connection.execute("INSERT OR IGNORE INTO capture_locations VALUES (?, ?)", (str(path), identity))
             for sample in measurements:
                 key = (identity, sample.position, sample.quantity)
                 value = (
@@ -115,23 +146,19 @@ class PerformanceData:
                     continue
                 self.connection.execute("INSERT INTO measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (*key, *value))
                 inserted += 1
-        return {"capture": identity, "inserted": inserted, "reused": reused}
+        return {"capture": identity, "location": str(path), "inserted": inserted, "reused": reused}
 
-    def samples(self, path: Path):
-        capture = self.connection.execute(
-            "SELECT adapter, context, metadata FROM captures WHERE identity = ?", (str(path),)
-        ).fetchone()
+    def samples(self, path: Path) -> tuple[CaptureRecord, list[tuple[str, str, str, dict, int]]]:
+        capture = self.capture_metadata(path)
         if capture is None:
             raise ValueError(f"Training capture has not been imported: {path}")
         rows = self.connection.execute(
             "SELECT operation, implementation, timing_scope, features, duration_ns "
             "FROM measurements WHERE capture = ? AND warmup = 0 ORDER BY position, quantity",
-            (str(path),),
+            (capture.identity,),
         )
         return (
-            capture[0],
-            json.loads(capture[1]),
-            json.loads(capture[2]),
+            capture,
             [
                 (operation, implementation, scope, json.loads(features), duration)
                 for operation, implementation, scope, features, duration in rows

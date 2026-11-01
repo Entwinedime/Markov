@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 
 from markov.artifacts.request import positive_integer, reject_unknown, required_text
+
+
+def capture_origin(directory: Path) -> dict[str, str | float]:
+    """Identify one real collection; moving its files preserves this origin."""
+    return {"directory": str(directory.resolve()), "started_at_sec": time.time()}
 
 
 def parse_budget(raw: dict) -> dict[str, int]:
@@ -28,6 +34,7 @@ class DeviceCommand:
     output_tokens: int = 0
     usage_file: str | None = None
     measurement_adapter: str | None = None
+    required_measurement_ports: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

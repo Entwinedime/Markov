@@ -10,6 +10,7 @@ import sys
 import time
 import json
 
+from markov.artifacts.capture import capture_origin
 from markov.artifacts.request import read_json
 from markov.artifacts.writing import write_json
 from markov.instrumentation.http import SerialHttpClient, encode_inputs, inference_server
@@ -149,6 +150,7 @@ class Capture(SerialHttpClient):
     def run(self) -> None:
         profiling_requested = self.plan["profiling"]
         if self.plan["calibration"] or self.plan["record_regions"]:
+            origin = capture_origin(self.directory)
             (self.directory / "regions").mkdir()
         control = self.directory / "native" / "enabled"
         if profiling_requested:
@@ -212,6 +214,8 @@ class Capture(SerialHttpClient):
                 raise RuntimeError("Independent region measurement did not report every TP worker")
             phases = set()
             measurement_ports = set()
+            input_metadata_observed = True
+            input_metadata_stream_observed = True
             for path in files:
                 with path.open(encoding="utf-8") as stream:
                     roles = set()
@@ -219,6 +223,15 @@ class Capture(SerialHttpClient):
                         event = json.loads(line)
                         roles.add(event["name"])
                         measurement_ports.add(event["name"])
+                        if event["name"] == "region.batch":
+                            input_metadata_observed = input_metadata_observed and "input_metadata" in event["args"]
+                        if event["name"] == "region.stream":
+                            metadata = event["args"].get("input_metadata")
+                            input_metadata_stream_observed = (
+                                input_metadata_stream_observed
+                                and metadata is not None
+                                and "stream_interval_ns" in metadata
+                            )
                         if any(
                             int(rid.removeprefix("request_")) >= self.plan["workload"]["formal_begin_index"]
                             for rid in event["args"]["request_ids"]
@@ -229,11 +242,17 @@ class Capture(SerialHttpClient):
                     <= roles
                 ):
                     raise RuntimeError(f"Independent region ports are incomplete: {path}")
+
+            if input_metadata_observed:
+                measurement_ports.add("region.batch.input_metadata")
+            if input_metadata_stream_observed:
+                measurement_ports.add("region.stream.input_metadata")
             write_json(
                 self.directory / "region_measurements.json",
                 {
                     "kind": "independent_region_measurements",
                     "status": "completed",
+                    "capture_origin": origin,
                     "profiling": False,
                     "temporary_storage_bytes": temporary_storage_bytes,
                     "deployment": self.plan["deployment"],

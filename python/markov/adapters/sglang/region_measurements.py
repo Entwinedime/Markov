@@ -42,11 +42,18 @@ def recipes(captured: dict) -> dict:
             ("prepare", "thread_cpu"),
             ("prepare", "caller_blocking_interval"),
             ("prepare", "current_stream_interval"),
-            ("batch", "thread_cpu"),
-            ("batch", "caller_blocking_interval"),
+            ("batch", "input_ready_thread_cpu"),
+            ("batch", "input_ready_caller_interval"),
             ("batch", "current_stream_interval"),
             ("result", "thread_cpu"),
         ):
+            if (
+                operation == "batch"
+                and scope != "current_stream_interval"
+                and "region.stream.input_metadata" not in captured.get("measurement_ports", [])
+            ):
+                continue
+
             predictors = ["query_tokens", "attention_pairs"] if phase == "prefill" else ["attention_pairs"]
             if operation != "result":
                 predictors += ["first_phase"]
@@ -99,7 +106,13 @@ def events(path: Path, captured: dict) -> Iterator[tuple[int, dict, bool]]:
 
 
 def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
-    for position, event, warmup in events(path, captured):
+    records = list(events(path, captured))
+    metadata_by_frame = {
+        (event["pid"], tuple(event["args"]["request_ids"]), event["args"]["iteration"]): event["args"]["input_metadata"]
+        for _, event, _ in records
+        if event["name"] == "region.stream" and "stream_interval_ns" in event["args"].get("input_metadata", {})
+    }
+    for position, event, warmup in records:
         if event["name"] in (
             "region.scheduler_idle",
             "region.load_failed",
@@ -127,6 +140,21 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
         if kind[0] == "result":
             features.pop("first_phase")
         implementation = result_implementation(captured) if name == "result" else IMPLEMENTATION
+        wall = int(Decimal(str(event["dur"])) * 1000) if name in ("prepare", "batch") else None
+        if name == "batch":
+            metadata = metadata_by_frame.get((event["pid"], tuple(fields["request_ids"]), fields["iteration"]))
+            if metadata is None:
+                continue
+
+            # Host-minus-device timing estimates wait/spin, but can include
+            # host setup and event queueing; it is not a strict bound.
+            device_ns = metadata["stream_interval_ns"]
+            duration -= max(0, metadata["thread_cpu_ns"] - device_ns)
+            wall -= max(0, metadata["wall_ns"] - device_ns)
+            kind = (name, "input_ready_thread_cpu")
+            if device_ns < 0 or duration < 0 or wall < 0:
+                raise ValueError(f"Input metadata exceeds its batch interval: {path}, record {position}")
+
         yield Measurement(
             position,
             kind[1],
@@ -138,13 +166,13 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
             warmup,
         )
         if name in ("prepare", "batch"):
-            wall = int(Decimal(str(event["dur"])) * 1000)
+            scope = "input_ready_caller_interval" if name == "batch" else "caller_blocking_interval"
             yield Measurement(
                 position,
-                "caller_interval_ns",
+                scope if name == "batch" else "caller_interval_ns",
                 f"{name}.{fields['phase']}",
                 IMPLEMENTATION,
-                "caller_blocking_interval",
+                scope,
                 features,
                 wall,
                 warmup,

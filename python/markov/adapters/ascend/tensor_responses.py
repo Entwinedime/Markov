@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+from markov.artifacts.capture import capture_origin
 from markov.artifacts.request import positive_integer, read_json, reject_unknown
 from markov.artifacts.writing import write_json
 
@@ -46,6 +47,7 @@ def main():
         raise ValueError("Native tensor calibration must run without the experimental symbol observer")
 
     args.output.mkdir(parents=True, exist_ok=False)
+    origin = capture_origin(args.output)
     import torch
     import torch_npu
     from markov.adapters.ascend.native_tensor_responses import NativeTensorResponses
@@ -73,6 +75,7 @@ def main():
         args.output / "capture.json",
         {
             "status": "completed",
+            "capture_origin": origin,
             "recipe": recipe,
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,

@@ -224,6 +224,7 @@ measure 将 profiler、Markov Python 与原生观察全部关闭，输出 normal
 calibrate 运行独立选择的小型 workload，安装输入准备、分配规格、eager batch、结果处理/发送包络和异步 NPU event。
 它不安装底层算子探针、不采 snapshot、不启 profiler，输出 calibration/region_measurements.json 及轻量 JSONL。
 线程 CPU、caller 返回与 current-stream 区间分开记录；查询已完成 event 不新增前向同步。
+Ascend eager 另记录输入元数据的墙钟、线程 CPU 和设备区间。batch 的 CPU/返回模型使用 input_ready_thread_cpu、input_ready_caller_interval，按同边界的主机/设备时间差估计并扣除输入等待及自旋，由目标依赖重新表达；差值可能混入主机准备和事件排队，不能当作严格界限。未配对的末尾记录不补零。旧采集缺少这一边界时不能提供这两项新成本，其他有效观察仍可使用。
 结果模型区分 HiRadixCache 与 RadixCache，不能用未启 HiCache 的结果 CPU 响应冒充启用分支。
 结果发送前与发送后的线程时间由同一观察划分，不算两次独立实验。
 warmup 依据 formal_begin_index 排除，请求身份仅用于关联与预热划分，不进入回归特征。
@@ -408,6 +409,7 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 路径相对维护请求解析。sglang_cache_io 导入正常备份、主机克隆和回载准备/提交/完成观测；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
 sglang_cache_controls 从独立 region_measurements.json 仅导入失败回载的排他线程 CPU；不重训该文件的 Prefill/Decode 响应。
 只填 imports 可以单独入库；已有数据可省略 imports，只用 training 的原来源路径离线训练，不再打开原始采样。training 必须显式选择，不扫描整库；预热、未选择的采集及独立留出不参加训练。
+独立采集器自动记录 capture_origin，包括原始输出目录和实际开始时间；应用用户无需填写。复制或移动测量文件时保留它，导入的新位置会关联同一采集，重复导入不增加样本。training 可引用任一已导入位置，但不能同时重复选择同一采集；模型来源统一引用首次导入位置。外部测量文件必须提供其实际采集来源，不能按当前文件路径伪造一次新采集。
 可选 models 指向已有选定模型；训练只替换相同操作/实现/口径，完整结果原子写到 output。输出与数据库、请求及原始采集目录分开。报告区分新增/复用记录与训练响应；单设备数据不绑定模型名或全局 TP，平台、runtime 和实际工作条件仍须相容。
 
 当前原生张量校准在兼容 Torch-NPU 推理环境中运行：

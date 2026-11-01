@@ -199,8 +199,6 @@ def maintain_performance(path: Path):
     database = resolve_path(directory, raw["database"])
     deployment = asdict(Deployment.parse(raw["deployment"]))
     training = [resolve_path(directory, item) for item in raw.get("training", [])]
-    if len(set(training)) != len(training):
-        raise ValueError("A training capture can only be selected once")
     if not training and ("output" in raw or "models" in raw):
         raise ValueError("Model export requires an explicit training capture selection")
     if not training and not raw.get("imports"):
@@ -242,8 +240,13 @@ def maintain_performance(path: Path):
         grouped, recipes, sources = {}, {}, {}
         conditions = {}
         sample_count = 0
+        identities = set()
         for source in training:
-            adapter_name, current, metadata, samples = store.samples(source)
+            capture, samples = store.samples(source)
+            if capture.identity in identities:
+                raise ValueError("A physical training capture can only be selected once")
+            identities.add(capture.identity)
+            adapter_name, current, metadata = capture.adapter, capture.context, capture.metadata
             if current != ADAPTERS[adapter_name].context(metadata, deployment):
                 raise ValueError(f"Training capture belongs to different measurement conditions: {source}")
             recipes.update(ADAPTERS[adapter_name].recipes(metadata))
@@ -253,7 +256,7 @@ def maintain_performance(path: Path):
                     raise ValueError(f"Training selection mixes measurement conditions for {operation}/{scope}")
                 conditions[kind] = current
                 grouped.setdefault(kind, []).append((features, duration))
-                sources.setdefault(kind, set()).add(str(source))
+                sources.setdefault(kind, set()).add(capture.identity)
             sample_count += len(samples)
         trained = [
             train_response(kind, recipe, grouped.get(kind, []), sorted(sources.get(kind, set())))

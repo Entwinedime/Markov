@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 
+from markov.artifacts.capture import capture_origin
 from markov.artifacts.request import Deployment, positive_integer, read_json, reject_unknown
 from markov.artifacts.writing import write_json
 from markov.instrumentation.events import EventWriter
@@ -160,6 +161,9 @@ class Capture(SerialHttpClient):
         )
 
     def run(self) -> None:
+        if self.plan["calibration"]:
+            origin = capture_origin(self.directory)
+
         if self.plan["workload"].get("drain_before_formal", False):
             raise ValueError("drain_before_formal requires SGLang HiCache")
 
@@ -209,6 +213,7 @@ class Capture(SerialHttpClient):
                 {
                     "kind": "independent_ktransformers_regions",
                     "status": "completed",
+                    "capture_origin": origin,
                     "profiling": False,
                     "deployment": self.plan["deployment"],
                     "configuration": self.plan["server"],

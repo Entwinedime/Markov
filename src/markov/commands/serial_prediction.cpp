@@ -113,7 +113,7 @@ nlohmann::json serial_prediction_report(const adapters::PreparedPrediction & inp
         { "models", input.models_path.string() },
         { "source_prepare_sec", input.source.read_and_interpret_sec + input.source.build_sec },
         { "source_records_read", std::accumulate(input.source.input_record_counts.begin(), input.source.input_record_counts.end(), std::size_t{ 0 }) },
-        { "unread_device_trace_files", input.source.skipped_files.size() },
+        { "unread_low_level_trace_files", input.source.skipped_files.size() },
         { "source_details_materialized", source.detailed_preparation_sec() != 0 },
         { "process_peak_rss_bytes", usage_status == 0 ? Json(usage.ru_maxrss * 1'024) : Json(nullptr) },
         { "selected_models", input.costs.models.size() },

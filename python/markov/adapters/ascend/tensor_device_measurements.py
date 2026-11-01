@@ -9,6 +9,7 @@ from markov.adapters.ascend.tensor_responses import validate_recipe
 def metadata(path):
     report = read_json(path)
     captured = report["metadata"]
+    report["capture_origin"] = captured["capture_origin"]
     validate_recipe(captured["recipe"])
     if (
         report["status"] != "completed"

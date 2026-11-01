@@ -231,9 +231,9 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id) {
     frame.prepare_cpu = work("prepare", "thread_cpu");
     frame.prepare_stream = work("prepare", "current_stream_interval");
     frame.prepare_return = work("prepare", "caller_blocking_interval");
-    frame.batch_cpu = work("batch", "thread_cpu");
+    frame.batch_cpu = work("batch", "input_ready_thread_cpu");
     frame.batch_stream = work("batch", "current_stream_interval");
-    frame.batch_return = work("batch", "caller_blocking_interval");
+    frame.batch_return = work("batch", "input_ready_caller_interval");
     frame.result_cpu = work("result", "thread_cpu");
     frame.result_cpu.kind.implementation = backend_.result_implementation;
     const auto & result = source_.frame_result(frame.description.source_frame)->processed;
@@ -292,6 +292,11 @@ void RegionCompute::run_frame(ProgramRuntime & runtime, std::size_t id, graph::N
           { begin + 2, begin + 4, graph::EdgeKind::DataDependency },
           { begin + 3, begin + 4, graph::EdgeKind::DataDependency } }
     };
+    if (backend_.host_reads_stream_inputs) {
+        // Host scalar reads block this caller on its local stream, not peers.
+        mutation.dependencies.push_back({ *frame.input_ready, begin + 1, graph::EdgeKind::Synchronization });
+        if (frame.previous) mutation.dependencies.push_back({ *stats_.frames[*frame.previous].completed, begin + 1, graph::EdgeKind::Synchronization });
+    }
     identify(runtime, mutation, frame, "batch");
     runtime.submit(std::move(mutation));
 }

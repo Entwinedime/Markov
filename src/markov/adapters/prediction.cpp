@@ -94,7 +94,13 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
         cache.storage = sglang::configured_storage(configuration, cache.device_pages, cache.host_pages);
         const auto result_implementation =
             configuration.at("enable_hierarchical_cache").get<bool>() ? "sglang.ascend.eager:HiRadixCache" : "sglang.ascend.eager:RadixCache";
-        targets.push_back({ target.at("name").get<std::string>(), std::move(configuration), page, prefill, result_implementation, std::move(cache) });
+        targets.push_back({
+            target.at("name").get<std::string>(),
+            std::move(configuration),
+            page,
+            { "sglang.ascend.eager", result_implementation, prefill, true },
+            std::move(cache)
+        });
     }
     auto source = prepare_source(manifest, std::nullopt, SourceDetail::Regions);
     const auto & observations = source.context.observations();

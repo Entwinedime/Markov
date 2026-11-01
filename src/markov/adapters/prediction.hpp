@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/adapters/source.hpp"
+#include "markov/trace_graph/planning/region_compute.hpp"
 #include "markov/trace_graph/planning/serial_program.hpp"
 
 #include <filesystem>
@@ -15,8 +16,7 @@ struct PredictionTarget {
     std::string name;
     nlohmann::json configuration;
     std::size_t page_tokens;
-    std::size_t maximum_prefill_tokens;
-    std::string result_implementation;
+    trace_graph::planning::RegionBackend regions;
     sglang::CacheSettings cache;
     std::optional<std::string> infeasible = std::nullopt;
 };

@@ -206,6 +206,29 @@ class RegionProbe:
         start.record(stream)
         return original(worker, *args, **kwargs)
 
+    def input_metadata(self, original: Callable, backend: Any, batch: Any) -> Any:
+        fields = self.running
+        if fields is None:
+            return original(backend, batch)
+
+        import torch
+
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        stream = torch.npu.current_stream()
+        begin = time.time_ns()
+        start.record(stream)
+        wall_begin = time.perf_counter_ns()
+        cpu_begin = time.thread_time_ns()
+        try:
+            return original(backend, batch)
+        finally:
+            cpu_ns = time.thread_time_ns() - cpu_begin
+            wall_ns = time.perf_counter_ns() - wall_begin
+            fields["input_metadata"] = {"wall_ns": wall_ns, "thread_cpu_ns": cpu_ns}
+            end.record(stream)
+            self.pending.append(("input_metadata", start, end, begin, fields))
+
     def process_result(self, original, scheduler, batch, result):
         fields = self.results.pop(id(result), None)
         if fields is None:
@@ -226,12 +249,11 @@ class RegionProbe:
         pending = []
         for name, start, end, begin, measured in self.pending:
             if end.query():
-                self.writer.write(
-                    name,
-                    begin,
-                    begin,
-                    {**measured, "stream_interval_ns": round(start.elapsed_time(end) * 1_000_000)},
-                )
+                duration_ns = round(start.elapsed_time(end) * 1_000_000)
+                if name == "input_metadata":
+                    measured["input_metadata"]["stream_interval_ns"] = duration_ns
+                else:
+                    self.writer.write(name, begin, begin, {**measured, "stream_interval_ns": duration_ns})
             else:
                 pending.append((name, start, end, begin, measured))
         self.pending = pending
@@ -256,6 +278,7 @@ class RegionProbe:
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_decode": self.prepare,
             "sglang.srt.managers.scheduler.Scheduler.run_batch": self.run_batch,
             "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation": self.forward,
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.init_forward_metadata": self.input_metadata,
             "sglang.srt.managers.scheduler.Scheduler.process_batch_result": self.process_result,
         }
         if self.record_scheduler:

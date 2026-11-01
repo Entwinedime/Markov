@@ -54,6 +54,8 @@ private:
     std::vector<Lookup> lookups_;
     using BatchIdentity = std::pair<std::string, trace_graph::source::Index>;
     std::map<BatchIdentity, trace_graph::source::Index> batch_results_;
+    std::map<std::tuple<trace_graph::source::Index, trace_graph::source::Index, trace_graph::source::Index>, trace_graph::source::ObservedRegion>
+        region_batches_;
     std::map<BatchIdentity, trace_graph::source::ResultCopy> result_copies_;
     std::map<BatchIdentity, std::vector<trace_graph::source::ResultSend>> result_sends_;
     struct RequestBroadcast {

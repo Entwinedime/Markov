@@ -19,6 +19,7 @@ struct RegionBackend {
     std::string implementation;
     std::string result_implementation;
     std::size_t maximum_prefill_tokens;
+    bool host_reads_stream_inputs;
 };
 
 struct RegionFrame {

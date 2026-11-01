@@ -96,7 +96,10 @@ class PerformancePreparation:
             actual = read_json(output / "capture_input.json")
             actual.pop("budget", None)
             if encoded(actual) == wanted:
-                return output / attempt["artifact"]
+                artifact = output / attempt["artifact"]
+                ports = read_json(artifact).get("measurement_ports", [])
+                if set(command.required_measurement_ports) <= set(ports):
+                    return artifact
         return None
 
     def approved_training(self, models: Path, adapter: str) -> set[Path]:
@@ -108,12 +111,10 @@ class PerformancePreparation:
             selected = set()
             for source in sources:
                 capture = store.capture_metadata(source)
-                if capture is None or capture["adapter"] != adapter:
+                if capture is None or capture.adapter != adapter:
                     continue
-                if capture["context"] == ADAPTERS[adapter].context(
-                    capture["metadata"], asdict(self.request.deployment)
-                ):
-                    selected.add(source)
+                if capture.context == ADAPTERS[adapter].context(capture.metadata, asdict(self.request.deployment)):
+                    selected.add(Path(capture.identity))
             return selected
         finally:
             store.close()
