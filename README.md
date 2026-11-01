@@ -9,7 +9,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 ```
 
 当前正式入口已运行限定范围的 SGLang 主机/文件回访，以及 KTransformers dense 的 self、分块 Prefill 和 SDPA。
-两框架的完整请求预测已接通，186 cross 和 33 self 已完成每条件三次正常评分；cross WAPE 为 2.786%，P90 为 11.030%，尾部及逐 base 精度仍未达标。两个有限资源搜索已有正常实测对照，代码、文档和数据维护检查已完成；旧工程严格同成本的效率对照仍未取得。
+两框架的完整请求预测已接通，186 cross 和 33 self 已完成每条件三次正常评分；cross WAPE 为 2.786%，P90 为 11.030%，尾部及逐 base 精度仍未达标。两个有限资源搜索已有正常实测对照，本轮重建已按确认范围收口。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实，作为限制保留。
 
 ## 怎样运行
 
@@ -94,7 +94,7 @@ KTransformers 单 NPU dense/Torch 入口已接通真实来源、独立阶段/控
 
 - [架构](docs/design/architecture.md)、[用户合同](docs/design/user_contract.md)、[成本与数据库](docs/design/cost_models.md)
 - [验证口径](docs/design/validation.md)、[工程约束](docs/design/engineering_constraints.md)
-- [项目工作流](docs/workflow.md)、本轮[计划](docs/windows/2026-10-27_full_rebuild/plan.md)、[状态](docs/windows/2026-10-27_full_rebuild/status.md)、[日志](docs/windows/2026-10-27_full_rebuild/log.md)
+- [项目工作流与重建结果](docs/workflow.md)
 
 Python 的 workflow 组织正式任务，artifacts 定义输入，adapters 处理框架/runtime 差异；
 C++ 的 trace_graph 维护源依据、目标规则、成本查询与共同执行器。scripts 保持薄入口，examples 承担研究案例。
