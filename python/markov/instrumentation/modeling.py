@@ -23,6 +23,7 @@ class ModelingProcess:
         current = container_state(self.cid)
         if current is not None and current["Running"]:
             raise ValueError("This modeling output still has a running container")
+        self.report.unlink(missing_ok=True)
         self.report.with_name(self.report.name + ".partial").unlink(missing_ok=True)
 
     def run(self, command: str, prepared: Path, assets: tuple[Path, ...]) -> dict:

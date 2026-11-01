@@ -45,7 +45,7 @@ def grouped_metrics(rows: list[dict], field: str) -> dict[str, dict]:
     return {name: metrics([row for row in rows if row[field] == name]) for name in sorted({row[field] for row in rows})}
 
 
-def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], set[str]]) -> dict:
+def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], set[str]], repetitions: int) -> dict:
     predictions = read_json(output / "predictions.json")
     by_cell, group_status = {}, {}
     overhead = []
@@ -66,14 +66,22 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         for cell in report.get("cells", []):
             by_cell[(*key, cell["name"])] = cell
 
+    measurements = read_json(output / "measurements.json")["entries"]
     normal = {
-        (entry["configuration"], entry["workload"]): normal_statistics(entry["observations"])
-        for entry in read_json(output / "measurements.json")["entries"]
+        (entry["configuration"], entry["workload"]): normal_statistics(entry["observations"]) for entry in measurements
     }
+    capture_history = {
+        path: read_json(Path(path))["attempts"]
+        for path in sorted({path for entry in measurements for path in entry["capture_states"]})
+    }
+    attempt_statuses = Counter(attempt["status"] for attempts in capture_history.values() for attempt in attempts)
+
     rows = []
     all_cases = cases + [
         {"panel": "self", "base": base, "workload": workload, "target": base} for base, workload in groups
     ]
+    conditions = {(case["target"], case["workload"]) for case in all_cases}
+    completed_conditions = sum(key in normal and normal[key]["n"] >= repetitions for key in conditions)
     for case in all_cases:
         base, workload, target = case["base"], case["workload"], case["target"]
         cell = by_cell.get((base, workload, target))
@@ -117,6 +125,18 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         "formal_prediction_overhead": overhead,
         "qualification": "Complete formal HTTP including client intervals, gaps, unassigned control and Prefill/Decode. Warmup excluded by declared boundary. Normal samples are shared by target configuration/workload; self is separate. No refitting from scores.",
         "normal_conditions": [{"configuration": key[0], "workload": key[1], **value} for key, value in normal.items()],
+        "normal_coverage": {
+            "expected_conditions": len(conditions),
+            "completed_conditions": completed_conditions,
+            "required_repetitions": repetitions,
+        },
+        "normal_capture_history": {
+            "owners": len(capture_history),
+            "attempt_statuses": dict(attempt_statuses),
+            "failed_owners": [
+                path for path, attempts in capture_history.items() if any(row["status"] == "failed" for row in attempts)
+            ],
+        },
         "cells": rows,
     }
     write_json(output / "results.json", summary)
@@ -134,6 +154,8 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         "计时取首个正式请求发出至最后一个正式响应结束，保留请求间隔、gap、未归属控制和 Prefill/Decode。",
         "",
         "正常实测按 target 配置与 workload 共享；同一实测被多个 base 引用，不代表多次独立采集。self 单独统计。",
+        f"每条件要求 {repetitions} 次正常实测，已满足 {completed_conditions}/{len(conditions)} 个条件；有单次评分不等于重复采集已完成。",
+        f"所引用采集账本累计 {sum(attempt_statuses.values())} 次尝试，其中 {attempt_statuses['failed']} 次失败；误差使用成功的完整 HTTP 窗口，续跑不会抹掉历史失败。",
         "",
         "| 面板 | 应有 cross | 已预测 | 已评分 | WAPE (%) | P90 APE (%) |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",

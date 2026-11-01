@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+import fcntl
 import math
 from pathlib import Path
 
@@ -174,13 +175,20 @@ def search(path: Path) -> dict:
     if policy.baseline not in {target.name for target in request.targets}:
         raise ValueError("Search baseline must name one of the supplied prediction targets")
 
-    prediction = predict(request)
-    result = (
-        policy.rank(prediction) if "cells" in prediction else {"status": "incomplete", "prediction_result": prediction}
-    )
-    result["prediction_report"] = str(request.execution.output / "prediction/report.json")
     output = request.execution.output / "search"
     output.mkdir(parents=True, exist_ok=True)
-    write_json(output / "report.json", result)
-    result["report"] = str(output / "report.json")
-    return result
+    with (output / "search.lock").open("a") as lease:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = output / "report.json"
+        report.unlink(missing_ok=True)
+
+        prediction = predict(request)
+        result = (
+            policy.rank(prediction)
+            if "cells" in prediction
+            else {"status": "incomplete", "prediction_result": prediction}
+        )
+        result["prediction_report"] = str(request.execution.output / "prediction/report.json")
+        write_json(report, result)
+        result["report"] = str(report)
+        return result

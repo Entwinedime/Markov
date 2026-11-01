@@ -71,7 +71,10 @@ class SearchExample:
         if policy.baseline in {".", ".."} or Path(policy.baseline).name != policy.baseline:
             raise ValueError("The example baseline name must be a single path component")
         self.output = args.output.resolve()
-        self.targets = candidates(self.settings)
+        if args.phase in {"confirm", "report"}:
+            self.targets = read_json(self.output / "requests/prediction.json")["targets"]
+        else:
+            self.targets = candidates(self.settings)
         if not any(target["name"] == policy.baseline for target in self.targets):
             raise ValueError("The example space must include its declared base configuration")
         self.capture = dict(self.settings["capture"])
@@ -194,7 +197,9 @@ def main() -> None:
     example.output.mkdir(parents=True, exist_ok=True)
     with (example.output / "search.lock").open("a") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        request = example.prepare_request()
+        request = (
+            example.prepare_request() if args.phase in {"all", "predict"} else example.output / "requests/search.json"
+        )
         example.recover()
 
         if args.phase in {"all", "predict"}:

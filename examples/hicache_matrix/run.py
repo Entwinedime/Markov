@@ -318,7 +318,13 @@ class Matrix:
         entries = []
         begin = time.monotonic()
         for base, workload in sorted(conditions):
-            entry = {"configuration": base, "workload": workload, "observations": [], "errors": []}
+            entry = {
+                "configuration": base,
+                "workload": workload,
+                "observations": [],
+                "capture_states": [],
+                "errors": [],
+            }
             for repetition in range(self.repetitions):
                 self.progress(
                     "measure",
@@ -332,6 +338,7 @@ class Matrix:
                 request = self.request(base, workload, output, "normal_budget")
                 try:
                     result = InferenceCapture(request, profiling=False).run(reuse=True)
+                    entry["capture_states"].append(result["capture_state"])
                     if result["status"] in {"completed", "reused"}:
                         entry["observations"].append(result["observation"])
                     else:
@@ -438,10 +445,18 @@ def main() -> None:
         if args.phase in {"all", "report"}:
             if args.structure or args.source_reports:
                 matrix.diagnostics()
-            result = write_report(matrix.output, matrix.cells, matrix.groups)
-            complete = result["cross"]["scored"] == result["cross"]["expected"]
+            result = write_report(matrix.output, matrix.cells, matrix.groups, matrix.repetitions)
+            normal = result["normal_coverage"]
+            complete = (
+                result["cross"]["scored"] == result["cross"]["expected"]
+                and result["self"]["scored"] == result["self"]["expected"]
+                and normal["completed_conditions"] == normal["expected_conditions"]
+            )
             matrix.progress(
-                "finished" if complete else "incomplete", result["cross"]["scored"], result["cross"]["expected"]
+                "finished" if complete else "incomplete",
+                result["cross"]["scored"],
+                result["cross"]["expected"],
+                f"normal repetitions {normal['completed_conditions']}/{normal['expected_conditions']} conditions",
             )
             if not complete:
                 raise SystemExit(1)
