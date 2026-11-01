@@ -70,7 +70,7 @@ preparation 中单列 base/performance 时间、sampling_rounds 和累计状态�
 预测及评价容器显式使用 runc，不继承宿主的设备 runtime；无设备、无网络，仅挂载可执行文件及各自明确选择的输入与结果目录。
 预测的输入仅包括所选 base 采集目录、模型和准备输入。
 不挂载项目/data 根目录或 evaluator 的正常测量。输出须与 base/模型输入分离；已有活跃容器时拒绝复用其输出。
-一次进程共享 source 和只读模型，当前 targets 顺序执行，jobs 尚未用于预测并发。
+一次进程共享 source 和只读模型，targets 按声明顺序执行。
 execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}]；默认空列表，按声明顺序取首个子串匹配。
 匹配标签为操作、实现和计时口径的组合，只缩放已绑定的工作响应，不修改来源、模型系数或残余等待。
 区域响应只支持区域名字，不能把内部某个算子的倍率套到整个区域；更细的名字需要有对应的原生工作。
@@ -159,7 +159,7 @@ manifest 检查只读取 manifest 和文件元数据；输出 inputs_accessible 
 每个 target 只有 name 和 configuration；name 用于定位结果，不作为结构或成本特征。
 deployment 包含 platform、framework、runtime、model、dtype、tensor_parallel；工作配置由相应适配器解释。
 performance.models 和 performance.database 均可省略作输入预览；实际预测需要其中之一。
-execution 必须给 output，jobs 默认为 1，memory_limit_gib 可显式声明。
+execution 必须给 output，memory_limit_gib 可显式声明。
 示例在 configs 中；模型位置、镜像、设备和预算须按实际部署修改，不含评分文件或实验身份。
 
 采集文件可以相对 manifest 所在目录声明；完整采集移动后，原 run_dir 内的绝对引用按同一采集的相对位置解析。

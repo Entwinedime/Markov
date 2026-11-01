@@ -63,7 +63,6 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         ],
         "execution": {
             "output": str(request.execution.output),
-            "jobs": request.execution.jobs,
             "memory_limit_gib": request.execution.memory_limit_gib,
             "record_graph": request.execution.record_graph,
         },

@@ -123,7 +123,6 @@ class ScalingRule:
 @dataclass(frozen=True)
 class Execution:
     output: Path
-    jobs: int
     memory_limit_gib: int | None
     capture: CaptureSettings | None = None
     kernel_cache_initial_state: str | None = None
@@ -138,7 +137,6 @@ class Execution:
             raw,
             {
                 "output",
-                "jobs",
                 "memory_limit_gib",
                 "capture",
                 "kernel_cache_initial_state",
@@ -159,7 +157,6 @@ class Execution:
 
         return cls(
             resolve_path(directory, raw["output"]),
-            positive_integer(raw.get("jobs", 1), "jobs"),
             memory_limit,
             CaptureSettings.parse(raw["capture"]) if "capture" in raw else None,
             initial,

@@ -37,7 +37,6 @@
   ],
   "execution": {
     "output": "../data/prediction",
-    "jobs": 1,
     "memory_limit_gib": 4,
     "kernel_cache_initial_state": "empty",
     "capture": {
