@@ -78,9 +78,9 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
     for (std::size_t file_id = 0; file_id < manifest.files.size(); ++file_id) {
         const auto & file = manifest.files[file_id];
         std::size_t records = 0;
-        if (detail == SourceDetail::Regions && file.channel == source::Channel::Torch) {
-            // Region work comes from semantic probes. Independent stream
-            // responses do not consume per-kernel services or exported flows.
+        if (detail == SourceDetail::Regions && file.channel != source::Channel::PythonProbe && file.channel != source::Channel::Client) {
+            // Semantic execution consumes probe ports, not kernel/runtime
+            // services. Keep complete low-level inputs for explicit diagnostics.
             counts.push_back(0);
             skipped.push_back(file_id);
             continue;
@@ -125,7 +125,8 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
 
     probes->finish();
     const auto parsed = Clock::now();
-    if (observations.spans.empty()) throw std::runtime_error("No execution spans were observed in the declared source inputs");
+    if (detail == SourceDetail::Native && observations.spans.empty())
+        throw std::runtime_error("No execution spans were observed in the declared source inputs");
     source::SourceContext context(std::move(observations));
     if (detail == SourceDetail::Regions) context.regions();
     const auto built = Clock::now();
