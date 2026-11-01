@@ -187,6 +187,7 @@ trace_graph::planning::CacheBackend cache_backend(const trace_graph::source::Sou
         static_cast<std::size_t>(bytes_per_token),
         participants.size(),
         10,
+        1,
         { "cache.load", "kernel_ascend.page_first_direct", "device_service" },
         { "cache.backup", "kernel_ascend.page_first_direct", "device_service" },
         { "cache.backup.caller", "sglang.HiCacheController.write:kernel_ascend.page_first_direct", "caller_blocking_interval" },

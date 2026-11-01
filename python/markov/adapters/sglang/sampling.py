@@ -38,7 +38,7 @@ def _region_capture_command(deployment: Deployment, configuration: dict, workloa
 
 
 def region_workload(maximum: int, page: int, final_phases: list[str]) -> dict:
-    """Fresh prompts separate reuse from size; one paired prefix varies attention work."""
+    """Vary query and cached context independently with bounded prefix pairs."""
     maximum = max(2, maximum)
     middle = max(1, maximum // 2)
     lengths = [maximum, maximum, 1, 1, middle, middle]
@@ -68,6 +68,20 @@ def region_workload(maximum: int, page: int, final_phases: list[str]) -> dict:
             requests.append(
                 {"prompt": None, "input_ids": tokens, "max_new_tokens": 3, "ignore_eos": True, "return_logprob": False}
             )
+
+    # Short extensions of long prefixes exercise metadata and attention work
+    # that full-prefill points and a half-prefix pair cannot separate.
+    for context in sorted({middle, maximum}):
+        prefix = ((context - page) // page) * page
+        if prefix < page:
+            continue
+
+        first = prompt(prefix + page, len(requests) + 1)
+        for tokens in (first, first[:prefix] + [1], first[:prefix] + [1] * page):
+            requests.append(
+                {"prompt": None, "input_ids": tokens, "max_new_tokens": 3, "ignore_eos": True, "return_logprob": False}
+            )
+
     if "prefill" in final_phases:
         for length in sorted({1, middle, maximum}):
             requests.append(

@@ -366,7 +366,12 @@ void CacheProgram::admit(ProgramRuntime & runtime, RadixId prefix, const Pending
     const auto device_pages = cache_.page_count(prefix);
     const auto committed_tokens = observed.token_paths.length(tokens.committed.value().path);
     const auto active_pages = (committed_tokens + page_tokens_ - 1) / page_tokens_;
-    const auto room = make_device_room(runtime, active_pages - device_pages);
+    const auto query_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
+    const auto allocation_pages = (query_tokens + page_tokens_ - 1) / page_tokens_ + backend_.prefill_allocation_extra_pages;
+
+    // The native prefill allocator checks query length plus its page headroom,
+    // even when the exact extension would fit. Reclamation changes later hits.
+    const auto room = make_device_room(runtime, std::max(active_pages - device_pages, allocation_pages));
     if (room != RoomStatus::Ready) {
         const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
             return request.compute || request.final_publication || request.prefix_publication;
@@ -382,7 +387,7 @@ void CacheProgram::admit(ProgramRuntime & runtime, RadixId prefix, const Pending
     }
     running.buffer = cache_.reserve_request(active_pages - device_pages).value();
     requests_[request_].device_hit_pages = device_pages;
-    requests_[request_].prefill_tokens = observed.token_paths.length(tokens.prompt.value().path) - device_pages * page_tokens_;
+    requests_[request_].prefill_tokens = query_tokens;
     waiting_ = false;
     compute(runtime, load);
 }
