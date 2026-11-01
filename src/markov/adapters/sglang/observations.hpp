@@ -27,7 +27,7 @@ struct AttentionDescriptor {
 class ProbeReader final : public adapters::ProbeReader {
 public:
     ProbeReader(trace_graph::source::Observations & output, std::optional<bool> deterministic_sampling,
-                const std::optional<std::filesystem::path> & configuration);
+                const std::optional<std::filesystem::path> & configuration, bool full_compute);
 
 private:
     void observe(const ProbeEvent & event) override;
@@ -45,6 +45,7 @@ private:
     std::optional<std::filesystem::path> configuration_;
     std::string result_implementation_;
     std::optional<bool> deterministic_sampling_;
+    bool full_compute_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);
     std::map<std::string, trace_graph::source::Index> forward_frames_;
     struct Lookup {

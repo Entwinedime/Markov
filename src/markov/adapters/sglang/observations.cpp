@@ -712,6 +712,9 @@ const AttentionDescriptor & ProbeReader::attention_descriptor(const ProbeEvent &
 }
 
 void ProbeReader::observe_compute(const ProbeEvent & event) {
+    // Regional execution needs attention/cache geometry, not native dense recipes.
+    if (!full_compute_ && event.name != "runtime.phase.attention") return;
+
     const auto & args = event.args;
     if (args.at("status") != "returned") return;
     if (event.name == "runtime.phase.logits_pruning" && args.at("passthrough").get<bool>()) {

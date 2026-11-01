@@ -8,10 +8,11 @@
 namespace markov::adapters::sglang {
 
 ProbeReader::ProbeReader(trace_graph::source::Observations & output, std::optional<bool> deterministic_sampling,
-                         const std::optional<std::filesystem::path> & configuration)
+                         const std::optional<std::filesystem::path> & configuration, bool full_compute)
     : adapters::ProbeReader(output),
       configuration_(configuration),
-      deterministic_sampling_(deterministic_sampling) {}
+      deterministic_sampling_(deterministic_sampling),
+      full_compute_(full_compute) {}
 
 void ProbeReader::observe_response(const ProbeEvent & event) {
     using namespace trace_graph;

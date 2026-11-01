@@ -37,6 +37,7 @@ C++ 适配器核对部署、固定 workload 和支持设置，再一次提取语
 CacheProgram 拥有唯一的目标缓存、准入、发布和请求生命周期。它组合 RequestComputation 接口：
 正式路径用 RegionCompute 表达输入准备、batch、结果处理与发送；显式原生诊断使用 ComputeProgram。
 区域来源仅消费语义 probe 和客户端记录，不解析普通预测没有消费者的 profiler/native-hook 服务与关联；完整原生来源仍供显式诊断。报告的 unread_low_level_trace_files 统计被跳过的底层文件，不能把跳过解释为原始捕获完整性已证明。
+区域解释保留注意力与 K/V 几何、层及参与者、准备和结果端口；不构造只供原生执行使用的 dense 逐算子配方。原始观察保留，原生诊断仍解释完整配方。
 两者共享 CallerSchedule、资源前沿和 ProgramExecution，不各自维护缓存或局部时钟。
 
 区域程序分别保留 caller CPU、caller 返回和流进度。CPU 与阻塞返回从同一入口推进、汇合后释放调用权，
