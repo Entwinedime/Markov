@@ -9,7 +9,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 ```
 
 当前正式入口已运行限定范围的 SGLang 主机/文件回访，以及 KTransformers dense 的 self、分块 Prefill 和 SDPA。
-两框架的完整请求预测已接通，原始 60 cross 已有完整单次正常评分，但精度未达目标；两个有限资源搜索已有正常实测对照，扩展泛化与整体效率尚未验收。
+两框架的完整请求预测已接通，186 cross 和 33 self 已完成每条件三次正常评分；cross WAPE 为 2.786%，P90 为 11.030%，尾部及逐 base 精度仍未达标。两个有限资源搜索已有正常实测对照，旧工程的可比效率与最终交付仍待收口。
 
 ## 怎样运行
 
@@ -35,6 +35,7 @@ scripts/markov.sh predict --request /path/to/request.json
 execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/prediction/report.json，
 包含完整正式 HTTP、逐请求耗时、后台完成、缺口、成本来源、近似、图规模和运行开销。
 同一会话只准备一次 source；每个 target 独立维护缓存和执行状态。
+SGLang 普通预测解释语义 probe 与客户端记录；完整 profiler/native-hook 仍保存在采集资产中，按需用于原始图诊断。
 预测容器只挂载指定程序、base、模型和输出，不挂载整个仓库、真实设备或正常评分数据。
 
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
@@ -59,7 +60,7 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 批量研究例子在 [HiCache 矩阵](examples/hicache_matrix/README.md)：声明原始 60 和完整 186 cross，复用正式接口，失败与缺成本保留。
 这些数字是实验布局，当前实际完成范围以运行结果为准。
 有限候选可用 `scripts/markov.sh search --request /path/to/search.json`，在完整预测上按资源配额和声明报价选择。
-[HiCache 搜索例子](examples/hicache_search/README.md)负责组合参数与独立正常确认；当前实现仍待完整实例验收。
+[HiCache 搜索例子](examples/hicache_search/README.md)负责组合参数与独立正常确认；回访和低复用场景已运行有限实例，完整精度与真实全空间排名仍未认证。
 
 ## 已验证范围与限制
 
