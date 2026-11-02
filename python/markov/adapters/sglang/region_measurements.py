@@ -62,7 +62,7 @@ def recipes(captured: dict) -> dict:
             if operation == "result":
                 predictors += ["finished"]
             implementation = result_implementation(captured) if operation == "result" else IMPLEMENTATION
-            result[(f"{operation}.{phase}", implementation, scope)] = {
+            recipe = {
                 "feature": predictors,
                 "curve": "page_tokens",
                 "nonnegative": True,
@@ -71,6 +71,13 @@ def recipes(captured: dict) -> dict:
                 + (["finished"] if operation == "result" else []),
                 "limitations": captured["limitations"],
             }
+            if operation != "result":
+                recipe["initialization_features"] = ["first_phase"]
+                if operation == "prepare" and phase == "prefill":
+                    recipe["initialization_features"].append("new_preparations")
+            if operation == "batch" and phase == "prefill" and scope == "current_stream_interval":
+                recipe["hinge"] = "query_tokens"
+            result[(f"{operation}.{phase}", implementation, scope)] = recipe
     final_phases = set("prefill" if count == 1 else "decode" for count in captured["output_counts"])
     for phase in final_phases:
         for part in ("send", "tail"):

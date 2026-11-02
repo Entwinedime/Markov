@@ -9,14 +9,19 @@
 namespace markov::trace_graph::cost {
 namespace {
 
-long double evaluate(const Affine & response, const planning::Features & features) {
+long double evaluate(const AdditiveResponse & response, const planning::Features & features) {
     long double result = response.intercept_ns;
     for (const auto & [name, coefficient] : response.coefficients_ns) result += static_cast<long double>(coefficient) * features.at(name);
+
+    if (response.hinge) {
+        const auto & term = *response.hinge;
+        result += static_cast<long double>(term.coefficient_ns) * std::max(0.0, features.at(term.feature) - term.knot);
+    }
     return result;
 }
 
 long double evaluate(const Formula & response, const planning::Features & features) {
-    if (const auto * affine = std::get_if<Affine>(&response)) return evaluate(*affine, features);
+    if (const auto * additive = std::get_if<AdditiveResponse>(&response)) return evaluate(*additive, features);
 
     const auto & curve = std::get<CoefficientCurve>(response);
     const auto coordinate = features.at(curve.feature);
@@ -24,7 +29,8 @@ long double evaluate(const Formula & response, const planning::Features & featur
     if (right == curve.points.end()) return evaluate(curve.points.back().response, features);
 
     // Intake requires the coordinate domain to lie within the measured curve.
-    // Interpolate response coefficients, never clamp an unsupported work point.
+    // Interpolate anchored responses, including any geometry-specific knee;
+    // never clamp an unsupported work point.
     const auto & left = *(right - 1);
     const auto position = (coordinate - left.coordinate) / (right->coordinate - left.coordinate);
     const auto lower = evaluate(left.response, features);

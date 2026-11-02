@@ -150,6 +150,80 @@ def nonnegative_affine(points: Points, features: str | list[str] | None) -> dict
     }
 
 
+def _evaluate_response(response: dict, features: dict[str, float]) -> float:
+    value = response["intercept_ns"] + sum(
+        coefficient * features[name] for name, coefficient in response["coefficients_ns"].items()
+    )
+    if "hinge" in response:
+        term = response["hinge"]
+        value += term["coefficient_ns"] * max(0.0, features[term["feature"]] - term["knot"])
+    return value
+
+
+def _hinged_response(points: Points, features: list[str], coordinate: str) -> dict:
+    """Fit one continuous knee, using measured-coordinate partitions only."""
+    response = nonnegative_affine(points, features)
+    best_error = sum((duration - _evaluate_response(response, work)) ** 2 for work, duration in points)
+    coordinates = sorted({work[coordinate] for work, _ in points})
+    others = [name for name in features if name != coordinate]
+
+    for lower, upper in zip(coordinates, coordinates[1:]):
+        transformed = [
+            (
+                {
+                    **work,
+                    "_hinge_span": work[coordinate] - lower if work[coordinate] > lower else 0.0,
+                    "_hinge_shift": -1.0 if work[coordinate] > lower else 0.0,
+                },
+                duration,
+            )
+            for work, duration in points
+        ]
+        fitted = nonnegative_affine(transformed, [*others, "_hinge_span", "_hinge_shift"])
+        slope = fitted["coefficients_ns"]["_hinge_span"]
+        if slope == 0:
+            continue
+
+        # The negative active offset yields the knee; it is not a work feature.
+        knot = lower + fitted["coefficients_ns"]["_hinge_shift"] / slope
+        if not lower <= knot <= upper:
+            continue
+        candidate = {
+            "intercept_ns": fitted["intercept_ns"],
+            "coefficients_ns": {name: fitted["coefficients_ns"][name] for name in others},
+            "hinge": {"feature": coordinate, "knot": knot, "coefficient_ns": slope},
+        }
+        error = sum((duration - _evaluate_response(candidate, work)) ** 2 for work, duration in points)
+        if error < best_error:
+            best_error, response = error, candidate
+    return response
+
+
+def _fit_response(points: Points, recipe: dict) -> dict:
+    feature = recipe["feature"]
+    initialization = recipe.get("initialization_features", [])
+    selected = [(work, duration) for work, duration in points if not any(work[name] for name in initialization)]
+    names = feature if isinstance(feature, list) else [feature]
+    names = [name for name in names if name is not None and name not in initialization]
+    if not selected:
+        raise ValueError("Separating initialization requires independent steady measurements")
+    fit = nonnegative_affine if recipe.get("nonnegative", False) else affine
+    if "hinge" in recipe:
+        response = _hinged_response(selected, names, recipe["hinge"])
+    else:
+        response = fit(selected, names if feature is not None else None)
+
+    # First phase and later new specializations are disjoint observations.
+    # Estimate their additional cost after steady work, without tilting its slope.
+    for name in initialization:
+        cold = [(work, duration) for work, duration in points if work[name]]
+        if cold:
+            numerator = sum(work[name] * (duration - _evaluate_response(response, work)) for work, duration in cold)
+            denominator = sum(work[name] ** 2 for work, _ in cold)
+            response["coefficients_ns"][name] = max(0.0, numerator / denominator)
+    return response
+
+
 def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, sources: list[str]) -> dict:
     points = []
     for features, rows in groupby(sorted(samples, key=lambda row: encoded(row[0])), key=lambda row: encoded(row[0])):
@@ -168,14 +242,14 @@ def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, so
         if len({features[name] for features, _ in points}) != 1:
             raise ValueError(f"Response needs a different model form for varying {name}: {kind[0]}")
 
-    fit = nonnegative_affine if recipe.get("nonnegative", False) else affine
     if curve is None:
-        response = {"form": "affine", **fit(points, feature)}
+        response = _fit_response(points, recipe)
+        response = {"form": "hinge" if "hinge" in response else "affine", **response}
     else:
         response = {"form": "coefficient_curve", "feature": curve, "points": []}
         for coordinate in sorted({features[curve] for features, _ in points}):
             selected = [(features, duration) for features, duration in points if features[curve] == coordinate]
-            response["points"].append({"coordinate": coordinate, **fit(selected, feature)})
+            response["points"].append({"coordinate": coordinate, **_fit_response(selected, recipe)})
     return {
         "operation": kind[0],
         "implementation": kind[1],

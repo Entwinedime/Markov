@@ -17,14 +17,21 @@ struct Range {
     double upper;
 };
 
-struct Affine {
+struct HingeTerm {
+    std::string feature;
+    double knot;
+    double coefficient_ns;
+};
+
+struct AdditiveResponse {
     double intercept_ns;
     planning::Features coefficients_ns;
+    std::optional<HingeTerm> hinge = {};
 };
 
 struct CoefficientPoint {
     double coordinate;
-    Affine response;
+    AdditiveResponse response;
 };
 
 struct CoefficientCurve {
@@ -32,7 +39,7 @@ struct CoefficientCurve {
     std::vector<CoefficientPoint> points;
 };
 
-using Formula = std::variant<Affine, CoefficientCurve>;
+using Formula = std::variant<AdditiveResponse, CoefficientCurve>;
 
 struct Model {
     planning::WorkKind kind;

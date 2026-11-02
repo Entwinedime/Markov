@@ -48,17 +48,31 @@ planning::Features features(const Json & raw) {
     return result;
 }
 
-cost::Affine affine(const Json & raw) {
+cost::AdditiveResponse additive(const Json & raw) {
     const auto intercept = raw.at("intercept_ns").get<double>();
     if (!std::isfinite(intercept)) throw std::runtime_error("Cost intercept must be finite");
-    return { intercept, features(raw.at("coefficients_ns")) };
+
+    cost::AdditiveResponse result{ intercept, features(raw.at("coefficients_ns")) };
+    if (raw.contains("hinge")) {
+        const auto & term = raw.at("hinge");
+        fields(term, { "feature", "knot", "coefficient_ns" });
+        const auto knot = term.at("knot").get<double>();
+        const auto coefficient = term.at("coefficient_ns").get<double>();
+        if (!std::isfinite(knot) || !std::isfinite(coefficient)) throw std::runtime_error("Cost hinge coordinates and coefficients must be finite");
+        result.hinge = cost::HingeTerm{ term.at("feature").get<std::string>(), knot, coefficient };
+    }
+    return result;
 }
 
 cost::Formula formula(const Json & raw) {
     const auto form = raw.at("form").get<std::string>();
     if (form == "affine") {
         fields(raw, { "form", "intercept_ns", "coefficients_ns" });
-        return affine(raw);
+        return additive(raw);
+    }
+    if (form == "hinge") {
+        fields(raw, { "form", "intercept_ns", "coefficients_ns", "hinge" });
+        return additive(raw);
     }
     if (form != "coefficient_curve") throw std::runtime_error("Unsupported cost response form: " + form);
     fields(raw, { "form", "feature", "points" });
@@ -66,11 +80,11 @@ cost::Formula formula(const Json & raw) {
     const auto & points = raw.at("points");
     if (!points.is_array() || points.empty()) throw std::runtime_error("Cost coefficient curve requires a measured anchor");
     for (const auto & point : points) {
-        fields(point, { "coordinate", "intercept_ns", "coefficients_ns" });
+        fields(point, { "coordinate", "intercept_ns", "coefficients_ns" }, { "hinge" });
         const auto coordinate = point.at("coordinate").get<double>();
         if (!std::isfinite(coordinate) || (!result.points.empty() && coordinate <= result.points.back().coordinate))
             throw std::runtime_error("Cost curve coordinates must be finite and strictly increasing");
-        result.points.push_back({ coordinate, affine(point) });
+        result.points.push_back({ coordinate, additive(point) });
     }
     return result;
 }
@@ -104,18 +118,18 @@ cost::Model model(const Json & raw) {
             throw std::runtime_error("Invalid cost domain range: " + name);
         result.ranges.emplace(name, cost::Range{ values[0], values[1] });
     }
-    if (const auto * response = std::get_if<cost::Affine>(&result.response)) {
-        for (const auto & [name, coefficient] : response->coefficients_ns) result.ranges.at(name);
-    }
+    const auto check_features = [&result](const cost::AdditiveResponse & response) {
+        for (const auto & [name, coefficient] : response.coefficients_ns) result.ranges.at(name);
+        if (response.hinge) result.ranges.at(response.hinge->feature);
+    };
+    if (const auto * response = std::get_if<cost::AdditiveResponse>(&result.response)) check_features(*response);
     else {
         const auto & curve = std::get<cost::CoefficientCurve>(result.response);
         const auto domain = result.ranges.at(curve.feature);
         if (domain.lower < curve.points.front().coordinate || domain.upper > curve.points.back().coordinate
             || result.extrapolation_features.contains(curve.feature))
             throw std::runtime_error("Cost curve domain must remain within its anchors: " + curve.feature);
-        for (const auto & point : curve.points) {
-            for (const auto & [name, coefficient] : point.response.coefficients_ns) result.ranges.at(name);
-        }
+        for (const auto & point : curve.points) check_features(point.response);
     }
     for (const auto & name : result.extrapolation_features) result.ranges.at(name);
 
