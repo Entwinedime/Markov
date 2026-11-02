@@ -191,7 +191,7 @@ class RegionProbe:
             self.running = None
             self.forward_event = None
 
-    def forward(self, original, worker, *args, **kwargs):
+    def forward(self, original: Callable, worker: Any, *args: Any, **kwargs: Any) -> Any:
         if self.running is None:
             return original(worker, *args, **kwargs)
 
@@ -204,7 +204,12 @@ class RegionProbe:
         stream = torch.npu.current_stream()
         self.forward_event = (start, end, time.time_ns(), stream)
         start.record(stream)
-        return original(worker, *args, **kwargs)
+        result = original(worker, *args, **kwargs)
+
+        # The worker has now applied the actual batch's consumer index.
+        counter = worker.hicache_layer_transfer_counter
+        self.running["load_consumer_active"] = counter is not None and counter.consumer_index >= 0
+        return result
 
     def input_metadata(self, original: Callable, backend: Any, batch: Any) -> Any:
         fields = self.running

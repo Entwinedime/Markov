@@ -98,7 +98,10 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
             target.at("name").get<std::string>(),
             std::move(configuration),
             page,
-            { "sglang.ascend.eager", result_implementation, prefill, true },
+            { "sglang.ascend.eager",
+              result_implementation, prefill,
+              true, { "cache.load.consumer", "sglang.LayerDoneCounter.wait_until", "caller_blocking_interval" },
+              2 },
             std::move(cache)
         });
     }

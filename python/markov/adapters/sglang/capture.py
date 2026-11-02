@@ -62,6 +62,7 @@ def capture_environment(profiling: bool, calibration: bool = False) -> dict[str,
         "MARKOV_INPUT_FACTS": "",
         "MARKOV_NATIVE_PROBE": "",
         "MARKOV_REGION_MEASUREMENTS": "/capture/regions" if calibration else "",
+        "MARKOV_FILE_MEASUREMENTS": "",
         "LD_PRELOAD": "",
         "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/capture/storage",
         "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "0",
@@ -151,7 +152,12 @@ class Capture(SerialHttpClient):
         profiling_requested = self.plan["profiling"]
         if self.plan["calibration"] or self.plan["record_regions"]:
             origin = capture_origin(self.directory)
-            (self.directory / "regions").mkdir()
+        for flag, directory in (
+            ("MARKOV_REGION_MEASUREMENTS", "regions"),
+            ("MARKOV_FILE_MEASUREMENTS", "file_workers"),
+        ):
+            if self.plan["environment"].get(flag):
+                (self.directory / directory).mkdir()
         control = self.directory / "native" / "enabled"
         if profiling_requested:
             control.parent.mkdir()
@@ -208,6 +214,30 @@ class Capture(SerialHttpClient):
         temporary_storage_bytes = sum(path.stat().st_size for path in storage.rglob("*") if path.is_file())
         if profiling_requested:
             self.publish_manifest(temporary_storage_bytes)
+        elif self.plan["calibration"] and self.plan["environment"].get("MARKOV_FILE_MEASUREMENTS"):
+            files = sorted((self.directory / "file_workers").glob("*.jsonl"))
+            if len(files) != self.plan["deployment"]["tensor_parallel"]:
+                raise RuntimeError("Independent file observation did not report every TP worker")
+            ports = set()
+            for path in files:
+                with path.open(encoding="utf-8") as stream:
+                    ports.update(json.loads(line)["name"] for line in stream)
+            write_json(
+                self.directory / "file_measurements.json",
+                {
+                    "kind": "independent_file_worker_measurements",
+                    "status": "completed",
+                    "capture_origin": origin,
+                    "profiling": False,
+                    "temporary_storage_bytes": temporary_storage_bytes,
+                    "deployment": self.plan["deployment"],
+                    "configuration": self.plan["server"],
+                    "warmup_batches": 1,
+                    "formal_begin_index": self.plan["workload"]["formal_begin_index"],
+                    "measurement_ports": sorted(ports),
+                    "files": [str(path.relative_to(self.directory)) for path in files],
+                },
+            )
         elif self.plan["calibration"]:
             files = sorted((self.directory / "regions").glob("*.jsonl"))
             if len(files) != self.plan["deployment"]["tensor_parallel"]:
@@ -216,6 +246,7 @@ class Capture(SerialHttpClient):
             measurement_ports = set()
             input_metadata_observed = True
             input_metadata_stream_observed = True
+            load_consumer_observed = True
             for path in files:
                 with path.open(encoding="utf-8") as stream:
                     roles = set()
@@ -227,6 +258,7 @@ class Capture(SerialHttpClient):
                             input_metadata_observed = input_metadata_observed and "input_metadata" in event["args"]
                         if event["name"] == "region.stream":
                             metadata = event["args"].get("input_metadata")
+                            load_consumer_observed = load_consumer_observed and "load_consumer_active" in event["args"]
                             input_metadata_stream_observed = (
                                 input_metadata_stream_observed
                                 and metadata is not None
@@ -247,6 +279,8 @@ class Capture(SerialHttpClient):
                 measurement_ports.add("region.batch.input_metadata")
             if input_metadata_stream_observed:
                 measurement_ports.add("region.stream.input_metadata")
+            if load_consumer_observed:
+                measurement_ports.add("region.batch.load_consumer")
             write_json(
                 self.directory / "region_measurements.json",
                 {
@@ -271,10 +305,14 @@ class Capture(SerialHttpClient):
                 },
             )
         else:
+            observed = any(
+                self.plan["environment"].get(flag)
+                for flag in ("MARKOV_REGION_MEASUREMENTS", "MARKOV_FILE_MEASUREMENTS", "SGLANG_STEP_TIMING_DIR")
+            )
             write_json(
                 self.directory / "normal_observation.json",
                 {
-                    "kind": "normal_http_observation",
+                    "kind": "instrumented_http_observation" if observed else "normal_http_observation",
                     "status": "completed",
                     "profiling": False,
                     "framework": "sglang",

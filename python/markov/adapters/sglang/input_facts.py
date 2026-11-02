@@ -117,6 +117,17 @@ def install() -> None:
 
         LoadProbe(writer, region_writer).install()
         PrefetchProbe(writer, region_writer).install()
+
+    file_measurements = os.environ.get("MARKOV_FILE_MEASUREMENTS")
+    if file_measurements or (writer is not None and region_writer is not None):
+        from markov.adapters.sglang.storage_probe import StorageProbe
+
+        file_writer = EventWriter(Path(file_measurements)) if file_measurements else region_writer
+        StorageProbe(file_writer).install()
+        if file_measurements:
+            from markov.adapters.sglang.prefetch_probe import PrefetchProbe
+
+            PrefetchProbe(None, file_writer).install_query()
     if not output:
         return
 
@@ -132,10 +143,4 @@ def install() -> None:
     PreparationProbe(writer).install()
     RequestProbe(writer).install()
     ComputeProbe(writer).install()
-    storage = None
-    if region_writer is not None:
-        from markov.adapters.sglang.storage_probe import StorageProbe
-
-        storage = StorageProbe(region_writer)
-        storage.install()
-    CacheProbe(writer, storage).install()
+    CacheProbe(writer).install()

@@ -58,12 +58,22 @@ class PerformancePreparation:
             capture_sec = time.monotonic() - begin
             begin = time.monotonic()
             try:
-                training = self.approved_training(models, command.measurement_adapter)
+                selected = read_json(models)
+                training = self.approved_training(selected, command.measurement_adapter)
+                keys = ("operation", "implementation", "timing_scope")
+                responses = {tuple(entry["work"][key] for key in keys) for entry in report["cost_requirements"]}
+                adapter = ADAPTERS[command.measurement_adapter]
+                available = adapter.recipes(adapter.metadata(artifact))
+
+                # Fill other absent kinds from this capture without replacing
+                # ready responses or requiring another prediction pass for each.
+                responses.update(set(available) - {tuple(model[key] for key in keys) for model in selected["models"]})
                 raw = {
                     "database": str(self.request.database),
                     "deployment": asdict(self.request.deployment),
                     "imports": [{"adapter": command.measurement_adapter, "capture": str(artifact)}],
                     "training": [str(path) for path in sorted(training | {artifact})],
+                    "responses": [dict(zip(keys, kind)) for kind in sorted(responses)],
                     "models": str(models),
                     "output": str(self.directory / "selected_models.json"),
                 }
@@ -102,10 +112,10 @@ class PerformancePreparation:
                     return artifact
         return None
 
-    def approved_training(self, models: Path, adapter: str) -> set[Path]:
-        # A capture refits more than the missing kind; retain already selected
-        # evidence for the whole adapter, including other page-size anchors.
-        sources = {Path(path) for model in read_json(models)["models"] for path in model["sources"]}
+    def approved_training(self, selected: dict, adapter: str) -> set[Path]:
+        # Keep prior anchors for required kinds. Other responses stay selected,
+        # even when these same captures contain a different measurement scope.
+        sources = {Path(path) for model in selected["models"] for path in model["sources"]}
         store = PerformanceData(self.request.database)
         try:
             selected = set()

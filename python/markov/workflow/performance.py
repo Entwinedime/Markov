@@ -10,11 +10,12 @@ from pathlib import Path
 from statistics import median
 
 from markov.artifacts.performance import PerformanceData, encoded
-from markov.artifacts.request import Deployment, read_json, reject_unknown, resolve_path
+from markov.artifacts.request import Deployment, read_json, reject_unknown, required_text, resolve_path
 from markov.artifacts.writing import write_json
 from markov.adapters.sglang import (
     cache_control_measurements,
     cache_measurements,
+    file_measurements,
     prefetch_measurements,
     region_measurements,
     scheduler_measurements,
@@ -27,6 +28,7 @@ ADAPTERS = {
     "ktransformers_phases": ktransformers_measurements,
     "sglang_cache_io": cache_measurements,
     "sglang_cache_controls": cache_control_measurements,
+    "sglang_file_workers": file_measurements,
     "sglang_prefetch_query": prefetch_measurements,
     "sglang_regions": region_measurements,
     "sglang_scheduler": scheduler_measurements,
@@ -264,15 +266,28 @@ def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, so
     }
 
 
-def maintain_performance(path: Path):
+def maintain_performance(path: Path) -> dict:
     raw = read_json(path)
     reject_unknown(
-        raw, {"database", "deployment", "imports", "training", "models", "output"}, "performance maintenance"
+        raw,
+        {"database", "deployment", "imports", "training", "models", "output", "responses"},
+        "performance maintenance",
     )
     directory = path.resolve().parent
     database = resolve_path(directory, raw["database"])
     deployment = asdict(Deployment.parse(raw["deployment"]))
     training = [resolve_path(directory, item) for item in raw.get("training", [])]
+    responses = None
+    if "responses" in raw:
+        if not isinstance(raw["responses"], list) or not raw["responses"]:
+            raise ValueError("responses must be a nonempty list of cost kinds")
+        responses = set()
+        for item in raw["responses"]:
+            reject_unknown(item, {"operation", "implementation", "timing_scope"}, "cost response")
+            responses.add(
+                tuple(required_text(item[key], key) for key in ("operation", "implementation", "timing_scope"))
+            )
+
     if not training and ("output" in raw or "models" in raw):
         raise ValueError("Model export requires an explicit training capture selection")
     if not training and not raw.get("imports"):
@@ -323,15 +338,22 @@ def maintain_performance(path: Path):
             adapter_name, current, metadata = capture.adapter, capture.context, capture.metadata
             if current != ADAPTERS[adapter_name].context(metadata, deployment):
                 raise ValueError(f"Training capture belongs to different measurement conditions: {source}")
-            recipes.update(ADAPTERS[adapter_name].recipes(metadata))
+            recipes.update(
+                (kind, recipe)
+                for kind, recipe in ADAPTERS[adapter_name].recipes(metadata).items()
+                if responses is None or kind in responses
+            )
             for operation, implementation, scope, features, duration in samples:
                 kind = (operation, implementation, scope)
+                if responses is not None and kind not in responses:
+                    continue
+
                 if kind in conditions and conditions[kind] != current:
                     raise ValueError(f"Training selection mixes measurement conditions for {operation}/{scope}")
                 conditions[kind] = current
                 grouped.setdefault(kind, []).append((features, duration))
                 sources.setdefault(kind, set()).add(capture.identity)
-            sample_count += len(samples)
+                sample_count += 1
         trained = [
             train_response(kind, recipe, grouped.get(kind, []), sorted(sources.get(kind, set())))
             for kind, recipe in recipes.items()

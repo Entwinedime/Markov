@@ -518,7 +518,12 @@ void CacheProgram::compute(ProgramRuntime & runtime, const PendingCopy * load) {
         }
         const double context = frame.phase == Phase::Prefill ? observed.token_paths.length(tokens.prompt.value().path) : frame.sequence_tokens.front();
         const FrameInput variables{ query, query, context, 1, static_cast<double>(page_tokens_) };
-        if (regions_) region_frames.push_back({ frame_id, variables });
+        if (regions_) {
+            std::optional<Work> consumer;
+            if (load || requests_[request_].loaded_pages > 0)
+                consumer = Work{ regions_->load_consumer, { { "events", backend_.layers * regions_->event_waits_per_layer } } };
+            region_frames.push_back({ frame_id, variables, std::move(consumer) });
+        }
         else plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/planning/request_compute.hpp"
+#include "markov/trace_graph/planning/work.hpp"
 #include "markov/trace_graph/source/context.hpp"
 
 #include <cstddef>
@@ -20,11 +21,14 @@ struct RegionBackend {
     std::string result_implementation;
     std::size_t maximum_prefill_tokens;
     bool host_reads_stream_inputs;
+    WorkKind load_consumer;
+    std::size_t event_waits_per_layer;
 };
 
 struct RegionFrame {
     source::Index source_frame;
     FrameInput input;
+    std::optional<Work> load_consumer = std::nullopt;
 };
 
 // These are observable invocation conditions, not a replica of a compiler's

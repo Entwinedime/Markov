@@ -1,4 +1,4 @@
-"""Record native file service and token ancestry only for explicit target diagnostics."""
+"""Observe native file worker intervals without instrumenting foreground polling."""
 
 from __future__ import annotations
 
@@ -172,30 +172,34 @@ class StorageProbe:
             self.backup.reset(context)
 
     def read(
-        self, original: Callable, controller: Any, operation: Any, keys: list[str], indices: Any, extra: Any
+        self, original: Callable, controller: Any, operation: Any, keys: list[str], indices: Any, extra_info: Any = None
     ) -> Any:
-        if not hasattr(operation, "_markov_storage_position"):
-            return original(controller, operation, keys, indices, extra)
+        if controller.storage_backend_type != "file" or not hasattr(operation, "_markov_storage_position"):
+            return original(controller, operation, keys, indices, extra_info)
 
         batch = FileBatch(controller, operation, keys, False)
         context = self.batch.set(batch)
         try:
-            result = original(controller, operation, keys, indices, extra)
+            result = original(controller, operation, keys, indices, extra_info)
             end = time.perf_counter_ns()
         finally:
             self.batch.reset(context)
         batch.report(self.writer, end, "read" in batch.stages)
         return result
 
-    def write(self, original: Callable, controller: Any, keys: list[str], indices: Any, extra: Any) -> bool:
+    def write(self, original: Callable, controller: Any, keys: list[str], indices: Any, extra_info: Any = None) -> bool:
         operation = self.backup.get()
-        if operation is None or not hasattr(operation, "_markov_storage_position"):
-            return original(controller, keys, indices, extra)
+        if (
+            controller.storage_backend_type != "file"
+            or operation is None
+            or not hasattr(operation, "_markov_storage_position")
+        ):
+            return original(controller, keys, indices, extra_info)
 
         batch = FileBatch(controller, operation, keys, True)
         context = self.batch.set(batch)
         try:
-            result = original(controller, keys, indices, extra)
+            result = original(controller, keys, indices, extra_info)
             end = time.perf_counter_ns()
         finally:
             self.batch.reset(context)
@@ -250,6 +254,8 @@ class StorageProbe:
             ("sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup_storage", self.write_backup),
             ("sglang.srt.managers.cache_controller.StorageOperation.__init__", self.initialize),
             ("sglang.srt.managers.cache_controller.HiCacheController._page_backup", self.page_backup),
+            ("sglang.srt.managers.cache_controller.HiCacheController._generic_page_get", self.read),
+            ("sglang.srt.managers.cache_controller.HiCacheController._generic_page_set", self.write),
             ("sglang.srt.utils.step_timing.storage_read_stage_recorder", self.stage_recorder),
             ("sglang.srt.mem_cache.hicache_storage.HiCacheFile.batch_set", self.batch_set),
             ("sglang.srt.mem_cache.hicache_storage.HiCacheFile.get", self.get),

@@ -17,19 +17,7 @@ SCOPE = "query_group_response"
 
 
 def recipes(captured: dict) -> dict:
-    result = {
-        (OPERATION, IMPLEMENTATION, SCOPE): {
-            "feature": ["hashed_pages", "checked_pages"],
-            "curve": "page_tokens",
-            "nonnegative": True,
-            "extrapolation_features": ["hashed_pages", "checked_pages"],
-            "limitations": [
-                "Closed query-group response from eligible enqueue to completed native rank reduction, excluding prior query backlog.",
-                "Warm local file metadata and serial requests; thread wakeup and light observation remain included.",
-                "One shared query lane approximates small rank-return skew; concurrent file changes during a query are not certified.",
-            ],
-        }
-    }
+    result = {}
     features = {
         "issue": ["candidate_pages", "allocated_pages"],
         "check": ["operation_present", "state_reductions"],
@@ -53,15 +41,21 @@ def recipes(captured: dict) -> dict:
 
 
 def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
+    yield from response_measurements(
+        (row for row in events(path, captured) if row[1]["name"] != "prefetch.query"), captured
+    )
+
+
+def response_measurements(records: Iterator[tuple[int, dict, bool]], captured: dict) -> Iterator[Measurement]:
     groups = defaultdict(list)
-    for position, event, warmup in events(path, captured):
+    for position, event, warmup in records:
         if event["name"] in ("prefetch.query", "prefetch.issue", "prefetch.check", "prefetch.accept"):
             groups[(event["name"], tuple(event["args"]["request_ids"]))].append((position, event, warmup))
     previous_end = 0
     for rows in sorted(groups.values(), key=lambda rows: max(Decimal(row[1]["ts"]) for row in rows)):
         ranks = {row[1]["args"]["participant"] for row in rows}
         if len(rows) != captured["deployment"]["tensor_parallel"] or ranks != set(range(len(rows))):
-            raise ValueError(f"Prefetch response is missing a unique TP participant: {path}")
+            raise ValueError("Prefetch response is missing a unique TP participant")
         end = max(int((Decimal(event["ts"]) + Decimal(event["dur"])) * 1000) for _, event, _ in rows)
         query = rows[0][1]["name"] == "prefetch.query"
         begin = (
@@ -71,7 +65,7 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
         )
         duration = end - begin
         if duration < 0:
-            raise ValueError(f"Prefetch response precedes its eligible group start: {path}")
+            raise ValueError("Prefetch response precedes its eligible group start")
         if query:
             previous_end = end
         features = {

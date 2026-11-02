@@ -25,6 +25,11 @@ RESPONSES = {
             LOAD_IMPLEMENTATION,
             "completion_observation_upper_interval",
         ),
+        "load_consumer_increment_ns": (
+            "cache.load.consumer",
+            "sglang.LayerDoneCounter.wait_until",
+            "caller_blocking_interval",
+        ),
     },
     "file": {
         "file_allocate_ns": ("cache.prefetch.allocate", "file.generic_page_get", "storage_worker_service"),
@@ -66,6 +71,31 @@ RESPONSES = {
 FILE_PER_PAGE = {"file_read_page_ns", "file_copy_publish_ns", "file_new_page_ns", "file_existing_page_ns"}
 
 
+def response_kinds(captured: dict, direction: str) -> dict:
+    return {
+        quantity: kind
+        for quantity, kind in RESPONSES[direction].items()
+        if quantity != "load_consumer_increment_ns" or quantity in captured.get("measurement_ports", [])
+    }
+
+
+def file_recipes(limitations: list[str]) -> dict:
+    return {
+        kind: {
+            "feature": None if quantity in FILE_PER_PAGE else "pages",
+            "curve": "page_bytes",
+            "nonnegative": True,
+            "extrapolation_features": ["pages"],
+            "limitations": limitations
+            + [
+                "Native buffered file responses on warm filesystem cache; no fsync or cold-media guarantee.",
+                "Allocation includes read-batch iteration overhead; batch-prepare includes write-loop/return overhead. Recording overhead remains included.",
+            ],
+        }
+        for quantity, kind in RESPONSES["file"].items()
+    }
+
+
 def recipes(captured: dict) -> dict:
     limits = [
         "Independent initialized idle single-device response; no competing I/O or CPU load. "
@@ -74,17 +104,18 @@ def recipes(captured: dict) -> dict:
     limits.append(captured["limitations"])
     result = {}
     for direction in captured["recipe"].get("operations", ["backup"]):
-        for quantity, kind in RESPONSES[direction].items():
-            if direction == "file":
+        if direction == "file":
+            result.update(file_recipes(limits))
+            continue
+        for quantity, kind in response_kinds(captured, direction).items():
+            if kind[0] == "cache.load.consumer":
                 result[kind] = {
-                    "feature": None if quantity in FILE_PER_PAGE else "pages",
-                    "curve": "page_bytes",
+                    "feature": None,
                     "nonnegative": True,
-                    "extrapolation_features": ["pages"],
                     "limitations": limits
                     + [
-                        "Native buffered file responses on warm filesystem cache; no fsync or cold-media guarantee.",
-                        "Allocation includes read-batch iteration overhead; batch-prepare includes write-loop/return overhead. Recording overhead remains included.",
+                        "Ready native layer-event enqueue increment over inactive accesses; not device waiting time.",
+                        "The coarse caller response does not resolve its interleaving with individual attention layers.",
                     ],
                 }
                 continue
@@ -178,7 +209,7 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
                 "layers": geometry["layers"],
                 "bytes_per_token": bytes_per_token,
             }
-            for quantity, kind in RESPONSES[direction].items():
+            for quantity, kind in response_kinds(captured, direction).items():
                 if direction == "file":
                     per_page = quantity in FILE_PER_PAGE
                     durations = row[quantity] if per_page else [row[quantity]]
@@ -193,7 +224,9 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
                 duration = row[quantity]
                 if type(duration) is not int or duration < 0:
                     raise ValueError(f"Invalid ns response: {path}, line {position}, {quantity}")
-                if quantity == "host_index_clone_ns":
+                if quantity == "load_consumer_increment_ns":
+                    features = {"events": 2 * geometry["layers"]}
+                elif quantity == "host_index_clone_ns":
                     features = {"elements": pages * tokens, "element_bytes": 8, "tensor_rank": 1}
                 elif quantity == "load_prepare_return_ns":
                     features = {**work, "segments": segments}

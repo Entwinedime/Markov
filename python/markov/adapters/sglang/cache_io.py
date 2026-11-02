@@ -141,11 +141,29 @@ class CacheIOSampler:
         prepared = time.perf_counter_ns()
 
         begin_load = time.perf_counter_ns()
-        controller.start_loading()
+        producer = controller.start_loading()
         returned = time.perf_counter_ns()
         ack = controller.ack_load_queue.pop()
         ack.finish_event.synchronize()
         completed = time.perf_counter_ns()
+
+        # MHA obtains K and V separately; both accesses enqueue a layer wait.
+        counter = controller.layer_done_counter
+        counter.set_consumer(-1)
+        begin_consumer = time.perf_counter_ns()
+        for layer in range(self.geometry["layers"]):
+            counter.wait_until(layer)
+            counter.wait_until(layer)
+        inactive_consumer_ns = time.perf_counter_ns() - begin_consumer
+
+        counter.set_consumer(producer)
+        begin_consumer = time.perf_counter_ns()
+        for layer in range(self.geometry["layers"]):
+            counter.wait_until(layer)
+            counter.wait_until(layer)
+        active_consumer_ns = time.perf_counter_ns() - begin_consumer
+        torch.npu.current_stream().synchronize()
+        counter.set_consumer(-1)
 
         # The normal framework also keeps these index tensors alive through the
         # queued transfer. Synchronization and value checks are outside timing.
@@ -162,6 +180,9 @@ class CacheIOSampler:
             "load_prepare_return_ns": prepared - begin,
             "load_caller_return_ns": returned - begin_load,
             "load_completion_observed_ns": completed - begin_load,
+            "load_consumer_active_ns": active_consumer_ns,
+            "load_consumer_inactive_ns": inactive_consumer_ns,
+            "load_consumer_increment_ns": active_consumer_ns - inactive_consumer_ns,
             "physical_pages_verified": pages,
             "device_capacity_pages": allocator.size // controller.page_size,
             "host_capacity_pages": host.size // controller.page_size,
@@ -207,6 +228,7 @@ def main() -> None:
     origin = capture_origin(args.output)
     os.environ["SGLANG_STEP_TIMING_DIR"] = ""
     sampler = CacheIOSampler(device, geometry)
+    measurement_ports = set()
     with (args.output / "measurements.jsonl").open("x", encoding="utf-8", buffering=1) as stream:
         for page_tokens in sorted({case["page_tokens"] for case in cases}):
             selected = [case for case in cases if case["page_tokens"] == page_tokens]
@@ -222,6 +244,7 @@ def main() -> None:
                             from markov.adapters.sglang.file_io import FileIOSampler
 
                             measurement = FileIOSampler(sampler, controller, args.output).measure(case["pages"])
+                        measurement_ports.update(name for name in measurement if name.endswith("_ns"))
                         stream.write(
                             json.dumps(
                                 {
@@ -244,6 +267,7 @@ def main() -> None:
                 "status": "completed",
                 "capture_origin": origin,
                 "recipe": recipe,
+                "measurement_ports": sorted(measurement_ports),
                 "torch": sampler.torch.__version__,
                 "dtype": "bfloat16",
                 "backend": "kernel_ascend",

@@ -57,7 +57,7 @@ def recipes(captured: dict) -> dict:
             predictors = ["query_tokens", "attention_pairs"] if phase == "prefill" else ["attention_pairs"]
             if operation != "result":
                 predictors += ["first_phase"]
-            if operation == "prepare" and phase == "prefill":
+            if operation != "result" and phase == "prefill":
                 predictors += ["new_preparations"]
             if operation == "result":
                 predictors += ["finished"]
@@ -73,7 +73,7 @@ def recipes(captured: dict) -> dict:
             }
             if operation != "result":
                 recipe["initialization_features"] = ["first_phase"]
-                if operation == "prepare" and phase == "prefill":
+                if phase == "prefill":
                     recipe["initialization_features"].append("new_preparations")
             if operation == "batch" and phase == "prefill" and scope == "current_stream_interval":
                 recipe["hinge"] = "query_tokens"
@@ -142,7 +142,7 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
         if type(duration) is not int or duration < 0:
             raise ValueError(f"Invalid region duration in {path}, record {position}")
         features = {**fields["features"]}
-        if kind[0] != "prepare":
+        if kind[0] == "result" or (kind[0] == "batch" and fields["phase"] != "prefill"):
             features.pop("new_preparations")
         if kind[0] == "result":
             features.pop("first_phase")

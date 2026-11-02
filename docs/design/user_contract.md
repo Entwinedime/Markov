@@ -58,12 +58,14 @@ issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一
 相应操作未发生时为 null。后台读完并不自动插入缓存，接受仍依赖请求端检查及已发布的前缀。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
 自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载、失败回载控制与 buffered 文件 worker。
+补采只更新本轮缺口，并补入同次采集能提供、库中尚未具备的其他响应；其他已有选择保留，生成的维护请求记录实际范围。
 逐请求 failed_load_attempts 记录回载失败转重新计算的次数；失败不计为成功传输，loaded_pages 仍只计实际回载页。
 base 的 runtime.hicache.load_failed 只在实际两次设备分配失败后记录，包含请求、rank、页/段及成功子备份数，不读取缓存快照。
 其包络由目标失败控制和已执行备份替代，不再次迁移进控制残余；原始 DAG 的观测时间保留。
 显式 record-regions 另记录可用于独立评价的排他线程 CPU，按请求/rank/工作对应，扣除子备份的分组余量不认证墙钟顺序。
-文件配方不加载模型权重，不运行 HTTP 请求；在采集输出下临时构造真实 K/V 页，读写核对后删除页文件，只保留轻量计时。
-这是暖文件缓存下的 buffered 响应，不保证冷介质、fsync 或争用时的性能。
+文件 worker 与查询补采在真实 TP 进程中运行小型回访，关闭前台轮询观察及计算区域 NPU 事件；临时 KV 文件导出计时后清理。
+原生空闲控制器配方另外保留，不加载模型权重或运行 HTTP，在计时外核对真实 K/V；两类观察不混作同一条件。
+这些是暖文件缓存下的 buffered 响应，不保证冷介质、fsync 或任意争用时的性能。
 同一缺口补采后仍未解决时停止，预算耗尽或采集失败保留原因及缺失结果，不无限启动模型。
 preparation 中单列 base/performance 时间、sampling_rounds 和累计状态路径；这些不计入预测的 HTTP。
 
@@ -406,9 +408,10 @@ scripts/markov.sh maintain --request /path/to/maintenance.json
 }
 ```
 
-路径相对维护请求解析。sglang_cache_io 导入正常备份、主机克隆和回载准备/提交/完成观测；ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
+路径相对维护请求解析。sglang_cache_io 导入正常备份、主机克隆和回载准备/提交/完成及消费控制观测；sglang_file_workers 从独立 file_measurements.json 导入正常 TP 轮询下的后台文件与查询响应。ascend_tensor_device 导入独立设备服务；ascend_tensor_queue 导入正常 C++ API/线程时钟与独立 profiler 分段共同形成的端口估计。ascend_tensor 只解释已有 Python API 响应采样，不能把这类整段响应作为当前原生队列的 CPU/worker 服务。
 sglang_cache_controls 从独立 region_measurements.json 仅导入失败回载的排他线程 CPU；不重训该文件的 Prefill/Decode 响应。
 只填 imports 可以单独入库；已有数据可省略 imports，只用 training 的原来源路径离线训练，不再打开原始采样。training 必须显式选择，不扫描整库；预热、未选择的采集及独立留出不参加训练。
+可选 responses 是由 operation、implementation、timing_scope 三个必填字符串组成的非空列表，只训练所列响应，其余现行模型保留。省略时训练所选来源实际提供的全部响应。自动准备显式填写本轮成本缺口；原始事实仍完整入库，未观测到的成本不会凭此生成。
 独立采集器自动记录 capture_origin，包括原始输出目录和实际开始时间；应用用户无需填写。复制或移动测量文件时保留它，导入的新位置会关联同一采集，重复导入不增加样本。training 可引用任一已导入位置，但不能同时重复选择同一采集；模型来源统一引用首次导入位置。外部测量文件必须提供其实际采集来源，不能按当前文件路径伪造一次新采集。
 可选 models 指向已有选定模型；训练只替换相同操作/实现/口径，完整结果原子写到 output。输出与数据库、请求及原始采集目录分开。报告区分新增/复用记录与训练响应；单设备数据不绑定模型名或全局 TP，平台、runtime 和实际工作条件仍须相容。
 

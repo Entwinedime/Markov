@@ -10,8 +10,15 @@ from markov.artifacts.request import Deployment
 from markov.adapters.sglang.capture import CAPTURE_OWNED_ARGUMENTS, capture_environment, server_arguments
 
 
-def _region_capture_command(deployment: Deployment, configuration: dict, workload: dict, adapter: str) -> DeviceCommand:
-    environment = capture_environment(False, True)
+def _capture_command(deployment: Deployment, configuration: dict, workload: dict, adapter: str) -> DeviceCommand:
+    file_workers = adapter == "sglang_file_workers"
+    environment = capture_environment(False, not file_workers)
+    required_ports = ()
+    if file_workers:
+        environment["MARKOV_FILE_MEASUREMENTS"] = "/capture/file_workers"
+        required_ports = ("prefetch.query",)
+    elif adapter == "sglang_regions":
+        required_ports = ("region.stream.input_metadata",)
     payload = {
         "deployment": asdict(deployment),
         "server": server_arguments(deployment, configuration),
@@ -24,7 +31,7 @@ def _region_capture_command(deployment: Deployment, configuration: dict, workloa
         "markov.adapters.sglang.capture",
         ("collect", "--input", "/capture/capture_input.json"),
         payload,
-        "region_measurements.json",
+        "file_measurements.json" if file_workers else "region_measurements.json",
         "calibration",
         ((Path(deployment.model), "/model", False),),
         environment,
@@ -33,7 +40,7 @@ def _region_capture_command(deployment: Deployment, configuration: dict, workloa
         sum(row["max_new_tokens"] for row in workload["requests"]),
         "workload_report.json",
         adapter,
-        ("region.stream.input_metadata",) if adapter == "sglang_regions" else (),
+        required_ports,
     )
 
 
@@ -132,12 +139,14 @@ def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -
         "hicache_ratio": 1.0,
         "hicache_write_policy": "write_back",
     }
-    return _region_capture_command(
+    return _capture_command(
         deployment, configuration, {"requests": requests, "formal_begin_index": 0}, "sglang_cache_controls"
     )
 
 
-def _prefetch_capture(deployment: Deployment, page: int, policy: str) -> DeviceCommand:
+def _prefetch_capture(
+    deployment: Deployment, page: int, policy: str, adapter: str = "sglang_prefetch_query"
+) -> DeviceCommand:
     # Fixed small anchors keep calibration independent of base trace size.
     # Larger hash/check counts remain declared extrapolation, not larger captures.
     maximum = 7
@@ -163,9 +172,7 @@ def _prefetch_capture(deployment: Deployment, page: int, policy: str) -> DeviceC
         "hicache_storage_prefetch_policy": policy,
         "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
     }
-    return _region_capture_command(
-        deployment, configuration, {"requests": requests, "formal_begin_index": 1}, "sglang_prefetch_query"
-    )
+    return _capture_command(deployment, configuration, {"requests": requests, "formal_begin_index": 1}, adapter)
 
 
 def sampling_commands(deployment: Deployment, report: dict, requirements: list[dict]) -> list[DeviceCommand]:
@@ -179,7 +186,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     io_operations = set()
     scheduler_pages = set()
     failed_load_pages = {}
-    query_pages = set()
+    file_pages = set()
     control_pages = set()
     geometry = context["geometry"]
     for requirement in requirements:
@@ -206,15 +213,17 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             "cache.load.prepare",
             "cache.load.caller",
             "cache.load.completion",
+            "cache.load.consumer",
         ):
             io_operations.add("load" if operation.startswith("cache.load.") else "backup")
             for name in requirement["targets"]:
                 page = int(cells[name]["configuration"]["page_size"])
-                needed = (
-                    int(work["features"]["pages"])
-                    if "pages" in work["features"]
-                    else math.ceil(work["features"]["elements"] / page)
-                )
+                if operation == "cache.load.consumer":
+                    needed = 1
+                elif "pages" in work["features"]:
+                    needed = int(work["features"]["pages"])
+                else:
+                    needed = math.ceil(work["features"]["elements"] / page)
                 segments = int(work["features"].get("segments", 1))
                 io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
                 if segments > 1:
@@ -223,7 +232,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             control_pages.update(int(cells[name]["configuration"]["page_size"]) for name in requirement["targets"])
         elif operation == "cache.prefetch.query":
             for name in requirement["targets"]:
-                query_pages.add(int(cells[name]["configuration"]["page_size"]))
+                file_pages.add(int(cells[name]["configuration"]["page_size"]))
         elif operation.startswith(("cache.prefetch.", "cache.storage_write.")):
             io_operations.add("file")
             for name in requirement["targets"]:
@@ -233,10 +242,9 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
     commands = []
     for page, pages in sorted(failed_load_pages.items()):
         commands.append(_failed_load_capture(deployment, page, pages))
-    for page in sorted(query_pages | control_pages):
+    for page in sorted(control_pages):
         commands.append(_prefetch_capture(deployment, page, "wait_complete"))
-        if page in control_pages:
-            commands.append(_prefetch_capture(deployment, page, "best_effort"))
+        commands.append(_prefetch_capture(deployment, page, "best_effort"))
     for (page, enabled), target in sorted(regions.items()):
         workload = region_workload(math.ceil(context["max_context_tokens"]), page, context["final_phases"])
         capacity = sum(
@@ -257,7 +265,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             max_total_tokens=capacity,
             max_prefill_tokens=math.ceil(context["max_context_tokens"] / page) * page,
         )
-        commands.append(_region_capture_command(deployment, configuration, workload, "sglang_regions"))
+        commands.append(_capture_command(deployment, configuration, workload, "sglang_regions"))
     if scheduler_pages:
         page = min(scheduler_pages)
         # Two alternating prefixes exceed both small pools; later requests
@@ -286,8 +294,13 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             "hicache_storage_prefetch_policy": "wait_complete",
             "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
         }
-        commands.append(_region_capture_command(deployment, configuration, workload, "sglang_scheduler"))
-    if io_cases:
+        commands.append(_capture_command(deployment, configuration, workload, "sglang_scheduler"))
+    if "file" in io_operations:
+        file_pages.update(page for page, _, _ in io_cases)
+        io_operations.remove("file")
+    for page in sorted(file_pages):
+        commands.append(_prefetch_capture(deployment, page, "wait_complete", "sglang_file_workers"))
+    if io_operations:
         if geometry["key_dim"] != geometry["value_dim"]:
             raise ValueError("The current independent I/O sampler requires equal K/V head dimensions")
         recipe = {
@@ -314,6 +327,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 "cache_io",
                 environment=capture_environment(False),
                 measurement_adapter="sglang_cache_io",
+                required_measurement_ports=("load_consumer_increment_ns",) if "load" in io_operations else (),
             )
         )
     return commands

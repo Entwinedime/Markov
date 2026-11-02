@@ -298,6 +298,12 @@ void RegionCompute::run_frame(ProgramRuntime & runtime, std::size_t id, graph::N
         if (frame.previous) mutation.dependencies.push_back({ *stats_.frames[*frame.previous].completed, begin + 1, graph::EdgeKind::Synchronization });
     }
     identify(runtime, mutation, frame, "batch");
+    if (frame.description.load_consumer) {
+        // Charge event submission on the caller; load readiness is already a dependency.
+        auto & submitted = mutation.operations.back();
+        submitted.cost = std::cref(*frame.description.load_consumer);
+        if (runtime.records_graph()) submitted.position->port = "load_consumer";
+    }
     runtime.submit(std::move(mutation));
 }
 

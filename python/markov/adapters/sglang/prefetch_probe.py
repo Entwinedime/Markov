@@ -203,6 +203,12 @@ class PrefetchProbe:
         HookRegistry.register(
             "sglang.srt.managers.cache_controller.HiCacheController.terminate_prefetch", self.stop, HookType.AROUND
         )
+        self.install_query()
+
+    def install_query(self) -> None:
+        """Observe the background query without wrapping foreground polling."""
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
         HookRegistry.register(
             "sglang.srt.managers.cache_controller.HiCacheController._storage_hit_query",
             self.storage_query,
