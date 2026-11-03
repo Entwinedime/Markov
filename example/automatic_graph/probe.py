@@ -14,7 +14,7 @@ import torch_npu
 from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
 from markov_collection.adapters.runtimes.ascend.synchronization import SynchronizationObservation
 from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation, GroupRepetition
-from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
+from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries, TensorAssignmentCall
 from markov_collection.adapters.runtimes.pytorch.modules import ModuleObservation
 from markov_collection.adapters.runtimes.pytorch.observation import OperatorObservation, TorchMarkers
 from markov_collection.artifacts import write_json
@@ -154,7 +154,7 @@ class MechanismProbe:
             "device": "npu",
             "device_index": torch.npu.current_device(),
         }
-        geometries = TensorAssignmentCall.input_geometries(self.recording.regions)
+        geometries = InputGeometries(self.recording.regions, self.recording.values)
         TensorAssignmentCall.declare(self.recording.regions, self.recording.values, geometries)
         AscendLayouts.declare(self.recording.regions, self.recording.operations, self.recording.values, geometries)
         self.recording.write(self.output / "observations.json", environment)

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+from graphlib import TopologicalSorter
 from typing import Any
 
 
 class DependencyPaths:
     def __init__(self, graph: dict[str, Any]) -> None:
         self.successors: dict[int, set[int]] = defaultdict(set)
+        predecessors: dict[int, set[int]] = defaultdict(set)
         for edge in graph["dependencies"]:
             self.successors[edge["source"]].add(edge["target"])
+            predecessors[edge["target"]].add(edge["source"])
+        self.order = {node: position for position, node in enumerate(TopologicalSorter(predecessors).static_order())}
 
     def missing(self, links: set[tuple[int, int]]) -> set[tuple[int, int]]:
         required: dict[int, set[int]] = defaultdict(set)
@@ -19,13 +23,26 @@ class DependencyPaths:
 
         missing = set()
 
-        # Search the full graph once per source; paths may cross another rank or flow.
+        # Paths can cross ranks and flows, but cannot move backward in the DAG's topological order.
         for source, targets in required.items():
+            targets.discard(source)
+            position = self.order.get(source, -1)
+
+            # Vertices absent from all edges are isolated; only their self-path can exist.
+            unreachable = {target for target in targets if self.order.get(target, -1) <= position}
+            missing.update((source, target) for target in unreachable)
+            targets.difference_update(unreachable)
+            if not targets:
+                continue
+
+            limit = max(self.order[target] for target in targets)
             visited = {source}
             pending = deque([source])
-            targets.discard(source)
             while pending and targets:
-                children = self.successors.get(pending.popleft(), set()) - visited
+                children = {
+                    child for child in self.successors.get(pending.popleft(), ())
+                    if child not in visited and self.order[child] <= limit
+                }
                 targets.difference_update(children)
                 visited.update(children)
                 pending.extend(children)
@@ -74,11 +91,13 @@ class ExecutionComparison:
         target: list[dict[str, Any]],
         execution: dict[str, Any],
         physical: dict[str, Any],
+        paths: DependencyPaths,
     ) -> None:
         self.native = native
         self.physical = physical
         self.positions = {operation["id"]: position for position, operation in enumerate(target)}
         self.execution = execution
+        self.paths = paths
         self.nodes = [node for node in execution["nodes"] if node.get("operation") in self.positions]
         self.order = DependencyPaths.resource_order(execution, self.nodes)
 
@@ -421,7 +440,7 @@ class ExecutionComparison:
 
         # A later frontier outside this flow can still complete its local work in the unchanged full graph.
         missing = required - internal
-        transitive = missing - DependencyPaths(self.execution).missing(missing) if missing else set()
+        transitive = missing - self.paths.missing(missing) if missing else set()
         missing -= transitive
         extra = internal - required
         same = not missing and not extra and not unexpected

@@ -71,20 +71,10 @@ print('Selected native devices are idle')
         self.investigation.check_storage(retained)
         return super().storage_bytes(retained)
 
-    def acquire(self, name: str, domain: dict[str, Any]) -> None:
-        super().acquire(name, domain)
+    def release_exports(self, domains: dict[str, dict[str, Any]]) -> None:
 
-        # Preserve source evidence before the default product workflow discards consumed SDK exports.
-        for key, relative in self.state["sources"].items():
-            if not key.startswith(name + "-source-"):
-                continue
-            for parent in self.acquisition.observation_directories(domain, self.directory / relative):
-                for child in ("native", "runtime"):
-                    source = parent / child
-                    if source.exists():
-                        archive = parent / "evidence"
-                        archive.mkdir(exist_ok=True)
-                        source.rename(archive / child)
+        # Independent investigation retains SDK facts at their original paths for later reinterpretation.
+        pass
 
 
 class Investigation:
@@ -267,9 +257,7 @@ class Investigation:
 
     def task(self, job_id: str) -> InvestigationTask:
         task = InvestigationTask(self, self.jobs[job_id])
-        if not all(
-            (task.directory / "assets" / domain / "templates.json").is_file() for domain in task.domain_settings
-        ):
+        if not all(task.asset_path(domain).is_file() for domain in task.domain_settings):
             raise FileNotFoundError(f"source library was not published: {job_id}")
         return task
 
@@ -295,20 +283,6 @@ class Investigation:
                     case.get("minimum_batch_members", 1),
                     case.get("control"),
                 )
-                if not validation.reuse_published:
-
-                    # A second backend consumes the first observation, including its resumed capture path.
-                    primary = NativeValidation(task, case["configuration"], case["workload"], capture)
-                    if primary.report.is_file():
-                        observation = json.loads(primary.report.read_text())
-                        primary.capture = task.directory / observation["capture"]
-                    if not primary.interpreted():
-                        return {
-                            "status": "blocked",
-                            "depends_on": self.native_key(job, {**case, "control": primary.control}),
-                            "reason": "the shared native target has not been fully interpreted",
-                        }
-                    validation.capture = primary.capture
                 previous = json.loads(validation.report.read_text()) if validation.report.exists() else None
                 outcome = (
                     previous
@@ -319,6 +293,7 @@ class Investigation:
                     self.coverage(outcome, subject, minimum, outcome.get(subject + "_evidence", {}))
                 outcome["report"] = str(validation.report.relative_to(self.directory))
                 self.check_storage(retained=True)
+                validation.release_observations({validation.control})
                 return outcome
             finally:
                 task.environment.cleanup()
@@ -341,12 +316,12 @@ class Investigation:
 
     @staticmethod
     def prediction(
-        task: Exploration, target: Path, output: Path, expected: str, error_terms: list[str]
+        task: Exploration, target: Path, output: Path, expected: str, error_terms: list[str], *, control: str
     ) -> dict[str, Any]:
-        asset = task.directory / "assets/domain-0/templates.json"
+        asset = task.asset_path("domain-0")
         detailed = task.directory / "work/investigation" / output.parent.name / "prediction.json"
         try:
-            task.simulate(asset, target, detailed, True)
+            task.simulate(asset, target, detailed, True, control=control)
         except CommandFailed as error:
 
             # A worker crash is not a successful negative case; require the declared input error.
@@ -381,11 +356,13 @@ class Investigation:
             task = self.task(case["job"])
         except FileNotFoundError as error:
             return {"status": "blocked", "depends_on": "workflow/" + case["job"], "reason": str(error)}
-        task.specification = {**task.specification, "control": case["control"]}
         output = self.directory / "cases" / case["id"] / "result.json"
         with (task.directory / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return self.prediction(task, self.directory / case["input"], output, case["expected"], case["error_terms"])
+            return self.prediction(
+                task, self.directory / case["input"], output, case["expected"], case["error_terms"],
+                control=case["control"],
+            )
 
     def public(
         self, arguments: list[str], output: Path, timeout: int = 30, owner: Exploration | None = None
@@ -543,12 +520,12 @@ class Investigation:
                 return {"status": "complete" if not missing.exists() and not result.parent.exists() else "differences"}
             return {"status": "differences"}
         if kind == "protect-input":
-            task.specification = {**task.specification, "control": case.get("control", task.specification["control"])}
+            control = case.get("control", task.specification["control"])
             target = self.directory / case["input"]
             original = target.read_bytes()
-            asset = task.directory / "assets/domain-0/templates.json"
+            asset = task.asset_path("domain-0")
             paths = [(target, target)]
-            if task.specification["control"] == "native":
+            if control == "native":
                 for role in ("core", "native"):
                     result = output.parent / role / "prediction.json"
                     source = result.with_suffix(".logs") / (role + ".log")
@@ -558,7 +535,7 @@ class Investigation:
             checks = []
             for source, result in paths:
                 try:
-                    task.simulate(asset, source, result, False)
+                    task.simulate(asset, source, result, False, control=control)
                 except CommandFailed as error:
                     passed = (
                         error.returncode == 1

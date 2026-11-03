@@ -14,9 +14,9 @@ from markov_collection.artifacts import write_json
 
 
 class PhysicalComparison:
-    def __init__(self, source: Path, trace: Path, runtime: Path | None = None) -> None:
+    def __init__(self, source: Path, trace: Path, profile: Path, runtime: Path | None = None) -> None:
         self.source = json.loads(source.read_text())
-        self.trace = AscendTrace(trace, runtime, device=self.source["environment"]["device_index"])
+        self.trace = AscendTrace(trace, profile, runtime, device=self.source["environment"]["device_index"])
 
     @staticmethod
     def signature(batch: dict[str, Any]) -> tuple[Any, ...]:
@@ -210,10 +210,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument(
+        "--profile", type=Path, required=True, help="original SDK profile directory containing host metadata",
+    )
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
-    report = PhysicalComparison(arguments.source, arguments.trace, arguments.runtime).write(arguments.output)
+    report = PhysicalComparison(
+        arguments.source, arguments.trace, arguments.profile, arguments.runtime,
+    ).write(arguments.output)
     print(
         json.dumps(
             {

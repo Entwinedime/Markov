@@ -130,7 +130,7 @@ class MatrixInputs:
         native_cases = [{"configuration": "wide", "workload": "varying" if moe else "boundaries"}]
         task = {
             "framework": "sglang",
-            "control": "lightweight",
+            "control": "native",
             "model": {"path": model["path"], "dtype": dtype},
             "deployment": {"physical_devices": list(range(devices))},
             "budget": {
@@ -194,24 +194,11 @@ class MatrixInputs:
         self.extended_inputs()
         self.capacity_and_route_inputs()
         self.scheduling_inputs()
+        self.arrival_inputs()
         self.lifecycle_inputs()
         for entry in self.manifest["jobs"]:
             task = self.tasks[entry["id"]]
-            controls = ("native",) if task["control"] == "native" else ("lightweight", "native")
-            entry["native_cases"] = [
-                {**case, "control": control} for case in entry["native_cases"] for control in controls
-            ]
-            if task["control"] == "lightweight":
-                for configuration in task["configurations"]:
-                    for workload in task["workloads"]:
-                        self.conditional(
-                            f"prediction-{entry['id']}-{configuration['id']}-{workload['id']}",
-                            entry["id"],
-                            self.target(configuration, workload, self.durations),
-                            "complete",
-                            entry["groups"],
-                            controls=("native",),
-                        )
+            entry["native_cases"] = [{**case, "control": "native"} for case in entry["native_cases"]]
             self.write(entry["task"], task)
         base_budget = {
             "native_attempts": sum(entry["native_attempt_cap"] for entry in self.manifest["jobs"]),
@@ -239,7 +226,7 @@ class MatrixInputs:
         }
         self.manifest["round_budget"] = {key: value + allowance.get(key, 0) for key, value in base_budget.items()}
         self.manifest["preparation_remaining"] = [
-            "Qualify shared observations, backend-specific reports, negative causes and lifecycle recovery",
+            "Qualify native-control reports, negative causes and lifecycle recovery",
             "Check that scheduling cases actually exercise mixed work, cache reuse, eviction and pressure",
             "Review native eligibility, reserved targets, per-job budgets and all previous coverage mappings",
             "Complete final code/document/data checks",
@@ -252,7 +239,12 @@ class MatrixInputs:
         entry = next(item for item in self.manifest["jobs"] if item["id"] == "qwen3-tp1")
         for running in (1, 2, 31, 32, 33, 101, 128):
             configuration = copy.deepcopy(task["configurations"][1])
-            configuration.update(id=f"r{running}", max_running_requests=running)
+
+            # Native admission charges at least one page per short Prefill member.
+            configuration.update(
+                id=f"r{running}", max_running_requests=running,
+                max_prefill_tokens=max(configuration["max_prefill_tokens"], running * configuration["page_size"]),
+            )
             task["configurations"].append(configuration)
         for count in (31, 32, 33, 64, 101, 128):
             requests = [
@@ -377,13 +369,15 @@ class MatrixInputs:
         )
         negative = copy.deepcopy(target)
         negative["configuration"]["page_size"] = 64
+
+        # Require the rejection boundary, not the printed operand order of its guard.
         self.conditional(
             "C-wrong-page-asset",
             "qwen3-tp1",
             negative,
             "rejected",
             ["C"],
-            ["markov: no region layout matches", '["eq","page_size",128] requires true'],
+            ["markov: no region layout matches"],
         )
         negative = copy.deepcopy(target)
         negative["configuration"].update(pp=3, microbatch_requests=2)
@@ -423,7 +417,6 @@ class MatrixInputs:
         )
         for name, model, tp, pp, ep, pd, mixed, cache in cases:
             task, entry = self.job(f"scheduling-{name}", model, tp, pp, ep, pd=pd, groups=["G", "K", "L"])
-            task["control"] = "native"
             task["configurations"] = task["configurations"][:2]
             for configuration, chunk in zip(task["configurations"], (128, 256), strict=True):
                 configuration["id"] = f"chunk-{chunk}"
@@ -492,7 +485,11 @@ class MatrixInputs:
                 configuration = copy.deepcopy(task["configurations"][1])
                 configuration["id"] = "cache-pressure"
                 for pool in configuration["pd"].values() if pd else (configuration,):
-                    pool.update(max_running_requests=1, max_total_tokens=1024)
+                    pool["max_running_requests"] = 1
+
+                # Prefix pressure belongs to Prefill; Decode still needs its native growth reservation.
+                prefill = configuration["pd"]["prefill"] if pd else configuration
+                prefill["max_total_tokens"] = 1024
                 task["configurations"].append(configuration)
                 workload = copy.deepcopy(task["workloads"][0])
                 workload["id"] = "cache-pressure"
@@ -504,6 +501,15 @@ class MatrixInputs:
                 for index, prefix in ((0, "extended"), (1, "common"), (2, "extended"), (4, "common"), (5, "extended")):
                     workload["requests"][index]["prefix_id"] = prefix
                 task["workloads"].append(workload)
+
+                if pd:
+                    impossible = copy.deepcopy(configuration)
+                    impossible["pd"]["decode"]["max_total_tokens"] = prefill["max_total_tokens"]
+                    self.conditional(
+                        "E-pd-decode-reservation", entry["id"], self.target(impossible, workload, self.durations),
+                        "rejected", ["E"], ["native Decode reservation cannot admit request"],
+                    )
+
                 minimum = {"chunked_batches": 1, "reused_prefix_tokens": 128}
                 entry["native_cases"].append(
                     {
@@ -588,6 +594,21 @@ class MatrixInputs:
             ["markov: incomplete route for"],
         )
 
+    def arrival_inputs(self):
+
+        # Arrival workloads need real timed cases as well as predictions with assumed durations.
+        for identifier, configuration, workload in (
+            ("qwen3-tp1", "small", "staggered"),
+            ("qwen3-tp1-pp3", "wide", "staggered"),
+            ("scheduling-pd", "chunk-256", "arrivals"),
+        ):
+            entry = next(item for item in self.manifest["jobs"] if item["id"] == identifier)
+            entry["native_cases"].append({"configuration": configuration, "workload": workload})
+            entry["native_attempt_cap"] += 1
+            budget = self.tasks[identifier]["budget"]
+            budget["native_seconds"] += 700
+            budget["processing_seconds"] += 900
+
     def lifecycle_inputs(self):
         base = copy.deepcopy(self.tasks["qwen3-tp1"])
         base["configurations"] = [copy.deepcopy(base["configurations"][0])]
@@ -632,42 +653,20 @@ class MatrixInputs:
             {"id": "L-bind-input", "kind": "missing-input", "job": "qwen3-tp1", "groups": ["L"]},
             {"id": "L-protect-input", "kind": "protect-input", "job": "qwen3-tp1", "input": guarded, "groups": ["L"]},
         ]
-        interrupted["control"] = "native"
-        native_path = self.write("lifecycle/interrupted-native/inputs/task.json", interrupted)
-        self.manifest["lifecycle_cases"] += [
-            {
-                "id": "L-interrupt-resume-native",
-                "kind": "interrupt",
-                "job": "qwen3-tp1",
-                "task": native_path,
-                "groups": ["L"],
-            },
-            {
-                "id": "L-protect-input-native",
-                "kind": "protect-input",
-                "job": "qwen3-tp1",
-                "control": "native",
-                "input": guarded,
-                "groups": ["L"],
-            },
-        ]
 
-    def conditional(
-        self, identifier, job, target, expected, groups, error_terms=(), controls=("lightweight", "native")
-    ):
+    def conditional(self, identifier, job, target, expected, groups, error_terms=()):
         name = self.write(f"inputs/cases/{identifier}.json", target)
-        for control in controls:
-            self.manifest["conditional_cases"].append(
-                {
-                    "id": identifier + "-" + control,
-                    "job": job,
-                    "input": name,
-                    "control": control,
-                    "expected": expected,
-                    "groups": groups,
-                    "error_terms": error_terms,
-                }
-            )
+        self.manifest["conditional_cases"].append(
+            {
+                "id": identifier + "-native",
+                "job": job,
+                "input": name,
+                "control": "native",
+                "expected": expected,
+                "groups": groups,
+                "error_terms": error_terms,
+            }
+        )
 
 
 if __name__ == "__main__":

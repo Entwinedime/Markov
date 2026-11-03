@@ -1,5 +1,6 @@
 {
   "framework": "sglang",
+  "control": "native",
   "model": {"path": "/models/Qwen3-8B", "dtype": "bfloat16"},
   "deployment": {"physical_devices": [4]},
   "budget": {

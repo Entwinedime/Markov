@@ -39,11 +39,13 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 ## 来源复用与结果含义
 
+模型词表和专家参数由SGLang的配置对象提供，完整配置同时保留用于恢复时核对模型身份；字段别名在框架适配边界处理。
+
 每次任务固定一个模型。dtype、TP、PP、EP、attention backend、page_size及chunk、mixed、prefix cache机制相同的配置共享来源；每个域保留实际逻辑 rank 的本地分片。可隔离 TP 先取得必要根角色，由实际模块和原生词表分片 API 规划其余代表，再为等价 peer 生成独立绑定。原生组仍启动协议所需的参与者，模型加载后比较模块布局和角色职责，仅选代表观察与导出；PP4、EP4 复用、TP2×PP3×EP2 及限定多 rank PD 组合已有开发核对。`inputs/role-plans` 和结果的 `role_source` 区分观察与派生。不同模型或域分别建立来源，不以相似 shape 自动替代所有职责，也不声明同库跨 TP 或跨页大小变换。
 
 同域内根据请求、并发、KV 容量与 Prefill 预算重新组批、求值几何、重复成员子图和连接端口。原生实现变化由已声明的条件和局部原型选择；超过模型上下文、参数范围或原型覆盖时保留明确失败。正式入口提供 SGLang/Ascend，单卡辅助通信只提供结构接口，不提供真实跨卡时延。
 
-一键探索默认使用轻量控制器，基线为 FCFS、分开的 Prefill/Decode、固定输出长度和冷逻辑 KV。先用下文命令构建control镜像，任务顶层设置 `"control": "native"` 可使用原生控制；已有模板也可通过下文的原生控制入口运行。原生代码决定组批及PP/PD推进，核心管理KV资源和模拟完成反馈，两种控制不保证产生相同批次。
+随附探索输入均显式选择 `"control": "native"`。先用下文命令构建control镜像，再运行一键探索；已有模板也可通过原生控制入口运行。原生代码决定组批及PP/PD推进，核心管理KV资源和模拟完成反馈。当前开发与验收只推进原生后端，轻量实现保留为待开发/待复验；未指定control的通用输入仍沿用既有缺省，不属于本轮示例选择。
 
 共同实例配置可加 `"prefill_chunk_tokens": 128`，PD放在 `pd.prefill` 内，要求原生控制、正整数且页对齐。chunk机制单独建来源域，目标chunk长度在域内变换；中间块保存KV索引并继续下一块，最终块才生成输出。单worker、dense TP2、MoE TP2/EP2、dense TP1×PP3、P1/D1、P TP2/D TP4、P/D各TP2/EP2及P/D各TP1×PP3已有分块开发核对。
 
@@ -53,7 +55,19 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 
 统一预热使用与目标序列分开的固定五请求，并按原生 ATB 上界预留 workspace；预热不计入目标服务时间，但计入采集费用。当前 runtime 规则针对 CANN 9.0/Ascend910B 的 dense 路径，workspace 预留限制为相等且不大于 128 的 head 维度。新的并行chunk/缓存组合、overlap、speculative 或其他内容相关路径需要各自的实现和证据。
 
+原生采集在资源清空和观察准备完成后，等待完整循环的空闲边界，再阻塞入口等待真实输入；Profiler启动后也等待相同边界。清空请求沿原生延后flush唤醒并等待发送/设备排空，workspace保留预热，已释放的PD元数据槽位恢复统一顺序。仿真先以空请求推进同一原生循环，所有组都到过空闲后停驻入口，目标请求到达才放行；下游stage继续排空控制环，准备不计入目标图或时间。旁路要求观察域声明`prewarmed_idle_ingress`，旧记录不能补写声明后使用；具名开发案例已贯通这一交接，泛化范围仍需独立验证。
+
 给定耗时改变后，完成事件会改变后续组批。一次运行完成、条件结构可展开、独立原生对照相符和性能精度通过分别判断，不能相互代替。
+
+开发中的真实时间旁路由`markov_application.native --completion-times <观察文件>`交给核心，使用相同原生控制、构图和资源主循环。独立观察文件包含来源、模型/环境域、对应输入及带语义身份的发布/完成事件，各事件携带原生rank/region引用`observations`；不修改workload，也不输入目标图或强制批次。明细输出的`observed_work`给出已匹配的目标任务与原生区域，只供诊断，不影响控制或构图。输出以`completion_source: observed_boundaries`标识，不产生内部节点时间线；结构/资源检查继续运行，内部时间检查为`not_measured`。
+
+普通serving、PP及PD共用转换开发入口`python3 -m markov_collection.adapters.frameworks.sglang.completion_times --capture <采集目录> --output <观察文件>`，在Docker内运行。普通目录包含本次完整请求序列的`session.json`、`request-delivery.json`及所有真实TP/PP参与者的`rank-N.json`；PD传入两池共同的采集根，消费根下的投递记录和prefill/decode各自的会话、rank观察及接收端`transport-rank-N.json`。单卡隔离分片不能提供真实组完成时间，输出位于原始采集目录之外。
+
+PP按stage合并TP完成，从原生发送句柄取得等待时刻；工作引用按原发送批次及wire字段关联延后等待，并涵盖同批次的结果准备和同步。PD接收准入同时引用原生BatchAccepted准备与PrebuiltResult，不以最终时间marker代替全部工作。PD沿实际分片和传输会话合并数据/末片元数据完成，并分别消费目的广告、源端握手、两端成功发布及状态查询事实。握手与发布按请求及端点控制组合并，不按每条路由复制；复制返回不能同时充作两端成功，源端接收广告也不必等待目的发送调用返回。查询只交接读取边界，状态、归约、metadata gate及请求选择仍由核心资源和原生代码决定。
+
+转换直接消费不可变rank观察，共享调度、结果和缓存服务解释，辅助primitive原型不进入控制动作，不要求预先解析完整物理trace。发送以原生入队服务前的KvSubmit标记反馈，后续CPU尾部不阻挡后台复制。具名多阶段PD开发案例已完整消费真实边界，内部结构及工作范围仍有未验证项；旧失败记录保留，缺必要事实的旧派生输入不能用于当前合同。末轮清理沿控制动作交接，不另填idle时间表。
+
+独立原生比较入口`validation.py`先固定目标原生观察，自动将边界时间写入`work/validation/<实际采集名>/observed/completion-times.json`，再经任务的`simulate(..., completion_times=...)`执行精简与明细预测。它不复用给定耗时的探索结果，缺少必要边界时保留错误。默认/明细比较排除图、逐步历史及`observed_work`等诊断字段，正式请求、资源和完成结果仍须相同；恢复到新采集尝试时，预测及评价也归属新尝试。常规探索继续使用输入给定的节点耗时，不自动运行目标ground truth。
 
 核心CLI的`record-batches`和`simulate --batches`可固定原生成员、token范围及PP lane作诊断，当前限完整Prefill、无前缀缓存。它沿用轻量控制器，未记录原生预分配槽位或跨实例预约历史；同一批次仍可能具有不同池状态和缓冲区形状。回放不能代替原生控制预测，局部比较须同时核对输入条件。
 
@@ -64,19 +78,20 @@ MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --inp
 ```text
 data/<UTC时间>_automatic-graph/
   inputs/                       原任务、环境身份、角色规划及逐组合输入
-  captures/<角色-尝试>/         会话摘要、操作来源及规范物理事实
+  captures/<角色-尝试>/         原始会话、语义记录及按策略保留的SDK导出
   assets/<实现域>/templates.json  共享定义/布局/执行模式与独立角色绑定
   results/summary.md             人读入口、失败与累计费用
   results/<配置>/<请求集>.json   默认的精简组合结果及逐请求结果
   diagnostics/                  --details 时的完整组合结果
   logs/run.log                  子进程命令与失败原因
   state.json                    任务状态、资产位置及费用
-  work/                         SDK、观察库与尚未发布的草稿
+  work/observations/<采集名>/    建库消费的语义解释、物理事实及派生trace
+  work/                         SDK、观察库与尚未发布的草稿，按任务生命周期清理
 ```
 
-默认保留后续消费需要的规范来源与模板，随状态提交释放无引用历史。PD来源另保留每rank的`transport-rank-N.json`注册端点/地址，以及`rank-N.json`中实际复制的地址片段，用于对应原生rank、层、head和页；进程地址不进入模板或目标身份。首次运行加 `--details` 才保留完整图、逐批/逐 token 记录和原始 profiler/runtime 导出；完整组合结果改写到 diagnostics。全部域资产发布后释放私有 work，即使目标结构仍为 partial。数据和构建产物不提交 Git。
+原始语义记录与模板保留，解释阶段不回写采集文件。建库使用work中的语义声明和物理事实，资产发布后按任务策略释放；PD原始来源另保留每rank的`transport-rank-N.json`注册端点、地址及buffer布局，以及`rank-N.json`中实际复制的地址片段。框架适配将其解释为layer/head、逻辑页槽区间和元数据行，example再对照目标声明与完成关系；进程地址不进入模板或目标身份，页尾填充不冒充有效模型token。首次运行加 `--details` 才保留完整图、逐批/逐token记录和原始profiler/runtime导出；完整组合结果改写到diagnostics。全部域资产发布后释放私有work，即使目标结构仍为partial；独立调查保留原始SDK材料供重解释。数据和构建产物不提交Git。
 
-显式重新执行 `interpret` 会按当前适配规则重建语义声明和物理事实；开始后旧物理结果失效，失败时不作为完成结果复用。带 profile 的重新解释需要保留原始 native/runtime 导出；默认精简任务已删除这些文件后仍可使用已发布模板，但不能重建物理事实。任务恢复继续复用已发布资产，不因源码变化自动更新旧库。
+显式重新执行`acquisition interpret --capture <原始目录> --output <工作目录>`按当前规则生成语义声明和物理事实，输出必须在原始目录之外。SDK使用临时可写副本处理其日志和表，trace及分析日志写入工作目录；解释进程不加载采集用preload。开始后工作目录的旧物理结果失效，失败时不能复用；原生会话已完成而解释失败时，只恢复后处理。带profile的重解释需要原始native/runtime导出，默认精简任务删除它们后仍可使用已发布模板，不能重建物理事实；恢复也不因源码变化自动更新旧库。
 
 恢复沿用原目录：
 
@@ -84,7 +99,7 @@ data/<UTC时间>_automatic-graph/
 example/automatic_graph/run.sh --resume data/<UTC时间>_automatic-graph
 ```
 
-模型、配置、请求和部署固定；通过 `--input 修改后的任务.json --resume 原目录` 仅可调整总预算或替换完整给定耗时。累计费用不清零，耗时变化从初态重算结果，模板继续复用。已有事实足够时只重做解释或建库，不重复启动 Engine；恢复不自动升级旧资产，源码合同变化须明确建立新基线。
+模型、配置、请求和部署固定；通过 `--input 修改后的任务.json --resume 原目录` 仅可调整总预算或替换完整给定耗时。累计费用不清零，耗时变化从初态重算结果，模板继续复用。模板是否已发布以`assets/<域>/templates.json`实际存在为准，空目录不能跳过建库或触发来源清理。已完成任务的摘要直接由保存状态重新生成，摘要缺失不触发构建或计算。已有事实足够时只重做解释或建库，不重复启动 Engine；恢复不自动升级旧资产，源码合同变化须明确建立新基线。
 
 更换耗时先使全部旧结果登记失效，再发布新输入，避免中断后混用新旧结果。命令失败或中断时先回收本地进程，再清理本任务容器；清理无法确认则保留pending及预留费用，失败原因仍写入状态和摘要。原生预测的结果和两份日志都不得覆盖输入，包括日志通过链接指向输入的情况。
 
@@ -100,31 +115,31 @@ cmake -S src/collection/native/runtimes/ascend \
   -B "$MARKOV_OBSERVER_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DMARKOV_ASCEND_INCLUDE_DIR=/usr/local/Ascend/ascend-toolkit/latest/include
 cmake --build "$MARKOV_OBSERVER_BUILD" -j2
-mkdir -p data/YOUR_RUN/captures/source/runtime
+mkdir -p data/YOUR_RUN/capture/runtime
 LD_PRELOAD="$MARKOV_OBSERVER_BUILD/libmarkov_ascend_observer.so" \
-MARKOV_NATIVE_RUNTIME_DIR="$PWD/data/YOUR_RUN/captures/source/runtime" \
+MARKOV_NATIVE_RUNTIME_DIR="$PWD/data/YOUR_RUN/capture/runtime" \
 python example/automatic_graph/serving.py \
   --model /models/Qwen3-8B --profile \
   --matrix-selector "$MARKOV_OBSERVER_BUILD/markov_ascend_matmul_selection" \
-  --output data/YOUR_RUN/captures/source
+  --output data/YOUR_RUN
 ```
 
 `--tp-size N --rank R` 在单张物理卡上执行指定逻辑角色；实际请求、KV、槽位和 worker 仍由原生框架维护。物理卡由容器的 `ASCEND_RT_VISIBLE_DEVICES` 选择，worker 使用映射后的逻辑卡号。`--dtype float16` 可用于对应 FP16 模型，必须与目标资产一致。
 
-`--input` 可读取 serving 输入中的配置与请求，但原生观察入口只接受全部 `arrival_ns=0` 的请求。不提供时使用固定代表配方；自定义目标请求不替换统一预热。输出包括 `rank-N.json`、`session-summary.json`，启用 profile 后还生成规范 `physical.json`。预加载目录须与 runtime 输出目录一致。
+`--input`可读取serving配置与请求；原生观察按`arrival_ns`的单调时钟期限异步提交，同刻请求按声明顺序提交，后到请求不等待前一请求完成。实际组批归原生框架，不提供输入时使用固定代表配方，统一预热独立于目标请求。输出根下`capture/`保存原始rank记录、会话、SDK材料和`request-delivery.json`，后者记录投递轮次、起点、计划到达及实际偏移；它不等于scheduler接收时刻或精确纳秒保证。`source/`保存解释后的rank记录及启用profile时的物理事实/trace，解释由清除采集preload的独立进程完成。预加载目录须与capture/runtime一致。
 
 ## 建库与目标执行
 
 在宿主通过 modeling 容器消费来源：
 
 ```bash
-scripts/markov.sh inspect --source data/YOUR_RUN/captures/source/rank-0.json
+scripts/markov.sh inspect --source data/YOUR_RUN/source/rank-0.json
 scripts/markov.sh produce \
-  --source data/YOUR_RUN/captures/source/rank-0.json \
+  --source data/YOUR_RUN/source/rank-0.json \
   --output data/YOUR_RUN/diagnostics/source-graph.json
 scripts/markov.sh templates \
-  --source data/YOUR_RUN/captures/source/rank-0.json \
-  --physical data/YOUR_RUN/captures/source/physical.json \
+  --source data/YOUR_RUN/source/rank-0.json \
+  --physical data/YOUR_RUN/source/physical.json \
   --output data/YOUR_RUN/assets/templates.json
 scripts/markov.sh simulate \
   --templates data/YOUR_RUN/assets/templates.json \
@@ -148,7 +163,9 @@ bash scripts/markov-control.sh \
 
 `inspect` 报告声明的形状、条件和状态缺口；`produce` 发布公开图。模板分开自身工作定义、子调用组合布局、具体调用绑定与物理执行变体；层号、动态成员和目标实例不自动形成新定义。`simulate` 依据目标状态和完成事件持续展开，CPU 服务、设备工作、等待及输出端口各有边界。
 
-`expand --templates ... --target ... --output ...` 用于单区域诊断。例如模型 Decode 的目标参数可包含 `M`（新增 token）、`B`（本批成员）、`R`（请求池容量）和 `max_sequence_tokens`。固定模型绑定来自资产；动态参数和子调用仍须满足模板合同。`expand`/`compose` 的目标可用 `source_rank` 选择来源角色，默认 0；`compose` 按具名端口连接多个区域，不另建调度器。
+`expand --templates ... --target ... --output ...` 用于单区域诊断，`compose` 的 `invocations` 数组用于多个区域；二者均通过正式 `TargetGraph` 绑定、选择和发布，输出同一种图。目标可用 `source_rank` 选择来源角色，默认 0。动态参数、子调用和必需输入均须满足模板合同，不能仅凭标量参数跳过数据输入。
+
+目标的 `values` 数组声明初始操作数，每项给出非负 `storage`（相同编号表示共享存储）和 `kind`；`tensor` 另给 `dtype`、`device`、非负整数 `shape`。调用的 `inputs` 按端口名使用 `{"value": 0}` 引用初始值，或在 `compose` 中用 `{"call": 0, "port": "输出端口名"}` 引用前一调用输出。初始值没有图内 producer，输出及状态变化由模板计算；不输入预期输出或来源 layout 编号来选择候选。由所有者初始化的池状态可以省略，显式提供时仍检查几何与别名。
 
 局部诊断核对给定输入条件下的模板行为，派生输出由模板计算；完整serving还需核对控制器怎样产生这些输入，以及跨调用的资源与完成关系。
 
@@ -162,9 +179,9 @@ example/automatic_graph/run.sh validate \
   --capture captures/target-larger-together
 ```
 
-配置和请求集ID来自该任务的输入。入口沿用任务的`control`选择，通过正式预测入口计算默认/明细结果，再观察全部真实worker，逐rank比较；目标观察不参与建库。摘要比较仅去掉明细独有的图、轨迹及资源所有权记录，资源计数等正式结果仍须完全相同。原生入口要求请求同时到达，所需物理卡由原任务deployment提供，预算继续使用该任务的累计额度，必须事先覆盖来源与目标运行。已有capture仅在模型、拓扑、请求、规定的池参数及路由一致时复用，已有案例报告拒绝覆盖；不自动重试。
+配置和请求集ID来自该任务的输入，当前选择原生控制。入口先观察或复用全部真实worker的固定案例，自动转换本例真实边界时间，再经正式任务入口计算默认/明细结果并逐rank比较；目标观察不参与建库。摘要比较去掉明细独有的图、轨迹、工作引用及资源所有权，资源计数等正式结果仍须完全相同。请求按workload到达约定投递，现有固定开发案例为同时到达，错峰资格仍须单独验证。物理卡由原任务deployment提供，来源、目标运行及后处理共用任务累计额度；模型、拓扑、请求、池参数及路由一致时才复用capture，失败记录保留，显式恢复到新尝试时不沿用旧预测和评价。
 
-案例汇总保存在`results/validation/<配置>/<请求集>/<control>/<capture名>.json`，逐rank明细及执行/路由证据在旁边同名目录，原生事实保存在指定capture目录。原生证据逐行核对workload专家ID与实际通信split、专家计数；批次人数取实际Prefill/Decode执行区域。预测证据检查节点完成、依赖就绪、资源独占、动作排空、交接边及输出序列。普通失败保留错误并继续其他rank；预算耗尽与中断单独记录，保留尚需处理的临时材料。完成对照后删除消费过的大图，结构差异或partial均不代表性能精度结论。
+案例汇总保存在`results/validation/<配置>/<请求集>/<control>/<原始capture名>.json`，入口保持稳定；逐rank明细及执行/路由证据放在旁边的实际采集名目录，原生事实保存在指定capture目录。原生证据逐行核对workload专家ID与实际通信split、专家计数；批次人数取实际Prefill/Decode执行区域。预测证据检查节点完成、依赖就绪、资源独占、动作排空、交接边及输出序列。普通失败保留错误并继续其他rank；预算耗尽与中断单独记录，旧尝试保留为history。matched后清理已消费的派生工作区，其余状态保留必要材料；结构差异或partial均不代表性能精度结论。
 
 `matrix.py`维护基础边界及调度/缓存组合的调查配方。已有模型来源元数据的准备目录可用`run.sh matrix --run data/YOUR_MATRIX`生成任务与边界输入；它只写输入，未运行模型，且拒绝改写已冻结清单。每个来源域的正式输入位于`runs/<域名>/inputs/task.json`，后续通过同一正式workflow启动，批量调查编排和汇总继续留在example。负例通过`error_terms`预先声明必要错误内容，只有原因匹配且未发布结果才算预期拒绝；其他失败记为error，进程崩溃不能充当输入拒绝。
 
@@ -172,7 +189,9 @@ example/automatic_graph/run.sh validate \
 
 `request_seed`同时影响通用请求组合和固定边界案例的输出长度；人数、prompt边界和单步结束保持，32/64步输出案例改用种子生成的prompt。专家路由在请求长度确定后生成。备用种子沿同一配方预先生成并核对，不能仅改ID或在看到结果后选输入；历史触发案例保留为回归。请求几何未重复只是输入检查，不证明独立验证或泛化通过。Decode优先标签只用于启用mixed的共同实例；EP非mixed及P/D分离仍检查自身chunk/cache机制。
 
-基础范围分别运行轻量与原生后端，共用模板、真实目标和任务额度，报告按control隔离；另一后端重新预测，不使用主后端的已发布结果。共享目标未完成解释时，另一后端等待同一观察，不额外启动采集。chunk/mixed/cache组合只交给已实现这些能力的原生后端。生成配方不等于矩阵已经合格：冻结前仍须核对实际机制触发、原生资格、留出、预算和完整覆盖。
+调查配方仅生成原生控制后端的任务、条件和生命周期案例，取消轻量重复项及双后端比较。同一预测的多rank比较通过一次工作交接读取预测并建立共用索引，逐rank原子发布报告；中断或额度停止后保留已完成rank，不重新比较。实际分配动作推进请求驻留范围，准备输入只观察已有槽位、token及页身份，最终prepare不重复记账。生成配方不等于矩阵已经合格：冻结前仍须核对七模型及A–L组的实际机制触发、原生资格、留出、预算和完整覆盖。
+
+正式workflow承担其全部配置/request组合的原生预测，指定真实对照继续消费这些结果并取得独立观察；不再为原先另一后端补生成同一正向预测条件。具名负例及机制条件保留，重复的中断/输入保护副本合并成一套原生生命周期检查。清单变更后重新统计次数与额度，旧双后端报告不改写；对应任务受阻时仍保持未覆盖。
 
 原生案例的`minimum_coverage`分别约束`native`和`execution`证据。`coverage.by_actor`从实际模型区域记录总成员、Prefill/Decode成员峰值、未完成prompt的分块批次、混合批次及首次Prefill已有的前缀token；`observed`取各rank最大值，不把TP/PP重复工作累加。预测另从资源历史统计`cache_evictions`，原生未观察的淘汰不补成零。未达到门槛或缺少事实时，原本通过的案例降为partial，已有error/differences保留。覆盖只说明机制发生，不能替代结构、状态或Decode优先策略的正确性检查。
 
@@ -186,7 +205,7 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 
 批量入口核对冻结代码与镜像，先运行全部正式来源/预测任务，再执行预选原生对照、边界输入和生命周期案例；不根据目标结果补模板。整轮与各任务分别保留时间、尝试及存储上限，原生启动前检查声明卡的实际进程，已有占用或无法确认空闲时不启动Engine。独立案例出错后继续无依赖案例，缺来源的案例记blocked；预算停止/中断保留历史与费用，原命令可继续未完成案例，完成的结果不覆盖。
 
-`results/summary.md`为整轮入口，`results/outcomes.json`保留逐次结果，`runs/<域>/`仍采用正式目录结构，额外边界及生命周期证据在`cases/`。来源SDK/runtime原始导出消费后移到原capture的`evidence/`中，避免默认清理且不复制；规范事实保留采集时路径，需检查原始文件时使用该归档位置。完整临时图消费后删除，只保留精简证据。整轮结束不自动判为结构全部通过，也不自动生成窗口审查结论。
+`results/summary.md`为整轮入口，`results/outcomes.json`保留逐次结果，`runs/<域>/`仍采用正式目录结构，额外边界及生命周期证据在`cases/`。调查保留原始SDK/runtime在capture原位置，覆盖普通任务的导出释放策略，不移动或改写原始目录。目标解释结果在`work/validation/<capture>/observed/source`，公开投影和完成时间在其父目录共用，预测明细按后端保存；matched后释放已消费的后端明细，全部计划后端matched再释放共用观察。partial、差异及停止的明细保留供归因，不把重新运行预测当作旧明细。整轮结束不自动判为结构全部通过，也不自动生成窗口审查结论。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -196,11 +215,15 @@ example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 | [structure.py](structure.py) | 比较独立观察与预测的批次、工作、几何、状态及端口 |
 | [operations.py](operations.py) | 共用操作、端口及数据依赖核对，独立于serving配对和调度 |
 | [execution.py](execution.py) | 核对 API、事件、队列排空与 stream 完成前沿；共用依赖路径查询，保持完整图中的跨rank/flow路径 |
-| [evidence.py](evidence.py) | 检查预测时间线、输出及原生实际路由与组批证据 |
+| [evidence.py](evidence.py) | 检查预测时间线、输出及原生投递、路由与组批证据 |
 | [request_state.py](request_state.py) | 核对共同动作顺序、请求输入范围和输出进度；另核对终态资源及逐rank索引绑定，不重演独占页池 |
 | [resource_history.py](resource_history.py) | 核对所有者实际分配、共享绑定、传输、释放与终态，以及页归还时已提交模型/传输的设备消费者是否结束；不选择缓存策略 |
 | [operands.py](operands.py) | 按当时资源绑定核对SGLang模型入口的KV位置、槽位和长度；检查同rank/layer的attention状态存储及跨动作设备路径 |
 | [validation.py](validation.py)、[matrix.py](matrix.py)、[investigation.py](investigation.py) | 单案例对照、具名输入和冻结批量调查；复用正式workflow并与核心业务分开 |
+
+`allocator.py --output <目录> --device npu --page-size 128 --need-sort`直接观察实际分配器，不启动模型或serving；省略`--need-sort`观察普通即时池，`--device cpu`只使用大分配的原生Python路径。原始公共操作保存在observations.json，summary.json只给成员数和三段分支覆盖；该诊断不自动取得物理归属或完整serving资格。
+
+`evidence.py --source ... --input <目标输入> --delivery <同次capture/request-delivery.json> --output <报告>`读取一次连续workload的发送记录，检查请求分组覆盖、未提前发送和发送次序，并报告发送延迟；发现/重复轮次不能当作单次目标输入。验证编排在观察目录共用`native-evidence-<minimum-batch-members>.json`。投递检查只说明发送端行为，不观察调度器接收时刻、不改写arrival_ns，也不单独证明组批或结构正确；`--prediction`只消费预测结果，不接收`--delivery`。
 
 这些入口读取公共结果和原生事实，不回流修改被验预测。物理工作有归属不等于全部依赖已恢复；不完整参数或关联保留 partial，不能按最近时间强配。结构来源 profiler 耗时不直接成为 CPU、设备、通信成本，dummy 权重也不提供数值或内容相关行为的正确性结论。
 
@@ -216,11 +239,23 @@ PD交接检查覆盖每个生产端完成端口：它必须到达接收动作等
 
 执行核对还沿目标图每个输入值的实际producer，检查生产调用的CPU返回能否到达使用调用的入口，报告在`value_production`。该项保证值描述符先产生再使用，不按原生批次顺序替换目标生产者；设备内容就绪及共享存储读写保护属于另外的关系，不能仅凭描述符检查就授予这些资格。
 
-模型主体比较包含Prefill、Decode和Mixed及其子调用，独立核对该范围的操作、设备工作和异步复制。配置启用mixed不代表实际出现混合批次，仍须以观察或展开记录确认。
+模型主体比较包含Prefill、Decode和Mixed及其子调用，按请求/token独立核对该范围的操作、设备工作、异步复制和完成关系，结果放在`comparisons[].model_body`。同一项的`checks`核对原生结果scope的槽位、请求效果、回收页身份及池大小；预约和准备的行访问使用实际批次工作信息。配置启用mixed不代表实际出现混合批次，仍须以观察或展开记录确认。
 
-单个flow的完成关系比较只证明所选操作范围内的边。等待若涉及起点之前或上一flow的工作，会分别报告外部完成边及未绑定前沿，保持partial；完整窗口及控制交接另行核对。范围内缺边、多余边或外部资源连接错误仍判为差异。
+模型主体的完成关系只证明所选操作范围内的边。等待若涉及起点之前或其他工作，分别报告外部完成边及未绑定前沿；完整窗口可证明其中已对应的跨工作路径，状态错误或其他未知不随之消除。范围内缺边、多余边或外部资源连接错误仍判为差异。
 
-整窗口覆盖原生明确记录的source serving批次及请求所属传输，包括无计算决定和终止清理，排除baseline与标为primitive的辅助原型。配对沿请求/token、具名调用入口和调用者的完整序列区间建立，保留已知锚点；明确请求归属优先于当前调度轮。输入生产者冲突时，同名调用不能建立新对应，已知锚点的冲突仍报告。排除冲突后，可依据全部已对应的输入生产者和调用合同定位同一执行主体内两侧唯一的调用；重复调用或输入身份不足仍保留未对应。仅比较已对应调用的公开端口、逻辑依赖及CPU返回到消费入口的路径，再核对事件/队列/stream关系；原生调用者总顺序单列，不将独立请求的换序直接视为错误。原始设备与异步复制总量在完整窗口独立核对，未对应调用保持覆盖缺口。核对始终使用原预测图及其依赖，序列化排列另行报告。覆盖不完整时不能判为matched；已对应部分存在差异时仍报告differences。未配对工作及其因果仍未验证，结构核对不授予原生调度策略等价资格。
+整窗口覆盖原生明确记录的source serving批次及请求所属传输，包括无计算决定和终止清理，排除baseline与标为primitive的辅助原型。原始批次标签只用于范围资格及模型/结果定位，不将请求操作重挂到最后一个模型批次，也不再比较“整批所有CPU调用”的人为切片。整窗口统一核对全部公开操作与依赖；`observed_work`提供实际工作引用，同一调用的多个动作和多片段传输据此归并，再沿已知输入和数据生产者建立对应。没有模型批次标签的合格请求传输仍纳入设备/API总量；已知跨工作配对不接受，缺少依据继续保留未验证。
+
+调用序列只能在既有锚点之间补充完整相等区间，输入冲突必须拒绝，新增对应也须重新核对输入。仅比较已对应调用的公开端口、逻辑依赖及CPU返回到消费入口的路径，再核对事件/队列/stream关系；原生调用者总顺序单列，不将独立请求的换序直接视为错误。原始设备及异步复制总量在完整窗口独立核对，未对应工作及其因果仍保留缺口。没有完整对应或工作归属依据时不能判为matched，已证明的差异仍报告differences；核对不改写原图，也不授予原生调度策略等价资格。
+
+没有具名输入的接口按标准化实参树中的Tensor路径核对输入，额外捕获的私有存储没有位置合同。编码字典按实际键识别实参，关键字排列不改变身份。
+
+赋值的目标引用与读取实参分开判断：同一个张量也出现在索引或载荷中时仍有读取，不能因输入ID去重只剩一项就将其视为只写。无法证明读取行范围时保留未知，不移除相应存储依赖。
+
+共享request map与token relay复用同一按行追溯。实际索引必须对应当前批次已声明的request_slots列；request_slot回调优先使用明确请求身份，再使用可对应的批次成员，部分Mixed不能套用最终合批的全部成员。
+
+视图描述符也可由已对应的生产调用证明：先定位同名输出端口或同一输出位置，再核对原生存储、偏移、shape、stride、dtype及device；不能任选同一调用的其他输出。存储版本更新不改变视图几何，写入到读取、CPU返回和设备完成仍独立核对。读取数据按选中行的实际写入者匹配，不把其他行的最后写入者当作当前数据来源。只去除有明确不相交范围证明的整存储约束，未知范围、别名或输入历史保留。`verified_storage_bindings`记录有证据的输入对应；不改写原始来源或目标图。
+
+调用身份使用种类与名称，返回值和公开端口另行检查。`opaque_outputs`沿正式模板生产、展开及图压缩保留，表示存储内容而非张量视图；非具名接口与普通操作的张量结果不计这些内容别名，具名端口仍按其声明核对。原有输出、存储写入及依赖不删除，不根据目标缺shape推断opaque，也不按操作名跳过输出检查。
 
 原生适配器可以在实际控制调用边界声明`control_only`。`controller_scope`单列这些调用及操作数；只有没有跨范围数据依赖、设备/runtime动作和共同通信合同时，比较视图才分开这部分控制工作。声明不成立时保留操作并报告差异；未标记的工作不自动排除。原图、模型通信、准备/释放和等待关系保持原样，状态轮询与不同策略的原生开销不因此获得预测资格。
 

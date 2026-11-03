@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +45,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--observe-all-workers", action="store_true", help="observe native peers without changing role reuse"
     )
-    parser.add_argument("--input", type=Path, help="serving input with simultaneous requests and native pool limits")
+    parser.add_argument("--input", type=Path, help="serving input with request arrivals and native pool limits")
     parser.add_argument(
         "--matrix-selector", required=True, help="native matrix metadata executable from the observer build"
     )
@@ -56,8 +58,6 @@ if __name__ == "__main__":
     serving_input = None
     if arguments.input is not None:
         specification = json.loads(arguments.input.read_text())
-        if any(request["arrival_ns"] != 0 for request in specification["requests"]):
-            parser.error("native observation submits requests together; arrival_ns must be zero")
         requests = tuple((request["prompt_tokens"], request["output_tokens"]) for request in specification["requests"])
         settings = specification["configuration"]
         range_configuration = settings
@@ -69,10 +69,11 @@ if __name__ == "__main__":
     if tp_size < 1 or not 0 <= arguments.rank < tp_size:
         parser.error("rank must be in [0, tp-size)")
 
+    capture = arguments.output / "capture"
     NativeServingSession(
         arguments.model,
         requests,
-        arguments.output,
+        capture,
         arguments.profile,
         tp_size,
         arguments.rank,
@@ -88,4 +89,13 @@ if __name__ == "__main__":
         observe_all_workers=arguments.observe_all_workers,
         serving_input=serving_input,
     ).run()
-    SGLangAcquisition.interpret({"output": str(arguments.output), "rank": arguments.rank})
+
+    # Analysis must not append runtime observations to the completed native case.
+    environment = dict(os.environ)
+    for name in ("LD_PRELOAD", "MARKOV_NATIVE_RUNTIME_DIR"):
+        environment.pop(name, None)
+    subprocess.run(
+        SGLangAcquisition.command("interpret", str(capture.resolve()), str((arguments.output / "source").resolve())),
+        env=environment,
+        check=True,
+    )

@@ -91,14 +91,9 @@ class ExecutionEvidence:
     def check(self) -> dict[str, Any]:
         graph = self.result["graph"]
         execution = graph["execution"]
-        timeline = {item["node"]: item for item in self.result["execution_timeline"]}
         identities = {node["id"] for node in execution["nodes"]}
-        checks = {
-            "timeline_identity": len(timeline) == len(self.result["execution_timeline"])
-            and len(identities) == len(execution["nodes"])
-            and set(timeline) == identities,
-        }
-        if not checks["timeline_identity"]:
+        checks = {"node_identity": len(identities) == len(execution["nodes"])}
+        if not checks["node_identity"]:
             return {"status": "differences", "checks": checks}
 
         # Follow each target's actual producer; native batching can carry a different state value.
@@ -112,48 +107,42 @@ class ExecutionEvidence:
         missing = DependencyPaths(execution).missing(required)
         checks["value_descriptor_readiness"] = not missing
 
-        # A serving window ends at its visible ports; unrelated asynchronous tails can still be in flight.
-        checks["nonnegative_intervals"] = all(
-            self.valid_interval(item, self.result["completed_ns"]) for item in timeline.values()
-        )
-        checks["dependency_readiness"] = all(
-            timeline[edge["target"]]["status"] == "waiting"
-            or (
-                timeline[edge["source"]]["status"] == "completed"
-                and timeline[edge["source"]]["completed_ns"] <= timeline[edge["target"]]["started_ns"]
-            )
-            for edge in execution["dependencies"]
-        )
-        resources = defaultdict(list)
         owned = defaultdict(list)
         owner = {}
         for node in execution["nodes"]:
-            item = timeline[node["id"]]
-            if item["status"] != "waiting":
-                end = item["completed_ns"] if item["status"] == "completed" else item["expected_ns"]
-                resources[node["resource"]].append((item["started_ns"], end))
             region = node.get("region")
             if region is None:
                 region = graph["operations"][node["operation"]]["region"]
             scope = graph["regions"][region]
-            identity = (
-                ("action", scope["task"]["group"], scope["task"]["sequence"])
-                if "task" in scope
-                else ("control", scope["control"])
-            )
-            owned[identity].append(item)
+            identity = ("action", scope["task"]["group"], scope["task"]["sequence"])
+            owned[identity].append(node["id"])
             owner[node["id"]] = identity
-        checks["exclusive_resources"] = all(
-            left[1] <= right[0] for intervals in resources.values() for left, right in pairwise(sorted(intervals))
-        )
         decisions = self.result["decisions"]
         boundaries = {("action", item["task"]["group"], item["task"]["sequence"]): item for item in decisions}
-        boundaries.update((("control", index), item) for index, item in enumerate(self.result["controls"]))
-        checks["work_ownership"] = len(boundaries) == len(decisions) + len(self.result["controls"]) and set(
-            owned
-        ) <= set(boundaries)
+        checks["work_ownership"] = len(boundaries) == len(decisions) and set(owned) <= set(boundaries)
         if not checks["work_ownership"]:
             return {"status": "differences", "checks": checks}
+
+        # Boundary evidence does not imply that any internal device node has completed.
+        checks["boundary_ports"] = all(
+            bool(item["execution_ports"]["completions"])
+            and set(item["execution_ports"]["completions"]) <= identities
+            for item in boundaries.values()
+        ) and all(
+            item["execution_ports"]["publication"] is None or item["execution_ports"]["publication"] in identities
+            for item in decisions
+        )
+        if not checks["boundary_ports"]:
+            return {"status": "differences", "checks": checks}
+        checks["boundary_intervals"] = all(
+            0 <= item["scheduled_ns"] <= item["completed_ns"] <= self.result["completed_ns"]
+            for item in boundaries.values()
+        ) and all(
+            "published_ns" not in item
+            if item["execution_ports"]["publication"] is None
+            else item["scheduled_ns"] <= item["published_ns"] <= item["completed_ns"]
+            for item in decisions
+        )
 
         # A continuation can close an existing call without creating another operation or execution node.
         checks["continuation_ownership"] = all(
@@ -167,23 +156,8 @@ class ExecutionEvidence:
             for identity, boundary in boundaries.items()
         )
 
-        checks["scheduled_work"] = all(
-            item["status"] == "waiting" or boundaries[identity]["scheduled_ns"] <= item["started_ns"]
-            for identity, items in owned.items()
-            for item in items
-        )
-        checks["completion_ports"] = all(self.ports_complete(item, timeline) for item in boundaries.values())
-        checks["publication_ports"] = all(
-            "published_ns" not in item
-            if item["execution_ports"]["publication"] is None
-            else (
-                timeline[item["execution_ports"]["publication"]]["status"] == "completed"
-                and max(item["scheduled_ns"], timeline[item["execution_ports"]["publication"]]["completed_ns"])
-                == item["published_ns"]
-                <= item["completed_ns"]
-            )
-            for item in decisions
-        )
+        timing = self.node_timing(boundaries, owner)
+        checks.update(timing["checks"])
         outputs = defaultdict(list)
         for item in self.result["outputs"]:
             outputs[item["request"]].append(item)
@@ -225,10 +199,9 @@ class ExecutionEvidence:
             "status": status,
             "scope": "recorded execution consistency; not independent native equivalence or KV content correctness",
             "checks": checks,
-            "execution_nodes": len(timeline),
-            "node_states": dict(Counter(item["status"] for item in timeline.values())),
+            "execution_nodes": len(identities),
+            "node_timing": timing,
             "actions": len(decisions),
-            "controls": len(self.result["controls"]),
             "handoffs": handoffs["requests"],
             "handoff_missing_paths": handoffs["missing_paths"],
             "request_state": state,
@@ -245,6 +218,57 @@ class ExecutionEvidence:
         if index_work is not None:
             report["cache_rank_bindings"] = index_work
         return report
+
+    def node_timing(self, boundaries: dict, owner: dict) -> dict:
+        if self.result["completion_source"] == "observed_boundaries":
+            return {"status": "not_measured", "checks": {}, "scope": "observations supply work boundaries only"}
+        if self.result["completion_source"] != "execution_ports":
+            raise ValueError("Unknown completion source")
+        execution = self.result["graph"]["execution"]
+        timeline = {item["node"]: item for item in self.result["execution_timeline"]}
+        checks = {
+            "timeline_identity": len(timeline) == len(self.result["execution_timeline"]) and set(timeline) == set(owner)
+        }
+        if not checks["timeline_identity"]:
+            return {"status": "differences", "checks": checks}
+
+        # A serving window ends at visible ports; unrelated asynchronous tails may still be in flight.
+        checks["nonnegative_intervals"] = all(
+            self.valid_interval(item, self.result["completed_ns"]) for item in timeline.values()
+        )
+        checks["dependency_readiness"] = all(
+            timeline[edge["target"]]["status"] == "waiting"
+            or (
+                timeline[edge["source"]]["status"] == "completed"
+                and timeline[edge["source"]]["completed_ns"] <= timeline[edge["target"]]["started_ns"]
+            )
+            for edge in execution["dependencies"]
+        )
+        resources = defaultdict(list)
+        for node in execution["nodes"]:
+            item = timeline[node["id"]]
+            if item["status"] != "waiting":
+                end = item["completed_ns"] if item["status"] == "completed" else item["expected_ns"]
+                resources[node["resource"]].append((item["started_ns"], end))
+        checks["exclusive_resources"] = all(
+            left[1] <= right[0] for intervals in resources.values() for left, right in pairwise(sorted(intervals))
+        )
+        checks["scheduled_work"] = all(
+            item["status"] == "waiting" or boundaries[owner[node]]["scheduled_ns"] <= item["started_ns"]
+            for node, item in timeline.items()
+        )
+        checks["completion_ports"] = all(self.ports_complete(item, timeline) for item in boundaries.values())
+        checks["publication_ports"] = all(
+            timeline[port]["status"] == "completed"
+            and max(item["scheduled_ns"], timeline[port]["completed_ns"]) == item["published_ns"]
+            for item in self.result["decisions"]
+            if (port := item["execution_ports"]["publication"]) is not None
+        )
+        return {
+            "status": "matched" if all(checks.values()) else "differences",
+            "checks": checks,
+            "node_states": dict(Counter(item["status"] for item in timeline.values())),
+        }
 
     def handoffs(self, ownership: RequestStateEvidence) -> dict:
         if "pd" not in self.result["configuration"]:
@@ -349,15 +373,43 @@ class ExecutionEvidence:
 
 
 class NativeEvidence:
-    def __init__(self, sources: list[Path], target: dict[str, Any], minimum_members: int) -> None:
+    def __init__(self, sources: list[Path], target: dict[str, Any], minimum_members: int, delivery: Path) -> None:
         self.sources = sources
         self.target = target
         self.minimum_members = minimum_members
+        self.delivery = json.loads(delivery.read_text())["capture"]
         self.groups = defaultdict(dict)
         self.coverage = BatchCoverage(target["requests"])
         self.mismatches = []
         self.difference_count = 0
         self.unobserved = 0
+
+    def input_delivery(self) -> dict[str, Any]:
+        if len(self.delivery) != 1:
+            raise ValueError("native input evidence requires one continuous workload, not discovery rounds")
+        delivery = self.delivery[0]
+        expected = defaultdict(list)
+        for index, request in enumerate(self.target["requests"]):
+            expected[request["arrival_ns"]].append(index)
+        cohorts = [{"arrival_ns": arrival, "requests": indices} for arrival, indices in sorted(expected.items())]
+        submissions = delivery["submissions"]
+        actual = [{key: row[key] for key in ("arrival_ns", "requests")} for row in submissions]
+        submitted = [row["submitted_ns"] for row in submissions]
+        delays = [row["submitted_ns"] - row["arrival_ns"] for row in submissions]
+
+        # Submission records verify release intent; receiver polling and batching remain native execution.
+        return {
+            "checks": {
+                "complete_ordered_cohorts": actual == cohorts,
+                "not_submitted_early": all(delay >= 0 for delay in delays),
+                "submission_order": submitted == sorted(submitted),
+            },
+            "submissions": len(submissions),
+            "requests": sum(len(row["requests"]) for row in submissions),
+            "min_delay_ns": min(delays, default=None),
+            "max_delay_ns": max(delays, default=None),
+            "scope": "sender_release_only; scheduler_receive_timing_not_observed",
+        }
 
     def difference(self, key: tuple, check: str) -> None:
         self.difference_count += 1
@@ -416,6 +468,10 @@ class NativeEvidence:
         return matches[0]
 
     def check(self) -> dict[str, Any]:
+        delivery = self.input_delivery()
+        for check, passed in delivery["checks"].items():
+            if not passed:
+                self.difference(("input_delivery",), check)
         for path in self.sources:
             self.collect(path)
         rows = padding = calls = 0
@@ -478,6 +534,7 @@ class NativeEvidence:
         )
         return {
             "status": status,
+            "input_delivery": delivery,
             "minimum_batch_members": self.minimum_members,
             "batch_size_covered": batch_covered,
             "coverage": coverage,
@@ -497,13 +554,17 @@ if __name__ == "__main__":
     subject.add_argument("--source", type=Path, nargs="+")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--minimum-batch-members", type=int, default=1)
+    parser.add_argument("--delivery", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
+    if bool(arguments.source) != (arguments.delivery is not None):
+        parser.error("--source requires --delivery; --prediction does not consume delivery records")
     if arguments.prediction:
         report = ExecutionEvidence(json.loads(arguments.prediction.read_text())).check()
     else:
         report = NativeEvidence(
-            arguments.source, json.loads(arguments.input.read_text()), arguments.minimum_batch_members
+            arguments.source, json.loads(arguments.input.read_text()),
+            arguments.minimum_batch_members, arguments.delivery,
         ).check()
     write_json(arguments.output, report, indent=2)
     print(json.dumps({"status": report["status"], "report": str(arguments.output)}))

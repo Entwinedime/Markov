@@ -169,7 +169,7 @@ class RequestStateEvidence:
 
     @staticmethod
     def allocates(action: dict) -> bool:
-        return action["step"] in {"batch", "reserve", "model", "prepare"} or (
+        return action["step"] in {"batch", "reserve", "model", "allocate"} or (
             action["step"] == "stage" and action["stage"] == 0
         )
 
@@ -268,7 +268,7 @@ class RequestStateEvidence:
 
         for _, _, event, index in events:
             action = actions[index]
-            if action.get("channel") or action["step"] == "indices":
+            if action.get("channel") or "members" not in action:
                 continue
             if event == "submitted":
                 self.start(action)

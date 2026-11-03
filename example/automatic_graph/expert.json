@@ -1,5 +1,6 @@
 {
   "framework": "sglang",
+  "control": "native",
   "model": {"path": "/root/models/markov-next/Qwen1.5-MoE-A2.7B", "dtype": "bfloat16"},
   "deployment": {"physical_devices": [0, 1]},
   "budget": {

@@ -5,24 +5,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import traceback
 from collections import Counter, defaultdict, deque
 from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from communication import CommunicationComparison
 from execution import ExecutionComparison
 from markov_collection.artifacts import write_json
-from operations import OperationComparison
+from operations import OperationComparison, RowAccess, TargetOperations, WorkOrigins
 
 
 class StructureComparison:
-    def __init__(self, source: Path, physical: Path, observed: Path, prediction: Path, input_path: Path) -> None:
+    def __init__(
+        self, source: Path, physical: Path, observed: Path,
+        prediction: dict[str, Any], specification: dict[str, Any], target: TargetOperations,
+        communication: CommunicationComparison,
+    ) -> None:
         self.source = json.loads(source.read_text())
         self.physical = json.loads(physical.read_text())
         self.observed = json.loads(observed.read_text())
-        self.prediction = json.loads(prediction.read_text())
-        self.operations = OperationComparison(self.source, self.observed, self.prediction["graph"])
-        specification = json.loads(input_path.read_text())
+        self.prediction = prediction
+        self.target = target
+        self.communication = communication
         session = json.loads((source.parent / "session.json").read_text())
         self.request_ids = dict(
             zip(session["source_requests"], (item["id"] for item in specification["requests"]), strict=True)
@@ -36,14 +42,21 @@ class StructureComparison:
             for task in self.region_labels(self.prediction["graph"]["regions"], False, "task")
         ]
         self.native_requests = self.region_labels(self.source["regions"], True, "request")
+        self.serving_batches = {
+            batch["id"] for batch in self.source["batches"]
+            if batch["observation"] == "source" and batch.get("kind") != "primitive"
+        }
+        self.serving_regions = self.observation_regions()
         self.native_model = self.model_regions(self.source["regions"])
         self.target_model = self.model_regions(self.prediction["graph"]["regions"])
-        self.native_call_scopes = self.call_scopes(self.source["regions"], True)
-        self.target_call_scopes = self.call_scopes(self.prediction["graph"]["regions"], False)
+        self.work_origins = WorkOrigins(
+            prediction.get("observed_work", []), self.rank, self.source["regions"], self.target_actions,
+        )
         self.native_controls = self.region_labels(self.source["regions"], True, "control_only")
         self.excluded_control, self.control_scope = self.controller_scope()
 
         self.decisions: dict[int, dict[str, Any]] = {}
+        self.batches: dict[int, dict[str, Any]] = {}
         self.completions = {}
 
         # A batch can span pipeline actions; P and D select their own member groups.
@@ -55,6 +68,8 @@ class StructureComparison:
             if decision["task"]["group"] not in groups:
                 continue
             flow = decision["flow"]
+            if "phase" in decision:
+                self.batches[flow] = decision
             if decision["commits_requests"] or decision["step"] == "model":
                 self.completions[flow] = decision
             if decision["step"] in {"batch", "model", "compute", "accept"} or (
@@ -62,64 +77,138 @@ class StructureComparison:
             ):
                 self.decisions[flow] = decision
 
-        self.attach_handoffs(groups)
+        self.operations = OperationComparison(
+            self.source, self.observed, target, self.work_origins,
+            self.row_accesses(self.observed, True), self.row_accesses(self.prediction["graph"], False),
+        )
+        self.native_models = self.model_operations(self.observed, self.native_batches, True)
+        self.target_models = self.model_operations(self.prediction["graph"], self.target_batches, False)
 
-    def attach_handoffs(self, groups: set[str]) -> None:
+    def request_rows(self, region: dict[str, Any], metadata: dict[str, Any], observed: bool) -> dict[str, int] | None:
+        flow = (self.native_batches if observed else self.target_batches)[region["id"]]
+        if observed:
+            if flow is None:
+                return None
+            batch = self.source["batches"][flow]
+            if batch["observation"] != "source" or batch.get("kind") == "primitive":
+                return None
+        else:
+            # Reservation and preparation carry real batch operands even when this flow has no model call.
+            batch = self.batches.get(flow)
+            if batch is None:
+                return None
 
-        # Request-owned KV work can run inside a later scheduling iteration; its request determines the owner.
-        handoff_batches = {
-            self.native_batches[region["id"]]
-            for region in self.source["regions"]
-            if region["role"] in {"Prefill", "PrebuiltResult"}
+        phases = {"prefill", "decode"}
+        if metadata.get("entrypoint") == "batch_preparation":
+            phases = (
+                {metadata["entrypoint_phase"]} if observed else
+                {phase for phase in phases if metadata["parameters"][phase + "_members"]}
+            )
+        return {
+            self.request_ids[m["id"]] if observed else m["id"]: m["slot"] if observed else m["slot"] + 1
+            for m in batch["members"] if m["phase"] in phases
         }
-        handoffs = {
-            member["id"]: batch["id"]
-            for batch in self.source["batches"]
-            if batch["id"] in handoff_batches
-            for member in batch["members"]
-        }
-        for index, request in enumerate(self.native_requests):
-            if request in handoffs:
-                self.native_batches[index] = handoffs[request]
 
-        # Attach the whole handoff to the request's final Prefill or prebuilt batch on both sides.
-        target_handoffs = {
-            member["id"]: flow
-            for flow, decision in self.decisions.items() if decision["phase"] == "prefill"
-            for member in decision["members"]
+    def row_accesses(self, graph: dict[str, Any], observed: bool) -> dict[tuple[int, int], RowAccess]:
+        regions = self.source["regions"] if observed else graph["regions"]
+        values = self.source["values"] if observed else graph["values"]
+        metadata = [region["metadata"] if observed else region for region in regions]
+        maps = {
+            values[ports["request_map"]]["storage"]
+            for item in metadata for ports in item.get("ports", {}).values() if "request_map" in ports
         }
-        handoff_actions = {}
-        handoff_completions = {}
-        for decision in self.prediction["decisions"]:
-            action = decision["task"]["group"], decision["task"]["sequence"]
-
-            # Pipeline messages retain their model batch; channel-free actions belong to the KV handoff.
-            if (
-                action[0] not in groups
-                or decision["step"] not in {"reserve", "transfer", "receive", "release"}
-                or decision.get("channel")
-            ):
+        tables = maps | {
+            values[ports["token_relay"]]["storage"]
+            for item in metadata for ports in item.get("ports", {}).values() if "token_relay" in ports
+        }
+        batches = self.native_batches if observed else self.target_batches
+        indices = {}
+        scopes = []
+        for region, item in zip(regions, metadata, strict=True):
+            if not observed and region.get("rank") != self.rank:
+                scopes.append(None)
                 continue
-            (member,) = decision["members"]
-            flow = target_handoffs[member["id"]]
-            handoff_actions[action] = flow
-            for completion in decision["execution_ports"]["completions"]:
-                handoff_completions[completion] = flow
+            scope = None if region["parent"] is None else scopes[region["parent"]]
+            slot_values = [
+                ports["request_slots"] for ports in item.get("ports", {}).values() if "request_slots" in ports
+            ]
+            request_slot = item.get("parameters", {}).get("request_slot")
+            needs_rows = slot_values or request_slot is not None or item.get("entrypoint") == "batch_preparation"
+            selected = self.request_rows(region, item, observed) if needs_rows else None
+            if selected is not None:
+                for value in slot_values:
+                    if values[value].get("shape") == [len(selected)]:
+                        indices[batches[region["id"]], value] = selected
 
-        # A release can reuse a preceding cache call's return; its explicit port identifies that work.
-        handoff_regions = {
-            call["region"]: handoff_completions[call["return"]]
-            for call in self.prediction["graph"]["execution"]["host_calls"]
-            if "operation" not in call and call["return"] in handoff_completions
-        }
-        for region in self.prediction["graph"]["regions"]:
-            action = self.target_actions[region["id"]]
-            if region.get("rank") != self.rank or action is None:
+            # A partial Mixed preparation cannot claim accesses for the other part's requests.
+            if item.get("entrypoint") == "batch_preparation":
+                complete = selected is not None and len(selected) == item["parameters"]["B"]
+                scope = (selected, set(selected.values())) if complete else None
+            if request_slot is not None:
+
+                # A request-scoped callback can run under a later batch's scheduling frame.
+                request = self.native_requests[region["id"]] if observed else None
+                if request is not None:
+                    selected = {self.request_ids[request]: request_slot} if request in self.request_ids else None
+                else:
+                    selected = {name: row for name, row in (selected or {}).items() if row == request_slot} or None
+                scope = selected, {request_slot}
+            scopes.append(scope)
+
+        accesses = {}
+        for operation in graph["operations"]:
+            scope = scopes[operation["region"]]
+            indexed = None
+
+            # These native APIs index the first table axis; identity ties the selector to an actual batch column.
+            if operation["name"] in {"tensor_assignment", "aten.index.Tensor"}:
+                table, index = operation["arguments"][:2]
+                if isinstance(index, list):
+                    index = index[0] if index else None
+                if isinstance(table, dict) and "value" in table and isinstance(index, dict) and "value" in index:
+                    rows = indices.get((batches[operation["region"]], index["value"]))
+                    if rows is not None:
+                        indexed = values[table["value"]]["storage"], rows
+
+            assignment = operation["kind"] == "interface" and operation["name"] == "tensor_assignment"
+            read_storage = set()
+            if assignment:
+
+                # A destination reused as payload or selector is still read, even when inputs deduplicate its ID.
+                operands = OperationComparison.argument_values([operation["arguments"][1:], operation["keywords"]])
+                read_storage = {values[value]["storage"] for value in operands.values()}
+
+            aliases = {values[value]["storage"] for value in operation["inputs"]} & tables
+            for storage in aliases:
+                if indexed is not None and storage == indexed[0]:
+                    selected, rows = indexed[1], set(indexed[1].values())
+                elif storage in maps and scope is not None:
+                    selected, rows = scope
+                else:
+                    continue
+                writes = storage in operation["writes"]
+                reads = selected
+                if writes and assignment:
+                    reads = None if storage in read_storage else {}
+                accesses[operation["id"], storage] = RowAccess(reads, rows if writes else set())
+        return accesses
+
+    def observation_regions(self) -> set[int]:
+        request_lists = self.region_labels(self.source["regions"], True, "requests")
+        result = set()
+        for region in self.source["regions"]:
+            identity = region["id"]
+            batch = self.native_batches[identity]
+            if batch is not None:
+
+                # Original batch labels decide qualification, including prototypes that reuse serving request names.
+                if batch in self.serving_batches:
+                    result.add(identity)
                 continue
-            flow = handoff_regions.get(region["id"], handoff_regions.get(region["parent"], handoff_actions.get(action)))
-            if flow is not None:
-                handoff_regions[region["id"]] = flow
-                self.target_batches[region["id"]] = flow
+            requests = request_lists[identity] or [self.native_requests[identity]]
+            if requests and set(requests) <= self.request_ids.keys():
+                result.add(identity)
+        return result
 
     @staticmethod
     def region_labels(regions: list[dict[str, Any]], observed: bool, field: str) -> list[Any]:
@@ -148,71 +237,28 @@ class StructureComparison:
             members.append(identity if prebuilt else (identity, member["new_tokens"], member["context_tokens"]))
         return "prebuilt" if prebuilt else batch["phase"], tuple(members)
 
-    @staticmethod
-    def call_scopes(regions: list[dict[str, Any]], observed: bool) -> list[str | None]:
-        scopes = []
-        for region in regions:
-            scope = region["role"]
-            metadata = region["metadata"] if observed else region
-
-            # Normalization may inline an outer wrapper; the invoked entrypoint still identifies its body.
-            if scope in {"operation", "call"}:
-                parent = None if region["parent"] is None else scopes[region["parent"]]
-                scope = metadata.get("entrypoint", parent) if scope == "call" else parent
-            scopes.append(scope)
-        return scopes
-
-    def pair_named_calls(
-        self, native: list[dict[str, Any]], target: list[dict[str, Any]], known: dict[int, dict[str, Any]]
-    ) -> bool:
-        left = defaultdict(list)
-        right = defaultdict(list)
-        for operation in native:
-            left[self.native_call_scopes[operation["region"]]].append(operation)
-        for operation in target:
-            right[self.target_call_scopes[operation["region"]]].append(operation)
-
-        consistent = True
-
-        # Outer scheduling scopes can include preceding-batch work; inner named calls retain the matched flow.
-        for role in sorted((left.keys() & right.keys()) - {None, "Schedule"}):
-            anchors = {operation["id"]: known[operation["id"]] for operation in left[role] if operation["id"] in known}
-            pairs, correspondence = self.operations.correspondence(left[role], right[role], anchors)
-            consistent = consistent and correspondence["consistent_bindings"]
-            if correspondence["complete"]:
-                known.update(pairs)
-        return consistent
-
-    def batch_operations(
-        self, graph: dict[str, Any], batches: list[int | None], batch: int, observed: bool
-    ) -> list[dict[str, Any]]:
-        return [
-            operation
-            for operation in graph["operations"]
-            if batches[operation["region"]] == batch
-            and (not observed or operation["id"] not in self.excluded_control)
-            and (
-                observed
-                or (
-                    graph["regions"][operation["region"]].get("rank") == self.rank
-                    and self.target_actions[operation["region"]] is not None
-                )
-            )
-        ]
+    def model_operations(
+        self, graph: dict[str, Any], batches: list[int | None], observed: bool
+    ) -> dict[int | None, list[dict[str, Any]]]:
+        operations = defaultdict(list)
+        modeled = self.native_model if observed else self.target_model
+        for operation in graph["operations"]:
+            region = operation["region"]
+            if not modeled[region]:
+                continue
+            if observed:
+                if region not in self.serving_regions or operation["id"] in self.excluded_control:
+                    continue
+            elif graph["regions"][region].get("rank") != self.rank:
+                continue
+            operations[batches[region]].append(operation)
+        return operations
 
     def native_region(self, record: dict[str, Any]) -> int | None:
         region = record["region"]
         if region is None and record["operation"] is not None:
             region = self.source["operations"][record["operation"]]["region"]
         return region
-
-    def native_batch(self, record: dict[str, Any], model_only: bool) -> int | None:
-        region = self.native_region(record)
-        if region is None or (model_only and not self.native_model[region]):
-            return None
-        if self.control_scope["closed"] and self.native_controls[region]:
-            return None
-        return self.native_batches[region]
 
     def controller_scope(self) -> tuple[set[int], dict[str, Any]]:
         operations = [
@@ -258,37 +304,42 @@ class StructureComparison:
             "scope": "declared native controller decisions; retained in observations, separate from modeled work",
         }
 
-    def native_work(self, model_only: bool = False) -> dict[int, Counter[str]]:
-        result: dict[int, Counter[str]] = defaultdict(Counter)
-        for work in self.physical["work"]:
-            if work["observer"] or work["auxiliary"] or work["baseline"] is not None:
-                continue
-            if work["kind"] != "device" or work["task_type"] in ("EVENT_RECORD", "EVENT_WAIT"):
-                continue
-            operation = work["operation"]
-            if operation is not None and self.source["operations"][operation].get("communication", False):
-                continue
-            batch = self.native_batch(work, model_only)
-            if batch is not None:
-                result[batch][work["name"]] += 1
+    def native_work(self, model_only: bool = False) -> dict[int | None, Counter[str]]:
+        result: dict[int | None, Counter[str]] = defaultdict(Counter)
+        for records, device in ((self.physical["work"], True), (self.physical["runtime_actions"], False)):
+            for record in records:
+                if record["observer"] or record["auxiliary"] or record["baseline"] is not None:
+                    continue
+                if device:
+                    if record["kind"] != "device" or record["task_type"] in ("EVENT_RECORD", "EVENT_WAIT"):
+                        continue
+                    operation = record["operation"]
+                    if operation is not None and self.source["operations"][operation].get("communication", False):
+                        continue
+                    name = record["name"]
+                else:
 
-        # Transfers can lack a profiler task; their native async API remains the common observable boundary.
-        for action in self.physical["runtime_actions"]:
-            if (
-                action["kind"] != "copy_async"
-                or action["observer"]
-                or action["auxiliary"]
-                or action["baseline"] is not None
-            ):
-                continue
-            batch = self.native_batch(action, model_only)
-            if batch is not None:
-                result[batch]["copy_async:" + action["native_api"]] += 1
+                    # An async copy can lack a profiler task; its native API is still an observable boundary.
+                    if record["kind"] != "copy_async":
+                        continue
+                    name = "copy_async:" + record["native_api"]
+
+                region = self.native_region(record)
+                if (
+                    region is None or region not in self.serving_regions
+                    or (model_only and not self.native_model[region])
+                ):
+                    continue
+                if self.control_scope["closed"] and self.native_controls[region]:
+                    continue
+
+                # Request-owned transport remains in the window even without a model-batch label.
+                result[self.native_batches[region]][name] += 1
         return result
 
-    def target_work(self, model_only: bool = False) -> dict[int, Counter[str]]:
+    def target_work(self, model_only: bool = False) -> dict[int | None, Counter[str]]:
         graph = self.prediction["graph"]
-        result: dict[int, Counter[str]] = defaultdict(Counter)
+        result: dict[int | None, Counter[str]] = defaultdict(Counter)
         for node in graph["execution"]["nodes"]:
             if node["kind"] not in ("device", "copy_async"):
                 continue
@@ -298,8 +349,6 @@ class StructureComparison:
             batch = self.target_batches[region]
             if (
                 graph["regions"][region].get("rank") == self.rank
-                and batch is not None
-                and self.target_actions[region] is not None
                 and (not model_only or self.target_model[region])
             ):
                 name = node["name"] if node["kind"] == "device" else "copy_async:" + node["name"]
@@ -381,21 +430,12 @@ class StructureComparison:
         return checks
 
     def window(self, operation_pairs: dict[int, dict[str, Any]]) -> dict[str, Any]:
-        serving_batches = {
-            batch["id"]
-            for batch in self.source["batches"]
-            if batch["observation"] == "source" and batch.get("kind") != "primitive"
-        }
-
         # Source membership includes empty decisions and final cleanup; auxiliary prototypes are separate work.
         native = [
             operation
             for operation in self.observed["operations"]
             if operation["id"] not in self.excluded_control
-            and (
-                self.native_batches[operation["region"]] in serving_batches
-                or self.native_requests[operation["region"]] in self.request_ids
-            )
+            and operation["region"] in self.serving_regions
         ]
         graph = self.prediction["graph"]
         target = [
@@ -408,7 +448,9 @@ class StructureComparison:
             for operation in native
             if operation["id"] in operation_pairs
         }
+        work = self.work_origins.bind(native, target, self.operations, known)
         pairs, correspondence = self.operations.correspondence(native, target, known)
+        correspondence.update(self.operations.caller_order(native, pairs))
         paired_native = [operation for operation in native if operation["id"] in pairs]
         paired = [pairs[operation["id"]] for operation in paired_native]
         window = {
@@ -419,21 +461,34 @@ class StructureComparison:
             "native_operations": len(native),
             "target_operations": len(target),
             "correspondence": correspondence,
+            "observed_work": work,
+            "source_boundary": self.source["environment"].get("observation_window"),
+            "initial_source_lane": next(
+                (batch["lane"] for batch in self.source["batches"] if batch["id"] in self.serving_batches), None
+            ),
+            "initial_target_lane": next(
+                (region["lane"] for region in graph["regions"] if region.get("rank") == self.rank), None
+            ),
+            "communication": self.communication.observe(self.source, self.physical, native, pairs),
         }
         if not paired:
             return {**window, "status": "partial", "reason": "no paired operations in the window"}
 
         # Unpaired work limits coverage, but cannot hide dependencies between paired owners.
         report = self.operations.compare(paired_native, paired)
-        report["execution"] = ExecutionComparison(paired_native, paired, graph["execution"], self.physical).compare()
+        report["execution"] = ExecutionComparison(
+            paired_native, paired, graph["execution"], self.physical, self.target.execution_paths
+        ).compare()
         report["checks"]["execution_relations"] = report["execution"]["same"]
         report["checks"]["consistent_bindings"] = correspondence["consistent_bindings"]
+        report["checks"]["observed_work_ownership"] = (
+            False if work["conflicting_bindings"] else self.work_origins.consistent(pairs, native)
+        )
 
         # Raw window totals also cover work omitted from a projection; scheduling scopes need not coincide.
-        native_work = self.native_work()
         self.compare_work(
             report,
-            sum((native_work[batch] for batch in serving_batches), Counter()),
+            sum(self.native_work().values(), Counter()),
             sum(self.target_work().values(), Counter()),
         )
         checks = report["checks"]
@@ -446,6 +501,35 @@ class StructureComparison:
             "same_operation_order": correspondence["same_serialized_order"],
             "status": status,
         }
+
+    def model_body(
+        self, batch: int, flow: int, native_work: Counter[str], target_work: Counter[str],
+    ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+        native = self.native_models.get(batch, [])
+        target = self.target_models.get(flow, [])
+        pairs, correspondence = self.operations.correspondence(native, target)
+        correspondence.update(self.operations.caller_order(native, pairs))
+        matched = [operation for operation in native if operation["id"] in pairs]
+        predicted = [pairs[operation["id"]] for operation in matched]
+        report = {
+            **self.operations.compare(matched, predicted),
+            "correspondence": correspondence,
+            "native_operations": len(native),
+            "target_operations": len(target),
+        }
+        report["checks"].update(
+            call_correspondence=True if correspondence["complete"] else None,
+            consistent_bindings=correspondence["consistent_bindings"],
+        )
+        if pairs:
+            report["execution"] = ExecutionComparison(
+                matched, predicted, self.prediction["graph"]["execution"], self.physical, self.target.execution_paths,
+            ).compare()
+            report["checks"]["execution_relations"] = report["execution"]["same"]
+        self.compare_work(report, native_work, target_work)
+
+        # Only a complete model correspondence anchors the whole-window comparison.
+        return report, pairs if correspondence["complete"] else {}
 
     def compare(self) -> dict[str, Any]:
         target: dict[tuple[Any, ...], deque[int]] = defaultdict(deque)
@@ -463,60 +547,21 @@ class StructureComparison:
         }
 
         for batch in self.source["batches"]:
-            if batch["observation"] != "source" or batch["id"] not in serving_batches:
+            if batch["id"] not in self.serving_batches or batch["id"] not in serving_batches:
                 continue
             key = self.signature(batch, True, serving_batches[batch["id"]] == "PrebuiltResult")
             if not target[key]:
                 unmatched.append(batch["id"])
                 continue
             index = target[key].popleft()
-            native = self.batch_operations(self.observed, self.native_batches, batch["id"], True)
-            predicted = self.batch_operations(self.prediction["graph"], self.target_batches, index, False)
-            paired, correspondence = self.operations.correspondence(native, predicted)
-            matched_native = [operation for operation in native if operation["id"] in paired]
-            matched_target = [paired[operation["id"]] for operation in matched_native]
-            comparison = self.operations.compare(matched_native, matched_target)
-            comparison["correspondence"] = correspondence
-            comparison["checks"]["call_correspondence"] = True if correspondence["complete"] else None
-            comparison["checks"]["consistent_bindings"] = correspondence["consistent_bindings"]
-            comparison["checks"].update(self.state(batch, index))
-            comparison.update(native_batch=batch["id"], target_flow=index)
-            if paired:
-                operation_pairs.update(paired)
-                comparison["execution"] = ExecutionComparison(
-                    matched_native,
-                    matched_target,
-                    self.prediction["graph"]["execution"],
-                    self.physical,
-                ).compare()
-                comparison["checks"]["execution_relations"] = comparison["execution"]["same"]
+            comparison = {"native_batch": batch["id"], "target_flow": index, "checks": self.state(batch, index)}
 
             # Model reuse is checked separately; different control paths do not certify or refute its body.
             if self.decisions[index]["step"] != "accept":
-                model_native = [operation for operation in native if self.native_model[operation["region"]]]
-                model_target = [operation for operation in predicted if self.target_model[operation["region"]]]
-                known = {
-                    operation["id"]: paired[operation["id"]] for operation in model_native if operation["id"] in paired
-                }
-                model_pairs, model_correspondence = self.operations.correspondence(model_native, model_target, known)
-                comparison["checks"]["model_binding_consistency"] = model_correspondence["consistent_bindings"]
-                if model_correspondence["complete"]:
-
-                    # Keep request/token body correspondence when outer control scopes differ.
-                    operation_pairs.update(model_pairs)
-                matched_model = [operation for operation in model_native if operation["id"] in model_pairs]
-                comparison["model_body"] = {
-                    **self.operations.compare(
-                        matched_model, [model_pairs[operation["id"]] for operation in matched_model]
-                    ),
-                    "correspondence": model_correspondence,
-                    "native_operations": len(model_native),
-                    "target_operations": len(model_target),
-                }
-                self.compare_work(comparison["model_body"], native_model_work[batch["id"]], target_model_work[index])
-            comparison["checks"]["named_call_binding_consistency"] = self.pair_named_calls(
-                native, predicted, operation_pairs
-            )
+                comparison["model_body"], model_pairs = self.model_body(
+                    batch["id"], index, native_model_work[batch["id"]], target_model_work[index],
+                )
+                operation_pairs.update(model_pairs)
             comparisons.append(comparison)
 
         unmatched_target = sorted(index for indices in target.values() for index in indices)
@@ -526,13 +571,15 @@ class StructureComparison:
             and [item["target_flow"] for item in comparisons] == list(self.decisions)
         )
         window = self.window(operation_pairs)
-        failures = sum(any(value is False for value in item["checks"].values()) for item in comparisons)
+        checks = [item["checks"] for item in comparisons]
+        checks.extend(item["model_body"]["checks"] for item in comparisons if "model_body" in item)
+        failures = any(False in item.values() for item in checks)
 
         # A complete window can prove cross-batch dependencies that a single batch cannot see.
         unverified = any(
             value is None and not (name == "execution_relations" and window["status"] == "matched")
-            for item in comparisons
-            for name, value in item["checks"].items()
+            for item in checks
+            for name, value in item.items()
         )
         unassociated = len(self.physical["unassociated_tasks"]) + len(self.physical["unassociated_runtime_actions"])
         status = "matched"
@@ -546,9 +593,8 @@ class StructureComparison:
             status = window["status"]
         return {
             "scope": (
-                "rank-local matched flows: public geometry, logical and CPU return dependencies, available CPU state, "
-                "compute and async APIs; "
-                "named interface ports and ordered returns checked; "
+                "rank-local serving window: all public operations, data/CPU return and execution dependencies; "
+                "request/token model bodies and native result-state snapshots checked separately; "
                 "batch and observed caller/serialized order reported separately; "
                 "opaque geometry, captured inputs, policy equivalence, timing and distributed progress unqualified"
             ),
@@ -567,11 +613,54 @@ class StructureComparison:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source", "physical", "observed", "prediction", "input", "output"):
-        parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--input", required=True, type=Path)
     arguments = parser.parse_args()
-    report = StructureComparison(
-        arguments.source, arguments.physical, arguments.observed, arguments.prediction, arguments.input
-    ).compare()
-    write_json(arguments.output, report, indent=2)
-    print(json.dumps({"status": report["status"], "compared_batches": len(report["comparisons"])}))
+    comparison = json.loads(arguments.input.read_text())
+    prediction = json.loads(Path(comparison["prediction"]).read_text())
+    specification = json.loads(Path(comparison["input"]).read_text())
+
+    # One immutable prediction and its indexes serve all rank-local comparisons.
+    target = TargetOperations(prediction["graph"])
+    communication = CommunicationComparison(
+        target, comparison["ranks"], prediction["decisions"], prediction["configuration"]["page_size"],
+    )
+    observations = []
+    failed = False
+    for case in comparison["ranks"]:
+        output = Path(case["output"])
+        published = output.is_file()
+        try:
+            if published:
+                report = json.loads(output.read_text())
+            else:
+                rank = StructureComparison(
+                    Path(case["source"]), Path(case["physical"]), Path(case["observed"]),
+                    prediction, specification, target, communication,
+                )
+                if rank.rank != case["rank"]:
+                    raise ValueError("comparison source rank differs from its declared rank")
+                report = rank.compare()
+                write_json(output, report, indent=2)
+            if report["status"] == "error":
+                failed = True
+            else:
+                observations.append(report["window"]["communication"])
+        except Exception as error:
+
+            # A bad rank must not hide the remaining planned comparisons or its traceback.
+            traceback.print_exc()
+            report = {
+                "rank": case["rank"],
+                "status": "error",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            failed = True
+
+            # A bad published report remains evidence; only this attempt's new output may be replaced.
+            if not published:
+                write_json(output, report, indent=2)
+        print(json.dumps({"rank": case["rank"], "status": report["status"]}), flush=True)
+    write_json(Path(comparison["communication_output"]), communication.compare(observations), indent=2)
+    if failed:
+        raise SystemExit(2)

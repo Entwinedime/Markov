@@ -32,7 +32,8 @@ class ResourceHistoryEvidence:
             if region["parent"] in model_regions:
                 model_regions.add(region["id"])
         transfers = {key for key, action in self.actions.items() if action["step"] == "transfer"}
-        timeline = {item["node"]: item for item in result["execution_timeline"]}
+        self.timed = result["completion_source"] == "execution_ports"
+        timeline = {item["node"]: item for item in result["execution_timeline"]} if self.timed else {}
         self.work = {}
         nodes = [
             node
@@ -51,14 +52,15 @@ class ResourceHistoryEvidence:
                 # Combined actions also contain pool maintenance; only model and KV transfer work consume KV pages.
                 if region not in model_regions and key not in transfers:
                     continue
-                self.work.setdefault(key, []).append(timeline[node["id"]])
+                if self.timed:
+                    self.work.setdefault(key, []).append(timeline[node["id"]])
                 streams = self.frontiers.setdefault(key, {})
                 resource = node["resource"]
                 if resource not in streams or order[node["id"]] > order[streams[resource]]:
                     streams[resource] = node["id"]
 
     def use(self, action: dict) -> None:
-        if action.get("channel") or action["step"] == "indices":
+        if action.get("channel") or "members" not in action:
             return
         pool = self.ownership.pool(action)
         event = {"pool": pool, "kind": action["step"], "order": action["submitted_order"]}
@@ -69,9 +71,21 @@ class ResourceHistoryEvidence:
             return
 
         allocate = self.ownership.allocates(action)
+        if action["step"] == "prepare_inputs":
+            self.require(action["allocated_pages"] == 0, "preparation_snapshot", event)
         for member in action["members"]:
             request = self.pools[pool]["requests"][self.request_ids[member["id"]]]
             self.require(request["slot"] == member["slot"], "action_ownership", event)
+
+            # Input preparation observes residency; only the later allocator may reserve new pages.
+            if action["step"] == "prepare_inputs":
+                self.require(
+                    member["context_tokens"] == request["tokens"]
+                    and not member["new_pages"]
+                    and member["previous_page"] == (request["pages"][-1] if request["pages"] else None),
+                    "preparation_snapshot",
+                    event,
+                )
             if allocate:
                 expected = request["allocation"]
                 self.require(all(member[key] == value for key, value in expected.items()), "allocation_binding", event)
@@ -280,11 +294,12 @@ class ResourceHistoryEvidence:
                 for page in pages:
                     users = self.consumers.pop((pool, page), {})
                     consumers.update(users)
-                    self.require(
-                        all(end is not None and end <= event["time_ns"] for end in users.values()),
-                        "return_after_device_consumers",
-                        event,
-                    )
+                    if self.timed:
+                        self.require(
+                            all(end is not None and end <= event["time_ns"] for end in users.values()),
+                            "return_after_device_consumers",
+                            event,
+                        )
 
                 # All completion ports must finish before return; each device frontier must reach one of them.
                 task = event["task"]
@@ -370,9 +385,10 @@ class ResourceHistoryEvidence:
             if not self.failures and all(terminal.values()) and returns and releases and operands["status"] == "matched"
             else "differences",
             "scope": (
-                "observed resource mutations, device-use intervals and paths to page-return completion ports; "
+                "resource mutations and paths to page-return completion ports; "
                 "not independent KV content or completeness of declared device consumers"
             ),
+            "not_measured": [] if self.timed else ["return_after_device_consumers"],
             "events": dict(Counter(event["kind"] for event in events)),
             "device_consumer_actions": dict(self.uses),
             "release_device_frontiers": len(self.release_paths),
