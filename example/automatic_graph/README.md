@@ -21,9 +21,9 @@ docker compose -p markov-next-redesign -f docker/compose/inference.yml build sgl
 example/automatic_graph/run.sh --input example/automatic_graph/exploration.json
 ```
 
-`MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器；采集前会构建当前 C++ 核心和任务私有 SDK 观察库。物理设备只选择采集位置，TP 本地分片不要求现场拥有目标数量的卡；PP 采集使用实际 TP×PP 参与进程。
+`MARKOV_IMAGE_PREFIX` 可选择其他已准备好的前缀，默认 `markov-next`。脚本在 modeling 容器内组织任务，通过宿主 Docker 创建本任务的原生容器。采集使用镜像内已安装的观察包和SDK源码，构建任务私有观察库，不逐任务安装可变工作区；C++核心在建库/预测前单独构建。修改观察代码后须重建原生镜像并明确新来源依据。物理设备只选择采集位置，TP 本地分片不要求现场拥有目标数量的卡；PP 采集使用实际 TP×PP 参与进程。
 
-正式探索在任务准备阶段将挂载的Python采集源码安装到隔离原生容器；直接使用镜像入口则运行镜像内的包。阶段交付时重建`sglang-profile`，使镜像快照与源码一致。使用本机代理且构建网络不可达时，可通过已有的`MARKOV_BUILD_NETWORK=host`选择构建网络；运行镜像和依赖仍由同一Dockerfile制作。
+解释在匹配SDK的原生环境中加载当前工作区消费端代码，采集仍使用固定镜像内的包。阶段交付时重建`sglang-profile`，使镜像快照与源码一致。使用本机代理且构建网络不可达时，可通过已有的`MARKOV_BUILD_NETWORK=host`选择构建网络；运行镜像和依赖仍由同一Dockerfile制作。
 
 配置可用 `"placement": {"devices": [4, 6]}` 指定 TP2 的两个目标设备，省略时按 rank 绑定 `0..TP×PP-1`；当前要求单机、设备互异，纯预测不检查现场卡数。它与采集用的 `deployment.physical_devices` 独立，结果的 topology 会列出实际绑定和参与组；设备标签不自行产生带宽或争用成本。
 
@@ -36,6 +36,16 @@ P/D 分离使用 [disaggregated.json](disaggregated.json)：`example/automatic_g
 MoE/EP 使用 [expert.json](expert.json)：`example/automatic_graph/run.sh --input example/automatic_graph/expert.json`。示例为完整 Qwen1.5 MoE、TP2/EP2，需两张实际采集卡；请求路由按层和逻辑 token 区间给出，padding 路由单独声明。它是给定路由的条件结构，仍执行 gate/top-k 等工作，不能从长度推断真实内容路由；缺少原型或来源覆盖为 partial 时如实报告。
 
 示例预算是有限上限，不保证任意模型或配置都能在其中完成。初始化、统一预热、观察、导出、处理和失败均计入累计额度；额度不足时保留状态并停止，不隐式扩大预算或循环补采。
+
+同一正式任务可以分阶段执行，状态和费用沿原目录保存：
+
+```bash
+example/automatic_graph/run.sh --input example/automatic_graph/exploration.json --stop-after sources
+example/automatic_graph/run.sh --resume data/YOUR_RUN --stop-after templates
+example/automatic_graph/run.sh --resume data/YOUR_RUN
+```
+
+`sources`只取得计划内代表来源，不构建C++核心；`templates`在来源就绪后解释并原子发布模板；默认继续预测全部组合。缺来源时恢复先补齐来源，模板生产方法本身只消费已发布事实，不启动Engine。`sources_complete`与`templates_complete`只表示对应准备阶段完成，不能作为预测或独立对照通过。
 
 ## 来源复用与结果含义
 
@@ -77,7 +87,7 @@ PP按stage合并TP完成，从原生发送句柄取得等待时刻；工作引�
 
 ```text
 data/<UTC时间>_automatic-graph/
-  inputs/                       原任务、环境身份、角色规划及逐组合输入
+  inputs/                       原任务、固定model.json、角色规划及逐组合输入
   captures/<角色-尝试>/         原始会话、语义记录及按策略保留的SDK导出
   assets/<实现域>/templates.json  共享定义/布局/执行模式与独立角色绑定
   results/summary.md             人读入口、失败与累计费用
@@ -85,13 +95,13 @@ data/<UTC时间>_automatic-graph/
   diagnostics/                  --details 时的完整组合结果
   logs/run.log                  子进程命令与失败原因
   state.json                    任务状态、资产位置及费用
-  work/observations/<采集名>/    建库消费的语义解释、物理事实及派生trace
+  work/sources/<域>/<采集名>/   建库消费的语义解释、物理事实及派生trace
   work/                         SDK、观察库与尚未发布的草稿，按任务生命周期清理
 ```
 
-原始语义记录与模板保留，解释阶段不回写采集文件。建库使用work中的语义声明和物理事实，资产发布后按任务策略释放；PD原始来源另保留每rank的`transport-rank-N.json`注册端点、地址及buffer布局，以及`rank-N.json`中实际复制的地址片段。框架适配将其解释为layer/head、逻辑页槽区间和元数据行，example再对照目标声明与完成关系；进程地址不进入模板或目标身份，页尾填充不冒充有效模型token。首次运行加 `--details` 才保留完整图、逐批/逐token记录和原始profiler/runtime导出；完整组合结果改写到diagnostics。全部域资产发布后释放私有work，即使目标结构仍为partial；独立调查保留原始SDK材料供重解释。数据和构建产物不提交Git。
+原始语义记录与模板保留，解释阶段不回写采集文件。建库使用work中的语义声明和物理事实，资产发布后按任务策略释放；PD原始来源另保留每rank的`transport-rank-N.json`注册端点、地址及buffer布局，以及`rank-N.json`中实际复制的地址片段。框架适配将其解释为layer/head、逻辑页槽区间和元数据行，example再对照目标声明与完成关系；进程地址不进入模板或目标身份，页尾填充不冒充有效模型token。首次运行加 `--details` 才保留完整图、逐批/逐token记录和原始profiler/runtime导出；完整组合结果改写到diagnostics。已发布域仅清理自己的`work/sources/<域>`，全部所需域发布后再释放SDK构建与编译缓存；验证和调查尚未消费的work保留。独立调查保留原始SDK材料供重解释，数据和构建产物不提交Git。
 
-显式重新执行`acquisition interpret --capture <原始目录> --output <工作目录>`按当前规则生成语义声明和物理事实，输出必须在原始目录之外。SDK使用临时可写副本处理其日志和表，trace及分析日志写入工作目录；解释进程不加载采集用preload。开始后工作目录的旧物理结果失效，失败时不能复用；原生会话已完成而解释失败时，只恢复后处理。带profile的重解释需要原始native/runtime导出，默认精简任务删除它们后仍可使用已发布模板，不能重建物理事实；恢复也不因源码变化自动更新旧库。
+显式重新执行`acquisition interpret --capture <原始目录> --output <工作目录>`按当前规则生成语义声明和物理事实，输出必须在原始目录之外。解释先建立通用接口及框架局部作用域，再统一派生运行时几何和条件；通用池声明不能覆盖原生循环实际使用的局部池。SDK使用临时可写副本处理其日志和表，trace及分析日志写入工作目录；解释进程不加载采集用preload。开始后工作目录的旧物理结果失效，失败时不能复用；原生会话已完成而解释失败时，只恢复后处理。带profile的重解释需要原始native/runtime导出，默认精简任务删除它们后仍可使用已发布模板，不能重建物理事实；恢复也不因源码变化自动更新旧库。
 
 恢复沿用原目录：
 
@@ -203,7 +213,21 @@ example/automatic_graph/run.sh validate \
 example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX
 ```
 
-批量入口核对冻结代码与镜像，先运行全部正式来源/预测任务，再执行预选原生对照、边界输入和生命周期案例；不根据目标结果补模板。整轮与各任务分别保留时间、尝试及存储上限，原生启动前检查声明卡的实际进程，已有占用或无法确认空闲时不启动Engine。独立案例出错后继续无依赖案例，缺来源的案例记blocked；预算停止/中断保留历史与费用，原命令可继续未完成案例，完成的结果不覆盖。
+批量入口核对冻结代码与镜像，每个来源工作流完成后接着比较该域的预选原生目标，再处理边界输入和生命周期案例；不等待全部来源，也不根据目标结果补模板。整轮与各任务分别保留时间、尝试及存储上限，原生启动前检查声明卡的实际进程，已有占用或无法确认空闲时不启动Engine。独立案例出错后继续无依赖案例，缺来源的案例记blocked；预算停止/中断保留历史与费用，原命令可继续未完成案例，完成的结果不覆盖。
+
+真实目标也可提前采集，入口为：
+
+```bash
+example/automatic_graph/run.sh investigate --run data/YOUR_MATRIX --collect-targets
+```
+
+采集冻结在清单中使用`status=capture_frozen`及`capture_image`，先锁定输入与实际推理镜像；此状态禁止重生成矩阵及正式比较。功能/旧问题回归收口后，再登记正式比较的代码、评价和全部执行镜像，将状态改为`frozen`，保留既有事实、历史及费用。
+
+此模式只使用固定输入及登记的原生镜像，不要求模板或编译仿真器，也不解释目标图或执行比较。观察包和SDK源码从镜像加载，允许CPU主线在其他开发任务中修改核心；已完成会话记为`captured`，不算独立验证通过，后续正式调查继续消费同一原始记录。单个正式任务可用`validate ... --capture-only`执行相同采集阶段。固定模型元数据在`inputs/model.json`，每次原生实际使用的镜像ID写入其`capture.json/native_image`；恢复不覆盖旧采集依据，正式比较镜像由整轮冻结记录确定。
+
+需要单独取得清单中某个来源域时，使用`investigate --run data/YOUR_MATRIX --collect-sources JOB`，JOB取自矩阵清单。它调用正式任务的来源阶段，复用原案例编号、尝试上限及累计费用；来源完成不算工作流预测或独立比较通过。来源可隔离代表角色，真实目标采集必须有全部rank所需的物理卡；已有目标事实仍可离线复用。
+
+一轮仍只有一个调查进程和一个任务状态写者：提前采集期间不能同时对同一调查根运行完整investigate、collect-sources或修改其任务。当前入口支持NPU队列与其他开发任务的CPU工作重叠，尚不在同一调查内同时派发采集和比较；它们共用同一份累计费用、锁及原始会话发布规则，不复制预算或启动多项NPU采集。来源角色集合另由任务状态的`source_image`绑定同一生产镜像；换镜像不能沿旧集合继续补角色，须按受影响来源域重新取得资格。
 
 `results/summary.md`为整轮入口，`results/outcomes.json`保留逐次结果，`runs/<域>/`仍采用正式目录结构，额外边界及生命周期证据在`cases/`。调查保留原始SDK/runtime在capture原位置，覆盖普通任务的导出释放策略，不移动或改写原始目录。目标解释结果在`work/validation/<capture>/observed/source`，公开投影和完成时间在其父目录共用，预测明细按后端保存；matched后释放已消费的后端明细，全部计划后端matched再释放共用观察。partial、差异及停止的明细保留供归因，不把重新运行预测当作旧明细。整轮结束不自动判为结构全部通过，也不自动生成窗口审查结论。
 
