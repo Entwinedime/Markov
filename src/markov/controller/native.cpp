@@ -14,6 +14,7 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
     for (const auto & instance : instances) {
         inputs_.try_emplace(instance.id);
         auto bindings = nlohmann::json::array();
+        const bool pipeline = std::ranges::any_of(instance.participants, [](const auto & participant) { return participant.stage != 0; });
         for (const auto & participant : instance.participants) {
             groups_.emplace(participant.group,
                             std::make_unique<NativeGroup>(requests_,
@@ -21,10 +22,11 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
                                                           participant.group,
                                                           participant.stage,
                                                           instance.role,
-                                                          instance.participants.size() > 1));
+                                                          pipeline));
             instances_.emplace(participant.group, instance.id);
             bindings.push_back({
                 {    "id", participant.group },
+                {  "rank", participant.rank },
                 { "stage", participant.stage }
             });
         }

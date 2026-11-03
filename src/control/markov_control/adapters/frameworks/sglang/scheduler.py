@@ -155,7 +155,9 @@ class NativeScheduler(Scheduler):
         self.model_worker.forward_batch_generation = self.model_result
         if isinstance(self.tree_cache, ChunkCache):
             ChunkIndices(self.tree_cache, peer)
-        self.published = PublishedRequests(self.ps.pp_rank == 0, self.token_to_kv_pool_allocator)
+        self.published = PublishedRequests(
+            self.output_streamer.send_to_detokenizer.socket is not None, self.token_to_kv_pool_allocator
+        )
         self.output_streamer.send_to_detokenizer = self.published
         native = self.dp_attn_adapter
         self.dp_attn_adapter = ScheduleBoundary(
@@ -186,7 +188,7 @@ class NativeScheduler(Scheduler):
         previous = self.last_batch if self.last_batch and self.last_batch.forward_mode.is_extend() else None
 
         # The previous Prefill is filtered and joined before native prefix lookup and admission.
-        with NativeBatch.report_selection(previous, "previous"):
+        with NativeBatch.report_selection(previous, "previous" if self.observing else None):
             return super().get_next_batch_to_run()
 
     def prepare(self, batch):
@@ -214,11 +216,11 @@ class NativeScheduler(Scheduler):
         return batch
 
     def update_running_batch(self, batch):
-        with NativeBatch.report_selection(batch):
+        with NativeBatch.report_selection(batch, "running" if self.observing else None):
             return super().update_running_batch(batch)
 
     def get_new_batch_prefill(self):
-        with NativeBatch.report_selection(self.running_batch):
+        with NativeBatch.report_selection(self.running_batch, "running" if self.observing else None):
             return super().get_new_batch_prefill()
 
     def model_result(self, batch, **kwargs):
@@ -258,7 +260,7 @@ class NativeScheduler(Scheduler):
         super().on_idle()
         if not idle:
             return
-        message = {"kind": "idle", "waiting": self.ps.pp_rank == 0}
+        message = {"kind": "idle", "waiting": self.ps.pp_rank == 0 and self.ps.tp_rank == 0}
 
         # Match native ingress sleeping; downstream stages must still drain the control ring.
         if message["waiting"]:

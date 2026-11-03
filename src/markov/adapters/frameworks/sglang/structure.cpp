@@ -136,8 +136,9 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
         graph_.regions[region]["lane"] = action.lane;
     }
     ++action_count_;
-    if (action.step == ServingStep::Batch || action.step == ServingStep::Model
-        || ((action.step == ServingStep::Stage || action.step == ServingStep::Compute) && action.stage == 0))
+    if ((action.step == ServingStep::Batch || action.step == ServingStep::Model
+         || ((action.step == ServingStep::Stage || action.step == ServingStep::Compute) && action.stage == 0))
+        && group.members.front() == topology_.parallel().group(group.members.front(), "tp").members.front())
         ++batch_count_;
     operation_count_ += graph_.operations.size() - operation_begin;
     node_count_ += graph_.execution.nodes().size() - node_begin;

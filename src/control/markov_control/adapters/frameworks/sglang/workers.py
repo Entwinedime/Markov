@@ -1,4 +1,4 @@
-"""Run independent native groups while applying each group's resource action once."""
+"""Keep native worker returns independent and expose their control waits to the broker."""
 
 import json
 from collections import defaultdict, deque
@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch.multiprocessing as multiprocessing
+from markov_control.adapters.runtimes.collectives import CollectiveCalls, CpuCollectives
 from markov_control.adapters.runtimes.cpu import CpuDeclarations
 from markov_control.peer import ControlPeer
 
@@ -78,9 +79,9 @@ class NativeWorkers:
                 for rank in range(instance["tp"] * instance["pp"]):
                     workers.append((instance, settings, str(model), rank))
                 for group in configured["groups"]:
-                    begin = first + group["stage"] * instance["tp"]
+                    local = instance["ranks"].index(group["rank"])
                     groups.append(
-                        {**group, "instance": instance["id"], "members": tuple(range(begin, begin + instance["tp"]))}
+                        {**group, "instance": instance["id"], "members": (first + local,), "ingress": local == 0}
                     )
             connections, children = [], []
             for _ in workers:
@@ -133,6 +134,8 @@ class NativeWorkers:
             else:
                 implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
             scheduler = implementation(peer, settings, directory, source, rank, workload)
+            world = tuple(position for position, worker in enumerate(workers) if worker[0]["id"] == source["id"])
+            CpuCollectives.install(peer, world)
             peer.send({"kind": "ready"})
             try:
                 scheduler.run_event_loop()
@@ -166,9 +169,10 @@ class NativeCalls:
         self.peer = peer
         self.connections = connections
         self.context = context
-        self.groups = groups
         self.membership = {rank: group for group in groups for rank in group["members"]}
+        self.collectives = CollectiveCalls()
         self.packets = defaultdict(deque)
+        self.staged_packets = {}
         self.receivers = {}
         self.object_sends = {}
         self.closing = False
@@ -189,9 +193,18 @@ class NativeCalls:
             send.waiter.send(None)
             del self.object_sends[identity]
 
+    def publish_object(self, key, identity) -> None:
+        if key in self.receivers:
+            self.receivers.pop(key).send(self.object_sends[identity].value)
+            self.finish_object(identity)
+        else:
+            self.packets[key].append(identity)
+
     def receive_worker(self, channel, rank, operation, message) -> None:
         group = self.membership[rank]
-        members = tuple(self.connections[index] for index in group["members"])
+        if operation == "collective":
+            self.collectives.submit(channel, rank, message)
+            return
         if operation == "wait_object":
             identity = message["identity"]
             send = self.object_sends[identity]
@@ -209,11 +222,10 @@ class NativeCalls:
                 self.object_sends[identity] = ObjectSend(message["value"])
                 if self.closing and message["channel"] == "requests":
                     self.finish_object(identity)
-                elif key in self.receivers:
-                    self.receivers.pop(key).send(message["value"])
-                    self.finish_object(identity)
+                elif message["channel"] == "tensors":
+                    self.staged_packets[channel] = key, identity
                 else:
-                    self.packets[key].append(identity)
+                    self.publish_object(key, identity)
                 channel.send(identity)
             elif self.closing and message["channel"] == "requests":
                 channel.send([StopInput()])
@@ -225,7 +237,7 @@ class NativeCalls:
                 self.receivers[key] = channel
             return
         if operation == "receive":
-            if group["stage"] != 0 or rank != group["members"][0]:
+            if not group["ingress"]:
                 raise ValueError("Only the native input rank receives core arrivals")
             if self.closing:
                 channel.send({"kind": "stop"})
@@ -234,15 +246,13 @@ class NativeCalls:
             return
         message = {**message, "group": group["id"]}
 
-        # Native rank-local statistics may read capacity without another worker making the same query.
-        if message["kind"] in ("capacity", "free_slots"):
+        if message["kind"] != "ready":
             self.ready.append(WorkerCall(operation, message, (channel,)))
             return
-        if message["kind"] == "ready":
 
-            # Initialization completes across the world before any participant starts its native loop.
-            members = tuple(self.connections)
-            message = {"kind": "ready"}
+        # Only startup waits for the world; native CPU collectives own all later rank agreement.
+        members = tuple(self.connections)
+        message = {"kind": "ready"}
         self.pending[channel] = (operation, message)
         if all(participant in self.pending for participant in members):
             for participant in members:
@@ -250,7 +260,7 @@ class NativeCalls:
                 if (other_operation, other) != (operation, message):
                     fields = sorted(key for key in other.keys() | message.keys() if other.get(key) != message.get(key))
                     raise ValueError(
-                        f"Native TP group {group['id']} disagrees on {other['kind']} / {message['kind']}: {fields}"
+                        f"Native initialization disagrees on {other['kind']} / {message['kind']}: {fields}"
                     )
             self.ready.append(WorkerCall(operation, message, members))
             for participant in members:
@@ -284,22 +294,13 @@ class NativeCalls:
                 channel.send(message["result"])
 
     def quiescent(self) -> bool:
-        blocked = self.stopped | set(self.pending) | set(self.receivers.values())
+        blocked = self.stopped | set(self.pending) | set(self.receivers.values()) | self.collectives.blocked()
         calls = [*self.ready, *self.awaiting.values()]
         for call in calls:
             blocked.update(call.participants)
 
         send_waiters = {send.waiter for send in self.object_sends.values() if send.waiter is not None}
         blocked.update(send_waiters)
-        group_waiters = {call.participants[0] for call in calls if call.operation == "receive"}
-        group_waiters.update(channel for key, channel in self.receivers.items() if key[3] == "requests")
-        group_waiters.update(send_waiters)
-
-        # A TP leader's input or transport wait also blocks its peers' next native collective.
-        for group in self.groups:
-            members = [self.connections[index] for index in group["members"]]
-            if members[0] in group_waiters:
-                blocked.update(members)
         return len(blocked) == len(self.connections)
 
     def dispatch(self) -> None:
@@ -340,6 +341,12 @@ class NativeCalls:
                     channel.send(None)
             else:
                 self.awaiting[identity] = call
+
+            # The next core poll follows graph submission; peers need not wait for the sender's API return.
+            if call.message["kind"] == "send":
+                for channel in call.participants:
+                    key, packet = self.staged_packets.pop(channel)
+                    self.publish_object(key, packet)
         else:
             if not self.quiescent():
                 return
@@ -365,7 +372,7 @@ class NativeCalls:
                     try:
                         self.receive_core()
                     except EOFError:
-                        if self.awaiting or self.pending or self.ready:
+                        if self.awaiting or self.pending or self.ready or self.collectives.pending:
                             raise
                         core_open = False
                         self.polled = False

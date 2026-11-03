@@ -10,9 +10,11 @@
 namespace markov::sglang {
 
 DisaggregatedStructure::DisaggregatedStructure(std::span<const TemplateAsset> assets, ServingSettings prefill, ServingSettings decode,
-                                               std::span<const Request> requests, const DisaggregatedGroups & groups, std::span<const std::int64_t> devices,
+                                               std::span<const Request> requests, const DisaggregatedGroups & groups, const ServingTopology & topology,
+                                               std::vector<std::string> resource_owners,
                                                const nlohmann::json & prefill_routes, const nlohmann::json & decode_routes)
-    : topology_(assets, devices),
+    : topology_(topology),
+      resource_owners_(std::move(resource_owners)),
       groups_(groups),
       prefill_(graph_, assets, prefill, requests, topology_, groups.prefill, prefill_routes),
       decode_(graph_, assets, decode, requests, topology_, groups.decode, decode_routes),
@@ -41,8 +43,7 @@ PageReuse DisaggregatedStructure::page_reuse() const { return prefill_.page_reus
 const ServingTopology & DisaggregatedStructure::topology() const { return topology_; }
 
 const std::string & DisaggregatedStructure::resource_group(std::size_t rank) const {
-    const auto & instance = topology_.parallel().group(rank, "serving");
-    return topology_.stage_count(instance.id) == 1 ? instance.id : topology_.parallel().group(rank, "tp").id;
+    return resource_owners_.at(rank);
 }
 
 std::vector<TransferBinding> DisaggregatedStructure::transfer_bindings() const {
@@ -290,7 +291,9 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
             { "sequence", action.task.sequence }
         };
     }
-    if (action.step == ServingStep::Model || action.step == ServingStep::Batch || (action.step == ServingStep::Compute && action.stage == 0)) ++batches_;
+    if ((action.step == ServingStep::Model || action.step == ServingStep::Batch || (action.step == ServingStep::Compute && action.stage == 0))
+        && members.front() == topology_.parallel().group(members.front(), "tp").members.front())
+        ++batches_;
     ++actions_;
     count(operation_begin, node_begin, dependency_begin);
     return result;

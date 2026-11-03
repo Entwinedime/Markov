@@ -103,7 +103,6 @@ class PipelineScheduler(NativeScheduler):
         work = self.tensor_work[next(iter(tensors.values()))]
         if any(self.tensor_work[value] != work for value in tensors.values()):
             raise ValueError("Native PP message mixes different work identities")
-        self.peer.call("send", **work, channel=channel)
         packet = {
             "work": work,
             "channel": channel,
@@ -125,6 +124,9 @@ class PipelineScheduler(NativeScheduler):
                 "value": packet,
             },
         )
+
+        # A peer can receive before native isend returns; metadata must not wait for local send completion.
+        self.peer.call("send", **work, channel=channel)
         return [P2PWork(PipelineWork(self.peer, identity, work, channel), None)]
 
     def receive_tensors(self, all_gather_group=None):

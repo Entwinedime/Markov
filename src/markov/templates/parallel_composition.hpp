@@ -22,7 +22,7 @@ struct RankWork {
     std::size_t end;
 };
 
-// Collectives join one action; directed messages join the same flow even when peers arrive in separate actions.
+// Communication joins the same flow even when its ranks arrive in separate controller actions.
 class ParallelComposition {
 public:
     explicit ParallelComposition(RegionGraph & graph);
@@ -37,6 +37,9 @@ private:
 
     RegionGraph & graph_;
     std::map<std::pair<std::string, std::vector<std::size_t>>, std::size_t> resources_;
+
+    using CollectiveKey = std::pair<std::size_t, std::string>;
+    std::map<CollectiveKey, std::vector<std::deque<std::size_t>>> collectives_;
 
     using MessageKey = std::tuple<std::size_t, std::string, std::size_t, std::size_t, std::string, std::string>;
     std::map<MessageKey, std::array<std::deque<std::size_t>, 2>> messages_;

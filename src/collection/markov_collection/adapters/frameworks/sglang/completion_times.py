@@ -35,14 +35,13 @@ class WorkerCompletions:
         self.stage = environment["pp_rank"]
         self.role = environment["implementation"]["disaggregation_mode"]
         instance = "model" if self.role == "null" else self.role
-        self.group = (
-            instance if self.role != "null" and environment["logical_pp"] == 1 else f"{instance}.tp-{self.stage}"
-        )
+        self.group = f"{instance}.rank-{environment['rank']}"
         self.regions = source["regions"]
         self.children: dict[int, list[int]] = defaultdict(list)
         self.batches: list[dict | None] = []
         self.request_contexts: list[dict | None] = []
         self.batch_scopes: dict[tuple[int, str], list[int]] = defaultdict(list)
+        self.prefix_matches: dict[int, int] = {}
         for region in self.regions:
             parent, metadata = region["parent"], region["metadata"]
             self.batches.append(
@@ -60,6 +59,8 @@ class WorkerCompletions:
             batch = self.batches[-1]
             if batch is not None and "entrypoint" in metadata:
                 self.batch_scopes[batch["id"], metadata["entrypoint"]].append(region["id"])
+            if metadata.get("entrypoint") == "prefix_match":
+                self.prefix_matches[metadata["ports"]["outputs"]["prefix_indices"]] = region["id"]
 
     def related(self, region: dict, *entrypoints: str) -> list[int]:
         batch = self.batches[region["id"]]
@@ -113,10 +114,10 @@ class WorkerCompletions:
             ],
         }
 
-    def selection_completion(self, region: dict) -> int:
+    def selection_scopes(self, region: dict) -> list[int]:
         metadata = region["metadata"]
         if metadata["selection_view"] != "previous" or not metadata["requests"]:
-            return region["ended_ns"]
+            return []
         schedule = next(parent for parent in self.ancestors(region) if parent["role"] == "Schedule")
         slots = metadata["ports"]["outputs"]["request_slots"]
         merged = [
@@ -129,7 +130,7 @@ class WorkerCompletions:
         # Previous-batch selection may include the following merge; connect it by the actual column value.
         if len(merged) > 1:
             raise ValueError(f"native selection {region['id']} feeds more than one batch merge")
-        return merged[0]["ended_ns"] if merged else region["ended_ns"]
+        return [child["id"] for child in merged]
 
     def cache_action(self, region: dict, service: str) -> dict:
         metadata = region["metadata"]
@@ -200,8 +201,18 @@ class WorkerCompletions:
                 records.append(self.action(region, step, completed=completed, members=[member], **identity))
             elif entry == "batch_preparation":
                 members = self.members(batch, metadata["requests"])
+                prefixes = (
+                    metadata["input_groups"]["prefixes"]["members"] if metadata["entrypoint_phase"] == "prefill" else []
+                )
+
+                # Input construction owns its actual cold-prefix producers, even when they precede the batch helper.
+                prefix_scopes = [
+                    self.prefix_matches[member["value"]]
+                    for member in prefixes if member["value"] in self.prefix_matches
+                ]
                 records.append(self.action(
-                    region, "prepare_inputs", completed=metadata["preparation_inputs_finished_ns"], members=members
+                    region, "prepare_inputs", completed=metadata["preparation_inputs_finished_ns"],
+                    related=prefix_scopes, members=members,
                 ))
 
                 # Preparation owns its allocator seam; allocations inside PD reservation stay in that operation.
@@ -210,8 +221,10 @@ class WorkerCompletions:
                         records.append(self.action(child, "allocate", members=members))
                 records.append(self.action(region, "prepare_outputs", members=members))
             elif entry == "batch_filter" and "selection_view" in metadata:
+                merged = self.selection_scopes(region)
                 records.append(self.action(
-                    region, "select", completed=self.selection_completion(region), view=metadata["selection_view"],
+                    region, "select", completed=self.regions[merged[-1]]["ended_ns"] if merged else None,
+                    related=merged, view=metadata["selection_view"],
                     requests=[self.requests[request] for request in metadata["requests"]],
                 ))
             elif entry == "batch_coordination":
@@ -337,35 +350,7 @@ class WorkerCompletions:
 
 class SGLangCompletionTimes:
     @staticmethod
-    def group_records(workers: list[list[dict]]) -> list[dict]:
-
-        # Stage-local TP participants share work; PP stages progress independently on the same observation clock.
-        indexed = []
-        for rows in workers:
-            index: dict[str, list[dict]] = defaultdict(list)
-            for row in rows:
-                index[json.dumps(row["work"], sort_keys=True)].append(row)
-            indexed.append(index)
-        keys = indexed[0].keys()
-        if any(index.keys() != keys for index in indexed[1:]):
-            raise ValueError("native TP workers disagree on their observed control work")
-
-        observations = []
-        for key in keys:
-            for participants in zip(*(index[key] for index in indexed), strict=True):
-                publications = [row["published"] for row in participants if row["published"] is not None]
-                if len(publications) > 1:
-                    raise ValueError("native TP group has more than one publishing worker")
-                observations.append({
-                    "work": participants[0]["work"],
-                    "completed": max(row["completed"] for row in participants),
-                    "published": publications[0] if publications else None,
-                    "observations": [origin for row in participants for origin in row["observations"]],
-                })
-        return observations
-
-    @classmethod
-    def read(cls, directory: Path) -> dict:
+    def read(directory: Path) -> dict:
         pools = [("prefill", directory / "prefill"), ("decode", directory / "decode")] if (
             directory / "prefill"
         ).is_dir() else [("null", directory)]
@@ -374,7 +359,7 @@ class SGLangCompletionTimes:
         if len(delivery) != 1:
             raise ValueError("completion feedback requires one continuous serving workload, not discovery rounds")
         origin_ns = delivery[0]["origin_ns"]
-        groups: dict[str, list[list[dict]]] = defaultdict(list)
+        observations = []
         copies = []
         destinations = {}
         domains = []
@@ -411,15 +396,15 @@ class SGLangCompletionTimes:
 
                 worker = WorkerCompletions(source, requests)
                 try:
-                    groups[worker.group].append(worker.records())
-                    copies.append((environment["rank"], worker.group, worker.transfers()))
+                    observations.extend(worker.records())
+                    copies.append(worker.transfers())
                 except KeyError as error:
                     raise ValueError(f"{path}: missing native boundary fact {error}") from error
                 if role == "decode":
                     transport = json.loads(path.with_name("transport-" + path.name).read_text())
                     if transport["rank"] != environment["rank"] or transport["session"] in destinations:
                         raise ValueError("native transport registration repeats or misidentifies its receiver")
-                    destinations[transport["session"]] = environment["rank"], worker.group
+                    destinations[transport["session"]] = worker.group
 
                 domains.append({
                     **{name: environment[name] for name in (
@@ -437,18 +422,13 @@ class SGLangCompletionTimes:
             if not paths:
                 raise ValueError(f"native instance {pool} contains no worker observations")
 
-        observations = [record for group in groups.values() for record in cls.group_records(group)]
-
-        # Actual transport endpoints define participation; topology combinations do not get separate converters.
-        transfers = defaultdict(dict)
-        for rank, source_group, routes in copies:
+        # Native worker returns stay local; transport records name the actual source and destination.
+        for routes in copies:
             for session, rows in routes.items():
-                target, group = destinations[session]
+                group = destinations[session]
                 for row in rows:
                     row["work"]["transfer"]["destination"] = group
-                transfers[source_group, group][rank, target] = rows
-        for routes in transfers.values():
-            observations.extend(cls.group_records(list(routes.values())))
+                observations.extend(rows)
         if not observations:
             raise ValueError("native observation contains no serving completion boundaries")
 

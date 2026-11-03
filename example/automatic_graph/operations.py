@@ -487,6 +487,23 @@ class OperationComparison:
                         {
                             "native_operations": len(signature[left]), "target_operations": len(expected[right]),
                             "calls": self.operation_difference(list(signature[left]), list(expected[right])),
+                            "anchor_order": begin[1] < end[1],
+                            "occupied_target": occupied,
+                            "same_work": same_work,
+                            "native_examples": [
+                                {
+                                    "id": operation["id"], "name": operation["name"],
+                                    "work": self.origins.native[operation["region"]],
+                                }
+                                for operation in operations[left][:3]
+                            ],
+                            "target_examples": [
+                                {
+                                    "id": operation["id"], "name": operation["name"],
+                                    "work": self.origins.target[operation["region"]],
+                                }
+                                for operation in matched[right][:3]
+                            ],
                         }
                     )
                     continue

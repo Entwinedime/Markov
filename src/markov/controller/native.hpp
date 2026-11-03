@@ -23,6 +23,7 @@ namespace markov {
 
 struct NativeParticipant {
     std::string group;
+    std::size_t rank;
     std::size_t stage;
     KvPool & resources;
 };

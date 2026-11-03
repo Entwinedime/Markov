@@ -235,16 +235,21 @@ nlohmann::json ServingSimulation::disaggregated(ResourceTrace * trace) {
     const ServingSettings prefill(integer(p.at("max_running_requests")), integer(p.at("max_total_tokens")), page_size, integer(p.at("max_prefill_tokens")));
     const ServingSettings decode(integer(d.at("max_running_requests")), integer(d.at("max_total_tokens")), page_size, 1);
     const DisaggregatedGroups groups{ "prefill", "decode", "kv" };
+    const sglang::ServingTopology topology(assets_, devices_);
+    std::vector<std::string> resource_owners;
+    for (std::size_t rank = 0; rank < assets_.size(); ++rank)
+        resource_owners.push_back(topology.parallel().group(rank, peer_ ? "worker" : "serving").id);
     sglang::DisaggregatedStructure expansion(assets_,
                                              prefill,
                                              decode,
                                              requests_,
                                              groups,
-                                             devices_,
+                                             topology,
+                                             std::move(resource_owners),
                                              expert_condition(p, input_, *prefill_source),
                                              expert_condition(d, input_, *decode_source));
 
-    // Resource pools outlive both the controller and all borrowed stage participants.
+    // Pools own resource state; native participants borrow them until control has stopped.
     std::map<std::string, KvPool> resources;
     std::array instances{
         NativeInstance{ groups.prefill, NativeRole::Prefill, prefill, 0, {}, prefill_chunk_tokens(p, prefill) },
@@ -253,12 +258,18 @@ nlohmann::json ServingSimulation::disaggregated(ResourceTrace * trace) {
     instances[0].expert_routes = expert_condition(p, input_, *prefill_source);
     instances[1].expert_routes = expert_condition(d, input_, *decode_source);
     for (auto & instance : instances) {
-        const auto stages = peer_ ? expansion.topology().stage_count(instance.id) : 1;
+        const auto stages = topology.stage_count(instance.id);
         instance.batch_limit = (static_cast<std::size_t>(instance.settings.max_running_requests) - 1) / stages + 1;
-        for (std::size_t stage = 0; stage < stages; ++stage) {
-            const auto & name = stages == 1 ? instance.id : expansion.topology().stage(instance.id, stage).id;
+        if (!peer_) {
+            resources.try_emplace(instance.id, requests_.size(), instance.settings, expansion.page_reuse(), trace, instance.id);
+            continue;
+        }
+        const auto & members = topology.instance(instance.id).members;
+        for (std::size_t local = 0; local < members.size(); ++local) {
+            const auto rank = members[local];
+            const auto & name = topology.parallel().group(rank, "worker").id;
             auto [pool, _] = resources.try_emplace(name, requests_.size(), instance.settings, expansion.page_reuse(), trace, name);
-            instance.participants.push_back({ name, stage, pool->second });
+            instance.participants.push_back({ name, rank, local / topology.tensor_parallel_size(instance.id), pool->second });
         }
     }
 
@@ -322,13 +333,7 @@ nlohmann::json ServingSimulation::joint(ResourceTrace * trace) {
     RegionGraph graph;
     sglang::ServingStructure expansion(graph, assets_, settings, requests_, topology, "model", routes);
 
-    // Reserve before borrowing pool references into native participants.
-    std::vector<KvPool> resources;
-    resources.reserve(static_cast<std::size_t>(stages));
-    for (std::int64_t stage = 0; stage < (peer_ ? stages : 1); ++stage) {
-        const auto & name = peer_ ? topology.stage("model", static_cast<std::size_t>(stage)).id : control_group;
-        resources.emplace_back(requests_.size(), settings, expansion.page_reuse(), trace, name);
-    }
+    std::map<std::string, KvPool> resources;
 
     std::unique_ptr<ServingControl> controller;
     if (peer_) {
@@ -337,7 +342,13 @@ nlohmann::json ServingSimulation::joint(ResourceTrace * trace) {
             { "instances", { topology.control_source(assets_.front(), "model") } }
         });
         std::vector<NativeParticipant> participants;
-        for (std::size_t stage = 0; stage < resources.size(); ++stage) participants.push_back({ topology.stage("model", stage).id, stage, resources[stage] });
+        const auto & members = topology.instance("model").members;
+        for (std::size_t local = 0; local < members.size(); ++local) {
+            const auto rank = members[local];
+            const auto & name = topology.parallel().group(rank, "worker").id;
+            auto [pool, _] = resources.try_emplace(name, requests_.size(), settings, expansion.page_reuse(), trace, name);
+            participants.push_back({ name, rank, local / topology.tensor_parallel_size("model"), pool->second });
+        }
         const std::array instances{
             NativeInstance{ "model",
                            NativeRole::Model,
@@ -348,21 +359,20 @@ nlohmann::json ServingSimulation::joint(ResourceTrace * trace) {
         };
         controller = std::make_unique<NativeController>(std::move(requests_), instances, *peer_, input_.value("prefixes", nlohmann::json::array()));
     }
-    else
+    else {
+        auto [pool, _] = resources.try_emplace(control_group, requests_.size(), settings, expansion.page_reuse(), trace, control_group);
         controller = std::make_unique<ServingController>(settings,
                                                          std::move(requests_),
-                                                         resources.front(),
+                                                         pool->second,
                                                          control_group,
                                                          static_cast<std::size_t>(stages),
                                                          static_cast<std::size_t>(batch_limit),
                                                          replay_ ? &*replay_ : nullptr);
+    }
 
     ServingWorkflow workflow(*controller, expansion, *execution_, trace);
     auto result = workflow.run(details);
-    for (std::size_t stage = 0; stage < resources.size(); ++stage) {
-        const auto & name = peer_ ? topology.stage("model", stage).id : control_group;
-        result["resources"][name] = resource_state(resources[stage], *controller, details);
-    }
+    for (const auto & [name, pool] : resources) result["resources"][name] = resource_state(pool, *controller, details);
 
     result["structure"] = expansion.summary();
     if (details) result["graph"] = expansion.document();

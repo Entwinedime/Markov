@@ -1,13 +1,14 @@
 """Keep native batch decisions while reporting the selected rows and allocations."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache import common
 
 
 class NativeBatch(ScheduleBatch):
-    control_selection = None
+    selection_views: ContextVar[dict[int, str | None]] = ContextVar("native_selection_views")
 
     def prepare_for_extend(self):
         result = super().prepare_for_extend()
@@ -21,17 +22,17 @@ class NativeBatch(ScheduleBatch):
 
     @staticmethod
     @contextmanager
-    def report_selection(batch, view="running"):
+    def report_selection(batch, view: str | None = "running"):
         if batch is None:
             yield
             return
 
-        previous = getattr(batch, "control_selection", None)
-        batch.control_selection = view
+        views = NativeBatch.selection_views
+        token = views.set({**views.get({}), id(batch): view})
         try:
             yield
         finally:
-            batch.control_selection = previous
+            views.reset(token)
 
     def prepare_for_prebuilt(self):
         super().prepare_for_prebuilt()
@@ -42,11 +43,10 @@ class NativeBatch(ScheduleBatch):
     def filter_batch(self, *args, **kwargs):
 
         # PP can revisit an already empty last batch; acquisition excludes that no-work call too.
-        selection = self.control_selection if self.reqs else None
-        if self.reqs and selection is None and self.forward_mode.is_prebuilt():
+        fallback = "previous" if self.reqs and self.forward_mode.is_prebuilt() else None
 
-            # PD filters accepted members before joining them to the running Decode batch.
-            selection = "previous"
+        # Explicitly inactive scopes suppress idle cleanup; native prebuilt selection still has its own view.
+        selection = self.selection_views.get({}).get(id(self), fallback) if self.reqs else None
         result = super().filter_batch(*args, **kwargs)
         if selection:
 

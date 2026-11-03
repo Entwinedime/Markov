@@ -197,7 +197,7 @@ class DisaggregatedScheduler(NativeScheduler):
     def process_prefill_chunk(self):
 
         # Both PD loops filter the preceding Prefill here, including unchanged membership.
-        with NativeBatch.report_selection(self.last_batch, "previous"):
+        with NativeBatch.report_selection(self.last_batch, "previous" if self.observing else None):
             return super().process_prefill_chunk()
 
 

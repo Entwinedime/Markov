@@ -20,7 +20,8 @@ namespace markov::sglang {
 class DisaggregatedStructure final : public BatchExpansion {
 public:
     DisaggregatedStructure(std::span<const TemplateAsset> assets, ServingSettings prefill, ServingSettings decode, std::span<const Request> requests,
-                           const DisaggregatedGroups & groups, std::span<const std::int64_t> devices, const nlohmann::json & prefill_routes,
+                           const DisaggregatedGroups & groups, const ServingTopology & topology, std::vector<std::string> resource_owners,
+                           const nlohmann::json & prefill_routes,
                            const nlohmann::json & decode_routes);
 
     GroupAdmission admission() const override;
@@ -64,7 +65,8 @@ private:
     const std::string & resource_group(std::size_t rank) const;
 
     RegionGraph graph_;
-    ServingTopology topology_;
+    const ServingTopology & topology_;
+    std::vector<std::string> resource_owners_;
     DisaggregatedGroups groups_;
     ServingStructure prefill_;
     ServingStructure decode_;

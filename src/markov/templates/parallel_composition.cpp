@@ -80,7 +80,6 @@ nlohmann::json ParallelComposition::exchange(std::span<const std::size_t> operat
 }
 
 void ParallelComposition::connect(std::span<const RankWork> ranks, const ParallelTopology & topology, const TaskIdentity & task, std::size_t flow) {
-    std::map<std::string, std::vector<std::vector<std::size_t>>> groups;
     for (const auto & rank : ranks) {
         for (auto operation = rank.begin; operation < rank.end; ++operation) {
             const auto & work = graph_.work[operation];
@@ -108,22 +107,21 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
                 continue;
             }
 
-            auto & calls = groups.try_emplace(group.id, group.members.size()).first->second;
+            auto & calls = collectives_.try_emplace(CollectiveKey{ flow, group.id }, group.members.size()).first->second;
             calls[static_cast<std::size_t>(member)].push_back(operation);
         }
     }
 
-    for (const auto & [group, calls] : groups) {
-        for (const auto & rank : calls) {
-            if (rank.size() != calls.front().size()) throw std::invalid_argument("ranks have different collective call counts");
-        }
-        for (std::size_t index = 0; index < calls.front().size(); ++index) {
+    // A native CPU return does not require other ranks to have submitted their next graph yet.
+    for (auto & [key, calls] : collectives_) {
+        std::size_t index = 0;
+        while (std::ranges::all_of(calls, [](const auto & rank) { return !rank.empty(); })) {
             std::vector<std::size_t> operations;
-            const auto first = calls.front()[index];
+            const auto first = calls.front().front();
             const auto & specification = graph_.work[first].at("communication");
             const bool variable_exchange = specification.at("primitive") == "all_to_all";
             for (const auto & rank : calls) {
-                const auto operation = rank[index];
+                const auto operation = rank.front();
                 const auto & access = graph_.operations[operation];
                 if (operation != first && !variable_exchange) {
                     if (graph_.work[operation].at("communication") != specification)
@@ -135,10 +133,14 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
             }
 
             auto bound = variable_exchange ? exchange(operations) : specification;
-            bound["group"] = group;
-            connect_calls(operations, task, std::move(bound), index, "collective", {});
+            bound["group"] = key.second;
+            connect_calls(operations, task, std::move(bound), index++, "collective", {});
+            for (auto & rank : calls) rank.pop_front();
         }
     }
+    std::erase_if(collectives_, [](const auto & item) {
+        return std::ranges::all_of(item.second, [](const auto & rank) { return rank.empty(); });
+    });
 
     // Flow identity survives stage actions and lane reuse; a peer cannot satisfy another microbatch's wait.
     for (auto & [key, calls] : messages_) {
@@ -167,6 +169,11 @@ void ParallelComposition::connect(std::span<const RankWork> ranks, const Paralle
 }
 
 void ParallelComposition::live_state(GraphRoots & roots) {
+    for (auto & [_, calls] : collectives_) {
+        for (auto & rank : calls) {
+            for (auto & operation : rank) roots.operations.push_back(&operation);
+        }
+    }
     for (auto & [_, calls] : messages_) {
         for (auto & endpoints : calls) {
             for (auto & operation : endpoints) roots.operations.push_back(&operation);

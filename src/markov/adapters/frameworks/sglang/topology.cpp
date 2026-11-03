@@ -58,6 +58,9 @@ ParallelTopology ServingTopology::build(std::span<const TemplateAsset> assets, s
         }
         groups.push_back({ name, "serving", members });
 
+        // A worker owns CPU returns and resources; communication still uses the full native groups below.
+        for (const auto rank : members) groups.push_back({ name + ".rank-" + std::to_string(rank), "worker", { rank } });
+
         // Group identities include the instance; native group roles remain the same at each rank.
         for (std::size_t stage = 0; stage < pp; ++stage) {
             std::vector<std::size_t> local(members.begin() + stage * tp, members.begin() + (stage + 1) * tp);
