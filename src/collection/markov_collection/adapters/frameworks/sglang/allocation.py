@@ -267,15 +267,18 @@ class SGLangAllocation:
                 empty["shape_relation"] = [0]
                 producer["argument_relations"] = [{"shape": [0]}]
 
-            if metadata.get("entrypoint") != "allocation_member":
+            if member["role"] not in ("AllocationPart", "allocation_members"):
                 continue
 
-            # A member consumes the current pool, independently of whether its caller first merged deferred pages.
+            # Prefix, loop and member scopes all consume the same post-merge pool, not their caller's old pool.
             pool = metadata["ports"]["inputs"]["free_pages"]
-            metadata["parameters"]["allocation_pool_pages"] = values[pool]["shape"][0]
+            metadata.setdefault("parameters", {})["allocation_pool_pages"] = values[pool]["shape"][0]
             contracts = {item["value"]: item["shape"] for item in metadata.get("shape_contracts", [])}
             contracts[pool] = ["allocation_pool_pages"]
             metadata["shape_contracts"] = [{"value": value, "shape": shape} for value, shape in contracts.items()]
+
+            if metadata.get("entrypoint") != "allocation_member":
+                continue
 
             written: Any = 0
             for identity in indexed.children[member["id"]]:

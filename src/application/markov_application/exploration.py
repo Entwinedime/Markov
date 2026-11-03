@@ -12,14 +12,14 @@ import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
 from markov_collection.artifacts import write_json
 
 from markov_application.command import CommandFailed, terminate
-from markov_application.environment import DockerEnvironment
-from markov_application.specification import read_specification
+from markov_application.environment import DockerEnvironment, NativeDeviceUnavailable
+from markov_application.specification import read_specification, serving_input
 
 
 class BudgetExceeded(RuntimeError):
@@ -90,6 +90,19 @@ class Exploration:
         return remaining
 
     def step(self, command: list[str], category: str) -> None:
+        if category == "native":
+            try:
+                self.step(
+                    [
+                        "docker", "exec", str(self.environment.native),
+                        *self.environment.limited(
+                            self.acquisition.device_command(self.environment.devices), self.available("processing")
+                        ),
+                    ],
+                    "processing",
+                )
+            except CommandFailed as error:
+                raise NativeDeviceUnavailable(str(error)) from error
         reserved = self.available(category)
 
         # A lost launcher or unconfirmed cleanup keeps the reserved allocation charged.
@@ -155,7 +168,7 @@ class Exploration:
             "processing",
         )
 
-    def prepare(self) -> None:
+    def prepare_native(self) -> dict[str, str]:
         self.environment.start()
         model_configuration = subprocess.check_output(
             [
@@ -167,30 +180,25 @@ class Exploration:
             text=True,
             timeout=30,
         )
-        observed = {
-            "model_configuration": json.loads(model_configuration),
-            "native_image": subprocess.check_output(
-                ["docker", "inspect", "--format", "{{.Image}}", str(self.environment.native)], text=True, timeout=30
-            ).strip(),
-            "modeling_image": subprocess.check_output(
-                ["docker", "image", "inspect", "--format", "{{.Id}}", self.environment.modeling_image],
-                text=True,
-                timeout=30,
-            ).strip(),
-        }
-        path = self.directory / "inputs/environment.json"
-        if path.exists() and json.loads(path.read_text()) != observed:
-            raise ValueError("model configuration or execution images changed; start a new run")
-        write_json(path, observed, indent=2)
-        self.model_configuration = observed["model_configuration"]
+        self.model_configuration = json.loads(model_configuration)
+        path = self.directory / "inputs/model.json"
+        if path.exists():
+            if json.loads(path.read_text()) != self.model_configuration:
+                raise ValueError("model configuration changed; start a new run")
+        else:
+            write_json(path, self.model_configuration, indent=2)
 
-        invalid = self.acquisition.check_workloads(observed["model_configuration"], self.specification)
+        # Production belongs to each capture; later preparation cannot relabel earlier native facts.
+        self.native_image = subprocess.check_output(
+            ["docker", "inspect", "--format", "{{.Image}}", str(self.environment.native)], text=True, timeout=30
+        ).strip()
+
+        invalid = self.acquisition.check_workloads(self.model_configuration, self.specification)
         self.state["failures"].update(invalid)
         expected = len(self.specification["configurations"]) * len(self.specification["workloads"])
         if len(invalid) == expected:
-            return
+            return invalid
 
-        self.build_tool()
         for command in self.acquisition.observer_commands(
             self.environment.native_path(self.environment.observer_build)
         ):
@@ -203,39 +211,34 @@ class Exploration:
                 ],
                 "processing",
             )
-        self.step(
-            [
-                "docker",
-                "exec",
-                str(self.environment.native),
-                "python3",
-                "-m",
-                "pip",
-                "install",
-                "--no-deps",
-                "--no-build-isolation",
-                "-e",
-                "/workspace/trace-sim",
-            ],
-            "processing",
+        return invalid
+
+    def capture_request(self, domain: dict[str, Any], rank: int, capture: Path) -> dict[str, Any]:
+        request = self.acquisition.request(
+            self.specification,
+            domain,
+            rank,
+            self.environment.native_path(capture),
+            self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
+            self.model_configuration,
         )
+        request["native_image"] = self.native_image
+        return request
 
     def capture_source(self, name: str, domain: dict[str, Any], representative: int, roles: Sequence[int]) -> Path:
         key = f"{name}-source-{representative}"
         if key not in self.state["sources"]:
             self.available("native")
+
+            # One source bundle cannot mix producer images; target captures have independent provenance.
+            if self.state["sources"] and self.state["source_image"] != self.native_image:
+                raise ValueError("source producer image changed; acquire the affected source bundle in a new task")
+            self.state["source_image"] = self.native_image
             capture = self.directory / "captures" / f"{key}-attempt-{self.state['native_attempts'] + 1}"
 
             # A device preflight can stop before spending an Engine attempt, leaving only its request file.
             capture.mkdir(parents=True, exist_ok=True)
-            request = self.acquisition.request(
-                self.specification,
-                domain,
-                roles[0],
-                self.environment.native_path(capture),
-                self.environment.native_path(self.environment.observer_build / self.acquisition.selector_binary),
-                self.model_configuration,
-            )
+            request = self.capture_request(domain, roles[0], capture)
             write_json(capture / "capture.json", request, indent=2)
             command = self.acquisition.command("capture", self.environment.native_path(capture / "capture.json"))
             self.step(
@@ -247,8 +250,11 @@ class Exploration:
             self.state["sources"][key] = str(capture.relative_to(self.directory))
             self.save()
 
-        capture = self.directory / self.state["sources"][key]
-        capture.resolve().relative_to(self.directory)
+        return self.source_path(key)
+
+    def source_path(self, key: str) -> Path:
+        capture = (self.directory / self.state["sources"][key]).resolve()
+        capture.relative_to(self.directory)
         return capture
 
     def source_plan(self, name: str, domain: dict[str, Any], bootstrap: Path) -> tuple[Path, dict[str, Any]]:
@@ -261,10 +267,10 @@ class Exploration:
         return path, plan
 
     def sources_ready(self, name: str, domain: dict[str, Any]) -> bool:
-        bootstrap = self.state["sources"].get(f"{name}-source-0")
-        if bootstrap is None:
+        key = f"{name}-source-0"
+        if key not in self.state["sources"]:
             return False
-        _, plan = self.source_plan(name, domain, self.directory / bootstrap)
+        _, plan = self.source_plan(name, domain, self.source_path(key))
         return all(
             f"{name}-source-{representative}" in self.state["sources"]
             for representative, _ in enumerate(self.acquisition.source_groups(domain, plan))
@@ -273,23 +279,31 @@ class Exploration:
     def asset_path(self, name: str) -> Path:
         return self.directory / "assets" / name / "templates.json"
 
-    def acquire(self, name: str, domain: dict[str, Any]) -> None:
+    def collect_sources(self, name: str, domain: dict[str, Any]) -> None:
+
+        # Choose later representatives only after the first native session exposes actual partitions.
+        bootstrap = self.capture_source(name, domain, 0, next(self.acquisition.source_groups(domain)))
+        _, plan = self.source_plan(name, domain, bootstrap)
+        for representative, roles in enumerate(self.acquisition.source_groups(domain, plan)):
+            self.capture_source(name, domain, representative, roles)
+
+    def build_templates(self, name: str, domain: dict[str, Any]) -> None:
         library = self.asset_path(name)
         if library.is_file():
             return
-        draft = self.directory / "work" / name
+        draft = self.directory / "work/sources" / name
         draft.mkdir(parents=True, exist_ok=True)
         arguments = ["templates"]
         inputs = []
 
-        # The mandatory first representative supplies native module partitions before choosing remaining sessions.
-        bootstrap = self.capture_source(name, domain, 0, next(self.acquisition.source_groups(domain)))
+        # Production consumes published facts and cannot start another Engine.
+        bootstrap = self.source_path(f"{name}-source-0")
         instances, plan = self.source_plan(name, domain, bootstrap)
         arguments += ["--instances", str(instances)]
         inputs.append(instances)
         for representative, roles in enumerate(self.acquisition.source_groups(domain, plan)):
-            capture = self.capture_source(name, domain, representative, roles)
-            interpreted = self.directory / "work/observations" / capture.name
+            capture = self.source_path(f"{name}-source-{representative}")
+            interpreted = draft / capture.name
             interpreted.mkdir(parents=True, exist_ok=True)
             command = self.acquisition.command(
                 "interpret", self.environment.native_path(capture), self.environment.native_path(interpreted)
@@ -314,9 +328,9 @@ class Exploration:
             "processing",
         )
 
-        # A domain becomes reusable only after every role's asset has been published together.
-        library.parent.parent.mkdir(parents=True, exist_ok=True)
-        draft.replace(library.parent)
+        # The single catalog contains every role; publish that file without moving interpretation data into assets.
+        library.parent.mkdir(parents=True, exist_ok=True)
+        output.replace(library)
 
     def release_exports(self, domains: dict[str, dict[str, Any]]) -> None:
         if self.details:
@@ -371,35 +385,7 @@ class Exploration:
                 if key in self.state["results"] and (self.directory / self.state["results"][key]).exists():
                     continue
                 target = self.directory / "inputs/targets" / (key + ".json")
-                settings = {
-                    name: configuration[name]
-                    for name in (
-                        "max_running_requests",
-                        "max_total_tokens",
-                        "page_size",
-                        "max_prefill_tokens",
-                        "prefill_chunk_tokens",
-                        "mixed_batches",
-                        "prefix_cache",
-                        "pd",
-                        "pp",
-                        "ep",
-                        "microbatch_requests",
-                        "placement",
-                    )
-                    if name in configuration
-                }
-                inputs = {
-                    "configuration": settings,
-                    "requests": workload["requests"],
-                    "node_durations_ns": self.specification["node_durations_ns"],
-                }
-                if "prefixes" in workload:
-                    inputs["prefixes"] = workload["prefixes"]
-                pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
-                if any("ep" in pool for pool in pools):
-                    inputs["ep_routes"] = workload["ep_routes"]
-                write_json(target, inputs)
+                write_json(target, serving_input(configuration, workload, self.specification["node_durations_ns"]))
                 base = "diagnostics" if self.details else "results"
                 result = self.directory / base / (key + ".json")
                 try:
@@ -423,6 +409,8 @@ class Exploration:
             "请求完成仅指控制流程结束；仿真结果仍保守标为 partial，来源覆盖和适用条件由 structure 单独说明。",
             "",
             f"模型：{self.specification['model']['path']}，{self.specification['model']['dtype']}。",
+            "",
+            f"任务状态：{self.state['status']}；sources_complete和templates_complete分别只表示对应准备阶段完成。",
             "",
             f"来源实现域 {len(self.domain_settings)} 个，已保存来源会话 {len(self.state['sources'])} 份。",
             "",
@@ -458,7 +446,7 @@ class Exploration:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(lines))
 
-    def run(self) -> None:
+    def run(self, stop_after: Literal["sources", "templates", "predictions"] = "predictions") -> None:
         expected = len(self.specification["configurations"]) * len(self.specification["workloads"])
         if (
             self.state["status"] == "complete"
@@ -480,19 +468,16 @@ class Exploration:
                 name: domain for name, domain in self.domain_settings.items()
                 if not self.asset_path(name).is_file()
             }
-            if any(not self.sources_ready(name, domain) for name, domain in pending_assets.items()):
-                self.prepare()
+            pending_sources = {
+                name: domain for name, domain in pending_assets.items() if not self.sources_ready(name, domain)
+            }
+            if pending_sources:
+                self.prepare_native()
             else:
-                observed = json.loads((self.directory / "inputs/environment.json").read_text())
+                model = json.loads((self.directory / "inputs/model.json").read_text())
                 self.state["failures"].update(
-                    self.acquisition.check_workloads(observed["model_configuration"], self.specification)
+                    self.acquisition.check_workloads(model, self.specification)
                 )
-                if len(self.state["failures"]) != expected:
-                    self.build_tool()
-                    if pending_assets:
-
-                        # Published native facts need only interpretation, without acquisition setup or another Engine.
-                        self.environment.start()
             needed = {
                 self.configurations[configuration["id"]]
                 for configuration in self.specification["configurations"]
@@ -501,12 +486,30 @@ class Exploration:
             }
             domains = {name: domain for name, domain in self.domain_settings.items() if name in needed}
             for name, domain in domains.items():
-                self.acquire(name, domain)
+                if name in pending_sources:
+                    self.collect_sources(name, domain)
 
-            # Publication may precede interruption; reclaim consumed exports on recovery as well.
-            self.release_exports(domains)
-            self.predict()
-            self.state["status"] = "complete" if not self.state["failures"] else "partial"
+            if stop_after != "sources":
+                if needed and (pending_assets or stop_after == "predictions"):
+                    self.build_tool()
+                if pending_assets and needed and self.environment.native is None:
+
+                    # Interpretation reuses native facts with the SDK, without another acquisition setup.
+                    self.environment.start()
+                for name, domain in domains.items():
+                    self.build_templates(name, domain)
+
+                # Publication may precede interruption; reclaim consumed exports on recovery as well.
+                self.release_exports(domains)
+                if stop_after == "predictions":
+                    self.predict()
+
+            self.state["status"] = (
+                {"sources": "sources_complete", "templates": "templates_complete", "predictions": "complete"}[
+                    stop_after
+                ]
+                if not self.state["failures"] else "partial"
+            )
             if self.storage_bytes(retained=True) > self.specification["budget"]["retained_bytes"]:
                 raise BudgetExceeded("retained storage budget exceeded")
         except BaseException as error:
@@ -518,9 +521,15 @@ class Exploration:
                 self.environment.cleanup()
                 work = self.directory / "work"
 
-                # Published sources no longer need the SDK or observer build, including a partial target result.
-                if work.exists() and all(self.asset_path(name).is_file() for name in domains):
-                    shutil.rmtree(work)
+                # Source production owns its subtrees, never pending validation or other consumers' work.
+                for name in domains:
+                    source_work = work / "sources" / name
+                    if self.asset_path(name).is_file() and source_work.exists():
+                        shutil.rmtree(source_work)
+                if domains and all(self.asset_path(name).is_file() for name in domains):
+                    for preparation in (self.environment.observer_build, work / "triton-cache"):
+                        if preparation.exists():
+                            shutil.rmtree(preparation)
             except BaseException as error:
                 self.state["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
                 self.state["failures"]["cleanup"] = str(error)
@@ -535,6 +544,7 @@ def main() -> None:
     parser.add_argument("--input", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--details", action="store_true")
+    parser.add_argument("--stop-after", choices=("sources", "templates", "predictions"), default="predictions")
     arguments = parser.parse_args()
     if arguments.input is None and arguments.resume is None:
         parser.error("provide --input or --resume")
@@ -576,9 +586,9 @@ def main() -> None:
                 owned.unlink(missing_ok=True)
         if old != specification:
             write_json(previous, specification, indent=2)
-        task.run()
+        task.run(stop_after=arguments.stop_after)
         print(directory / "results/summary.md")
-        if task.state["status"] != "complete":
+        if task.state["status"] not in {"sources_complete", "templates_complete", "complete"}:
             raise SystemExit(2)
 
 

@@ -47,7 +47,6 @@ class SGLangSource:
             source["regions"], source["operations"], source["values"], source["environment"]["matrix_selection"]
         )
         CollectiveCall.bind_transports(source["regions"], source["operations"], source["values"])
-        SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
         if source["environment"]["logical_pp"] > 1:
             from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
 
@@ -55,6 +54,9 @@ class SGLangSource:
 
         DisaggregatedTemplates.declare(source)
         SGLangSource.pool_interfaces(source)
+
+        # Refine framework-local pool geometry before runtime rules consume the completed declarations.
+        SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
         geometries = InputGeometries(source["regions"], source["values"])
         AscendConcatenation.declare(source["regions"], source["operations"], source["values"], geometries)
         ModelPaddingCall.declare(source["regions"], source["values"], geometries)

@@ -8,6 +8,10 @@ import subprocess
 from pathlib import Path
 
 
+class NativeDeviceUnavailable(RuntimeError):
+    pass
+
+
 class DockerEnvironment:
     def __init__(self, root: Path, run: Path, service: str, devices: list[int]) -> None:
         self.root = root
@@ -57,6 +61,12 @@ class DockerEnvironment:
                 "-e", f"MARKOV_NATIVE_RUNTIME_DIR={self.native_path(output / 'runtime')}",
                 "-e", f"TRITON_CACHE_DIR={self.native_path(self.observer_build.parent / 'triton-cache')}",
             ]
+        else:
+
+            # Interpretation uses current consumer code with the native SDK; observation stays image-installed.
+            command += [
+                "-e", "PYTHONPATH=/workspace/trace-sim/src/collection:/workspace/trace-sim/src/workload",
+            ]
         return [*command, str(self.native), *self.limited(arguments, remaining_ns)]
 
     def build_command(
@@ -79,7 +89,7 @@ class DockerEnvironment:
 
     def python_command(self, arguments: list[str], remaining_ns: int) -> list[str]:
 
-        # Interpretation and evaluation share one task-owned Python environment without devices.
+        # CPU reports and timing extraction use the task's modeling environment without devices.
         return [
             "docker",
             "run",

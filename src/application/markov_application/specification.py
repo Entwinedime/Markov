@@ -2,11 +2,29 @@
 
 import json
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.acquisition import SGLangAcquisition
 from markov_workload import WorkloadContent
+
+
+def serving_input(configuration: dict, workload: dict, durations: dict) -> dict:
+    content = {
+        "configuration": {
+            key: value for key, value in configuration.items() if key not in ("id", "tp", "attention_backend")
+        },
+        "requests": workload["requests"],
+        "node_durations_ns": durations,
+        **({"prefixes": workload["prefixes"]} if "prefixes" in workload else {}),
+    }
+
+    # One workload can cover configurations with and without expert parallelism.
+    pools = configuration["pd"].values() if "pd" in configuration else (configuration,)
+    if any("ep" in pool for pool in pools):
+        content["ep_routes"] = workload["ep_routes"]
+    return deepcopy(content)
 
 
 def check_fields(source: dict[str, Any], fields: set[str], context: str) -> None:

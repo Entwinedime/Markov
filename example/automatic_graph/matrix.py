@@ -6,6 +6,8 @@ import json
 import random
 from pathlib import Path
 
+from markov_application.specification import serving_input
+
 
 class MatrixInputs:
     def __init__(self, directory):
@@ -288,7 +290,7 @@ class MatrixInputs:
             self.conditional(
                 f"D-running-{running}",
                 "qwen3-tp1",
-                self.target(configuration, workload, self.durations),
+                serving_input(configuration, workload, self.durations),
                 "complete",
                 ["D"],
             )
@@ -297,7 +299,8 @@ class MatrixInputs:
             configuration["max_running_requests"] = running
             workload = next(item for item in task["workloads"] if item["id"] == f"seed-{count}")
             self.conditional(
-                f"G-seed-{count}", "qwen3-tp1", self.target(configuration, workload, self.durations), "complete", ["G"]
+                f"G-seed-{count}", "qwen3-tp1", serving_input(configuration, workload, self.durations),
+                "complete", ["G"],
             )
         task["configurations"] = [
             item for item in task["configurations"] if item["id"] in ("small", "wide", "r32", "r33", "r128")
@@ -333,12 +336,12 @@ class MatrixInputs:
             configuration = task["configurations"][1]
             workload = task["workloads"][0]
             for category, duration in (("host", 137), ("device", 4009), ("communication", 31003), ("transfer", 700001)):
-                target = self.target(configuration, workload, task["node_durations_ns"])
+                target = serving_input(configuration, workload, task["node_durations_ns"])
                 target["node_durations_ns"][category] = duration
                 self.conditional(f"K-{identifier}-{category}", identifier, target, "complete", ["K"])
 
         base = self.tasks["qwen3-tp1"]
-        target = self.target(base["configurations"][0], base["workloads"][0], self.durations)
+        target = serving_input(base["configurations"][0], base["workloads"][0], self.durations)
         negative = copy.deepcopy(target)
         negative["configuration"].update(max_running_requests=1, max_total_tokens=128)
         negative["requests"] = [{"id": "too-large", "arrival_ns": 0, "prompt_tokens": 257, "output_tokens": 2}]
@@ -389,20 +392,6 @@ class MatrixInputs:
             ["A", "H"],
             ["markov: target PP differs from its source topology"],
         )
-
-    @staticmethod
-    def target(configuration, workload, durations):
-        target = {
-            "configuration": {
-                key: value for key, value in configuration.items() if key not in ("id", "tp", "attention_backend")
-            },
-            "requests": copy.deepcopy(workload["requests"]),
-            "node_durations_ns": copy.deepcopy(durations),
-        }
-        for field in ("ep_routes", "prefixes"):
-            if field in workload:
-                target[field] = copy.deepcopy(workload[field])
-        return target
 
     def scheduling_inputs(self):
         cases = (
@@ -506,7 +495,7 @@ class MatrixInputs:
                     impossible = copy.deepcopy(configuration)
                     impossible["pd"]["decode"]["max_total_tokens"] = prefill["max_total_tokens"]
                     self.conditional(
-                        "E-pd-decode-reservation", entry["id"], self.target(impossible, workload, self.durations),
+                        "E-pd-decode-reservation", entry["id"], serving_input(impossible, workload, self.durations),
                         "rejected", ["E"], ["native Decode reservation cannot admit request"],
                     )
 
@@ -555,13 +544,13 @@ class MatrixInputs:
             self.conditional(
                 f"C-equal-pages-{page}",
                 identifier,
-                self.target(configuration, workload, self.durations),
+                serving_input(configuration, workload, self.durations),
                 "complete",
                 ["C", "E"],
             )
 
         task = self.tasks["qwen3-moe-ep2"]
-        target = self.target(task["configurations"][0], task["workloads"][0], self.durations)
+        target = serving_input(task["configurations"][0], task["workloads"][0], self.durations)
         missing = copy.deepcopy(target)
         del missing["ep_routes"]
         self.conditional(
@@ -636,7 +625,7 @@ class MatrixInputs:
         interrupted_path = self.write("lifecycle/interrupted/inputs/task.json", interrupted)
         guarded = self.write(
             "inputs/cases/L-protect-input.json",
-            self.target(base["configurations"][0], base["workloads"][0], self.durations),
+            serving_input(base["configurations"][0], base["workloads"][0], self.durations),
         )
         self.manifest["lifecycle_cases"] = [
             {"id": "L-cli-invalid", "kind": "reject-task", "input": invalid_path, "groups": ["A", "L"]},

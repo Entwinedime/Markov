@@ -217,9 +217,6 @@ class ProcessGroupObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
-            (
-                "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile"
-            ): self.profile_request,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce": self.collective,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather": self.collective,
             "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor": self.collective,

@@ -22,6 +22,20 @@ class SGLangAcquisition:
     observer_library = "libmarkov_ascend_observer.so"
 
     @staticmethod
+    def device_command(devices: Sequence[int]) -> list[str]:
+
+        # The selected Ascend environment must establish idleness before any Engine starts.
+        script = """import subprocess, sys
+for device in sys.argv[1:]:
+    command = ['npu-smi', 'info', '-t', 'proc-mem', '-i', device, '-c', '0']
+    status = subprocess.check_output(command, text=True, timeout=15)
+    if status.strip() != 'No process in device.':
+        raise SystemExit(f'Native device {device} is occupied or its occupancy is unknown: {status}')
+print('Selected native devices are idle')
+"""
+        return ["python3", "-c", script, *map(str, devices)]
+
+    @staticmethod
     def model_command(path: str) -> list[str]:
 
         # Config properties resolve framework aliases; serialized field names need not use those public names.
@@ -69,7 +83,7 @@ class SGLangAcquisition:
             [
                 "cmake",
                 "-S",
-                "/workspace/trace-sim/src/collection/native/runtimes/ascend",
+                "/opt/markov/native/ascend",
                 "-B",
                 directory,
                 "-G",

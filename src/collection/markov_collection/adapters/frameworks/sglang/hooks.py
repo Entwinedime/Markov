@@ -513,7 +513,12 @@ class SGLangObservation:
     def profile(self, original: Any, profiler: Any, request: Any) -> Any:
         from sglang.srt.managers.io_struct import ProfileReqType
 
-        result = original(profiler, request)
+        if self.process_groups is None:
+            result = original(profiler, request)
+        else:
+            result = self.process_groups.profile_request(original, profiler, request)
+
+        # Every participant completes the phase even when only representatives export a profile.
         if request.req_type == ProfileReqType.START_PROFILE:
             self.window.prepared_phase = "profiler"
         return result

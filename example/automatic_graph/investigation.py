@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from markov_application.command import CommandFailed
+from markov_application.environment import NativeDeviceUnavailable
 from markov_application.exploration import BudgetExceeded, Exploration
 from markov_application.specification import read_specification
 from markov_collection.artifacts import write_json
-from validation import NativeDeviceUnavailable, NativeValidation, analyze, completion_checks
+from validation import NativeValidation, analyze, completion_checks
 
 
 class InvestigationTask(Exploration):
@@ -39,33 +40,7 @@ class InvestigationTask(Exploration):
                 raise BudgetExceeded("domain native attempt limit exhausted")
             if attempts >= self.investigation.manifest["round_budget"]["native_attempts"]:
                 raise BudgetExceeded("investigation native attempt limit exhausted")
-            self.check_devices()
         super().step(command, category)
-
-    def check_devices(self) -> None:
-
-        # Query before Engine starts; never compete with another task already using a selected card.
-        script = """import subprocess, sys
-for device in sys.argv[1:]:
-    command = ['npu-smi', 'info', '-t', 'proc-mem', '-i', device, '-c', '0']
-    status = subprocess.check_output(command, text=True, timeout=15)
-    if status.strip() != 'No process in device.':
-        raise SystemExit(f'Native device {device} is occupied or its occupancy is unknown: {status}')
-print('Selected native devices are idle')
-"""
-        command = ["python3", "-c", script, *map(str, self.environment.devices)]
-        try:
-            self.step(
-                [
-                    "docker",
-                    "exec",
-                    str(self.environment.native),
-                    *self.environment.limited(command, self.available("processing")),
-                ],
-                "processing",
-            )
-        except CommandFailed as error:
-            raise NativeDeviceUnavailable(str(error)) from error
 
     def storage_bytes(self, retained: bool = False) -> int:
         self.investigation.check_storage(retained)
@@ -131,9 +106,25 @@ class Investigation:
         if total > limit:
             raise BudgetExceeded("investigation storage budget exhausted")
 
-    def verify_freeze(self) -> None:
-        if self.manifest["status"] != "frozen":
+    def verify_freeze(self, *, capture_only: bool = False) -> None:
+        allowed = {"capture_frozen", "frozen"} if capture_only else {"frozen"}
+        if self.manifest["status"] not in allowed:
             raise ValueError("freeze the reviewed code and inputs before starting the investigation")
+        prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
+        names = [f"{prefix}-sglang:ubuntu22.04", f"{prefix}-control:ubuntu22.04", f"{prefix}-modeling:ubuntu24.04"]
+        if capture_only:
+
+            # Acquisition loads its package and SDK source from the fixed image, never the editable core.
+            names = names[:1]
+        expected = {names[0]: self.manifest["capture_image"]} if capture_only else self.manifest["images"]
+        images = json.loads(subprocess.check_output(["docker", "image", "inspect", *names], text=True))
+        if dict(zip(names, (image["Id"] for image in images), strict=True)) != {
+            name: expected[name] for name in names
+        }:
+            raise ValueError("execution images changed after freezing")
+        if capture_only:
+            return
+
         paths = [
             "src",
             "example",
@@ -169,15 +160,17 @@ class Investigation:
             ["git", "ls-files", "--others", "--exclude-standard", "--", *paths], cwd=self.root, text=True
         ).strip():
             raise ValueError("untracked code was added after freezing")
-        prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
-        names = [f"{prefix}-sglang:ubuntu22.04", f"{prefix}-control:ubuntu22.04", f"{prefix}-modeling:ubuntu24.04"]
-        images = json.loads(subprocess.check_output(["docker", "image", "inspect", *names], text=True))
-        if dict(zip(names, (image["Id"] for image in images), strict=True)) != self.manifest["images"]:
-            raise ValueError("execution images changed after freezing")
 
-    def done(self, case: str) -> bool:
+    def done(self, case: str, *, capture_only: bool = False) -> bool:
         previous = next((item for item in reversed(self.outcomes) if item["case"] == case), None)
-        if previous is None or previous["status"] in NativeValidation.resumable | {"blocked"}:
+        incomplete = NativeValidation.resumable | {"blocked", "sources_complete", "templates_complete"}
+        if capture_only:
+            incomplete -= {"captured", "sources_complete", "templates_complete"}
+        if (
+            previous is None
+            or previous["status"] in incomplete
+            or (not capture_only and previous.get("stage") == "sources")
+        ):
             return False
         return previous["source_task"] == self.case_tasks[case]
 
@@ -218,10 +211,10 @@ class Investigation:
         (self.output.parent / "summary.md").write_text("\n".join(lines) + "\n")
         print(json.dumps({"case": case, "status": outcome["status"]}), flush=True)
 
-    def execute(self, case: str, action, *arguments) -> None:
-        if self.done(case):
+    def execute(self, case: str, action, *arguments, capture_only: bool = False) -> None:
+        if self.done(case, capture_only=capture_only):
             return
-        self.verify_freeze()
+        self.verify_freeze(capture_only=capture_only)
         try:
             outcome = action(*arguments)
         except KeyboardInterrupt:
@@ -236,11 +229,17 @@ class Investigation:
         else:
             self.record(case, outcome)
 
-    def workflow(self, job: dict[str, Any]) -> dict[str, Any]:
-        task = InvestigationTask(self, job)
-        with (task.directory / ".lock").open("a") as lock:
+    def workflow(self, job: dict[str, Any], sources_only: bool = False) -> dict[str, Any]:
+        directory = (self.directory / job["task"]).parent.parent
+        with (directory / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            task.run()
+            task = InvestigationTask(self, job)
+            task.run(stop_after="sources" if sources_only else "predictions")
+        if sources_only:
+            return {
+                "status": task.state["status"], "stage": "sources", "source_sessions": len(task.state["sources"]),
+                "report": str((task.directory / "results/summary.md").relative_to(self.directory)),
+            }
         invalid = []
         for key, relative in task.state["results"].items():
             target = json.loads((task.directory / "inputs/targets" / (key + ".json")).read_text())
@@ -266,15 +265,19 @@ class Investigation:
         key = f"native/{job['id']}/{case['configuration']}/{case['workload']}"
         return key + "/" + case["control"] if "control" in case else key
 
-    def native(self, job: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
-        try:
-            task = self.task(job["id"])
-        except FileNotFoundError as error:
-            return {"status": "blocked", "depends_on": "workflow/" + job["id"], "reason": str(error)}
-        capture = task.directory / "captures" / f"validation-{case['configuration']}-{case['workload']}"
-        with (task.directory / ".lock").open("a") as lock:
+    def native(self, job: dict[str, Any], case: dict[str, Any], capture_only: bool = False) -> dict[str, Any]:
+        directory = (self.directory / job["task"]).parent.parent
+        with (directory / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
+                task = InvestigationTask(self, job) if capture_only else self.task(job["id"])
+            except FileNotFoundError as error:
+                if capture_only:
+                    raise
+                return {"status": "blocked", "depends_on": "workflow/" + job["id"], "reason": str(error)}
+            capture = task.directory / "captures" / f"validation-{case['configuration']}-{case['workload']}"
+            try:
+                task.environment.cleanup()
                 validation = NativeValidation(
                     task,
                     case["configuration"],
@@ -287,10 +290,11 @@ class Investigation:
                 outcome = (
                     previous
                     if previous and previous["status"] not in NativeValidation.resumable
-                    else validation.run(resume=True)
+                    else validation.run(resume=True, capture_only=capture_only)
                 )
-                for subject, minimum in case.get("minimum_coverage", {}).items():
-                    self.coverage(outcome, subject, minimum, outcome.get(subject + "_evidence", {}))
+                if not capture_only:
+                    for subject, minimum in case.get("minimum_coverage", {}).items():
+                        self.coverage(outcome, subject, minimum, outcome.get(subject + "_evidence", {}))
                 outcome["report"] = str(validation.report.relative_to(self.directory))
                 self.check_storage(retained=True)
                 validation.release_observations({validation.control})
@@ -397,9 +401,9 @@ class Investigation:
         assets.mkdir(exist_ok=True)
         if not (assets / "domain-0").exists():
             (assets / "domain-0").symlink_to(source.directory / "assets/domain-0", target_is_directory=True)
-        environment = directory / "inputs/environment.json"
-        if not environment.exists():
-            shutil.copyfile(source.directory / "inputs/environment.json", environment)
+        model = directory / "inputs/model.json"
+        if not model.exists():
+            shutil.copyfile(source.directory / "inputs/model.json", model)
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("a") as log:
             process = subprocess.Popen(
@@ -551,11 +555,30 @@ class Investigation:
             }
         raise ValueError(f"unsupported lifecycle case: {kind}")
 
-    def run(self) -> None:
-        self.verify_freeze()
+    def run(self, *, capture_only: bool = False, source_job: str | None = None) -> None:
+        self.verify_freeze(capture_only=capture_only or source_job is not None)
+        if source_job is not None:
+            job = self.jobs[source_job]
+            case = "workflow/" + source_job
+            self.execute(case, self.workflow, job, True, capture_only=True)
+            if not self.done(case, capture_only=True):
+                raise SystemExit(2)
+            return
+        if capture_only:
+            cases = []
+            for job in self.manifest["jobs"]:
+                for case in job["native_cases"]:
+                    key = self.native_key(job, case)
+                    cases.append(key)
+                    self.execute(key, self.native, job, case, True, capture_only=True)
+            pending = [case for case in cases if not self.done(case, capture_only=True)]
+            print(json.dumps({"native_capture_queue_complete": not pending, "pending": pending}), flush=True)
+            if pending:
+                raise SystemExit(2)
+            return
+
         for job in self.manifest["jobs"]:
             self.execute("workflow/" + job["id"], self.workflow, job)
-        for job in self.manifest["jobs"]:
             for case in job["native_cases"]:
                 self.execute(self.native_key(job, case), self.native, job, case)
         for case in self.manifest["conditional_cases"]:
@@ -571,10 +594,17 @@ class Investigation:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
+    collection = parser.add_mutually_exclusive_group()
+    collection.add_argument(
+        "--collect-targets", action="store_true", help="collect fixed native targets without comparison"
+    )
+    collection.add_argument(
+        "--collect-sources", metavar="JOB", help="collect the planned representatives of one source job"
+    )
     arguments = parser.parse_args()
     root = Path.cwd()
     directory = arguments.run.resolve()
     directory.relative_to(root / "data")
     with (directory / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        Investigation(root, directory).run()
+        Investigation(root, directory).run(capture_only=arguments.collect_targets, source_job=arguments.collect_sources)

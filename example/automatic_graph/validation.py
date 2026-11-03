@@ -10,15 +10,12 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from markov_application.environment import NativeDeviceUnavailable
 from markov_application.exploration import BudgetExceeded, Exploration
-from markov_application.specification import read_specification
+from markov_application.specification import read_specification, serving_input
 from markov_collection.artifacts import write_json
 from request_state import ResourceStateEvidence
 from serving import native_configuration
-
-
-class NativeDeviceUnavailable(RuntimeError):
-    pass
 
 
 def analyze(task: Exploration, script: str, arguments: list[str]) -> None:
@@ -57,7 +54,7 @@ def completion_checks(target: dict[str, Any], result: dict[str, Any]) -> dict[st
 
 
 class NativeValidation:
-    resumable = {"interrupted", "budget_exhausted", "resource_blocked"}
+    resumable = {"interrupted", "budget_exhausted", "resource_blocked", "captured"}
 
     def __init__(
         self,
@@ -187,25 +184,25 @@ class NativeValidation:
                 content = json.loads((directory / "session.json").read_text())["content"]
                 if content != {"requests": target["requests"], "prefixes": target.get("prefixes", [])}:
                     raise ValueError("native capture content differs from the case")
-            if not self.interpreted():
-                self.interpret()
             self.outcome["native_complete"] = True
             return
         task = self.task
         environment = task.environment
+
+        # Isolated source roles may use one card; a real target needs every native participant.
+        if len(environment.devices) < len(self.ranks()):
+            raise NativeDeviceUnavailable(
+                f"native target requires {len(self.ranks())} devices; "
+                f"the source task declares {len(environment.devices)}"
+            )
         if environment.native is None:
-            task.prepare()
+            invalid = task.prepare_native()
+            if self.key in invalid:
+                raise ValueError(invalid[self.key])
 
         # An explicit resume may reuse a request directory left by an unstarted device preflight.
         self.capture.mkdir(parents=True, exist_ok=self.resuming)
-        request = task.acquisition.request(
-            task.specification,
-            self.domain,
-            0,
-            environment.native_path(self.capture),
-            environment.native_path(environment.observer_build / task.acquisition.selector_binary),
-            task.model_configuration,
-        )
+        request = task.capture_request(self.domain, 0, self.capture)
         request["configuration"] = configuration
         request["requests"] = pairs
 
@@ -213,6 +210,7 @@ class NativeValidation:
         request["submissions"] = [list(range(len(pairs)))]
         request["serving_input"] = target
         request["observe_all_workers"] = True
+        self.outcome["native_image"] = request["native_image"]
         path = self.capture / "capture.json"
         write_json(path, request, indent=2)
         self.task.step(
@@ -225,7 +223,6 @@ class NativeValidation:
             "native",
         )
         self.outcome["native_complete"] = True
-        self.interpret()
 
     def ranks(self) -> range:
         count = (
@@ -360,7 +357,7 @@ class NativeValidation:
             analyze(self.task, "evidence.py", ["--input", str(self.input), *arguments, "--output", str(output)])
         return json.loads(output.read_text())
 
-    def run(self, resume: bool = False) -> dict[str, Any]:
+    def run(self, resume: bool = False, *, capture_only: bool = False) -> dict[str, Any]:
         if self.report.exists():
             previous = json.loads(self.report.read_text())
             if not resume or previous["status"] not in self.resumable:
@@ -382,10 +379,28 @@ class NativeValidation:
             }
         outcome = self.outcome
         try:
-            target = json.loads(self.input.read_text())
+            configuration, workload = self.key.split("/")
+            target = serving_input(
+                next(item for item in self.task.specification["configurations"] if item["id"] == configuration),
+                next(item for item in self.task.specification["workloads"] if item["id"] == workload),
+                self.task.specification["node_durations_ns"],
+            )
+            if self.input.is_file() and json.loads(self.input.read_text()) != target:
+                raise ValueError("published target differs from the declared configuration/workload")
+            if not self.input.is_file():
+                write_json(self.input, target)
+            if not capture_only and not self.asset.is_file():
+                raise FileNotFoundError(f"source library was not published: {self.asset}")
 
             # Fix native facts first; only their boundary times reach prediction, never their decisions or graph.
             self.observe(target)
+            if capture_only:
+                if self.task.storage_bytes(retained=True) > self.task.specification["budget"]["retained_bytes"]:
+                    raise BudgetExceeded("retained storage budget exceeded after native capture")
+                outcome["status"] = "captured"
+                return outcome
+            if not self.interpreted():
+                self.interpret()
             try:
                 outcome["native_evidence"] = self.evidence(
                     "native",
@@ -472,6 +487,7 @@ if __name__ == "__main__":
     parser.add_argument("--configuration", required=True)
     parser.add_argument("--workload", required=True)
     parser.add_argument("--capture", type=Path, required=True)
+    parser.add_argument("--capture-only", action="store_true", help="save native facts without templates or prediction")
     arguments = parser.parse_args()
     directory = arguments.run.resolve()
     directory.relative_to(Path.cwd() / "data")
@@ -482,10 +498,10 @@ if __name__ == "__main__":
             validation = NativeValidation(
                 task, arguments.configuration, arguments.workload, directory / arguments.capture
             )
-            outcome = validation.run()
+            outcome = validation.run(resume=True, capture_only=arguments.capture_only)
             validation.release_observations({validation.control})
             print(json.dumps(outcome))
-            if outcome["status"] not in {"matched", "partial", "differences"}:
+            if outcome["status"] not in {"matched", "partial", "differences", "captured"}:
                 raise SystemExit(2)
         finally:
             task.environment.cleanup()

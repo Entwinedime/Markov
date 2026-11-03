@@ -16,6 +16,9 @@ COPY src/collection/markov_collection /opt/markov/collector/src/collection/marko
 COPY src/workload/markov_workload /opt/markov/collector/src/workload/markov_workload
 RUN python3 -m pip install --no-deps --no-build-isolation /opt/markov/collector && rm -rf /opt/markov/collector
 
+# The observer and installed collector share this image, independent of edits to the mounted workspace.
+COPY src/collection/native/runtimes/ascend /opt/markov/native/ascend
+
 WORKDIR /workspace/trace-sim
 
 CMD ["bash"]
