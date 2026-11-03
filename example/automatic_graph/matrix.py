@@ -134,7 +134,7 @@ class MatrixInputs:
             "model": {"path": model["path"], "dtype": dtype},
             "deployment": {"physical_devices": list(range(devices))},
             "budget": {
-                "native_seconds": max(1800, 600 * source_sessions + 700),
+                "native_seconds": max(2400 if moe else 1800, 600 * source_sessions + 700),
                 "processing_seconds": 5400,
                 "temporary_bytes": (64 if moe or pd else 32) * 1024**3,
                 "retained_bytes": (48 if moe or pd else 24) * 1024**3,
