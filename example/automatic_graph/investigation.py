@@ -127,7 +127,7 @@ class Investigation:
 
         paths = [
             "src",
-            "example",
+            "example/automatic_graph",
             "docker",
             "scripts",
             "third_party",
