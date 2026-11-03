@@ -11,9 +11,8 @@ namespace markov {
 
 Executor::Executor(const NodeDurations & durations) : durations_(durations) {}
 
-void Executor::submit(const RegionGraph & graph, const TaskIdentity & task, const BatchProgram & program) {
-    if (program.completions.empty()) throw std::invalid_argument("work needs a completion port");
-    if (tasks_.contains(task)) throw std::invalid_argument("control reused an in-flight task identity");
+void Executor::submit(const RegionGraph & graph, const ServingAction & action, const BatchProgram & program) {
+    const auto & task = action.task;
     ingest(graph);
     tasks_.emplace(task, Task{ next_submission_++, program.completions.size(), program.publication.has_value() });
 
@@ -25,21 +24,6 @@ void Executor::submit(const RegionGraph & graph, const TaskIdentity & task, cons
 
 void Executor::ingest(const RegionGraph & graph) {
     const auto & execution = graph.execution;
-    if (!execution.incoming_waits().empty()) {
-        const auto & wait = execution.incoming_waits().front();
-        const auto & owner = execution.nodes()[wait.target - execution.first_node()].owner;
-        const auto region = owner.kind == ExecutionOwner::Kind::Region ? owner.identity : graph.operations.at(owner.identity).region;
-        const auto & scope = graph.regions.at(region);
-        auto root = region;
-        while (!graph.regions[root].at("parent").is_null()) root = graph.regions[root].at("parent").get<std::size_t>();
-        throw std::invalid_argument("execution has unresolved wait: "
-                                    + nlohmann::json{ { "kind", wait.kind }, { "resource", wait.resource }, { "target", wait.target },
-                                                      { "role", graph.regions[root].at("role") },
-                                                      { "operation", owner.kind == ExecutionOwner::Kind::Operation ? nlohmann::json(graph.operations.at(owner.identity).name) : nlohmann::json(nullptr) },
-                                                      { "rank", scope.value("rank", nlohmann::json(nullptr)) },
-                                                      { "batch", scope.value("batch", nlohmann::json(nullptr)) } }.dump());
-    }
-    if (execution.has_unbound_accesses(graph.operations.size())) throw std::invalid_argument("execution has unresolved data access ports");
 
     std::set<std::size_t> awaiting_peer;
     for (const auto & [_, ports] : execution.pending_communications()) awaiting_peer.insert(ports.returned);
@@ -205,19 +189,6 @@ std::optional<ExecutionEvent> Executor::advance_until(std::optional<std::int64_t
     }
 }
 
-std::int64_t Executor::idle_until(const RegionGraph & graph, std::span<const std::size_t> completions, std::int64_t time_ns) {
-    if (!tasks_.empty()) throw std::logic_error("idle advancement cannot skip task feedback");
-    if (time_ns < now_ns_) throw std::invalid_argument("execution time must not move backwards");
-    ingest(graph);
-    start_ready();
-    while (!std::ranges::all_of(completions, [this](auto node) { return completed(node); })) complete_work();
-    const auto ready_ns = now_ns_;
-    const auto until_ns = std::max(time_ns, ready_ns);
-    while (!completions_.empty() && completions_.begin()->first <= until_ns) complete_work();
-    now_ns_ = until_ns;
-    return ready_ns;
-}
-
 void Executor::retain(std::span<const std::size_t> frontiers) {
 
     // Keep unfinished tails with their durations and successors after the source graph releases its history.
@@ -233,6 +204,15 @@ void Executor::retain(std::span<const std::size_t> frontiers) {
 }
 
 std::int64_t Executor::now_ns() const { return now_ns_; }
+
+nlohmann::json Executor::finish(bool details) const {
+    nlohmann::json result{
+        { "completion_source",         "execution_ports" },
+        {   "duration_source", "given_execution_kind_ns" }
+    };
+    if (details) result["execution_timeline"] = timeline();
+    return result;
+}
 
 nlohmann::json Executor::timeline() const {
     auto result = nlohmann::json::array();

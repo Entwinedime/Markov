@@ -24,8 +24,7 @@ ExpertRouting::Geometry ExpertRouting::discover(std::span<const TemplateAsset * 
         if (result.size > 1 && environment.at("implementation").at("expert_transport") != "1")
             throw std::invalid_argument("expert routing requires the observed DeepEP all-to-all implementation");
 
-        for (const auto & entry : asset->entrypoints()) {
-            if (entry.role != "expert_layer") continue;
+        for (const auto & entry : asset->entrypoints("expert_layer")) {
             const auto & bindings = asset->frame(entry).bindings.values;
             const ExpertLayer layer{ bindings.at("expert_layer"), bindings.at("expert_count"), bindings.at("expert_top_k") };
             const Partition partition{ bindings.at("expert_rank"), bindings.at("expert_begin"), bindings.at("local_expert_count"), layer.experts };

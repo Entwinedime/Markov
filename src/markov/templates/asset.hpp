@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -58,7 +59,6 @@ struct TemplateEntry {
 };
 
 struct RegionSelection {
-    std::string role;
     std::optional<std::string> phase;
     std::size_t entry;
     std::vector<std::size_t> path;
@@ -88,7 +88,7 @@ public:
     const std::vector<std::string> & execution_resources() const;
     const ExecutionPattern & execution_pattern(std::size_t identity) const;
     const BoundExecution & execution_binding(const ExecutionBinding & binding, const Parameters & parameters) const;
-    const std::vector<RegionSelection> & entrypoints() const;
+    std::span<const RegionSelection> entrypoints(const std::string & role) const;
 
 private:
     enum class CallVisit { Unseen, Active, Complete };
@@ -107,7 +107,7 @@ private:
     std::vector<ExecutionSelection> execution_variants_;
 
     std::vector<TemplateEntry> entries_;
-    std::vector<RegionSelection> entrypoints_;
+    std::map<std::string, std::vector<RegionSelection>> entrypoints_;
 };
 
 } // namespace markov

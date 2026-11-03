@@ -26,13 +26,24 @@ class NativeExecution:
         self.task_directory = task_directory
         self.prefix = os.environ.get("MARKOV_IMAGE_PREFIX", "markov-next")
 
-    def run(self, templates: Path, workload: Path, details: bool) -> None:
+    def run(self, templates: Path, workload: Path, details: bool, completion_times: Path | None = None) -> None:
         templates, workload = (path.resolve(strict=True) for path in (templates, workload))
+        mounts = {
+            self.binary: ("/tool/markov", "ro"),
+            self.lock: ("/tool/build.lock", "ro"),
+            templates: ("/inputs/templates.json", "ro"),
+            workload: ("/inputs/serving.json", "ro"),
+        }
+        if completion_times is not None:
+            completion_times = completion_times.resolve(strict=True)
+            if completion_times in mounts:
+                raise ValueError("Completion observations must be a separate input")
+            mounts[completion_times] = ("/inputs/completion-times.json", "ro")
         logs = [self.logs / (role + ".log") for role in ("core", "native")]
         outputs = {path.resolve() for path in (self.output, *logs)}
 
         # Log streams truncate in place, including through a hard link to an input.
-        for path in (self.binary, self.lock, templates, workload):
+        for path in mounts:
             if not path.is_file():
                 raise FileNotFoundError(f"Prediction input is not a file: {path}")
             if path.resolve() in outputs or any(log.exists() and log.samefile(path) for log in logs):
@@ -41,23 +52,14 @@ class NativeExecution:
         self.logs.mkdir(exist_ok=True)
         staging = TemporaryDirectory(prefix=f".{self.output.name}.", dir=self.output.parent)
         pending = Path(staging.name) / self.output.name
+        mounts[pending.parent] = ("/output", "rw")
 
         core = [
             "flock",
             "--shared",
             "--no-fork",
             str(self.lock),
-            *self.container(
-                "modeling",
-                "ubuntu24.04",
-                {
-                    self.binary: ("/tool/markov", "ro"),
-                    self.lock: ("/tool/build.lock", "ro"),
-                    templates: ("/inputs/templates.json", "ro"),
-                    workload: ("/inputs/serving.json", "ro"),
-                    pending.parent: ("/output", "rw"),
-                },
-            ),
+            *self.container("modeling", "ubuntu24.04", mounts),
             "flock",
             "--shared",
             "--no-fork",
@@ -75,6 +77,8 @@ class NativeExecution:
         ]
         if details:
             core.append("--details")
+        if completion_times is not None:
+            core += ["--completion-times", "/inputs/completion-times.json"]
         native = [
             *self.container("control", "ubuntu22.04", {}),
             "python3",
@@ -185,13 +189,14 @@ def main() -> None:
     parser.add_argument("--timeout-seconds", type=float, default=300)
     parser.add_argument("--task-directory", type=Path, help="associate prediction workers with their owning task")
     parser.add_argument("--details", action="store_true")
+    parser.add_argument("--completion-times", type=Path, help="observed work boundaries; internal nodes are not timed")
     arguments = parser.parse_args()
     if arguments.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
 
     root = Path(__file__).resolve().parents[3]
     NativeExecution(root, arguments.output, arguments.timeout_seconds, arguments.task_directory).run(
-        arguments.templates, arguments.input, arguments.details
+        arguments.templates, arguments.input, arguments.details, arguments.completion_times
     )
 
 

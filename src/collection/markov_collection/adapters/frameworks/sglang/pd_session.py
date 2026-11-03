@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -15,9 +16,9 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from markov_workload import WorkloadContent
-
 from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
+from markov_collection.adapters.frameworks.sglang.submissions import DisaggregatedSubmissions
+from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
 from markov_collection.artifacts import write_json
 
 
@@ -61,18 +62,22 @@ class NativeDisaggregatedSession:
     def __init__(self, request: dict[str, Any]) -> None:
         self.request = request
         self.submissions = request["submissions"]
-        if not all(self.submissions) or sorted(index for group in self.submissions for index in group) != list(
-            range(len(request["requests"]))
-        ):
-            raise ValueError("PD submissions must contain every request exactly once")
         source = request.get("serving_input")
         if source is not None and [[item["prompt_tokens"], item["output_tokens"]] for item in source["requests"]] != [
             list(pair) for pair in request["requests"]
         ]:
             raise ValueError("injected workload must describe the submitted native requests")
         self.output = Path(request["output"])
+        self.warmup = NativeServingSession.warmup_requests(request["page_size"])
+        self.phases = (("warmup", self.warmup), ("baseline", request["requests"]), ("capture", request["requests"]))
+        self.rooms = {}
+        room = 1
+        for phase, pairs in self.phases:
+            self.rooms[phase] = room
+            room += len(pairs)
         self.content_input = NativeServingSession.content_input(request["requests"], source)
-        self.content = WorkloadContent(self.content_input["requests"], self.content_input["prefixes"])
+        self.inputs = DisaggregatedSubmissions(self.content_input, self.submissions)
+        self.deliveries: dict[str, Any] = {}
         self.services = self.instances(request)
         self.children: list[subprocess.Popen[bytes]] = []
 
@@ -96,13 +101,18 @@ class NativeDisaggregatedSession:
             description,
             {
                 "output": str(directory),
+                "warmup_requests": [f"warmup/{index}" for index in range(len(self.warmup))],
                 "source_requests": [f"capture/{index}" for index in range(len(self.request["requests"]))],
+                "source_bootstrap_rooms": [
+                    self.rooms["capture"] + index for index in range(len(self.request["requests"]))
+                ],
                 "baseline_requests": [f"baseline/{index}" for index in range(len(self.request["requests"]))],
                 "matrix_selection": self.request["matrix_selection"],
                 "native_library": self.request["native_library"],
                 "pp_size": instance["pp"],
                 "ep_size": instance["ep"],
                 "rank_offset": instance["offset"],
+                "native_participants": list(instance["ranks"]),
                 "disaggregation_role": role,
                 "observe_all_workers": self.request.get("observe_all_workers", False),
                 "serving_input": self.request.get("serving_input"),
@@ -144,6 +154,7 @@ class NativeDisaggregatedSession:
             str(self.bootstrap_port),
             "--disable-overlap-schedule",
             "--disable-cuda-graph",
+            "--sleep-on-idle",
             "--mem-fraction-static",
             "0.8",
             "--log-level",
@@ -215,29 +226,27 @@ class NativeDisaggregatedSession:
         while not all(directory.is_dir() for directory in directories):
             time.sleep(0.05)
 
-    def generate(self, device: int, prefix: str, pairs: Any, rooms: list[int], indices: list[int]) -> list[Any]:
-        if prefix == "warmup":
-            source = NativeServingSession.content_input(pairs)
-            content = WorkloadContent(source["requests"])
-            identities = [request["id"] for request in source["requests"]]
-        else:
-            content = self.content
-            identities = [self.content_input["requests"][index]["id"] for index in indices]
-        payload = {
-            "input_ids": [content.prompt(identity) for identity in identities],
-            "sampling_params": [
-                {"max_new_tokens": output, "temperature": 0, "ignore_eos": True} for _, output in pairs
-            ],
-            "rid": [f"{prefix}/{index}" for index in indices],
-            "bootstrap_host": ["127.0.0.1"] * len(pairs),
-            "bootstrap_port": [self.bootstrap_port] * len(pairs),
-            "bootstrap_room": rooms,
-            "stream": True,
-        }
-        body = self.query(device, "/generate", payload, timeout=None)
-        return [
-            json.loads(line[6:]) for line in body.splitlines() if line.startswith(b"data: ") and line != b"data: [DONE]"
-        ]
+    async def generate(self, prefix: str, room_begin: int) -> dict[str, list[dict[str, Any]]]:
+        import aiohttp
+
+        inputs = (
+            DisaggregatedSubmissions(
+                NativeServingSession.content_input(self.warmup), [list(range(len(self.warmup)))]
+            )
+            if prefix == "warmup"
+            else self.inputs
+        )
+        try:
+
+            # Native task budgets own the deadline; waiting for a response must not delay later arrivals.
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None), connector=aiohttp.TCPConnector(limit=0)
+            ) as session:
+                endpoint = (session, self.http_ports, self.bootstrap_port, room_begin)
+                return await inputs.run(endpoint, prefix)
+        finally:
+            self.deliveries[prefix] = inputs.delivery
+            write_json(self.output / "request-delivery.json", self.deliveries, indent=2)
 
     def run(self) -> None:
         started = time.perf_counter_ns()
@@ -246,46 +255,24 @@ class NativeDisaggregatedSession:
                 self.start(instance, index)
 
             initialized = time.perf_counter_ns()
-            warmup = NativeServingSession.warmup_requests(self.request["page_size"])
-            requests = self.request["requests"]
-            room = 1
+            warmup = self.warmup
             with ThreadPoolExecutor(max_workers=2) as executor, ExitStack() as profiles:
                 started_profiles = []
                 profiles.callback(self.stop_profiles, executor, started_profiles)
-                for prefix, pairs in (("warmup", warmup), ("baseline", requests), ("capture", requests)):
-                    groups = [list(range(len(pairs)))] if prefix == "warmup" else self.submissions
-                    responses: dict[str, list[Any]] = {"prefill": [], "decode": []}
-                    for indices in groups:
-                        rooms = list(range(room, room + len(indices)))
-                        room += len(indices)
-                        futures = [
-                            executor.submit(
-                                self.generate, device, prefix, [pairs[index] for index in indices], rooms, indices
-                            )
-                            for device in range(2)
-                        ]
-                        for role, future in zip(responses, futures, strict=True):
-                            responses[role].extend(future.result())
+                for prefix, _ in self.phases:
+                    responses = asyncio.run(self.generate(prefix, self.rooms[prefix]))
                     write_json(self.output / "responses" / f"{prefix}.json", responses, indent=2)
-                    for role, rows in responses.items():
-                        expected = {
-                            f"{prefix}/{index}": 1 if role == "prefill" else output
-                            for index, (_, output) in enumerate(pairs)
-                        }
-                        tokens = (
-                            None
-                            if prefix == "warmup"
-                            else {
-                                f"{prefix}/{index}": self.content.output_token(request["id"])
-                                for index, request in enumerate(self.content_input["requests"])
-                            }
-                        )
-                        NativeServingSession.check_responses(rows, expected, tokens)
                     print(f"markov: native PD {prefix} complete", flush=True)
 
-                    # Both native replies complete before reset; the observation keeps warmed allocator state.
+                    phase = "source" if prefix == "capture" else prefix
+                    for instance in self.services:
+                        ObservationWindow.request_drain(self.output / instance["role"], phase)
+
+                    # Reset changes cache and pool state only after both native request windows have drained.
                     for device in range(2):
                         self.query(device, "/flush_cache?timeout=30")
+                    for instance in self.services:
+                        ObservationWindow.wait(self.output / instance["role"], instance["ranks"], phase, "complete")
                     if prefix == "warmup":
                         warmed = time.perf_counter_ns()
                         for device, role in enumerate(("prefill", "decode")):
@@ -302,6 +289,10 @@ class NativeDisaggregatedSession:
 
                             # Each successfully started profiler is stopped even if later work fails.
                             started_profiles.append(device)
+                        for instance in self.services:
+                            ObservationWindow.wait(
+                                self.output / instance["role"], instance["ranks"], "profiler", "complete",
+                            )
 
             plan = {
                 "basis": "native_disaggregated_instance_roles",

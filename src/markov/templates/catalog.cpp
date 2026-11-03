@@ -189,6 +189,10 @@ TemplateCatalog::TemplateCatalog(nlohmann::json document) {
         layout.ports.inputs = source.at("ports").at("inputs").get<std::map<std::string, std::size_t>>();
         layout.ports.outputs = source.at("ports").at("outputs").get<std::map<std::string, std::size_t>>();
         layout.required_inputs = source.value("required_inputs", std::vector<std::string>{});
+        if (source.contains("caller_inputs")) layout.caller_inputs = source.at("caller_inputs").get<std::vector<std::string>>();
+        if (source.contains("resource_views")) {
+            for (const auto & view : source.at("resource_views")) layout.resource_views.emplace(view.at(0).get<std::size_t>(), view.at(1).get<std::size_t>());
+        }
 
         for (const auto & contract : source.at("input_shapes")) {
             std::vector<Expression> shape;
@@ -254,6 +258,17 @@ void TemplateCatalog::validate() const {
             for (const auto & name : operation.input_groups) {
                 if (!definition.input_groups.contains(name)) throw std::invalid_argument("operation references an undefined input group: " + name);
             }
+
+            // Content declarations refer to actual operands, never unrelated local values.
+            for (const bool output : { false, true }) {
+                const auto * key = output ? "opaque_outputs" : "opaque_inputs";
+                if (!operation.properties.contains(key)) continue;
+                const auto & operands = output ? operation.access.outputs : operation.access.inputs;
+                for (const auto & value : operation.properties.at(key)) {
+                    if (std::ranges::find(operands, value.get<std::size_t>()) == operands.end())
+                        throw std::invalid_argument("opaque declaration is not an operation operand");
+                }
+            }
         }
     }
 
@@ -269,6 +284,12 @@ void TemplateCatalog::validate() const {
         }
         for (const auto & [name, value] : layout.ports.outputs) {
             if (std::ranges::find(layout.outputs, value) == layout.outputs.end()) throw std::invalid_argument("named output port is not an output: " + name);
+        }
+        for (const auto & [view, resource] : layout.resource_views) {
+            if (std::ranges::find(layout.inputs, view) == layout.inputs.end()
+                || !std::ranges::any_of(layout.ports.inputs, [&](const auto & port) { return port.second == resource; })
+                || layout.storages.at(view) != layout.storages.at(resource))
+                throw std::invalid_argument("state view must alias a named input resource");
         }
 
         if (layout.own_values.size() != definition.values.size() || layout.own_resources.size() != definition.resources)

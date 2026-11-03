@@ -3,24 +3,25 @@
 #include <algorithm>
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace markov {
 
-ServingWorkflow::ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations, ResourceTrace * trace)
+ServingWorkflow::ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, ExecutionFeedback & execution, ResourceTrace * trace)
     : controller_(controller),
       expansion_(expansion),
-      executor_(durations),
+      executor_(execution),
       trace_(trace) {}
 
 nlohmann::json ServingWorkflow::run(bool details) {
     nlohmann::json result{
-        {             "scope",     "serving_execution" },
-        {            "status",               "partial" },
-        { "completion_source",       "execution_ports" },
-        {          "requests", nlohmann::json::array() }
+        {    "scope",     "serving_execution" },
+        {   "status",               "partial" },
+        { "requests", nlohmann::json::array() }
     };
 
     // Accumulate user-visible events directly; retain per-token and per-batch histories only when requested.
@@ -36,7 +37,6 @@ nlohmann::json ServingWorkflow::run(bool details) {
     if (details) {
         result["decisions"] = nlohmann::json::array();
         result["outputs"] = nlohmann::json::array();
-        result["controls"] = nlohmann::json::array();
     }
 
     struct PendingWork {
@@ -49,16 +49,20 @@ nlohmann::json ServingWorkflow::run(bool details) {
     // Diagnostics preserve state feedback order even when timestamps are equal.
     std::size_t state_order = 0;
 
-    while (!controller_.done() || !pending.empty()) {
+    while (true) {
         if (trace_) trace_->context(executor_.now_ns(), state_order, "plan");
         if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
+            if (pending.contains(action->task)) throw std::invalid_argument("control reused an in-flight task identity");
 
             // Resolve graph work before execution acceptance; a control backend may already hold its reservations.
             auto program = expansion_.expand(*action);
+            if (program.completions.empty()) throw std::invalid_argument("work needs a completion port");
+            const auto & graph = expansion_.graph();
+            graph.require_bound_execution();
             const bool publishes = action->commits_requests() && std::ranges::any_of(action->batch_work().effects.members, &RequestCompletion::emits_output);
             if (program.publication.has_value() != publishes) throw std::invalid_argument("request output effects and publication ports disagree");
             auto decision = details ? describe_action(*action, program) : nlohmann::json{};
-            executor_.submit(expansion_.graph(), action->task, program);
+            executor_.submit(graph, *action, program);
             if (trace_) trace_->context(executor_.now_ns(), state_order, "start", action->task);
             controller_.start(*action);
             if (details) decision["submitted_order"] = state_order++;
@@ -69,32 +73,17 @@ nlohmann::json ServingWorkflow::run(bool details) {
             continue;
         }
 
-        // A native participant can finish its control lifecycle without another graph action.
-        if (controller_.done() && pending.empty()) break;
-
-        // Native control finishes in the idle interval, rather than after the next arrival.
+        // Every graph operation belongs to a controller action, including final batch selection.
         const auto arrival_ns = controller_.next_arrival_ns(executor_.now_ns());
-        if (pending.empty()) {
-            if (!arrival_ns) throw std::logic_error("serving has no runnable work, completion or request arrival");
-            const auto scheduled_ns = executor_.now_ns();
-            const auto completions = expansion_.idle();
-            const auto ready_ns = executor_.idle_until(expansion_.graph(), completions, *arrival_ns);
-            if (!completions.empty()) {
-                if (details)
-                    result["controls"].push_back({
-                        {    "scheduled_ns",                       scheduled_ns },
-                        {    "completed_ns",                           ready_ns },
-                        { "execution_ports", { { "completions", completions } } }
-                    });
-                if (!details) executor_.retain(expansion_.retire());
-            }
-            continue;
-        }
+        if (pending.empty() && !arrival_ns && !controller_.done()) throw std::logic_error("serving has no runnable work, completion or request arrival");
 
-        // Progress internal work only as far as a visible completion or the next future arrival.
+        // With no future arrivals, this also drains submitted device tails after the last CPU feedback.
         const auto deadline_ns = arrival_ns && *arrival_ns > executor_.now_ns() ? arrival_ns : std::nullopt;
         const auto next = executor_.advance_until(deadline_ns);
-        if (!next) continue;
+        if (!next) {
+            if (pending.empty() && !arrival_ns) break;
+            continue;
+        }
 
         const auto & event = *next;
         auto & work = pending.at(event.task);
@@ -124,7 +113,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
     if (!expansion_.graph().execution.pending_communications().empty()) throw std::invalid_argument("serving finished with unmatched communication endpoints");
     result["control_status"] = "complete";
     result["completed_ns"] = executor_.now_ns();
-    if (details) result["execution_timeline"] = executor_.timeline();
+    result.update(executor_.finish(details));
     return result;
 }
 
@@ -140,6 +129,22 @@ nlohmann::json ServingWorkflow::describe_action(const ServingAction & action, co
         {  "execution_ports",
          { { "publication", program.publication ? nlohmann::json(*program.publication) : nlohmann::json(nullptr) }, { "completions", program.completions } } }
     };
+    if (action.step == ServingStep::Schedule) {
+        decision["operation"] = action.schedule_operation() == ScheduleOperation::Coordinate ? "coordinate" : "complete";
+        return decision;
+    }
+    if (action.step == ServingStep::Poll) {
+        decision["requests"] = nlohmann::json::array();
+        for (const auto request : action.transfer_query().requests) decision["requests"].push_back(controller_.request(request).id);
+        return decision;
+    }
+    if (const auto * endpoint = std::get_if<TransferEndpoint>(&action.work)) {
+        decision["endpoint"] = {
+            {   "group",                           endpoint->group },
+            { "request", controller_.request(endpoint->request).id }
+        };
+        return decision;
+    }
     if (action.step == ServingStep::Indices) {
         decision["index_operations"] = action.index_work().operations.size();
         return decision;
@@ -218,8 +223,9 @@ void ServingWorkflow::record_publication(nlohmann::json & result, const BatchEff
 
 void ServingWorkflow::record_completion(nlohmann::json & result, nlohmann::json & decision, const ServingAction & action, std::int64_t time_ns,
                                         bool details) const {
-    if (action.step == ServingStep::Indices || action.step == ServingStep::Select) return;
-    const auto & effects = action.batch_work().effects;
+    const auto * work = std::get_if<std::shared_ptr<const BatchWork>>(&action.work);
+    if (!work) return;
+    const auto & effects = (*work)->effects;
     for (std::size_t index = 0; index < effects.members.size(); ++index) {
         const auto & member = effects.members[index];
 

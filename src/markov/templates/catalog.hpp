@@ -145,6 +145,8 @@ struct TemplateLayout {
     std::vector<ShapeContract> input_shapes;
     ValuePorts ports;
     std::vector<std::string> required_inputs;
+    std::optional<std::vector<std::string>> caller_inputs;
+    std::map<std::size_t, std::size_t> resource_views;
 };
 
 // Shared work is parsed once; each source role borrows the catalog for its entire lifetime.

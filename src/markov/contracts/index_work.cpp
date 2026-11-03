@@ -8,20 +8,31 @@
 #include <nlohmann/json.hpp>
 
 namespace markov {
+namespace {
+
+const std::map<std::string, IndexService> services{
+    {           "match",          IndexService::Match },
+    {     "empty_match",     IndexService::EmptyMatch },
+    {          "insert",         IndexService::Insert },
+    {     "insert_path",     IndexService::InsertPath },
+    {           "split",          IndexService::Split },
+    {         "acquire",        IndexService::Acquire },
+    {         "release",        IndexService::Release },
+    {  "retain_request",  IndexService::RetainRequest },
+    { "release_request", IndexService::ReleaseRequest },
+    {           "evict",          IndexService::Evict }
+};
+
+} // namespace
+
+std::string_view index_service_name(IndexService service) {
+    for (const auto & [name, value] : services) {
+        if (value == service) return name;
+    }
+    throw std::invalid_argument("unknown index service");
+}
 
 IndexWork IndexWork::read(const nlohmann::json & source) {
-    static const std::map<std::string, IndexService> services{
-        {           "match",          IndexService::Match },
-        {     "empty_match",     IndexService::EmptyMatch },
-        {          "insert",         IndexService::Insert },
-        {     "insert_path",     IndexService::InsertPath },
-        {           "split",          IndexService::Split },
-        {         "acquire",        IndexService::Acquire },
-        {         "release",        IndexService::Release },
-        {  "retain_request",  IndexService::RetainRequest },
-        { "release_request", IndexService::ReleaseRequest },
-        {           "evict",          IndexService::Evict }
-    };
     static const std::map<std::string, IndexReleaseMode> modes{
         { "immediate", IndexReleaseMode::Immediate },
         {  "deferred",  IndexReleaseMode::Deferred },

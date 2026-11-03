@@ -12,30 +12,11 @@ from markov_collection.adapters.runtimes.pytorch.unique import UniqueObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
-class PoolPorts:
-    @staticmethod
-    def declare(regions: list[dict], values: list[dict]) -> None:
-        for region in regions:
-            metadata = region["metadata"]
-
-            # Host compositions delegate pool transitions to their callable child interfaces.
-            if "entrypoint" not in metadata or "ports" not in metadata or metadata.get("dynamic_calls"):
-                continue
-            for name, identity in metadata["ports"]["inputs"].items():
-                if name not in ("free_pages", "release_pages"):
-                    continue
-
-                # A pool's incoming size belongs to this call, not to the previous producer's before/after names.
-                parameter = name + "_before"
-                metadata.setdefault("parameters", {})[parameter] = values[identity]["shape"][0]
-                metadata["shape_contracts"] = [
-                    item for item in metadata.get("shape_contracts", []) if item["value"] != identity
-                ] + [{"value": identity, "shape": [parameter]}]
-
-
 class RequestCacheCall(NativeCall):
     def __init__(self, values: Any, original: Any, cache: Any, request: Any, finished: bool) -> None:
-        super().__init__(values.recording, values, original.__qualname__, original, {})
+        super().__init__(
+            values.recording, values, original.__qualname__, original, {}, scope_metadata={"requests": [request.rid]}
+        )
         self.cache = cache
         self.request = request
         self.finished = finished
@@ -206,14 +187,6 @@ class TokenAllocationCall(PoolAllocationCall):
 
         with allocated, views:
             return super().invoke(pool, need_size)
-
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> str | None:
-
-        # Downstream batch work consumes tokens, not the allocator's local page-count symbol.
-        self.values.bind_shape(result, (self.values.shapes.symbol("M"),))
-        return super().completed(args, kwargs, result, metadata)
 
 
 class PageAllocationCall(PoolAllocationCall):
@@ -387,57 +360,6 @@ class PageReleaseCall(NativeCall):
 
     def outputs(self, result: Any) -> Any:
         return self.state_outputs
-
-
-class PageMergeCall(NativeCall):
-    def __init__(self, values: Any, original: Any, pool: Any) -> None:
-        super().__init__(values.recording, values, "sglang.KV.merge_and_sort_free", original, {})
-        self.pool = pool
-
-    def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
-        tensors = {name: getattr(self.pool, name) for name in ("free_pages", "release_pages")}
-        for name, value in tensors.items():
-            self.values.bind_shape(value, (self.values.shapes.symbol(name + "_before"),))
-        self.input_ports = self.values.port_values(tensors)
-        return tuple(tensors.values()), ()
-
-    def invoke(self, *args: Any, **kwargs: Any) -> Any:
-        import torch
-
-        metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
-        metadata.update(
-            entrypoint="kv_merge_free",
-            entrypoint_phase=None,
-            parameters={
-                "free_pages_before": len(self.pool.free_pages),
-                "release_pages_before": len(self.pool.release_pages),
-            },
-            derived_parameters=[
-                {"name": "free_pages_after", "expression": ["add", "free_pages_before", "release_pages_before"]}
-            ],
-            guards=[{"condition": ["lt", 0, "release_pages_before"], "expected": True}],
-        )
-        with (
-            TensorGeometryObservation(self.values, factories={torch.empty: (0,)}),
-            ConcatenationObservation(self.values),
-        ):
-            return super().invoke(*args, **kwargs)
-
-    def outputs(self, result: Any) -> Any:
-        return self.pool.free_pages, self.pool.release_pages
-
-    def completed(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
-    ) -> str | None:
-        metadata["parameters"]["free_pages_after"] = len(self.pool.free_pages)
-        self.values.bind_shape(self.pool.free_pages, (self.values.shapes.symbol("free_pages_after"),))
-        metadata["ports"] = {
-            "inputs": self.input_ports,
-            "outputs": self.values.port_values(
-                {name: getattr(self.pool, name) for name in ("free_pages", "release_pages")}
-            ),
-        }
-        return None
 
 
 class PageReleaseGroupCall(NativeCall):

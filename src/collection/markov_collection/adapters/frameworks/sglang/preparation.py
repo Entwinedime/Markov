@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from time import perf_counter_ns
 from typing import Any
 
 import torch
@@ -142,13 +145,23 @@ class ForwardBatchCall(NativeCall):
 
 class BatchPreparationCall(TensorGeometryCall):
     def __init__(
-        self, values: Any, original: Any, batch: Any, decode: bool, fields: dict[str, str] = BatchTensors.fields
+        self, preparation: SGLangPreparation, original: Any, batch: Any, decode: bool
     ) -> None:
-        self.fields = fields if decode else BatchTensors.fields
+        values = preparation.values
+        self.preparation = preparation
+        self.fields = preparation.fields if decode else BatchTensors.fields
         inputs = {f"self.{path}": {0: "B"} for path in self.fields.values()} if decode else {}
         super().__init__(values.recording, values, original.__qualname__, original, inputs, data_shape=("B",))
         self.batch = batch
         self.decode = decode
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        token = self.preparation.current_preparation.set(metadata)
+        try:
+            return super().invoke(*args, **kwargs)
+        finally:
+            self.preparation.current_preparation.reset(token)
 
     @staticmethod
     def model_inputs(batch: Any, fields: dict[str, str] = BatchTensors.fields) -> dict[str, Any]:
@@ -166,6 +179,7 @@ class BatchPreparationCall(TensorGeometryCall):
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
         batch = self.batch
         metadata = self.recording.regions[self.recording.current_scope.get()]["metadata"]
+        metadata["requests"] = [request.rid for request in batch.reqs]
         metadata["parameters"] = {
             "B": len(batch.reqs),
             "M": len(batch.reqs) if self.decode else sum(request.extend_range.length for request in batch.reqs),
@@ -293,6 +307,43 @@ class SGLangPreparation:
         self.fields = fields
         self.native_padding = native_padding
         self.transitions = BatchTransitionPrototypes(operators, fields)
+        self.current_preparation: ContextVar[dict | None] = ContextVar("sglang_preparation", default=None)
+        self.selection_views: ContextVar[dict[int, str]] = ContextVar("sglang_selection_views")
+
+    @contextmanager
+    def selection(self, batch: Any, view: str):
+        if batch is None:
+            yield
+            return
+
+        # Nested admission may select the running batch while the previous batch remains in scope.
+        token = self.selection_views.set({**self.selection_views.get({}), id(batch): view})
+        try:
+            yield
+        finally:
+            self.selection_views.reset(token)
+
+    def previous_selection(self, original: Any, scheduler: Any) -> Any:
+        previous = scheduler.last_batch
+        if previous is not None and not previous.forward_mode.is_extend():
+            previous = None
+        with self.selection(previous, "previous"):
+            return original(scheduler)
+
+    def running_selection(self, original: Any, scheduler: Any, batch: Any) -> Any:
+        with self.selection(batch, "running"):
+            return original(scheduler, batch)
+
+    def admission_selection(self, original: Any, scheduler: Any) -> Any:
+        with self.selection(scheduler.running_batch, "running"):
+            return original(scheduler)
+
+    def before_eviction(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+        if (metadata := self.current_preparation.get()) is not None:
+
+            # This is the control adapter's prepare_inputs seam, before the native capacity check.
+            metadata["preparation_inputs_finished_ns"] = perf_counter_ns()
+        return original(*args, **kwargs)
 
     def grouped_inputs(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return ExtendAllocationCall(
@@ -334,13 +385,13 @@ class SGLangPreparation:
         )(cls, batch, model_runner)
 
     def prepare_extend(self, original: Any, batch: Any) -> Any:
-        return BatchPreparationCall(self.values, original, batch, decode=False)(batch)
+        return BatchPreparationCall(self, original, batch, decode=False)(batch)
 
     def match_prefix(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         return PrefixMatchCall(self.values.recording, self.values, original.__qualname__, original, {})(*args, **kwargs)
 
     def prepare_decode(self, original: Any, batch: Any) -> Any:
-        return BatchPreparationCall(self.values, original, batch, decode=True, fields=self.fields)(batch)
+        return BatchPreparationCall(self, original, batch, decode=True)(batch)
 
     def mix_batch(self, original: Any, batch: Any, running: Any) -> Any:
         return BatchMixCall(self.values, original, batch, running)(batch, running)
@@ -349,9 +400,16 @@ class SGLangPreparation:
         if self.values.recording.current_scope.get() is None or not batch.reqs:
             return original(batch, *args, **kwargs)
 
-        result = BatchTransitionCall(self.values, original, batch, fields=self.fields)(batch, *args, **kwargs)
+        # Keep a valid input before native filtering can discard every member.
         self.transitions.remember(batch)
-        return result
+        selection = self.selection_views.get({}).get(id(batch))
+        if selection is None and batch.forward_mode.is_prebuilt():
+
+            # The prebuilt batch is selected after acceptance and before joining running Decode.
+            selection = "previous"
+        return BatchTransitionCall(
+            self.values, original, batch, fields=self.fields, selection_view=selection
+        )(batch, *args, **kwargs)
 
     def merge_batch(self, original: Any, batch: Any, other: Any) -> Any:
         if self.values.recording.current_scope.get() is None:
@@ -363,7 +421,14 @@ class SGLangPreparation:
         return PageAllocationCall(self.values, original, pool, decode=False)(pool, *args, **kwargs)
 
     def allocate_tokens(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
-        return TokenAllocationCall(self.values, original, pool)(pool, *args, **kwargs)
+        result = TokenAllocationCall(self.values, original, pool)(pool, *args, **kwargs)
+        if self.values.recording.current_scope.get() is not None:
+            with self.values.metadata():
+
+                # Publish the caller's geometry before copies propagate the allocator's local page-count symbols.
+                self.values.bind(result, {0: "M"})
+
+        return result
 
     def allocate_decode(self, original: Any, pool: Any, *args: Any, **kwargs: Any) -> Any:
         return PageAllocationCall(self.values, original, pool, decode=True)(pool, *args, **kwargs)
@@ -402,7 +467,12 @@ class SGLangPreparation:
 
         # Hooks attach geometry at native materialization boundaries before dispatcher observation.
         targets = {
+            "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run": self.previous_selection,
+            "sglang.srt.managers.scheduler.Scheduler.process_prefill_chunk": self.previous_selection,
+            "sglang.srt.managers.scheduler.Scheduler.update_running_batch": self.running_selection,
+            "sglang.srt.managers.scheduler.Scheduler.get_new_batch_prefill": self.admission_selection,
             "sglang.srt.mem_cache.chunk_cache.ChunkCache.match_prefix": self.match_prefix,
+            "sglang.srt.mem_cache.common.evict_from_tree_cache": self.before_eviction,
             "sglang.srt.mem_cache.common.alloc_for_extend": self.grouped_inputs,
             "sglang.srt.mem_cache.common.alloc_req_slots": self.request_slots,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend": self.prepare_extend,

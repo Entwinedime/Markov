@@ -76,9 +76,6 @@ class PageAllocator:
         self.page_size = page_size
         self.device = "cpu"
         self.storage = KvStorage(size, page_size)
-        self.batch = None
-        self.phase = None
-        self.tokens = []
         self.group = None
         self.reservation = None
         self.trace = None
@@ -91,11 +88,7 @@ class PageAllocator:
 
     def allocate(self):
         if self.reservation is None:
-            members = [
-                {"request": int(req.rid), "tokens": tokens}
-                for req, tokens in zip(self.batch.reqs, self.tokens, strict=True)
-            ]
-            bindings = self.peer.call("allocate", phase=self.phase, members=members)
+            bindings = self.peer.call("allocate")["bindings"]
         else:
             req = self.reservation
             bindings = self.peer.call(

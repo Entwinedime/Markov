@@ -1,6 +1,6 @@
 """Run the native scheduler loop against core resource and execution services."""
 
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from functools import partial
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import schedule_batch
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
@@ -63,12 +64,33 @@ class ResultReady:
         self.peer.call("read_result", **self.work)
 
 
+@dataclass(kw_only=True, frozen=True)
+class ScheduleBoundary(SchedulerDPAttnAdapter):
+    controller: object
+
+    def maybe_prepare_mlp_sync_batch(self, batch, need_sync=None):
+
+        # Every supported selector finishes allocation before this shared native boundary.
+        self.controller.prepare(batch)
+        result = super().maybe_prepare_mlp_sync_batch(batch, need_sync=need_sync)
+        if self.controller.observing:
+            self.controller.peer.call("scheduled")
+        return result
+
+    def prepare_mlp_sync_batch(self, batch):
+        result = super().prepare_mlp_sync_batch(batch)
+        if self.controller.observing:
+            self.controller.peer.call("coordinate")
+        return result
+
+
 class NativeScheduler(Scheduler):
     def __init__(self, peer, settings, model_path: str, source, rank: int, workload) -> None:
         self.peer = peer
         self.control_rank = rank
         self.graph_rank = source["ranks"][rank]
         self.control_round = 0
+        self.native_idle = True
         model_runner.ModelRunner = partial(MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri())
         register_radix_cache_backend("markov", PrefixCache.build)
         scheduler_module.create_scheduler_watchdog = self.workflow_watchdog
@@ -81,6 +103,8 @@ class NativeScheduler(Scheduler):
             tp_size=source["tp"],
             ep_size=source["ep"],
             pp_size=source["pp"],
+            moe_a2a_backend=source["moe_a2a_backend"],
+            deepep_mode=source["deepep_mode"],
             pp_max_micro_batch_size=settings["microbatch_requests"],
             device="cpu",
             load_format="dummy",
@@ -133,9 +157,24 @@ class NativeScheduler(Scheduler):
             ChunkIndices(self.tree_cache, peer)
         self.published = PublishedRequests(self.ps.pp_rank == 0, self.token_to_kv_pool_allocator)
         self.output_streamer.send_to_detokenizer = self.published
+        native = self.dp_attn_adapter
+        self.dp_attn_adapter = ScheduleBoundary(
+            **{field.name: getattr(native, field.name) for field in fields(native)}, controller=self
+        )
 
     def current_lane(self):
         return 0
+
+    @property
+    def observing(self):
+        return not self.native_idle
+
+    def process_input_requests(self, requests):
+
+        # A new request opens the next serving interval after native idle housekeeping.
+        if requests:
+            self.native_idle = False
+        return super().process_input_requests(requests)
 
     def begin_iteration(self):
         self.peer.context = {"flow": self.control_round, "lane": self.current_lane()}
@@ -148,7 +187,7 @@ class NativeScheduler(Scheduler):
 
         # The previous Prefill is filtered and joined before native prefix lookup and admission.
         with NativeBatch.report_selection(previous, "previous"):
-            return self.prepare(super().get_next_batch_to_run())
+            return super().get_next_batch_to_run()
 
     def prepare(self, batch):
         if batch is not None:
@@ -213,5 +252,16 @@ class NativeScheduler(Scheduler):
             self.peer.context = previous
 
     def on_idle(self):
+        idle = self.is_fully_idle()
+        if idle:
+            self.native_idle = True
         super().on_idle()
-        self.peer.send({"kind": "idle"})
+        if not idle:
+            return
+        message = {"kind": "idle", "waiting": self.ps.pp_rank == 0}
+
+        # Match native ingress sleeping; downstream stages must still drain the control ring.
+        if message["waiting"]:
+            self.peer.call("idle", waiting=True)
+        else:
+            self.peer.send(message)

@@ -1,5 +1,6 @@
 #include "markov/templates/target_graph.hpp"
 
+#include <algorithm>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -26,13 +27,35 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
                                  const std::map<std::string, std::size_t> & inputs, const GroupValues & groups) {
 
     // Candidate selection and port validation finish before the shared graph changes.
-    const TargetInputs bindings{ graph_, inputs, groups };
-    auto instance = TemplateInstance::select(asset_, role, phase, invocation, &bindings);
+    const ValuePorts ports{ inputs, {} };
+    const TargetBindings bindings{ graph_, ports, groups };
+    auto instance = TemplateInstance::select(asset_, role, phase, invocation, bindings);
+    auto result = publish(std::move(instance));
+    graph_.execution.connect_accesses(graph_.values, graph_.types, graph_.operations);
+    return result;
+}
+
+TargetRegion TargetGraph::append_from(const std::string & role, const std::string & phase, const Invocation & invocation,
+                                      const std::map<std::string, std::size_t> & available, const GroupValues & groups,
+                                      const std::vector<std::string> * caller_inputs) {
+    const ValuePorts ports{ available, {} };
+    const TargetBindings bindings{ graph_, ports, groups, true, caller_inputs };
+    auto result = publish(TemplateInstance::select(asset_, role, phase, invocation, bindings));
+    graph_.execution.connect_accesses(graph_.values, graph_.types, graph_.operations);
+    return result;
+}
+
+TargetRegion TargetGraph::publish(TemplateInstance instance, std::optional<std::size_t> parent) {
     auto & fragment = instance.graph_;
-    auto & resource_bindings = instance.bound_inputs_.resources;
-    const auto & value_bindings = instance.bound_inputs_.values;
-    const auto & bound_types = instance.bound_inputs_.types;
-    fragment.regions.front()["entrypoint"] = role;
+    auto & resource_bindings = instance.bound_ports_.resources;
+    const auto & value_bindings = instance.bound_ports_.values;
+    const auto & bound_types = instance.bound_ports_.types;
+    fragment.regions.front()["entrypoint"] = instance.role_;
+
+    // A private parent still uses source origins; rank publication owns a separate target-state cache.
+    if (parent && std::ranges::any_of(fragment.external_resources, [&](const auto & origin) { return !resource_bindings.at(origin.first); })) {
+        for (const auto & [resource, source] : graph_.external_resources) external_resources_.emplace(source, resource);
+    }
 
     // External state is shared by source identity; all remaining resources belong to this invocation.
     auto resource_count = graph_.resource_count;
@@ -62,8 +85,7 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
     // Remap the private fragment into the shared identity space before publishing it.
     const auto region_offset = graph_.regions.size();
     const auto operation_offset = graph_.operations.size();
-    TargetRegion result{ region_offset, remap_ports(instance.ports_, values), {} };
-    for (const auto & [name, members] : instance.group_inputs_) result.group_inputs.emplace(name, remap(members, values));
+    TargetRegion result{ region_offset, remap_ports(instance.ports_, values) };
 
     for (auto & operation : fragment.operations) {
         operation.region += region_offset;
@@ -77,10 +99,7 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
         edge.target += operation_offset;
     }
 
-    for (auto & work : fragment.work) {
-        remap_arguments(work["arguments"], values);
-        remap_arguments(work["keywords"], values);
-    }
+    for (auto & work : fragment.work) remap_work(work, values);
 
     for (auto & region : fragment.regions) {
         region["id"] = region.at("id").get<std::size_t>() + region_offset;
@@ -101,14 +120,18 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
         fragment.regions.front()["parent"] = caller.identity;
         graph_.execution.append_host(caller.identity, caller.resource);
     }
+    else if (parent) fragment.regions.front()["parent"] = *parent;
 
     for (const auto & [target, type] : bound_types) graph_.types[target] = type;
     for (std::size_t local = 0; local < fragment.values.size(); ++local) {
-        if (value_bindings.contains(local)) continue;
-
         auto value = fragment.values[local];
         value.storage = resources.at(value.storage);
         if (value.producer) *value.producer += operation_offset;
+        if (const auto bound = value_bindings.find(local); bound != value_bindings.end()) {
+            if (value.producer) graph_.values.at(bound->second).producer = value.producer;
+            continue;
+        }
+
         graph_.values.push_back(value);
         graph_.types.push_back(std::move(fragment.types[local]));
     }
@@ -123,19 +146,18 @@ TargetRegion TargetGraph::append(const std::string & role, const std::string & p
                                 std::make_move_iterator(fragment.state_changes.begin()),
                                 std::make_move_iterator(fragment.state_changes.end()));
     graph_.execution.append(std::move(fragment.execution), operation_offset, region_offset, execution_offset_);
-    graph_.execution.connect_accesses(graph_.values, graph_.types, graph_.operations);
-
     graph_.resource_count = resource_count;
+    if (parent) {
+        for (const auto & [source, resource] : additions) graph_.external_resources.emplace(resource, source);
+    }
     external_resources_.merge(additions);
-    if (!result.group_inputs.empty()) graph_.regions[result.region]["group_inputs"] = result.group_inputs;
-
     return result;
 }
 
 std::size_t TargetGraph::begin_composition(const std::string & role, const std::string & phase, const Parameters & parameters,
                                            const std::map<std::string, std::size_t> & inputs) {
-    for (const auto & selection : asset_.entrypoints()) {
-        if (selection.role != role || (selection.phase && *selection.phase != phase)) continue;
+    for (const auto & selection : asset_.entrypoints(role)) {
+        if (selection.phase && *selection.phase != phase) continue;
         const auto frame = asset_.frame(selection);
         const auto definition_id = asset_.layout(frame.layout).definition;
         const auto & definition = asset_.definition(definition_id);
@@ -193,6 +215,18 @@ void TargetGraph::end_composition(const std::map<std::string, std::size_t> & out
     region["ports"]["outputs"] = outputs;
     graph_.execution.append_host(caller.identity, caller.resource);
     compositions_.pop_back();
+}
+
+std::size_t TargetGraph::initial_integers(const std::string & dtype, const std::string & device, IntegerData data) {
+    const auto value = graph_.values.size();
+    graph_.values.push_back({ graph_.resource_count++, std::nullopt });
+    graph_.types.push_back({
+        {   "kind", "tensor" },
+        {  "dtype",    dtype },
+        { "device",   device }
+    });
+    bind_integers(value, std::move(data));
+    return value;
 }
 
 void TargetGraph::bind_integers(std::size_t value, IntegerData data) {

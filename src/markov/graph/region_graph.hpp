@@ -34,7 +34,7 @@ struct GraphRoots {
     std::set<std::size_t> storage;
 };
 
-// Values, work and execution share this instance's identity space.
+// Graph tables have separate identities; execution owners identify which table they reference.
 struct RegionGraph {
     std::vector<ValueAccess> values;
     std::vector<nlohmann::json> types;
@@ -50,6 +50,12 @@ struct RegionGraph {
     std::map<std::size_t, std::size_t> external_resources;
     std::map<std::size_t, IntegerData> integer_data;
     std::size_t resource_count = 0;
+
+    // Operation and region identities belong to different tables, including on CPU service ports.
+    std::size_t owner_region(ExecutionOwner owner) const;
+
+    // A feedback provider may replace timing, but cannot supply missing waits or operand ports.
+    void require_bound_execution() const;
 
     // References belong to the adapter's live ports and are rebound before old values are released.
     std::vector<std::size_t> retire(GraphRoots roots);

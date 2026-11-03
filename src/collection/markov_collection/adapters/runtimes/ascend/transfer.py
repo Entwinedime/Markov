@@ -33,7 +33,10 @@ class MemfabricObservation:
                 writes=[],
                 parameters={"transfer_bytes": metadata["bytes"], "transfer_segments": len(metadata["segments"])},
                 attributes={"transport": metadata["transport"]},
-                native_work={"kind": "transfer", "resource": "transfer", "name": "memfabric.batch_transfer_sync_write"},
+                native_work={
+                    "kind": "transfer", "resource": "transfer", "identity": 0,
+                    "name": "memfabric.batch_transfer_sync_write",
+                },
             )
 
     def copy(self, original: Any, engine: Any, session: str, buffers: Any, destinations: Any, lengths: Any) -> Any:

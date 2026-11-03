@@ -41,9 +41,13 @@ public:
     PageReuse page_reuse() const;
     nlohmann::json source_summary() const;
     RankProgram expand(const ServingAction & action);
+    RankProgram schedule(ScheduleOperation operation, const std::map<std::string, std::size_t> & outputs);
     TargetRegion transfer(std::int64_t bytes, std::int64_t segments);
     TargetRegion prepare(const Batch & batch, std::size_t lane);
     TargetRegion prepare(const BatchWork & work, std::size_t lane);
+    RankProgram prepare_inputs(const Batch & batch, std::size_t lane);
+    RankProgram allocate(const Batch & batch);
+    RankProgram prepare_outputs(const Batch & batch, std::size_t lane);
     TargetRegion model(const Batch & batch, const std::map<std::string, std::size_t> & inputs);
     std::optional<std::size_t> begin_result(const Batch & batch, std::optional<std::size_t> sampled_tokens);
     RankProgram complete(const Batch & batch, const BatchEffects & effects, std::size_t lane, const std::map<std::string, std::size_t> & model_columns,
@@ -51,19 +55,20 @@ public:
                          const std::optional<IndexWork> & index_tail = std::nullopt);
     RankMessage message(const std::string & role, const Batch & batch, const std::map<std::string, std::size_t> & payload, bool sending);
     std::vector<std::size_t> wait_message(const std::string & channel, const Batch & batch, const RankMessage & message);
-    std::size_t prepare_result(const Batch & batch, std::size_t sampled_tokens);
+    std::size_t prepare_result(const Batch & batch, std::size_t sampled_tokens, std::size_t request_slots);
     std::size_t read_pipeline_result(const Batch & batch, std::size_t sampled_tokens);
-    std::optional<std::size_t> idle();
-
+    std::size_t transport_event(const std::string & role, std::int64_t prompt_tokens);
     void live_state(GraphRoots & roots);
 
 private:
     RankProgram indices(const IndexWork & work);
+    RankProgram poll(const TransferQuery & query);
     TargetRegion prepare_part(const Batch & batch, std::size_t lane);
-    void begin_schedule(Phase phase, std::size_t members);
+    void begin_schedule(const std::string & phase, std::size_t members);
     RankProgram select(const BatchSelection & selection, std::size_t lane);
     RankProgram retain(const Batch & batch);
     RankProgram reserve(const Batch & batch);
+    RankProgram advertise(const Batch & batch, std::size_t metadata_slot);
     TargetRegion send_kv(const Batch & batch, const BatchMember & member, std::size_t metadata_slot, bool final);
     RankProgram receive_kv(const Batch & batch, std::size_t metadata_slot);
     RankProgram accept(const Batch & batch, const BatchEffects & effects, std::size_t lane);
@@ -72,9 +77,10 @@ private:
                               std::int64_t slot_capacity);
     Invocation cache_arguments(std::size_t slot, std::int64_t tokens, std::int64_t slot_capacity) const;
     Invocation invocation(const Batch & batch) const;
+    Invocation allocation_invocation(const Batch & batch) const;
     void stamp(std::size_t region_begin);
     void return_pages(std::size_t output, std::span<const std::size_t> pages);
-    void merge_pages(const Batch & batch);
+    void bind_allocation(const TargetRegion & allocation, const Batch & batch);
     const char * released_pool() const;
 
     ServingSettings settings_;
@@ -85,6 +91,16 @@ private:
     // Transfer workers run independently while a scheduling or result caller can remain open.
     TargetGraph transfer_graph_;
     std::vector<BatchViews> views_;
+    std::vector<std::vector<TargetRegion>> prepared_;
+
+    struct Preparation {
+        Invocation invocation;
+        GroupValues groups;
+        std::map<std::string, std::size_t> values;
+        std::vector<std::string> caller_inputs;
+        std::size_t region;
+    };
+    std::optional<Preparation> preparation_;
     std::size_t rank_;
     const ExpertRouting * routing_;
     bool publishes_;
@@ -92,10 +108,10 @@ private:
     bool prefix_cache_;
     PageReuse page_reuse_;
 
-    std::optional<std::size_t> free_pages_;
+    std::size_t free_pages_;
     std::optional<std::size_t> request_map_;
     std::optional<std::size_t> token_relay_;
-    std::optional<std::size_t> release_pages_;
+    std::size_t release_pages_;
 
     // Graph operand contents and retained producer ports; allocation remains owned by KvPool.
     struct ChunkIndices {

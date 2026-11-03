@@ -162,10 +162,7 @@ class Exploration:
                 "docker",
                 "exec",
                 str(self.environment.native),
-                "python3",
-                "-c",
-                "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))",
-                str(Path(self.specification["model"]["path"]) / "config.json"),
+                *self.acquisition.model_command(self.specification["model"]["path"]),
             ],
             text=True,
             timeout=30,
@@ -254,9 +251,31 @@ class Exploration:
         capture.resolve().relative_to(self.directory)
         return capture
 
+    def source_plan(self, name: str, domain: dict[str, Any], bootstrap: Path) -> tuple[Path, dict[str, Any]]:
+        path = self.directory / "inputs/role-plans" / (name + ".json")
+        if path.is_file():
+            return path, json.loads(path.read_text())
+
+        plan = self.acquisition.role_plan(domain, bootstrap)
+        write_json(path, plan, indent=2)
+        return path, plan
+
+    def sources_ready(self, name: str, domain: dict[str, Any]) -> bool:
+        bootstrap = self.state["sources"].get(f"{name}-source-0")
+        if bootstrap is None:
+            return False
+        _, plan = self.source_plan(name, domain, self.directory / bootstrap)
+        return all(
+            f"{name}-source-{representative}" in self.state["sources"]
+            for representative, _ in enumerate(self.acquisition.source_groups(domain, plan))
+        )
+
+    def asset_path(self, name: str) -> Path:
+        return self.directory / "assets" / name / "templates.json"
+
     def acquire(self, name: str, domain: dict[str, Any]) -> None:
-        assets = self.directory / "assets" / name
-        if assets.exists():
+        library = self.asset_path(name)
+        if library.is_file():
             return
         draft = self.directory / "work" / name
         draft.mkdir(parents=True, exist_ok=True)
@@ -265,44 +284,69 @@ class Exploration:
 
         # The mandatory first representative supplies native module partitions before choosing remaining sessions.
         bootstrap = self.capture_source(name, domain, 0, next(self.acquisition.source_groups(domain)))
-        plan = self.acquisition.role_plan(domain, bootstrap)
-        instances = self.directory / "inputs/role-plans" / (name + ".json")
-        write_json(instances, plan, indent=2)
+        instances, plan = self.source_plan(name, domain, bootstrap)
         arguments += ["--instances", str(instances)]
         inputs.append(instances)
         for representative, roles in enumerate(self.acquisition.source_groups(domain, plan)):
             capture = self.capture_source(name, domain, representative, roles)
-            physical_paths = [capture / self.acquisition.physical_name(domain, rank) for rank in roles]
-            command = self.acquisition.command("interpret", self.environment.native_path(capture / "capture.json"))
+            interpreted = self.directory / "work/observations" / capture.name
+            interpreted.mkdir(parents=True, exist_ok=True)
+            command = self.acquisition.command(
+                "interpret", self.environment.native_path(capture), self.environment.native_path(interpreted)
+            )
             self.step(
                 self.environment.native_command(
-                    command, capture, self.acquisition.observer_library, self.available("processing")
+                    command, interpreted, None, self.available("processing")
                 ),
                 "processing",
             )
-            for rank, physical in zip(roles, physical_paths, strict=True):
-                source = capture / self.acquisition.source_name(domain, rank)
+            for rank in roles:
+                source = interpreted / self.acquisition.source_name(domain, rank)
+                physical = interpreted / self.acquisition.physical_name(domain, rank)
                 arguments += ["--source", str(source), "--physical", str(physical)]
                 inputs += [source, physical]
 
         # Compile all roles against one catalog, keeping each role's resource and execution bindings independent.
-        asset = draft / "templates.json"
-        arguments += ["--output", str(asset)]
+        output = draft / library.name
+        arguments += ["--output", str(output)]
         self.step(
-            self.environment.tool_command(arguments, inputs, asset, self.available("processing")),
+            self.environment.tool_command(arguments, inputs, output, self.available("processing")),
             "processing",
         )
 
         # A domain becomes reusable only after every role's asset has been published together.
-        assets.parent.mkdir(parents=True, exist_ok=True)
-        draft.replace(assets)
+        library.parent.parent.mkdir(parents=True, exist_ok=True)
+        draft.replace(library.parent)
 
-    def simulate(self, asset: Path, target: Path, result: Path, details: bool) -> None:
+    def release_exports(self, domains: dict[str, dict[str, Any]]) -> None:
+        if self.details:
+            return
+        for name, domain in domains.items():
+            for key, relative in self.state["sources"].items():
+                if not key.startswith(name + "-source-"):
+                    continue
+                for parent in self.acquisition.observation_directories(domain, self.directory / relative):
+                    parent = parent.resolve()
+                    parent.relative_to(self.directory)
+                    for child in ("native", "runtime"):
+                        path = parent / child
+                        if path.exists():
+                            shutil.rmtree(path)
+
+    def simulate(
+        self, asset: Path, target: Path, result: Path, details: bool, *,
+        control: str | None = None, completion_times: Path | None = None,
+    ) -> None:
         arguments = ["simulate", "--templates", str(asset), "--input", str(target), "--output", str(result)]
         if details:
             arguments.append("--details")
         remaining = self.available("processing")
-        if self.specification.get("control", "lightweight") == "native":
+        selected = self.specification.get("control", "lightweight") if control is None else control
+        if completion_times is not None:
+            if selected != "native":
+                raise ValueError("observed completion times require native control")
+            arguments += ["--completion-times", str(completion_times)]
+        if selected == "native":
             command = [
                 "bash",
                 str(self.root / "scripts/markov-control.sh"),
@@ -319,8 +363,7 @@ class Exploration:
     def predict(self) -> None:
         for configuration in self.specification["configurations"]:
             domain = self.configurations[configuration["id"]]
-            assets = self.directory / "assets" / domain
-            asset = assets / "templates.json"
+            asset = self.asset_path(domain)
             for workload in self.specification["workloads"]:
                 key = f"{configuration['id']}/{workload['id']}"
                 if key in self.state["failures"]:
@@ -421,8 +464,9 @@ class Exploration:
             self.state["status"] == "complete"
             and len(self.state["results"]) == expected
             and all((self.directory / path).is_file() for path in self.state["results"].values())
-            and (self.directory / "results/summary.md").is_file()
+            and all(self.asset_path(name).is_file() for name in self.domain_settings)
         ):
+            self.report()
             return
         self.state["status"] = "running"
         self.state["failures"] = {}
@@ -432,8 +476,11 @@ class Exploration:
         # The run lock is held; reclaim only this task's interrupted workers before doing new work.
         try:
             self.environment.cleanup()
-            needs_sources = any(not (self.directory / "assets" / name).exists() for name in self.domain_settings)
-            if needs_sources:
+            pending_assets = {
+                name: domain for name, domain in self.domain_settings.items()
+                if not self.asset_path(name).is_file()
+            }
+            if any(not self.sources_ready(name, domain) for name, domain in pending_assets.items()):
                 self.prepare()
             else:
                 observed = json.loads((self.directory / "inputs/environment.json").read_text())
@@ -442,6 +489,10 @@ class Exploration:
                 )
                 if len(self.state["failures"]) != expected:
                     self.build_tool()
+                    if pending_assets:
+
+                        # Published native facts need only interpretation, without acquisition setup or another Engine.
+                        self.environment.start()
             needed = {
                 self.configurations[configuration["id"]]
                 for configuration in self.specification["configurations"]
@@ -453,18 +504,7 @@ class Exploration:
                 self.acquire(name, domain)
 
             # Publication may precede interruption; reclaim consumed exports on recovery as well.
-            if not self.details:
-                for name, domain in domains.items():
-                    for key, relative in self.state["sources"].items():
-                        if not key.startswith(name + "-source-"):
-                            continue
-                        for parent in self.acquisition.observation_directories(domain, self.directory / relative):
-                            parent = parent.resolve()
-                            parent.relative_to(self.directory)
-                            for child in ("native", "runtime"):
-                                path = parent / child
-                                if path.exists():
-                                    shutil.rmtree(path)
+            self.release_exports(domains)
             self.predict()
             self.state["status"] = "complete" if not self.state["failures"] else "partial"
             if self.storage_bytes(retained=True) > self.specification["budget"]["retained_bytes"]:
@@ -479,7 +519,7 @@ class Exploration:
                 work = self.directory / "work"
 
                 # Published sources no longer need the SDK or observer build, including a partial target result.
-                if work.exists() and all((self.directory / "assets" / name).exists() for name in domains):
+                if work.exists() and all(self.asset_path(name).is_file() for name in domains):
                     shutil.rmtree(work)
             except BaseException as error:
                 self.state["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"

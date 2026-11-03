@@ -56,6 +56,8 @@ public:
 private:
     nlohmann::json receive_call();
     void reply(std::size_t call, const nlohmann::json & result);
+    bool reach_idle(const std::string & group, std::size_t call, bool waiting);
+    void release_idle(const std::string & instance);
 
     struct Input {
         std::optional<std::size_t> call;
@@ -66,7 +68,7 @@ private:
     std::vector<Request> requests_;
     std::map<std::string, std::unique_ptr<NativeGroup>> groups_;
     std::set<std::string> stopped_;
-    std::set<std::string> idle_;
+    std::map<std::string, std::optional<std::size_t>> idle_;
     std::map<std::string, Input> inputs_;
     std::map<std::string, std::string> instances_;
     std::unique_ptr<NativeTransfer> transfer_;

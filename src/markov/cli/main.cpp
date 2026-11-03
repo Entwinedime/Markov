@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -56,20 +57,59 @@ void write_json(const std::filesystem::path & path, const nlohmann::json & resul
     std::filesystem::rename(temporary, path);
 }
 
-nlohmann::json compose(const markov::TemplateAsset & asset, const nlohmann::json & target) {
+nlohmann::json compose(const markov::TemplateAsset & asset, const nlohmann::json & target, bool single) {
     markov::RegionGraph shared;
     shared.execution_resources = asset.execution_resources();
+
+    // Initial values declare caller-owned tensors and aliases, never observed outputs.
+    std::map<std::int64_t, std::size_t> storage;
+    const auto values = target.value("values", nlohmann::json::array());
+    if (!values.is_array()) throw std::invalid_argument("initial values must be an array");
+    for (const auto & value : values) {
+        const auto & identity = value.at("storage");
+        if (!identity.is_number_integer() || identity.get<std::int64_t>() < 0) throw std::invalid_argument("initial storage must be a nonnegative integer");
+        const auto kind = value.at("kind").get<std::string>();
+        if (kind != "tensor" && kind != "resource") throw std::invalid_argument("unknown initial value kind: " + kind);
+
+        nlohmann::json type{
+            { "kind", kind }
+        };
+        if (kind == "tensor") {
+            const auto & shape = value.at("shape");
+            if (!shape.is_array()
+                || !std::ranges::all_of(shape, [](const auto & size) { return size.is_number_integer() && size.template get<std::int64_t>() >= 0; }))
+                throw std::invalid_argument("initial tensor dimensions must be nonnegative integers");
+            type.update({
+                {  "dtype",  value.at("dtype").get<std::string>() },
+                { "device", value.at("device").get<std::string>() },
+                {  "shape",                                 shape }
+            });
+        }
+
+        const auto resource = storage.try_emplace(identity.get<std::int64_t>(), storage.size()).first->second;
+        shared.values.push_back({ resource, std::nullopt });
+        shared.types.push_back(std::move(type));
+    }
+    shared.resource_count = storage.size();
     markov::TargetGraph graph(asset, shared);
     std::vector<markov::TargetRegion> calls;
-    const auto & invocations = target.at("invocations");
+    const auto invocations = single ? nlohmann::json::array({ target }) : target.at("invocations");
     if (!invocations.is_array() || invocations.empty()) throw std::invalid_argument("composition requires a nonempty invocation array");
 
     for (const auto & call : invocations) {
         std::map<std::string, std::size_t> inputs;
         if (call.contains("inputs")) {
             for (const auto & [name, source] : call.at("inputs").items()) {
-                const auto & previous = calls.at(source.at("call").get<std::size_t>());
-                inputs.emplace(name, previous.ports.outputs.at(source.at("port").get<std::string>()));
+                if (source.contains("value") == source.contains("call")) throw std::invalid_argument("input must select one initial value or previous call");
+                if (source.contains("value")) {
+                    const auto value = source.at("value").get<std::size_t>();
+                    values.at(value);
+                    inputs.emplace(name, value);
+                }
+                else {
+                    const auto & previous = calls.at(source.at("call").get<std::size_t>());
+                    inputs.emplace(name, previous.ports.outputs.at(source.at("port").get<std::string>()));
+                }
             }
         }
 
@@ -125,6 +165,7 @@ int main(int argc, char ** argv) {
             std::filesystem::path input;
             std::filesystem::path output;
             std::filesystem::path batches;
+            std::filesystem::path completion_times;
             bool details = false;
             std::string control;
             for (int index = 2; index < argc; ++index) {
@@ -139,6 +180,7 @@ int main(int argc, char ** argv) {
                 else if (option == "--input" && input.empty()) input = value;
                 else if (option == "--output" && output.empty()) output = value;
                 else if (option == "--batches" && batches.empty()) batches = value;
+                else if (option == "--completion-times" && completion_times.empty()) completion_times = value;
                 else if (option == "--control" && control.empty()) control = value;
                 else throw std::invalid_argument("unknown or repeated simulate option: " + option);
             }
@@ -149,11 +191,13 @@ int main(int argc, char ** argv) {
             const auto assets = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
             const auto specification = read_json(input);
             const auto recorded = batches.empty() ? nlohmann::json(nullptr) : read_json(batches);
+            const auto observation = completion_times.empty() ? nlohmann::json(nullptr) : read_json(completion_times);
             markov::ControlStream peer(std::cin, std::cout);
-            markov::ServingSimulation simulation(assets, specification, recorded, control == "native" ? &peer : nullptr);
+            markov::ServingSimulation simulation(assets, specification, recorded, observation, control == "native" ? &peer : nullptr);
             const auto result = simulation.run(details);
             std::vector<std::filesystem::path> inputs{ template_path, input };
             if (!batches.empty()) inputs.push_back(batches);
+            if (!completion_times.empty()) inputs.push_back(completion_times);
             write_json(output, result, inputs, !details);
             (control == "native" ? std::cerr : std::cout) << nlohmann::json{
                 {          "scope",                                result.at("scope") },
@@ -228,55 +272,26 @@ int main(int argc, char ** argv) {
                          "       markov compose --templates templates.json --target calls.json --output graph.json\n"
                          "       markov record-batches --source rank.json [--source peer.json] --input serving.json --output batches.json\n"
                          "       markov simulate --templates templates.json --input serving.json --output result.json [--batches batches.json | --control "
-                         "native] [--details]\n";
+                         "native [--completion-times observations.json]] [--details]\n";
             return 2;
         }
 
-        if (composition) {
+        if (composition || expand) {
             auto document = read_json(argv[3]);
             const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
             const auto roles = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
             const auto target = read_json(argv[5]);
             const auto & asset = select_role(roles, target);
-            const auto result = compose(asset, target);
+            const auto result = compose(asset, target, expand);
             write_json(argv[7], result, { argv[3], argv[5] });
             std::cout << nlohmann::json{
-                {              "scope",               result.at("scope") },
-                {        "invocations",  target.at("invocations").size() },
-                {         "operations",   result.at("operations").size() },
-                {             "values",       result.at("values").size() },
-                {          "resources",           result.at("resources") },
-                { "external_resources",  result.at("external_resources") },
-                {       "dependencies", result.at("dependencies").size() }
-            }.dump(2) << '\n';
-            return 0;
-        }
-
-        if (expand) {
-            auto document = read_json(argv[3]);
-            const markov::TemplateCatalog catalog(std::move(document.at("catalog")));
-            const auto roles = markov::TemplateAsset::read_roles(catalog, document.at("roles"));
-            const auto target = read_json(argv[5]);
-            const auto & asset = select_role(roles, target);
-            auto instance = markov::TemplateInstance::select(asset,
-                                                             target.at("role").get<std::string>(),
-                                                             target.at("phase").get<std::string>(),
-                                                             markov::Invocation::read(target));
-            const auto result = instance.document();
-            write_json(argv[7], result, { argv[3], argv[5] });
-            std::cout << nlohmann::json{
-                {                    "scope",                    result.at("scope") },
-                {                     "role",                     result.at("role") },
-                {            "state_changes",       instance.state_changes().size() },
-                {              "input_ports",        instance.ports().inputs.size() },
-                {             "output_ports",       instance.ports().outputs.size() },
-                { "source_physical_coverage", result.at("source_physical_coverage") },
-                {  "source_runtime_coverage",  result.at("source_runtime_coverage") },
-                { "source_runtime_arguments", result.at("source_runtime_arguments") },
-                {                   "layout",                   result.at("layout") },
-                {               "operations",        result.at("operations").size() },
-                {                   "values",            result.at("values").size() },
-                {             "dependencies",      result.at("dependencies").size() }
+                {              "scope",                           result.at("scope") },
+                {        "invocations", expand ? 1 : target.at("invocations").size() },
+                {         "operations",               result.at("operations").size() },
+                {             "values",                   result.at("values").size() },
+                {          "resources",                       result.at("resources") },
+                { "external_resources",              result.at("external_resources") },
+                {       "dependencies",             result.at("dependencies").size() }
             }.dump(2) << '\n';
             return 0;
         }

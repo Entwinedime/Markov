@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -11,6 +12,8 @@
 namespace markov {
 
 enum class IndexService { Match, EmptyMatch, Insert, InsertPath, Split, Acquire, Release, RetainRequest, ReleaseRequest, Evict };
+
+std::string_view index_service_name(IndexService service);
 
 struct IndexCall {
     IndexService service;

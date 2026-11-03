@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -28,6 +29,8 @@ private:
 
     void select();
     void bind();
+    void bind_aliases();
+    std::set<std::size_t> public_values() const;
 
     std::optional<std::size_t> owner(const nlohmann::json & record) const;
 

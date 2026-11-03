@@ -22,7 +22,6 @@ public:
     void advance(Phase phase);
     void consume_running();
     std::size_t select(const BatchSelection & selection);
-    std::optional<std::size_t> idle();
     std::map<std::string, std::size_t> decode_inputs() const;
     void remember(Phase phase, const std::map<std::string, std::size_t> & ports, const BatchEffects & effects);
     void live_values(std::vector<std::size_t *> & values);
@@ -44,7 +43,6 @@ private:
     std::optional<View> running_;
     std::optional<View> prefill_;
     bool prefill_only_;
-    bool selected_ = false;
 };
 
 } // namespace markov::sglang

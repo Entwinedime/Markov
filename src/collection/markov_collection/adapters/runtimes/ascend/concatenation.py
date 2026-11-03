@@ -6,11 +6,12 @@ import platform
 from contextlib import nullcontext
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries
 
-from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation
+if TYPE_CHECKING:
+    import torch
 
 
 # CANN 9.0 SplitToConcat / IsSupportConcatDV2, commit 51abc745ad50d50ef762d0e843dae2d0cb7ea06b.
@@ -31,6 +32,8 @@ class AscendConcatenation:
 
     @classmethod
     def points(cls) -> list[tuple[tuple[torch.dtype, int], ...]]:
+        import torch
+
         points = []
         for dtype in (torch.int32, torch.int64):
             aligned_extent = cls.alignment_bytes // cls.dtype_bytes[str(dtype)]
@@ -44,6 +47,8 @@ class AscendConcatenation:
         return points
 
     def warmup(self) -> None:
+        import torch
+
         if self.warmed:
             return
         if self.version != "9.0.0" or not torch.npu.get_device_name().startswith("Ascend910B"):
@@ -56,6 +61,10 @@ class AscendConcatenation:
         self.warmed = True
 
     def capture(self) -> None:
+        import torch
+
+        from markov_collection.adapters.runtimes.pytorch.concatenation import ConcatenationObservation
+
         if self.captured:
             return
         for point in self.points():
@@ -97,7 +106,40 @@ class AscendConcatenation:
         )
 
     @classmethod
-    def declare(cls, regions: list[dict[str, Any]], source_values: list[dict[str, Any]]) -> None:
+    def declare(
+        cls, regions: list[dict[str, Any]], operations: list[dict], source_values: list[dict[str, Any]],
+        geometries: InputGeometries,
+    ) -> None:
+        private = []
+        for region in regions:
+            parent = region["parent"]
+            private.append("interface" in region["metadata"] or (parent is not None and private[parent]))
+
+        for operation in operations:
+            if operation["name"] != "aten.cat.default" or private[operation["region"]]:
+                continue
+            operands = operation["arguments"][0]
+            values = [source_values[operand["value"]] for operand in operands]
+            dtype = source_values[operation["outputs"][0]]["dtype"]
+            if (
+                len(values) > cls.fan_in or dtype not in cls.dtype_bytes
+                or (len(operation["arguments"]) > 1 and operation["arguments"][1] != 0)
+                or any(
+                    value["device"] != "npu" or value["dtype"] != dtype
+                    or len(value["shape"]) != 1 or value["stride"] != [1] for value in values
+                )
+            ):
+                continue
+
+            # Fixed operand lists still change device execution when empty tensors are filtered out.
+            operation["execution_guards"] = [
+                {
+                    "condition": ["eq", geometries.shape(operation["region"], value["id"])[0], 0],
+                    "expected": value["shape"][0] == 0,
+                }
+                for value in values
+            ]
+
         for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "concatenate":

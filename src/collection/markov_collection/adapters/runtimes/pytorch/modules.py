@@ -11,6 +11,19 @@ from markov_collection.instrumentation.calls import NativeCall
 from markov_collection.instrumentation.recording import Recording
 
 
+class ModuleState:
+    """Bind finalized module state once; ordinal ports keep repeated call records small."""
+
+    def __init__(self, model: Any) -> None:
+        self.tensors = {}
+        self.names = {}
+        for kind, entries in (("parameters", model.named_parameters()), ("buffers", model.named_buffers())):
+            for index, (name, tensor) in enumerate(entries):
+                port = f"{kind}.{index}"
+                self.tensors[port] = tensor
+                self.names[port] = name
+
+
 class ModuleObservation:
     def __init__(
         self,
@@ -19,12 +32,15 @@ class ModuleObservation:
         values: Any,
         inputs: dict[str, dict[int, str]],
         calls: dict[type, Callable[..., NativeCall]] | None = None,
+        *,
+        root_call: Callable[..., NativeCall] = NativeCall,
     ) -> None:
         self.recording = recording
         self.model = model
         self.values = values
         self.inputs = inputs
         self.calls = calls or {}
+        self.root_call = root_call
         self.originals: list[tuple[Any, bool, Any]] = []
 
     def __enter__(self) -> ModuleObservation:
@@ -46,7 +62,7 @@ class ModuleObservation:
             owned = "forward" in module.__dict__
             original = module.forward
             self.originals.append((module, owned, original))
-            call = self.calls.get(type(module), NativeCall)
+            call = self.root_call if not path else self.calls.get(type(module), NativeCall)
             module.forward = call(
                 self.recording, self.values, path, original, self.inputs if not path else {}, role="module"
             )

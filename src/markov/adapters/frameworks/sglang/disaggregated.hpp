@@ -25,7 +25,6 @@ public:
 
     GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
-    std::vector<std::size_t> idle() override;
     const RegionGraph & graph() const override;
     std::vector<std::size_t> retire() override;
     nlohmann::json summary() const;
@@ -44,8 +43,10 @@ private:
 
     struct Handoff {
         RankPorts reserved;
+        RankPorts advertised;
+        RankPorts connected;
         RankPorts prepared;
-        RankPorts transferred;
+        RankPorts transport;
         RankPorts received;
         std::map<TaskIdentity, Offered> offered;
         std::map<std::pair<std::size_t, std::size_t>, std::vector<std::size_t>> copied;
@@ -55,6 +56,7 @@ private:
 
     void require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind);
     void transfer(const ServingAction & action, Handoff & handoff);
+    BatchProgram transport_event(const ServingAction & action, Handoff & handoff);
     void bind_readiness(const ServingAction & action, const BatchProgram & program, std::span<const std::size_t> drained, RankPorts & ports);
     std::size_t append_transfer(const KvTransfer & route, std::int64_t bytes, std::int64_t segments, std::span<const std::size_t> prerequisites,
                                 const std::string & kind, std::span<const KvSlice> slices);
@@ -67,6 +69,7 @@ private:
     ServingStructure prefill_;
     ServingStructure decode_;
     KvTransfers transfers_;
+    std::vector<std::int64_t> prompt_tokens_;
     std::map<std::size_t, Handoff> handoffs_;
     std::size_t batches_ = 0;
     std::size_t actions_ = 0;

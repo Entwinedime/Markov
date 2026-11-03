@@ -12,27 +12,25 @@ from markov_collection.artifacts import write_json
 
 class SGLangSource:
     @staticmethod
-    def interpret(path: Path, profile: bool) -> None:
+    def interpret(path: Path, output: Path, profile: bool, *, communication: bool = False) -> None:
         from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
         from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
         from markov_collection.adapters.frameworks.sglang.expert_geometry import ModelPaddingCall
         from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
         from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
-        from markov_collection.adapters.frameworks.sglang.prefix import PrefixObservation
         from markov_collection.adapters.frameworks.sglang.preparation import PrefixLocations
-        from markov_collection.adapters.frameworks.sglang.state import PoolPorts
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
         from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
         from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
         from markov_collection.adapters.runtimes.pytorch.collectives import AllReduceGeometry
-        from markov_collection.adapters.runtimes.pytorch.indexing import TensorAssignmentCall
+        from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries, TensorAssignmentCall
 
         directory = path.parent
         source = json.loads(path.read_text())
         grouped = source["environment"]["source_transport"] != "physical_group_of_one"
-        physical_path = directory / (f"physical-{path.name}" if grouped else "physical.json")
+        physical_path = output.parent / (f"physical-{path.name}" if grouped else "physical.json")
         if profile:
 
             # A failed reinterpretation must not leave an older physical result marked as complete.
@@ -40,38 +38,145 @@ class SGLangSource:
 
         # Interpretation can be repeated from the captured facts without another native session.
         SGLangSource.declare_execution_domain(source, directory)
-        SGLangSource.result_interfaces(source["regions"])
+        SGLangSource.control_interfaces(source)
+        SGLangSource.model_interfaces(source)
         ExpertObservation.declare(source)
         BatchTensors.declare_model_inputs(source["regions"], source["values"])
         PrefixLocations.declare(source)
-        PrefixObservation.declare(source["regions"], source["values"])
-        AscendConcatenation.declare(source["regions"], source["values"])
         AscendMatrices.declare(
             source["regions"], source["operations"], source["values"], source["environment"]["matrix_selection"]
         )
         CollectiveCall.bind_transports(source["regions"], source["operations"], source["values"])
         SGLangAllocation.declare(source["regions"], source["operations"], source["values"])
-        geometries = TensorAssignmentCall.input_geometries(source["regions"])
+        if source["environment"]["logical_pp"] > 1:
+            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
+
+            PipelineObservation.declare_waits(source["regions"])
+
+        DisaggregatedTemplates.declare(source)
+        SGLangSource.pool_interfaces(source)
+        geometries = InputGeometries(source["regions"], source["values"])
+        AscendConcatenation.declare(source["regions"], source["operations"], source["values"], geometries)
         ModelPaddingCall.declare(source["regions"], source["values"], geometries)
         TensorAssignmentCall.declare(source["regions"], source["values"], geometries)
         AscendIndexedWrites.declare(source["regions"], source["values"], geometries)
         AscendLayouts.declare(source["regions"], source["operations"], source["values"], geometries)
         AllReduceGeometry.declare(source["operations"], source["values"])
-        DisaggregatedTemplates.declare(source)
-        PoolPorts.declare(source["regions"], source["values"])
-        if source["environment"]["logical_pp"] > 1:
-            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
-
-            PipelineObservation.declare_waits(source["regions"])
-        write_json(path, source)
+        write_json(output, source)
         if not profile:
             return
 
         traces = directory / "native" / path.stem if grouped else directory / "native"
-        trace = AscendTrace.exported_trace(traces)
-        observer = AscendTrace(trace, directory / "runtime", device=source["environment"]["device_index"])
+        observer = AscendTrace.from_capture(
+            traces, output.parent / "native" / path.stem, directory / "runtime",
+            device=source["environment"]["device_index"], communication=communication,
+        )
         physical = observer.physical_work(len(source["regions"]), len(source["operations"]))
         write_json(physical_path, physical)
+
+    @classmethod
+    def control_interfaces(cls, source: dict[str, Any]) -> None:
+        cls.schedule_interfaces(source)
+        cls.result_interfaces(source["regions"])
+        for region in source["regions"]:
+            metadata = region["metadata"]
+            if region["role"] in {"KvAdvertise", "KvReady", "KvSubmit", "KvComplete", "KvPoll"}:
+
+                # Explicit CPU services use their recorded thread even when the profiler misses background scopes.
+                metadata.update(
+                    interface=region["role"], inputs=[], outputs=[], writes=[], arguments=[], keywords={"mapping": []},
+                    native_work={
+                        "kind": "host", "resource": "thread", "identity": region["thread"], "name": region["role"],
+                    },
+                )
+
+            if metadata.get("entrypoint") != "cache_match_prefix":
+                continue
+
+            # MatchResult's returned tensor distinguishes a cache hit from the native empty-match service.
+            indices = metadata["result"][0]["value"]
+            metadata["ports"] = {"inputs": {}, "outputs": {"prefix_indices": indices}}
+            if source["values"][indices]["shape"] == [0]:
+                metadata["entrypoint"] = "cache_empty"
+                metadata.pop("dynamic_calls", None)
+
+    @staticmethod
+    def pool_interfaces(source: dict[str, Any]) -> None:
+        for region in source["regions"]:
+            metadata = region["metadata"]
+
+            # Preparation crosses the real cache/allocator seam; it cannot execute as one late call.
+            if metadata.get("entrypoint") == "batch_preparation":
+                metadata["resource_calls"] = ["cache_evict", "kv_allocate"]
+            elif region["role"] == "KvReserve":
+
+                # PD admission and model preparation expose the same allocator implementation boundary.
+                metadata.update(
+                    entrypoint="KvReserve", entrypoint_phase=None, path="KvReserve",
+                    resource_calls=["kv_allocate"], required_inputs=[],
+                )
+
+            # Host compositions delegate pool transitions to their callable child interfaces.
+            if "entrypoint" not in metadata or "ports" not in metadata or metadata.get("dynamic_calls"):
+                continue
+            inputs = metadata["ports"]["inputs"]
+            if effects := metadata.get("state_effects"):
+
+                # Pool APIs are selected by their operands and state, independently of the enclosing model phase.
+                metadata["entrypoint_phase"] = None
+
+                # State may be initialized by its owner; API operands must come from the caller.
+                metadata["required_inputs"] = sorted(
+                    set(metadata.get("required_inputs", [])) | (inputs.keys() - effects.keys())
+                )
+
+            for name, identity in inputs.items():
+                if name not in ("free_pages", "release_pages"):
+                    continue
+
+                # Incoming pool geometry belongs to this call, not to a previous producer's parameters.
+                parameter = name + "_before"
+                metadata.setdefault("parameters", {})[parameter] = source["values"][identity]["shape"][0]
+                metadata["shape_contracts"] = [
+                    item for item in metadata.get("shape_contracts", []) if item["value"] != identity
+                ] + [{"value": identity, "shape": [parameter]}]
+
+    @staticmethod
+    def schedule_interfaces(source: dict[str, Any]) -> None:
+        for region in source["regions"]:
+            metadata = region["metadata"]
+            if region["role"] == "Schedule":
+                batch = source["batches"][metadata["batch"]]
+                metadata.update(
+                    entrypoint="Schedule",
+                    entrypoint_phase=None,
+                    dynamic_calls=True,
+                    parameters={"scheduled_members": len(batch["members"])},
+                )
+            elif metadata.get("path") == "prepare_mlp_sync_batch_raw":
+
+                # A None decision still executes the native coordination body.
+                metadata.update(
+                    entrypoint="batch_coordination", entrypoint_phase=None, ports={"inputs": {}, "outputs": {}}
+                )
+
+    @staticmethod
+    def model_interfaces(source: dict[str, Any]) -> None:
+        for region in source["regions"]:
+            metadata = region["metadata"]
+            if region["role"] != "module" or metadata["path"] != "" or "ports" not in metadata:
+                continue
+
+            ports = metadata["ports"]["inputs"]
+
+            # Named module state and KV are persistent tensors; native reads can expose fresh views of them.
+            state = [*source["environment"]["model_state"], "cache.k", "cache.v"]
+            metadata.update(
+                entrypoint="model",
+                call_family="model",
+                required_inputs=sorted(ports),
+                resource_inputs=list(dict.fromkeys(ports[name] for name in state)),
+            )
 
     @staticmethod
     def declare_execution_domain(source: dict[str, Any], directory: Path) -> None:
@@ -99,8 +204,25 @@ class SGLangSource:
 
     @staticmethod
     def result_interfaces(regions: list[dict[str, Any]]) -> None:
+        pipeline_results: list[dict[str, Any] | None] = []
         for region in regions:
             metadata = region["metadata"]
+            parent = region["parent"]
+            pipeline = pipeline_results[parent] if parent is not None else None
+            if metadata.get("entrypoint") == "pipeline_result_tokens":
+                pipeline = metadata
+            pipeline_results.append(pipeline)
+
+            # Relay rows come from the actual indexed write, never a reconstructed slot tensor.
+            if pipeline is not None and metadata.get("interface") == "tensor_assignment":
+                tensor, indices, _ = metadata["arguments"]
+                if tensor["value"] == pipeline["ports"]["inputs"]["token_relay"]:
+                    pipeline["ports"]["inputs"]["request_slots"] = indices["value"]
+                    pipeline["required_inputs"] = ["request_slots", "sampled_tokens"]
+                    contracts = pipeline.setdefault("shape_contracts", [])
+                    contract = {"value": indices["value"], "shape": ["B"]}
+                    if contract not in contracts:
+                        contracts.append(contract)
 
             # The target controller supplies members; the source supplies this caller's own CPU service.
             if region["role"] == "ResultProcessed":

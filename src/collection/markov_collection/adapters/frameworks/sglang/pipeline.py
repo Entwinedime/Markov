@@ -6,6 +6,7 @@ import inspect
 import math
 from contextlib import contextmanager
 from functools import partial
+from time import perf_counter_ns
 from typing import Any
 
 import torch
@@ -123,6 +124,7 @@ class ObservedWork(CommunicationWork):
         self.operators = observation.operators
         self.tensor = tensor
         self.identity = identity
+        self.message = observation.message.metadata
         self.entrypoint = f"pipeline_wait_{channel}_{field}"
 
     def wait(self, *args: Any, **kwargs: Any) -> Any:
@@ -157,24 +159,21 @@ class PipelineObservation:
         self.receive_channel = ""
         self.message: MessageGeometry | None = None
         self.channel = ""
-        self.export_pending = False
 
-    def export(self, scheduler: Any) -> None:
-        self.export_pending = True
-        self.write_if_ready(scheduler)
-
-    def write_if_ready(self, scheduler: Any) -> None:
-        if scheduler.send_proxy_work or scheduler.send_output_work or self.recording.current_scope.get() is not None:
-            return
-
-        # The native loop owns submission and waits; publication only follows its completed queues.
-        self.observation.write()
-        self.export_pending = False
+    @staticmethod
+    def pending_work(scheduler: Any) -> int:
+        return len(scheduler.send_proxy_work) + len(scheduler.send_output_work)
 
     def commit(self, original: Any, scheduler: Any, work: Any) -> Any:
+
+        # Native commit clears these handles; retain their send owners before waiting, not the current batch.
+        messages = {id(item.work.message): item.work.message for item in work if isinstance(item.work, ObservedWork)}
         result = original(scheduler, work)
-        if self.export_pending:
-            self.write_if_ready(scheduler)
+        completed_ns = perf_counter_ns()
+        for metadata in messages.values():
+            metadata["wait_completed_ns"] = completed_ns
+
+        self.observation.drain_if_ready(scheduler)
         return result
 
     @staticmethod
@@ -205,6 +204,12 @@ class PipelineObservation:
             for name in ("parameters", "bindings", "guards"):
                 if name in sender:
                     metadata[name] = sender[name]
+
+            # Work.wait consumes the wire port in the send's public geometry, including an unsliced tensor.
+            tensor = metadata["ports"]["inputs"]["tensor"]
+            metadata["shape_contracts"] = [
+                contract for contract in metadata.get("shape_contracts", []) if contract["value"] != tensor
+            ] + [contract for contract in sender.get("shape_contracts", []) if contract["value"] == tensor]
 
     def remember(self, identity: int, result: Any) -> None:
         payload = result.pp_hidden_states_proxy_tensors

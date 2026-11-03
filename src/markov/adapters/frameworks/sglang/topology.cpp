@@ -102,6 +102,8 @@ nlohmann::json ServingTopology::control_source(const TemplateAsset & asset, cons
         { "dtype", implementation.at("dtype") },
         { "mode", implementation.at("disaggregation_mode") },
         { "disable_radix_cache", implementation.value("disable_radix_cache", true) },
+        { "moe_a2a_backend", implementation.at("moe_a2a_backend") },
+        { "deepep_mode", implementation.at("deepep_mode") },
         { "tp", environment.at("logical_tp") },
         { "ep", environment.at("logical_ep") },
         { "pp", environment.at("logical_pp") }

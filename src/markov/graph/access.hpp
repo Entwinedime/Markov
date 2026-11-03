@@ -51,6 +51,17 @@ template <typename Bindings> void remap_arguments(nlohmann::json & arguments, co
     }
 }
 
+// All operation metadata follows the same value lifetime during expansion and compaction.
+template <typename Bindings> void remap_work(nlohmann::json & work, const Bindings & values) {
+    for (const auto * key : { "arguments", "keywords", "communication" }) {
+        if (work.contains(key)) remap_arguments(work[key], values);
+    }
+    for (const auto * key : { "opaque_inputs", "opaque_outputs" }) {
+        if (!work.contains(key)) continue;
+        for (auto & value : work[key]) value = values.at(value.template get<std::size_t>());
+    }
+}
+
 std::vector<Dependency> connect_accesses(std::span<const ValueAccess> values, std::span<const Operation> operations);
 
 } // namespace markov

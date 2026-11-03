@@ -44,18 +44,22 @@ TemplateAsset::TemplateAsset(const TemplateCatalog & catalog, nlohmann::json doc
     }
 
     for (const auto & source : document.at("entries")) entries_.push_back({ source.at("layout").get<std::size_t>(), fixed_bindings(source) });
+
+    // Role lookup belongs to the immutable asset; preserve candidate order within each role.
     for (const auto & source : document.at("entrypoints"))
-        entrypoints_.push_back({ source.at("role").get<std::string>(),
-                                 source.at("phase").is_null() ? std::nullopt : std::optional(source.at("phase").get<std::string>()),
-                                 source.at("entry").get<std::size_t>(),
-                                 source.at("path").get<std::vector<std::size_t>>() });
+        entrypoints_[source.at("role").get<std::string>()].push_back(
+            { source.at("phase").is_null() ? std::nullopt : std::optional(source.at("phase").get<std::string>()),
+              source.at("entry").get<std::size_t>(),
+              source.at("path").get<std::vector<std::size_t>>() });
 
     for (const auto & entry : entries_) validate_bindings(entry.layout, entry.bindings);
 
     // A shared catalog may include another role's families; only this role's reachable calls need its entrypoints.
     std::vector<CallVisit> visiting(catalog_.layout_count());
     for (const auto & entry : entries_) validate_calls(entry.layout, visiting);
-    for (const auto & selection : entrypoints_) validate_calls(frame(selection).layout, visiting);
+    for (const auto & [_, selections] : entrypoints_) {
+        for (const auto & selection : selections) validate_calls(frame(selection).layout, visiting);
+    }
 }
 
 std::vector<TemplateAsset> TemplateAsset::read_roles(const TemplateCatalog & catalog, const nlohmann::json & roles) {
@@ -201,13 +205,9 @@ void TemplateAsset::validate_calls(std::size_t identity, std::vector<CallVisit> 
 
     // Family selection may choose a later layout; validate the possible calls rather than source numbering.
     for (const auto & role : roles) {
-        bool found = false;
-        for (const auto & selection : entrypoints_) {
-            if (selection.role != role) continue;
-            found = true;
-            validate_calls(frame(selection).layout, visiting);
-        }
-        if (!found) throw std::invalid_argument("template call family has no entrypoint: " + role);
+        const auto selections = entrypoints(role);
+        if (selections.empty()) throw std::invalid_argument("template call family has no entrypoint: " + role);
+        for (const auto & selection : selections) validate_calls(frame(selection).layout, visiting);
     }
     visiting[identity] = CallVisit::Complete;
 }
@@ -265,6 +265,9 @@ const BoundExecution & TemplateAsset::execution_binding(const ExecutionBinding &
     return *selected;
 }
 
-const std::vector<RegionSelection> & TemplateAsset::entrypoints() const { return entrypoints_; }
+std::span<const RegionSelection> TemplateAsset::entrypoints(const std::string & role) const {
+    if (const auto found = entrypoints_.find(role); found != entrypoints_.end()) return found->second;
+    return {};
+}
 
 } // namespace markov

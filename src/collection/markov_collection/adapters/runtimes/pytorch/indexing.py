@@ -32,19 +32,26 @@ class ScalarReductionObservation(TorchFunctionMode):
         return result
 
 
+class InputGeometries:
+    def __init__(self, regions: list[dict[str, Any]], values: list[dict[str, Any]]) -> None:
+        self.regions = regions
+        self.values = values
+
+    def shape(self, region: int | None, value: int) -> list[Any] | None:
+
+        # Declarations are added during interpretation; read the nearest current scope instead of a stale snapshot.
+        while region is not None:
+            record = self.regions[region]
+            for contract in reversed(record["metadata"].get("shape_contracts", [])):
+                if contract["value"] == value:
+                    return contract["shape"]
+            region = record["parent"]
+        return self.values[value]["shape_relation"]
+
+
 class TensorAssignmentCall(NativeCall):
     @staticmethod
-    def input_geometries(regions: list[dict[str, Any]]) -> list[dict[int, Any]]:
-        geometries: list[dict[int, Any]] = []
-        for region in regions:
-            parent = region["parent"]
-            geometry = dict(geometries[parent]) if parent is not None else {}
-            geometry.update((item["value"], item["shape"]) for item in region["metadata"].get("shape_contracts", []))
-            geometries.append(geometry)
-        return geometries
-
-    @staticmethod
-    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: list[dict[int, Any]]) -> None:
+    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: InputGeometries) -> None:
         for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "tensor_assignment":
@@ -53,7 +60,7 @@ class TensorAssignmentCall(NativeCall):
             if not isinstance(payload, dict) or "value" not in payload:
                 continue
             tensor = values[payload["value"]]
-            shape = geometries[region["id"]].get(payload["value"], tensor["shape_relation"])
+            shape = geometries.shape(region["id"], payload["value"])
             if shape is None:
                 continue
 
@@ -206,6 +213,7 @@ class IndexedRegions:
     def __init__(self, regions: list[dict], operations: list[dict], values: list[dict]) -> None:
         self.regions = regions
         self.values = values
+        self.geometries = InputGeometries(regions, values)
         self.children: list[list[int]] = [[] for _ in regions]
         self.operations: list[list[dict]] = [[] for _ in regions]
         for region in regions:
@@ -228,23 +236,42 @@ class IndexedRegions:
             if operation["name"] in ("aten.slice.Tensor", "aten.select.int")
         ]
         copies = [operation for operation in self.operations[identity] if operation["name"] == "aten.copy_.default"]
-        if len(views) != 1 or len(views) + len(copies) != len(self.operations[identity]) or len(copies) > 1:
+        if (
+            len(views) > 1 or len(copies) > 1 or not (views or copies)
+            or len(views) + len(copies) != len(self.operations[identity])
+        ):
             raise NotImplementedError("device-indexed interface needs a native indexing primitive declaration")
-        view = views[0]
-        result = self.values[view["outputs"][0]]
-        original = self.values[view["inputs"][0]]
-        metadata.setdefault("parameters", {})["view_offset"] = result["offset"] - original["offset"]
-        metadata.setdefault("derived_parameters", []).append({"name": "view_offset", "expression": start})
 
-        # The captured scalar reads stay public; only the following view receives the geometry declaration.
+        if views:
+            view = views[0]
+            result = self.values[view["outputs"][0]]
+            original = self.values[view["inputs"][0]]
+            metadata.setdefault("parameters", {})["view_offset"] = result["offset"] - original["offset"]
+            metadata.setdefault("derived_parameters", []).append({"name": "view_offset", "expression": start})
+            view["interface"] = "buffer_view"
+            view["argument_relations"] = [view["arguments"][0], {"shape": shape}, {"scalar": "view_offset"}]
+            result["shape_relation"] = shape
+        else:
+
+            # PyTorch can omit the destination view when an assignment covers the complete buffer.
+            target = metadata["arguments"][0]
+            if copies[0]["arguments"][0] != target:
+                raise NotImplementedError("indexed copy has no declared destination view")
+            extent = self.geometries.shape(identity, target["value"])
+            guards = [{"condition": ["eq", start, 0], "expected": True}]
+            guards.extend(
+                {"condition": ["eq", left, right], "expected": True}
+                for left, right in zip(shape, extent, strict=True)
+            )
+            metadata.setdefault("guards", []).extend(guards)
+            shape = extent
+
+        # Keep scalar reads and the actual view/copy public instead of hiding them inside the indexed interface.
         metadata.pop("interface")
         for current in descendants:
             for operation in self.operations[current]:
                 operation.pop("shape_analysis", None)
                 operation.pop("interface_region", None)
-        view["interface"] = "buffer_view"
-        view["argument_relations"] = [view["arguments"][0], {"shape": shape}, {"scalar": "view_offset"}]
-        result["shape_relation"] = shape
         for copy in copies:
             for value in copy["outputs"]:
                 self.values[value]["shape_relation"] = shape

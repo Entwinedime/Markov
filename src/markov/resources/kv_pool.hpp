@@ -47,6 +47,7 @@ public:
     const KvCapacity & capacity() const;
     PrefixIndex & prefixes();
     const PrefixIndex & prefixes() const;
+    Batch describe(Phase phase, std::span<const KvDemand> demands) const;
     Batch plan(Phase phase, std::span<const KvDemand> demands = {}) const;
     std::vector<std::int64_t> indices(std::size_t request, std::int64_t begin, std::int64_t end) const;
 

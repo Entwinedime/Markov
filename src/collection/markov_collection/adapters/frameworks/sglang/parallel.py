@@ -145,20 +145,6 @@ class CollectiveCall(NativeCall):
         return None
 
 
-class BatchCoordinationCall(NativeCall):
-    def __init__(self, values: Any, original: Any) -> None:
-        super().__init__(values.recording, values, original.__qualname__, original, {})
-
-    def completed(self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]) -> None:
-        if result is None or not result.reqs:
-            return
-        metadata.update(
-            entrypoint="batch_coordination",
-            entrypoint_phase=None,
-            ports={"inputs": {}, "outputs": {}},
-        )
-
-
 class ProcessGroupObservation:
     def __init__(self, observation: Any) -> None:
         self.observation = observation
@@ -203,7 +189,7 @@ class ProcessGroupObservation:
     def coordinate(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         if self.recording.current_scope.get() is None:
             return original(*args, **kwargs)
-        return BatchCoordinationCall(self.values, original)(*args, **kwargs)
+        return NativeCall(self.recording, self.values, original.__qualname__, original, {})(*args, **kwargs)
 
     def coordination_geometry(self, original: Any, info: Any, *args: Any, **kwargs: Any) -> Any:
         if self.recording.current_scope.get() is None:

@@ -194,6 +194,8 @@ void SourceProjection::bind() {
         }
     }
 
+    bind_aliases();
+
     // A private intermediate may escape only through the native interface's declared output ports.
     for (std::size_t consumer = 0; consumer < operations_.size(); ++consumer) {
         for (const auto input : operations_[consumer].access.inputs) {
@@ -205,6 +207,35 @@ void SourceProjection::bind() {
                                             + std::to_string(operations_[*producer].access.region) + " into " + operations_[consumer].access.name
                                             + " in region " + std::to_string(operations_[consumer].access.region));
         }
+    }
+}
+
+void SourceProjection::bind_aliases() {
+    const auto & records = source_.at("values");
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> writers;
+    for (std::size_t identity = 0; identity < operations_.size(); ++identity) {
+        const auto & operation = operations_[identity].access;
+        for (const auto output : operation.outputs) {
+            const auto storage = values_.at(output).storage;
+            if (std::ranges::find(operation.writes, storage) == operation.writes.end() || values_[output].producer != identity) continue;
+            const auto key = std::pair{ storage, records.at(output).at("version").get<std::size_t>() };
+            const auto [position, added] = writers.emplace(key, identity);
+            if (!added && position->second != identity) throw std::invalid_argument("storage version has multiple public writers");
+        }
+    }
+
+    // A mutation refreshes existing views without another native operation; retain the write as their producer.
+    for (const auto identity : public_values()) {
+        auto & value = values_.at(identity);
+        if (value.producer) continue;
+        const auto writer = writers.find({ value.storage, records.at(identity).at("version").get<std::size_t>() });
+        if (writer == writers.end()) continue;
+        value.producer = writer->second;
+        auto & operation = operations_[writer->second];
+        operation.access.outputs.push_back(identity);
+
+        // The write produces storage contents, not the later reader's view geometry.
+        operation.properties["opaque_outputs"].push_back(identity);
     }
 }
 
@@ -359,65 +390,11 @@ SourceProjection::RuntimeFacts SourceProjection::runtime_facts(const nlohmann::j
     return result;
 }
 
-nlohmann::json SourceProjection::document(const nlohmann::json * physical) const {
-    auto runtime = runtime_facts(physical);
-    auto device = physical_facts(physical);
-
-    std::map<std::pair<std::string, std::size_t>, const nlohmann::json *> host_scopes;
-    if (physical != nullptr) {
-        for (const auto & scope : physical->at("host_scopes")) {
-            if (!host_scopes.emplace(std::pair{ scope.at("kind").get<std::string>(), scope.at("identity").get<std::size_t>() }, &scope).second)
-                throw std::invalid_argument("public host scope has multiple native observations");
-        }
-    }
-
-    nlohmann::json result{
-        {  "environment", source_.at("environment") },
-        {      "modules",     source_.at("modules") },
-        {      "batches",     source_.at("batches") },
-        {      "regions",   nlohmann::json::array() },
-        {       "values",   nlohmann::json::array() },
-        {   "operations",   nlohmann::json::array() },
-        { "dependencies",   nlohmann::json::array() },
-        {        "scope",     "public_source_graph" }
-    };
-    if (source_.contains("execution_domain")) result["execution_domain"] = source_.at("execution_domain");
-    result["external_resources"] = external_resources_;
-    result["runtime_coverage"] = std::move(runtime.coverage);
-    result["physical_coverage"] = std::move(device.coverage);
-
+std::set<std::size_t> SourceProjection::public_values() const {
     std::set<std::size_t> used;
-    std::vector<Operation> accesses;
-    for (std::size_t identity = 0; identity < operations_.size(); ++identity) {
-        const auto & operation = operations_[identity];
-        const auto & access = operation.access;
-        auto record = operation.properties;
-        const auto host =
-            host_scopes.find(operation.source ? std::pair{ std::string("operation"), *operation.source } : std::pair{ std::string("region"), access.region });
-        if (!device.work[identity].empty() || !runtime.effects[identity].empty() || host != host_scopes.end() || record.contains("native_work")) {
-            record["execution_observation"] = {
-                { "communication", record.value("communication", nlohmann::json(nullptr)) },
-                { "host_scope", host == host_scopes.end() ? nlohmann::json(nullptr) : *host->second },
-                { "device_work", std::move(device.work[identity]) },
-                { "runtime_actions", std::move(runtime.effects[identity]) }
-            };
-            if (record.contains("native_work")) record["execution_observation"]["native_work"] = record.at("native_work");
-        }
-
-        record.update({
-            {       "id",                                    identity },
-            {     "name",                                 access.name },
-            {   "region",                               access.region },
-            { "position",                          operation.position },
-            {   "inputs",                               access.inputs },
-            {  "outputs",                              access.outputs },
-            {   "writes",                               access.writes },
-            {     "kind", operation.source ? "operator" : "interface" }
-        });
-        result["operations"].push_back(std::move(record));
-        used.insert(access.inputs.begin(), access.inputs.end());
-        used.insert(access.outputs.begin(), access.outputs.end());
-        accesses.push_back(access);
+    for (const auto & operation : operations_) {
+        used.insert(operation.access.inputs.begin(), operation.access.inputs.end());
+        used.insert(operation.access.outputs.begin(), operation.access.outputs.end());
     }
 
     // Keep values referenced by public boundaries and module state, even without an operation edge.
@@ -446,7 +423,68 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         for (const auto & parameter : module.at("parameters")) used.insert(parameter.at("value").get<std::size_t>());
     }
 
-    for (const auto identity : used) {
+    return used;
+}
+
+nlohmann::json SourceProjection::document(const nlohmann::json * physical) const {
+    auto runtime = runtime_facts(physical);
+    auto device = physical_facts(physical);
+
+    std::map<std::pair<std::string, std::size_t>, const nlohmann::json *> host_scopes;
+    if (physical != nullptr) {
+        for (const auto & scope : physical->at("host_scopes")) {
+            if (!host_scopes.emplace(std::pair{ scope.at("kind").get<std::string>(), scope.at("identity").get<std::size_t>() }, &scope).second)
+                throw std::invalid_argument("public host scope has multiple native observations");
+        }
+    }
+
+    nlohmann::json result{
+        {  "environment", source_.at("environment") },
+        {      "modules",     source_.at("modules") },
+        {      "batches",     source_.at("batches") },
+        {      "regions",   nlohmann::json::array() },
+        {       "values",   nlohmann::json::array() },
+        {   "operations",   nlohmann::json::array() },
+        { "dependencies",   nlohmann::json::array() },
+        {        "scope",     "public_source_graph" }
+    };
+    if (source_.contains("execution_domain")) result["execution_domain"] = source_.at("execution_domain");
+    result["external_resources"] = external_resources_;
+    result["runtime_coverage"] = std::move(runtime.coverage);
+    result["physical_coverage"] = std::move(device.coverage);
+
+    std::vector<Operation> accesses;
+    for (std::size_t identity = 0; identity < operations_.size(); ++identity) {
+        const auto & operation = operations_[identity];
+        const auto & access = operation.access;
+        auto record = operation.properties;
+        const auto host =
+            host_scopes.find(operation.source ? std::pair{ std::string("operation"), *operation.source } : std::pair{ std::string("region"), access.region });
+        if (!device.work[identity].empty() || !runtime.effects[identity].empty() || host != host_scopes.end() || record.contains("native_work")) {
+            record["execution_observation"] = {
+                { "communication", record.value("communication", nlohmann::json(nullptr)) },
+                { "host_scope", host == host_scopes.end() ? nlohmann::json(nullptr) : *host->second },
+                { "device_work", std::move(device.work[identity]) },
+                { "runtime_actions", std::move(runtime.effects[identity]) }
+            };
+            if (record.contains("native_work")) record["execution_observation"]["native_work"] = record.at("native_work");
+        }
+
+        record.update({
+            {       "id",                                    identity },
+            {     "name",                                 access.name },
+            {   "region",                               access.region },
+            { "position",                          operation.position },
+            {   "inputs",                               access.inputs },
+            {  "outputs",                              access.outputs },
+            {   "writes",                               access.writes },
+            {     "kind", operation.source ? "operator" : "interface" }
+        });
+        result["operations"].push_back(std::move(record));
+        accesses.push_back(access);
+    }
+
+    for (const auto identity : public_values()) {
         auto value = source_.at("values").at(identity);
         const auto producer = values_[identity].producer;
         value["producer"] = producer ? nlohmann::json(*producer) : nlohmann::json(nullptr);
@@ -465,6 +503,7 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
                                   "input_groups",
                                   "opaque_inputs",
                                   "opaque_outputs",
+                                  "resource_inputs",
                                   "parameters",
                                   "derived_parameters",
                                   "state_effects",
@@ -480,6 +519,7 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
                                   "ports",
                                   "entrypoint_phase",
                                   "dynamic_calls",
+                                  "resource_calls",
                                   "call_role",
                                   "call_count",
                                   "call_family",
@@ -493,11 +533,15 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         const auto host = host_scopes.find({ "region", region.at("id").get<std::size_t>() });
         result["regions"].push_back({
             {              "id",                                                     region.at("id") },
+            {   "source_region",                                                     region.at("id") },
             {          "parent",                                                 region.at("parent") },
             {            "role",                                                   region.at("role") },
             { "operation_begin",                                        region.at("operation_begin") },
             { "interface_owner",                                                               owner },
             {      "host_scope", host == host_scopes.end() ? nlohmann::json(nullptr) : *host->second },
+            {      "started_ns",                                             region.at("started_ns") },
+            {        "ended_ns",                                               region.at("ended_ns") },
+            {       "completed",                                              region.at("completed") },
             {        "metadata",                                                 std::move(metadata) }
         });
     }

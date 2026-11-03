@@ -3,6 +3,7 @@
 #include "markov/contracts/expression.hpp"
 #include "markov/contracts/input_group.hpp"
 #include "markov/production/execution_source.hpp"
+#include "markov/production/source_partitions.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -42,14 +43,80 @@ nlohmann::json normalized_shape(nlohmann::json shape) {
     return shape;
 }
 
-// Source identities disappear from shared definitions through encounter-ordered local slots.
-class LocalValues {
+} // namespace
+
+// Compile bottom-up so parent layouts reuse already-normalized child definitions.
+class SourceTemplates {
 public:
-    LocalValues(const std::map<std::size_t, const nlohmann::json *> & source, const std::map<std::size_t, nlohmann::json> & declarations,
-                const std::set<std::size_t> & grouped)
+    SourceTemplates(const nlohmann::json & source, TemplateLibrary & library);
+    nlohmann::json document();
+
+private:
+    enum class ValueScope { Inputs, Body };
+    class LocalValues;
+
+    struct Region {
+        std::vector<std::size_t> children;
+        std::vector<std::size_t> operations;
+
+        std::vector<std::size_t> inputs;
+        std::vector<std::size_t> outputs;
+        std::vector<std::size_t> resources;
+
+        std::size_t layout = 0;
+        nlohmann::json frame;
+
+        std::map<std::size_t, const nlohmann::json *> declarations;
+        GroupValues input_groups;
+        std::map<std::size_t, std::size_t> call_indices;
+    };
+
+    struct Item {
+        std::size_t position;
+        bool operation;
+        std::size_t identity;
+        std::size_t host_order = 0;
+    };
+
+    struct Repetition {
+        std::string kind;
+        nlohmann::json count;
+        std::vector<std::size_t> members;
+        std::vector<std::size_t> producers;
+        nlohmann::json mapping;
+    };
+
+    void index();
+    void compile(std::size_t region);
+    std::optional<std::size_t> host_resource(std::size_t region, const std::vector<Item> & items);
+    std::map<std::size_t, std::map<std::string, Repetition>> repetitions(const std::vector<Item> & items) const;
+
+    bool contains(std::size_t region, std::size_t operation) const;
+    bool contains_region(std::size_t region, std::size_t child) const;
+    const nlohmann::json & shape(std::size_t region, std::size_t value, ValueScope scope) const;
+    void use(std::size_t region, std::size_t value);
+
+    // The producer owns this immutable source throughout library compilation.
+    const nlohmann::json & source_;
+    TemplateLibrary & library_;
+    ExecutionSource & execution_;
+
+    std::set<std::size_t> external_resources_;
+    std::map<std::size_t, const nlohmann::json *> values_;
+    std::map<std::string, const nlohmann::json *> modules_;
+    std::vector<Region> regions_;
+    std::vector<std::size_t> roots_;
+    std::set<std::size_t> mapped_roots_;
+};
+
+// Source identities disappear from shared definitions through encounter-ordered local slots.
+class SourceTemplates::LocalValues {
+public:
+    LocalValues(const SourceTemplates & source, std::size_t region, const std::set<std::size_t> & grouped, ValueScope scope)
         : source_(source),
-          declarations_(declarations),
-          grouped_(grouped) {}
+          region_(region),
+          grouped_(grouped),
+          scope_(scope) {}
 
     std::size_t resource(std::size_t source) {
         const auto [position, added] = resources_.try_emplace(source, resources_.size());
@@ -64,13 +131,13 @@ public:
 
         const auto [position, added] = values_.try_emplace(source, values_.size());
         if (added) {
-            const auto & record = *source_.at(source);
+            const auto & record = *source_.values_.at(source);
             values.push_back({
-                {    "kind",                                                                                                  "tensor" },
-                { "storage",                                                         resource(record.at("storage").get<std::size_t>()) },
-                {   "shape", normalized_shape(declarations_.contains(source) ? declarations_.at(source) : record.at("shape_relation")) },
-                {   "dtype",                                                                                        record.at("dtype") },
-                {  "device",                                                                                       record.at("device") }
+                {    "kind",                                                        "tensor" },
+                { "storage",               resource(record.at("storage").get<std::size_t>()) },
+                {   "shape", normalized_shape(source_.shape(region_, source, scope_)) },
+                {   "dtype",                                              record.at("dtype") },
+                {  "device",                                             record.at("device") }
             });
         }
 
@@ -142,72 +209,12 @@ public:
     std::vector<std::size_t> resources;
 
 private:
-    const std::map<std::size_t, const nlohmann::json *> & source_;
-    const std::map<std::size_t, nlohmann::json> & declarations_;
+    const SourceTemplates & source_;
+    std::size_t region_;
     const std::set<std::size_t> & grouped_;
+    ValueScope scope_;
     std::map<std::size_t, std::size_t> values_;
     std::map<std::size_t, std::size_t> resources_;
-};
-
-} // namespace
-
-// Compile bottom-up so parent layouts reuse already-normalized child definitions.
-class SourceTemplates {
-public:
-    SourceTemplates(const nlohmann::json & source, TemplateLibrary & library);
-    nlohmann::json document();
-
-private:
-    struct Region {
-        std::vector<std::size_t> children;
-        std::vector<std::size_t> operations;
-
-        std::vector<std::size_t> inputs;
-        std::vector<std::size_t> outputs;
-        std::vector<std::size_t> resources;
-
-        std::size_t layout = 0;
-        nlohmann::json frame;
-
-        std::map<std::size_t, nlohmann::json> declarations;
-        GroupValues input_groups;
-        std::map<std::size_t, std::size_t> call_indices;
-    };
-
-    struct Item {
-        std::size_t position;
-        bool operation;
-        std::size_t identity;
-    };
-
-    struct Repetition {
-        std::string kind;
-        nlohmann::json count;
-        std::vector<std::size_t> members;
-        std::vector<std::size_t> producers;
-        nlohmann::json mapping;
-    };
-
-    void index();
-    void compile(std::size_t region);
-    std::optional<std::size_t> host_resource(std::size_t region, const std::vector<Item> & items);
-    std::map<std::size_t, std::map<std::string, Repetition>> repetitions(const std::vector<Item> & items) const;
-
-    bool contains(std::size_t region, std::size_t operation) const;
-    bool contains_region(std::size_t region, std::size_t child) const;
-    void use(std::size_t region, std::size_t value);
-
-    // The producer owns this immutable source throughout library compilation.
-    const nlohmann::json & source_;
-    TemplateLibrary & library_;
-    ExecutionSource & execution_;
-
-    std::set<std::size_t> external_resources_;
-    std::map<std::size_t, const nlohmann::json *> values_;
-    std::map<std::string, const nlohmann::json *> modules_;
-    std::vector<Region> regions_;
-    std::vector<std::size_t> roots_;
-    std::set<std::size_t> mapped_roots_;
 };
 
 
@@ -236,6 +243,23 @@ bool SourceTemplates::contains_region(std::size_t region, std::size_t child) con
     }
 
     return true;
+}
+
+const nlohmann::json & SourceTemplates::shape(std::size_t region, std::size_t value, ValueScope scope) const {
+    const auto & record = *values_.at(value);
+    const auto & producer = record.at("producer");
+
+    // A layout binds external contracts; internal values retain their operation's own geometry.
+    if (scope == ValueScope::Inputs && !producer.is_null() && contains(region, producer.get<std::size_t>())) return record.at("shape_relation");
+
+    for (std::optional current = region; current;) {
+        const auto & declarations = regions_[*current].declarations;
+        if (const auto found = declarations.find(value); found != declarations.end()) return *found->second;
+
+        const auto & parent = source_.at("regions")[*current].at("parent");
+        current = parent.is_null() ? std::nullopt : std::optional(parent.get<std::size_t>());
+    }
+    return record.at("shape_relation");
 }
 
 void SourceTemplates::use(std::size_t region, std::size_t value) {
@@ -286,11 +310,10 @@ void SourceTemplates::index() {
             }
         }
 
-        if (!region.at("parent").is_null()) regions_[identity].declarations = regions_[region.at("parent").get<std::size_t>()].declarations;
         if (metadata.contains("shape_contracts")) {
             for (const auto & contract : metadata.at("shape_contracts")) {
                 const auto value = contract.at("value").get<std::size_t>();
-                regions_[identity].declarations.insert_or_assign(value, contract.at("shape"));
+                regions_[identity].declarations.insert_or_assign(value, &contract.at("shape"));
                 use(identity, value);
             }
         }
@@ -470,8 +493,17 @@ void SourceTemplates::compile(std::size_t identity) {
             throw std::invalid_argument("dynamic caller exposes operation data or execution effects: " + record.at("role").get<std::string>());
     }
 
+    // Empty continuations share an operation position; their observed calls still have a strict order.
+    if (!record.at("host_scope").is_null()) {
+        for (auto & item : items) {
+            const auto & host = item.operation ? source_.at("operations")[item.identity].at("execution_observation").at("host_scope")
+                                              : source_.at("regions")[item.identity].at("host_scope");
+            if (!host.is_null()) item.host_order = host.at("order").get<std::size_t>();
+        }
+    }
     std::ranges::sort(items, [](const auto & left, const auto & right) {
-        return std::tie(left.position, left.operation, left.identity) < std::tie(right.position, right.operation, right.identity);
+        return std::tie(left.position, left.host_order, left.operation, left.identity)
+               < std::tie(right.position, right.host_order, right.operation, right.identity);
     });
 
     const auto repetitions = this->repetitions(items);
@@ -488,18 +520,12 @@ void SourceTemplates::compile(std::size_t identity) {
         }
     }
 
-    auto external_declarations = region.declarations;
-    std::erase_if(external_declarations, [&](const auto & item) {
-        const auto & producer = values_.at(item.first)->at("producer");
-        return !producer.is_null() && contains(identity, producer.template get<std::size_t>());
-    });
-
     std::set<std::size_t> grouped_values;
     for (const auto & [_, members] : region.input_groups) grouped_values.insert(members.begin(), members.end());
     grouped_values.insert(produced_values.begin(), produced_values.end());
 
-    LocalValues local(values_, external_declarations, grouped_values);
-    LocalValues own(values_, region.declarations, grouped_values);
+    LocalValues local(*this, identity, grouped_values, ValueScope::Inputs);
+    LocalValues own(*this, identity, grouped_values, ValueScope::Body);
     nlohmann::json definition{
         { "role",       record.at("role") },
         { "body", nlohmann::json::array() }
@@ -514,6 +540,7 @@ void SourceTemplates::compile(std::size_t identity) {
         { "outputs", nlohmann::json::object() }
     };
     if (metadata.contains("required_inputs")) layout["required_inputs"] = metadata.at("required_inputs").get<std::set<std::string>>();
+    if (metadata.contains("caller_inputs")) layout["caller_inputs"] = metadata.at("caller_inputs").get<std::set<std::string>>();
     if (metadata.contains("ports")) {
         for (const auto & [direction, ports] : metadata.at("ports").items()) {
             for (const auto & [name, value] : ports.items()) layout["ports"][direction][name] = local.value(value.get<std::size_t>());
@@ -600,6 +627,21 @@ void SourceTemplates::compile(std::size_t identity) {
         }
     }
 
+    // New continuation boundaries bind from effective public geometry, after scope declarations override source shapes.
+    if (metadata.contains("caller_inputs")) {
+        auto parameters = definition.value("parameters", std::set<std::string>{});
+        const auto fixed = definition.value("bindings", std::set<std::string>{});
+        for (const auto & [_, shape] : port_shapes) {
+            for (const auto & axis : shape) {
+                if (axis.is_string()) {
+                    const auto name = axis.get<std::string>();
+                    if (!derived.contains(name) && !fixed.contains(name)) parameters.insert(name);
+                }
+            }
+        }
+        definition["parameters"] = std::move(parameters);
+    }
+
     region.frame["children"] = nlohmann::json::array();
     for (const auto & item : items) {
         if (!item.operation && producers.contains(item.identity)) continue;
@@ -614,9 +656,14 @@ void SourceTemplates::compile(std::size_t identity) {
 
             for (const auto & key : { "opaque_inputs", "opaque_outputs" }) {
                 if (!operation.contains(key)) continue;
+                std::vector<std::size_t> contents;
                 for (const auto & value : operation.at(key)) {
-                    if (!grouped_values.contains(value.get<std::size_t>())) own.opaque(value.get<std::size_t>());
+                    const auto source = value.get<std::size_t>();
+                    if (grouped_values.contains(source)) continue;
+                    own.opaque(source);
+                    contents.push_back(source);
                 }
+                if (!contents.empty()) work[key] = own.ports(contents);
             }
 
             for (const auto & key : { "kind", "name", "attributes" }) {
@@ -695,6 +742,38 @@ void SourceTemplates::compile(std::size_t identity) {
     layout["own_values"] = own.bind_values(local);
     layout["own_resources"] = nlohmann::json::array();
     for (const auto resource : own.resources) layout["own_resources"].push_back(local.resource(resource));
+
+    if (metadata.contains("call_family")) {
+        std::set<std::size_t> named_inputs;
+        std::set<std::size_t> named_outputs;
+        for (const auto & [_, value] : metadata.at("ports").at("inputs").items()) named_inputs.insert(value.get<std::size_t>());
+        for (const auto & [_, value] : metadata.at("ports").at("outputs").items()) named_outputs.insert(value.get<std::size_t>());
+        const auto resources = metadata.value("resource_inputs", std::vector<std::size_t>{});
+        for (const auto resource : resources) {
+            if (!named_inputs.contains(resource)) throw std::invalid_argument("state resource requires a named input port");
+        }
+
+        // Native state writes create fresh read versions of the same view, not new caller data.
+        for (const auto input : region.inputs) {
+            if (named_inputs.contains(input)) continue;
+            const auto & view = *values_.at(input);
+            const auto state = std::ranges::find_if(resources, [&](const auto resource) {
+                if (!view.at("producer").is_null()) return false;
+                const auto & origin = *values_.at(resource);
+                for (const auto * key : { "storage", "shape", "stride", "offset", "dtype", "device" }) {
+                    if (view.at(key) != origin.at(key)) return false;
+                }
+                return true;
+            });
+            if (state == resources.end())
+                throw std::invalid_argument("reusable call has an unnamed input: region " + std::to_string(identity) + " value " + std::to_string(input));
+            layout["resource_views"].push_back({ local.value(input), local.value(*state) });
+        }
+        for (const auto output : region.outputs) {
+            if (!named_outputs.contains(output))
+                throw std::invalid_argument("reusable call has an unnamed output: region " + std::to_string(identity) + " value " + std::to_string(output));
+        }
+    }
 
     layout["storages"] = nlohmann::json::array();
     for (const auto & value : local.values) layout["storages"].push_back(value.at("storage"));
@@ -779,8 +858,9 @@ nlohmann::json SourceTemplates::document() {
     return result;
 }
 
-void TemplateLibrary::add(const nlohmann::json & source) {
-    SourceTemplates compiled(source, *this);
+void TemplateLibrary::add(nlohmann::json source) {
+    const auto partitioned = partition_source(std::move(source));
+    SourceTemplates compiled(partitioned, *this);
     roles_.push_back(compiled.document());
 }
 

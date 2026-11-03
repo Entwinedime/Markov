@@ -9,6 +9,8 @@ import sympy
 import torch
 from torch.utils._sympy.functions import FloorDiv
 
+from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries
+
 
 class AscendLayouts:
     @staticmethod
@@ -145,7 +147,7 @@ class AscendLayouts:
         regions: list[dict[str, Any]],
         operations: list[dict[str, Any]],
         values: list[dict[str, Any]],
-        geometries: list[dict[int, Any]],
+        geometries: InputGeometries,
     ) -> None:
         owners: list[int | None] = []
         device_interfaces = set()
@@ -163,12 +165,12 @@ class AscendLayouts:
                 continue
             owner = owners[operation["region"]]
             if owner is None:
-                candidates.append((operation, geometries[operation["region"]]))
+                candidates.append((operation, operation["region"]))
             else:
                 device_interfaces.add(owner)
-        candidates.extend((regions[owner]["metadata"], geometries[owner]) for owner in sorted(device_interfaces))
+        candidates.extend((regions[owner]["metadata"], owner) for owner in sorted(device_interfaces))
 
-        for candidate, geometry in candidates:
+        for candidate, region in candidates:
             previous = [
                 guard for guard in candidate.get("execution_guards", []) if guard.get("basis") != "operand_layout"
             ]
@@ -189,7 +191,7 @@ class AscendLayouts:
 
                 # Reused tensors have call-local geometry; their earlier producer may use different symbols.
                 tensor = values[value]
-                for guard in AscendLayouts.guards(tensor, geometry.get(value, tensor["shape_relation"])):
+                for guard in AscendLayouts.guards(tensor, geometries.shape(region, value)):
                     guard["basis"] = "operand_layout"
                     guards[json.dumps(guard["condition"])] = guard
 

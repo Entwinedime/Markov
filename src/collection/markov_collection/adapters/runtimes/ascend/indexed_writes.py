@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries
+
 
 class AscendIndexedWrites:
 
@@ -15,13 +17,10 @@ class AscendIndexedWrites:
 
     @classmethod
     def declare(
-        cls, regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: list[dict[int, Any]]
+        cls, regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: InputGeometries
     ) -> None:
         for region in regions:
             metadata = region["metadata"]
-
-            # Port geometry is local to the call; a reused tensor may retain a previous scope's relation.
-            geometry = geometries[region["id"]]
 
             if metadata.get("interface") != "tensor_assignment":
                 continue
@@ -29,7 +28,7 @@ class AscendIndexedWrites:
             if len(arguments) != 3 or not all(isinstance(item, dict) and "value" in item for item in arguments):
                 continue
             target, indices, payload = (values[item["value"]] for item in arguments)
-            shapes = [geometry.get(item["value"], values[item["value"]]["shape_relation"]) for item in arguments]
+            shapes = [geometries.shape(region["id"], item["value"]) for item in arguments]
             if (
                 any(
                     tensor["device"] != "npu"

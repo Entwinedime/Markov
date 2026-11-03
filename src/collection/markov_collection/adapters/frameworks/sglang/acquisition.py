@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,23 @@ class SGLangAcquisition:
     sdk_include = "/usr/local/Ascend/ascend-toolkit/latest/include"
     selector_binary = "markov_ascend_matmul_selection"
     observer_library = "libmarkov_ascend_observer.so"
+
+    @staticmethod
+    def model_command(path: str) -> list[str]:
+
+        # Config properties resolve framework aliases; serialized field names need not use those public names.
+        return [
+            "python3",
+            "-c",
+            "import json,sys; "
+            "from sglang.srt.utils.hf_transformers_utils import get_config,get_hf_text_config; "
+            "config=get_hf_text_config(get_config(sys.argv[1],trust_remote_code=False,local_files_only=True)); "
+            "metadata=config.to_dict(); "
+            "metadata.update(vocab_size=config.vocab_size,num_hidden_layers=config.num_hidden_layers,"
+            "num_experts=getattr(config,'num_experts',0),num_experts_per_tok=getattr(config,'num_experts_per_tok',0)); "
+            "print(json.dumps(metadata))",
+            path,
+        ]
 
     @staticmethod
     def check_workloads(model: dict[str, Any], specification: dict[str, Any]) -> dict[str, str]:
@@ -300,8 +318,7 @@ class SGLangAcquisition:
             if domain["prefix_cache"]:
                 groups.extend([initial_count + index for index in group] for group in ((0,), (1, 2), (3,), (4, 5)))
             result["submissions"] = groups
-        if model_configuration.get("num_experts", 0) or content is not None:
-            result["serving_input"] = SGLangAcquisition.source_input(result, model_configuration, content)
+        result["serving_input"] = SGLangAcquisition.source_input(result, model_configuration, content)
         return result
 
     @staticmethod
@@ -356,15 +373,18 @@ class SGLangAcquisition:
         return result
 
     @staticmethod
-    def command(stage: str, request: str) -> list[str]:
-        return [
+    def command(stage: str, source: str, output: str | None = None) -> list[str]:
+        arguments = [
             "python3",
             "-m",
             "markov_collection.adapters.frameworks.sglang.acquisition",
             stage,
-            "--request",
-            request,
+            "--request" if stage == "capture" else "--capture",
+            source,
         ]
+        if output is not None:
+            arguments += ["--output", output]
+        return arguments
 
     @staticmethod
     def capture(request: dict[str, Any]) -> None:
@@ -402,23 +422,45 @@ class SGLangAcquisition:
             (Path(request["output"]) / f"rank-{rank}.json").stat()
 
     @staticmethod
-    def interpret(request: dict[str, Any]) -> None:
+    def interpret(directory: Path, output: Path) -> None:
         from markov_collection.adapters.frameworks.sglang.source import SGLangSource
 
-        directory = Path(request["output"])
+        if output.resolve().is_relative_to(directory.resolve()):
+            raise ValueError("interpretation output must be outside the immutable native capture")
         summary = json.loads((directory / "session-summary.json").read_text())
-        for rank in summary["observed_roles"]:
-            path = directory / SGLangAcquisition.source_name(request, rank)
-            SGLangSource.interpret(path, summary["profile"])
+
+        # Session and transport metadata travel with interpreted graphs; SDK buffers remain at their source.
+        pools = (
+            [directory / instance["role"] for instance in summary["instances"]]
+            if "instances" in summary else [directory]
+        )
+        for pool in pools:
+            destination = output / pool.relative_to(directory)
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(pool / "session.json", destination / "session.json")
+            session = json.loads((pool / "session.json").read_text())
+            for rank in summary["observed_roles"]:
+                if rank not in session["native_participants"]:
+                    continue
+                path = pool / f"rank-{rank}.json"
+                if "disaggregation_role" in session:
+                    registration = "transport-" + path.name
+                    shutil.copyfile(pool / registration, destination / registration)
+                SGLangSource.interpret(
+                    path, destination / path.name, summary["profile"], communication=session["observe_all_workers"]
+                )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("capture", "interpret"))
-    parser.add_argument("--request", required=True, type=Path)
+    stages = parser.add_subparsers(dest="stage", required=True)
+    capture = stages.add_parser("capture")
+    capture.add_argument("--request", required=True, type=Path)
+    interpret = stages.add_parser("interpret")
+    interpret.add_argument("--capture", required=True, type=Path)
+    interpret.add_argument("--output", required=True, type=Path)
     arguments = parser.parse_args()
-    request = json.loads(arguments.request.read_text())
     if arguments.stage == "capture":
-        SGLangAcquisition.capture(request)
+        SGLangAcquisition.capture(json.loads(arguments.request.read_text()))
     else:
-        SGLangAcquisition.interpret(request)
+        SGLangAcquisition.interpret(arguments.capture, arguments.output)

@@ -22,6 +22,7 @@ add_library(markov_core
     src/markov/execution/protocol.cpp
     src/markov/execution/durations.cpp
     src/markov/execution/executor.cpp
+    src/markov/execution/observed_feedback.cpp
     src/markov/contracts/expression.cpp
     src/markov/contracts/expert_routes.cpp
     src/markov/contracts/input_group.cpp
@@ -33,6 +34,7 @@ add_library(markov_core
     src/markov/graph/region_graph.cpp
     src/markov/graph/source_graph.cpp
     src/markov/production/source_projection.cpp
+    src/markov/production/source_partitions.cpp
     src/markov/production/execution_source.cpp
     src/markov/production/execution_reuse.cpp
     src/markov/production/execution_pattern.cpp

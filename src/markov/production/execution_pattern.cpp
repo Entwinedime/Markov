@@ -15,10 +15,10 @@ public:
     ExecutionPrototype compile(const nlohmann::json & observation) {
         if (observation.contains("native_work")) {
             const auto & work = observation.at("native_work");
-            const auto lane = resource(work.at("resource").get<std::string>(), 0);
+            const auto lane = resource(work.at("resource").get<std::string>(), work.at("identity").get<std::int64_t>());
             const auto node = add("native", 0, 0, work.at("kind").get<std::string>(), lane, work.at("name").get<std::string>());
 
-            // A synchronous native API is one opaque service, including its blocking completion.
+            // A declared service owns its ports independently of profiler CPU markers.
             return {
                 { { "nodes", std::move(nodes_) },
                  { "links", nlohmann::json::array() },

@@ -83,7 +83,7 @@ void KvPool::bind_prefix(std::size_t request, std::size_t node, std::int64_t tok
         });
 }
 
-Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
+Batch KvPool::describe(Phase phase, std::span<const KvDemand> demands) const {
     Batch batch{ phase, request_capacity_, static_cast<std::int64_t>(free_pages_.size()), 0, {}, deferred_pages(), static_cast<std::int64_t>(capacity_.slots) };
     std::size_t new_slots = 0;
     for (const auto & [request, tokens] : demands) {
@@ -92,13 +92,22 @@ Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
         BatchMember member{ request, slot, resident.allocated_tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()),
                             {},      phase };
 
-        // Selection describes an allocation; reserve commits it when control submits the work.
-        const auto pages = pages_for(resident.allocated_tokens + tokens) - static_cast<std::int64_t>(resident.pages.size());
+        batch.members.push_back(std::move(member));
+    }
+    return batch;
+}
+
+Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
+    auto batch = describe(phase, demands);
+    for (auto & member : batch.members) {
+        const auto & resident = residence(member.request);
+
+        // Concrete page identities are selected only after the controller has made room.
+        const auto pages = pages_for(member.context_tokens + member.new_tokens) - static_cast<std::int64_t>(resident.pages.size());
         if (batch.allocated_pages + pages > static_cast<std::int64_t>(free_pages_.size())) throw std::invalid_argument("batch exceeds available KV pages");
         for (std::int64_t index = 0; index < pages; ++index)
             member.new_pages.push_back(free_pages_.at(static_cast<std::size_t>(batch.allocated_pages + index)));
         batch.allocated_pages += pages;
-        batch.members.push_back(std::move(member));
     }
 
     assign_pages(batch);

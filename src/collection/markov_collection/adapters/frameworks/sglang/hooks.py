@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from contextlib import nullcontext
+from collections import deque
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.content import NativeContent
         from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.primitives import IndexedWritePrototypes
+        from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
         from markov_collection.adapters.runtimes.ascend.observation import AscendOperatorObservation
@@ -46,8 +48,8 @@ class SGLangObservation:
         self.experts = ExpertObservation(self)
         self.ep_size = description["ep_size"]
 
-        self.requests = set(description["source_requests"])
-        self.baseline_requests = set(description["baseline_requests"])
+        self.window = ObservationWindow(self.directory, description)
+        self.requests = self.window.requests["source"]
         self.shard = None
         if "shard" in description:
             from markov_collection.adapters.frameworks.sglang.parallel import SingleDeviceShard
@@ -56,6 +58,7 @@ class SGLangObservation:
             self.shard = SingleDeviceShard(shard["size"], shard["rank"], self.operators.values)
 
         self.model: Any = None
+        self.model_state: Any = None
         self.model_stream: Any = None
         self.selected = True
         self.derived_role = False
@@ -83,7 +86,7 @@ class SGLangObservation:
         if "disaggregation_role" in description:
             from markov_collection.adapters.frameworks.sglang.disaggregation import DisaggregationObservation
 
-            self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"])
+            self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"], description)
 
         self.routing = None
         if (description.get("serving_input") or {}).get("ep_routes"):
@@ -195,14 +198,11 @@ class SGLangObservation:
         return identity
 
     def observation(self, requests: Any) -> str | None:
-        if not self.selected:
-            return None
-        identities = {request.rid for request in requests}
-        if identities and identities <= self.requests:
-            return "source"
-        if identities and identities <= self.baseline_requests:
-            return "baseline"
-        return None
+        return self.window.observation(requests) if self.selected else None
+
+    def request(self, original: Any, scheduler: Any, request: Any) -> Any:
+        self.window.begin(request.rid)
+        return original(scheduler, request)
 
     def begin_batch(self, scheduler: Any) -> None:
         self.operators.begin_batch()
@@ -212,64 +212,6 @@ class SGLangObservation:
 
             # Pool capacity belongs to every value version, before preparation first reads or writes it.
             shapes.bind_shape(mapping, (shapes.symbol("slot_capacity") + 1, mapping.shape[1]))
-
-    def schedule(self, original: Any, scheduler: Any) -> Any:
-
-        # The native loop installs its running view before this scheduling call can replace it.
-        if self.pipeline is not None:
-            self.batch_lane = next(
-                index for index, batch in enumerate(scheduler.running_mbs) if batch is scheduler.running_batch
-            )
-        pending = list(scheduler.waiting_queue)
-
-        # PP may remove the unfinished request from its last microbatch before scheduling its next chunk.
-        if scheduler.chunked_req is not None:
-            pending.append(scheduler.chunked_req)
-        for batch in (scheduler.running_batch, scheduler.last_batch):
-            if batch is not None:
-                pending.extend(batch.reqs)
-
-        # Finished members still participate in the native filter before the scheduler becomes idle.
-        observation = self.observation(pending)
-        if observation is None:
-            return original(scheduler)
-
-        identity = len(self.recording.batches)
-        if observation == "source":
-            self.begin_batch(scheduler)
-        context = (
-            self.recording.scope("Schedule")
-            if observation == "source"
-            else self.recording.markers.scope(f"markov.baseline/{identity}")
-        )
-        with context as scope, self.operators if observation == "source" else nullcontext():
-            if observation == "source":
-                scope.metadata["ports"] = {
-                    "inputs": self.operators.values.port_values(
-                        {"free_pages": scheduler.token_to_kv_pool_allocator.free_pages}
-                    ),
-                    "outputs": {},
-                }
-
-            batch = original(scheduler)
-            identity = self.record_batch(scheduler, batch, observation)
-            if observation == "source":
-                scope.metadata["batch"] = identity
-                if batch is None:
-                    scope.metadata["no_batch"] = True
-                else:
-                    scope.metadata["dynamic_calls"] = True
-                    scope.metadata["parameters"] = {"scheduled_members": len(batch.reqs)}
-                    scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
-                        {
-                            "request_slots": batch.req_pool_indices,
-                            "sequence_lengths": batch.seq_lens,
-                            "kv_locations": batch.out_cache_loc,
-                            "free_pages": scheduler.token_to_kv_pool_allocator.free_pages,
-                        }
-                    )
-
-            return batch
 
     def run_batch(self, original: Any, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         from sglang.srt.layers.radix_attention import RadixAttention
@@ -349,12 +291,23 @@ class SGLangObservation:
                 "forward_batch.req_pool_indices": {0: member_axis},
                 "forward_batch.extend_seq_lens": {0: member_axis},
             }
+            from markov_collection.adapters.frameworks.sglang.model import ModelForwardCall
+            from markov_collection.adapters.runtimes.pytorch.modules import ModuleState
+
+            if self.model_state is None:
+                with self.operators.values.metadata():
+                    self.model_state = ModuleState(self.model)
+
             with ModuleObservation(
                 self.recording,
                 self.model,
                 self.operators.values,
                 inputs,
-                {RadixAttention: AttentionCall, **self.experts.module_calls(self.model)},
+                {
+                    RadixAttention: AttentionCall,
+                    **self.experts.module_calls(self.model),
+                },
+                root_call=partial(ModelForwardCall, state=self.model_state),
             ):
                 result = original(scheduler, batch, *args, **kwargs)
 
@@ -494,16 +447,15 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.state import RequestCacheCall
 
         if self.recording.current_scope.get() is None:
-            if self.disaggregation is not None and request.rid in self.requests:
-                return self.disaggregation.release(original, cache, request, *args, **kwargs)
             return original(cache, request, *args, **kwargs)
 
         values = self.operators.values
         if isinstance(cache, RadixCache):
             if not cache.disable:
-                return PrefixServiceCall(self.recording, values, original.__qualname__, original, {})(
-                    cache, request, *args, **kwargs
-                )
+                return PrefixServiceCall(
+                    self.recording, values, original.__qualname__, original, {},
+                    scope_metadata={"requests": [request.rid]},
+                )(cache, request, *args, **kwargs)
 
             # Disabled RadixCache keeps no unfinished mapping; ChunkCache has a different native contract.
             if original.__name__ == "cache_unfinished_req":
@@ -515,9 +467,75 @@ class SGLangObservation:
 
         # Reset logical pools without discarding the allocator state established by uniform warmup.
         result = original(scheduler, empty_cache=False)
-        if not result:
+        if not result or not self.window.drained:
             return result
 
+        self.complete_window(scheduler)
+        return result
+
+    def idle(self, original: Any, scheduler: Any) -> Any:
+        if scheduler.is_fully_idle():
+            self.window.native_idle = True
+            self.drain_if_ready(scheduler)
+            if self.window.prepared_phase is not None:
+                self.window.complete(self.parallel["rank"], scheduler.idle_sleeper is not None)
+
+        # Publish readiness before an optional native idle sleep can wait for the next phase's input.
+        return original(scheduler)
+
+    def flush_wrapper(
+        self, original: Any, wrapper: Any, *, flush_cache: Any, is_fully_idle: Any, ipc_channels: Any,
+    ) -> None:
+        self.scheduler = flush_cache.__self__
+        original(wrapper, flush_cache=flush_cache, is_fully_idle=self.can_flush, ipc_channels=ipc_channels)
+
+    def can_flush(self) -> bool:
+        if not self.scheduler.is_fully_idle():
+            return False
+        if self.window.phase is not None and self.window.close_requested():
+
+            # The native deferred flush waits for the same device and send drain as the observation window.
+            self.drain_if_ready(self.scheduler)
+            return self.window.drained
+        return True
+
+    def sleep_on_idle(self, original: Any, sleeper: Any) -> None:
+        if self.window.prepared_phase is not None:
+            return
+        if self.pipeline is not None and self.pipeline.pending_work(self.scheduler):
+            return
+        if self.window.phase is not None and self.window.close_requested():
+            return
+
+        # Acquisition preserves warmed allocators and waits for real ingress instead of restarting idle PP cycles.
+        sleeper.poller.poll()
+
+    def profile(self, original: Any, profiler: Any, request: Any) -> Any:
+        from sglang.srt.managers.io_struct import ProfileReqType
+
+        result = original(profiler, request)
+        if request.req_type == ProfileReqType.START_PROFILE:
+            self.window.prepared_phase = "profiler"
+        return result
+
+    def drain_if_ready(self, scheduler: Any) -> None:
+        if (
+            self.window.phase is None or self.window.drained or not self.window.native_idle
+            or self.recording.current_scope.get() is not None
+        ):
+            return
+        if self.pipeline is not None and self.pipeline.pending_work(scheduler):
+            return
+        if not self.window.close_requested():
+            return
+
+        import torch
+
+        # Finish device tails before the parent asks native flush to change the pool and cache state.
+        torch.npu.synchronize()
+        self.window.drain(self.parallel["rank"])
+
+    def complete_window(self, scheduler: Any) -> None:
         import torch
 
         from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
@@ -550,13 +568,7 @@ class SGLangObservation:
             self.materializations.warmup()
         self.indexed_writes.warmup()
 
-        # Pool reset enqueues device work even when reusable warmup helpers have already returned early.
-        torch.npu.synchronize()
-
-        boundary = self.recording.batches[-1]["observation"] if self.recording.batches else "warmup"
-        self.workspace_states[boundary] = self.workspaces.snapshot()
-
-        has_source = any(batch["observation"] == "source" for batch in self.recording.batches)
+        has_source = self.selected and self.window.phase == "source"
         if has_source:
             self.concatenation.capture()
             self.allocation.capture()
@@ -566,15 +578,23 @@ class SGLangObservation:
             self.indexed_writes.capture()
             self.preparation.transitions.capture()
 
+        # Observation helpers run after native work and finish before the next acquisition phase starts.
+        torch.npu.synchronize()
+
         if self.disaggregation is not None and self.derived_role:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
-        if has_source:
-            if self.pipeline is None:
-                self.write()
-            else:
-                self.pipeline.export(scheduler)
 
-        return result
+        self.workspace_states[self.window.phase] = self.workspaces.snapshot()
+        if self.selected and self.window.phase == "source":
+            self.write()
+
+        if self.disaggregation is not None:
+
+            # Native queues borrow this allocator; keep the object and canonicalize only its released slots.
+            allocator = scheduler.req_to_metadata_buffer_idx_allocator
+            allocator.free_slots = deque(sorted(allocator.free_slots))
+
+        self.window.prepared_phase = self.window.phase
 
     def write(self) -> None:
         import torch
@@ -589,6 +609,10 @@ class SGLangObservation:
                 "cann": self.concatenation.version,
                 "matrix_selection": self.matrices.description,
                 "observer": __file__,
+                "observation_window": {
+                    "start": "prewarmed_idle_ingress", "native_flush": True,
+                    "native_idle": True, "pending_transfers": 0,
+                },
                 **self.parallel,
                 "source_transport": "native_disaggregation"
                 if self.disaggregation is not None
@@ -600,6 +624,7 @@ class SGLangObservation:
                 "device_index": torch.npu.current_device(),
                 "workspace_boundaries": self.workspace_states,
                 "workspace_policy": self.workspace_policy,
+                "model_state": self.model_state.names if self.model_state is not None else {},
             },
         )
         self.synchronization.write(self.directory / "runtime")
@@ -611,6 +636,7 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.prefix import PrefixObservation
         from markov_collection.adapters.frameworks.sglang.preparation import SGLangPreparation
         from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
+        from markov_collection.adapters.frameworks.sglang.scheduling import SGLangScheduling
         from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
         from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
 
@@ -624,6 +650,7 @@ class SGLangObservation:
             fields = self.pipeline.fields
         self.preparation = SGLangPreparation(self.operators, fields, self.ep_size > 1)
         self.preparation.install()
+        SGLangScheduling(self).install()
         PrefixObservation(self.operators.values, self.preparation.match_prefix).install()
         if self.ep_size > 1:
             from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
@@ -635,9 +662,13 @@ class SGLangObservation:
             "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.load_model,
             "sglang.srt.model_executor.model_runner.ModelRunner.forward": self.forward,
             "sglang.srt.managers.scheduler.Scheduler.run_batch": self.run_batch,
-            "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run": self.schedule,
+            "sglang.srt.managers.scheduler.Scheduler.handle_generate_request": self.request,
             "sglang.srt.managers.scheduler.Scheduler.process_batch_result": self.process_result,
             "sglang.srt.managers.scheduler.Scheduler.flush_cache": self.flush,
+            "sglang.srt.managers.scheduler.Scheduler.on_idle": self.idle,
+            "sglang.srt.managers.scheduler_components.idle_sleeper.IdleSleeper.maybe_sleep": self.sleep_on_idle,
+            "sglang.srt.managers.scheduler_components.flush_wrapper.SchedulerFlushWrapper.__init__": self.flush_wrapper,
+            "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile": self.profile,
             "sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output": self.publish,
             "sglang.srt.managers.overlap_utils.FutureMap.stash": self.stash,
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free": self.release_pages,
@@ -649,22 +680,6 @@ class SGLangObservation:
             functions.target: functions.split_qkv,
             "flash_attn_npu_v3.flash_attn_with_kvcache": functions.flash_attention,
         }
-        if self.disaggregation is not None:
-            targets.pop("sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run")
-            role = self.disaggregation.role
-
-            # Native PP Prefill calls admission directly; the non-PP loop owns an outer PD scheduling method.
-            method = (
-                "get_new_batch_prefill"
-                if self.pipeline is not None and role == "prefill"
-                else f"get_next_disagg_{role}_batch_to_run"
-            )
-            target = f"sglang.srt.managers.scheduler.Scheduler.{method}"
-            targets[target] = self.schedule
-            if self.pipeline is not None and role == "prefill":
-
-                # PP filters and retains the previous chunk before entering its admission method.
-                targets["sglang.srt.managers.scheduler.Scheduler.process_prefill_chunk"] = self.schedule
         for target, observer in targets.items():
             HookRegistry.register(target, observer, HookType.AROUND)
 

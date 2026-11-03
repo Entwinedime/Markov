@@ -25,6 +25,7 @@ class NativeCall:
         role: str = "call",
         interface: str | None = None,
         mutations: tuple[int, ...] = (),
+        scope_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.recording = recording
         self.values = values
@@ -35,6 +36,7 @@ class NativeCall:
         self.interface = interface
         self.role = role
         self.mutations = mutations
+        self.scope_metadata = scope_metadata if scope_metadata is not None else {}
         self.signature = inspect.signature(original) if inputs else None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -42,7 +44,7 @@ class NativeCall:
             return self.original(*args, **kwargs)
 
         role = "operation" if self.interface is not None else self.role
-        with self.recording.scope(role, path=self.path) as scope, ExitStack() as input_bindings:
+        with self.recording.scope(role, path=self.path, **self.scope_metadata) as scope, ExitStack() as input_bindings:
             with self.values.metadata():
                 bound = {}
                 declared_inputs = []

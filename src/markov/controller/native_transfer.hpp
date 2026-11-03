@@ -22,19 +22,22 @@ struct NativeTransferRoute {
     KvPool & destination;
 };
 
-// Native calls submit transport intent; graph completion alone makes the payload readable.
+// Copies, source publication and destination notification advance at their own graph ports.
 class NativeTransfer {
 public:
     explicit NativeTransfer(std::span<const NativeTransferRoute> routes);
 
-    nlohmann::json call(const nlohmann::json & message);
+    nlohmann::json poll(const nlohmann::json & message) const;
     void submit(const ServingAction & action, const nlohmann::json & payload);
     std::optional<ServingAction> plan(std::int64_t now_ns);
+    void start(const ServingAction & action);
     void finish(const ServingAction & action);
     bool running() const;
     bool settled() const;
 
 private:
+    enum class Progress { Waiting, Submitted, Complete };
+
     struct Fragment {
         BatchMember member;
         bool final;
@@ -43,19 +46,27 @@ private:
         std::set<TransferBinding> completed;
     };
 
-    struct Endpoint {
-        bool registered = false;
-        bool ready = false;
-        bool consumed = false;
+    struct Source {
+        Progress connected = Progress::Waiting;
+        Progress published = Progress::Waiting;
         nlohmann::json payload;
         std::int64_t submitted_tokens = 0;
         std::map<std::size_t, Fragment> fragments;
+        bool released = false;
+    };
+
+    struct Destination {
+        Progress published = Progress::Waiting;
+        bool consumed = false;
     };
 
     struct Handoff {
-        std::map<std::string, Endpoint> endpoints;
-        std::set<TransferBinding> completed;
+        std::map<std::string, Source> sources;
+        std::map<std::string, Destination> destinations;
+        std::set<TransferBinding> copied;
     };
+
+    ServingAction endpoint_event(std::size_t request, const std::string & group, ServingStep step, std::int64_t now_ns);
 
     std::vector<NativeTransferRoute> routes_;
     std::map<std::size_t, Handoff> handoffs_;

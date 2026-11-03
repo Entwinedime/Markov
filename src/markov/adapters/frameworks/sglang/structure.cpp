@@ -32,9 +32,7 @@ ServingStructure::ServingStructure(RegionGraph & graph, std::span<const Template
         }
     }
 
-    const bool experts = std::ranges::any_of(assets_, [](const auto * asset) {
-        return std::ranges::any_of(asset->entrypoints(), [](const auto & entry) { return entry.role == "expert_layer"; });
-    });
+    const bool experts = std::ranges::any_of(assets_, [](const auto * asset) { return !asset->entrypoints("expert_layer").empty(); });
     if (experts) {
         if (routes.is_null()) throw std::invalid_argument("MoE targets require an EP topology and matching workload routes");
         routing_.emplace(assets_, requests, routes);
@@ -78,14 +76,32 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     const auto region_begin = graph_.regions.size();
     std::vector<RankWork> work;
     BatchProgram result{ std::nullopt, {}, {} };
-    const bool local = action.step == ServingStep::Prepare || action.step == ServingStep::Compute
-                       || (action.step == ServingStep::Send && !action.channel.empty()) || action.step == ServingStep::Wait
-                       || (action.step == ServingStep::Receive && !action.channel.empty())
-                       || ((action.step == ServingStep::PrepareResult || action.step == ServingStep::ReadResult || action.step == ServingStep::Result)
-                           && action.stage);
-    if (local) {
+    const bool local =
+        action.step == ServingStep::Schedule || action.step == ServingStep::PrepareInputs || action.step == ServingStep::Allocate
+        || action.step == ServingStep::PrepareOutputs || action.step == ServingStep::Prepare || action.step == ServingStep::Compute
+        || (action.step == ServingStep::Send && !action.channel.empty()) || action.step == ServingStep::Wait
+        || (action.step == ServingStep::Receive && !action.channel.empty())
+        || ((action.step == ServingStep::PrepareResult || action.step == ServingStep::ReadResult || action.step == ServingStep::Result) && action.stage);
+    const bool whole_pipeline = (action.step == ServingStep::Batch || action.step == ServingStep::Model) && topology_.stage_count(instance_.id) > 1;
+    const bool composite =
+        !local && (action.step == ServingStep::Stage || action.step == ServingStep::ReadResult || action.step == ServingStep::Result || whole_pipeline);
+    if (!composite) {
         for (const auto rank : group.members) {
-            auto program = rank_step(action, rank, work);
+            const auto begin = graph_.operations.size();
+            const auto rank_node_begin = graph_.execution.first_node() + graph_.execution.nodes().size();
+            BatchProgram program{ std::nullopt, {}, {} };
+            if (local) program = rank_step(action, rank, work);
+            else {
+                auto single = ranks_.at(rank)->expand(action);
+                program = { single.publication, { single.completion }, std::move(single.returned_pages) };
+                work.push_back({ rank, begin, graph_.operations.size() });
+            }
+            if (const auto required = prerequisites.find(rank); required != prerequisites.end()) {
+                const auto consumers = graph_.execution.initial_nodes(rank_node_begin);
+                for (const auto producer : required->second) {
+                    for (const auto consumer : consumers) graph_.execution.depend(producer, consumer, "instance_input_ready");
+                }
+            }
             if (program.publication) {
                 if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
                 result.publication = program.publication;
@@ -98,7 +114,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
     else if (action.step == ServingStep::Stage) result = pipeline_stage(action, work);
     else if (action.step == ServingStep::ReadResult) result = read_result(action, work);
     else if (action.step == ServingStep::Result) result = pipeline_result(action, work);
-    else if ((action.step == ServingStep::Batch || action.step == ServingStep::Model) && topology_.stage_count(instance_.id) > 1) {
+    else if (whole_pipeline) {
 
         // Simple PD control submits a whole batch; its execution still uses the shared stage and message expansion.
         auto staged = action;
@@ -108,26 +124,6 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
         }
         staged.stage.reset();
         result = pipeline_result(staged, work);
-    }
-    else {
-        for (const auto rank : group.members) {
-            const auto begin = graph_.operations.size();
-            const auto rank_node_begin = graph_.execution.first_node() + graph_.execution.nodes().size();
-            auto program = ranks_.at(rank)->expand(action);
-            if (const auto required = prerequisites.find(rank); required != prerequisites.end()) {
-                const auto consumers = graph_.execution.initial_nodes(rank_node_begin);
-                for (const auto producer : required->second) {
-                    for (const auto consumer : consumers) graph_.execution.depend(producer, consumer, "instance_input_ready");
-                }
-            }
-            work.push_back({ rank, begin, graph_.operations.size() });
-            if (program.publication) {
-                if (result.publication) throw std::invalid_argument("one serving action has multiple publishing roles");
-                result.publication = program.publication;
-            }
-            if (rank == group.members.front()) result.returned_pages = std::move(program.returned_pages);
-            result.completions.push_back(program.completion);
-        }
     }
     parallel_.connect(work, topology_.parallel(), action.task, action.flow);
 
@@ -152,36 +148,56 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
 
 BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool retain_unfinished) {
     const auto begin = graph_.operations.size();
-    const auto & batch = action.batch_work().batch;
     auto & builder = *ranks_.at(rank);
-    if (action.step == ServingStep::Prepare) flows_.try_emplace(action.flow);
+    if (action.step == ServingStep::PrepareInputs || action.step == ServingStep::Allocate || action.step == ServingStep::PrepareOutputs) {
+        const auto & batch = action.batch_work().batch;
+        const auto program = action.step == ServingStep::PrepareInputs ? builder.prepare_inputs(batch, action.lane)
+                             : action.step == ServingStep::Allocate    ? builder.allocate(batch)
+                                                                       : builder.prepare_outputs(batch, action.lane);
+        work.push_back({ rank, begin, graph_.operations.size() });
+        return { std::nullopt, { program.completion }, {} };
+    }
+    if (action.step == ServingStep::Schedule) {
+        const std::map<std::string, std::size_t> empty;
+        const auto * outputs = &empty;
+        if (const auto flow = flows_.find(action.flow); flow != flows_.end()) {
+            if (const auto view = flow->second.find(rank); view != flow->second.end() && view->second.inputs) outputs = &*view->second.inputs;
+        }
+        const auto program = builder.schedule(action.schedule_operation(), *outputs);
+        work.push_back({ rank, begin, graph_.operations.size() });
+        return { std::nullopt, { program.completion }, {} };
+    }
+
+    const auto & batch = action.batch_work().batch;
+    if (action.step == ServingStep::Prepare) flows_[action.flow].try_emplace(rank);
     auto & flow = flows_.at(action.flow);
+    auto & view = flow.at(rank);
     BatchProgram result{ std::nullopt, {}, {} };
     switch (action.step) {
     case ServingStep::Prepare: {
         auto prepared = builder.prepare(action.batch_work(), action.lane);
-        flow.inputs[rank] = std::move(prepared.ports.outputs);
+        view.inputs = std::move(prepared.ports.outputs);
         result.completions.push_back(graph_.execution.region_call(prepared.region).returned);
         break;
     }
     case ServingStep::Compute: {
-        auto model = builder.model(batch, flow.inputs.at(rank));
-        flow.inputs.erase(rank);
-        flow.outputs[rank] = std::move(model.ports.outputs);
-        flow.outputs[rank].erase("token_relay");
+        auto model = builder.model(batch, view.inputs.value());
+        view.inputs.reset();
+        view.outputs = std::move(model.ports.outputs);
+        view.outputs->erase("token_relay");
         auto values = nlohmann::json::object();
-        for (const auto & [name, value] : flow.outputs.at(rank)) values[name] = graph_.types.at(value);
+        for (const auto & [name, value] : *view.outputs) values[name] = graph_.types.at(value);
         result.values.emplace(std::to_string(rank), std::move(values));
         result.completions.push_back(graph_.execution.region_call(model.region).returned);
         break;
     }
     case ServingStep::Send: {
-        auto & payload = flow.payloads[rank][action.channel];
+        auto & payload = view.payloads[action.channel];
         if (action.channel == "proxy") {
 
             // A stage sends its computed proxy, not the proxy received from its predecessor.
             payload.clear();
-            auto & output = flow.outputs.at(rank);
+            auto & output = view.outputs.value();
             for (auto item = output.begin(); item != output.end();) {
                 if (item->first.starts_with("proxy.")) {
                     payload.emplace(item->first.substr(6), item->second);
@@ -190,10 +206,10 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
                 else ++item;
             }
         }
-        else if (payload.empty()) payload.emplace("next_token_ids", flow.outputs.at(rank).at("sampled_tokens"));
+        else if (payload.empty()) payload.emplace("next_token_ids", view.outputs.value().at("sampled_tokens"));
         auto message = builder.message("pipeline_send_" + action.channel, batch, payload, true);
         result.completions.push_back(graph_.execution.region_call(message.region.region).returned);
-        flow.messages[rank].emplace(action.channel, std::move(message));
+        view.messages.emplace(action.channel, std::move(message));
         break;
     }
     case ServingStep::Receive: {
@@ -202,59 +218,63 @@ BatchProgram ServingStructure::rank_step(const ServingAction & action, std::size
         const auto sender = members[(static_cast<std::size_t>(position) + members.size() - 1) % members.size()];
 
         // Native receive first obtains the sender's metadata; no fabricated model-specific dimensions are needed.
-        auto message = builder.message("pipeline_receive_" + action.channel, batch, flow.payloads.at(sender).at(action.channel), false);
-        flow.payloads[rank][action.channel] = std::move(message.region.ports.outputs);
+        auto message = builder.message("pipeline_receive_" + action.channel, batch, flow.at(sender).payloads.at(action.channel), false);
+        view.payloads[action.channel] = std::move(message.region.ports.outputs);
         if (action.channel == "proxy") {
-            for (const auto & [name, value] : flow.payloads.at(rank).at(action.channel)) flow.inputs.at(rank).emplace("proxy." + name, value);
+            for (const auto & [name, value] : view.payloads.at(action.channel)) view.inputs.value().emplace("proxy." + name, value);
         }
         result.completions.push_back(graph_.execution.region_call(message.region.region).returned);
         break;
     }
     case ServingStep::Wait: {
-        auto & messages = flow.messages.at(rank);
-        result.completions = builder.wait_message(action.channel, batch, messages.at(action.channel));
-        messages.erase(action.channel);
-        if (messages.empty()) flow.messages.erase(rank);
+        result.completions = builder.wait_message(action.channel, batch, view.messages.at(action.channel));
+        view.messages.erase(action.channel);
         break;
     }
     case ServingStep::PrepareResult: {
-        const auto tokens = flow.payloads.at(rank).at("output").at("next_token_ids");
+        const auto tokens = view.payloads.at("output").at("next_token_ids");
 
         // Preparation updates the shared token relay; the received output itself is unchanged.
-        flow.tokens[rank] = tokens;
-        result.completions.push_back(builder.prepare_result(batch, tokens));
+        view.tokens = tokens;
+        result.completions.push_back(builder.prepare_result(batch, tokens, view.outputs.value().at("request_slots")));
         break;
     }
     case ServingStep::ReadResult: {
         if (topology_.stage_count(instance_.id) == 1) {
-            const auto tokens = flow.outputs.at(rank).at("sampled_tokens");
-            flow.tokens[rank] = tokens;
+            const auto tokens = view.outputs.value().at("sampled_tokens");
+            view.tokens = tokens;
             result.completions.push_back(builder.begin_result(batch, tokens).value());
         }
-        else result.completions.push_back(builder.read_pipeline_result(batch, flow.tokens.at(rank)));
+        else result.completions.push_back(builder.read_pipeline_result(batch, view.tokens.value()));
         break;
     }
     case ServingStep::Result: {
         const auto program = builder.complete(batch,
                                               action.batch_work().effects,
                                               action.lane,
-                                              flow.outputs.at(rank),
-                                              flow.tokens.at(rank),
+                                              view.outputs.value(),
+                                              view.tokens.value(),
                                               action.batch_work().metadata_slots,
                                               retain_unfinished,
                                               action.batch_work().index_tail);
         result.publication = program.publication;
         result.returned_pages = program.returned_pages;
         result.completions.push_back(program.completion);
-        flow.outputs.erase(rank);
-        flow.tokens.erase(rank);
+        view.outputs.reset();
+        view.tokens.reset();
         break;
     }
     default:
         throw std::logic_error("unknown local serving step");
     }
     work.push_back({ rank, begin, graph_.operations.size() });
-    if (flow.inputs.empty() && flow.outputs.empty() && flow.messages.empty()) flows_.erase(action.flow);
+
+    // The output ring may forward a finished rank's payload until every rank has released its work.
+    if (std::ranges::all_of(flow, [](const auto & entry) {
+            const auto & state = entry.second;
+            return !state.inputs && !state.outputs && state.messages.empty();
+        }))
+        flows_.erase(action.flow);
     return result;
 }
 
@@ -320,7 +340,7 @@ BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std
                 step.step = ServingStep::PrepareResult;
                 rank_step(step, rank, work);
             }
-            if (stages > 1 || !flows_.at(action.flow).tokens.contains(rank)) {
+            if (stages > 1 || !flows_.at(action.flow).at(rank).tokens) {
                 step.step = ServingStep::ReadResult;
                 rank_step(step, rank, work);
             }
@@ -346,25 +366,6 @@ BatchProgram ServingStructure::pipeline_result(const ServingAction & action, std
 
 const RegionGraph & ServingStructure::graph() const { return graph_; }
 
-std::vector<std::size_t> ServingStructure::idle() {
-    const auto operation_begin = graph_.operations.size();
-    const auto node_begin = graph_.execution.nodes().size();
-    const auto dependency_begin = graph_.execution.dependencies().size();
-    const auto region_begin = graph_.regions.size();
-    std::vector<std::size_t> completions;
-    for (auto & [_, rank] : ranks_) {
-        if (const auto completion = rank->idle()) completions.push_back(*completion);
-    }
-    if (completions.empty()) return completions;
-
-    for (std::size_t region = region_begin; region < graph_.regions.size(); ++region) graph_.regions[region]["control"] = control_count_;
-    ++control_count_;
-    operation_count_ += graph_.operations.size() - operation_begin;
-    node_count_ += graph_.execution.nodes().size() - node_begin;
-    dependency_count_ += graph_.execution.dependencies().size() - dependency_begin;
-    return completions;
-}
-
 std::vector<std::size_t> ServingStructure::retire() {
     GraphRoots roots;
     live_state(roots);
@@ -375,30 +376,35 @@ void ServingStructure::live_state(GraphRoots & roots) {
     parallel_.live_state(roots);
     for (auto & [_, rank] : ranks_) rank->live_state(roots);
     for (auto & [_, flow] : flows_) {
-        for (auto & [rank, inputs] : flow.inputs) {
-            for (auto & [name, value] : inputs) roots.values.push_back(&value);
-        }
-        for (auto & [rank, output] : flow.outputs) {
-            for (auto & [name, value] : output) roots.values.push_back(&value);
-        }
-        for (auto & [rank, channels] : flow.payloads) {
-            for (auto & [channel, payload] : channels) {
+        for (auto & [rank, view] : flow) {
+            if (view.inputs) {
+                for (auto & [name, value] : *view.inputs) roots.values.push_back(&value);
+            }
+            if (view.outputs) {
+                for (auto & [name, value] : *view.outputs) roots.values.push_back(&value);
+            }
+
+            for (auto & [channel, payload] : view.payloads) {
                 for (auto & [name, value] : payload) roots.values.push_back(&value);
             }
-        }
-        for (auto & [rank, messages] : flow.messages) {
-            for (auto & [channel, message] : messages) {
+
+            for (auto & [channel, message] : view.messages) {
                 roots.regions.push_back(&message.region.region);
                 for (auto & [name, value] : message.region.ports.outputs) roots.values.push_back(&value);
             }
+
+            if (view.tokens) roots.values.push_back(&*view.tokens);
         }
-        for (auto & [rank, tokens] : flow.tokens) roots.values.push_back(&tokens);
     }
 }
 
 PageReuse ServingStructure::page_reuse() const { return ranks_.begin()->second->page_reuse(); }
 std::span<const TemplateAsset * const> ServingStructure::sources() const { return assets_; }
 TargetRegion ServingStructure::transfer(std::size_t rank, std::int64_t bytes, std::int64_t segments) { return ranks_.at(rank)->transfer(bytes, segments); }
+
+std::size_t ServingStructure::transport_event(std::size_t rank, const std::string & role, std::int64_t prompt_tokens) {
+    return ranks_.at(rank)->transport_event(role, prompt_tokens);
+}
 
 nlohmann::json ServingStructure::summary() const {
     const auto & environment = assets_.front()->environment();
@@ -415,7 +421,6 @@ nlohmann::json ServingStructure::summary() const {
         {            "counts",
          { { "batches", batch_count_ },
          { "actions", action_count_ },
-         { "control_decisions", control_count_ },
          { "operations", operation_count_ },
          { "execution_nodes", node_count_ },
          { "execution_dependencies", dependency_count_ } }                 },
@@ -430,7 +435,6 @@ nlohmann::json ServingStructure::summary() const {
         {         "token_values",                                     "symbolic" },
         {          "preparation",                           "native_batch_calls" },
         {    "batch_transitions",                          "native_column_calls" },
-        {           "scheduling",                 "native_scheduled_batch_calls" },
         {   "resource_execution", "observed_relations_and_collective_interfaces" },
         {            "workspace",             "prewarmed_native_attention_bound" }
     };

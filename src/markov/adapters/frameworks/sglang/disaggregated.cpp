@@ -28,6 +28,7 @@ DisaggregatedStructure::DisaggregatedStructure(std::span<const TemplateAsset> as
             throw std::invalid_argument("PD instances require the same model and implementation");
     }
     if (prefill_.page_reuse() != decode_.page_reuse()) throw std::invalid_argument("PD instances require matching page reuse policies");
+    for (const auto & request : requests) prompt_tokens_.push_back(request.prompt_tokens);
 }
 
 GroupAdmission DisaggregatedStructure::admission() const {
@@ -81,6 +82,38 @@ std::size_t DisaggregatedStructure::append_transfer(const KvTransfer & route, st
     return graph_.execution.region_call(copied.region).returned;
 }
 
+BatchProgram DisaggregatedStructure::transport_event(const ServingAction & action, Handoff & handoff) {
+    BatchProgram result{ std::nullopt, {}, {} };
+    const auto & endpoint = action.transfer_endpoint();
+    const auto & members = topology_.parallel().group(endpoint.group).members;
+    const bool source = topology_.parallel().group(members.front(), "serving").id == groups_.prefill;
+    const bool connecting = action.step == ServingStep::Handshake;
+    auto & instance = source ? prefill_ : decode_;
+    for (const auto rank : members) {
+        const auto begin = graph_.execution.first_node() + graph_.execution.nodes().size();
+        const auto ready = instance.transport_event(rank, connecting ? "kv_ready" : "kv_complete", prompt_tokens_.at(endpoint.request));
+        std::vector<std::size_t> prerequisites;
+        if (!connecting) prerequisites = handoff.transport.at(rank);
+        for (const auto & route : transfers_.copies()) {
+            if (connecting && route.source == rank) {
+                const auto & ports = handoff.advertised.at(route.destination);
+                prerequisites.insert(prerequisites.end(), ports.begin(), ports.end());
+            }
+            else if (!connecting && !source && route.destination == rank) {
+                const auto & ports = handoff.transport.at(route.source);
+                prerequisites.insert(prerequisites.end(), ports.begin(), ports.end());
+            }
+        }
+
+        // Source publication follows copies; destination publication additionally follows source notifications.
+        require(prerequisites, begin, connecting ? "kv_metadata_ready" : "kv_status_ready");
+        auto & ports = connecting ? handoff.connected : handoff.transport;
+        ports[rank] = { ready };
+        result.completions.push_back(ready);
+    }
+    return result;
+}
+
 void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & handoff) {
     const auto & pages = action.batch_work().transferred_pages;
     const auto page_size = prefill_.sources().front()->environment().at("kv_layout").at("page_size").get<std::int64_t>();
@@ -94,6 +127,10 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
             continue;
         const auto & offered = action.transfer ? handoff.offered.at({ action.transfer->source, action.flow }).ready : handoff.prepared;
         auto ready = offered.at(route.source);
+        if (action.transfer) {
+            const auto & connected = handoff.connected.at(route.source);
+            ready.insert(ready.end(), connected.begin(), connected.end());
+        }
         const auto & reserved = handoff.reserved.at(route.destination);
         ready.insert(ready.end(), reserved.begin(), reserved.end());
         const auto identity = std::pair{ route.source, route.destination };
@@ -112,13 +149,13 @@ void DisaggregatedStructure::transfer(const ServingAction & action, Handoff & ha
         if (!route.per_buffer_tokens)
             copied.push_back(append_transfer(route, bulk_bytes, runs * static_cast<std::int64_t>(route.slices.size()), ready, "kv", route.slices));
 
-        // Only the final metadata acknowledges all preceding fragments of this rank pair.
+        // Final metadata ends the physical copy; endpoint success is published by a separate native event.
         if (action.batch_work().final_transfer) {
             const auto bytes = std::accumulate(route.metadata_item_bytes.begin(), route.metadata_item_bytes.end(), std::int64_t{ 0 });
             const auto done = append_transfer(route, bytes, static_cast<std::int64_t>(route.metadata_item_bytes.size()), copied, "metadata", {});
             metadata_bytes_ += bytes;
-            handoff.transferred[route.source].push_back(done);
-            handoff.transferred[route.destination].push_back(done);
+            handoff.transport[route.source].push_back(done);
+            handoff.transport[route.destination].push_back(done);
             handoff.copied.erase(identity);
         }
         else handoff.copied[identity] = std::move(copied);
@@ -140,7 +177,7 @@ void DisaggregatedStructure::bind_readiness(const ServingAction & action, const 
     // CPU return and device readiness differ; retain local tails and each communication's actual participants.
     for (const auto node : drained) {
         const auto & owner = graph_.execution.nodes()[node - graph_.execution.first_node()].owner;
-        const auto region = owner.kind == ExecutionOwner::Kind::Region ? owner.identity : graph_.operations.at(owner.identity).region;
+        const auto region = graph_.owner_region(owner);
         const auto & scope = graph_.regions.at(region);
         std::set<std::size_t> participants;
         if (scope.contains("rank")) participants.insert(scope.at("rank").get<std::size_t>());
@@ -165,13 +202,15 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
     const auto region_begin = graph_.regions.size();
     BatchProgram result{ std::nullopt, {}, {} };
     const auto & members = topology_.parallel().group(action.task.group).members;
-    const bool source = action.step != ServingStep::Transfer && topology_.parallel().group(members.front(), "serving").id == groups_.prefill;
+    const bool source = !action.detached() && topology_.parallel().group(members.front(), "serving").id == groups_.prefill;
     const bool produced = source && (action.step == ServingStep::Model || action.step == ServingStep::Compute);
     const bool sent = action.step == ServingStep::Send && action.channel.empty() && source;
     const bool received = action.step == ServingStep::Receive && action.channel.empty();
     const bool released = action.step == ServingStep::Release && source;
+    const bool advertised = action.step == ServingStep::Advertise;
 
     if (action.step == ServingStep::Transfer) transfer(action, handoffs_.at(action.batch_work().batch.members.front().request));
+    else if (const auto * endpoint = std::get_if<TransferEndpoint>(&action.work)) result = transport_event(action, handoffs_.at(endpoint->request));
     else {
         auto & instance = source ? prefill_ : decode_;
         const bool consumes_transfer = received || released;
@@ -179,20 +218,28 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
         if (source && action.step == ServingStep::Indices && action.index_work().release_request) {
 
             // Cached pages unlock in index work, before the later request-slot release.
-            prerequisites = handoffs_.at(*action.index_work().release_request).transferred;
+            prerequisites = handoffs_.at(*action.index_work().release_request).transport;
         }
-        else if (consumes_transfer || action.step == ServingStep::Accept) {
+        else if (advertised || consumes_transfer || action.step == ServingStep::Accept) {
             for (const auto & member : action.batch_work().batch.members) {
                 const auto & handoff = handoffs_.at(member.request);
-                const auto & ready = consumes_transfer ? handoff.transferred : handoff.received;
+                const auto & ready = advertised ? handoff.reserved : consumes_transfer ? handoff.transport : handoff.received;
                 for (const auto & [rank, ports] : ready) prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
+            }
+        }
+        else if (source && action.step == ServingStep::Indices && action.index_work().prefix)
+            prerequisites = handoffs_.at(action.index_work().prefix->request).connected;
+        else if (source && (action.step == ServingStep::PrepareInputs || action.step == ServingStep::Prepare || action.step == ServingStep::Compute)) {
+            for (const auto & member : action.batch_work().batch.members) {
+                for (const auto & [rank, ports] : handoffs_.at(member.request).connected)
+                    prerequisites[rank].insert(prerequisites[rank].end(), ports.begin(), ports.end());
             }
         }
         result = instance.expand(action, prerequisites);
     }
 
     auto drained = graph_.execution.terminal_nodes(node_begin);
-    if (action.step == ServingStep::Reserve || produced || sent || received || action.step == ServingStep::Accept || released) {
+    if (action.step == ServingStep::Reserve || advertised || produced || sent || received || action.step == ServingStep::Accept || released) {
 
         // Batch membership may change between P computation and D admission; request identity is stable.
         for (const auto & member : action.batch_work().batch.members) {
@@ -202,10 +249,24 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
                 for (const auto rank : members) ports.erase(rank);
                 bind_readiness(action, result, drained, ports);
             }
+            if (advertised) {
+
+                // This opaque native service has a separate entry gate; message arrival need not follow its return.
+                for (std::size_t index = 0; index < members.size(); ++index) {
+                    const auto returned = result.completions.at(index);
+                    const auto & owner = graph_.execution.nodes()[returned - graph_.execution.first_node()].owner;
+                    handoff.advertised[members[index]] = { graph_.execution.region_call(graph_.owner_region(owner)).entry };
+                }
+            }
             if (sent) {
                 auto & offered = handoff.offered[action.task];
                 for (const auto rank : members) offered.ready[rank] = handoff.prepared.at(rank);
-                bind_readiness(action, result, drained, offered.ready);
+                bind_readiness(action, result, {}, offered.ready);
+                if (action.batch_work().final_transfer) {
+
+                    // Ranks without a physical slice still publish their native endpoint completion.
+                    for (const auto rank : members) handoff.transport[rank] = offered.ready.at(rank);
+                }
                 for (const auto & binding : transfer_bindings()) {
                     if (binding.source == action.task.group) offered.consumers.insert(binding);
                 }
@@ -219,9 +280,8 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
         }
     }
 
-    // Resource effects and transfers commit only after their participating ranks' work has drained.
-    if (!drained.empty() && (!action.stage || received || released || action.step == ServingStep::Reserve || action.step == ServingStep::Accept))
-        result.completions = std::move(drained);
+    // Native calls return at their own ports; handoff readiness above retains device tails independently.
+    if (!drained.empty() && !action.stage) result.completions = std::move(drained);
 
     for (auto region = region_begin; region < graph_.regions.size(); ++region) {
         graph_.regions[region]["batch"] = action.flow;
@@ -242,15 +302,6 @@ void DisaggregatedStructure::count(std::size_t operation_begin, std::size_t node
     dependencies_ += graph_.execution.dependencies().size() - dependency_begin;
 }
 
-std::vector<std::size_t> DisaggregatedStructure::idle() {
-    const auto operation_begin = graph_.operations.size();
-    const auto node_begin = graph_.execution.first_node() + graph_.execution.nodes().size();
-    const auto dependency_begin = graph_.execution.dependencies().size();
-    auto result = decode_.idle();
-    count(operation_begin, node_begin, dependency_begin);
-    return result.empty() ? result : graph_.execution.terminal_nodes(node_begin);
-}
-
 const RegionGraph & DisaggregatedStructure::graph() const { return graph_; }
 
 std::vector<std::size_t> DisaggregatedStructure::retire() {
@@ -261,7 +312,7 @@ std::vector<std::size_t> DisaggregatedStructure::retire() {
 
     // A peer may become ready before the next control action; retain that time across IR compaction.
     for (const auto & [_, handoff] : handoffs_) {
-        for (const auto * ports : { &handoff.reserved, &handoff.prepared, &handoff.transferred, &handoff.received }) {
+        for (const auto * ports : { &handoff.reserved, &handoff.advertised, &handoff.connected, &handoff.prepared, &handoff.transport, &handoff.received }) {
             for (const auto & [rank, ready] : *ports) nodes.insert(nodes.end(), ready.begin(), ready.end());
         }
         for (const auto & [task, offered] : handoff.offered) {
@@ -279,11 +330,11 @@ nlohmann::json DisaggregatedStructure::summary() const {
         for (const auto & source : summary.at("rank_sources")) sources.push_back(source);
     }
     return {
-        {     "framework",                                              "sglang"                          },
-        {          "mode",                                                                 "disaggregated" },
-        {      "topology",                                                 topology_.parallel().document() },
-        {         "model", prefill_.sources().front()->environment().at("implementation").at("model_path") },
-        {  "rank_sources",                                                              std::move(sources) },
+        {     "framework",                                                                                                "sglang"                          },
+        {          "mode",                                                                                                                   "disaggregated" },
+        {      "topology",                                                                                                   topology_.parallel().document() },
+        {         "model",                                                   prefill_.sources().front()->environment().at("implementation").at("model_path") },
+        {  "rank_sources",                                                                                                                std::move(sources) },
         {        "counts",
          { { "batches", batches_ },
          { "actions", actions_ },
@@ -291,14 +342,8 @@ nlohmann::json DisaggregatedStructure::summary() const {
          { "execution_nodes", nodes_ },
          { "execution_dependencies", dependencies_ },
          { "kv_bytes", kv_bytes_ },
-         { "metadata_bytes", metadata_bytes_ } }                                                          },
-        { "qualification",
-         { { "scheduling", "controller_selected_batches" },
-         { "initial_state", "prewarmed_drained" },
-         { "completion", "declared_action_completion_ports" },
-         { "transfer", "native_synchronous_sdma_interface" },
-         { "token_values", "symbolic" },
-         { "costs", "given_execution_kind_ns" } }                                                         }
+         { "metadata_bytes", metadata_bytes_ } }                                                                                                            },
+        { "qualification", { { "initial_state", "prewarmed_drained" }, { "transfer", "native_synchronous_sdma_interface" }, { "token_values", "symbolic" } } }
     };
 }
 

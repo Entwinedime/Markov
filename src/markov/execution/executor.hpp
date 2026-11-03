@@ -15,30 +15,23 @@
 
 #include "markov/contracts/serving.hpp"
 #include "markov/execution/durations.hpp"
+#include "markov/execution/feedback.hpp"
 
 namespace markov {
 
-struct ExecutionEvent {
-    enum class Kind { Published, Completed };
-
-    std::int64_t time_ns;
-    TaskIdentity task;
-    Kind kind;
-};
-
 // Dependencies make work ready; a resource is acquired only when that work actually starts.
-class Executor {
+class Executor final : public ExecutionFeedback {
 public:
     explicit Executor(const NodeDurations & durations);
 
-    void submit(const RegionGraph & graph, const TaskIdentity & task, const BatchProgram & program);
-    std::optional<ExecutionEvent> advance_until(std::optional<std::int64_t> deadline_ns);
-    std::int64_t idle_until(const RegionGraph & graph, std::span<const std::size_t> completions, std::int64_t time_ns);
-    void retain(std::span<const std::size_t> frontiers);
-    std::int64_t now_ns() const;
-    nlohmann::json timeline() const;
+    void submit(const RegionGraph & graph, const ServingAction & action, const BatchProgram & program) override;
+    std::optional<ExecutionEvent> advance_until(std::optional<std::int64_t> deadline_ns) override;
+    void retain(std::span<const std::size_t> frontiers) override;
+    std::int64_t now_ns() const override;
+    nlohmann::json finish(bool details) const override;
 
 private:
+    nlohmann::json timeline() const;
     struct Notification {
         TaskIdentity task;
         ExecutionEvent::Kind kind;

@@ -18,6 +18,8 @@
 #include "markov/controller/disaggregated.hpp"
 #include "markov/controller/native.hpp"
 #include "markov/controller/serving.hpp"
+#include "markov/execution/executor.hpp"
+#include "markov/execution/observed_feedback.hpp"
 #include "markov/resources/kv_pool.hpp"
 #include "markov/resources/trace.hpp"
 #include "markov/serving/workflow.hpp"
@@ -92,11 +94,11 @@ nlohmann::json resource_state(const KvPool & resources, const ServingControl & c
 
 } // namespace
 
-ServingSimulation::ServingSimulation(std::span<const TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches, ControlPeer * peer)
+ServingSimulation::ServingSimulation(std::span<const TemplateAsset> assets, const nlohmann::json & input, const nlohmann::json & batches,
+                                     const nlohmann::json & observation, ControlPeer * peer)
     : assets_(assets),
       input_(input),
       configuration_(input.at("configuration")),
-      durations_(input.at("node_durations_ns")),
       peer_(peer) {
     check_fields(input_, { "configuration", "requests", "prefixes", "ep_routes", "node_durations_ns" }, "serving input");
     const bool disaggregated = configuration_.contains("pd");
@@ -132,6 +134,35 @@ ServingSimulation::ServingSimulation(std::span<const TemplateAsset> assets, cons
     requests_ = Request::read(input_.at("requests"));
     if (!batches.is_null()) replay_.emplace(batches, requests_, disaggregated);
 
+    if (observation.is_null()) {
+        durations_.emplace(input.at("node_durations_ns"));
+        execution_ = std::make_unique<Executor>(*durations_);
+    }
+    else {
+        if (!peer_) throw std::invalid_argument("observed boundaries require native control");
+        for (const auto * field : { "configuration", "requests", "prefixes", "ep_routes" }) {
+            if (observation.at("input").value(field, nlohmann::json(nullptr)) != input_.value(field, nlohmann::json(nullptr)))
+                throw std::invalid_argument(std::string("observed boundary input differs: ") + field);
+        }
+        const auto & domains = observation.at("domains");
+        if (!domains.is_array() || domains.size() != assets_.size())
+            throw std::invalid_argument("observed boundaries must cover every template role");
+        for (const auto & asset : assets_) {
+            const auto & environment = asset.environment();
+            nlohmann::json domain;
+            for (const auto * field : { "framework", "torch", "torch_npu", "cann", "device", "rank", "tp_rank", "pp_rank", "ep_rank",
+                                       "logical_tp", "logical_pp", "logical_ep", "observation_window" })
+                domain[field] = environment.at(field);
+
+            // Chunk size belongs to the checked target input; model, implementation and runtime must still agree.
+            domain["implementation"] = environment.at("implementation");
+            domain["implementation"].erase("chunked_prefill_size");
+            if (domains.at(environment.at("rank").get<std::size_t>()) != domain)
+                throw std::invalid_argument("observed completion domain differs from its template role");
+        }
+        execution_ = std::make_unique<ObservedFeedback>(observation, requests_);
+    }
+
     if (configuration_.contains("placement")) {
         const auto & placement = configuration_.at("placement");
         check_fields(placement, { "devices" }, "placement");
@@ -150,7 +181,6 @@ nlohmann::json ServingSimulation::run(bool details) {
     if (replay_ && !replay_->done()) throw std::logic_error("serving completed with unconsumed batch records");
     result["control_source"] = peer_ ? "native_control" : replay_ ? "recorded_batches" : "lightweight_policy";
     result["configuration"] = configuration_;
-    result["duration_source"] = "given_execution_kind_ns";
     return result;
 }
 
@@ -253,7 +283,7 @@ nlohmann::json ServingSimulation::disaggregated(ResourceTrace * trace) {
                                                                resources.at(groups.decode),
                                                                replay_ ? &*replay_ : nullptr);
 
-    ServingWorkflow workflow(*controller, expansion, durations_, trace);
+    ServingWorkflow workflow(*controller, expansion, *execution_, trace);
     auto result = workflow.run(details);
     for (const auto & [name, pool] : resources) result["resources"][name] = resource_state(pool, *controller, details);
 
@@ -327,7 +357,7 @@ nlohmann::json ServingSimulation::joint(ResourceTrace * trace) {
                                                          static_cast<std::size_t>(batch_limit),
                                                          replay_ ? &*replay_ : nullptr);
 
-    ServingWorkflow workflow(*controller, expansion, durations_, trace);
+    ServingWorkflow workflow(*controller, expansion, *execution_, trace);
     auto result = workflow.run(details);
     for (std::size_t stage = 0; stage < resources.size(); ++stage) {
         const auto & name = peer_ ? topology.stage("model", stage).id : control_group;

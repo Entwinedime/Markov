@@ -1,5 +1,7 @@
 #include "markov/templates/instance.hpp"
 
+#include "markov/templates/target_graph.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <numeric>
@@ -7,6 +9,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <variant>
 
@@ -37,7 +40,14 @@ Parameters read_parameters(const nlohmann::json & source) {
     return result;
 }
 
-Parameters bind_parameters(Parameters inherited, const Parameters & fixed, const Invocation & invocation, const ScopedParameters & scopes) {
+Parameters bind_parameters(Parameters inherited, const Parameters & fixed, const Invocation & invocation, const ScopedParameters & scopes,
+                           const TemplateDefinition & definition) {
+
+    // Collection aggregates belong to this call, even when its caller uses the same parameter names.
+    for (const auto & [_, group] : definition.input_groups) {
+        inherited.erase(group.count);
+        for (const auto & [name, _] : group.sums) inherited.erase(name);
+    }
     for (const auto & [name, value] : fixed) inherited.insert_or_assign(name, value);
 
     for (const auto & [name, choices] : scopes) {
@@ -84,6 +94,37 @@ bool bind_input_parameters(const TemplateLayout & layout, const TemplateDefiniti
     return true;
 }
 
+void bind_input_groups(const TemplateDefinition & definition, const GroupValues & groups, const RegionGraph & graph, Parameters & parameters,
+                       Invocation & invocation) {
+    for (const auto & [name, _] : invocation.input_groups) {
+        if (!definition.input_groups.contains(name)) throw LayoutMismatch("region has no input group " + name);
+    }
+    for (const auto & [name, _] : groups) {
+        if (!definition.input_groups.contains(name)) throw LayoutMismatch("region has no input group " + name);
+    }
+    for (const auto & [name, group] : definition.input_groups) {
+        if (!invocation.input_groups.contains(name)) {
+            const auto supplied = groups.find(name);
+            if (supplied == groups.end()) throw LayoutMismatch("region requires input group " + name);
+            const auto & values = supplied->second;
+            if (parameters.contains(group.count) && parameters.at(group.count) != static_cast<std::int64_t>(values.size()))
+                throw LayoutMismatch("bound input group has a fixed member count: " + name);
+
+            auto & members = invocation.input_groups[name];
+            for (const auto value : values) {
+                const auto & type = graph.types.at(value);
+                if (!type.contains("shape")) throw LayoutMismatch("bound input group member needs target geometry: " + name);
+
+                const auto geometry = type.at("shape").get<std::vector<std::int64_t>>();
+                auto inferred = group.infer_member(geometry, parameters);
+                if (!inferred) throw LayoutMismatch("bound input group member does not match its element geometry: " + name);
+                members.push_back(std::move(*inferred));
+            }
+        }
+        group.derive(parameters, invocation.input_groups.at(name));
+    }
+}
+
 } // namespace
 
 // Borrow only the active call's bindings; recursive expansion cannot outlive these stack values.
@@ -126,10 +167,15 @@ Invocation Invocation::read(const nlohmann::json & source) {
 }
 
 TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation,
-                                          const TargetInputs * inputs) {
+                                          const TargetBindings & bindings) {
+    return select(asset, role, phase, invocation, bindings, nullptr);
+}
+
+TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std::string & role, const std::string & phase, const Invocation & invocation,
+                                          const TargetBindings & bindings, const ExpansionScope * inherited) {
     std::set<std::string> mismatches;
-    for (const auto & selection : asset.entrypoints()) {
-        if (selection.role != role || (selection.phase && *selection.phase != phase)) continue;
+    for (const auto & selection : asset.entrypoints(role)) {
+        if (selection.phase && *selection.phase != phase) continue;
 
         // Follow the recorded call path to preserve the selected region's fixed bindings.
         const auto frame = asset.frame(selection);
@@ -139,26 +185,38 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
             const auto & layout = asset.layout(frame.layout);
             const auto & definition = asset.definition(layout.definition);
 
-            // A call family can contain grouped and positional signatures; select one before expanding its body.
-            if (definition.input_groups.size() != bound.input_groups.size()
-                || !std::ranges::all_of(definition.input_groups, [&](const auto & group) { return bound.input_groups.contains(group.first); }))
-                throw LayoutMismatch(role + " input-group signature differs");
-            if (inputs != nullptr) {
+            // Continuations retain the enclosing caller's complete input contract.
+            const bool matches_caller_inputs =
+                bindings.caller_inputs ? layout.caller_inputs && *bindings.caller_inputs == *layout.caller_inputs : !layout.caller_inputs;
+            if (!matches_caller_inputs) throw LayoutMismatch(role + " caller input contract differs");
 
-                // Required values come from their producer; only declared state may remain unbound.
-                if (!std::ranges::all_of(layout.required_inputs, [&](const auto & name) { return inputs->ports.contains(name); }))
-                    throw LayoutMismatch(role + " requires its declared input ports");
-                if (!std::ranges::all_of(inputs->ports, [&](const auto & port) { return layout.ports.inputs.contains(port.first); }))
-                    throw LayoutMismatch(role + " input-port signature differs");
-                auto parameters = bind_parameters({}, frame.bindings.values, bound, bound.parameter_scopes);
-                if (!bind_input_parameters(layout, definition, inputs->ports, inputs->graph, parameters))
-                    throw LayoutMismatch(role + " input geometry differs");
-                for (const auto & name : definition.parameters) {
-                    if (parameters.contains(name)) bound.parameters.emplace(name, parameters.at(name));
-                }
+            auto ports = bindings.ports;
+            if (bindings.available_ports) std::erase_if(ports.inputs, [&](const auto & port) { return !layout.ports.inputs.contains(port.first); });
+            const TargetBindings selected{ bindings.graph, ports, bindings.groups };
+
+            // Required values come from their producer; only declared state may remain unbound.
+            if (!std::ranges::all_of(layout.required_inputs, [&](const auto & name) { return ports.inputs.contains(name); }))
+                throw LayoutMismatch(role + " requires its declared input ports");
+            if (!std::ranges::all_of(ports.inputs, [&](const auto & port) { return layout.ports.inputs.contains(port.first); }))
+                throw LayoutMismatch(role + " input-port signature differs");
+            if (!std::ranges::all_of(ports.outputs, [&](const auto & port) { return layout.ports.outputs.contains(port.first); }))
+                throw LayoutMismatch(role + " output-port signature differs");
+
+            auto parameters = bind_parameters(inherited ? inherited->parameters : Parameters{},
+                                              frame.bindings.values,
+                                              bound,
+                                              inherited ? inherited->scopes : bound.parameter_scopes,
+                                              definition);
+            if (!bind_input_parameters(layout, definition, ports.inputs, bindings.graph, parameters)) throw LayoutMismatch(role + " input geometry differs");
+
+            // Fixed and replaceable calls derive the same member parameters from the supplied tensor values.
+            bind_input_groups(definition, bindings.groups, bindings.graph, parameters, bound);
+            for (const auto & name : definition.parameters) {
+                if (parameters.contains(name)) bound.parameters.emplace(name, parameters.at(name));
             }
-            auto instance = TemplateInstance(asset, frame.layout, frame.bindings, bound, role, phase);
-            if (inputs != nullptr) instance.bind_inputs(*inputs);
+
+            auto instance = TemplateInstance(asset, frame.layout, frame.bindings, bound, role, phase, inherited);
+            instance.bind_ports(selected);
             return instance;
         }
         catch (const LayoutMismatch & error) {
@@ -174,40 +232,48 @@ TemplateInstance TemplateInstance::select(const TemplateAsset & asset, const std
     throw LayoutMismatch(message);
 }
 
-void TemplateInstance::bind_inputs(const TargetInputs & inputs) {
-    bound_inputs_.resources.resize(graph_.resource_count);
-    std::vector<std::pair<std::size_t, std::size_t>> ports;
-    for (const auto & [name, target] : inputs.ports) {
-        const auto local = ports_.inputs.find(name);
-        if (local == ports_.inputs.end()) throw LayoutMismatch(role_ + " has no input port: " + name);
-        ports.emplace_back(local->second, target);
+void TemplateInstance::bind_ports(const TargetBindings & bindings) {
+    bound_ports_.resources.resize(graph_.resource_count);
+    std::vector<std::tuple<std::size_t, std::size_t, bool>> ports;
+    for (const bool output : { false, true }) {
+        const auto & local_ports = output ? ports_.outputs : ports_.inputs;
+        for (const auto & [name, target] : output ? bindings.ports.outputs : bindings.ports.inputs) ports.emplace_back(local_ports.at(name), target, output);
     }
-    for (const auto & [name, members] : inputs.groups) {
+    for (const auto & [name, members] : bindings.groups) {
         const auto local = group_inputs_.find(name);
         if (local == group_inputs_.end() || local->second.size() != members.size()) throw LayoutMismatch(role_ + " has a different input group: " + name);
-        for (std::size_t index = 0; index < members.size(); ++index) ports.emplace_back(local->second[index], members[index]);
+        for (std::size_t index = 0; index < members.size(); ++index) ports.emplace_back(local->second[index], members[index], false);
     }
 
     // Geometry and aliases select an implementation before any target state changes.
-    for (const auto & [local, target] : ports) {
+    for (const auto & [local, target, output] : ports) {
         const auto & value = graph_.values.at(local);
-        if (value.producer) throw std::invalid_argument("bound input port is produced inside its region");
-        const auto [position, added] = bound_inputs_.values.emplace(local, target);
-        if (!added && position->second != target) throw LayoutMismatch(role_ + " binds one input to different target values");
-        auto & resource = bound_inputs_.resources.at(value.storage);
-        const auto storage = inputs.graph.values.at(target).storage;
+        if (!output && value.producer) throw std::invalid_argument("bound input port is produced inside its region");
+        if (output && value.producer && bindings.graph.values.at(target).producer) throw LayoutMismatch(role_ + " output already has a producer");
+        const auto [position, added] = bound_ports_.values.emplace(local, target);
+        if (!added && position->second != target) throw LayoutMismatch(role_ + " binds one value to different target ports");
+        auto & resource = bound_ports_.resources.at(value.storage);
+        const auto storage = bindings.graph.values.at(target).storage;
         if (resource && *resource != storage) throw LayoutMismatch(role_ + " input aliases differ from the target");
         resource = storage;
 
-        auto & type = bound_inputs_.types.try_emplace(target, inputs.graph.types.at(target)).first->second;
-        bind_type(type, graph_.types.at(local), role_ + " input " + std::to_string(local));
+        auto & type = bound_ports_.types.try_emplace(target, bindings.graph.types.at(target)).first->second;
+        bind_type(type, graph_.types.at(local), role_ + " port " + std::to_string(local));
+    }
+
+    // Only recorded initial state and declared state views may exist without a caller's data producer.
+    for (const auto input : inputs_) {
+        if (bound_ports_.values.contains(input)) continue;
+        const auto storage = graph_.values.at(input).storage;
+        if (graph_.external_resources.contains(storage)) continue;
+        if (std::ranges::find(resource_views_, input) != resource_views_.end() && bound_ports_.resources.at(storage)) continue;
+        throw LayoutMismatch(role_ + " has an unbound input value " + std::to_string(input));
     }
 }
 
 TemplateInstance::TemplateInstance(const TemplateAsset & asset, std::size_t layout, const FixedBindings & bindings, const Invocation & invocation,
-                                   std::string role, std::string phase)
+                                   std::string role, std::string phase, const ExpansionScope * inherited)
     : asset_(asset),
-      layout_(layout),
       role_(std::move(role)),
       phase_(std::move(phase)) {
     graph_.resource_count = asset.layout(layout).resources;
@@ -216,65 +282,25 @@ TemplateInstance::TemplateInstance(const TemplateAsset & asset, std::size_t layo
     expand(layout,
            bindings,
            invocation,
-           {},
+           inherited ? inherited->parameters : Parameters{},
            std::nullopt,
            resources,
            std::vector<std::optional<std::size_t>>(asset.layout(layout).storages.size()),
            {},
-           invocation.sequences,
-           invocation.parameter_scopes);
+           inherited ? inherited->sequences : invocation.sequences,
+           inherited ? inherited->scopes : invocation.parameter_scopes);
 }
 
 std::size_t TemplateInstance::expand_call(const std::string & role, const Invocation & invocation, const Parameters & parameters, std::size_t parent,
-                                          const ValuePorts & ports, const ParameterGroups & sequences, const ScopedParameters & scopes) {
-    for (const auto & selection : asset_.entrypoints()) {
-        if (selection.role != role || (selection.phase && *selection.phase != phase_)) continue;
-        const auto frame = asset_.frame(selection);
-        const auto & layout = asset_.layout(frame.layout);
-        const auto & definition = asset_.definition(layout.definition);
+                                          const ValuePorts & ports, const GroupValues & groups, const ParameterGroups & sequences,
+                                          const ScopedParameters & scopes) {
+    const TargetBindings bindings{ graph_, ports, groups };
+    const ExpansionScope inherited{ parameters, sequences, scopes };
+    auto instance = select(asset_, role, phase_, invocation, bindings, &inherited);
 
-        auto arguments = bind_parameters(parameters, frame.bindings.values, invocation, scopes);
-
-        // A call family may expose different signatures, such as extend and decode allocation.
-        if (layout.ports.inputs.size() != ports.inputs.size()
-            || !std::ranges::all_of(ports.inputs, [&](const auto & port) { return layout.ports.inputs.contains(port.first); })
-            || !std::ranges::all_of(ports.outputs, [&](const auto & port) { return layout.ports.outputs.contains(port.first); }))
-            continue;
-
-        if (!bind_input_parameters(layout, definition, ports.inputs, graph_, arguments)) continue;
-        if (!std::ranges::all_of(definition.guards, [&](const auto & guard) { return (guard.condition.evaluate(arguments) != 0) == guard.expected; })) continue;
-
-        // Named boundaries permit a different implementation without inheriting its source's private slots.
-        std::vector<std::optional<std::size_t>> slots(layout.storages.size());
-        std::vector<std::optional<std::size_t>> bound_resources(layout.resources);
-        for (const auto & [local_ports, target_ports] : {
-                 std::pair{  &layout.ports.inputs,  &ports.inputs },
-                 std::pair{ &layout.ports.outputs, &ports.outputs }
-        }) {
-            for (const auto & [name, target] : *target_ports) {
-                const auto local = local_ports->at(name);
-                if (slots[local] && *slots[local] != target) throw LayoutMismatch("call binds one value to different target ports");
-                slots[local] = target;
-
-                auto & resource = bound_resources.at(layout.storages[local]);
-                const auto storage = graph_.values.at(target).storage;
-                if (resource && *resource != storage) throw LayoutMismatch("call port aliases differ from its selected implementation");
-                resource = storage;
-            }
-        }
-
-        for (const auto input : layout.inputs) {
-            if (!slots[input])
-                throw LayoutMismatch("selected call has an unbound input: " + role + " layout " + std::to_string(frame.layout) + " value "
-                                     + std::to_string(input));
-        }
-
-        std::vector<std::size_t> resources;
-        for (const auto bound : bound_resources) resources.push_back(bound ? *bound : graph_.resource_count++);
-        return expand(frame.layout, frame.bindings, invocation, std::move(arguments), parent, resources, std::move(slots), {}, sequences, scopes);
-    }
-
-    throw LayoutMismatch("no call implementation matches target: " + role);
+    // Nested guards reject a private candidate before the caller's values or execution change.
+    TargetGraph target(asset_, graph_);
+    return target.publish(std::move(instance), parent).region;
 }
 
 void TemplateInstance::require_value(std::size_t identity, const nlohmann::json & specification) {
@@ -302,39 +328,9 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
         if (!added && position->second != source) throw std::invalid_argument("conflicting external resource origins");
     }
 
-    // Collection aggregates belong to this call, even when its caller uses the same parameter names.
-    for (const auto & [group_name, group] : definition.input_groups) {
-        parameters.erase(group.count);
-        for (const auto & [name, _] : group.sums) parameters.erase(name);
-    }
-
     // Target arguments override inherited and session bindings; derived values are computed below.
-    parameters = bind_parameters(std::move(parameters), bindings.values, invocation, scopes);
-
-    for (const auto & [name, _] : invocation.input_groups) {
-        if (!definition.input_groups.contains(name)) throw std::invalid_argument("region has no input group " + name);
-    }
-    for (const auto & [name, group] : definition.input_groups) {
-        if (!invocation.input_groups.contains(name)) {
-            if (!input_groups.contains(name)) throw std::invalid_argument("region requires input group " + name);
-            const auto & values = input_groups.at(name);
-            if (parameters.contains(group.count) && parameters.at(group.count) != static_cast<std::int64_t>(values.size()))
-                throw LayoutMismatch("bound input group has a fixed member count: " + name);
-
-            auto & members = invocation.input_groups[name];
-            for (const auto value : values) {
-                const auto & type = graph_.types.at(value);
-                if (!type.contains("shape")) throw LayoutMismatch("bound input group member needs target geometry: " + name);
-
-                const auto geometry = type.at("shape").get<std::vector<std::int64_t>>();
-                auto inferred = group.infer_member(geometry, parameters);
-                if (!inferred) throw LayoutMismatch("bound input group member does not match its element geometry: " + name);
-                members.push_back(std::move(*inferred));
-            }
-        }
-
-        group.derive(parameters, invocation.input_groups.at(name));
-    }
+    parameters = bind_parameters(std::move(parameters), bindings.values, invocation, scopes, definition);
+    bind_input_groups(definition, input_groups, graph_, parameters, invocation);
 
     for (const auto & guard : definition.guards) {
         if ((guard.condition.evaluate(parameters) != 0) != guard.expected)
@@ -371,8 +367,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
     }
 
     if (!parent) {
-        inputs_ = remap(layout.inputs, values);
-        outputs_ = remap(layout.outputs, values);
+        for (const auto & [view, _] : layout.resource_views) resource_views_.push_back(values.at(view));
     }
 
     for (const auto & contract : layout.input_shapes) {
@@ -384,6 +379,9 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                           { "shape", evaluate_shape(contract.shape, parameters) }
         });
     }
+
+    // Identical state views follow the named tensor's target geometry, including opaque native reads.
+    for (const auto & [view, origin] : layout.resource_views) require_value(values.at(view), graph_.types.at(values.at(origin)));
 
     auto region_inputs = remap(layout.inputs, values);
     for (const auto & [name, group] : definition.input_groups) {
@@ -469,6 +467,7 @@ std::size_t TemplateInstance::expand(std::size_t identity, const FixedBindings &
                                            parameters,
                                            region,
                                            { current, last ? named_ports.outputs : std::map<std::string, std::size_t>{} },
+                                           {},
                                            sequences,
                                            scopes);
 
@@ -546,6 +545,7 @@ void TemplateInstance::expand_operation(std::size_t identity, const TemplateDefi
     }
 
     auto work = prototype.properties;
+    remap_work(work, own_values);
     work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
     work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
     if (prototype.communication) work["communication"] = prototype.communication->instantiate(own_values, parameters, input_groups, bindings.literals);
@@ -618,7 +618,7 @@ void TemplateInstance::expand_child(const CallStep & call, std::size_t child_ind
                 ports.inputs.emplace(mapping->input, source[index]);
 
                 // Select by this member's geometry; empty and resident inputs may take different native branches.
-                const auto produced = expand_call(mapping->family, member, parameters, region, ports, sequences, scopes);
+                const auto produced = expand_call(mapping->family, member, parameters, region, ports, {}, sequences, scopes);
                 outputs.push_back(graph_.regions.at(produced).at("ports").at("outputs").at(mapping->output).get<std::size_t>());
             }
         }
@@ -680,12 +680,12 @@ void TemplateInstance::expand_child(const CallStep & call, std::size_t child_ind
         ValuePorts bound;
         for (const auto & [name, value] : child.ports.inputs) bound.inputs.emplace(name, child_values.at(value).value());
         for (const auto & [name, value] : child.ports.outputs) bound.outputs.emplace(name, child_values.at(value).value());
-        expand_call(*call.family, child_invocation, parameters, region, bound, sequences, scopes);
+        expand_call(*call.family, child_invocation, parameters, region, bound, child_groups, sequences, scopes);
     }
     else {
 
         // Fixed children bind local axes from their ports just like replaceable call families.
-        auto arguments = bind_parameters(parameters, bindings.children.at(child_index).values, child_invocation, scopes);
+        auto arguments = bind_parameters(parameters, bindings.children.at(child_index).values, child_invocation, scopes, asset_.definition(child.definition));
         std::map<std::string, std::size_t> inputs;
         for (const auto & [name, value] : child.ports.inputs) inputs.emplace(name, child_values.at(value).value());
         if (!bind_input_parameters(child, asset_.definition(child.definition), inputs, graph_, arguments))
@@ -702,30 +702,6 @@ void TemplateInstance::expand_child(const CallStep & call, std::size_t child_ind
                sequences,
                scopes);
     }
-}
-
-const std::vector<StateChange> & TemplateInstance::state_changes() const { return graph_.state_changes; }
-const ValuePorts & TemplateInstance::ports() const { return ports_; }
-
-nlohmann::json TemplateInstance::document() {
-    graph_.execution.connect_accesses(graph_.values, graph_.types, graph_.operations);
-    auto result = graph_.document();
-    result["execution"]["resources"] = asset_.execution_resources();
-    result["group_inputs"] = group_inputs_;
-    result.update({
-        {              "environment",                                           asset_.environment() },
-        {                   "layout",                                                        layout_ },
-        {                    "scope",                                      "logical_region_instance" },
-        { "source_physical_coverage",                        asset_.physical_coverage().at("status") },
-        {  "source_runtime_coverage",                         asset_.runtime_coverage().at("status") },
-        { "source_runtime_arguments",  asset_.runtime_coverage().at("native_arguments").at("status") },
-        {                     "role",                                                          role_ },
-        {                    "phase",                                                         phase_ },
-        {                   "inputs",                                                        inputs_ },
-        {                  "outputs",                                                       outputs_ },
-        {                    "ports", { { "inputs", ports_.inputs }, { "outputs", ports_.outputs } } }
-    });
-    return result;
 }
 
 } // namespace markov

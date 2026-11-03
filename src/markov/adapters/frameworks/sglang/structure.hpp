@@ -31,7 +31,6 @@ public:
     GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
     BatchProgram expand(const ServingAction & action, const std::map<std::size_t, std::vector<std::size_t>> & prerequisites);
-    std::vector<std::size_t> idle() override;
     const RegionGraph & graph() const override;
     std::vector<std::size_t> retire() override;
     nlohmann::json summary() const;
@@ -39,15 +38,19 @@ public:
     PageReuse page_reuse() const;
     std::span<const TemplateAsset * const> sources() const;
     TargetRegion transfer(std::size_t rank, std::int64_t bytes, std::int64_t segments);
+    std::size_t transport_event(std::size_t rank, const std::string & role, std::int64_t prompt_tokens);
     void live_state(GraphRoots & roots);
 
 private:
-    struct FlowViews {
-        std::map<std::size_t, std::map<std::string, std::size_t>> inputs;
-        std::map<std::size_t, std::map<std::string, std::size_t>> outputs;
-        std::map<std::size_t, std::map<std::string, std::map<std::string, std::size_t>>> payloads;
-        std::map<std::size_t, std::map<std::string, RankMessage>> messages;
-        std::map<std::size_t, std::size_t> tokens;
+
+    struct RankViews {
+
+        // A present empty column set is still live work; absence means it was consumed.
+        std::optional<std::map<std::string, std::size_t>> inputs;
+        std::optional<std::map<std::string, std::size_t>> outputs;
+        std::map<std::string, std::map<std::string, std::size_t>> payloads;
+        std::map<std::string, RankMessage> messages;
+        std::optional<std::size_t> tokens;
     };
 
     BatchProgram rank_step(const ServingAction & action, std::size_t rank, std::vector<RankWork> & work, bool retain_unfinished = false);
@@ -69,10 +72,9 @@ private:
 
     // Views borrow their rank's builder, so rank objects retain stable addresses.
     std::map<std::size_t, std::unique_ptr<RankStructure>> ranks_;
-    std::map<std::size_t, FlowViews> flows_;
+    std::map<std::size_t, std::map<std::size_t, RankViews>> flows_;
     std::size_t batch_count_ = 0;
     std::size_t action_count_ = 0;
-    std::size_t control_count_ = 0;
     std::size_t operation_count_ = 0;
     std::size_t node_count_ = 0;
     std::size_t dependency_count_ = 0;

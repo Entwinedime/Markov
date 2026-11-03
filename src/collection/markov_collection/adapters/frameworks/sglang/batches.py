@@ -29,11 +29,19 @@ class BatchTensors:
     def phase(batch: Any) -> str:
         if batch.forward_mode.is_mixed():
             return "mixed"
-        return "prefill" if batch.forward_mode.is_extend() else "decode"
+        return "prefill" if batch.forward_mode.is_extend() or batch.forward_mode.is_prebuilt() else "decode"
 
     @staticmethod
     def members(batch: Any) -> list[dict[str, Any]]:
-        lengths = batch.extend_lens if batch.forward_mode.is_extend() else [1] * len(batch.reqs)
+        sequences = batch.seq_lens_cpu.tolist()
+
+        # Prebuilt represents the received prompt, not a one-token Decode model invocation.
+        if batch.forward_mode.is_prebuilt():
+            lengths = sequences
+        elif batch.forward_mode.is_extend():
+            lengths = batch.extend_lens
+        else:
+            lengths = [1] * len(batch.reqs)
         decoding = {request.rid for request in batch.decoding_reqs or ()}
 
         # Prepared columns include each member's actual input, even when cached prefix indices lag behind.
@@ -45,7 +53,7 @@ class BatchTensors:
                 "slot": int(request.req_pool_idx),
                 "phase": "decode" if batch.forward_mode.is_decode() or request.rid in decoding else "prefill",
             }
-            for request, sequence, tokens in zip(batch.reqs, batch.seq_lens_cpu.tolist(), lengths, strict=True)
+            for request, sequence, tokens in zip(batch.reqs, sequences, lengths, strict=True)
         ]
 
     @staticmethod
@@ -88,7 +96,8 @@ class BatchTensors:
 
 class BatchTransitionCall(NativeCall):
     def __init__(
-        self, values: Any, original: Any, batch: Any, other: Any = None, *, fields: dict[str, str] = BatchTensors.fields
+        self, values: Any, original: Any, batch: Any, other: Any = None, *,
+        fields: dict[str, str] = BatchTensors.fields, selection_view: str | None = None
     ) -> None:
         inputs = {f"self.{path}": {0: "before_members"} for path in fields.values()}
         if other is not None:
@@ -101,6 +110,7 @@ class BatchTransitionCall(NativeCall):
             original,
             inputs,
             interface="batch_filter" if other is None else "batch_merge",
+            scope_metadata={"selection_view": selection_view} if selection_view is not None else None,
         )
         self.batch = batch
         self.other = other
@@ -133,6 +143,7 @@ class BatchTransitionCall(NativeCall):
         self, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any, metadata: dict[str, Any]
     ) -> str | None:
         after_members = len(self.batch.reqs)
+        metadata["requests"] = [request.rid for request in self.batch.reqs]
         metadata["entrypoint"] = self.interface
         metadata["entrypoint_phase"] = None
         metadata["required_inputs"] = sorted(self.input_ports)

@@ -1,8 +1,31 @@
 #include "markov/graph/region_graph.hpp"
 
+#include <stdexcept>
 #include <utility>
 
 namespace markov {
+
+std::size_t RegionGraph::owner_region(ExecutionOwner owner) const {
+    return owner.kind == ExecutionOwner::Kind::Region ? owner.identity : operations.at(owner.identity).region;
+}
+
+void RegionGraph::require_bound_execution() const {
+    if (!execution.incoming_waits().empty()) {
+        const auto & wait = execution.incoming_waits().front();
+        const auto & owner = execution.nodes()[wait.target - execution.first_node()].owner;
+        const auto region = owner_region(owner);
+        const auto & scope = regions.at(region);
+        auto root = region;
+        while (!regions[root].at("parent").is_null()) root = regions[root].at("parent").get<std::size_t>();
+        throw std::invalid_argument("execution has unresolved wait: "
+                                    + nlohmann::json{ { "kind", wait.kind }, { "resource", wait.resource }, { "target", wait.target },
+                                                      { "role", regions[root].at("role") },
+                                                      { "operation", owner.kind == ExecutionOwner::Kind::Operation ? nlohmann::json(operations.at(owner.identity).name) : nlohmann::json(nullptr) },
+                                                      { "rank", scope.value("rank", nlohmann::json(nullptr)) },
+                                                      { "batch", scope.value("batch", nlohmann::json(nullptr)) } }.dump());
+    }
+    if (execution.has_unbound_accesses(operations.size())) throw std::invalid_argument("execution has unresolved data access ports");
+}
 
 std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
     std::map<std::size_t, std::size_t> bindings;
@@ -69,8 +92,7 @@ std::vector<std::size_t> RegionGraph::retire(GraphRoots roots) {
         for (auto & value : operation.outputs) value = bindings.at(value);
         kept_operations[new_operation] = std::move(operation);
         kept_work[new_operation] = std::move(work.at(old_operation));
-        remap_arguments(kept_work[new_operation]["arguments"], bindings);
-        remap_arguments(kept_work[new_operation]["keywords"], bindings);
+        remap_work(kept_work[new_operation], bindings);
     }
     for (const auto & [old_value, new_value] : bindings) {
         const auto producer = values[old_value].producer;

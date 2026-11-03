@@ -72,12 +72,20 @@ std::string_view ServingAction::step_name() const {
     switch (step) {
     case ServingStep::Batch:
         return "batch";
+    case ServingStep::Schedule:
+        return "schedule";
     case ServingStep::Select:
         return "select";
     case ServingStep::Retain:
         return "retain";
     case ServingStep::Stage:
         return "stage";
+    case ServingStep::PrepareInputs:
+        return "prepare_inputs";
+    case ServingStep::Allocate:
+        return "allocate";
+    case ServingStep::PrepareOutputs:
+        return "prepare_outputs";
     case ServingStep::Prepare:
         return "prepare";
     case ServingStep::Compute:
@@ -96,6 +104,14 @@ std::string_view ServingAction::step_name() const {
         return "result";
     case ServingStep::Reserve:
         return "reserve";
+    case ServingStep::Advertise:
+        return "advertise";
+    case ServingStep::Handshake:
+        return "handshake";
+    case ServingStep::Notify:
+        return "notify";
+    case ServingStep::Poll:
+        return "poll";
     case ServingStep::Model:
         return "model";
     case ServingStep::Transfer:

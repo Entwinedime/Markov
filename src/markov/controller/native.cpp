@@ -16,7 +16,11 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         auto bindings = nlohmann::json::array();
         for (const auto & participant : instance.participants) {
             groups_.emplace(participant.group,
-                            std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage, instance.role,
+                            std::make_unique<NativeGroup>(requests_,
+                                                          participant.resources,
+                                                          participant.group,
+                                                          participant.stage,
+                                                          instance.role,
                                                           instance.participants.size() > 1));
             instances_.emplace(participant.group, instance.id);
             bindings.push_back({
@@ -55,12 +59,26 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         { "instances",                                         std::move(configuration) },
         {  "workload", { { "requests", std::move(content) }, { "prefixes", prefixes } } }
     });
-    for (;;) {
+
+    // Let the original loops establish empty PP consensus before workload time and graph observation start.
+    std::set<std::string> parked;
+    while (parked.size() != inputs_.size()) {
         const auto call = receive_call();
+        if (call.at("kind") == "waiting") {
+            auto observed = nlohmann::json::array();
+            for (const auto & [name, _] : idle_) observed.push_back(name);
+            throw std::logic_error("native priming stopped: " + nlohmann::json{ { "observed_idle", observed }, { "parked_instances", parked } }.dump());
+        }
         const auto & message = call.at("message");
-        if (message.at("kind") == "ready") break;
-        auto & group = *groups_.at(message.at("group").get<std::string>());
-        reply(call.at("id").get<std::size_t>(), group.resource_call(message, 0));
+        const auto kind = message.at("kind").get<std::string>();
+        if (kind == "ready" || kind == "begin") continue;
+        const auto & name = message.at("group").get_ref<const std::string &>();
+        const auto identity = call.at("id").get<std::size_t>();
+        if (kind == "idle") {
+            if (reach_idle(name, identity, message.at("waiting").get<bool>())) parked.insert(instances_.at(name));
+        }
+        else if (kind == "input") reply(identity, { { "kind", "advance" }, { "now_ns", 0 }, { "arrivals", nlohmann::json::array() } });
+        else reply(identity, groups_.at(name)->resource_call(message, 0));
     }
 }
 
@@ -78,6 +96,31 @@ void NativeController::reply(std::size_t call, const nlohmann::json & result) {
     });
 }
 
+bool NativeController::reach_idle(const std::string & group, std::size_t call, bool waiting) {
+    idle_.insert_or_assign(group, std::nullopt);
+    if (!waiting) return false;
+    const auto & instance = instances_.at(group);
+    const bool settled = std::ranges::all_of(instances_, [&](const auto & entry) {
+        return entry.second != instance || idle_.contains(entry.first);
+    });
+
+    // Ingress must keep empty control turns moving until every downstream stage has reached idle.
+    if (settled) idle_.at(group) = call;
+    else reply(call, nullptr);
+    return settled;
+}
+
+void NativeController::release_idle(const std::string & instance) {
+    for (auto group = idle_.begin(); group != idle_.end();) {
+        if (instances_.at(group->first) != instance) {
+            ++group;
+            continue;
+        }
+        if (group->second) reply(*group->second, nullptr);
+        group = idle_.erase(group);
+    }
+}
+
 std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const GroupAdmission &) {
     while (!done()) {
         if (transfer_) {
@@ -90,16 +133,25 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             peer_.send({
                 { "kind", "shutdown" }
             });
-            for (auto & [_, input] : inputs_) input.call.reset();
+            for (auto & [instance, input] : inputs_) {
+                release_idle(instance);
+                input.call.reset();
+            }
             shutdown_ = true;
         }
         for (auto & [instance, input] : inputs_) {
-            if (!input.call) continue;
             const bool arrived = input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns;
+            const bool drained = std::ranges::all_of(groups_, [&](const auto & entry) {
+                return instances_.at(entry.first) != instance || entry.second->caught_up(input.arrived);
+            });
+
+            // Idle waits belong to the original loop; arrivals or unfinished peers release that instance together.
+            if (!shutdown_ && (arrived || !drained)) release_idle(instance);
+            if (!input.call) continue;
 
             // Empty rounds can carry downstream control messages; only the whole instance can be idle.
-            const bool idle = std::ranges::all_of(groups_, [&](const auto & entry) {
-                return instances_.at(entry.first) != instance || (entry.second->caught_up(input.arrived) && idle_.contains(entry.first));
+            const bool idle = drained && std::ranges::all_of(groups_, [&](const auto & entry) {
+                return instances_.at(entry.first) != instance || idle_.contains(entry.first);
             });
 
             // With no graph work in flight, native PP consensus still needs empty receive rounds.
@@ -107,11 +159,6 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             if (arrived || (!idle && (!input.sequence || *input.sequence != sequence_ || !executing))) {
                 auto arrivals = nlohmann::json::array();
                 while (input.arrived < requests_.size() && requests_[input.arrived].arrival_ns <= now_ns) { arrivals.push_back(input.arrived++); }
-                if (arrived) {
-                    for (const auto & [group, owner] : instances_) {
-                        if (owner == instance) idle_.erase(group);
-                    }
-                }
                 reply(*input.call,
                       {
                           {     "kind",           "advance" },
@@ -144,17 +191,17 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             continue;
         }
         if (kind == "idle") {
-            idle_.insert(name);
+            reach_idle(name, identity, message.at("waiting").get<bool>());
             continue;
         }
-        if (kind.starts_with("transfer_") && kind != "transfer_submit") {
-            reply(identity, transfer_->call(message));
-            if (kind != "transfer_poll") ++sequence_;
+        if (kind == "transfer_poll") {
+            reply(identity, transfer_->poll(message));
             continue;
         }
         if (auto action = group.plan(message, now_ns, input.arrived)) {
             if (kind == "transfer_submit") transfer_->submit(*action, message.at("payload"));
-            idle_.erase(name);
+
+            // An idle observation remains valid until new arrivals; empty coordination is not new request work.
             running_calls_.emplace(action->task, identity);
             return action;
         }
@@ -164,21 +211,23 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
 }
 
 void NativeController::start(const ServingAction & action) {
-    if (action.step != ServingStep::Transfer) groups_.at(action.task.group)->start(action);
+    if (!action.detached()) groups_.at(action.task.group)->start(action);
+    if (transfer_) transfer_->start(action);
     ++sequence_;
 }
 
 void NativeController::finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) {
     if (transfer_) transfer_->finish(action);
     ++sequence_;
-    if (action.step == ServingStep::Transfer) return;
+    if (action.detached()) return;
     auto & group = *groups_.at(action.task.group);
     group.finish(action, program.returned_pages);
-    reply(running_calls_.at(action.task),
-          {
-              { "completed_ns",   completed_ns },
-              {       "values", program.values }
-    });
+    nlohmann::json result{
+        { "completed_ns",   completed_ns },
+        {       "values", program.values }
+    };
+    if (action.step == ServingStep::Allocate) result["bindings"] = group.allocation_bindings(action.batch_work().batch);
+    reply(running_calls_.at(action.task), result);
     running_calls_.erase(action.task);
 }
 

@@ -6,7 +6,7 @@
 
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/control.hpp"
-#include "markov/execution/executor.hpp"
+#include "markov/execution/feedback.hpp"
 #include "markov/resources/trace.hpp"
 #include "markov/templates/batch_expansion.hpp"
 
@@ -15,7 +15,7 @@ namespace markov {
 // Assemble graph effects before committing their corresponding controller state changes.
 class ServingWorkflow {
 public:
-    ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, const NodeDurations & durations, ResourceTrace * trace = nullptr);
+    ServingWorkflow(ServingControl & controller, BatchExpansion & expansion, ExecutionFeedback & execution, ResourceTrace * trace = nullptr);
 
     nlohmann::json run(bool details);
 
@@ -27,7 +27,7 @@ private:
     // The caller owns the chosen control implementation for the entire workflow.
     ServingControl & controller_;
     BatchExpansion & expansion_;
-    Executor executor_;
+    ExecutionFeedback & executor_;
     ResourceTrace * trace_;
 };
 

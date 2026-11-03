@@ -11,7 +11,7 @@ from markov_collection.artifacts import write_json
 
 
 class DisaggregationObservation:
-    def __init__(self, serving: Any, role: str) -> None:
+    def __init__(self, serving: Any, role: str, description: dict[str, Any]) -> None:
         from torch.utils.weak import WeakIdKeyDictionary
 
         from markov_collection.adapters.runtimes.ascend.transfer import MemfabricObservation
@@ -22,8 +22,47 @@ class DisaggregationObservation:
         self.operators = serving.operators
         self.values = self.operators.values
         self.rooms: dict[int, dict[str, Any]] = {}
+        self.inputs = {
+            room: {"request": identity, "room": room, "parameters": {"B": 1, "M": request["prompt_tokens"]}}
+            for room, identity, request in zip(
+                description["source_bootstrap_rooms"], description["source_requests"],
+                description["content"]["requests"], strict=True,
+            )
+        }
         self.transfers: Any = WeakIdKeyDictionary()
         self.transport = MemfabricObservation(self.recording)
+
+    def advertise(
+        self, original: Any, receiver: Any, kv_indices: Any, aux_index=None, state_indices=None, decode_prefix_len=None,
+    ) -> Any:
+        metadata = self.inputs.get(receiver.bootstrap_room) if self.serving.selected else None
+        if metadata is None:
+            return original(receiver, kv_indices, aux_index, state_indices, decode_prefix_len)
+        with self.recording.scope(
+            "KvAdvertise", **metadata, lane=self.serving.batch_lane, entrypoint="kv_advertise", entrypoint_phase=None,
+            ports={"inputs": {}, "outputs": {}},
+        ) as scope:
+            scope.metadata["parameters"] = {**metadata["parameters"], "metadata_slot": int(aux_index)}
+            return original(receiver, kv_indices, aux_index, state_indices, decode_prefix_len)
+
+    def status(self, original: Any, manager: Any, bootstrap_room: int, status: int) -> Any:
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        metadata = self.inputs.get(bootstrap_room) if self.serving.selected else None
+        connecting = self.role == "prefill" and status == KVPoll.WaitingForInput
+        if metadata is None or not (connecting or status == KVPoll.Success):
+            return original(manager, bootstrap_room, status)
+        previous = manager.request_status.get(bootstrap_room)
+        if previous is not None and previous >= status:
+            return original(manager, bootstrap_room, status)
+
+        # Observe real endpoint transitions, not repeated writes or the first successful scheduler poll.
+        with self.recording.scope(
+            "KvReady" if connecting else "KvComplete", **metadata,
+            entrypoint="kv_ready" if connecting else "kv_complete", entrypoint_phase=None,
+            ports={"inputs": {}, "outputs": {}},
+        ):
+            return original(manager, bootstrap_room, status)
 
     def registration(self, original: Any, queue: Any) -> Any:
         manager = original(queue)
@@ -64,6 +103,8 @@ class DisaggregationObservation:
             self.serving.directory / f"transport-rank-{self.serving.parallel['rank']}.json",
             {
                 "session": manager.engine.get_session_id(),
+                "rank": self.serving.parallel["rank"],
+                "kv_layout": self.serving.parallel["kv_layout"],
                 "kv_addresses": list(manager.kv_args.kv_data_ptrs),
                 "kv_bytes": list(manager.kv_args.kv_data_lens),
                 "metadata_addresses": list(manager.kv_args.aux_data_ptrs),
@@ -72,20 +113,37 @@ class DisaggregationObservation:
         )
         return manager
 
-    def poll_readiness(self, original: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.recording.current_scope.get() is None:
-            return original(*args, **kwargs)
+    def poll_readiness(self, original: Any, pollers: Any) -> Any:
+        if (
+            not self.serving.selected or not pollers
+            or any(poller.bootstrap_room not in self.inputs for poller in pollers)
+        ):
+            return original(pollers)
 
-        # Native status consensus selects requests; the target controller owns that decision.
-        with self.recording.scope("ReadinessPoll", control_only=True, path=original.__qualname__):
-            return original(*args, **kwargs)
+        # This native helper only samples local states; TP/PP consensus and request selection stay outside it.
+        with self.recording.scope(
+            "KvPoll", requests=[self.inputs[poller.bootstrap_room]["request"] for poller in pollers],
+            lane=self.serving.batch_lane, entrypoint="kv_poll", entrypoint_phase=None,
+            ports={"inputs": {}, "outputs": {}}, parameters={"B": len(pollers)},
+        ) as scope:
+            result = original(pollers)
+            scope.metadata["statuses"] = result.copy()
+            return result
 
-    @staticmethod
-    def request_metadata(request: Any, pool: Any) -> dict[str, Any]:
+    def request_metadata(self, request: Any, pool: Any) -> dict[str, Any]:
         prompt = len(request.origin_input_ids)
+        lane = self.serving.batch_lane
+        parent = self.recording.current_scope.get()
+        while parent is not None:
+            region = self.recording.regions[parent]
+            if "batch" in region["metadata"]:
+                lane = self.recording.batches[region["metadata"]["batch"]]["lane"]
+                break
+            parent = region["parent"]
         return {
             "request": request.rid,
             "room": request.bootstrap_room,
+            "lane": lane,
             "parameters": {
                 "B": 1,
                 "M": prompt,
@@ -229,6 +287,8 @@ class DisaggregationObservation:
         # PP can send the previous chunk outside both scheduling and result processing.
         observation = self.operators if self.recording.current_scope.get() is None else nullcontext()
         with observation, self.recording.scope("KvSend", **metadata) as scope:
+            metadata["send_region"] = scope.identity
+            scope.metadata["send_region"] = scope.identity
             self.bind_metadata(scheduler.disagg_metadata_buffers, scope.metadata)
 
             with self.values.metadata():
@@ -273,6 +333,10 @@ class DisaggregationObservation:
             self.transfers[indices] = metadata
             scope = self.recording.regions[self.recording.current_scope.get()]["metadata"]
             scope["source_pages"] = indices.tolist()
+
+            # Publish intent before the native queue call; its worker may finish before the caller returns.
+            with self.recording.scope("KvSubmit"):
+                pass
         return original(manager, room, indices, *args, **kwargs)
 
     def transfer(
@@ -291,7 +355,8 @@ class DisaggregationObservation:
             return original(session, source, destination_buffers, destination, *args)
 
         with self.recording.scope(
-            "KvTransfer", **metadata, source_pages=source.tolist(), destination_pages=destination.tolist()
+            "KvTransfer", **metadata, source_pages=source.tolist(), destination_pages=destination.tolist(),
+            destination_session=session,
         ) as scope:
             result = original(session, source, destination_buffers, destination, *args)
             scope.metadata["status"] = result
@@ -307,17 +372,25 @@ class DisaggregationObservation:
             **metadata,
             destination_session=request.mooncake_session_id,
             destination_metadata_slot=request.dst_aux_index,
-        ):
-            return original(manager, request, *args, **kwargs)
+        ) as scope:
+            result = original(manager, request, *args, **kwargs)
+            scope.metadata["status"] = result
+            return result
 
-    def release(self, original: Any, cache: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        if not self.serving.selected:
-            return original(cache, request, *args, **kwargs)
+    def release(self, original: Any, request: Any, cache: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.serving.selected or request.rid not in self.serving.requests:
+            return original(request, cache, *args, **kwargs)
+
+        metadata = self.request_metadata(request, cache.req_to_token_pool)
+        metadata["parameters"]["resident_tokens"] = request._cache_commit_len()
+        observation = self.operators if self.recording.current_scope.get() is None else nullcontext()
         with (
-            self.recording.scope("KvReleased", **self.request_metadata(request, cache.req_to_token_pool)),
-            self.operators,
+            self.recording.scope("KvReleased", **metadata),
+            observation,
         ):
-            return self.serving.request_cache(original, cache, request, *args, **kwargs)
+
+            # The native helper owns cache release, tail trimming and slot release as one operation.
+            return original(request, cache, *args, **kwargs)
 
     def submit(self, original: Any, executor: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
         scope = self.recording.current_scope.get()
@@ -331,7 +404,10 @@ class DisaggregationObservation:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         targets = {
-            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group": self.poll_readiness,
+            "sglang.srt.disaggregation.common.conn.CommonKVManager.update_status": self.status,
+            "sglang.srt.disaggregation.mooncake.conn.MooncakeKVReceiver.send_metadata": self.advertise,
+            "sglang.srt.mem_cache.common.release_kv_cache": self.release,
+            "sglang.srt.disaggregation.utils._poll_with_failure_injection": self.poll_readiness,
             "concurrent.futures.ThreadPoolExecutor.submit": self.submit,
             "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager": self.registration,
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._init_kv_manager": self.registration,

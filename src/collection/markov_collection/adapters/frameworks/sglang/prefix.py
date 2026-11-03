@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import torch
@@ -133,28 +134,28 @@ class PrefixServiceCall(NativeCall):
             entrypoint="cache_" + self.original.__name__.lstrip("_"), entrypoint_phase=None, dynamic_calls=True
         )
 
+        # Match parameters carry the request when this lookup belongs to admission rather than a tree-only query.
+        if self.original.__name__ == "match_prefix":
+            params = inspect.signature(self.original).bind(*args, **kwargs).arguments["params"]
+            if params.req is not None:
+                metadata["requests"] = [params.req.rid]
+
         # Only actual tensor work becomes reusable children; private tree traversal stays in CPU service.
         with CacheIndexObservation(self.values), ConcatenationObservation(self.values):
             return super().invoke(*args, **kwargs)
+
+    def completed(self, args: tuple, kwargs: dict, result: Any, metadata: dict) -> None:
+        if self.original.__name__ == "cache_unfinished_req":
+
+            # The native service publishes the retained prefix length; do not infer it from tensor-call counts.
+            request = inspect.signature(self.original).bind(*args, **kwargs).arguments["req"]
+            metadata["retained_tokens"] = len(request.prefix_indices)
 
 
 class PrefixObservation:
     def __init__(self, values: Any, empty_match: Any) -> None:
         self.values = values
         self.empty_match = empty_match
-
-    @staticmethod
-    def declare(regions: list[dict], values: list[dict]) -> None:
-        for region in regions:
-            metadata = region["metadata"]
-            if metadata.get("entrypoint") != "cache_match_prefix":
-                continue
-
-            # MatchResult is a native tuple: the first field is the actual returned index tensor, including misses.
-            metadata["ports"] = {"inputs": {}, "outputs": {"prefix_indices": metadata["result"][0]["value"]}}
-            if values[metadata["result"][0]["value"]]["shape"] == [0]:
-                metadata["entrypoint"] = "cache_empty"
-                metadata.pop("dynamic_calls", None)
 
     def service(self, original: Any, cache: Any, *args: Any, **kwargs: Any) -> Any:
 

@@ -1,9 +1,10 @@
-"""Expose the native allocator's prefix and ordered cold-Prefill members."""
+"""Expose native page allocation through its existing tail, full pages and new tail."""
 
 from __future__ import annotations
 
 import inspect
 from contextlib import contextmanager, nullcontext
+from itertools import accumulate, product
 from typing import Any
 
 import torch
@@ -14,10 +15,11 @@ from markov_collection.instrumentation.loops import NativeLoop
 
 
 class AllocationViews(TorchFunctionMode):
-    def __init__(self, values: Any, buffers: dict[str, torch.Tensor]) -> None:
+    def __init__(self, values: Any, buffers: dict[str, torch.Tensor], frame: Any) -> None:
         super().__init__()
         self.values = values
         self.buffers = {id(value): name for name, value in buffers.items()}
+        self.frame = frame
         self.scope = values.recording.current_scope.get()
 
     def __torch_function__(self, function: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
@@ -30,14 +32,15 @@ class AllocationViews(TorchFunctionMode):
 
         symbols = self.values.shapes
 
-        # Cold-prefix page offsets come from the native allocator's equations, not fitted observed integers.
+        # Offsets follow the native loop; equal observed scalar values never identify a slice's meaning.
         if isinstance(args[1], int):
             geometry, start = (), symbols.symbol("member_index")
         elif name == "free_pages":
             geometry = (symbols.symbol("full_pages"),) if isinstance(args[1], slice) else ()
             start = symbols.symbol("page_offset") + (0 if geometry else symbols.symbol("full_pages"))
         elif name == "pos_in_page":
-            geometry, start = (symbols.symbol("tail_tokens"),), 0
+            part = "head_tokens" if args[1].stop is self.frame.f_locals["num1"] else "tail_tokens"
+            geometry, start = (symbols.symbol(part),), 0
         else:
             return function(*args, **kwargs)
 
@@ -63,6 +66,12 @@ class AllocationLoop(NativeLoop):
         self.lengths = lengths
         self.contexts = contexts
         self.page_size = page_size
+        pages = (
+            (context + length + page_size - 1) // page_size - (context + page_size - 1) // page_size
+            for length, context in zip(lengths, contexts, strict=True)
+        )
+        self.page_offsets = tuple(accumulate(pages, initial=0))
+        self.token_offsets = tuple(accumulate(lengths, initial=0))
 
     @contextmanager
     def sequence(self, frame: Any) -> Any:
@@ -91,31 +100,40 @@ class AllocationLoop(NativeLoop):
             inputs = self.buffers
             index = frame.f_locals["i"]
             tokens = self.lengths[index]
+            context = self.contexts[index]
+            head = min(tokens, -context % self.page_size)
+            remaining = tokens - head
             parameters = {
                 "member_index": index,
                 "new_tokens": tokens,
-                "context_tokens": self.contexts[index],
-                "full_pages": tokens // self.page_size,
-                "tail_tokens": tokens % self.page_size,
-                "page_offset": sum((length - 1) // self.page_size + 1 for length in self.lengths[:index]),
-                "token_offset": sum(self.lengths[:index]),
+                "context_tokens": context,
+                "head_tokens": head,
+                "remaining_tokens": remaining,
+                "full_pages": remaining // self.page_size,
+                "tail_tokens": remaining % self.page_size,
+                "page_offset": self.page_offsets[index],
+                "token_offset": self.token_offsets[index],
             }
             metadata.update(
                 parameters=parameters,
                 bindings={"page_size": self.page_size},
                 derived_parameters=[
-                    {"name": "full_pages", "expression": ["floor_div", "new_tokens", "page_size"]},
-                    {"name": "tail_tokens", "expression": ["mod", "new_tokens", "page_size"]},
+                    {
+                        "name": "head_tokens",
+                        "expression": ["min", "new_tokens", ["mod", ["mul", -1, "context_tokens"], "page_size"]],
+                    },
+                    {"name": "remaining_tokens", "expression": ["add", "new_tokens", ["mul", -1, "head_tokens"]]},
+                    {"name": "full_pages", "expression": ["floor_div", "remaining_tokens", "page_size"]},
+                    {"name": "tail_tokens", "expression": ["mod", "remaining_tokens", "page_size"]},
                 ],
-                guards=[{"condition": ["eq", "context_tokens", 0], "expected": True}]
-                + [
+                guards=[
                     {"condition": ["eq", name, 0], "expected": parameters[name] == 0}
-                    for name in ("full_pages", "tail_tokens")
+                    for name in ("head_tokens", "full_pages", "tail_tokens")
                 ],
             )
         metadata["ports"] = {"inputs": self.values.port_values(inputs), "outputs": {}}
         with self.recording.scope("AllocationPart", **metadata) as scope:
-            views = AllocationViews(self.values, self.buffers) if kind == "member" else nullcontext()
+            views = AllocationViews(self.values, self.buffers, frame) if kind == "member" else nullcontext()
             with views:
                 yield
             with self.values.metadata():
@@ -144,32 +162,64 @@ class SGLangAllocation:
         self.warmed = False
         self.captured = False
 
-    def points(self) -> tuple[tuple[int, ...], ...]:
+    def points(self) -> list[tuple[tuple[int, ...], tuple[int, ...], int | None]]:
         from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall
 
         page = self.page_size
         boundary = PageAllocationCall.parallel_page_limit
-        return (
-            (page - 1, boundary * page, 2 * page + 1),
-            (page + 1, boundary // 2 * page, page - 1, boundary // 2 * page, 2 * page),
-        )
+        ready = (None, 0, 1) if self.need_sort else (None,)
+        points = [((boundary * page,), (0,), count) for count in ready]
+        if torch.device(self.device).type == "npu":
+            points[:0] = [((page + 1,), (0,), count) for count in ready]
 
-    def execute(self, lengths: tuple[int, ...], observed: bool | None) -> torch.Tensor:
+        # Each segment is absent, singleton or non-singleton; one batch covers this finite native basis.
+        fragments = sorted({extent for extent in (0, 1, page - 1) if extent < page})
+        members = [
+            (head + full * page + tail, page - head if head else 0)
+            for head, full, tail in product(fragments, (0, 1, 2), fragments)
+            if head or full or tail
+        ]
+        lengths, contexts = zip(*members, strict=True)
+
+        # The final member selects the native large-allocation implementation independently of the basis size.
+        points.append(((*lengths, boundary * page), (*contexts, 0), None))
+        return points
+
+    def execute(
+        self, lengths: tuple[int, ...], contexts: tuple[int, ...], ready_pages: int | None, observed: bool | None
+    ) -> torch.Tensor:
         from markov_collection.adapters.frameworks.sglang.state import PageAllocationCall
 
         values = self.operators.values
         with values.auxiliary():
-            pages = sum((tokens - 1) // self.page_size + 1 for tokens in lengths)
+            sequences = tuple(context + length for context, length in zip(contexts, lengths, strict=True))
+            prefix_pages = tuple((context + self.page_size - 1) // self.page_size for context in contexts)
+            total_pages = sum((tokens + self.page_size - 1) // self.page_size for tokens in sequences)
+            pages = total_pages - sum(prefix_pages)
             pool = self.pool_type(
-                pages * self.page_size, self.page_size, torch.bfloat16, self.device, None, self.need_sort
+                total_pages * self.page_size, self.page_size, torch.bfloat16, self.device, None, self.need_sort
             )
+            last = torch.full((len(lengths),), -1, dtype=torch.int64, device=self.device)
+            if any(prefix_pages):
+
+                # Allocate real prefix pages so the native tail path reads a valid last location.
+                prefix_indices = pool.alloc(sum(prefix_pages) * self.page_size)
+                offset = 0
+                for index, (context, count) in enumerate(zip(contexts, prefix_pages, strict=True)):
+                    if context:
+                        last[index] = prefix_indices[offset * self.page_size + context - 1]
+                    offset += count
+
+            # Exercise merging through the actual allocator, preserving its page-count read before the merge.
+            if ready_pages is not None:
+                allocated = pool.alloc((pages - ready_pages) * self.page_size)
+                pool.free(allocated)
 
             # SGLang alloc_for_extend supplies int64 length vectors; no model or request state is recreated.
-            prefix_cpu = torch.zeros(len(lengths), dtype=torch.int64)
-            lengths_cpu = torch.tensor(lengths, dtype=torch.int64)
-            prefix, sequences = prefix_cpu.to(self.device), lengths_cpu.to(self.device)
-            last = torch.full((len(lengths),), -1, dtype=torch.int64, device=self.device)
-        arguments = (pool, prefix, prefix_cpu, sequences, lengths_cpu, last, sum(lengths))
+            prefix_cpu = torch.tensor(contexts, dtype=torch.int64)
+            sequences_cpu = torch.tensor(sequences, dtype=torch.int64)
+            prefix, sequences_device = prefix_cpu.to(self.device), sequences_cpu.to(self.device)
+        arguments = (pool, prefix, prefix_cpu, sequences_device, sequences_cpu, last, sum(lengths))
         if observed is None:
             return self.original(*arguments)
 
@@ -183,10 +233,8 @@ class SGLangAllocation:
     def warmup(self) -> None:
         if self.warmed:
             return
-        for point in self.points():
-            self.execute(point, None)
-        if self.need_sort:
-            self.merge(None)
+        for lengths, contexts, ready in self.points():
+            self.execute(lengths, contexts, ready, None)
         if torch.device(self.device).type == "npu":
             torch.npu.synchronize()
         self.warmed = True
@@ -194,39 +242,13 @@ class SGLangAllocation:
     def capture(self) -> None:
         if self.captured:
             return
-        for point in self.points():
-            baseline = self.execute(point, False)
-            observed = self.execute(point, True)
+        for lengths, contexts, ready in self.points():
+            baseline = self.execute(lengths, contexts, ready, False)
+            observed = self.execute(lengths, contexts, ready, True)
             with self.operators.values.auxiliary():
                 if not torch.equal(baseline, observed):
                     raise RuntimeError("allocator observation changed native output")
-        if self.need_sort:
-            baseline = self.merge(False)
-            observed = self.merge(True)
-            with self.operators.values.auxiliary():
-                if not all(torch.equal(left, right) for left, right in zip(baseline, observed, strict=True)):
-                    raise RuntimeError("allocator merge observation changed native output")
         self.captured = True
-
-    def merge(self, observed: bool | None) -> tuple[torch.Tensor, torch.Tensor]:
-        from markov_collection.adapters.frameworks.sglang.state import PageMergeCall
-
-        values = self.operators.values
-        with values.auxiliary():
-            pool = self.pool_type(4 * self.page_size, self.page_size, torch.bfloat16, self.device, None, True)
-            allocated = pool.alloc(2 * self.page_size)
-            pool.free(allocated)
-        original = inspect.unwrap(type(pool).merge_and_sort_free)
-        if observed is None:
-            original(pool)
-            return pool.free_pages, pool.release_pages
-
-        with self.operators.prototype("AllocationPrototype", observed, phase="control"):
-            if observed:
-                PageMergeCall(values, original, pool)(pool)
-            else:
-                original(pool)
-        return pool.free_pages, pool.release_pages
 
     @staticmethod
     def declare(regions: list[dict], operations: list[dict], values: list[dict]) -> None:
@@ -247,6 +269,14 @@ class SGLangAllocation:
 
             if metadata.get("entrypoint") != "allocation_member":
                 continue
+
+            # A member consumes the current pool, independently of whether its caller first merged deferred pages.
+            pool = metadata["ports"]["inputs"]["free_pages"]
+            metadata["parameters"]["allocation_pool_pages"] = values[pool]["shape"][0]
+            contracts = {item["value"]: item["shape"] for item in metadata.get("shape_contracts", [])}
+            contracts[pool] = ["allocation_pool_pages"]
+            metadata["shape_contracts"] = [{"value": value, "shape": shape} for value, shape in contracts.items()]
+
             written: Any = 0
             for identity in indexed.children[member["id"]]:
                 metadata = regions[identity]["metadata"]

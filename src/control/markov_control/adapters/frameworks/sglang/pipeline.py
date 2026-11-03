@@ -12,13 +12,16 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 
 class PipelineWork:
-    def __init__(self, peer, work, channel) -> None:
+    def __init__(self, peer, message, work=None, channel="") -> None:
         self.peer = peer
+        self.message = message
         self.work = work
         self.channel = channel
 
     def wait(self):
-        self.peer.call("wait", **self.work, channel=self.channel)
+        if self.work is not None:
+            self.peer.call("wait", **self.work, channel=self.channel)
+        self.peer.exchange("wait_object", {"identity": self.message})
         if self.channel == "output":
 
             # The output-ring send is this stage's last transport use, even if its result was processed earlier.
@@ -37,12 +40,23 @@ class PipelineScheduler(NativeScheduler):
     def current_lane(self):
         return next(index for index, batch in enumerate(self.running_mbs) if batch is self.running_batch)
 
+    @property
+    def observing(self):
+
+        # Logical idle does not retire the final model message's native send handles.
+        return super().observing or bool(self.send_proxy_work or self.send_output_work)
+
     def transfer_requests(self, data, rank, group, src, dst, async_send=False):
         message = {"source": src, "target": dst, "channel": "requests"}
         if rank == src:
-            self.peer.exchange("send_object", {**message, "value": data})
-            return []
-        return self.peer.exchange("receive_object", message)
+            identity = self.peer.exchange("send_object", {**message, "value": data})
+            work = PipelineWork(self.peer, identity)
+            if async_send:
+                return [P2PWork(work, None)]
+            work.wait()
+        elif rank == dst:
+            return self.peer.exchange("receive_object", message)
+        return []
 
     def _pp_recv_pyobj_from_prev_stage(self):
         message = super()._pp_recv_pyobj_from_prev_stage()
@@ -102,7 +116,7 @@ class PipelineScheduler(NativeScheduler):
                 for name, value in tensors.items()
             },
         }
-        self.peer.exchange(
+        identity = self.peer.exchange(
             "send_object",
             {
                 "source": self.control_rank,
@@ -111,7 +125,7 @@ class PipelineScheduler(NativeScheduler):
                 "value": packet,
             },
         )
-        return [P2PWork(PipelineWork(self.peer, work, channel), None)]
+        return [P2PWork(PipelineWork(self.peer, identity, work, channel), None)]
 
     def receive_tensors(self, all_gather_group=None):
         packet = self.peer.exchange(

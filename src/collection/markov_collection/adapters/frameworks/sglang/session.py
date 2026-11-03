@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from markov_workload import WorkloadContent
-
+from markov_collection.adapters.frameworks.sglang.submissions import EngineSubmissions
+from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
 from markov_collection.artifacts import write_json
 
 
@@ -57,16 +57,14 @@ class NativeServingSession:
         self.observe_all_workers = observe_all_workers
         self.serving_input = serving_input
         self.submissions = [list(range(len(requests)))] if submissions is None else submissions
-        if not all(self.submissions) or sorted(index for group in self.submissions for index in group) != list(
-            range(len(requests))
-        ):
-            raise ValueError("native submissions must contain every request exactly once")
         if (
             serving_input is not None
             and tuple((request["prompt_tokens"], request["output_tokens"]) for request in serving_input["requests"])
             != requests
         ):
             raise ValueError("injected workload must describe the submitted native requests")
+        self.inputs = EngineSubmissions(self.content_input(requests, serving_input), self.submissions)
+        self.deliveries: dict[str, Any] = {}
 
     @staticmethod
     def source_roles(tp: int, pp: int, rank: int, ep: int = 1) -> range:
@@ -98,53 +96,22 @@ class NativeServingSession:
         initial[2] = (page_size, initial[2][1])
         return (*initial, (tail[0], 3))
 
-    @staticmethod
-    def check_responses(
-        responses: Iterable[dict[str, Any]], expected: dict[str, int], tokens: dict[str, int] | None = None
-    ) -> None:
-        completed = set()
-        for response in responses:
-            metadata = response["meta_info"]
-            identity = metadata["id"]
-            if tokens is not None and any(token != tokens[identity] for token in response["output_ids"]):
-                raise RuntimeError(f"native request {identity} did not preserve its declared synthetic output")
-            reason = metadata["finish_reason"]
-            if reason is None:
-                continue
-
-            if reason["type"] != "length" or metadata["completion_tokens"] != expected[identity]:
-                raise RuntimeError(f"native request {identity} did not finish its fixed output: {reason}")
-            completed.add(identity)
-
-        if completed != expected.keys():
-            raise RuntimeError(f"native stream ended before requests completed: {sorted(expected.keys() - completed)}")
-
     def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
-        print(f"markov: native {prefix}begin", flush=True)
-        source = self.content_input(requests, self.serving_input if prefix != "warmup/" else None)
-        content = WorkloadContent(source["requests"], source["prefixes"])
-        content.check_vocabulary(engine.tokenizer_manager.model_config.vocab_size)
-        groups = [list(range(len(requests)))] if prefix == "warmup/" else self.submissions
-        for indices in groups:
+        print(f"markov: native {prefix} begin", flush=True)
+        inputs = (
+            EngineSubmissions(self.content_input(requests), [list(range(len(requests)))])
+            if prefix == "warmup"
+            else self.inputs
+        )
+        inputs.content.check_vocabulary(engine.tokenizer_manager.model_config.vocab_size)
+        try:
+            engine.loop.run_until_complete(inputs.run(engine, prefix))
+        finally:
 
-            # Grouped discovery keeps the same content IDs and native cache across submissions.
-            response = engine.generate(
-                input_ids=[content.prompt(source["requests"][index]["id"]) for index in indices],
-                sampling_params=[
-                    {"max_new_tokens": requests[index][1], "temperature": 0, "ignore_eos": True} for index in indices
-                ],
-                rid=[f"{prefix}{index}" for index in indices],
-                stream=True,
-            )
-
-            # HTTP success and a closed stream can still contain aborted native requests.
-            tokens = (
-                None
-                if prefix == "warmup/"
-                else {f"{prefix}{index}": content.output_token(source["requests"][index]["id"]) for index in indices}
-            )
-            self.check_responses(response, {f"{prefix}{index}": requests[index][1] for index in indices}, tokens)
-        print(f"markov: native {prefix}complete", flush=True)
+            # Actual submission delay is evidence; it never rewrites the declared workload.
+            self.deliveries[prefix] = inputs.delivery
+            write_json(self.output / "request-delivery.json", self.deliveries, indent=2)
+        print(f"markov: native {prefix} complete", flush=True)
 
     @staticmethod
     def content_input(requests, source=None) -> dict:
@@ -152,27 +119,20 @@ class NativeServingSession:
             "requests": source["requests"]
             if source is not None
             else [
-                {"id": str(index), "prompt_tokens": prompt, "output_tokens": output}
+                {"id": str(index), "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
                 for index, (prompt, output) in enumerate(requests)
             ],
             "prefixes": source.get("prefixes", []) if source is not None else [],
         }
 
-    @staticmethod
-    def reset(engine: object) -> None:
+    def reset(self, engine: object, phase: str) -> None:
         print("markov: native pool reset begin", flush=True)
+        ObservationWindow.request_drain(self.output, phase)
         response = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
         if not response.success:
             raise RuntimeError(f"native idle/cache reset failed: {response.message}")
+        ObservationWindow.wait(self.output, self.roles, phase, "complete")
         print("markov: native pool reset complete", flush=True)
-
-    def wait_for_sources(self) -> None:
-        sources = [self.output / f"rank-{rank}.json" for rank in self.observed_roles]
-
-        # PP forwards control requests after replying locally; every role must publish before shutdown.
-        while not all(path.is_file() for path in sources):
-            time.sleep(0.05)
-        print("markov: all native role sources complete", flush=True)
 
     def run(self) -> None:
         warmup = self.warmup_requests(self.configuration["page_size"])
@@ -181,11 +141,13 @@ class NativeServingSession:
         description = self.output / "session.json"
         session = {
             "output": str(self.output),
+            "warmup_requests": [f"warmup/{index}" for index in range(len(warmup))],
             "source_requests": [f"capture/{index}" for index in range(len(self.requests))],
             "baseline_requests": [f"baseline/{index}" for index in range(len(self.requests))],
             "matrix_selection": self.matrix_selection,
             "native_library": self.native_library,
             "rank_offset": 0,
+            "native_participants": list(self.roles),
             "pp_size": self.pp_size,
             "ep_size": self.ep_size,
             "observe_all_workers": self.observe_all_workers,
@@ -224,6 +186,7 @@ class NativeServingSession:
             **{"chunked_prefill_size": -1, "disable_radix_cache": True, **self.configuration},
             disable_overlap_schedule=True,
             disable_cuda_graph=True,
+            sleep_on_idle=True,
             mem_fraction_static=0.8,
             log_level="warning",
         )
@@ -234,8 +197,8 @@ class NativeServingSession:
                 self.observed_roles = tuple(plan["observed_roles"])
             print("markov: native initialization complete", flush=True)
 
-            self.generate(engine, "warmup/", warmup)
-            self.reset(engine)
+            self.generate(engine, "warmup", warmup)
+            self.reset(engine, "warmup")
             warmed = time.perf_counter_ns()
             if self.profile:
                 engine.start_profile(
@@ -244,12 +207,12 @@ class NativeServingSession:
                     record_shapes=False,
                     with_stack=False,
                 )
+                ObservationWindow.wait(self.output, self.roles, "profiler", "complete")
             try:
-                self.generate(engine, "baseline/", self.requests)
-                self.reset(engine)
-                self.generate(engine, "capture/", self.requests)
-                self.reset(engine)
-                self.wait_for_sources()
+                self.generate(engine, "baseline", self.requests)
+                self.reset(engine, "baseline")
+                self.generate(engine, "capture", self.requests)
+                self.reset(engine, "source")
             finally:
                 if self.profile:
                     engine.stop_profile()

@@ -171,16 +171,15 @@ RankProgram RankStructure::indices(const IndexWork & work) {
                 {                         "released_pages", static_cast<std::int64_t>(release->pages.size()) },
                 {                      "release_immediate",                                        immediate },
                 {                  "pending_tokens_before",                   release->pending_tokens_before },
-                { std::string(released_pool()) + "_before",     bucket ? graph_.integers(*bucket).size() : 0 }
+                { std::string(released_pool()) + "_before",                   graph_.integers(bucket).size() }
             };
             call.bindings = {
                 { "page_size",                      settings_.page_size },
                 { "need_sort", page_reuse_ == PageReuse::DeferredSorted }
             };
-            if (bucket && immediate && tokens != 0) inputs.emplace(released_pool(), *bucket);
+            if (immediate && tokens != 0) inputs.emplace(released_pool(), bucket);
             region = graph_.append(grouped ? "kv_release_group" : "kv_release", "control", call, inputs, groups);
             if (immediate && tokens != 0) {
-                if (!bucket) graph_.bind_integers(region.ports.inputs.at(released_pool()), {});
                 return_pages(region.ports.outputs.at(released_pool()), release->pages);
                 returned.insert(returned.begin(), release->pages.begin(), release->pages.end());
             }

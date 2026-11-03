@@ -1,6 +1,7 @@
 #include "markov/adapters/frameworks/sglang/rank_structure.hpp"
 
 #include "markov/adapters/frameworks/sglang/expert_routing.hpp"
+#include "markov/templates/catalog.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -91,20 +92,34 @@ RankStructure::RankStructure(const TemplateAsset & asset, ServingSettings settin
       transfer_graph_(asset, graph, execution_offset),
       rank_(rank),
       routing_(routing),
-      publishes_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "request_output"; })),
-      coordinates_(std::ranges::any_of(asset.entrypoints(), [](const RegionSelection & entry) { return entry.role == "batch_coordination"; })),
+      publishes_(!asset.entrypoints("request_output").empty()),
+      coordinates_(!asset.entrypoints("batch_coordination").empty()),
       prefix_cache_(!asset.environment().at("implementation").value("disable_radix_cache", true)),
       page_reuse_(PageReuse::Immediate) {
-    const auto allocation = std::ranges::find(asset.entrypoints(), "kv_allocate", &RegionSelection::role);
-    if (allocation == asset.entrypoints().end()) throw std::invalid_argument("serving source requires an allocation interface");
-    if (asset.frame(*allocation).bindings.values.at("need_sort") != 0) page_reuse_ = PageReuse::DeferredSorted;
+    const auto allocations = asset.entrypoints("kv_allocate");
+    if (allocations.empty()) throw std::invalid_argument("serving source requires an allocation interface");
+    const auto frame = asset.frame(allocations.front());
+    if (frame.bindings.values.at("need_sort") != 0) page_reuse_ = PageReuse::DeferredSorted;
+
+    // Initialize the rank's tensor views once; KvPool remains the allocation owner.
+    const auto & layout = asset.layout(frame.layout);
+    const auto geometry = std::ranges::find(layout.input_shapes, layout.ports.inputs.at("free_pages"), &ShapeContract::value);
+    if (geometry == layout.input_shapes.end()) throw std::invalid_argument("allocation interface requires free_pages tensor geometry");
+
+    IntegerData pages;
+    pages.append(1, settings_.max_total_tokens / settings_.page_size);
+    free_pages_ = graph_.initial_integers(geometry->dtype, geometry->device, std::move(pages));
+    release_pages_ = graph_.initial_integers(geometry->dtype, geometry->device, {});
+
     views_.reserve(lanes);
+    prepared_.resize(lanes);
     for (std::size_t lane = 0; lane < lanes; ++lane) views_.emplace_back(graph_, asset);
 }
 
 RankProgram RankStructure::expand(const ServingAction & action) {
     if (action.step == ServingStep::Indices) return indices(action.index_work());
     if (action.step == ServingStep::Select) return select(action.selection(), action.lane);
+    if (action.step == ServingStep::Poll) return poll(action.transfer_query());
     const auto & batch = action.batch_work().batch;
     const auto & effects = action.batch_work().effects;
     switch (action.step) {
@@ -119,10 +134,18 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     case ServingStep::Send: {
         const auto & member = batch.members.front();
         const auto region = send_kv(batch, member, action.batch_work().metadata_slots.at(member.request), action.batch_work().final_transfer);
-        return { std::nullopt, shared_.execution.region_call(region.region).returned, {} };
+        const auto calls = std::span(shared_.regions).subspan(region.region + 1);
+        const auto submitted =
+            std::ranges::find_if(calls, [&](const auto & call) { return call.at("parent") == region.region && call.at("role") == "KvSubmit"; });
+        if (submitted == calls.end()) throw LayoutMismatch("native KV send has no submission boundary");
+
+        // Data preparation precedes submission; caller bookkeeping remains in the graph after this feedback.
+        return { std::nullopt, shared_.execution.region_call(submitted->at("id").get<std::size_t>()).returned, {} };
     }
     case ServingStep::Reserve:
         return reserve(batch);
+    case ServingStep::Advertise:
+        return advertise(batch, action.batch_work().metadata_slots.at(batch.members.front().request));
     case ServingStep::Receive:
         return receive_kv(batch, action.batch_work().metadata_slots.at(batch.members.front().request));
     case ServingStep::Accept:
@@ -134,38 +157,50 @@ RankProgram RankStructure::expand(const ServingAction & action) {
     }
 }
 
-void RankStructure::begin_schedule(Phase phase, std::size_t members) {
-    std::map<std::string, std::size_t> state;
-    if (free_pages_) state.emplace("free_pages", *free_pages_);
+void RankStructure::begin_schedule(const std::string & phase, std::size_t members) {
+    std::map<std::string, std::size_t> state{
+        { "free_pages", free_pages_ }
+    };
     if (request_map_) state.emplace("request_map", *request_map_);
     graph_.begin_composition("Schedule",
-                             phase_name(phase),
+                             phase,
                              {
                                  { "scheduled_members", static_cast<std::int64_t>(members) }
     },
                              state);
 }
 
+RankProgram RankStructure::schedule(ScheduleOperation operation, const std::map<std::string, std::size_t> & outputs) {
+    const auto begin = shared_.regions.size();
+    if (!graph_.composition()) begin_schedule("control", 0);
+    auto completion = graph_.composition().value();
+    if (operation == ScheduleOperation::Coordinate) completion = graph_.append("batch_coordination", "control", {}).region;
+    else {
+        auto result = outputs;
+        if (!result.empty()) {
+            result.emplace("free_pages", free_pages_);
+            result.emplace("request_map", request_map_.value());
+        }
+        graph_.end_composition(result);
+    }
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(completion).returned, {} };
+}
+
 RankProgram RankStructure::select(const BatchSelection & selection, std::size_t lane) {
     const auto begin = shared_.regions.size();
     auto & views = views_.at(lane);
     const auto phase = selection.view == BatchView::Previous ? Phase::Prefill : Phase::Decode;
-    if (!graph_.composition()) begin_schedule(phase, selection.requests.size());
+    if (!graph_.composition()) begin_schedule(phase_name(phase), selection.requests.size());
     const auto filtered = views.select(selection);
-    auto completion = shared_.execution.region_call(filtered).returned;
-    if (selection.view == BatchView::Running && selection.requests.empty()) {
-        const auto schedule = graph_.composition().value();
-        graph_.end_composition({});
-        completion = shared_.execution.region_call(schedule).returned;
-    }
     stamp(begin);
-    return { std::nullopt, completion, {} };
+    return { std::nullopt, shared_.execution.region_call(filtered).returned, {} };
 }
 
 RankProgram RankStructure::retain(const Batch & batch) {
     const auto begin = shared_.regions.size();
     const auto & member = batch.members.front();
-    if (!graph_.composition()) begin_schedule(batch.phase, 0);
+    if (!graph_.composition()) begin_schedule(phase_name(batch.phase), 0);
     const auto retained = graph_.append("request_cache_retain",
                                         "prefill",
                                         cache_arguments(member.slot, member.context_tokens, batch.slot_capacity),
@@ -182,14 +217,15 @@ RankProgram RankStructure::retain(const Batch & batch) {
 
 TargetRegion RankStructure::prepare(const Batch & batch, std::size_t lane) {
     const auto begin = shared_.regions.size();
-    merge_pages(batch);
     const auto phase = phase_name(batch.phase);
-    if (!graph_.composition()) { begin_schedule(batch.phase, batch.members.size()); }
+    if (!graph_.composition()) { begin_schedule(phase, batch.members.size()); }
     else {
 
         // Native filtering and resource releases already opened this scheduling call.
         shared_.regions.at(*graph_.composition())["parameters"]["scheduled_members"] = batch.members.size();
+        shared_.regions.at(*graph_.composition())["phase"] = phase;
     }
+    views_.at(lane).advance(batch.phase);
     const auto prepared = prepare_part(batch, lane).ports;
     if (coordinates_) graph_.append("batch_coordination", phase, {});
     const auto schedule = graph_.composition().value();
@@ -202,43 +238,35 @@ TargetRegion RankStructure::prepare(const Batch & batch, std::size_t lane) {
     stamp(begin);
     return {
         schedule,
-        { {}, std::move(inputs) },
-        {}
+        { {}, std::move(inputs) }
     };
 }
 
 TargetRegion RankStructure::prepare(const BatchWork & work, std::size_t lane) {
-    if (work.preparations.empty()) return prepare(work.batch, lane);
+    auto & parts = prepared_.at(lane);
+    if (parts.empty()) return prepare(work.batch, lane);
     const bool mixed = work.batch.phase == Phase::Mixed;
-    const auto & first = std::get<Batch>(work.preparations.front());
-    const auto parts = std::ranges::count_if(work.preparations, [](const auto & part) { return std::holds_alternative<Batch>(part); });
-    if (mixed && (parts != 2 || first.phase != Phase::Prefill || std::get<Batch>(work.preparations.back()).phase != Phase::Decode))
+    if (mixed
+        && (parts.size() != 2 || shared_.regions.at(parts.front().region).at("phase") != "prefill"
+            || shared_.regions.at(parts.back().region).at("phase") != "decode"))
         throw LayoutMismatch("SGLang mixed preparation requires Prefill followed by Decode");
 
     const auto begin = shared_.regions.size();
-    merge_pages(first);
-    if (!graph_.composition()) begin_schedule(work.batch.phase, work.batch.members.size());
-    else shared_.regions.at(*graph_.composition())["parameters"]["scheduled_members"] = work.batch.members.size();
+    shared_.regions.at(*graph_.composition())["parameters"]["scheduled_members"] = work.batch.members.size();
+    shared_.regions.at(*graph_.composition())["phase"] = phase_name(work.batch.phase);
 
     std::map<std::string, std::size_t> inputs;
-    for (std::size_t index = 0; index < work.preparations.size(); ++index) {
-        if (const auto * selection = std::get_if<BatchSelection>(&work.preparations[index])) {
-            views_.at(lane).select(*selection);
-            continue;
-        }
-
-        const auto & part = std::get<Batch>(work.preparations[index]);
-        if (index != 0) merge_pages(part);
-        const auto prepared = prepare_part(part, lane);
+    auto prepared = parts.back();
+    for (const auto & part : parts) {
         if (!mixed) {
-            inputs = prepared.ports.outputs;
+            inputs = part.ports.outputs;
             continue;
         }
-        for (const auto & [name, value] : prepared.ports.outputs) {
+        for (const auto & [name, value] : part.ports.outputs) {
 
             // Mixed input staging reads token IDs from the relay, not the pure-Decode column.
             if (name != "free_pages" && name != "request_map" && name != "model_tokens")
-                inputs.emplace(std::string(phase_name(part.phase)) + "." + name, value);
+                inputs.emplace(shared_.regions.at(part.region).at("phase").get<std::string>() + "." + name, value);
         }
     }
 
@@ -248,31 +276,38 @@ TargetRegion RankStructure::prepare(const BatchWork & work, std::size_t lane) {
         auto call = invocation(work.batch);
         call.parameters.erase("B");
         call.parameters.erase("M");
-        inputs = graph_.append("batch_mix", "mixed", call, inputs).ports.outputs;
+        prepared = graph_.append("batch_mix", "mixed", call, inputs);
+        inputs = prepared.ports.outputs;
         auto columns = batch_operands(work.batch, settings_.page_size);
         columns["original_lengths"] = columns.at("sequence_lengths");
         bind_columns(graph_, inputs, columns);
         views_.at(lane).consume_running();
     }
-    if (coordinates_) graph_.append("batch_coordination", phase_name(work.batch.phase), {});
-    const auto schedule = graph_.composition().value();
-    auto outputs = inputs;
-    outputs.emplace("free_pages", *free_pages_);
-    outputs.emplace("request_map", *request_map_);
-    graph_.end_composition(outputs);
+
+    // Native coordination and Schedule return arrive separately; only this preparation has completed.
     inputs.erase("free_pages");
     inputs.erase("request_map");
+    parts.clear();
     stamp(begin);
     return {
-        schedule,
-        { {}, std::move(inputs) },
-        {}
+        prepared.region,
+        { {}, std::move(inputs) }
     };
 }
 
 TargetRegion RankStructure::prepare_part(const Batch & batch, std::size_t lane) {
+    prepare_inputs(batch, lane);
+    allocate(batch);
+    prepare_outputs(batch, lane);
+    auto prepared = std::move(prepared_.at(lane).back());
+    prepared_.at(lane).pop_back();
+    return prepared;
+}
+
+RankProgram RankStructure::prepare_inputs(const Batch & batch, std::size_t lane) {
+    const auto begin = shared_.regions.size();
+    if (!graph_.composition()) begin_schedule(phase_name(batch.phase), batch.members.size());
     auto & views = views_.at(lane);
-    views.advance(batch.phase);
     const auto columns = batch_operands(batch, settings_.page_size);
     const auto phase = phase_name(batch.phase);
     auto invocation = this->invocation(batch);
@@ -293,56 +328,88 @@ TargetRegion RankStructure::prepare_part(const Batch & batch, std::size_t lane) 
                 { "extent", member.context_tokens }
             });
         }
-
-        auto & allocation = invocation.sequences["allocation_members"];
-        std::int64_t page_offset = 0;
-        std::int64_t token_offset = 0;
-        for (std::size_t index = 0; index < batch.members.size(); ++index) {
-            const auto & member = batch.members[index];
-            allocation.push_back({
-                {   "member_index", static_cast<std::int64_t>(index) },
-                {     "new_tokens",                member.new_tokens },
-                { "context_tokens",            member.context_tokens },
-                {    "page_offset",                      page_offset },
-                {   "token_offset",                     token_offset }
-            });
-            page_offset += static_cast<std::int64_t>(member.new_pages.size());
-            token_offset += member.new_tokens;
-        }
     }
 
     std::map<std::string, std::size_t> inputs;
     if (batch.phase == Phase::Decode) inputs = views.decode_inputs();
-    if (free_pages_) inputs.emplace("free_pages", *free_pages_);
+    std::vector<std::string> caller_inputs;
+    for (const auto & [name, _] : inputs) caller_inputs.push_back(name);
+    inputs.emplace("free_pages", free_pages_);
     if (request_map_) inputs.emplace("request_map", *request_map_);
-    const auto preparation = graph_.append("batch_preparation", phase, invocation, inputs, groups);
-    const auto & prepared = preparation.ports;
-    if (!free_pages_) {
-        IntegerData initial;
-        initial.append(1, invocation.parameters.at("free_pages_before"));
-        graph_.bind_integers(prepared.inputs.at("free_pages"), std::move(initial));
-    }
+    const auto caller = graph_.begin_composition("batch_preparation", phase, invocation.parameters, inputs);
+    const auto input_work = graph_.append_from("batch_preparation_inputs", phase, invocation, inputs, groups, &caller_inputs);
+    auto values = inputs;
+    for (const auto & [name, value] : input_work.ports.inputs) values.insert_or_assign(name, value);
+    for (const auto & [name, value] : input_work.ports.outputs) values.insert_or_assign(name, value);
+    bind_columns(graph_, input_work.ports.inputs, columns);
+    bind_columns(graph_, input_work.ports.outputs, columns);
+    if (const auto original = input_work.ports.outputs.find("original_lengths"); original != input_work.ports.outputs.end())
+        graph_.bind_integers(original->second, columns.at("sequence_lengths"));
+    preparation_.emplace(Preparation{ std::move(invocation), std::move(groups), std::move(values), std::move(caller_inputs), caller });
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(input_work.region).returned, {} };
+}
 
-    bind_columns(graph_, prepared.inputs, columns);
-    bind_columns(graph_, prepared.outputs, columns);
-    if (batch.phase == Phase::Decode) graph_.bind_integers(prepared.inputs.at("original_lengths"), columns.at("prefix_lengths"));
-    graph_.bind_integers(prepared.outputs.at("original_lengths"), columns.at("sequence_lengths"));
+RankProgram RankStructure::allocate(const Batch & batch) {
+    const auto begin = shared_.regions.size();
+    auto call = allocation_invocation(batch);
+    auto values = preparation_->values;
+    values.insert_or_assign("free_pages", free_pages_);
+    values.insert_or_assign("release_pages", release_pages_);
+    auto allocated = graph_.append_from("kv_allocate", phase_name(batch.phase), call, values);
+    const auto & ports = allocated.ports;
+    bind_allocation(allocated, batch);
+
+    const auto columns = batch_operands(batch, settings_.page_size);
+    bind_columns(graph_, ports.inputs, columns);
+    bind_columns(graph_, ports.outputs, columns);
+    for (const auto & [name, value] : ports.outputs) preparation_->values.insert_or_assign(name, value);
+
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(allocated.region).returned, {} };
+}
+
+RankProgram RankStructure::prepare_outputs(const Batch & batch, std::size_t lane) {
+    const auto begin = shared_.regions.size();
+    auto call = invocation(batch);
+    call.input_groups = preparation_->invocation.input_groups;
+    if (request_map_) preparation_->values.insert_or_assign("request_map", *request_map_);
+    const auto output_work = graph_.append_from("batch_preparation_outputs",
+                                                phase_name(batch.phase),
+                                                call,
+                                                preparation_->values,
+                                                preparation_->groups,
+                                                &preparation_->caller_inputs);
+    const auto & ports = output_work.ports;
+    const auto columns = batch_operands(batch, settings_.page_size);
+    bind_columns(graph_, ports.outputs, columns);
+    graph_.bind_integers(ports.outputs.at("original_lengths"), columns.at("sequence_lengths"));
     if (batch.phase == Phase::Prefill) {
         std::int64_t offset = 0;
         for (std::size_t index = 0; index < batch.members.size(); ++index) {
             const auto & member = batch.members[index];
-            auto contents = graph_.integers(groups.at("prefixes")[index]);
+            auto contents = graph_.integers(preparation_->groups.at("prefixes")[index]);
             contents.append(columns.at("kv_locations").slice(offset, member.new_tokens));
             chunks_.insert_or_assign(member.request, ChunkIndices{ std::move(contents), std::nullopt });
             offset += member.new_tokens;
         }
     }
-    graph_.bind_integers(
-        prepared.outputs.at("free_pages"),
-        graph_.integers(prepared.inputs.at("free_pages")).slice(batch.allocated_pages, invocation.parameters.at("free_pages_before") - batch.allocated_pages));
-    free_pages_ = prepared.outputs.at("free_pages");
-    request_map_ = prepared.outputs.at("request_map");
-    return preparation;
+    free_pages_ = ports.outputs.at("free_pages");
+    request_map_ = ports.outputs.at("request_map");
+    auto & root = shared_.regions.at(preparation_->region);
+    if (!root["ports"]["inputs"].contains("request_map")) {
+        root["ports"]["inputs"]["request_map"] = ports.inputs.at("request_map");
+        root["inputs"].push_back(ports.inputs.at("request_map"));
+    }
+    graph_.end_composition(ports.outputs);
+    prepared_.at(lane).push_back({
+        preparation_->region,
+        { {}, ports.outputs }
+    });
+    const auto completion = shared_.execution.region_call(preparation_->region).returned;
+    preparation_.reset();
+    stamp(begin);
+    return { std::nullopt, completion, {} };
 }
 
 TargetRegion RankStructure::model(const Batch & batch, const std::map<std::string, std::size_t> & inputs) {
@@ -362,7 +429,7 @@ std::optional<std::size_t> RankStructure::begin_result(const Batch & batch, std:
     const auto begin = shared_.regions.size();
     const auto phase = phase_name(batch.phase);
     std::map<std::string, std::size_t> state{
-        {  "free_pages",  free_pages_.value() },
+        {  "free_pages",          free_pages_ },
         { "request_map", request_map_.value() }
     };
     if (sampled_tokens) state.emplace("sampled_tokens", *sampled_tokens);
@@ -436,16 +503,28 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
         { "B", static_cast<std::int64_t>(batch.members.size()) }
     };
 
+    std::map<std::size_t, const RequestCompletion *> completions;
+    std::vector<std::size_t> cache_order;
     for (const auto & member : effects.members) {
 
         // Native scheduling stashes an intermediate chunk on its next iteration, outside result processing.
         if (member.continues_prefill) continue;
         chunks_.erase(member.request);
         if (prefix_cache_) continue;
+        completions.emplace(member.request, &member);
+        if (effects.cache_order) continue;
+
         const auto & input = *std::ranges::find(batch.members, member.request, &BatchMember::request);
 
-        // Native retention already ran at its call boundary; combined lightweight work emits it here.
+        // Without native calls, the lightweight policy retains only completed Prefill members.
         if (!member.finished && (!retain_unfinished || input.phase == Phase::Decode)) continue;
+        cache_order.push_back(member.request);
+    }
+
+    // Prefix index work has its own native call boundaries; ordinary result work stays in one ordered owner.
+    if (!prefix_cache_ && effects.cache_order) cache_order = *effects.cache_order;
+    for (const auto request : cache_order) {
+        const auto & member = *completions.at(request);
 
         const auto cache = cache_member(member, immediate, pending_tokens, phase, batch.slot_capacity);
         if (!member.finished) continue;
@@ -486,16 +565,16 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
         std::ranges::sort(returned_pages);
         const auto bucket = page_reuse_ == PageReuse::DeferredSorted ? release_pages_ : free_pages_;
         group.parameters = {
-            { std::string(released_pool()) + "_before",     bucket ? graph_.integers(*bucket).size() : 0 },
+            { std::string(released_pool()) + "_before",                   graph_.integers(bucket).size() },
             {                         "released_pages", static_cast<std::int64_t>(returned_pages.size()) }
         };
         group.bindings = {
             { "page_size", settings_.page_size }
         };
-        std::map<std::string, std::size_t> inputs;
-        if (bucket) inputs.emplace(released_pool(), *bucket);
+        std::map<std::string, std::size_t> inputs{
+            { released_pool(), bucket }
+        };
         const auto release = graph_.append("kv_release_group", phase, group, inputs, group_values);
-        if (!bucket) graph_.bind_integers(release.ports.inputs.at(released_pool()), {});
         return_pages(release.ports.outputs.at(released_pool()), returned_pages);
     }
 
@@ -503,7 +582,7 @@ RankProgram RankStructure::complete(const Batch & batch, const BatchEffects & ef
     cache_release_.reset();
 
     graph_.end_composition({
-        { "free_pages", free_pages_.value() }
+        { "free_pages", free_pages_ }
     });
     stamp(begin);
     return { publication, graph_.graph().execution.region_call(result_region).returned, std::move(returned_pages) };
@@ -530,48 +609,87 @@ TargetRegion RankStructure::cache_member(const RequestCompletion & member, bool 
         call.parameters.insert({
             {     "release_immediate",                                               immediate },
             { "pending_tokens_before",                                          pending_tokens },
-            {     "free_pages_before",                    graph_.integers(*free_pages_).size() },
+            {     "free_pages_before",                     graph_.integers(free_pages_).size() },
             {        "released_pages", static_cast<std::int64_t>(member.released_pages.size()) }
         });
-        call.parameters.emplace("release_pages_before", release_pages_ ? graph_.integers(*release_pages_).size() : 0);
+        call.parameters.emplace("release_pages_before", graph_.integers(release_pages_).size());
         call.bindings = {
             { "page_size",                      settings_.page_size },
             { "need_sort", page_reuse_ == PageReuse::DeferredSorted }
         };
         const auto bucket = page_reuse_ == PageReuse::DeferredSorted ? release_pages_ : free_pages_;
-        if (immediate && bucket) inputs.emplace(released_pool(), *bucket);
+        if (immediate) inputs.emplace(released_pool(), bucket);
     }
     auto result = graph_.append(member.finished ? "request_cache_release" : "request_cache_retain", phase, call, inputs);
 
     // The native map read has its own contents, independent of the pages returned by this operation.
     graph_.bind_integers(result.ports.outputs.at("request_indices"), page_indices(member.mapped_pages, member.resident_tokens, settings_.page_size));
-    if (member.finished && immediate && page_reuse_ == PageReuse::DeferredSorted && !release_pages_)
-        graph_.bind_integers(result.ports.inputs.at("release_pages"), {});
     return result;
 }
 
 RankProgram RankStructure::reserve(const Batch & batch) {
     const auto begin = shared_.regions.size();
-    merge_pages(batch);
-    auto call = invocation(batch);
+    auto call = allocation_invocation(batch);
     call.parameters.emplace("request_slot", static_cast<std::int64_t>(batch.members.front().slot) + 1);
-    std::map<std::string, std::size_t> state;
-    if (free_pages_) state.emplace("free_pages", *free_pages_);
+    std::map<std::string, std::size_t> state{
+        {    "free_pages",    free_pages_ },
+        { "release_pages", release_pages_ }
+    };
     if (request_map_) state.emplace("request_map", *request_map_);
-    const auto reserved = graph_.append("KvReserve", "control", call, state);
-    if (!free_pages_) {
-        IntegerData initial;
-        initial.append(1, call.parameters.at("free_pages_before"));
-        graph_.bind_integers(reserved.ports.inputs.at("free_pages"), std::move(initial));
-    }
-    graph_.bind_integers(
-        reserved.ports.outputs.at("free_pages"),
-        graph_.integers(reserved.ports.inputs.at("free_pages")).slice(batch.allocated_pages, call.parameters.at("free_pages_before") - batch.allocated_pages));
-    bind_columns(graph_, reserved.ports.outputs, batch_operands(batch, settings_.page_size));
-    free_pages_ = reserved.ports.outputs.at("free_pages");
-    request_map_ = reserved.ports.outputs.at("request_map");
+    const std::vector<std::string> caller_inputs;
+    const auto caller = graph_.begin_composition("KvReserve", "control", call.parameters, state);
+    const auto inputs = graph_.append_from("KvReserve_inputs", "control", call, state, {}, &caller_inputs);
+    state.insert(inputs.ports.inputs.begin(), inputs.ports.inputs.end());
+    for (const auto & [name, value] : inputs.ports.outputs) state.insert_or_assign(name, value);
+
+    // Reservation uses the same native allocator family as model preparation, including deferred-page merging.
+    const auto allocation = graph_.append_from("kv_allocate", "prefill", call, state);
+    bind_allocation(allocation, batch);
+    const auto columns = batch_operands(batch, settings_.page_size);
+    bind_columns(graph_, allocation.ports.inputs, columns);
+    bind_columns(graph_, allocation.ports.outputs, columns);
+    for (const auto & [name, value] : allocation.ports.outputs) state.insert_or_assign(name, value);
+
+    const auto outputs = graph_.append_from("KvReserve_outputs", "control", call, state, {}, &caller_inputs);
+    bind_columns(graph_, outputs.ports.outputs, columns);
+    request_map_ = outputs.ports.outputs.at("request_map");
+    graph_.end_composition(outputs.ports.outputs);
+
     stamp(begin);
-    return { std::nullopt, shared_.execution.region_call(reserved.region).returned, {} };
+    return { std::nullopt, shared_.execution.region_call(caller).returned, {} };
+}
+
+RankProgram RankStructure::poll(const TransferQuery & query) {
+    const auto begin = shared_.regions.size();
+    Invocation call;
+    call.parameters["B"] = static_cast<std::int64_t>(query.requests.size());
+    const auto region = graph_.append("kv_poll", "control", call);
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(region.region).returned, {} };
+}
+
+RankProgram RankStructure::advertise(const Batch & batch, std::size_t metadata_slot) {
+    const auto begin = shared_.regions.size();
+    auto call = invocation(batch);
+    call.parameters["metadata_slot"] = static_cast<std::int64_t>(metadata_slot);
+    const auto region = graph_.append("kv_advertise", "control", call);
+    shared_.execution.separate_entry(region.region);
+    stamp(begin);
+    return { std::nullopt, shared_.execution.region_call(region.region).returned, {} };
+}
+
+std::size_t RankStructure::transport_event(const std::string & role, std::int64_t prompt_tokens) {
+    const auto begin = shared_.regions.size();
+    Invocation call;
+    call.parameters = {
+        { "B",             1 },
+        { "M", prompt_tokens }
+    };
+
+    // shortcut: message transit stays opaque; calibrate this boundary service rather than only its status-write CPU time.
+    const auto region = transfer_graph_.append(role, "control", call);
+    stamp(begin);
+    return shared_.execution.region_call(region.region).returned;
 }
 
 RankProgram RankStructure::receive_kv(const Batch & batch, std::size_t metadata_slot) {
@@ -590,10 +708,9 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     auto call = invocation(batch);
 
     // The native prebuilt path installs token/state columns without another model forward.
-    graph_.begin_composition("Schedule", "control", {}, {});
-    views_.at(lane).advance(Phase::Prefill);
+    begin_schedule("control", batch.members.size());
     std::map<std::string, std::size_t> state{
-        {  "free_pages",  free_pages_.value() },
+        {  "free_pages",          free_pages_ },
         { "request_map", request_map_.value() }
     };
     if (token_relay_) state.emplace("token_relay", *token_relay_);
@@ -631,7 +748,7 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     const auto processed = graph_.append("prebuilt_process", "control", call, state);
     auto outputs = prepared.ports.outputs;
     outputs.insert_or_assign("token_relay", processed.ports.outputs.at("token_relay"));
-    outputs.emplace("free_pages", *free_pages_);
+    outputs.emplace("free_pages", free_pages_);
     outputs.emplace("request_map", *request_map_);
     auto columns = batch_operands(batch, settings_.page_size);
     columns["original_lengths"] = columns.at("sequence_lengths");
@@ -706,17 +823,16 @@ Invocation RankStructure::invocation(const Batch & batch) const {
 
     Invocation result;
     result.parameters = {
-        {                   "M",                                                             batch.new_tokens()                                },
-        {                   "B",                                                                static_cast<std::int64_t>(batch.members.size()) },
-        {                   "R",                                                                                 settings_.max_running_requests },
-        {       "slot_capacity",                                                                                            batch.slot_capacity },
-        {            "kv_pages",                                                               settings_.max_total_tokens / settings_.page_size },
-        {   "free_pages_before",
-         batch.allocated_pages > batch.free_pages_before - batch.deferred_pages_before ? batch.free_pages_before
-         : batch.free_pages_before - batch.deferred_pages_before                                                                               },
-        {     "allocated_pages",                                                                                          batch.allocated_pages },
-        { "max_sequence_tokens",                                                                                            max_sequence_tokens },
-        {    "max_query_tokens",                                                                                               max_query_tokens }
+        {                    "M",                                    batch.new_tokens() },
+        {                    "B",       static_cast<std::int64_t>(batch.members.size()) },
+        {                    "R",                        settings_.max_running_requests },
+        {        "slot_capacity",                                   batch.slot_capacity },
+        {             "kv_pages",      settings_.max_total_tokens / settings_.page_size },
+        {    "free_pages_before", batch.free_pages_before - batch.deferred_pages_before },
+        { "release_pages_before",                           batch.deferred_pages_before },
+        {      "allocated_pages",                                 batch.allocated_pages },
+        {  "max_sequence_tokens",                                   max_sequence_tokens },
+        {     "max_query_tokens",                                      max_query_tokens }
     };
     result.parameters["prefill_members"] = std::ranges::count(batch.members, Phase::Prefill, &BatchMember::phase);
     result.parameters["decode_members"] = std::ranges::count(batch.members, Phase::Decode, &BatchMember::phase);
@@ -730,6 +846,27 @@ Invocation RankStructure::invocation(const Batch & batch) const {
     return result;
 }
 
+Invocation RankStructure::allocation_invocation(const Batch & batch) const {
+    auto result = invocation(batch);
+    if (batch.phase != Phase::Prefill) return result;
+
+    std::int64_t page_offset = 0, token_offset = 0;
+    for (std::size_t index = 0; index < batch.members.size(); ++index) {
+        const auto & member = batch.members[index];
+        result.sequences["allocation_members"].push_back({
+            {   "member_index", static_cast<std::int64_t>(index) },
+            {     "new_tokens",                member.new_tokens },
+            { "context_tokens",            member.context_tokens },
+            {    "page_offset",                      page_offset },
+            {   "token_offset",                     token_offset }
+        });
+
+        page_offset += static_cast<std::int64_t>(member.new_pages.size());
+        token_offset += member.new_tokens;
+    }
+    return result;
+}
+
 void RankStructure::stamp(std::size_t region_begin) {
     for (std::size_t region = region_begin; region < shared_.regions.size(); ++region) shared_.regions[region]["rank"] = rank_;
 }
@@ -739,8 +876,8 @@ RankMessage RankStructure::message(const std::string & role, const Batch & batch
     const auto phase = phase_name(batch.phase);
     auto arguments = invocation(batch);
     const TemplateLayout * contract = nullptr;
-    for (const auto & entry : asset_.entrypoints()) {
-        if (entry.role == role && (!entry.phase || *entry.phase == phase)) {
+    for (const auto & entry : asset_.entrypoints(role)) {
+        if (!entry.phase || *entry.phase == phase) {
             const auto frame = asset_.frame(entry);
             contract = &asset_.layout(frame.layout);
             arguments.bindings.insert(frame.bindings.values.begin(), frame.bindings.values.end());
@@ -786,7 +923,7 @@ std::vector<std::size_t> RankStructure::wait_message(const std::string & channel
     return completions;
 }
 
-std::size_t RankStructure::prepare_result(const Batch & batch, std::size_t sampled_tokens) {
+std::size_t RankStructure::prepare_result(const Batch & batch, std::size_t sampled_tokens, std::size_t request_slots) {
     const auto begin = shared_.regions.size();
     const auto phase = phase_name(batch.phase);
     const auto arguments = invocation(batch);
@@ -797,6 +934,7 @@ std::size_t RankStructure::prepare_result(const Batch & batch, std::size_t sampl
                                       arguments,
                                       {
                                           { "sampled_tokens",       sampled_tokens },
+                                          {  "request_slots",        request_slots },
                                           {    "token_relay", token_relay_.value() }
     });
     token_relay_ = result.ports.outputs.at("token_relay");
@@ -817,41 +955,48 @@ void RankStructure::return_pages(std::size_t output, std::span<const std::size_t
     auto & bucket = page_reuse_ == PageReuse::DeferredSorted ? release_pages_ : free_pages_;
     IntegerData returned;
     for (const auto page : pages) returned.append(static_cast<std::int64_t>(page) + 1);
-    if (bucket) returned.append(graph_.integers(*bucket));
+    returned.append(graph_.integers(bucket));
     graph_.bind_integers(output, std::move(returned));
     bucket = output;
 }
 
-void RankStructure::merge_pages(const Batch & batch) {
-    if (batch.allocated_pages <= batch.free_pages_before - batch.deferred_pages_before) return;
+void RankStructure::bind_allocation(const TargetRegion & allocation, const Batch & batch) {
+    auto available = graph_.integers(allocation.ports.inputs.at("free_pages"));
+    if (allocation.ports.outputs.contains("release_pages")) {
 
-    Invocation call;
-    call.parameters = {
-        {    "free_pages_before",    graph_.integers(*free_pages_).size() },
-        { "release_pages_before", graph_.integers(*release_pages_).size() }
-    };
-    const auto merged = graph_.append("kv_merge_free",
-                                      "control",
-                                      call,
-                                      {
-                                          {    "free_pages",    *free_pages_ },
-                                          { "release_pages", *release_pages_ }
-    });
-    auto available = graph_.integers(*free_pages_);
-    available.append(graph_.integers(*release_pages_));
-    graph_.bind_integers(merged.ports.outputs.at("free_pages"), available.sorted_unique());
-    graph_.bind_integers(merged.ports.outputs.at("release_pages"), {});
-    free_pages_ = merged.ports.outputs.at("free_pages");
-    release_pages_ = merged.ports.outputs.at("release_pages");
+        // The selected native branch owns this state transition; do not insert another merge before it.
+        available.append(graph_.integers(allocation.ports.inputs.at("release_pages")));
+        available = available.sorted_unique();
+        release_pages_ = allocation.ports.outputs.at("release_pages");
+        graph_.bind_integers(release_pages_, {});
+    }
+
+    free_pages_ = allocation.ports.outputs.at("free_pages");
+    graph_.bind_integers(free_pages_, available.slice(batch.allocated_pages, available.size() - batch.allocated_pages));
 }
 
 void RankStructure::live_state(GraphRoots & roots) {
 
     // References remain stable while the shared graph compacts its values and rebinds these ports.
-    for (auto * value : { &free_pages_, &request_map_, &token_relay_, &release_pages_ }) {
+    roots.values.push_back(&free_pages_);
+    roots.values.push_back(&release_pages_);
+    for (auto * value : { &request_map_, &token_relay_ }) {
         if (*value) roots.values.push_back(&value->value());
     }
     for (auto & view : views_) view.live_values(roots.values);
+    if (preparation_) {
+        roots.regions.push_back(&preparation_->region);
+        for (auto & [_, value] : preparation_->values) roots.values.push_back(&value);
+        for (auto & [_, members] : preparation_->groups) {
+            for (auto & value : members) roots.values.push_back(&value);
+        }
+    }
+    for (auto & parts : prepared_) {
+        for (auto & part : parts) {
+            roots.regions.push_back(&part.region);
+            for (auto & [_, value] : part.ports.outputs) roots.values.push_back(&value);
+        }
+    }
     for (auto & [_, indices] : chunks_) {
         if (indices.retained) roots.values.push_back(&indices.retained.value());
     }
@@ -859,20 +1004,6 @@ void RankStructure::live_state(GraphRoots & roots) {
     if (cache_release_) roots.regions.push_back(&cache_release_.value());
     graph_.live_state(roots);
     transfer_graph_.live_state(roots);
-}
-
-std::optional<std::size_t> RankStructure::idle() {
-    const auto begin = shared_.regions.size();
-    std::optional<std::size_t> control;
-    for (auto & view : views_) {
-        if (const auto completion = view.idle()) control = completion;
-    }
-    if (graph_.composition()) {
-        control = graph_.composition();
-        graph_.end_composition({});
-    }
-    stamp(begin);
-    return control ? std::optional(shared_.execution.region_call(*control).returned) : std::nullopt;
 }
 
 } // namespace markov::sglang

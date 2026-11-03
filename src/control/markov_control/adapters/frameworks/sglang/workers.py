@@ -54,6 +54,21 @@ class NativeWorkers:
             workers, groups = [], []
             for instance in source["instances"]:
                 configured = configurations[instance["id"]]
+                settings = configured["settings"]
+
+                # Cold Decode admission must fit even in an empty pool, before any worker starts polling.
+                if instance["mode"] == "decode":
+                    from sglang.srt.server_args import ServerArgs
+
+                    capacity = settings["max_total_tokens"] // settings["page_size"] * settings["page_size"]
+                    for request in configuration["workload"]["requests"]:
+                        required = request["prompt_tokens"] + ServerArgs.num_reserved_decode_tokens
+                        if required > capacity:
+                            raise ValueError(
+                                f"native Decode reservation cannot admit request {request['id']}: "
+                                f"{required} tokens exceed the {capacity}-token pool"
+                            )
+
                 model = Path(directory, instance["id"])
                 model.mkdir()
 
@@ -61,7 +76,7 @@ class NativeWorkers:
                 (model / "config.json").write_text(json.dumps(instance["model_config"]))
                 first = len(workers)
                 for rank in range(instance["tp"] * instance["pp"]):
-                    workers.append((instance, configured["settings"], str(model), rank))
+                    workers.append((instance, settings, str(model), rank))
                 for group in configured["groups"]:
                     begin = first + group["stage"] * instance["tp"]
                     groups.append(
@@ -137,6 +152,13 @@ class WorkerCall:
     participants: tuple
 
 
+@dataclass
+class ObjectSend:
+    value: object
+    finished: bool = False
+    waiter: object = None
+
+
 class NativeCalls:
     """Keep worker calls suspended independently until their core response arrives."""
 
@@ -148,6 +170,7 @@ class NativeCalls:
         self.membership = {rank: group for group in groups for rank in group["members"]}
         self.packets = defaultdict(deque)
         self.receivers = {}
+        self.object_sends = {}
         self.closing = False
         self.stopped = set()
         self.pending = {}
@@ -155,22 +178,49 @@ class NativeCalls:
         self.awaiting = {}
         self.sequence = 0
         self.polled = False
+        self.initialized = False
+        self.next_rank = 0
+
+    def finish_object(self, identity) -> None:
+        send = self.object_sends[identity]
+        send.value = None
+        send.finished = True
+        if send.waiter is not None:
+            send.waiter.send(None)
+            del self.object_sends[identity]
 
     def receive_worker(self, channel, rank, operation, message) -> None:
         group = self.membership[rank]
         members = tuple(self.connections[index] for index in group["members"])
+        if operation == "wait_object":
+            identity = message["identity"]
+            send = self.object_sends[identity]
+            if send.finished:
+                channel.send(None)
+                del self.object_sends[identity]
+            else:
+                send.waiter = channel
+            return
         if operation in ("send_object", "receive_object"):
             key = (group["instance"], message["source"], message["target"], message["channel"])
             if operation == "send_object":
-                if key in self.receivers:
+                identity = self.sequence
+                self.sequence += 1
+                self.object_sends[identity] = ObjectSend(message["value"])
+                if self.closing and message["channel"] == "requests":
+                    self.finish_object(identity)
+                elif key in self.receivers:
                     self.receivers.pop(key).send(message["value"])
+                    self.finish_object(identity)
                 else:
-                    self.packets[key].append(message["value"])
-                channel.send(None)
+                    self.packets[key].append(identity)
+                channel.send(identity)
             elif self.closing and message["channel"] == "requests":
                 channel.send([StopInput()])
             elif self.packets[key]:
-                channel.send(self.packets[key].popleft())
+                identity = self.packets[key].popleft()
+                channel.send(self.object_sends[identity].value)
+                self.finish_object(identity)
             else:
                 self.receivers[key] = channel
             return
@@ -214,6 +264,12 @@ class NativeCalls:
             self.polled = True
         elif message.get("kind") == "shutdown":
             self.closing = True
+
+            # Serving is drained; retire idle control packets before native send waits leave their loops.
+            for key in list(self.packets):
+                if key[3] == "requests":
+                    for identity in self.packets.pop(key):
+                        self.finish_object(identity)
             for identity, call in list(self.awaiting.items()):
                 if call.operation == "receive":
                     call.participants[0].send({"kind": "stop"})
@@ -227,11 +283,48 @@ class NativeCalls:
             for channel in call.participants:
                 channel.send(message["result"])
 
+    def quiescent(self) -> bool:
+        blocked = self.stopped | set(self.pending) | set(self.receivers.values())
+        calls = [*self.ready, *self.awaiting.values()]
+        for call in calls:
+            blocked.update(call.participants)
+
+        send_waiters = {send.waiter for send in self.object_sends.values() if send.waiter is not None}
+        blocked.update(send_waiters)
+        group_waiters = {call.participants[0] for call in calls if call.operation == "receive"}
+        group_waiters.update(channel for key, channel in self.receivers.items() if key[3] == "requests")
+        group_waiters.update(send_waiters)
+
+        # A TP leader's input or transport wait also blocks its peers' next native collective.
+        for group in self.groups:
+            members = [self.connections[index] for index in group["members"]]
+            if members[0] in group_waiters:
+                blocked.update(members)
+        return len(blocked) == len(self.connections)
+
     def dispatch(self) -> None:
         if not self.polled:
             return
         if self.ready:
-            call = self.ready.popleft()
+            if not self.initialized:
+                call = self.ready.popleft()
+            else:
+
+                # Local statistics cannot change state or time and may unblock a native CPU collective.
+                call = next((item for item in self.ready if item.message["kind"] in {"capacity", "free_slots"}), None)
+                if call is None:
+                    if not self.quiescent():
+                        return
+
+                    # Resolve a stable logical turn after native actors reach their visible boundaries.
+                    call = min(
+                        self.ready,
+                        key=lambda item: (
+                            (self.connections.index(item.participants[0]) - self.next_rank) % len(self.connections)
+                        ),
+                    )
+                    self.next_rank = (self.connections.index(call.participants[0]) + 1) % len(self.connections)
+                self.ready.remove(call)
             if self.closing and call.operation == "receive":
                 call.participants[0].send({"kind": "stop"})
                 return
@@ -239,6 +332,8 @@ class NativeCalls:
             self.sequence += 1
             self.peer.send({"kind": "call", "id": identity, "message": call.message})
             if call.operation == "send":
+                if call.message["kind"] == "ready":
+                    self.initialized = True
                 if call.message["kind"] == "stopped":
                     self.stopped.update(call.participants)
                 for channel in call.participants:
@@ -246,20 +341,7 @@ class NativeCalls:
             else:
                 self.awaiting[identity] = call
         else:
-            blocked = self.stopped | set(self.pending)
-            for call in self.awaiting.values():
-                blocked.update(call.participants)
-
-            blocked.update(self.receivers.values())
-            input_waiters = {call.participants[0] for call in self.awaiting.values() if call.operation == "receive"}
-            input_waiters.update(channel for key, channel in self.receivers.items() if key[3] == "requests")
-
-            # Input rank waits represent only that stage's native TP broadcast, never all PP participants.
-            for group in self.groups:
-                members = [self.connections[index] for index in group["members"]]
-                if members[0] in input_waiters:
-                    blocked.update(members)
-            if len(blocked) != len(self.connections):
+            if not self.quiescent():
                 return
             self.peer.send({"kind": "waiting"})
         self.polled = False

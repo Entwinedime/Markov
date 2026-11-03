@@ -44,21 +44,20 @@ class DockerEnvironment:
         seconds = max(1, remaining_ns // 1_000_000_000 - 2)
         return ["timeout", "--kill-after=1s", str(seconds), *arguments]
 
-    def native_command(self, arguments: list[str], output: Path, library: str, remaining_ns: int) -> list[str]:
-        return [
+    def native_command(self, arguments: list[str], output: Path, library: str | None, remaining_ns: int) -> list[str]:
+        command = [
             "docker",
             "exec",
             "--workdir",
             self.native_path(output),
-            "-e",
-            f"LD_PRELOAD={self.native_path(self.observer_build / library)}",
-            "-e",
-            f"MARKOV_NATIVE_RUNTIME_DIR={self.native_path(output / 'runtime')}",
-            "-e",
-            f"TRITON_CACHE_DIR={self.native_path(self.observer_build.parent / 'triton-cache')}",
-            str(self.native),
-            *self.limited(arguments, remaining_ns),
         ]
+        if library is not None:
+            command += [
+                "-e", f"LD_PRELOAD={self.native_path(self.observer_build / library)}",
+                "-e", f"MARKOV_NATIVE_RUNTIME_DIR={self.native_path(output / 'runtime')}",
+                "-e", f"TRITON_CACHE_DIR={self.native_path(self.observer_build.parent / 'triton-cache')}",
+            ]
+        return [*command, str(self.native), *self.limited(arguments, remaining_ns)]
 
     def build_command(
         self, directory: Path, definitions: list[str], targets: list[str], remaining_ns: int
@@ -76,6 +75,28 @@ class DockerEnvironment:
             self.label,
             "modeling",
             *self.limited(["flock", build + ".lock", "bash", "-c", script], remaining_ns),
+        ]
+
+    def python_command(self, arguments: list[str], remaining_ns: int) -> list[str]:
+
+        # Interpretation and evaluation share one task-owned Python environment without devices.
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--init",
+            "--network",
+            "none",
+            "--workdir",
+            str(self.root),
+            "--label",
+            self.label,
+            "-v",
+            f"{self.root}:{self.root}",
+            "-e",
+            f"PYTHONPATH={self.root}/src/application:{self.root}/src/collection:{self.root}/src/workload",
+            self.modeling_image,
+            *self.limited(["python3", *arguments], remaining_ns),
         ]
 
     def tool_command(self, arguments: list[str], inputs: list[Path], output: Path, remaining_ns: int) -> list[str]:

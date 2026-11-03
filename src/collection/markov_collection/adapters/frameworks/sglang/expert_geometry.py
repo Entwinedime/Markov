@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from markov_collection.adapters.runtimes.pytorch.indexing import TensorViewObservation
+from markov_collection.adapters.runtimes.pytorch.indexing import InputGeometries, TensorViewObservation
 from markov_collection.instrumentation.calls import NativeCall
 
 
@@ -16,7 +16,7 @@ class ModelPaddingCall(NativeCall):
         self.axis = axis
 
     @staticmethod
-    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: list[dict[int, Any]]) -> None:
+    def declare(regions: list[dict[str, Any]], values: list[dict[str, Any]], geometries: InputGeometries) -> None:
         for region in regions:
             metadata = region["metadata"]
             if metadata.get("interface") != "model_padding":
@@ -24,7 +24,7 @@ class ModelPaddingCall(NativeCall):
             source = metadata["ports"]["inputs"]["tensor"]
             output = metadata["ports"]["outputs"]["tensor"]
             parent = regions[region["parent"]]["metadata"]
-            shape = geometries[region["parent"]].get(source, values[source]["shape_relation"])
+            shape = geometries.shape(region["parent"], source)
             caller_contracts = parent.setdefault("shape_contracts", [])
             if not any(contract["value"] == source for contract in caller_contracts):
                 caller_contracts.append({"value": source, "shape": shape})

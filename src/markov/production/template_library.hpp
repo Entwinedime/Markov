@@ -13,7 +13,7 @@ namespace markov {
 // Role bindings stay independent while normalized work and layouts share one source-domain catalog.
 class TemplateLibrary {
 public:
-    void add(const nlohmann::json & source);
+    void add(nlohmann::json source);
     void add_instances(const nlohmann::json & instances);
     nlohmann::json document() &&;
 

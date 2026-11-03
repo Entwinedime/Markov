@@ -100,6 +100,7 @@ public:
     void append(const ExecutionPattern & pattern, std::span<const std::size_t> resources, std::size_t operation, std::size_t region);
     void append(ExecutionGraph fragment, std::size_t operation_offset, std::size_t region_offset, std::size_t resource_offset = 0);
     void append_host(std::size_t region, std::size_t resource);
+    void separate_entry(std::size_t region);
     void initially_idle(std::size_t resource);
     void depend(std::size_t source, std::size_t target, std::string kind);
     std::vector<std::size_t> initial_nodes(std::size_t begin) const;

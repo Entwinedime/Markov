@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sqlite3
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.native_calls import NativeRuntimeCalls, event_time_ns
@@ -98,24 +102,37 @@ class AscendTrace:
         # Close every native recording window before spending time on CPU-side analysis.
         return original(directory, analyse_flag=False)
 
-    @staticmethod
-    def exported_trace(directory: Path) -> Path:
+    @classmethod
+    def from_capture(
+        cls, directory: Path, output: Path, runtime_directory: Path, *, device: int, communication: bool = False,
+    ) -> AscendTrace:
         from torch_npu.profiler.analysis._npu_profiler import NpuProfiler
         from torch_npu.profiler.analysis.prof_common_func._constant import Constant
         from torch_npu.profiler.analysis.prof_common_func._path_manager import ProfilerPathManager
 
         (profile,) = ProfilerPathManager.get_profiler_path_list(str(directory))
-        trace = Path(profile) / Constant.OUTPUT_DIR / "trace_view.json"
-        trace.parent.mkdir(exist_ok=True)
+        trace = output / "trace_view.json"
+        trace.parent.mkdir(parents=True, exist_ok=True)
 
         # SDK output is not atomic; an existing trace can belong to an interrupted analysis.
         trace.unlink(missing_ok=True)
 
-        # Structural observation consumes the timeline, not database and aggregate report exports.
-        NpuProfiler.analyse(
-            profile, analysis_type=Constant.EXPORT_CHROME_TRACE, output_path=str(trace), export_type=[Constant.Text]
-        )
-        return trace
+        # The SDK writes logs and CANN tables beside its input, even with an external trace destination.
+        with TemporaryDirectory(prefix="sdk-", dir=output) as temporary:
+            workspace = Path(temporary) / Path(profile).name
+            shutil.copytree(profile, workspace, ignore=shutil.ignore_patterns(Constant.OUTPUT_DIR, "logs"))
+            try:
+                NpuProfiler.analyse(
+                    str(workspace), analysis_type=Constant.EXPORT_CHROME_TRACE,
+                    output_path=str(trace), export_type=[Constant.Text],
+                )
+
+                # Load clocks and communication tables before releasing the writable SDK workspace.
+                return cls(trace, workspace, runtime_directory, device=device, communication=communication)
+            finally:
+                logs = workspace / "logs"
+                if logs.is_dir():
+                    shutil.copytree(logs, output / "logs", dirs_exist_ok=True)
 
     runtime_kinds = {
         "aclrtMemcpy": "copy",
@@ -129,11 +146,15 @@ class AscendTrace:
         "aclrtSynchronizeEventWithTimeout": "wait_event_complete",
     }
 
-    def __init__(self, path: Path, runtime_directory: Path | None = None, *, device: int) -> None:
+    def __init__(
+        self, path: Path, profile: Path, runtime_directory: Path | None = None,
+        *, device: int, communication: bool = False,
+    ) -> None:
         self.device = device
         self.runtime = (
-            NativeRuntimeCalls(runtime_directory, path.parent.parent) if runtime_directory is not None else None
+            NativeRuntimeCalls(runtime_directory, profile) if runtime_directory is not None else None
         )
+        self.communication_calls = self.read_communications(profile) if communication else None
 
         categories = {"async_npu", "async_task_queue", "enqueue", "dequeue", "HostToDevice"}
         self.events = []
@@ -174,6 +195,20 @@ class AscendTrace:
             or event["args"].get("connection_id") in connections
         ]
         self.queues = NativeQueues(self.events)
+
+    @staticmethod
+    def read_communications(profile: Path) -> list[dict[str, Any]] | None:
+        databases = list(profile.glob("PROF*/host/sqlite/hccl.db"))
+        if not databases:
+            return None
+
+        (database,) = databases
+        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            rows = connection.execute("SELECT group_name, op_type, connection_id, count, data_type FROM HCCLOP")
+            return [
+                dict(group=group, primitive=primitive, connection=identity, elements=count, dtype=dtype)
+                for group, primitive, identity, count, dtype in rows
+            ]
 
     @staticmethod
     def runtime_api(event: dict[str, Any]) -> str | None:
@@ -359,6 +394,12 @@ class AscendTrace:
                 if event.get("name") in self.runtime.callbacks:
                     queries[index] = self.queues.origin(event) or event
 
+        # Native group identity comes from CANN; its launch connection resolves the original caller.
+        for call in self.communication_calls or ():
+            launch = launches.get(call["connection"])
+            if launch is not None:
+                queries[launch] = self.queues.origin(self.events[launch]) or self.events[launch]
+
         owners = self.ownership(queries)
         if self.runtime is not None:
             self.runtime.bind_callbacks(self.events, actions, owners)
@@ -410,6 +451,17 @@ class AscendTrace:
             for identity, owner in owners.items()
             if all(owner[kind] is None or owner[kind] < count for kind, count in limits.items())
         }
+
+        communications = None if self.communication_calls is None else []
+        for call in self.communication_calls or ():
+            launch = launches.get(call["connection"])
+            if launch is not None and launch not in observed:
+                continue
+            communications.append({
+                **call,
+                "owner": owners.get(launch),
+                "submission": self.queues.submission(launch) if launch is not None else None,
+            })
 
         # The profiler can stop after the source flush; later scopes belong to the next observation window.
         outside = {
@@ -509,6 +561,7 @@ class AscendTrace:
             "unassociated_runtime_actions": unassociated_runtime,
             "unassociated_tasks": unmatched,
             "observer_controls": observer_controls,
+            "communication": communications,
         }
 
     @staticmethod

@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.base.conn import BaseKVReceiver, BaseKVSender, KV
 from sglang.srt.disaggregation.utils import KVClassType, setup_state_kv_args
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler_components.batch_result_processor import SchedulerBatchResultProcessor
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 
 class GraphTransport:
@@ -34,9 +35,7 @@ class GraphSender(BaseKVSender):
     def __init__(self, mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank):
         self.manager = mgr
         self.request = bootstrap_room - 1
-        self.sent = False
         self.conclude_state = None
-        mgr.peer.call("transfer_sender", request=self.request)
 
     def init(self, num_kv_indices, aux_index=None):
         self.index = aux_index
@@ -63,7 +62,6 @@ class GraphSender(BaseKVSender):
             metadata_slot=self.index,
             payload=payload,
         )
-        self.sent = True
 
     def poll(self):
         if self.conclude_state is not None:
@@ -72,8 +70,6 @@ class GraphSender(BaseKVSender):
         if state == "completed":
             self.conclude_state = KVPoll.Success
             return self.conclude_state
-        if self.sent:
-            return KVPoll.Transferring
         return KVPoll.WaitingForInput if state == "ready" else KVPoll.Bootstrapping
 
     def get_transfer_metric(self):
@@ -93,10 +89,12 @@ class GraphReceiver(BaseKVReceiver):
         self.initialized = False
 
     def init(self, prefill_dp_rank):
-        self.manager.peer.call("transfer_receiver", request=self.request)
         self.initialized = True
 
     def send_metadata(self, kv_indices, aux_index=None, state_indices=None, decode_prefix_len=None):
+        self.manager.peer.call(
+            "advertise", request=self.request, pages=(kv_indices - 1).tolist(), metadata_slot=aux_index
+        )
         self.index = aux_index
 
     def poll(self):
@@ -104,13 +102,11 @@ class GraphReceiver(BaseKVReceiver):
             return self.conclude_state
         if not self.initialized:
             return KVPoll.Bootstrapping
-        result = self.manager.peer.call("transfer_poll", request=self.request)
-        if result["state"] == "bootstrapping":
-            return KVPoll.Bootstrapping
         if self.index is None:
             return KVPoll.WaitingForInput
+        result = self.manager.peer.call("transfer_poll", request=self.request)
         if result["state"] != "completed":
-            return KVPoll.Transferring
+            return KVPoll.WaitingForInput
 
         # Metadata enters native CPU views only after the simulated copy has completed.
         for name, values in result["payload"].items():
@@ -180,18 +176,23 @@ class DisaggregatedScheduler(NativeScheduler):
         self.batch_result_processor = PrebuiltResults(
             **{field.name: getattr(processor, field.name) for field in fields(processor)}, controller=self
         )
+        HookRegistry.register(
+            "sglang.srt.disaggregation.utils._poll_with_failure_injection", self.poll_readiness, HookType.AROUND
+        )
+        HookRegistry.apply_hooks()
+
+    def poll_readiness(self, original, pollers):
+        if pollers:
+
+            # Advance the observation boundary before native code reads resources and reaches its own consensus.
+            self.peer.call("poll", requests=[poller.request for poller in pollers])
+        return original(pollers)
 
     def process_input_requests(self, requests):
 
         # PD performs allocation and polling before selecting a model batch.
         self.begin_iteration()
         return super().process_input_requests(requests)
-
-    def get_next_disagg_prefill_batch_to_run(self):
-        return self.prepare(super().get_next_disagg_prefill_batch_to_run())
-
-    def get_next_disagg_decode_batch_to_run(self):
-        return self.prepare(super().get_next_disagg_decode_batch_to_run())
 
     def process_prefill_chunk(self):
 
@@ -201,7 +202,4 @@ class DisaggregatedScheduler(NativeScheduler):
 
 
 class PipelineDisaggregatedScheduler(DisaggregatedScheduler, PipelineScheduler):
-    def get_new_batch_prefill(self):
-
-        # The PP prefill loop selects here, bypassing the single-stage disaggregated entry point.
-        return self.prepare(super().get_new_batch_prefill())
+    """Combine native PD queues and PP transport under their shared scheduling boundary."""

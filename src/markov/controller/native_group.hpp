@@ -29,6 +29,7 @@ public:
     void begin_iteration(std::size_t flow, std::size_t lane);
     std::optional<ServingAction> plan(const nlohmann::json & message, std::int64_t now_ns, std::size_t delivered);
     nlohmann::json resource_call(const nlohmann::json & message, std::size_t delivered);
+    nlohmann::json allocation_bindings(const Batch & batch) const;
     void start(const ServingAction & action);
     void finish(const ServingAction & action, std::span<const std::size_t> returned_pages);
     bool caught_up(std::size_t delivered) const;
@@ -40,8 +41,9 @@ private:
     std::vector<std::size_t> resident_requests(const nlohmann::json & requests, std::size_t delivered) const;
     Batch resident_batch(const nlohmann::json & requests, std::size_t delivered) const;
     struct Preparation {
-        std::vector<BatchPreparation> operations;
+        std::vector<Batch> batches;
         std::size_t lane;
+        ServingStep next = ServingStep::PrepareInputs;
     };
     struct Frame {
         std::shared_ptr<const BatchWork> work;
@@ -52,6 +54,9 @@ private:
         std::set<std::string> messages;
         bool released = false;
         std::vector<std::int64_t> generated_before{};
+
+        // Result owns these cache calls; resource residency remains in KvPool.
+        std::vector<std::size_t> cache_order{};
     };
     void observe_progress(Frame & frame, const nlohmann::json & members) const;
     BatchEffects result_effects(const Frame & frame, const nlohmann::json & members) const;

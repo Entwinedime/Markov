@@ -164,6 +164,20 @@ void ExecutionGraph::append_host(std::size_t region, std::size_t resource) {
     call(owner, { node, node });
 }
 
+void ExecutionGraph::separate_entry(std::size_t region) {
+    auto & ports = host_calls_.at({ ExecutionOwner::Kind::Region, region });
+    const auto entry = first_node_ + nodes_.size();
+    const auto resource = nodes_.at(ports.entry - first_node_).step.resource;
+    nodes_.push_back({ { ExecutionKind::WaitEntry, resource, std::nullopt, "call_entry" }, { ExecutionOwner::Kind::Region, region } });
+
+    // A remote effect can depend on call entry without waiting for the local CPU service to return.
+    for (auto & edge : dependencies_) {
+        if (edge.target == ports.entry) edge.target = entry;
+    }
+    depend(entry, ports.entry, "call_entry");
+    ports.entry = entry;
+}
+
 void ExecutionGraph::initially_idle(std::size_t resource) { initially_idle_.insert(resource); }
 
 void ExecutionGraph::append(const ExecutionPattern & pattern, std::span<const std::size_t> resources, std::size_t operation, std::size_t region) {
