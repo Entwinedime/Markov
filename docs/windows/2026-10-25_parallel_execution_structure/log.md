@@ -5049,3 +5049,629 @@
 **验证：** 入口调用/依赖及修改影响作静态审查，单文件Ruff、Python3.10语法及Git格式通过；本批业务0行、example只改1行，无C++、镜像、采集或仿真变化。处理0.853s，原开发任务累计1210.801s/1800s、native0、pending为空；依据为开发根results/final-interface-regression/freeze-scope-review.json。最终冻结核对须在本次提交登记后经正式入口执行，不将当前静态结果写成冻结运行已通过。
 
 **结论与限制：** A交付事实已核实，独立比较的冻结职责与实际依赖对齐；尚未消费54个独立目标的图。后续原生来源、正式预测及比较仍按原清单串行推进，已取得的真实目标继续复用，所有报错和未覆盖收齐后统一总结。
+
+## 2026-11-04 — S11-B启动：登记最终冻结并恢复完整调查
+
+**范围：** 冻结准备5713ed00dced950118b832c874cb3d9ecd4a1436已提交推送，远端核对一致；以该提交同时作为核心/适配/评价基线，沿原44/252/54/31/7及136项外围清单启动正式B，原请求种子、备用顺序和累计额度不变。
+
+**改动：** 同一调查根由capture_frozen交接为frozen，登记原生8fc4005539d3、控制94461194f31f、modeling e066a5196c3b；保留startup/capture-freeze历史及54目标的5fc920e9fa2d实际生产身份。调用既有run.sh investigate入口，按域完成来源/预测后消费该域固定真实目标，全部结果收齐前不修改核心、适配或评价；没有复制任务、增加后端或重生成矩阵。
+
+**验证：** 正式verify_freeze、镜像及整轮临时/保留存储检查通过；启动快照为59次尝试、native19336.990s/processing1166.905s、pending全空，依据为新根results/comparison-freeze.json。调查会话96909已确认存活，qwen3-tp1状态running/pending processing，8次原生尝试保持；正式Release入口仅重编已有注释变更涉及的simulation.cpp并链接成功，随后复用第8次来源进行SDK解释，所属解释容器e45d85481dab存活。当前没有新增Engine或独立比较结果。
+
+**结论与限制：** 正式B已经启动，当前证据只证明冻结与来源处理正在执行，不代表任何新目标通过。运行中的处理余额按既有协议整额预留，不将charged_ns临时上升误报为实际费用；不重复启动根写者。下一步等待原入口发布工作流/目标结果，并保留所有失败后统一汇报，S11及整个goal仍未完成。
+
+## 2026-11-04 — S11-B：首个来源发布与冻结链路静态审查
+
+**范围：** 同一调查会话96909持续运行，冻结5713ed0不变；静态联查CLI、SourceGraph/SourceProjection、SourcePartitions/TemplateLibrary、模板实例、ObservedFeedback、请求内容映射及NativeGroup/KvPool，不把此关联子集写成全仓审查完成。
+
+**改动：** 没有修改源码、规则、矩阵或镜像。核对来源父调用/生产者合同在投影和编译前建立，编译期形状声明借用不可变来源、按最近作用域解析，调用方持有catalog与角色直至实例销毁；旁路只按具名工作匹配边界，来源scope仅在结果中交给评价。请求逻辑身份对应共同WorkloadContent，框架适配只提供槽位/页视图，实际预约、回收及前缀状态仍归核心；未在这些已读链路中确认新的协议缺陷。
+
+**验证：** 调查句柄及所属容器均确认存活，冻结路径Git差异为空。qwen3-tp1复用同一来源发布130定义/230布局/63执行模式/1角色库，随后已发布21份给定耗时预测，当前failures为空、原生尝试仍8次；实际结果仍由原工作流继续汇总。未另启仿真、采集、编译或检查工具，未占用调查根的第二个状态写者；依据为该域assets/domain-0/templates.json、state.json、logs/run.log及冻结源码。
+
+**结论与限制：** 来源生产与目标展开已在本轮冻结代码下连续推进，暂未发生新的运行失败。当前审查是源码资格，既不证明整套泛化正确，也不替代真实窗口比较；内部实际计时、到达接收及其他未读模块仍保留相应验证义务。继续收齐正式矩阵，不基于局部结果修补。
+
+## 2026-11-04 — S11-B：首个工作流及三项独立目标完成
+
+**范围：** 冻结5713ed0下继续同一调查，完成qwen3-tp1原30项配置×workload并消费small/boundaries、r32/members-32、r33/members-33独立真实记录；没有另起调查、重跑原生目标或修改核心/适配/评价。
+
+**改动：** 首域正式工作流已发布全部30份给定耗时结果，invalid_completions和prediction_errors均为空；原入口随后自动进入该域预选真实目标，成功发布三份完整比较报告并继续其余目标。主工作流和窗口状态分别更新项目级结论与当前恢复点，不把此前captured状态算作通过。
+
+**验证：** 三例均matched，rank0分别16393/7185/7190项公开操作全部对应，模型主体12/6/6个，未归属物理任务/runtime动作均0；五项完成、默认/明细一致性及内部检查通过，首例七项窗口及12项可测内部检查均通过。首例实际Prefill/Decode达到3成员，后两例原生和预测分别达到32/33，未据此宣称128；报告位于该域results/validation下对应目标的native/validation-<配置>-<workload>.json及各自rank-0.json。工作流结束时快照为processing1000.122s、native1737.958s/8次，当前目标后处理继续沿同一任务累计，活动预留额不计为已消耗；所属句柄96909及控制/解释容器仍存活，冻结Git差异为空。
+
+**结论与限制：** 三项冻结独立目标取得限定范围通过证据，证明本轮来源生产、变换展开、真实边界反馈及正式评价已连续交接，并包含实际32/33成员；尚不代表全矩阵、其他模型/拓扑或更大成员泛化成立。内部实际计时、不透明几何和真实KV数值不属于该通过结论，继续收齐其余案例后统一总结，不现场修补。
+
+## 2026-11-04 — S11-B：首域真实结果收齐并继续TP2来源
+
+**范围：** 同一冻结5713ed0调查完成qwen3-tp1剩余128成员、长输出及错峰目标，随后进入TP2来源；另静态审阅Ascend的两个C++桥及其CMake，源码与评价均不修改。
+
+**改动：** 六个真实目标最终为4 matched、1 partial、1 differences。128成员原生与预测的Prefill/Decode均实际达到128，7665项公开操作及六个模型主体对应；它和32/33成员共用130/230/63/1库，没有按结果补图。长输出67300项公开操作及全部窗口检查对应，但1个设备任务未归属；错峰的公开窗口及内部检查matched，原生证据只在input_delivery/not_submitted_early失败。两项未通过均保留原性质和报告，未判断具体根因或加例外。
+
+**验证：** 首域30份给定耗时结果无完成错误，六个真实目标的完成、默认/明细及预测内部检查均通过；结果分别在该域results/validation的具名目标下。首域结束pending为空，累计native1737.958s/8次、processing2107.583s/6300s、峰值2051864054字节；六目标全部复用既有真实记录。调查96909继续存活，TP2第3/4次尝试分别发布两个代表来源，随后转processing继续解释/建库，此前两次属于已完成目标采集。SDK源码静态核对C++23及Torch/SDK ABI分离、原调用区间与记录开销分离、单次追加记录及失败不伪造成功、有限整数查询域压缩而不拟合阈值；没有为审查增加编译或运行。
+
+**结论与限制：** 本轮首次取得实际128成员的独立结构证据，关闭该TP1范围的覆盖未知；它不等于至少200页的大分配或其他拓扑通过。长输出设备归属与错峰输入证据差异留待整轮统一归因，不套用旧PD问题解释；静态SDK审阅不是所有ABI/设备场景均运行过的证明。继续完整矩阵与必要来源，冻结资产保持。
+
+## 2026-11-04 — S11-B：TP2至TP8结果收齐并进入PP
+
+**范围：** 同一调查96909、冻结5713ed0下完成TP2/4/8三域的计划来源、20项给定耗时展开和四个真实目标，随后进入qwen3-tp1-pp3；不修改冻结源码、矩阵、镜像或评价。
+
+**改动：** TP2两个真实目标matched，含KV262144长上下文边界；TP4目标在rank2空成员select/running工作与旁路反馈无法对应处error；TP8目标八rank均matched。TP4/8均仅观察rank0/1，其余角色绑定rank1；TP8本例证明六个未观察角色可以复用，TP4失败原因仍未知，未据此修规则。同步窗口状态及主工作流，区分来源发布、给定耗时完成与真实独立通过。
+
+**验证：**
+
+- TP2两例各444项通信/1776条完成关系对应；TP8共60048/60048公开操作、48模型主体、444项通信/7104条完成关系对应，八rank窗口检查通过，未归属任务/runtime动作均0，五项完成及默认/明细一致性通过。
+- 三域累计native772.295/618.302/626.081s、尝试4/3/3次，processing859.385/482.980/1019.297s，终态pending均空；本批各新增两个代表来源，真实目标均复用，依据为各域results/validation及根outcomes.json。至此正式完成4/44工作流、50/252展开、10/54目标（7 matched、1 partial、1 differences、1 error）；活跃句柄和PP所属容器已确认，冻结Git差异为空。
+- 静态联查模板资产/选择/发布、调查恢复、ServingWorkflow、Executor及RegionGraph/ExecutionGraph回收：角色派生不改共享catalog，来源完成不跳过正式比较，发布与状态提交分开，未匹配端点及在途尾部跨回收保留。没有在已读子集中确认新缺陷，没有另加编译或运行检查，不将该审阅写成全仓审查完成。
+
+**结论与限制：** TP8通过只授予本例的代表复用与连接证据，不覆盖TP4反馈失败或其他拓扑。当前三项未通过类型全部保留，整轮结束后统一分析，未将局部静态审阅或工作流complete写成全仓正确；调查继续运行，S11及goal未完成。
+
+## 2026-11-04 — S11-B：PP3完整对照与模板归一化关联审阅
+
+**范围：** 同一冻结5713ed0调查完成qwen3-tp1-pp3的六项给定耗时展开及两个真实目标，随后发布PP4的一个计划来源并转离线解释；静态联查模板定义/布局生成、执行模式选择/共享及成员归并展开，未修改冻结资产。
+
+**改动：** PP3普通目标matched，错峰目标differences；后者仅input_delivery/not_submitted_early失败，发送侧最小延迟-57480ns，全部rank公开窗口、预测内部及通信检查仍matched。两例原结果完整保留，未将投递差异改判为通过或提前归因；同步当前状态，不重采既有目标。
+
+**验证：**
+
+- 三rank两例分别18666/18690项公开操作全部对应，各39个模型主体、91项通信/364条完成关系，未归属设备任务/runtime动作均0；五项完成和默认/明细一致性通过。
+- 库177定义/393布局/66执行模式/3观察角色，任务终态pending为空，累计native694.869s/3次、processing744.041s，峰值749125260字节；依据为该域assets/domain-0/templates.json、state.json及results/validation下两份报告。
+- 静态联查TemplateLibrary/ExecutionSource/GroupExecution、WorkerRolePlan及应用/CLI调用：局部槽位保留别名，固定数值/会话资源进入绑定，执行选择只接受同域唯一资源对应且借用不再传播，成员归并按声明fan-in展开验证过的主体；代表计划在原生初始化后确定，CLI先装入观察来源再追加派生角色。没有新增编译、仿真或检查平台。
+- 后继PP4来源的role-plan.json记录4个参与worker、rank0/1/3为观察代表，rank2由rank1绑定并偏移9层；本批新增来源1次，任务已有目标1次，累计native506.959s/2次，processing正在预留中，不作实际消耗报告。来源已进入state.sources，未据此宣称PP4目标通过。
+
+**结论与限制：** 正式完成5/44工作流、56/252展开、12/54真实目标，当前8 matched、1 partial、2 differences、1 error；PP4已转processing，同一调查96909仍存活。关联审阅没有在已读范围内确认新缺陷，仍不代表所有模板/适配均正确；投递证据与TP4反馈等问题留待整轮统一分析，冻结及原有额度保持。
+
+## 2026-11-04 — S11-B：PP4中间stage复用通过与缓存所有权审阅
+
+**范围：** 同一冻结5713ed0调查完成qwen3-tp1-pp4建库、六项给定耗时展开及一个完整真实目标；关联静态审阅PrefixIndex、KvPool、NativeGroup和Python PrefixCache/IndexTrace，冻结源码、镜像及判据均未修改。
+
+**改动：** PP4来源观察rank0/1/3，rank2由rank1绑定并偏移9层；177定义/393布局/66执行模式/4角色库完成全部展开，随后四个真实rank的目标wide/boundaries均matched。同步状态与主工作流，调查继续TP2×PP3计划来源，不重跑既有真实目标。
+
+**验证：** 四rank共19968/19968项公开操作、52个模型主体、130项通信/520条完成关系对应，窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/wide/boundaries/native下报告及rank明细。PP4任务终态pending为空，累计native506.959s/2次、processing546.533s，峰值667157754字节；仅本批一个来源为新增原生，另一次为既有目标。静态检查缓存内容匹配/分裂/引用/LRU归核心，适配器维护必要索引张量和原生请求方法，槽位释放与页归还分开、页在工作完成后回池；没有在已读交接中确认新缺陷，未为审查增加运行或编译。
+
+**结论与限制：** 正式完成6/44工作流、62/252展开、13/54真实目标（9 matched、1 partial、2 differences、1 error），同一调查96909及后继TP2×PP3容器仍存活，冻结Git差异为空，文档diff检查通过。PP4只证明本例中间stage复用，不授予其他模型、联合拓扑或缓存配置资格；全矩阵、既有未通过及缓存独立运行义务继续保留，本次静态子集不计为全仓审查完成。
+
+## 2026-11-04 — S11-B：TP2×PP3完整对照与通信依赖审阅
+
+**范围：** 同一冻结5713ed0调查完成TP2×PP3计划来源、建库、六项展开及既有真实目标对照，继续TP2×PP4来源；静态追踪ParallelTopology、ParallelComposition、ExecutionGraph及其ServingStructure/DisaggregatedStructure调用，不修改冻结代码或评价。
+
+**改动：** 来源六个worker均为观察代表，首/中/尾stage及各stage的TP主/从职责没有合并；库208定义/510布局/70执行模式/6角色完成六项给定耗时结果，invalid_completions和prediction_errors为空。wide/boundaries完整真实目标六rank均matched；同步状态与主工作流，不增加目标采集。
+
+**验证：**
+
+- 六rank共39156/39156项公开操作、78个模型主体、1205项通信/4820条完成关系对应，全部窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/wide/boundaries/native报告及rank明细。
+- role-plan.json、assets/domain-0/templates.json及state.json核实一次新增来源、累计两次原生尝试/native509.118s，另一次为既有目标；终态pending为空、processing876.771s、峰值1544803867字节。正式累计7/44工作流、68/252展开、14/54真实目标（10 matched、1 partial、2 differences、1 error），同一调查96909和后继TP2×PP4容器存活，冻结路径差异为空。
+- 静态核对通信按flow/组及具名端点FIFO配对、逐peer split和几何一致性、未配对端点回收保留，以及模板资源序列/事件/调用端口的边界校验和实例绑定；没有增加运行或编译。另确认protocol.cpp:130/143端点查询扫描全部依赖，disaggregated.cpp:242每动作调用末端查询；详细模式保留全历史时存在累计重复扫描，实际占比未测量。
+
+**结论与限制：** TP2×PP3本例取得联合拓扑独立通过证据，不授予其他组合；静态子集不构成全仓正确性证明。历史依赖重复扫描是后续统一收紧项，可用新增片段的依赖区间消除；不先增加缓存或逐调用特判，不将该风险说成已有失败的根因。CPU操作数仍有现有保守访问范围，静态审阅不授予细粒度证据；整轮结果收齐前保持冻结。
+
+## 2026-11-04 — S11-B：八worker完整对照与任务/评价交接审阅
+
+**范围：** 同一冻结5713ed0调查完成TP2×PP4计划来源、建库、六项展开及完整真实目标，继续Mistral来源；静态追踪应用command/environment/native、Exploration.step/run及评价入口NativeValidation/StructureComparison、关联操作/依赖路径，不修改冻结代码、镜像或判据。
+
+**改动：** 八worker参与、仅观察rank0/1/2/3/6/7，rank4/5分别由rank2/3绑定并偏移9层；208定义/510布局/70执行模式/8角色库完成六项展开，invalid_completions和prediction_errors为空。full-micro/boundaries八rank完整对照matched，含两个未观察角色；状态文档压缩逐域费用重复叙述，最终费用仍保留在各任务和日志，不改历史结果，没有追加目标采集。
+
+**验证：**
+
+- 八rank共19100/19100项公开操作、48个模型主体、616项通信/2464条完成关系对应，全部窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/full-micro/boundaries/native报告及rank明细。
+- role-plan.json、assets/domain-0/templates.json及state.json核实一次新增来源、累计native519.901s/2次，另一次为既有目标；终态pending为空、processing750.413s、峰值1051880539字节。同一调查96909及后继mistral-tp1-pp1容器存活，冻结Git差异为空。
+- 静态检查单调计时、清理后结算预留、按所属标签回收、管道/构建锁寿命、双方成功退出后原子发布及来源工作区归属；评价合并完成/资源、默认与明细、整窗口、原生及通信证据，缺失/未知/未归属保留partial或error，数据/CPU返回必需路径和事件/流连接另有检查。没有在已读交接中确认新缺陷，没有增加编译或额外运行。
+
+**结论与限制：** 正式累计8/44工作流、74/252展开、15/54真实目标（11 matched、1 partial、2 differences、1 error）；TP2×PP4取得本例完整对照及两个中间角色复用资格。任务/评价静态子集不替代故障运行或全仓审查，也不授予全图逐边等价、物理并发或计时资格；七模型调查继续，已有未通过与历史扫描风险留待统一处理，整轮冻结保持。
+
+## 2026-11-04 — S11-B：Mistral TP1完整对照与模型入口审阅
+
+**范围：** 同一冻结5713ed0调查完成Mistral-7B-v0.3/BF16 TP1的计划来源、建库、四项展开及完整真实目标；静态联查SGLang ModelForwardCall、PyTorch ModuleState/ModuleObservation及NativeCall构造，未修改源码、镜像、矩阵或判据。
+
+**改动：** 127定义/221布局/62执行模式/1角色库完成四项展开，invalid_completions和prediction_errors为空；wide/boundaries真实目标matched。本次沿已有模块/参数/缓冲区及框架批次端口取得模型结构，没有新增模型分支；同步状态与主工作流，调查继续Mistral TP4，不重采已有目标。
+
+**验证：**
+
+- 6092/6092项公开操作、6个模型主体对应，七项窗口检查、五项完成和默认/明细一致性通过，未归属设备任务/runtime动作均0；TP1无跨rank通信，不将0项通信检查当成分布式证据。
+- 该域results/validation/wide/boundaries/native下报告和state.json记录终态pending为空，累计native370.089s/2次、processing277.314s，峰值430450669字节，本批新增来源1次、另一次为既有目标；正式累计9/44工作流、78/252展开、16/54目标（12 matched、1 partial、2 differences、1 error）。
+- 静态确认modules.py:64在包装器构造/赋值前登记originals，构造失败且原forward为类属性时，restore删除不存在实例属性会再抛AttributeError；NativeCall的签名检查是可抛错路径之一，未额外故障运行。
+
+**结论与限制：** 新模型在本例取得独立结构对应，不能推定其TP/PP/PD或其他模型均通过。ModuleObservation恢复顺序为源码确认的P2缺陷，影响原异常可见性与已安装插桩恢复；后续成功覆盖后再登记，无须增加分支或包装层，本轮不修改冻结资产，也不把它说成本次运行已触发。调查96909及后继来源容器保持存活，继续收齐整轮后统一整改。
+
+## 2026-11-04 — S11-B：Mistral TP4完整对照及代表复用
+
+**范围：** 同一冻结5713ed0调查完成Mistral TP4的两个计划代表来源、建库、四项给定耗时展开及wide/boundaries既有真实目标，继续Mistral PP3来源；不修改代码、镜像、矩阵或评价。
+
+**改动：** 观察rank0/1，rank2/3按实际词表分片绑定rank1；132定义/230布局/66执行模式/4角色库完成全部展开，invalid_completions与prediction_errors为空，随后四个真实rank的完整对照均matched。同步恢复点，来源和预测均按原流程产生，没有增加模型特化或目标采集。
+
+**验证：** 四rank共26024/26024项公开操作、24个模型主体、396项通信/3168条完成关系对应，全部窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/wide/boundaries/native报告及rank明细。role-plan.json、assets/domain-0/templates.json及state.json核实本批新增两个来源会话、累计native563.450s/3次，另一次为既有目标；终态pending为空、processing563.713s，峰值1056273696字节。正式累计10/44工作流、82/252展开、17/54目标（13 matched、1 partial、2 differences、1 error），同一调查96909及后继Mistral PP3容器存活，冻结路径Git差异为空；未另加编译或检查运行。
+
+**结论与限制：** Mistral TP4本例取得两个未观察角色的独立对应及通信证据，不替代Qwen3 TP4的反馈失败，也不推广到其他模型/拓扑。所有结果收齐前保持冻结，已有结构失败、恢复缺陷和重复扫描风险均保留；后续继续Mistral PP3，仍不重跑已有真实目标。
+
+## 2026-11-04 — S11-B：Mistral PP3非均分层完整对照
+
+**范围：** 同一冻结5713ed0调查完成Mistral PP3的计划来源、建库、六项展开及完整真实目标，继续Mistral PP4；关联静态阅读ServingTopology与KvTransfers，不修改源码、模型适配、矩阵或评价，不追加目标采集。
+
+**改动：** 三个worker均为观察代表，原生rank0/1/2层范围分别[0,10)、[10,21)、[21,32)，即10/11/11层；171定义/366布局/66执行模式/3角色库完成六项展开，invalid_completions和prediction_errors为空。small/boundaries三个真实rank完整对照matched；同步恢复点，来源保留实际分片，没有按等层数假定替换。
+
+**验证：**
+
+- 三rank共28611/28611项公开操作、66个模型主体、154项通信/616条完成关系对应，全部窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/small/boundaries/native下报告及rank明细。
+- 来源role-plan.json与rank-0/1/2.json记录三个代表及上述environment.layer_range；终态state.json为pending空，累计native503.793s/2次、processing577.367s，峰值806230204字节，本批只新增来源1次、另一次为既有目标。正式累计11/44工作流、88/252展开、18/54目标（14 matched、1 partial、2 differences、1 error），调查96909及后继Mistral PP4容器存活。
+- 静态核对ServingTopology按原生TP/PP坐标建组、KvTransfers按登记的层/head区间匹配，并未通过总层数除PP推算传输范围；未确认新缺陷，没有另加编译或检查运行。该静态阅读不替代PD真实对照。
+
+**结论与限制：** Mistral PP3本例取得非均分层下的完整独立结构证据，不授予其他模型、配置或PD资格。保持同一冻结基线和既有额度，已有未通过、异常恢复缺陷及历史扫描风险继续保留；后续按原流程推进，不基于局部结果修补。
+
+## 2026-11-04 — S11-B：Mistral PP4完整对照与角色复用
+
+**范围：** 同一冻结5713ed0调查完成Mistral PP4的计划来源、建库、六项给定耗时展开及wide/boundaries既有真实目标，继续Qwen1.5-MoE EP1来源；不修改代码、镜像、矩阵或评价，不增加目标采集。
+
+**改动：** 四worker参与、观察rank0/1/3，rank2由rank1绑定，按原生层范围[16,24)得到偏移8；171定义/366布局/66执行模式/4角色库完成全部展开，invalid_completions和prediction_errors为空，随后四个真实rank完整对照均matched。同步恢复点，层号绑定仍由已有原生分片流程产生，没有新增模型规则。
+
+**验证：** 四rank共17544/17544项公开操作、52个模型主体、130项通信/520条完成关系对应，全部窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；依据为该域results/validation/wide/boundaries/native报告及rank明细。role-plan.json、assets/domain-0/templates.json及state.json记录终态pending空，累计native483.945s/2次、processing530.839s，峰值613591372字节，本批新增来源1次、另一次为既有目标。正式累计12/44工作流、94/252展开、19/54目标（15 matched、1 partial、2 differences、1 error），同一调查96909及后继Qwen1.5-MoE EP1容器存活，冻结路径Git差异为空，未另加编译或检查运行。
+
+**结论与限制：** Mistral PP4本例取得中间角色复用与全窗口通信/完成关系的独立证据，不授予其他模型或组合资格，也不覆盖已有未通过。继续MoE域，保持同一冻结与既有额度，不按单例修补。
+
+## 2026-11-04 — S11-B：Qwen1.5-MoE EP1完整对照与路由交接审阅
+
+**范围：** 同一冻结5713ed0调查完成Qwen1.5-MoE-A2.7B/BF16 EP1来源、建库、四项展开及wide/varying完整真实目标；静态联查共同ExpertRoutes、SGLang ExpertRouting/ExpertRouteConditions/NativeExpertRoutes及RoutedContent的采集/控制消费者，未修改代码、镜像、输入或判据。
+
+**改动：** 137定义/226布局/63执行模式/1角色库完成varying/hotspot的四项展开，invalid_completions与prediction_errors为空，真实目标matched。路由输入仍为model-experts拓扑下的条件声明，没有新增逐模型或逐节点处理；同步状态，调查继续EP2，不重采既有目标。
+
+**验证：**
+
+- 6984/6984项公开操作、6个模型主体对应，七项窗口、五项完成及默认/明细一致性通过，未归属设备任务/runtime动作均0；原生路由144次调用、累计38064行对应，按层/调用累计而非唯一token数，padding行0。EP1没有跨rank通信，不将0项通信检查计为分布式证据。
+- 该域results/validation/wide/varying/native下报告及state.json记录终态pending空，累计native403.019s/2次、processing291.403s，峰值524128516字节；本批新增来源1次、另一次为既有目标。正式累计13/44工作流、98/252展开、20/54目标（16 matched、1 partial、2 differences、1 error），调查96909及后继EP2容器存活，冻结Git差异为空。
+- 静态核对路由按请求/层/token区间校验，适配器依据原生专家拥有范围及token分片生成计数/传输参数；真实路由注入与预测消费同一条件，内容身份在采集和原生控制间共用，条件路由通过RoutedContent进入缓存键而不改模型输入token。未确认新的当前交接缺陷，没有额外运行或编译；该静态子集不等于全部路由/缓存组合已通过。
+
+**结论与限制：** 本例取得给定路由下的单worker MoE结构证据，尚不能证明EP2/4/8的多worker专家传输；来源、四项展开和完整目标的资格分别保留。继续固定矩阵，已有未通过、异常恢复缺陷及历史扫描风险不变，整轮结束后统一处理。
+
+## 2026-11-04 — S11-B：Qwen1.5-MoE EP2完整对照与通信边界审阅
+
+**范围：** 同一冻结5713ed0调查完成EP2的计划来源、建库、四项给定耗时展开及wide/varying既有真实目标；静态联查角色规划、专家几何/通信观察、共同ParallelComposition及执行通信端口，不修改代码、输入、镜像或评价。
+
+**改动：** 两个worker均观察，203定义/371布局/82执行模式/2角色库完成varying/hotspot四项展开，invalid_completions及prediction_errors为空，两个真实rank均matched。审阅确认框架适配提供路由切片与逐peer收发量，共同层核对端点几何、成对split并连接提交/完成端口；评价从真实路由记录独立计数，没有用目标路由统计回填图。同步恢复点，调查继续EP4。
+
+**验证：**
+
+- results/validation/wide/varying/native下主报告与两份rank明细：25148/25148项公开操作、12个模型主体、739项通信/2956条完成关系对应，窗口七项、完成五项及默认/明细一致性均通过；未归属设备任务/runtime动作均0。
+- 原生路由证据matched，288次调用、累计38112行、其中48行padding、difference_count和unobserved_checks均0；累计行数不是唯一token数，EP2本例不代替EP4/8或其他路由的资格。
+- role-plan.json、模板库及state.json记录本批新增来源1次，累计native531.037s/2次、processing613.940s，峰值1677740768字节，终态pending空；另一次为既有目标。正式累计14/44工作流、102/252展开、21/54目标（17 matched、1 partial、2 differences、1 error），唯一调查96909存活并进入EP4，冻结Git路径差异为空；静态阅读未新增确认缺陷，没有追加编译或检查运行。
+
+**结论与限制：** 本例取得两worker专家分发/回收、padding和完整结构的独立对应证据；EP2没有未观察角色，不据此证明代表复用。现有未通过与两项维护发现继续保留，整轮收齐后统一归因，不作单例修补。
+
+## 2026-11-04 — S11-B：Qwen1.5-MoE EP4完整对照与专家角色复用
+
+**范围：** 同一冻结5713ed0调查完成EP4的四项给定耗时展开及wide/varying完整真实对照；复用已发布的计划来源和模板库，没有新增原生会话，也没有修改核心、adapter、输入、镜像或评价。
+
+**改动：** 203定义/370布局/82执行模式/4角色库完成全部展开，invalid_completions及prediction_errors为空；四个真实rank均matched。核对实际session-summary：来源观察rank0/1，目标观察全部四rank；rank2/3按实际词表分片及expert_rank/expert_begin绑定rank1，role-plan本身不代替实际观察范围。同步恢复点，原调查进入Qwen3-30B-A3B EP2来源。
+
+**验证：**
+
+- results/validation/wide/varying/native下主报告和四份rank明细：50164/50164项公开操作、24个模型主体、739项通信/5912条完成关系对应，窗口七项、完成五项、内部检查及默认/明细一致性通过；未归属设备任务/runtime动作、未验证通信及通信问题均0。
+- 原生路由证据matched，576次调用、累计38304行、其中240行padding，difference_count和unobserved_checks均0；来源/目标观察范围另由两个session-summary.json交叉确认。适配读取实际observed_roles，来源代表选择与独立目标全worker观察职责分开，本批未新增确认缺陷。
+- state.json终态pending空，累计native2567.260s/3次、processing931.237s，峰值5121301318字节；历史失败和费用沿原目录保留，本批新增原生0次。正式累计15/44工作流、106/252展开、22/54目标（18 matched、1 partial、2 differences、1 error）；调查96909及后继qwen3-moe-ep2来源容器存活，冻结路径Git差异为空。
+
+**结论与限制：** 本例取得两个未观察专家worker的模板复用、路由padding与通信/完成对应证据，不授予其他模型、EP8或PD组合资格。保持既有矩阵和额度，已有未通过及维护发现继续留待整轮统一处理；未进入性能层。
+
+## 2026-11-04 — S11-B：Qwen3-MoE EP2完整对照与执行模式审阅
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B EP2的计划来源、建库、四项给定耗时展开及wide/varying完整真实对照；静态联查Ascend算子/矩阵/置换观察、NativeCall、标记归属及ExecutionSource的模式共享，不修改代码、矩阵、镜像或评价。
+
+**改动：** 来源按原配方成功发布，两个worker均观察；实际绑定为48层、128专家、Top-8、每rank 64本地专家，196定义/357布局/82执行模式/2角色库完成全部展开，invalid_completions与prediction_errors为空。审阅确认矩阵分支依据CANN原生查询而非手调阈值，观察/辅助/基线区间有独立归属；模式共享只借用同域原始选择，在唯一资源对应下绑定上下文并为私有event分配新身份。本批没有新增确认缺陷或防御分支。
+
+**验证：**
+
+- 该域session-summary、role-plan、模板库及工作流summary记录来源和四项展开；results/validation/wide/varying/native主报告及两份rank明细均matched，共40840/40840项公开操作、12个模型主体、1459项通信/5836条完成关系，窗口七项、完成五项、内部检查及默认/明细一致性通过，未归属任务/runtime动作及通信问题均0。
+- 来源并发上限2、KV容量4096，wide目标上限64/65536，真实Prefill达到8成员、Decode达到6成员；576次路由调用、累计76224行、其中96行padding独立对应，difference_count与unobserved_checks均0。容量是配置上限，累计路由行数不是唯一token数，不据此声称64成员或满池占用。
+- state.json终态pending空；本批新增来源1次，累计native804.464s/2次、processing942.038s，峰值2884043998字节，另一次为既有目标。正式累计16/44工作流、110/252展开、23/54目标（19 matched、1 partial、2 differences、1 error）；调查96909及后继EP4来源保持运行，冻结Git路径差异为空，未追加构建或检查运行。
+
+**结论与限制：** 本例取得新MoE结构、Top-8、成员/容量变换及EP2通信的完整独立对应证据；两个worker均观察，不能代替EP4/8角色复用、其他路由或PD组合资格。继续原矩阵，已有未通过及维护发现留待整轮统一归因；没有性能结论。
+
+## 2026-11-04 — S11-B：Qwen3-MoE EP4完整对照与参数作用域审阅
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B EP4的计划来源、建库、四项给定耗时展开及wide/varying完整真实对照；静态联查Expression/ParameterRelations、来源声明、Catalog读取及TemplateInstance展开，不修改代码、矩阵、镜像或评价。
+
+**改动：** 四worker参与，来源实际只观察rank0/1，rank2/3按原生词表及专家区间绑定rank1；128专家、Top-8、每rank 32本地专家来自实际模块。196定义/358布局/83执行模式/4角色库完成全部展开，invalid_completions及prediction_errors为空。审阅确认Catalog先把guard中的派生量展开为基础输入表达式，实例化对匹配分支清除继承的派生输出再重算；来源检查使用同一表达式合同核对原生值，本批未新增确认缺陷或冗余校验。
+
+**验证：**
+
+- 该域来源session-summary、role-plan、模板库及工作流summary核实来源与四项展开，真实目标实际观察四rank；results/validation/wide/varying/native下主报告和四份rank明细均matched，共81224/81224项公开操作、24个模型主体、1459项通信/11672条完成关系，窗口七项、完成五项、内部检查及默认/明细一致性通过，未归属设备任务/runtime动作及通信问题均0。
+- 原生及预测均实际达到Prefill 8成员、Decode 6成员；1152次路由调用、累计76608行、其中480行padding独立对应，difference_count和unobserved_checks均0。来源只观察rank0/1，rank2/3的完整对照取得代表复用证据；累计行数不是唯一token数，容量上限不代表满池占用。
+- state.json终态pending空；本批新增来源1次，累计native828.769s/2次、processing1467.050s，峰值3594552659字节，另一次为既有目标。正式累计17/44工作流、114/252展开、24/54目标（20 matched、1 partial、2 differences、1 error）；唯一调查96909及后继EP8来源容器存活，冻结路径Git差异为空，没有追加编译或检查运行。
+
+**结论与限制：** 本例取得Qwen3-MoE EP4的专家分片、两个未观察角色、padding及通信/完成的独立对应证据，不授予EP8、PP/PD组合或其他请求资格。保持既有范围及额度，已有未通过和维护发现留待整轮统一处理；未进入性能层。
+
+## 2026-11-04 — S11-B：Qwen3-MoE EP8完整对照与集合输入审阅
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B EP8的计划来源、建库、四项给定耗时展开及wide/varying完整真实对照；静态联查InputGroup、SourceGraph、模板生产及TemplateInstance的集合交接，不修改代码、矩阵、镜像或评价。
+
+**改动：** 八worker参与，来源实际观察rank0/1，其余六rank按词表及专家区间绑定rank1；实际模块为128专家、Top-8、每rank 16本地专家。196定义/354布局/83执行模式/8角色库完成全部展开，invalid_completions及prediction_errors为空。审阅确认模板定义移除来源成员列表，目标集合数量和总量从实际成员重算，只有直接命名轴用于几何反推；来源与目标共用同一集合合同，本批未新增确认缺陷或防御分支。
+
+**验证：**
+
+- 该域来源session-summary、role-plan、模板库及工作流summary核实来源和四项展开，真实目标实际观察全部八rank；results/validation/wide/varying/native主报告和八份rank明细均matched，共162184/162184项公开操作、48个模型主体、1459项通信/23344条完成关系，窗口七项、完成五项、内部检查及默认/明细一致性通过，未归属任务/runtime动作及通信问题均0。
+- 原生及预测实际达到Prefill 8成员、Decode 6成员；2304次路由调用、累计77568行、其中1440行padding独立对应，difference_count和unobserved_checks均0。来源只观察rank0/1，其余六个真实rank取得代表复用证据；累计行数不是唯一token数，不据此授予更大人数或容量占用资格。
+- state.json终态pending空；本批新增来源1次，累计native865.086s/2次、processing2962.116s，峰值7330207865字节，另一次为既有目标。正式累计18/44工作流、118/252展开、25/54目标（21 matched、1 partial、2 differences、1 error）；唯一调查96909及后继TP2×PP3×EP2来源容器存活，冻结路径Git差异为空，没有追加编译或检查运行。
+
+**结论与限制：** 本例取得八worker条件EP、六个未观察角色、padding及通信/完成的独立对应证据，不代替TP×PP×EP、PD或其他请求/模型的资格。保持原范围及额度，已有未通过和维护发现留待整轮统一处理；未进入性能层。
+
+## 2026-11-04 — S11-B：条件与生命周期入口审阅
+
+**范围：** 静态检查冻结调查的execute/workflow、条件预测、public/interrupt_resume/lifecycle及run入口；期间EP8真实记录继续解释，没有启动额外案例或修改冻结代码。
+
+**改动：** 核实固定清单仍有31项条件及7项生命周期，正式入口会在来源/真实目标后继续执行，普通错误按案例保留、不终止后续独立案例，完成调查与全部通过分别判断。另确认P2日志隔离缺口：public追加同一日志，CLI拒绝和预算负例用累计关键字判错；中断恢复后可能把旧错误文本当作本次错误依据。后续仅消费当前调用输出区间，不删除历史日志或增加验证平台。
+
+**验证：** 源码位置为example/automatic_graph/investigation.py:375、481、491，日志生产与读取链路直接证明跨尝试混读条件；这是源码推导，未进行故障运行，也没有误通过的运行证据。整轮outcomes确认条件/生命周期结果均0，调查96909存活，EP8已有三个rank物理解释，冻结Git路径差异为空；无新增采集、构建或检查运行。
+
+**结论与限制：** 本批补充评价恢复边界的维护发现，不归因为已发生的四个未通过案例，也不修改本轮判据。继续收齐既定矩阵，日志隔离与已有维护问题在整轮结果后统一处理；生命周期行为本身尚未经本轮运行验证。
+
+## 2026-11-04 — S11-B：TP2×PP3×EP2完整对照与角色核对
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B TP2×PP3×EP2的计划来源、建库、六项给定耗时展开及wide/varying完整真实对照；核对原生角色、层范围及源/目标配置，没有修改代码、输入、镜像、评价或验证编排。
+
+**改动：** 六worker均为非等价观察代表，没有派生角色；三个stage的实际层范围为[0,16)、[16,32)、[32,48)，128专家、Top-8、每rank 64本地专家。286定义/656布局/84执行模式/6角色库完成微批次上限1/3/8×varying/hotspot的全部六项展开，invalid_completions及prediction_errors为空。源配置为并发上限4、KV容量4096、微批次上限2；wide真实目标为64/65536/3，原生与预测均实际达到3成员，六rank完整比较matched。
+
+**验证：**
+
+- 该域来源session-summary、role-plan、模板库及工作流summary核实来源与六项展开；results/validation/wide/varying/native主报告及六份rank明细均matched，共98844/98844项公开操作、78个模型主体、3452项通信/13808条完成关系，窗口七项、完成五项、内部检查及默认/明细一致性通过，未归属任务/runtime动作及通信问题均0。
+- 真实目标source观测模型区域各rank含3次Prefill（2/3成员）、10次Decode（1/2/3成员）；原生和预测覆盖报告均达到Prefill/Decode 3成员。1248次路由调用、累计76608行、其中480行padding独立对应，difference_count与unobserved_checks均0；baseline及初始化不计入覆盖，累计行数不是唯一token数。
+- state.json终态pending空；本批新增来源1次，累计native846.018s/2次、processing1686.165s，峰值3982822381字节，另一次为既有目标。正式累计19/44工作流、124/252展开、26/54目标（22 matched、1 partial、2 differences、1 error）；唯一调查96909及后继MoE PD2→2来源容器存活，冻结路径Git差异为空，未追加编译、检查运行或目标采集。
+
+**结论与限制：** wide/varying取得TP/PP/EP连接、非2幂微批次及完整窗口的独立对应证据；微批次上限1/8及hotspot当前仍为给定耗时展开资格，PD及其他组合继续验证。已有四个未通过案例及维护发现保留，整轮结束后统一归因；未进入性能层。
+
+## 2026-11-04 — S11-B：MoE PD2→2完整对照与职责审阅
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B的P/D两侧各TP2/EP2来源、建库、四项给定耗时展开及wide/varying完整真实对照；联查阶段收尾、PD接口/传输观察、C++ KV连接及真实性能旁路，不修改代码、矩阵、镜像或评价。
+
+**改动：** 来源观察P侧rank0/1及D侧rank2/3，没有派生角色；page128、并发上限5/KV容量4096的来源生产245定义/457布局/90执行模式/4角色库，完成small/wide×varying/hotspot四项展开，invalid_completions和prediction_errors为空。wide目标两侧为64/65536、8个请求，完整对照为differences；未对应操作、设备归属和通信配对分别保留，根因未定。静态联查确认adapter声明元数据槽位/切片、核心消费注册层/head区间及子调用顺序，旁路仅提供具名边界时间；没有以本地提交替代远端完成，也未根据本例新增特化。
+
+**验证：**
+
+- 该域来源session-summary、两侧role-plan与source/complete标记确认四worker事实，assets/domain-0/templates.json正式发布；本批新增来源1次，生产镜像8fc4005539d3，既有目标未重跑。工作流四项展开均通过完成检查，符号token及给定耗时不作为真实性能或KV数值证据。
+- results/validation/wide/varying/native下主报告及四份rank明细：78070项原生操作对应78054项，P侧每rank剩8项未对应、1696个未归属设备任务，示例操作含tensor_from_data/c10d.allreduce；D侧两rank matched，runtime未归属为0。22项批次子图对照及七项窗口布尔检查不消除P侧correspondence.complete=false的缺口。
+- 五项完成、十二项内部检查及默认/明细一致性通过，原生与预测达到Prefill 7、Decode 5成员；864次路由调用、累计76512行及384行padding对应。通信为differences：checked523、完成关系624、传输切片1536、未验证3896、issue_count491，展示样例为native_peer_pairing；累计行数不是唯一token数，未据样例推断全部问题同根。
+- state.json终态pending空，累计native1392.152s/2次、processing2168.600s，峰值6136709827字节；另一次尝试为既有目标。正式累计20/44工作流、128/252展开、27/54目标（22 matched、1 partial、3 differences、1 error）。唯一调查96909及后继PD4→2来源容器存活，冻结路径Git差异及文档diff检查为空，没有追加构建或检查运行。
+
+**结论与限制：** 来源、建库及给定耗时闭环完成，完整真实对照未通过；三类缺口不能合并成一个已知SDK问题，也不将491项报告问题当作491个独立Bug。整轮结束后按实际证据区分核心、adapter和评价责任，旧未通过与维护发现继续保留；性能层未启动。
+
+## 2026-11-04 — S11-B：非对称PD4→2对照失败与KV区间核对
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B的P侧TP4、D侧TP2来源、建库及四项给定耗时展开，wide/boundaries真实对照在预测阶段以error结束；核对代表选择、注册KV区间及相关生产/执行职责，不修改代码、矩阵、镜像或评价。
+
+**改动：** 六worker参与，来源实际观察rank0/1/4/5，P侧rank2/3由rank1派生；page128、并发上限5/KV容量4096的来源生产195定义/384布局/74执行模式/6角色库，四项展开的invalid_completions与prediction_errors为空。P侧每rank两head、D侧每rank四head，派生P角色保留实际[4,6)、[6,8)区间及buffer_tokens分组，地址解释与共同传输组合职责清楚。真实目标原生证据matched，但旁路无法交付P侧rank1的poll反馈；记录错误，继续PD2→4，不新增特化或预判核心/adapter责任。
+
+**验证：**
+
+- 来源session-summary、联合role-plan及六份source/complete标记确认发布；四份观察代表的transport记录各有72个KV buffer、每head 256字节，P侧[0,2)/[2,4)、D侧[0,4)/[4,8)。四代表解释及核心建库完成，assets/domain-0/templates.json正式发布。
+- 四项默认结果及工作流summary已发布，正式workflow为complete且完成检查通过；small/boundaries与small/staggered分别有31388/132492动作、18/22逻辑模型批次及92276/162098操作，wide/boundaries与wide/staggered为36538/132492动作、10/22批次。两组均使用host10ns等给定耗时，计数不代表真实原生循环次数，不据此归因为已确认的代码瓶颈。
+- 既有wide/boundaries目标实际观察全部六rank，两侧为64/65536；native-evidence-1.json为matched，实际Prefill 7/Decode 5成员。results/validation/wide/boundaries/native/validation-wide-boundaries.json为error，prediction_error记录ObservedFeedback无法交付prefill.rank-1、lane0、stage0、request-0至7的poll反馈；rank列表为空，完成、内部及通信检查均未取得结果，不按已通过推断。
+- ServingWorkflow静态核对提交、具名完成、状态提交及历史回收，未据此确认上述失败根因。state.json终态pending空，累计native741.741s/2次（本批新增来源1次，另一次为既有目标）、processing2153.177s、峰值2783926538字节。正式累计21/44工作流、132/252展开、28/54真实目标（22 matched、1 partial、3 differences、2 error）；原会话96909和后继PD2→4来源容器存活，冻结Git路径及文档diff检查为空，没有额外构建或诊断运行。
+
+**结论与限制：** 来源、建库和四项给定耗时闭环完成，真实对照未通过，两个未观察P角色的复用及分片连接没有获得独立资格。该poll反馈错误与先前TP4空select错误分别保留，整轮结束后联合归因，不仅凭错误文案断言同根；原始目标、失败和累计费用不重置，性能层未启动。
+
+## 2026-11-04 — S11-B：反向非对称PD2→4对照失败与D角色绑定
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B的P侧TP2、D侧TP4来源、建库及四项给定耗时展开，wide/boundaries真实六rank对照在预测阶段以error结束；核对代表、KV区间、字节量及请求接入职责，不新增配方或修改冻结代码、镜像与评价。
+
+**改动：** 来源观察rank0/1/2/3，D侧rank4/5由rank3派生并保留实际[4,6)、[6,8) head区间；page128、并发上限5/KV容量4096的来源生产195定义/385布局/74执行模式/6角色库，四项展开的invalid_completions与prediction_errors为空。真实目标证据matched，但ObservedFeedback无法交付已观察角色decode.rank-2的poll反馈；保留错误，继续既定MoE PP×PD来源，不按错误文案推定同根或追加特化。
+
+**验证：**
+
+- 来源session-summary、联合role-plan及六份source/complete标记确认事实；四个代表的transport记录各72个KV buffer、每head 256字节，P侧为[0,4)/[4,8)，D侧为[0,2)/[2,4)。四代表解释完成，assets/domain-0/templates.json正式发布；small/wide×boundaries/staggered四项、每项8请求的正式工作流为complete，完成检查均通过，累计22/44工作流、136/252展开。
+- 两个small结果均已发布，control_status=complete；boundaries/staggered分别有62062/200044动作、18/22逻辑模型批次及112812/198374操作，六池驻留为0、空闲槽位/页恢复容量。首例根据两个P角色注册布局相加，每token需147456字节，prompt共16页，16×128×147456=301989888字节，与结果一致；只核对量，不授予依赖/时序正确性，没有新增诊断运行。
+- 静态联查Request::read、NativeController、RequestInput、worker入口及WorkloadContent：请求按到达时间稳定排序，P/D分别按唯一模拟时钟交出到达身份，Python不提前消费未来请求；内容按同级ID排序分配token，不随输入排序变化。此链未新增确认缺陷，也未据此判断实际接收时刻已对齐或反馈错误已关闭，没有追加运行。
+- wide的boundaries/staggered分别有63634/200044动作、10/22逻辑模型批次；真实目标实际观察全部六rank，两侧为64/65536。主报告results/validation/wide/boundaries/native/validation-wide-boundaries.json为error，原生证据matched、Prefill 7/Decode 5成员；prediction_error定位decode.rank-2、lane0、stage0、request-0至7的poll反馈，rank列表为空，完成、内部及通信检查均未产生结果。
+- state.json终态pending空，累计native743.281s/2次、processing2861.431s、峰值3048061654字节；本批新增来源1次，另一次为既有目标，目标未重跑。正式累计22/44工作流、136/252展开、29/54真实目标（22 matched、1 partial、3 differences、3 error）；唯一调查96909及后继MoE PP×PD来源容器存活，冻结Git路径及文档diff检查为空，没有额外构建。
+
+**结论与限制：** 来源、实际绑定、建库及四项给定耗时闭环完成，真实对照未通过，两个未观察D角色的复用及分片连接没有获得独立资格；失败工作位于观察代表，仍不足以排除或确认复用关联。七个未通过目标全部保留，整轮收齐后联合分析核心、adapter和评价责任；性能层未启动。
+
+## 2026-11-04 — S11-B：MoE PP×PD八worker展开与反馈失败
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B的P侧TP2×PP3×EP2、D侧TP2×EP2来源、建库及四项给定耗时展开，wide/varying真实对照以error结束；没有修改代码、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 八worker来源完整发布，session-summary与role-plan一致记录参与及观察rank0至7，全部为观察代表，没有派生角色。源配置两侧page128、并发上限5、KV容量4096，P侧微批次上限2；P侧三个stage注册层范围为[0,16)、[16,32)、[32,48)，D侧为[0,48)，TP首角色均为head区间[0,2)、每head 256字节。八rank离线解析和来源解释完成，C++生产329定义/689布局/94执行模式/8角色库，small/wide×varying/hotspot四项展开及完成检查通过，invalid_completions和prediction_errors为空。
+
+**验证：**
+
+- runs/qwen3-moe-pd-pp3/captures/domain-0-source-0-attempt-2下session-summary.json、role-plan.json与transport记录核实来源，run.log确认全部SDK解析及C++生产完成，assets/domain-0/templates.json正式发布；本批新增来源1次，既有真实目标保持原记录。
+- results/summary.md、四份默认结果及整轮outcomes确认工作流complete；small两项各5010动作/17逻辑模型批次，wide两项各3336动作/11批次，四项均8请求完成输出、8池驻留清空、空闲槽位/页恢复容量。host10ns等给定耗时不代表实测，结果继续标记physical/runtime coverage为partial；小池逻辑空闲仍含延迟归还页，不将其重复计作占用。
+- 既有wide/varying目标实际观察全部八rank，两侧并发上限64、KV容量65536；native-evidence-1.json为matched，实际Prefill 5/Decode 4成员，1056次路由调用、累计76512行及384行padding对应，差异和未观察检查均0。主报告results/validation/wide/varying/native/validation-wide-varying.json为error，ObservedFeedback无法交付prefill.rank-1、lane0、stage0、request-0/1的poll反馈，rank列表为空，尚无完成、内部及通信报告。
+- state.json终态pending空，累计native1484.144s/2次、processing1929.127s，峰值7122071353字节；本批新增来源1次，另一次为既有目标，目标未重跑。正式累计23/44工作流、140/252展开、30/54真实目标（22 matched、1 partial、3 differences、4 error）。调查96909及后继Llama TP1来源容器存活，冻结路径Git差异及文档diff检查为空；条件和生命周期尚未执行，没有额外诊断、构建或原生运行。
+
+**结论与限制：** 来源、建库及四项给定耗时闭环完成，真实对照未通过；本例没有派生角色，但不能仅凭poll错误文案与其他案例预先合并根因。两侧server.log在退出时有TBE主进程消失及multiprocessing资源清理警告，尚未据此确认项目泄漏或采集失败，日志保留。八个未通过案例与维护发现继续保留，整轮完成后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：Llama TP1六项展开与完整对照
+
+**范围：** 同一冻结5713ed0调查完成Meta-Llama-3.1-8B-Instruct TP1的计划来源、建库、六项给定耗时展开及既有wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 来源单worker直接观察rank0，page128、并发上限2/KV容量4096，自动生产127定义/221布局/62执行模式/1角色库。small/wide×boundaries/staggered/context-boundaries六项展开与完成检查通过，invalid_completions和prediction_errors为空；small为3/4096、wide为64/65536，没有为新模型增加专属业务路径。
+
+**验证：**
+
+- runs/llama31-tp1下来源session-summary.json、assets/domain-0/templates.json、results/summary.md及整轮outcomes确认发布与正式工作流complete；六份默认结果均control_status=complete、输出数满足请求，单池驻留清空、槽位与页恢复容量。页边界及错峰各8请求，长上下文为2047/2048/2049/2305 token四请求；给定耗时结果继续标记physical/runtime coverage为partial。
+- results/validation/wide/boundaries/native主报告及rank-0.json均matched，6092/6092项公开操作、6个模型主体全部对应，未归属任务/runtime动作和未对应操作均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过；原生与预测实际达到Prefill 8/Decode 6成员，内部检查有32层绑定和192次attention调用，没有跨rank通信。
+- state.json终态pending空，累计native368.452s/2次、processing328.381s，峰值430453158字节；本批新增来源1次，另一次为既有目标。正式累计24/44工作流、146/252展开、31/54真实目标（23 matched、1 partial、3 differences、4 error）。原会话96909及后继Llama TP2来源容器存活，冻结Git路径差异为空；没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得新模型wide/boundaries的独立结构证据，错峰、长上下文及TP2仍保留各自资格；未测内部节点实际计时、KV数值及全部设备消费者的独立完整性。八个未通过目标与维护发现保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：Llama TP2代表来源与完整对照
+
+**范围：** 同一冻结5713ed0调查完成Meta-Llama-3.1-8B-Instruct TP2的两代表来源、建库、六项给定耗时展开及wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 按native_vocabulary_partitions_and_root_peer_control计划顺序采集rank0/1，没有派生角色；两份来源均为BF16、page128、并发上限2/KV容量4096，生产132定义/230布局/66执行模式/2角色库。small/wide×boundaries/staggered/context-boundaries六项展开与完成检查通过，invalid_completions和prediction_errors为空；没有新增模型专属路径。
+
+**验证：**
+
+- runs/llama31-tp2下两份来源session-summary、inputs/role-plans/domain-0.json、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成请求输出、两个资源池驻留清空且槽位/页恢复容量。来源角色采集与真实多卡协议证据分开，给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/wide/boundaries/native主报告及两份rank明细均matched，13012/13012项公开操作、12个模型主体、396项通信/1584条完成关系对应，未归属任务/runtime动作和通信问题/未验证均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过，原生与预测均实际Prefill 8/Decode 6成员。
+- state.json终态pending空，累计native564.368s/3次、processing477.916s，峰值853642301字节；本批新增来源2次，另一次为既有目标。正式累计25/44工作流、152/252展开、32/54真实目标（24 matched、1 partial、3 differences、4 error）。原会话96909及后继GLM TP1来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** Llama TP2的wide/boundaries取得独立结构和通信证据，错峰及2047/2048/2049/2305 token上下文仍仅有给定耗时资格，不推及未运行配置、KV数值或内部节点实际计时。八个未通过目标与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：GLM TP1六项展开与完整对照
+
+**范围：** 同一冻结5713ed0调查完成GLM-4-9B-Chat TP1的计划来源、建库、六项给定耗时展开及wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 来源直接观察rank0，BF16、page128、并发上限2/KV容量4096，自动生产124定义/208布局/59执行模式/1角色库。small/wide×boundaries/staggered/context-boundaries六项展开与完成检查通过，invalid_completions和prediction_errors为空；没有为新模型增加专属业务路径。
+
+**验证：**
+
+- runs/glm4-tp1下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成输出，单池驻留清空、槽位/页恢复容量。给定耗时结果继续保留physical/runtime coverage为partial，错峰各8请求及2047/2048/2049/2305 token四请求的长上下文不据此授予真实资格。
+- results/validation/wide/boundaries/native主报告及rank-0.json均matched，8936/8936项公开操作、6个模型主体对应，未对应操作、未归属任务/runtime动作均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过；原生与预测均实际Prefill 8/Decode 6成员，内部检查有40层绑定和240次attention调用，没有跨rank通信。
+- state.json终态pending空，累计native410.595s/2次、processing351.353s，峰值542126638字节；本批新增来源1次，另一次为既有目标。正式累计26/44工作流、158/252展开、33/54真实目标（25 matched、1 partial、3 differences、4 error）。原会话96909及后继GLM TP2来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得GLM TP1的wide/boundaries独立结构证据，不推及TP2、错峰、长上下文、KV数值或内部实际计时。八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：GLM TP2代表来源与完整对照
+
+**范围：** 同一冻结5713ed0调查完成GLM-4-9B-Chat TP2的两代表来源、建库、六项给定耗时展开及wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 按原生词表分片及root/peer职责计划顺序观察rank0/1，没有派生角色；来源均为BF16、page128、并发上限2/KV容量4096，自动生产129定义/217布局/63执行模式/2角色库。small/wide×boundaries/staggered/context-boundaries六项展开与完成检查通过，invalid_completions和prediction_errors为空，没有新增模型专属业务路径。
+
+**验证：**
+
+- runs/glm4-tp2下两份来源session-summary、inputs/role-plans/domain-0.json、模板库及results/summary.md确认发布；六份默认结果均完成输出，两个资源池驻留清空、槽位/页恢复容量。给定耗时结果继续保留physical/runtime coverage为partial，角色来源不冒充真实多卡协议证据。
+- results/validation/wide/boundaries/native主报告及两份rank明细均matched，18892/18892项公开操作、12个模型主体、492项通信/1968条完成关系对应，未对应操作、未归属任务/runtime动作、通信问题及未验证均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过，原生与预测均实际Prefill 8/Decode 6成员。
+- state.json终态pending空，累计native673.293s/3次、processing549.104s，峰值1080904109字节；本批新增来源2次，另一次为既有目标。正式累计27/44工作流、164/252展开、34/54真实目标（26 matched、1 partial、3 differences、4 error）。原会话96909及后继OLMoE EP1来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得GLM TP2的wide/boundaries独立结构及通信证据，不推及错峰、长上下文、其他拓扑、KV数值或内部节点实际计时。两份来源收尾均有profiler在RECORD状态停止及ZMQ context关闭告警，SDK解析均完成，尚未据此确认数据缺失或项目泄漏，原日志保留。八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：OLMoE EP1完整对照与七模型基本覆盖
+
+**范围：** 同一冻结5713ed0调查完成OLMoE-1B-7B-0924 TP1/EP1的计划来源、建库、四项给定耗时展开及wide/varying完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标，不扩展该模型原生不支持的并行方式。
+
+**改动：** 来源直接观察rank0，BF16、page128、并发上限2/KV容量4096，自动生产130定义/221布局/60执行模式/1角色库。small/wide×varying/hotspot四项展开与完成检查通过，invalid_completions和prediction_errors为空，没有新增模型专属业务路径；七个选定模型现均已取得具名基本配置的独立结构证据。
+
+**验证：**
+
+- runs/olmoe-ep1下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；四份默认结果均完成8个请求输出，单池驻留清空、槽位/页恢复容量。给定耗时结果继续保留physical/runtime coverage为partial，hotspot没有真实对照资格。
+- results/validation/wide/varying/native主报告及rank-0.json均matched，4168/4168项公开操作、6个模型主体、96次路由调用及累计25376行对应，padding为0，路由差异/未观察检查及未归属任务/runtime动作均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过，原生与预测均实际Prefill 8/Decode 6成员；EP1没有跨rank通信，累计路由行不是唯一token数。
+- state.json终态pending空，累计native336.218s/2次、processing262.159s，峰值370052946字节；本批新增来源1次，另一次为既有目标。正式累计28/44工作流、168/252展开、35/54真实目标（27 matched、1 partial、3 differences、4 error）。原会话96909及后继Qwen3 FP16来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得OLMoE原生合法TP1/EP1的wide/varying独立结构及路由证据，不推及hotspot、其他拓扑、真实权重路由、KV数值或内部节点实际计时。七模型基本覆盖不代表完整矩阵通过；八个未通过案例、其他配置/机制及维护发现仍待整轮统一处理，性能层未启动。
+
+## 2026-11-04 — S11-B：Qwen3 FP16来源与完整对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B TP1/FP16的计划来源、建库、四项给定耗时展开及wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标，不借用BF16来源替代本域采集。
+
+**改动：** model.dtype固定float16，来源直接观察rank0，page128、并发上限2/KV容量4096，自动生产130定义/230布局/62执行模式/1角色库。small/wide×boundaries/staggered四项展开与完成检查通过，invalid_completions和prediction_errors为空，没有新增dtype专属业务路径。
+
+**验证：**
+
+- runs/qwen3-fp16下采集输入、来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；四份默认结果均完成8请求输出，单池驻留清空、槽位/页恢复容量。给定耗时结果继续保留physical/runtime coverage为partial，错峰不据此授予真实对照资格。
+- results/validation/wide/boundaries/native主报告及rank-0.json均matched，7080/7080项公开操作、6个模型主体对应，未对应操作及未归属任务/runtime动作均0。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过，原生与预测均实际Prefill 8/Decode 6成员，没有跨rank通信。
+- state.json终态pending空，累计native399.938s/2次、processing290.485s，任务数据峰值488887210字节；本批新增来源1次，另一次为既有目标。正式累计29/44工作流、172/252展开、36/54真实目标（28 matched、1 partial、3 differences、4 error）。原会话96909及后继page_size=1来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得Qwen3-8B FP16具名配置的独立结构证据，不推及错峰、其他dtype/backend/拓扑、KV数值或内部节点实际计时。八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page1小池来源与单位容量真实对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16/TP1、page_size=1的来源、建库、六项给定耗时展开及small/unit-capacity完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有新增采集配方或重跑真实目标。
+
+**改动：** 来源直接观察rank0，并发上限2、KV/Prefill容量32 token，即32页，自动生产115定义/209布局/52执行模式/1角色库。small/wide×boundaries/staggered/unit-capacity六项展开与完成检查通过，invalid_completions和prediction_errors为空；目标容量分别4096/65536 token，页大小均为1，没有跨页布局套用page128库。
+
+**验证：**
+
+- runs/qwen3-page1下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成输出、单池驻留清空且槽位/页恢复容量。边界/错峰各8请求，单位容量为5/129/257 token三请求；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/small/unit-capacity/native主报告及rank-0.json均matched，5947/5947项公开操作、5个模型主体对应，未对应操作及未归属任务/runtime动作均0。目标并发上限3/KV容量4096，原生与预测均实际Prefill/Decode 3成员；257-token请求在本页布局下对应257页需求，取得超过200页需求的serving对照，未以既有allocator原语代替。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过，36层/180次attention绑定和必要状态路径检查通过。
+- state.json终态pending空，累计native352.217s/2次、processing323.165s，任务数据峰值432894183字节；本批新增来源1次，另一次为既有目标。正式累计30/44工作流、178/252展开、37/54真实目标（29 matched、1 partial、3 differences、4 error）。原会话96909及后继page_size=16来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得32页来源服务于4096页目标及超过200页需求的具名请求的独立结构证据；wide、错峰、其他页布局、KV数值及内部节点实际计时仍保留各自资格。八个未通过案例及维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page16单位换算与完整真实对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16/TP1、page_size=16的来源、建库、六项给定耗时展开及small/unit-capacity完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有新增配方或重跑真实目标。
+
+**改动：** 来源直接观察rank0，并发上限2、KV/Prefill容量512 token，即32页，自动生产130定义/230布局/62执行模式/1角色库。small/wide×boundaries/staggered/unit-capacity六项展开与完成检查通过，invalid_completions和prediction_errors为空；目标KV容量4096/65536 token分别为256/4096页，未跨页布局借用page1或page128来源。
+
+**验证：**
+
+- runs/qwen3-page16下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成输出，单池驻留清空、槽位/页恢复容量。边界/错峰各8请求，单位容量为5/129/257 token三请求，prompt按页取整分别为1/9/17页；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/small/unit-capacity/native主报告及rank-0.json均matched，5992/5992项公开操作、5个模型主体对应，未对应操作及未归属任务/runtime动作均0。目标并发上限3/KV容量4096 token，原生与预测均实际Prefill/Decode 3成员；七项窗口、五项完成、十二项内部检查及默认/明细一致性通过。
+- state.json终态pending空，累计native393.526s/2次、processing328.773s，任务数据峰值483667805字节；本批新增来源1次，另一次为既有目标。正式累计31/44工作流、184/252展开、38/54真实目标（30 matched、1 partial、3 differences、4 error）。原会话96909及后继page_size=64来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得32页来源服务于256页目标及具名尾页条件的独立结构证据；4096 token不能误记为4096页。wide、错峰、其他页布局、KV数值及内部节点实际计时仍保留各自资格，八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page64单位容量与完整真实对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16/TP1、page_size=64的来源、建库、六项给定耗时展开及small/unit-capacity完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有新增配方或重跑真实目标。
+
+**改动：** 来源直接观察rank0，并发上限2、KV/Prefill容量2048 token，即32页，自动生产130定义/230布局/62执行模式/1角色库。small/wide×boundaries/staggered/unit-capacity六项展开与完成检查通过，invalid_completions和prediction_errors为空；目标KV容量4096/65536 token分别为64/1024页，没有跨页布局借用其他来源。
+
+**验证：**
+
+- runs/qwen3-page64下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成输出，单池驻留清空、槽位/页恢复容量。单位容量三请求的prompt为5/129/257 token，按页取整分别为1/3/5页；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/small/unit-capacity/native主报告及rank-0.json均matched，5992/5992项公开操作、5个模型主体对应，未对应操作及未归属任务/runtime动作均0。目标并发上限3/KV容量4096 token，原生与预测均实际Prefill/Decode 3成员；七项窗口、五项完成、十二项内部检查及默认/明细一致性通过。
+- state.json终态pending空，累计native396.845s/2次、processing329.502s，任务数据峰值483701460字节；本批新增来源1次，另一次为既有目标。正式累计32/44工作流、190/252展开、39/54真实目标（31 matched、1 partial、3 differences、4 error）。原会话96909及后继page_size=256来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得32页来源服务于64页目标及具名尾页条件的独立结构证据，模板数相同不表示不同页布局可共用同一来源。wide、错峰、其他页布局、KV数值及内部节点实际计时仍保留各自资格，八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page256容量缩小与完整真实对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16/TP1、page_size=256的来源、建库、六项给定耗时展开及small/unit-capacity完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有新增配方或重跑真实目标。
+
+**改动：** 来源直接观察rank0，并发上限2、KV/Prefill容量8192 token，即32页，自动生产130定义/230布局/62执行模式/1角色库。small/wide×boundaries/staggered/unit-capacity六项展开与完成检查通过，invalid_completions和prediction_errors为空；目标KV容量4096/65536 token分别为16/256页，包含相对来源缩小容量，没有跨页布局借用其他来源。
+
+**验证：**
+
+- runs/qwen3-page256下来源session-summary、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成输出，单池驻留清空、槽位/页恢复容量。单位容量三请求的prompt为5/129/257 token，按页取整分别为1/1/2页；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/small/unit-capacity/native主报告及rank-0.json均matched，5992/5992项公开操作、5个模型主体对应，未对应操作及未归属任务/runtime动作均0。目标并发上限3/KV容量4096 token，原生与预测均实际Prefill/Decode 3成员；七项窗口、五项完成、十二项内部检查及默认/明细一致性通过。
+- state.json终态pending空，累计native393.287s/2次、processing331.114s，任务数据峰值483784319字节；本批新增来源1次，另一次为既有目标。正式累计33/44工作流、196/252展开、40/54真实目标（32 matched、1 partial、3 differences、4 error）。原会话96909及后继page64×PP3来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得32页来源服务于16页目标及具名尾页条件的独立结构证据；不将容量增减等同于实际满池运行。wide、错峰、并行组合、KV数值及内部节点实际计时仍保留各自资格，八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page64×PP3微批变换与完整对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16、page_size=64×TP1×PP3的来源、建库、六项给定耗时展开及wide/boundaries完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有新增配方或重跑真实目标。
+
+**改动：** 三个worker均为实际观察代表，无派生角色；来源并发上限4、KV/Prefill容量2048 token、微批上限2、pp_async_batch_depth为0，生产177定义/393布局/66执行模式/3角色库。small/wide/full-micro的微批上限1/3/8×boundaries/staggered六项展开与完成检查通过，invalid_completions和prediction_errors为空。
+
+**验证：**
+
+- runs/qwen3-page64-pp3下来源session-summary、role-plan、模板库、results/summary.md及整轮outcomes核实发布；六份默认结果均完成8请求输出，三个资源池驻留清空、槽位/页恢复容量。来源32页，small/wide池分别64/1024页；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/wide/boundaries/native主报告及三份rank明细均matched，18666/18666项公开操作、39个模型主体、91项通信/364条完成关系对应，未归属任务/runtime动作及通信问题/未验证均0。目标并发上限64/KV容量65536、微批上限3，原生与预测均实际Prefill/Decode 3成员；七项窗口、五项完成、十二项内部检查及默认/明细一致性通过。
+- state.json终态pending空，累计native479.602s/2次、processing526.414s，任务数据峰值606041012字节；本批新增三worker来源1次，另一次为既有目标。正式累计34/44工作流、202/252展开、41/54真实目标（33 matched、1 partial、3 differences、4 error）。原会话96909及后继MoE page64×EP2来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得page64与PP3、非2幂微批的独立结构和通信证据；微批上限1/8、错峰、其他拓扑、KV数值及内部节点实际计时仍保留各自资格。八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：MoE page64×EP2完整真实对照
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-30B-A3B BF16、page_size=64×TP2/EP2的来源、建库、四项给定耗时展开及wide/varying完整真实对照；没有修改核心、adapter、矩阵、镜像或评价，也没有重跑真实目标。
+
+**改动：** 两worker均为实际观察代表，无派生角色；来源并发上限2、KV/Prefill容量2048 token，即32页，生产196定义/357布局/82执行模式/2角色库。small/wide×varying/hotspot四项展开与完成检查通过，invalid_completions和prediction_errors为空；状态文档去除重复范围清单，具名资格集中在表格中。
+
+**验证：**
+
+- runs/qwen3-moe-page64-ep2下来源session-summary、role-plan、模板库、results/summary.md及整轮outcomes核实发布；四份默认结果均完成8请求输出，两个资源池驻留清空、槽位/页恢复容量。small/wide的KV容量4096/65536 token分别为64/1024页；给定耗时结果继续保留physical/runtime coverage为partial。
+- results/validation/wide/varying/native主报告及两份rank明细均matched，40840/40840项公开操作、12个模型主体、1459项通信/5836条完成关系对应，未归属任务/runtime动作及通信问题/未验证均0。原生与预测均实际Prefill 8/Decode 6成员；576次路由调用、累计38592行及144行padding独立对应，差异和未观察检查均0，累计路由行不是唯一token数。七项窗口、五项完成、十二项内部检查及默认/明细一致性通过。
+- state.json终态pending空，累计native807.531s/2次、processing933.556s，任务数据峰值2880513945字节；本批新增两worker来源1次，另一次为既有目标。正式累计35/44工作流、206/252展开、42/54真实目标（34 matched、1 partial、3 differences、4 error）。原会话96909及后继page64×PD1→1来源容器存活，冻结Git路径差异为空，没有额外诊断、构建或目标原生运行。
+
+**结论与限制：** 本例取得MoE page64×EP2的wide/varying独立结构、通信及padding证据；hotspot、其他并行/页布局、真实权重路由、KV数值及内部节点实际计时仍保留各自资格。八个未通过案例与维护发现继续保留，整轮结束后统一分析，性能层未启动。
+
+## 2026-11-04 — S11-B：page64×PD1→1完整对照保留partial
+
+**范围：** 同一冻结5713ed0调查完成Qwen3-8B BF16、page64×PD1→1的来源、建库、四项给定耗时展开与wide/boundaries真实对照；没有修改核心、adapter、矩阵、镜像或评价，没有重跑真实目标。
+
+**改动：** P/D两worker均观察，无派生角色；来源并发上限5、两池KV容量2048 token，即各32页，生产174定义/321布局/70执行模式/2角色库。small/wide×boundaries/staggered四项展开与完成检查通过，invalid_completions和prediction_errors为空，两池驻留清空、槽位和页恢复容量。
+
+**验证：** runs/qwen3-page64-pd1-1的wide/boundaries主报告为partial；P侧3937/3945项公开操作对应、8项未对应、1312个设备任务未归属，D侧9445/9445对应且matched，runtime未归属均0。16项通信、312条完成关系及576个传输切片matched，无通信问题或未验证；实际Prefill 7/Decode 5成员、五项完成、十二项内部检查及默认/明细一致性通过。state.json终态pending空，累计native705.220s/2次、processing856.886s，任务数据峰值1048376269字节；本批新增联合来源1次，另一次为既有目标。累计36/44工作流、210/252展开、43/54真实目标（34 matched、2 partial、3 differences、4 error）。
+
+**结论与限制：** P侧两处未对应序列的例项含tensor_from_data及c10d.allreduce_.default；虽七项窗口布尔检查通过，完整对应仍为false，不据此授予整图资格。未解释的操作与设备任务不预归因于SDK或核心，也不与其他PD案例直接合并同根；原始事实及所有失败保留，整轮结束后统一分析。
+
+## 2026-11-04 — S11-B：单worker调度来源建库失败
+
+**范围：** 同一冻结调查处理scheduling-single的chunked prefill＋mixed来源；既有chunk-256/shared真实目标复用，失败后不补样、不改规则，继续无依赖的scheduling-tp2。
+
+**改动：** 新来源实际采集完成，独立SDK解释完成；C++模板生产报reusable call has an unnamed input: region 874 value 2874，工作流记error，对应真实比较记blocked。计划的chunk-128/256×shared/arrivals四项展开均未执行，没有发布成功模板或预测。
+
+**验证：** runs/scheduling-single/logs/run.log保留SDK解析完成及templates命令的首个错误；state.json为failed、pending空，累计native460.927s/2次、processing87.163s，任务数据峰值550943035字节。本批新增来源1次，另一次为既有目标。静态联查CLI整库校验后输出、应用命令成功后发布及恢复沿用已发布来源的路径；实际正式模板不存在，结果为空，没有把失败工作区作为资产消费。原会话96909及scheduling-tp2来源容器存活，冻结Git路径差异为空。
+
+**结论与限制：** 已定位停止环节为来源解释后的模板生产，尚未证明是观察缺失、适配绑定还是核心提取问题。不能把建库失败写成原生模型不可运行，或以blocked抵充真实比较通过；整轮保留该阻断，结束后统一归因修复。
+
+## 2026-11-04 — S11-B：TP2调度来源建库失败及下游阻断
+
+**范围：** 同一冻结5713ed0调查处理scheduling-tp2的chunked prefill＋mixed＋prefix cache来源；两份既有真实目标均保留，失败后继续无依赖的scheduling-ep2，没有现场改代码或补样。
+
+**改动：** 两代表来源均实际采集、SDK解释完成，C++建库报reusable call has an unnamed input: region 988 value 3098。工作流记error，chunk-256/shared及cache-pressure/cache-pressure记blocked；三配置×三workload共九项展开未执行，正式模板与预测均未发布。
+
+**验证：** runs/scheduling-tp2/logs/run.log保留两份SDK解析完成及templates首个错误；state.json为failed、pending空、两份来源已发布、结果为空，实际正式模板不存在。累计native1514.739s/4次、processing368.020s，任务数据峰值2871487961字节；本批新增顺序代表来源2次，另两次为既有目标。整轮仍为36/44工作流、210/252展开、43项真实对照终态，blocked增至3；原会话96909及后继EP2来源容器存活，冻结代码路径差异为空。
+
+**结论与限制：** 离线读取两份已保存来源，缺失值2874/3098均为无记录生产者的NPU int8[2048,2048]张量，分别在操作1951/2093的atten_mask参数中出现；确认同类操作数，尚未闭合命名、持久资源声明或分区传播中的责任。报错region为分区后的编号，不能直接当作原始region索引。TP2目标分块、实际缓存命中及淘汰均未验证；事实与两份目标不丢弃、不重采，全量收齐后统一归因，性能层仍后置。
+
+## 2026-11-04 — S11-B：EP2调度建库及真实反馈失败
+
+**范围：** 同一冻结5713ed0调查推进scheduling-ep2的chunked prefill＋prefix cache来源；mixed按原生条件关闭，既有chunk-256/shared真实目标复用，没有修改代码、输入、镜像或评价。
+
+**改动：** 新增一个双worker联合来源，实际参与及观察rank0/1，TP=EP2、page128、并发上限2、KV/Prefill容量1024 token、chunk256、启用一级缓存。两rank解释完成，生产216定义/461布局/81执行模式/2角色库，chunk-128/256×shared/arrivals四项展开及完成检查通过，invalid_completions和prediction_errors为空；随后进入既有真实目标对照。
+
+**验证：**
+
+- runs/scheduling-ep2/captures/domain-0-source-0-attempt-2/session-summary.json分别记录初始化76.122s、预热58.406s、采集及flush739.432s，最后一项不等于净推理时间或可用预测成本。四份默认结果的control_status均complete、四请求输出完整；两个32页池的槽位全部恢复、驻留清空，shared/arrivals各保留6/10页可淘汰缓存，空闲26/22页，protected/deferred均0，不把缓存保留误记为泄漏。
+- results/validation/chunk-256/shared/native主报告为error：observed boundary and generated publication ports disagree；原生证据matched，实际Prefill 2/Decode 4成员、2个chunked批次及512 token前缀复用，1056次路由调用/累计40416行/144行padding的差异与未观察检查均0。预测未完成，未产生rank、通信、内部或完成比较报告。
+- 静态定位src/markov/execution/observed_feedback.cpp:124，具名工作已找到，但原生record.publishes与program.publication.has_value()不同，尚未知差异方向及首个工作身份。state.json终态pending空、工作流失败栏为空不代表真实比较通过；累计native1429.246s/2次、processing1492.212s，任务数据峰值6807103284字节，本批来源1次＋既有目标1次。累计37/44工作流、214/252展开、44/54真实对照终态（34 matched、2 partial、3 differences、5 error），另3 blocked；原会话96909及后继PP3来源容器存活，冻结代码路径差异为空。
+
+**结论与限制：** 给定耗时工作流与原生实际分块/命中证据分别成立，不能代替完整预测或缓存状态对应。单worker/TP2的未命名输入错误未在本例建库阶段复现，但本例另有完成反馈合同不符；具体责任待整轮收齐后统一分析，不合并不同错误、不修改判据、不重采目标，性能层仍后置。
+
+## 2026-11-04 — S11-B：PP3调度来源建库失败
+
+**范围：** 同一冻结5713ed0调查推进Qwen3-8B BF16、TP1×PP3的chunked prefill＋mixed＋prefix cache来源，复用既有chunk-256/shared真实目标；没有修改代码、输入、镜像或评价。
+
+**改动：** 新增三个worker的联合来源，实际参与及观察rank0/1/2，无派生角色。来源page128、并发上限4、KV/Prefill容量1024 token、chunk256、微批上限2及pp_async_batch_depth为0；三份解释完成后，C++建库报reusable call has an unnamed input: region 1331 value 3487，工作流error、真实比较blocked。
+
+**验证：**
+
+- runs/scheduling-pp3/captures/domain-0-source-0-attempt-2/session-summary.json分别记录初始化37.186s、预热25.044s、采集及flush296.838s，最后一项不是净推理时间或节点成本。日志保留三个rank的SDK解释完成和templates首个错误；首份解释的value3487为无记录生产者的NPU int8[2048,2048]张量，在操作2599的atten_mask参数中使用，与前两例确认相同操作数类型。
+- state.json终态failed、pending空、1份来源已发布、结果为空；累计native670.220s/2次（本批联合来源1次＋既有目标1次）、processing200.350s，任务数据峰值1259872920字节。四项展开及真实比较均未执行；整轮仍为37/44工作流、214/252展开、44项真实对照终态，blocked增至4。原会话96909及后继PD来源容器存活，冻结代码路径差异为空。
+
+**结论与限制：** 停止环节为模板生产，不归为原生PP不可运行；chunk128/256、微批1/3、两种到达及缓存状态均没有新展开资格。三种拓扑下的同类attention mask输入应统一追查观察、资源声明和分区传播，不逐拓扑增分支或补采；本轮只保留证据，全量收齐后再修复。
+
+## 2026-11-04 — S11-B：PD调度九项展开与真实对照
+
+**范围：** 同一冻结5713ed0调查推进Qwen3-8B BF16、PD1→1的chunked prefill＋P侧prefix cache来源；普通分块、缓存压力和错峰到达的三个既有真实目标复用，没有修改代码、输入、镜像或评价。
+
+**改动：** 新增两个worker的联合来源，实际参与及观察rank0/1，无派生角色；page128、两侧并发上限11，P侧KV/Prefill容量1024 token、chunk256及启用缓存，D侧KV/Prefill容量4096 token。两侧解释完成，生产200定义/403布局/69执行模式/2角色库；chunk-128/256/cache-pressure×shared/arrivals/cache-pressure九项展开及完成检查通过，invalid_completions和prediction_errors为空，原队列继续三个真实目标对照。
+
+**验证：**
+
+- runs/scheduling-pd/captures/domain-0-source-0-attempt-4/session-summary.json分别记录初始化123.757s、预热18.449s、采集及flush395.207s，最后一项不是净推理时间或节点成本。累计尝试4次（本批联合来源1次＋既有目标3次），来源保留完整发布记录。
+- 已读全部九份默认结果，control_status均complete、输出token完整，两侧驻留为0、槽位恢复、页数摘要守恒。P侧32页池的shared/arrivals保留6页可淘汰缓存、cache-pressure负载保留10页；8页池对应为6/3页，D侧32页均为逻辑空闲。deferred_free_pages是逻辑空闲页子集，不额外叠加计算占用或回收量，已联查src/markov/resources/kv_pool.cpp:41与application/simulation.cpp的定义和导出一致；本项不代替逐值资源历史、实际缓存淘汰及真实完成关系比较。
+- chunk-256/shared真实主报告partial：P侧9324/9344项公开操作对应、20项未对应及1376个未归属设备任务，D侧15456/15456且matched；10项通信/158条完成关系/432个传输切片matched，无问题或未验证。实际Prefill/Decode 2成员、2个chunked批次和512 token前缀复用满足原生与执行覆盖门槛。
+- cache-pressure/cache-pressure真实主报告partial：P侧16725/16777项公开操作对应、52项未对应及2136个未归属设备任务，D侧24012/24012且matched；15项通信/237条完成关系/648个传输切片matched，无问题或未验证。原生实际Prefill/Decode 1成员、3个chunked批次及768 token前缀复用；执行证据记录5次缓存淘汰，门槛均满足。两例五项完成、十三项内部检查及默认/明细一致性通过，runtime未归属均0，但P侧完整操作对应仍为false。
+- chunk-256/arrivals真实主报告partial：P侧9324/9344项公开操作对应、20项未对应及1376个未归属设备任务，D侧15415/15415且matched；10项通信/158条完成关系/432个传输切片matched，无问题或未验证。原生实际Prefill/Decode 2成员、2个chunked批次及512 token前缀复用；五项完成、十三项内部检查及默认/明细一致性通过，runtime未归属0，但P侧完整操作对应仍为false。四次发送的三项检查通过，延迟105020至2383500ns，仅为发送侧事实，未观察调度器接收时刻。
+- 三例均结束后state.json终态pending空，累计native1652.675s/4次（本批联合来源1次＋既有目标3次）、processing2440.958s，任务数据峰值2721008640字节。整轮outcomes累计38/44工作流、223/252展开、47/54真实对照终态（34 matched、5 partial、3 differences、5 error），另4 blocked；原会话96909及后继PD×TP来源容器存活，来源、九份预测与三份真实报告均在runs/scheduling-pd下。
+
+**结论与限制：** 九项给定耗时工作流完成，三例真实比较均保留partial；默认结果的physical/runtime coverage也继续保留partial，不把内部检查或覆盖计数代替全部公开操作及设备归属。P侧缺口、错峰接收事实及设备任务归属尚未闭合，不预归因于SDK，不据其他检查通过或本例建库成功消除原失败；按固定清单继续PD×TP，无新增目标采集或现场修补。
+
+## 2026-11-04 — S11-B：PD×TP2→TP4四项展开及真实反馈失败
+
+**范围：** 同一冻结5713ed0调查推进Qwen3-8B BF16、P侧TP2/D侧TP4的chunked prefill＋P侧prefix cache来源；复用既有chunk-256/shared真实目标，没有修改代码、输入、镜像或评价。
+
+**改动：** 新增一个联合来源，原生参与rank0–5，记录代表rank0/1/2/3；role-plan以rank3派生D侧rank4/5，分别绑定head区间[4,6)/[6,8)、36层及每head256字节。来源page128、两侧并发上限11，P侧KV/Prefill容量1024 token、chunk256及启用缓存，D侧KV/Prefill容量4096 token；四个观察角色解释完成，生产222定义/501布局/73执行模式/6角色库，chunk-128/256×shared/arrivals四项展开及完成检查通过，invalid_completions和prediction_errors为空，继续真实对照。
+
+**验证：**
+
+- runs/scheduling-pd-tp/captures/domain-0-source-0-attempt-2/session-summary.json分别记录初始化127.610s、预热21.865s、采集及flush421.767s，最后一项不是净推理时间或节点成本；inputs/role-plans/domain-0.json确认6参与/4观察/2派生的分工。
+- chunk-128/shared与arrivals两份默认结果已发布，control_status均complete、四请求输出完整，六池驻留清空、槽位恢复及页数摘要守恒；两个P池各32页中保留6页可淘汰缓存，四个D池32页均逻辑空闲。给定耗时下分别生成208738/208744次动作、均24逻辑批次、209196/209206项操作，KV/metadata量均264241152/25600字节；仅记录结果规模，不将其作为实测瓶颈或通信正确性证明。
+- 四份默认结果均control_status为complete、输出token完整、六池资源摘要守恒，默认physical/runtime coverage均partial；整轮outcomes确认本工作流complete，累计39/44工作流、227/252展开。既有目标captures/validation-chunk-256-shared/session-summary.json确认六rank全部实际观察，包含source仅派生的D侧rank4/5；P/D两侧目标并发上限6、KV容量4096 token、P侧chunk256及缓存，与来源用途分开。
+- chunk-256/shared真实主报告error：在decode.rank-5、lane0/stage0对scheduled-0/1/2/3的poll反馈处停止，尚无逐rank、通信、内部或完成比较报告。原生六rank记录已完整解释，实际Prefill/Decode 2成员、2个chunked批次及512 token前缀复用证据matched，不能据此授予预测通过。
+- 静态定位src/markov/execution/observed_feedback.cpp:138，检查合并“下一事件早于当前时刻”与“对应工作未提交”两种条件，现有报错尚不能区分触发项。state.json终态pending空、无工作流失败不代表真实比较通过；累计native989.725s/2次（本批联合来源1次＋既有目标1次）、processing3560.120s，任务数据峰值5833636853字节。整轮累计39/44工作流、227/252展开、48/54真实对照终态（34 matched、5 partial、3 differences、6 error），另4 blocked；原会话96909及后继PD×EP来源容器存活，冻结代码路径差异为空。
+
+**结论与限制：** 采前代表选择减少两角色的记录与导出，不等于减少原生参与worker、物理卡或Engine会话。四项给定耗时工作流完成，真实预测失败，不授予代表复用、分片交接或完整结构资格；默认physical/runtime coverage保留partial。报错涉及派生rank5，但原因未定，不直接归为复用错误，也不与既有观察角色的poll失败自动合并同根；固定清单继续PD×EP，没有新增目标采集或现场修补。
+
+## 2026-11-04 — S11-B：PD×EP2调度来源建库类型错误
+
+**范围：** 同一冻结5713ed0调查推进Qwen3-30B-A3B BF16、P/D两侧各TP2/EP2的chunked prefill＋P侧prefix cache来源，沿合同分别提供prefill-experts/decode-experts路由条件；复用既有chunk-256/shared真实目标，没有修改代码、输入、镜像或评价。
+
+**改动：** 新增一个联合来源，原生参与及观察rank0–3，四个角色均记录，无派生角色。来源page128、两侧并发上限11，P侧KV/Prefill容量1024 token、chunk256及启用缓存，D侧KV/Prefill容量4096 token；四角色解释完成，C++建库报json.exception.type_error.304：cannot use at() with null，工作流error、对应真实比较blocked。
+
+**验证：**
+
+- runs/scheduling-pd-ep/captures/domain-0-source-0-attempt-2/session-summary.json分别记录初始化231.530s、预热35.516s、采集及flush966.065s，最后一项不是净推理时间或节点成本；inputs/role-plans/domain-0.json确认四个代表和空派生列表。日志保留四份SDK解析完成及templates命令的首个类型错误，正式模板实际不存在、结果为空，四项展开及真实比较均未执行。
+- state.json终态failed、pending空，累计native1950.210s/2次（本批联合来源1次＋既有目标1次）、processing1592.145s，任务数据峰值10938508833字节。整轮仍为39/44工作流、227/252展开、48项真实对照终态；建库失败增至4、真实blocked增至5。原会话96909及后继PD×PP解释容器存活，后者复用已发布来源，冻结代码路径差异为空。
+
+**结论与限制：** 原生采集和解释已结束，停止环节为模板生产；尚未定位哪个空值及其生产者，不能据此判为原生配置不可运行或用空对象兜底绕过。来源、解释记录、目标及费用均保留，全量收齐后统一区分适配交接和核心消费责任，不补采或现场修补；路由/缓存、变换及完整结构没有新资格。
+
+## 2026-11-04 — S11-B：PD×PP3既有来源复用与离线处理
+
+**范围：** 同一冻结5713ed0调查推进Qwen3-8B BF16、P/D两侧各TP1/PP3的chunked prefill＋P侧prefix cache。复用本轮先前发布的来源及既有chunk-256/shared真实目标，没有新增Engine或修改代码、输入、镜像及评价。
+
+**改动：** 来源六个worker参与及观察rank0–5，无派生角色；state.json的source_image与capture.json的native_image均为5fc920e9fa2d，继续保留实际生产身份。来源page128、两侧并发上限11及微批上限2、pp_async_batch_depth为0，P侧KV/Prefill容量1024 token、chunk256及缓存，D侧KV/Prefill容量4096 token；由冻结流程离线解释、建库和比较，没有重新采集。
+
+**验证：**
+
+- runs/scheduling-pd-pp/captures/domain-0-source-0-attempt-2/session-summary.json保留历史初始化126.608s、预热37.194s、采集及flush526.165s，这些是已有来源开销，不作为本次新增采集。inputs/role-plans/domain-0.json确认六代表和空派生列表；六份解释已完成，assets/domain-0/templates.json正式发布259个定义、660个布局、75个执行模式及6个角色。
+- 四份results/chunk-{128,256}/{shared,arrivals}.json均control_status为complete、四请求输出完整、六池摘要守恒且槽位恢复。chunk-128两例分别95439/90011动作、27个逻辑批次、105994/102400操作；chunk-256为72441/66768动作、16/17批次、73280/70697操作。首例P侧各32页中26 free、6 evictable，D侧32页全free；deferred_free_pages是free的子集，不重复相加。
+- 整轮outcomes中本工作流complete、predictions为4、invalid_completions为空、prediction_errors为空，累计40/44工作流和231/252展开；四个建库失败域的21项仍未展开。state.json保留1份来源、累计尝试2次未增加、无工作流失败；最终费用取后续真实比较结束且pending为空的状态，不使用运行期间的预留值。
+- 本轮results/validation/chunk-256/shared/native/validation-chunk-256-shared.json为partial，无prediction_error；六rank公开操作依次4006、4061、4076、9724、9845、9834，共41546项，全部paired、无未对应操作或未解序列、七项窗口检查均通过。P侧三个rank各512个设备任务未归属，D侧0，所有rank未归属runtime动作0；不能据公开图对应将1536项设备任务忽略或直接归因为私有SDK。
+- 通信142项检查、922条完成关系、432个传输切片均matched，unverified及issue_count为0；五项完成、13项内部检查和默认/明细一致性均通过。原生条件证据matched，实际Prefill/Decode 2成员、2个chunked批次及512 token前缀复用；投递检查只覆盖发送侧。终态pending为空，累计native1171.951s/2次、processing2995.185s，任务数据峰值6121179150字节；本批新增原生会话0次，既有来源与目标各1次的费用保留。整轮54个目标均已登记，34 matched、6 partial、3 differences、6 error、5 blocked；原会话96909开始既定条件检查，没有新增案例。
+
+**结论与限制：** 来源复用、实际身份、正式建库、四项给定耗时闭环及六rank公开图/通信对应已核对，完整设备归属仍不成立，整例保持partial。内部不变量、发送侧投递及公开图对应分别保留自身范围，不推定接收时刻、设备完成或性能精度。既有费用不清零，旧来源不改标8fc400，离线恢复不算新原生观察；全轮结果收齐后统一分析，不现场修改规则或补采。
+
+## 2026-11-04 — S11-B：固定整轮收齐与独立报告
+
+**范围：** 5713ed0冻结基线下，继续执行固定31项条件及7项生命周期，并与44个来源工作流和54个真实目标一起完成整轮核对；没有追加案例、修改冻结实现或重启真实目标。
+
+**改动：** 生成[完整独立报告](2026-11-04_s11_independent_validation_report.md)，集中维护全部清单、实际生产身份、模板库、资格、开销及11项问题/风险。状态文档删除逐例长表，收紧为当前结论、资产入口和修复起点；主工作流只更新项目级影响，旧报告及用户无关改动保持原状。
+
+**验证：**
+
+- outcomes与固定清单均为136项，无遗漏或额外项；工作流40 complete/4 error、展开231/252，真实目标34 matched/6 partial/3 differences/6 error/5 blocked。条件20 complete/10 rejected/1 budget_exhausted，生命周期7 complete；43份已生成预测的真实比较均完成默认/明细一致性、五项完成及内部检查，公开差异和设备未知仍按原判据保留。
+- transfer条件耗尽约2968.389s的本次处理额度，任务累计processing5400.834s；超时后还触发native.py:177的Docker删除竞态，日志明确removal already in progress。入口96909最终退出2，六项pending案例均已有结果；46份相关任务状态pending均空，退出后未见本调查容器存活，不恢复原调查以修改结果。
+- 累计native107次/35234.516s、processing50303.157s，失败与中断不清零；51份完整来源和54份完整目标均有阶段摘要，来源50份8fc400与1份5fc920、目标54份5fc920的实际身份分别保留。当前总逻辑大小61316829927字节、保留区37782355413字节，已记账单任务峰值最大10938508833字节；这些不是内存或整轮连续峰值。
+- 静态关联检查确认三份匿名输入均用于attention mask，但根因责任尚待定位；复核反馈两种检查分支、发送侧判据、恢复登记和累计日志消费，并保留历史依赖扫描的未测量风险。冻结源码路径无Git差异，没有因汇报重新编译或新增测试。
+
+**结论与限制：** 本轮固定调查收齐，S11-B仍未通过，完整报告作为统一诊断和修复交接；来源合格、核心处理、公开图对应、内部不变量和设备完成分别保留资格。下一批从事实到入口资源、动作/发布/完成及跨实例端点的共同机制推进，先用保留ground truth离线回归；不进入多机或性能层，不按case补分支、补零、放宽判据或提高额度重复运行。
