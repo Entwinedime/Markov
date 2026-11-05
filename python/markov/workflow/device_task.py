@@ -234,6 +234,8 @@ class DeviceTask:
             "--shm-size",
             "8g",
         ]
+        if self.settings.cpu_set is not None:
+            args += ["--cpuset-cpus", self.settings.cpu_set]
         args += self.runtime.container_arguments()
         for source, target, writable in (
             *command.mounts,

@@ -44,10 +44,12 @@ class CaptureSettings:
     memory_limit_gib: int
     cpus: int
     budget: dict[str, int]
+    detail: str = "diagnostic"
+    cpu_set: str | None = None
 
     @classmethod
-    def parse(cls, raw: dict):
-        reject_unknown(raw, {"image", "devices", "memory_limit_gib", "cpus", "budget"}, "capture")
+    def parse(cls, raw: dict) -> CaptureSettings:
+        reject_unknown(raw, {"image", "devices", "memory_limit_gib", "cpus", "budget", "detail", "cpu_set"}, "capture")
         devices = raw["devices"]
         if (
             not isinstance(devices, list)
@@ -57,10 +59,15 @@ class CaptureSettings:
         ):
             raise ValueError("capture.devices must be unique nonnegative device indices")
         budget = parse_budget(raw["budget"])
+        detail = raw.get("detail", "diagnostic")
+        if detail not in ("semantic", "diagnostic"):
+            raise ValueError("capture.detail must be semantic or diagnostic")
         return cls(
             required_text(raw["image"], "capture.image"),
             tuple(devices),
             positive_integer(raw["memory_limit_gib"], "capture.memory_limit_gib"),
             positive_integer(raw["cpus"], "capture.cpus"),
             budget,
+            detail,
+            required_text(raw["cpu_set"], "capture.cpu_set") if "cpu_set" in raw else None,
         )

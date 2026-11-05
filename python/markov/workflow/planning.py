@@ -37,6 +37,7 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         "base": {
             "manifest": str(request.base.manifest) if request.base.manifest is not None else None,
             "requires_preparation": request.base.manifest is None,
+            "detail": request.execution.capture.detail if request.execution.capture is not None else None,
         },
         "workload": str(request.workload),
         "workload_size": {

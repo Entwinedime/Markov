@@ -19,9 +19,10 @@ class InferenceCapture:
         calibration: bool = False,
         workload: Workload | None = None,
         record_regions: bool = False,
-    ):
+    ) -> None:
         self.request = request
         self.settings = request.execution.capture
+        self.semantic = profiling and self.settings is not None and self.settings.detail == "semantic"
         self.profiling = profiling
         self.calibration = calibration
         self.record_regions = record_regions
@@ -52,6 +53,8 @@ class InferenceCapture:
             raise ValueError("Inference capture currently supports the Ascend runtime")
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
             raise ValueError("Single-host capture needs one declared device per tensor-parallel rank")
+        if self.semantic and self.request.deployment.framework != "sglang":
+            raise ValueError("Semantic-only base capture currently supports SGLang")
 
         if self.request.deployment.framework == "sglang":
             from markov.adapters.sglang import capture as adapter
@@ -73,6 +76,7 @@ class InferenceCapture:
                 captured["deployment"] != asdict(self.request.deployment)
                 or captured["server"] != server
                 or Workload.parse(captured["workload"]) != workload
+                or captured.get("semantic", False) != self.semantic
             ):
                 raise ValueError(
                     "This output belongs to different capture inputs; use a new output or explicit recapture"
@@ -83,15 +87,25 @@ class InferenceCapture:
         model = Path(self.request.deployment.model)
         if not model.is_absolute() or not model.is_dir():
             raise ValueError("Inference capture needs deployment.model to name an absolute local model directory")
+        if self.request.deployment.framework == "sglang":
+            environment = adapter.capture_environment(
+                self.profiling and not self.semantic,
+                self.calibration or self.record_regions,
+                semantic=self.semantic,
+            )
+        else:
+            environment = adapter.capture_environment(self.profiling, self.calibration or self.record_regions)
         payload = {
             "deployment": asdict(self.request.deployment),
             "server": server,
-            "environment": adapter.capture_environment(self.profiling, self.calibration or self.record_regions),
-            "profiling": self.profiling,
+            "environment": environment,
+            "profiling": self.profiling and not self.semantic,
             "calibration": self.calibration,
             "record_regions": self.record_regions,
             "workload": asdict(workload),
         }
+        if self.semantic:
+            payload["semantic"] = True
         command = DeviceCommand(
             adapter.__name__,
             ("collect", "--input", "/capture/capture_input.json"),

@@ -59,7 +59,8 @@ issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
 自动准备按实际工作及来源上下文构造独立小负载，多目标共享；目前支持区域响应、批量备份、整批回载、失败回载控制与 buffered 文件 worker。
 补采只更新本轮缺口，并补入同次采集能提供、库中尚未具备的其他响应；其他已有选择保留，生成的维护请求记录实际范围。
-逐请求 failed_load_attempts 记录回载失败转重新计算的次数；失败不计为成功传输，loaded_pages 仍只计实际回载页。
+逐请求 device_hit_pages 表示进入计算时设备上已就绪的前缀，包含本次成功回载；它与 loaded_pages 不能相加。loaded_pages 只计实际回载页，原本的设备命中为二者之差。
+failed_load_attempts 记录回载失败转重新计算的次数；失败不计为成功传输。
 base 的 runtime.hicache.load_failed 只在实际两次设备分配失败后记录，包含请求、rank、页/段及成功子备份数，不读取缓存快照。
 其包络由目标失败控制和已执行备份替代，不再次迁移进控制残余；原始 DAG 的观测时间保留。
 显式 record-regions 另记录可用于独立评价的排他线程 CPU，按请求/rank/工作对应，扣除子备份的分组余量不认证墙钟顺序。
@@ -182,6 +183,10 @@ scripts/markov.sh capture --request /path/to/request.json
 对应原生环境随调用输入和 base 配置保存。非 FIA 来源仍可构图，但现有注意力变换与独立成本不授予其支持资格；其他采集组合尚未恢复。
 
 execution.capture 另声明推理镜像 image、独占设备数组 devices、容器 memory_limit_gib/cpus，以及 budget。
+可选 cpu_set 使用 Docker 的 CPU 列表表达式，例如 "16-23"，固定进程 CPU 放置；cpus 仍约束累计 CPU 配额，不表示独占这些核。
+SGLang 可选 detail="semantic"，仅采集区域预测所需的 probe 与客户端记录，关闭 profiler 和 native hook，并省去无消费者的 dense 逐算子探针；detail="diagnostic" 为当前默认，保留完整诊断观察。
+两种模式均交付 profile_manifest.json；semantic 的 profiling_ready=false，如实表示没有详细源图或原成本回放资格，普通预测仍可读取。
+区域计时由 --record-regions 另行显式开启。KTransformers 当前只支持 diagnostic，正常实测和独立校准不受 detail 影响。
 Ascend 采集显式使用已注册的 ascend Docker runtime，由它将所选宿主设备映射为容器内逻辑编号；不依赖 Docker 的默认 runtime。
 HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用固定端口；这一环境随实际调用保存。依据为 [CANN 端口环境说明](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/envvar/envref_07_0144.html)。
 镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令在已有 SDK 环境中安装项目并构建原生观察库，需有 C++23 工具链、CMake 和 CANN 头文件。
@@ -200,7 +205,7 @@ workload 可设 drain_before_formal=true，在首个正式请求前等待 SGLang
 文本先用本地 tokenizer 编码并核对预算，再启动模型。预览列出请求数与输出上限；文本未经编码时输入 token 总量为未知。
 客户端时间覆盖实际 HTTP 发送到响应读取，不包括本地 JSON 编解码、写报告或 profiler 导出。
 
-成功返回本次 profile_manifest.json。其文件来自同一次运行：原始 trace、轻量观察与客户端报告，另保留 base 配置和时钟锚点。
+成功返回本次 profile_manifest.json。其文件来自同一次运行：必要观察与客户端报告；diagnostic 另含原始 trace、native hook 及对应时钟锚点。
 探针记录实际接收与最终结果发送端口；导出前检查每个请求恰有一对端口及必要的输入准备观察。
 profiling_ready 只授予这些声明通道的导出资格，不证明全部语义、设备依赖、正常性能或 E2E 预测正确。
 采集期间另观察原生事件记录、流等待、事件/流同步，保留实际句柄和返回码，借 CANN 连接编号关联设备命令；

@@ -53,13 +53,14 @@ def server_arguments(deployment, configuration):
     }
 
 
-def capture_environment(profiling: bool, calibration: bool = False) -> dict[str, str]:
+def capture_environment(profiling: bool, calibration: bool = False, *, semantic: bool = False) -> dict[str, str]:
     """Keep inference conditions equal while disabling all Markov instruments for normal time."""
     environment = {
         "TRITON_ENABLE_TASKQUEUE": "true",
         "ASCEND_USE_FIA": "1",
         "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
         "MARKOV_INPUT_FACTS": "",
+        "MARKOV_PROBE_DETAIL": "semantic" if semantic else "diagnostic",
         "MARKOV_NATIVE_PROBE": "",
         "MARKOV_REGION_MEASUREMENTS": "/capture/regions" if calibration else "",
         "MARKOV_FILE_MEASUREMENTS": "",
@@ -76,6 +77,8 @@ def capture_environment(profiling: bool, calibration: bool = False) -> dict[str,
             MARKOV_NATIVE_PROBE="/capture/native",
             LD_PRELOAD="/opt/markov/lib/libmarkov_runtime_probe.so",
         )
+    elif semantic:
+        environment["MARKOV_INPUT_FACTS"] = "/capture/probe"
     return environment
 
 
@@ -150,6 +153,7 @@ class Capture(SerialHttpClient):
 
     def run(self) -> None:
         profiling_requested = self.plan["profiling"]
+        semantic = self.plan.get("semantic", False)
         if self.plan["calibration"] or self.plan["record_regions"]:
             origin = capture_origin(self.directory)
         for flag, directory in (
@@ -162,8 +166,9 @@ class Capture(SerialHttpClient):
         if profiling_requested:
             control.parent.mkdir()
             control.write_bytes(b"\0")
-            (self.directory / "probe").mkdir()
             (self.directory / "trace").mkdir()
+        if profiling_requested or semantic:
+            (self.directory / "probe").mkdir()
         requests = self.prepare_inputs()
         command = [sys.executable, "-m", "markov.adapters.sglang.capture", "server", "--input", str(self.path)]
         write_json(
@@ -212,7 +217,7 @@ class Capture(SerialHttpClient):
             raise RuntimeError("Profiler did not finish exporting")
         storage = self.directory / "storage"
         temporary_storage_bytes = sum(path.stat().st_size for path in storage.rglob("*") if path.is_file())
-        if profiling_requested:
+        if profiling_requested or semantic:
             self.publish_manifest(temporary_storage_bytes)
         elif self.plan["calibration"] and self.plan["environment"].get("MARKOV_FILE_MEASUREMENTS"):
             files = sorted((self.directory / "file_workers").glob("*.jsonl"))
@@ -334,9 +339,11 @@ class Capture(SerialHttpClient):
         probes = sorted((self.directory / "probe").glob("*.jsonl"))
         native = sorted((self.directory / "native").glob("*.jsonl"))
         ranks = self.plan["deployment"]["tensor_parallel"]
-        if len(traces) != ranks or len(probes) != ranks or len(native) != ranks:
+        diagnostic = self.plan["profiling"]
+        if len(probes) != ranks or (diagnostic and (len(traces) != ranks or len(native) != ranks)):
             raise RuntimeError(
-                f"Expected {ranks} worker traces, probes and native observations; received {len(traces)}, {len(probes)}, {len(native)}"
+                f"Capture channels do not match {ranks} ranks with profiler={diagnostic}: "
+                f"{len(traces)} traces, {len(probes)} probes, {len(native)} native observations"
             )
         required = {
             "runtime.phase.batch_inputs",
@@ -396,9 +403,11 @@ class Capture(SerialHttpClient):
                 "run_dir": str(self.directory),
                 "config_path": "config.json",
                 "status": "completed",
-                "profiling_ready": True,
+                "profiling_ready": diagnostic,
                 "dry_run": False,
-                "scope": "Raw trace, stream/events and eager compute; semantic, dependency and cost coverage require qualification",
+                "scope": "Raw trace, stream/events and eager compute; semantic, dependency and cost coverage require qualification"
+                if diagnostic
+                else "Semantic base observations and client windows; no native trace or detailed source replay qualification",
                 "trace": {
                     "torch_trace_files": files,
                     "ld_preload_trace_files": [

@@ -64,6 +64,8 @@ PageWorkRequest read_page_work_request(const std::filesystem::path & path) {
 PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, const std::optional<std::filesystem::path> & cpu_costs_path, SourceDetail detail) {
     using namespace trace_graph;
     using Clock = std::chrono::steady_clock;
+    if (detail == SourceDetail::Native && !manifest.profiling_ready)
+        throw std::runtime_error("Detailed source diagnostics require a profiler capture; this base contains semantic observations only");
     const auto begin = Clock::now();
     source::Observations observations;
     ascend::RuntimeCausality causality;

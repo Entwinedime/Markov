@@ -365,23 +365,14 @@ class ComputeProbe:
         with self.writer.span("runtime.phase.attention", fields):
             return original(backend, q, k, v, layer, batch, save_kv_cache, **kwargs)
 
-    def install(self):
+    def install(self, *, semantic: bool = False) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         bindings = {
             "sglang.srt.model_executor.runner.eager_runner.EagerRunner.load_batch": self.input_buffers,
-            "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply": self.linear,
-            "sglang.srt.layers.layernorm.RMSNorm.forward_npu": self.normalization,
-            "sglang.srt.layers.activation.SiluAndMul.forward_npu": self.activation,
             "sglang.srt.layers.quantization.unquant.UnquantizedEmbeddingMethod.embedding": self.embedding,
             "sglang.srt.layers.vocab_parallel_embedding.VocabParallelEmbedding.forward": self.embedding_forward,
-            "sglang.srt.layers.vocab_parallel_embedding.get_masked_input_and_mask": self.embedding_mask,
-            "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.get_cos_sin_with_position": self.rotary_table,
-            "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.forward_npu": self.rotary,
-            "sglang.srt.models.utils._reshape_for_qk_norm": self.reshape,
-            "sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.split_qkv_rmsnorm_rope": self.qkv,
             "sglang.srt.layers.logits_processor.LogitsProcessor._get_pruned_states": self.pruning,
-            "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head": self.projection,
             "sglang.srt.layers.logits_processor.LogitsProcessor._copy_logits_to_buffer": self.logits_output,
             "torch.argmax": self.argmax,
             "sglang.srt.layers.sampler.Sampler.forward": self.sample,
@@ -390,5 +381,19 @@ class ComputeProbe:
             "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.forward_extend": self.attention_prefill,
             "sglang.srt.hardware_backend.npu.attention.ascend_backend.AscendAttnBackend.forward_decode": self.attention_decode,
         }
+        if not semantic:
+            bindings.update(
+                {
+                    "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply": self.linear,
+                    "sglang.srt.layers.layernorm.RMSNorm.forward_npu": self.normalization,
+                    "sglang.srt.layers.activation.SiluAndMul.forward_npu": self.activation,
+                    "sglang.srt.layers.vocab_parallel_embedding.get_masked_input_and_mask": self.embedding_mask,
+                    "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.get_cos_sin_with_position": self.rotary_table,
+                    "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.forward_npu": self.rotary,
+                    "sglang.srt.models.utils._reshape_for_qk_norm": self.reshape,
+                    "sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.split_qkv_rmsnorm_rope": self.qkv,
+                    "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head": self.projection,
+                }
+            )
         for target, observer in bindings.items():
             HookRegistry.register(target, observer, HookType.AROUND)

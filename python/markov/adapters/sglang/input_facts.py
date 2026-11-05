@@ -12,9 +12,10 @@ from markov.adapters.sglang.cache_probe import CacheProbe
 
 
 class InputFactsProbe:
-    def __init__(self, writer: EventWriter):
+    def __init__(self, writer: EventWriter, *, native_clock: bool = True) -> None:
         self.writer = writer
         self.clock_process = None
+        self.native_clock = native_clock
 
     def extend(self, original, batch):
         return self.schedule(original, batch, "prefill")
@@ -25,7 +26,7 @@ class InputFactsProbe:
     def schedule(self, original, batch, phase):
         from sglang.srt.server_args import get_global_server_args
 
-        if self.clock_process != os.getpid():
+        if self.native_clock and self.clock_process != os.getpid():
             from markov.adapters.ascend.clock import sample_clock
 
             anchor = sample_clock()
@@ -133,7 +134,8 @@ def install() -> None:
 
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    probe = InputFactsProbe(writer)
+    semantic = os.environ.get("MARKOV_PROBE_DETAIL") == "semantic"
+    probe = InputFactsProbe(writer, native_clock=not semantic)
     HookRegistry.register(
         "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend", probe.extend, HookType.AROUND
     )
@@ -142,5 +144,5 @@ def install() -> None:
     )
     PreparationProbe(writer).install()
     RequestProbe(writer).install()
-    ComputeProbe(writer).install()
+    ComputeProbe(writer).install(semantic=semantic)
     CacheProbe(writer).install()

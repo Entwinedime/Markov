@@ -47,10 +47,10 @@ ProfileManifest inspect_manifest(const std::filesystem::path & path) {
     if (!stream) throw std::runtime_error("Cannot read profile manifest: " + path.string());
 
     const auto raw = nlohmann::json::parse(stream);
-    if (!raw.at("profiling_ready").get<bool>() || raw.at("dry_run").get<bool>())
-        throw std::runtime_error("Profile is not a completed real capture: " + path.string());
+    if (raw.at("status") != "completed" || raw.at("dry_run").get<bool>()) throw std::runtime_error("Profile is not a completed real capture: " + path.string());
 
     ProfileManifest result{ std::filesystem::absolute(path).lexically_normal(), raw.at("framework").get<std::string>(), {} };
+    result.profiling_ready = raw.at("profiling_ready").get<bool>();
     if (raw.contains("capture_origin_manifest")) result.capture_origin_manifest = raw.at("capture_origin_manifest").get<std::string>();
     const std::filesystem::path origin = raw.at("run_dir").get<std::string>();
     if (raw.contains("config_path")) {

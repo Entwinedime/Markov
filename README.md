@@ -35,7 +35,8 @@ scripts/markov.sh predict --request /path/to/request.json
 execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/prediction/report.json，
 包含完整正式 HTTP、逐请求耗时、后台完成、缺口、成本来源、近似、图规模和运行开销。
 同一会话只准备一次 source；每个 target 独立维护缓存和执行状态。
-SGLang 普通预测解释语义 probe 与客户端记录；完整 profiler/native-hook 仍保存在采集资产中，按需用于原始图诊断。
+SGLang 普通预测解释语义 probe 与客户端记录；execution.capture.detail="semantic" 可只采这些记录，当前默认 diagnostic 另保留 profiler/native-hook 用于原始图诊断。
+语义采集没有完整源图回放资格；两种模式的实际精度与开销分别验证。可选 capture.cpu_set 固定采集进程的 CPU 放置。
 预测容器只挂载指定程序、base、模型和输出，不挂载整个仓库、真实设备或正常评分数据。
 
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
