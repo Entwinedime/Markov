@@ -70,3 +70,15 @@ examples/hicache_search/run.sh --model /path/to/Qwen3-32B \
 预算模式面向已经维护好的共同成本，缺口明确停止，不为单个算法临时补采。首次空库准备继续使用默认完整流程，维护好整组成本后再做方法比较。
 已完成批次可续跑，正在运行或没有完整结果的批次保留状态；恢复得到的未知耗时不会填零。改变方法、种子、预算或业务输入使用新输出目录。
 报告中的完成表示本次预算内请求已经评价，不表示枚举了整个空间或证明真实全局最优。
+
+研究对照使用以下入口，最多 3 个进程，每个预测容器沿用声明的内存上限：
+
+```bash
+PYTHONPATH=python python3 examples/hicache_search/compare.py \
+  --study /path/to/study.json --output data/comparison --jobs 3
+```
+
+study 使用 space、model、database、scenarios、workloads、sources、reference_reports、baseline_relative_limits、methods、prediction_budgets、seeds、prices 和 cpu_wall_limit_sec；
+路径相对该文件，workloads/sources/reference_reports 按场景列出明确文件。输入请求、来源与共同模型先确定，参照只在所有运行之后由评价步骤读取，不传给子搜索进程。
+`--phase run|report` 可分开执行；runs.json 保留命令、失败和实际墙钟，comparison.json 保存所有种子及条件于找到可行点的成本差距。
+三种报价的敏感性使用同一批查询结果重新排序，不能冒充三套独立在线搜索。
