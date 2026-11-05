@@ -15,6 +15,7 @@ from markov.workflow.capture import InferenceCapture
 from markov.workflow.device_task import DeviceTask
 from markov.workflow.search import SearchPolicy, search
 
+from budget import BudgetSearch
 from report import confirmation_names, write_report
 
 
@@ -189,6 +190,9 @@ def main() -> None:
     parser.add_argument("--base-manifest", type=Path)
     parser.add_argument("--settings", type=Path, default=EXAMPLE / "space.json")
     parser.add_argument("--phase", choices=("plan", "predict", "confirm", "report", "all"), default="all")
+    parser.add_argument("--method", choices=("enumerate", "random", "stratified"), default="enumerate")
+    parser.add_argument("--budgets", type=int, nargs="+", default=[48, 96, 192])
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     example = SearchExample(args)
     if args.phase == "plan":
@@ -198,6 +202,8 @@ def main() -> None:
                     "candidates": len(example.targets),
                     "normal_roles": ["baseline", "fastest", "selected"],
                     "normal_repetitions": example.repetitions,
+                    "method": args.method,
+                    "budgets": args.budgets if args.method != "enumerate" else None,
                     "qualification": "Declaration only; resource and cost coverage are not yet qualified.",
                 },
                 indent=2,
@@ -214,7 +220,11 @@ def main() -> None:
         example.recover()
 
         if args.phase in {"all", "predict"}:
-            result = search(request)
+            result = (
+                search(request)
+                if args.method == "enumerate"
+                else BudgetSearch(request, args.method, args.budgets, args.seed).run()
+            )
             print(
                 json.dumps(
                     {key: result.get(key) for key in ["status", "expected", "ranked", "selected", "fastest", "report"]}

@@ -74,7 +74,8 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
     lines = [
         "# 有限资源搜索结果",
         "",
-        f"候选 {result['expected']} 个，已进入排名 {result['ranked']} 个；状态 {result['status']}。",
+        f"声明候选 {result.get('space_candidates', result['expected'])} 个，评价 {result['expected']} 个，"
+        f"已进入排名 {result['ranked']} 个；状态 {result['status']}。",
         f"固定正式 HTTP 上限为 {result['maximum_time_sec']:.4f} 秒，预测筛选与正常确认共用此上限；{selection}",
         "",
         "资源档位使用声明的固定预留与原生 KV 池占用，报价为示例成本单位，不代表真实支出。",
