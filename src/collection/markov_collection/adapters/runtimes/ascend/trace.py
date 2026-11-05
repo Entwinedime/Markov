@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import shutil
 import sqlite3
@@ -151,9 +152,6 @@ class AscendTrace:
         *, device: int, communication: bool = False,
     ) -> None:
         self.device = device
-        self.runtime = (
-            NativeRuntimeCalls(runtime_directory, profile) if runtime_directory is not None else None
-        )
         self.communication_calls = self.read_communications(profile) if communication else None
 
         categories = {"async_npu", "async_task_queue", "enqueue", "dequeue", "HostToDevice"}
@@ -195,6 +193,12 @@ class AscendTrace:
             or event["args"].get("connection_id") in connections
         ]
         self.queues = NativeQueues(self.events)
+        self.runtime = None
+        if runtime_directory is not None:
+            processes = {int(event["pid"]) for event in self.events if event.get("name", "").startswith("markov.")}
+            if len(processes) != 1:
+                raise ValueError("Ascend runtime evidence requires one observed host process")
+            self.runtime = NativeRuntimeCalls(runtime_directory, profile, processes.pop())
 
     @staticmethod
     def read_communications(profile: Path) -> list[dict[str, Any]] | None:
@@ -401,13 +405,36 @@ class AscendTrace:
                 queries[launch] = self.queues.origin(self.events[launch]) or self.events[launch]
 
         owners = self.ownership(queries)
+        native_scopes = []
+        native_operations = set()
         if self.runtime is not None:
-            self.runtime.bind_callbacks(self.events, actions, owners)
+            for operation, api, callback in self.runtime.bind_callbacks(self.events, actions, owners):
+                owners[api] = {**owners[api], "operation": operation}
+                native_operations.add(api)
+                submission = self.queues.submission(api)
+                queue = submission["queue"]
+                caller = api if queue is None else queue["enqueue_event"]
+                event = self.events[caller]
+
+                # The callback may precede or follow the API; both boundaries belong to this logical call.
+                native_scopes.append({
+                    "kind": "operation", "identity": operation, "source_event": api,
+                    "thread": event.get("args", {}).get("Thread Id", event["tid"]),
+                    "order": min(self.queues.order[caller], self.queues.order[callback]),
+                    "completion_order": max(
+                        self.queues.completion_order[caller], self.queues.completion_order[callback],
+                    ),
+                })
+
+        services = self.runtime.native_services if self.runtime is not None else {}
 
         result = []
-        for index, (_, association) in claims.items():
-            task = records[index]
+        for index, task in records.items():
+            if index not in claims or task["args"]["Physic Stream Id"] in services:
+                continue
             launch = launches.get(task["args"].get("connection_id"))
+            if launch in native_operations:
+                owners[index] = owners[launch]
             result.append(
                 {
                     "name": task["name"],
@@ -417,7 +444,7 @@ class AscendTrace:
                     "duration_ns": event_time_ns(task, "dur"),
                     **owners[index],
                     "source_event": index,
-                    "association": association,
+                    "association": claims[index][1],
                     "order": self.queues.order[index],
                     "submission": self.queues.submission(launch) if launch is not None else None,
                 }
@@ -482,6 +509,7 @@ class AscendTrace:
             if action["kind"] == "copy_async" and action["target"] is not None and action["context"] == "runtime_queue":
                 queues_by_stream[action["target"]["identity"]].add(action["submission"]["thread"])
 
+        # Driver-private SDK queues are not CANN stream handles; their own synchronous call proves completion.
         streams = {task["stream"] for task in result}
         streams.update(
             action["target"]["identity"]
@@ -530,11 +558,17 @@ class AscendTrace:
             if action["context"] == "host"
             and self.events[action["source_event"]]["args"]["Thread Id"] not in host_threads
         ]
-        unmatched = [
-            {"source_event": index, "name": task["name"]} for index, task in records.items() if index not in claims
-        ]
+        unmatched = []
+        for index, task in records.items():
+            service = services.get(task["args"]["Physic Stream Id"])
+            if index in claims and service is None:
+                continue
+            record = {"source_event": index, "name": task["name"]}
+            if service is not None:
+                record["native_service"] = service["allocation"]
+            unmatched.append(record)
 
-        host_scopes = []
+        host_scopes = [scope for scope in native_scopes if scope["identity"] < operation_count]
         for identity, event in enumerate(self.events):
             if event.get("ph") != "X" or not event.get("name", "").startswith(("markov.operation/", "markov.region/")):
                 continue
@@ -560,6 +594,10 @@ class AscendTrace:
             "host_scopes": host_scopes,
             "unassociated_runtime_actions": unassociated_runtime,
             "unassociated_tasks": unmatched,
+            "native_services": {
+                "resources": {str(service["allocation"]): service for service in services.values()},
+                "calls": dict(self.runtime.service_calls) if self.runtime is not None else {},
+            },
             "observer_controls": observer_controls,
             "communication": communications,
         }
@@ -571,15 +609,18 @@ class AscendTrace:
             if action["kind"] != "copy_async" or action["target"] is None:
                 continue
             submission = action["submission"]
+            if submission["order"] > submission["completion_order"]:
+                continue
             queue = submission["queue"]
             key = (
                 submission["thread"],
                 None if queue is None else (queue["process"], queue["correlation"]),
                 action["target"]["identity"],
             )
-            copies[key].append(action)
+            copies[key].append(submission)
 
         # A parent ACLNN launch can own the DMA connection; its nested memcpy API is the actual submitter.
+        pending: dict[tuple[Any, ...], dict[int, list[dict[str, Any]]]] = defaultdict(dict)
         for task in work:
             submission = task["submission"]
             if task["kind"] != "transfer" or submission is None:
@@ -590,19 +631,50 @@ class AscendTrace:
                 None if queue is None else (queue["process"], queue["correlation"]),
                 task["stream"],
             )
-            candidates = []
-            for action in copies.get(key, []):
-                copy = action["submission"]
-                if (
-                    submission["order"] <= copy["order"] <= copy["completion_order"] <= submission["completion_order"]
-                    or copy["order"]
-                    <= submission["order"]
-                    <= submission["completion_order"]
-                    <= copy["completion_order"]
-                ):
-                    candidates.append(copy)
-            if len(candidates) == 1:
-                task["submission"] = candidates[0]
+            pending[key].setdefault(submission["source_event"], []).append(task)
+
+        for key, launches in pending.items():
+            calls = copies[key]
+            queries = [
+                (identity, tasks[0]["submission"]) for identity, tasks in launches.items()
+                if tasks[0]["submission"]["order"] <= tasks[0]["submission"]["completion_order"]
+            ]
+            candidates = {identity: set() for identity in launches}
+
+            # Two extreme ends distinguish one match from ambiguity; scan containing and contained calls separately.
+            for inner_copies in (False, True):
+                ordered = sorted(enumerate(calls), key=lambda item: item[1]["order"], reverse=inner_copies)
+                queries.sort(key=lambda item: item[1]["order"], reverse=inner_copies)
+                extremes = []
+                position = 0
+                for identity, launch in queries:
+                    while position < len(ordered):
+                        index, copy = ordered[position]
+                        eligible = (
+                            copy["order"] >= launch["order"] if inner_copies
+                            else copy["order"] <= launch["order"]
+                        )
+                        if not eligible:
+                            break
+                        priority = -copy["completion_order"] if inner_copies else copy["completion_order"]
+                        heapq.heappush(extremes, (priority, index))
+                        if len(extremes) > 2:
+                            heapq.heappop(extremes)
+                        position += 1
+
+                    for _, index in extremes:
+                        copy = calls[index]
+                        if (
+                            copy["completion_order"] <= launch["completion_order"] if inner_copies
+                            else copy["completion_order"] >= launch["completion_order"]
+                        ):
+                            candidates[identity].add(index)
+
+            for identity, tasks in launches.items():
+                if len(candidates[identity]) == 1:
+                    (index,) = candidates[identity]
+                    for task in tasks:
+                        task["submission"] = calls[index]
 
     @staticmethod
     def innermost(scopes: list[dict[str, Any]], prefix: str) -> int | None:

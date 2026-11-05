@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace markov {
@@ -17,16 +18,11 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         const bool pipeline = std::ranges::any_of(instance.participants, [](const auto & participant) { return participant.stage != 0; });
         for (const auto & participant : instance.participants) {
             groups_.emplace(participant.group,
-                            std::make_unique<NativeGroup>(requests_,
-                                                          participant.resources,
-                                                          participant.group,
-                                                          participant.stage,
-                                                          instance.role,
-                                                          pipeline));
+                            std::make_unique<NativeGroup>(requests_, participant.resources, participant.group, participant.stage, instance.role, pipeline));
             instances_.emplace(participant.group, instance.id);
             bindings.push_back({
                 {    "id", participant.group },
-                {  "rank", participant.rank },
+                {  "rank",  participant.rank },
                 { "stage", participant.stage }
             });
         }
@@ -79,7 +75,13 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         if (kind == "idle") {
             if (reach_idle(name, identity, message.at("waiting").get<bool>())) parked.insert(instances_.at(name));
         }
-        else if (kind == "input") reply(identity, { { "kind", "advance" }, { "now_ns", 0 }, { "arrivals", nlohmann::json::array() } });
+        else if (kind == "input")
+            reply(identity,
+                  {
+                      {     "kind",               "advance" },
+                      {   "now_ns",                       0 },
+                      { "arrivals", nlohmann::json::array() }
+            });
         else reply(identity, groups_.at(name)->resource_call(message, 0));
     }
 }
@@ -102,9 +104,7 @@ bool NativeController::reach_idle(const std::string & group, std::size_t call, b
     idle_.insert_or_assign(group, std::nullopt);
     if (!waiting) return false;
     const auto & instance = instances_.at(group);
-    const bool settled = std::ranges::all_of(instances_, [&](const auto & entry) {
-        return entry.second != instance || idle_.contains(entry.first);
-    });
+    const bool settled = std::ranges::all_of(instances_, [&](const auto & entry) { return entry.second != instance || idle_.contains(entry.first); });
 
     // Ingress must keep empty control turns moving until every downstream stage has reached idle.
     if (settled) idle_.at(group) = call;
@@ -153,8 +153,8 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
 
             // Empty rounds can carry downstream control messages; only the whole instance can be idle.
             const bool idle = drained && std::ranges::all_of(groups_, [&](const auto & entry) {
-                return instances_.at(entry.first) != instance || idle_.contains(entry.first);
-            });
+                                  return instances_.at(entry.first) != instance || idle_.contains(entry.first);
+                              });
 
             // With no graph work in flight, native PP consensus still needs empty receive rounds.
             const bool executing = !running_calls_.empty() || (transfer_ && transfer_->running());
@@ -196,10 +196,6 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const G
             reach_idle(name, identity, message.at("waiting").get<bool>());
             continue;
         }
-        if (kind == "transfer_poll") {
-            reply(identity, transfer_->poll(message));
-            continue;
-        }
         if (auto action = group.plan(message, now_ns, input.arrived)) {
             if (kind == "transfer_submit") transfer_->submit(*action, message.at("payload"));
 
@@ -228,6 +224,12 @@ void NativeController::finish(const ServingAction & action, const BatchProgram &
         { "completed_ns",   completed_ns },
         {       "values", program.values }
     };
+    if (action.step == ServingStep::Poll) {
+
+        // One native poll reads a single resource snapshot; no simulated event runs inside that call.
+        result["transfers"] = nlohmann::json::object();
+        for (const auto request : action.transfer_query().requests) result["transfers"][std::to_string(request)] = transfer_->poll(action.task.group, request);
+    }
     if (action.step == ServingStep::Allocate) result["bindings"] = group.allocation_bindings(action.batch_work().batch);
     reply(running_calls_.at(action.task), result);
     running_calls_.erase(action.task);

@@ -28,6 +28,7 @@ class ObservationWindow:
         self.native_idle = True
         self.drained = False
         self.prepared_phase: str | None = None
+        self.receipts: list[dict[str, Any]] = []
 
     def begin(self, identity: str) -> None:
         for phase, requests in self.requests.items():
@@ -35,6 +36,10 @@ class ObservationWindow:
                 self.phase = phase
                 self.native_idle = False
                 self.drained = False
+                if phase == "source":
+
+                    # This hook runs at native request dispatch, after receive and rank broadcast.
+                    self.receipts.append({"request": identity, "received_ns": time.perf_counter_ns()})
                 return
 
     def observation(self, requests: Iterable[Any]) -> str | None:

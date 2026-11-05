@@ -89,6 +89,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
         for (const auto rank : group.members) {
             const auto begin = graph_.operations.size();
             const auto rank_node_begin = graph_.execution.first_node() + graph_.execution.nodes().size();
+            const auto rank_dependency_begin = graph_.execution.dependencies().size();
             BatchProgram program{ std::nullopt, {}, {} };
             if (local) program = rank_step(action, rank, work);
             else {
@@ -97,7 +98,7 @@ BatchProgram ServingStructure::expand(const ServingAction & action, const std::m
                 work.push_back({ rank, begin, graph_.operations.size() });
             }
             if (const auto required = prerequisites.find(rank); required != prerequisites.end()) {
-                const auto consumers = graph_.execution.initial_nodes(rank_node_begin);
+                const auto consumers = graph_.execution.initial_nodes(rank_node_begin, rank_dependency_begin);
                 for (const auto producer : required->second) {
                     for (const auto consumer : consumers) graph_.execution.depend(producer, consumer, "instance_input_ready");
                 }

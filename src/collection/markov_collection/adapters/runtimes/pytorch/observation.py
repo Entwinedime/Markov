@@ -44,12 +44,12 @@ class TensorValues:
 
     @contextmanager
     def metadata(self) -> Iterator[None]:
-        with TorchMarkers.scope("markov.observer"), torch._C.DisableTorchFunction(), _disable_current_modes():
+        with self.recording.hidden_scope("observer"), torch._C.DisableTorchFunction(), _disable_current_modes():
             yield
 
     @contextmanager
     def auxiliary(self) -> Iterator[None]:
-        with TorchMarkers.scope("markov.auxiliary"), torch._C.DisableTorchFunction(), _disable_current_modes():
+        with self.recording.hidden_scope("auxiliary"), torch._C.DisableTorchFunction(), _disable_current_modes():
             yield
 
     def storage(self, tensor: torch.Tensor) -> int:
@@ -249,7 +249,7 @@ class OperatorObservation(TorchDispatchMode):
             with self.recording.scope(role, batch=identity), self:
                 yield
         else:
-            with self.recording.markers.scope(f"markov.baseline/{identity}"):
+            with self.recording.baseline(identity):
                 yield
 
     def __torch_dispatch__(self, operation: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
@@ -265,10 +265,9 @@ class OperatorObservation(TorchDispatchMode):
 
         return self.record_operation(operation, args, kwargs)
 
-    def record_operation(self, operation: Any, args: tuple, kwargs: dict) -> Any:
-        identity = len(self.recording.operations)
-        record = {"id": identity, "region": self.recording.current_scope.get(), "name": str(operation)}
-        self.recording.operations.append(record)
+    def record_operation(self, operation: Any, args: tuple, kwargs: dict, **metadata: Any) -> Any:
+        record = self.recording.operation(str(operation), **metadata)
+        identity = record["id"]
 
         internal = self.values.interface is not None
         with self.values.metadata():
@@ -299,7 +298,7 @@ class OperatorObservation(TorchDispatchMode):
                 interface = self.recording.regions[self.values.interface]["metadata"]
                 interface["writes"] = sorted(set(interface["writes"]) | writes)
 
-        with TorchMarkers.scope(f"markov.operation/{identity}"):
+        with self.recording.operation_scope(identity):
             result = operation(*args, **kwargs)
 
         with self.values.metadata():

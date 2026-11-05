@@ -11,8 +11,8 @@ namespace markov::sglang {
 
 DisaggregatedStructure::DisaggregatedStructure(std::span<const TemplateAsset> assets, ServingSettings prefill, ServingSettings decode,
                                                std::span<const Request> requests, const DisaggregatedGroups & groups, const ServingTopology & topology,
-                                               std::vector<std::string> resource_owners,
-                                               const nlohmann::json & prefill_routes, const nlohmann::json & decode_routes)
+                                               std::vector<std::string> resource_owners, const nlohmann::json & prefill_routes,
+                                               const nlohmann::json & decode_routes)
     : topology_(topology),
       resource_owners_(std::move(resource_owners)),
       groups_(groups),
@@ -42,9 +42,7 @@ GroupAdmission DisaggregatedStructure::admission() const {
 PageReuse DisaggregatedStructure::page_reuse() const { return prefill_.page_reuse(); }
 const ServingTopology & DisaggregatedStructure::topology() const { return topology_; }
 
-const std::string & DisaggregatedStructure::resource_group(std::size_t rank) const {
-    return resource_owners_.at(rank);
-}
+const std::string & DisaggregatedStructure::resource_group(std::size_t rank) const { return resource_owners_.at(rank); }
 
 std::vector<TransferBinding> DisaggregatedStructure::transfer_bindings() const {
     std::set<TransferBinding> bindings;
@@ -52,8 +50,8 @@ std::vector<TransferBinding> DisaggregatedStructure::transfer_bindings() const {
     return { bindings.begin(), bindings.end() };
 }
 
-void DisaggregatedStructure::require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind) {
-    const auto consumers = graph_.execution.initial_nodes(begin);
+void DisaggregatedStructure::require(std::span<const std::size_t> producers, std::size_t begin, std::size_t dependency_begin, const std::string & kind) {
+    const auto consumers = graph_.execution.initial_nodes(begin, dependency_begin);
     for (const auto producer : producers) {
         for (const auto consumer : consumers) graph_.execution.depend(producer, consumer, kind);
     }
@@ -62,8 +60,9 @@ void DisaggregatedStructure::require(std::span<const std::size_t> producers, std
 std::size_t DisaggregatedStructure::append_transfer(const KvTransfer & route, std::int64_t bytes, std::int64_t segments,
                                                     std::span<const std::size_t> prerequisites, const std::string & kind, std::span<const KvSlice> slices) {
     const auto begin = graph_.execution.first_node() + graph_.execution.nodes().size();
+    const auto dependency_begin = graph_.execution.dependencies().size();
     const auto copied = prefill_.transfer(route.source, bytes, segments);
-    require(prerequisites, begin, kind);
+    require(prerequisites, begin, dependency_begin, kind);
     graph_.regions[copied.region]["transfer"] = {
         {      "source",      route.source },
         { "destination", route.destination },
@@ -92,6 +91,7 @@ BatchProgram DisaggregatedStructure::transport_event(const ServingAction & actio
     auto & instance = source ? prefill_ : decode_;
     for (const auto rank : members) {
         const auto begin = graph_.execution.first_node() + graph_.execution.nodes().size();
+        const auto dependency_begin = graph_.execution.dependencies().size();
         const auto ready = instance.transport_event(rank, connecting ? "kv_ready" : "kv_complete", prompt_tokens_.at(endpoint.request));
         std::vector<std::size_t> prerequisites;
         if (!connecting) prerequisites = handoff.transport.at(rank);
@@ -107,7 +107,7 @@ BatchProgram DisaggregatedStructure::transport_event(const ServingAction & actio
         }
 
         // Source publication follows copies; destination publication additionally follows source notifications.
-        require(prerequisites, begin, connecting ? "kv_metadata_ready" : "kv_status_ready");
+        require(prerequisites, begin, dependency_begin, connecting ? "kv_metadata_ready" : "kv_status_ready");
         auto & ports = connecting ? handoff.connected : handoff.transport;
         ports[rank] = { ready };
         result.completions.push_back(ready);
@@ -239,7 +239,7 @@ BatchProgram DisaggregatedStructure::expand(const ServingAction & action) {
         result = instance.expand(action, prerequisites);
     }
 
-    auto drained = graph_.execution.terminal_nodes(node_begin);
+    auto drained = graph_.execution.terminal_nodes(node_begin, dependency_begin);
     if (action.step == ServingStep::Reserve || advertised || produced || sent || received || action.step == ServingStep::Accept || released) {
 
         // Batch membership may change between P computation and D admission; request identity is stable.

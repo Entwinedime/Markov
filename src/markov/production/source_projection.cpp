@@ -1,4 +1,5 @@
 #include "markov/production/source_projection.hpp"
+#include "markov/production/source_services.hpp"
 
 #include <algorithm>
 #include <map>
@@ -304,14 +305,30 @@ SourceProjection::PhysicalFacts SourceProjection::physical_facts(const nlohmann:
         });
     }
 
-    const auto unassociated = physical->at("unassociated_tasks").size();
+    std::set<nlohmann::json> services;
+    for (const auto & operation : operations_) {
+        if (operation.properties.contains("native_work")) services.insert(operation.properties.at("native_work"));
+    }
+    std::size_t opaque = 0;
+    for (const auto & task : physical->at("unassociated_tasks")) {
+
+        // Resource ownership qualifies an opaque service, not an invented task-to-call association.
+        if (!task.contains("native_service")) continue;
+        const auto identity = std::to_string(task.at("native_service").get<std::size_t>());
+        const auto & service = physical->at("native_services").at("resources").at(identity);
+        if (services.contains(service.at("work"))) ++opaque;
+    }
+    const auto unassociated = physical->at("unassociated_tasks").size() - opaque;
+    const auto status = !unowned.empty() || unassociated != 0 ? "partial" : opaque != 0 ? "publicly_covered" : "fully_attributed";
     result.coverage = {
-        {                 "scope", "device task ownership; not resource-order or read/write qualification" },
-        {                "status",   unowned.empty() && unassociated == 0 ? "fully_attributed" : "partial" },
+        {                 "scope", "public device work and declared native services; not internal task-to-call, resource-order or read/write qualification" },
+        {                "status",                                                                    status },
         {        "observed_tasks",                                                                observed },
         {      "attributed_tasks",                                                              attributed },
         { "attributed_operations",                                            attributed_operations.size() },
         {    "unassociated_tasks",                                                            unassociated },
+        {  "opaque_service_tasks",                                                                   opaque },
+        {    "unattributed_tasks",                                 physical->at("unassociated_tasks").size() },
         {               "unowned",                                                      std::move(missing) }
     };
     result.coverage["submissions"] = {
@@ -531,14 +548,22 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         const auto & interface = interfaces_[region.at("id").get<std::size_t>()];
         const auto owner = interface ? nlohmann::json(*interface) : nlohmann::json(nullptr);
         const auto host = host_scopes.find({ "region", region.at("id").get<std::size_t>() });
+        auto parent = region.at("parent");
+        const auto & declaration = region.at("metadata");
+
+        // An exported service on another actor is not a synchronous child of its originating caller.
+        if (owner == region.at("id") && declaration.contains("native_work") && declaration.contains("entrypoint") && !parent.is_null()
+            && source_.at("regions")[parent.get<std::size_t>()].at("thread") != region.at("thread"))
+            parent = nullptr;
         result["regions"].push_back({
             {              "id",                                                     region.at("id") },
             {   "source_region",                                                     region.at("id") },
-            {          "parent",                                                 region.at("parent") },
+            {          "parent",                                                               parent },
             {            "role",                                                   region.at("role") },
             { "operation_begin",                                        region.at("operation_begin") },
             { "interface_owner",                                                               owner },
             {      "host_scope", host == host_scopes.end() ? nlohmann::json(nullptr) : *host->second },
+            {          "thread",                                                 region.at("thread") },
             {      "started_ns",                                             region.at("started_ns") },
             {        "ended_ns",                                               region.at("ended_ns") },
             {       "completed",                                              region.at("completed") },
@@ -554,7 +579,7 @@ nlohmann::json SourceProjection::document(const nlohmann::json * physical) const
         });
     }
 
-    return result;
+    return SourceServices(std::move(result)).document();
 }
 
 } // namespace markov

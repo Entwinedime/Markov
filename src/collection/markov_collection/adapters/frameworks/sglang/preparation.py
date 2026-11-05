@@ -42,6 +42,22 @@ class PrefixMatchCall(NativeCall):
         }
         return None
 
+    @staticmethod
+    def declare(source: dict[str, Any]) -> None:
+        used = {
+            member["value"]
+            for region in source["regions"]
+            for member in region["metadata"].get("input_groups", {}).get("prefixes", {}).get("members", [])
+        }
+        for region in source["regions"]:
+            metadata = region["metadata"]
+            if metadata.get("entrypoint") != "prefix_match":
+                continue
+
+            # Candidate lookups stay in caller CPU service unless preparation consumes their result.
+            if metadata["ports"]["outputs"]["prefix_indices"] not in used:
+                del metadata["entrypoint"]
+
 
 class ExtendAllocationCall(CollectionCall):
     def invoke(self, batch: Any) -> Any:

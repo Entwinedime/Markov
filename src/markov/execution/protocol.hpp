@@ -103,8 +103,8 @@ public:
     void separate_entry(std::size_t region);
     void initially_idle(std::size_t resource);
     void depend(std::size_t source, std::size_t target, std::string kind);
-    std::vector<std::size_t> initial_nodes(std::size_t begin) const;
-    std::vector<std::size_t> terminal_nodes(std::size_t begin) const;
+    std::vector<std::size_t> initial_nodes(std::size_t begin, std::size_t dependency_begin) const;
+    std::vector<std::size_t> terminal_nodes(std::size_t begin, std::size_t dependency_begin) const;
     void connect_communication(std::span<const std::size_t> operations, std::size_t resource, std::size_t region, const std::string & kind);
     void connect_accesses(std::span<const ValueAccess> values, std::span<const nlohmann::json> types, std::span<const Operation> operations);
 

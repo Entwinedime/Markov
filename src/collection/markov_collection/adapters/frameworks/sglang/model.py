@@ -23,7 +23,7 @@ class ModelForwardCall(NativeCall):
 
         inputs = dict(self.state.tensors)
 
-        # Parameters and registered buffers keep their geometry in this finalized model domain.
+        # Model and backend state keep their geometry in this finalized implementation domain.
         for tensor in inputs.values():
             self.values.shapes.tensor(tensor)
 

@@ -277,7 +277,7 @@ class PipelineObservation:
             yield False
             return
         if self.recording.batches[identity]["observation"] == "baseline":
-            with self.recording.markers.scope(f"markov.baseline/{identity}"):
+            with self.recording.baseline(identity):
                 yield False
             return
 

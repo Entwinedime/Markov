@@ -14,12 +14,12 @@ class SGLangSource:
     @staticmethod
     def interpret(path: Path, output: Path, profile: bool, *, communication: bool = False) -> None:
         from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
-        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
+        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors, BatchTransitionCall
         from markov_collection.adapters.frameworks.sglang.expert_geometry import ModelPaddingCall
         from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
         from markov_collection.adapters.frameworks.sglang.parallel import CollectiveCall
         from markov_collection.adapters.frameworks.sglang.pd_templates import DisaggregatedTemplates
-        from markov_collection.adapters.frameworks.sglang.preparation import PrefixLocations
+        from markov_collection.adapters.frameworks.sglang.preparation import PrefixLocations, PrefixMatchCall
         from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
         from markov_collection.adapters.runtimes.ascend.indexed_writes import AscendIndexedWrites
         from markov_collection.adapters.runtimes.ascend.layouts import AscendLayouts
@@ -39,10 +39,12 @@ class SGLangSource:
         # Interpretation can be repeated from the captured facts without another native session.
         SGLangSource.declare_execution_domain(source, directory)
         SGLangSource.control_interfaces(source)
+        BatchTransitionCall.declare(source["regions"])
         SGLangSource.model_interfaces(source)
         ExpertObservation.declare(source)
         BatchTensors.declare_model_inputs(source["regions"], source["values"])
         PrefixLocations.declare(source)
+        PrefixMatchCall.declare(source)
         AscendMatrices.declare(
             source["regions"], source["operations"], source["values"], source["environment"]["matrix_selection"]
         )

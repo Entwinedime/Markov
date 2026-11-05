@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,9 @@ class Recording:
     def __init__(self, markers: Any) -> None:
         self.markers = markers
         self.current_scope: ContextVar[int | None] = ContextVar("markov_scope", default=None)
+        self.current_baseline: ContextVar[int | None] = ContextVar("markov_baseline", default=None)
+        self.current_operation: ContextVar[int | None] = ContextVar("markov_operation", default=None)
+        self.hidden: ContextVar[bool] = ContextVar("markov_hidden", default=False)
         self.scope_lock = threading.Lock()
 
         self.regions: list[dict[str, Any]] = []
@@ -66,6 +70,54 @@ class Recording:
 
     def scope(self, role: str, **metadata: Any) -> Scope:
         return Scope(self, role, metadata)
+
+    def operation(self, name: str, **metadata: Any) -> dict[str, Any]:
+
+        # Tensor dispatch and native callbacks reserve identities from the same sequence.
+        with self.scope_lock:
+            record = {"id": len(self.operations), "region": self.current_scope.get(), "name": name, **metadata}
+            self.operations.append(record)
+        return record
+
+    def native_operation(self, kind: str) -> int | None:
+
+        # Calls already inside a tensor operation, baseline or observer must not create duplicate public work.
+        if (
+            self.current_scope.get() is None or self.current_operation.get() is not None
+            or self.current_baseline.get() is not None or self.hidden.get()
+        ):
+            return None
+        return self.operation(
+            f"runtime.{kind}", arguments=[], keywords={}, inputs=[], outputs=[], writes=[],
+            result=None, shape_error=None,
+        )["id"]
+
+    @contextmanager
+    def operation_scope(self, identity: int) -> Any:
+        token = self.current_operation.set(identity)
+        try:
+            with self.markers.scope(f"markov.operation/{identity}"):
+                yield
+        finally:
+            self.current_operation.reset(token)
+
+    @contextmanager
+    def hidden_scope(self, kind: str) -> Any:
+        token = self.hidden.set(True)
+        try:
+            with self.markers.scope(f"markov.{kind}"):
+                yield
+        finally:
+            self.hidden.reset(token)
+
+    @contextmanager
+    def baseline(self, identity: int) -> Any:
+        token = self.current_baseline.set(identity)
+        try:
+            with self.markers.scope(f"markov.baseline/{identity}"):
+                yield
+        finally:
+            self.current_baseline.reset(token)
 
     def document(self, environment: dict[str, Any]) -> dict[str, Any]:
         return {

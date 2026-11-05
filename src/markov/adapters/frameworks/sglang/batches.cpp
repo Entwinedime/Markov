@@ -141,8 +141,14 @@ std::size_t BatchViews::merge(View & left, const View & right, const std::string
         {  "added_members", static_cast<std::int64_t>(right.requests.size()) }
     };
     std::map<std::string, std::size_t> inputs;
-    for (const auto & [name, value] : left.columns) inputs.emplace("left." + name, value);
-    for (const auto & [name, value] : right.columns) inputs.emplace("right." + name, value);
+
+    // Native merge concatenates only columns present on both sides; one-sided tokens are discarded.
+    for (const auto & [name, value] : left.columns) {
+        if (const auto other = right.columns.find(name); other != right.columns.end()) {
+            inputs.emplace("left." + name, value);
+            inputs.emplace("right." + name, other->second);
+        }
+    }
     const auto merged = graph_.append("batch_merge", phase, invocation, inputs);
     auto outputs = columns(merged.ports.outputs);
 

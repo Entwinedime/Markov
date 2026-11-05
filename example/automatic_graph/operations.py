@@ -319,11 +319,12 @@ class OperationComparison:
 
     def same_input(
         self, native: dict[str, Any], target: dict[str, Any], name: Any, paired: Mapping[int, dict[str, Any]],
+        target_owners: Mapping[int, list[int]],
     ) -> bool:
         original = self.operand_values(native, True, "inputs")[name]
         predicted = self.operand_values(target, False, "inputs")[name]
         descriptor = self.target_rows.descriptor(predicted)
-        owners = [identity for identity, operation in paired.items() if operation["id"] == descriptor]
+        owners = () if descriptor is None else target_owners.get(descriptor, ())
         if len(owners) == 1:
             actual = self.native_values[original]
             fields = ("storage", "offset", "shape", "stride", "dtype", "device")
@@ -392,8 +393,7 @@ class OperationComparison:
         self, native: list[dict], paired: dict[int, dict], context: dict[int, dict],
     ) -> tuple[list[int], int]:
         evidence = ChainMap(paired, context)
-        ambiguous = []
-        verified = 0
+        checks = []
         for operation in native:
             identity = operation["id"]
             if identity not in paired:
@@ -404,7 +404,22 @@ class OperationComparison:
                 name for name in left.keys() & right.keys()
                 if left[name] in evidence and right[name] is not None and evidence[left[name]]["id"] != right[name]
             ]
-            resolved = sum(self.same_input(operation, paired[identity], name, evidence) for name in mismatches)
+            if mismatches:
+                checks.append((operation, mismatches))
+
+        # Index this evidence once; retain every owner so ambiguous bindings cannot become unique.
+        target_owners = defaultdict(list)
+        if checks:
+            for identity, operation in evidence.items():
+                target_owners[operation["id"]].append(identity)
+
+        ambiguous = []
+        verified = 0
+        for operation, mismatches in checks:
+            identity = operation["id"]
+            resolved = sum(
+                self.same_input(operation, paired[identity], name, evidence, target_owners) for name in mismatches
+            )
             verified += resolved
             if resolved != len(mismatches):
                 ambiguous.append(identity)

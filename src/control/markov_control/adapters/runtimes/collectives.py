@@ -1,5 +1,7 @@
 """Expose native CPU metadata waits to the worker broker without advancing simulation time."""
 
+from dataclasses import dataclass, field
+
 import torch
 import torch.distributed as distributed
 
@@ -20,6 +22,10 @@ class CpuCollectives:
     def exchange(self, kind, tensor, group, async_op, **parameters):
         if tensor.device.type != "cpu" or async_op:
             raise ValueError("Native metadata collectives require blocking CPU tensors")
+
+        # Gloo returns locally for an empty reduction; waiting for peers would introduce a barrier.
+        if kind == "minimum" and tensor.numel() == 0:
+            return []
         group = distributed.group.WORLD if group is None else group
         members = tuple(self.world[rank] for rank in distributed.get_process_group_ranks(group))
         return self.peer.exchange(
@@ -51,43 +57,64 @@ class CpuCollectives:
         tensor.copy_(torch.tensor(values, dtype=tensor.dtype).reshape_as(tensor))
 
 
+@dataclass
+class CollectiveCall:
+    header: dict
+    values: dict = field(default_factory=dict)
+    waiting: dict = field(default_factory=dict)
+
+
 class CollectiveCalls:
     def __init__(self) -> None:
         self.pending = {}
+        self.positions = {}
 
     def submit(self, channel, rank, message) -> None:
         members = message["members"]
-        key = members, message["group"]
-        participants = self.pending.setdefault(key, {})
-        if rank not in members or rank in participants:
-            raise ValueError("Native CPU collective has an invalid or repeated participant")
-        participants[rank] = channel, message
-        if len(participants) != len(members):
-            return
+        if rank not in members:
+            raise ValueError("Native CPU collective has an invalid participant")
 
-        # A process-group identity separates independent collectives with the same member ranks.
+        # Participants can enter the next broadcast while another receiver is still in the preceding call.
+        group = members, message["group"]
+        participant = group, rank
+        position = self.positions.get(participant, 0)
+        key = group, position
         header = {name: value for name, value in message.items() if name != "values"}
-        calls = [participants[member] for member in members]
-        for _, call in calls:
-            if {name: value for name, value in call.items() if name != "values"} != header:
-                raise ValueError("Native CPU collective participants disagree on the operation")
-            if len(call["values"]) != len(message["values"]):
-                raise ValueError("Native CPU collective participants disagree on tensor extent")
+        call = self.pending.setdefault(key, CollectiveCall(header))
+        if call.header != header:
+            raise ValueError("Native CPU collective participants disagree on the operation")
+        if call.values and len(next(iter(call.values.values()))) != len(message["values"]):
+            raise ValueError("Native CPU collective participants disagree on tensor extent")
+        self.positions[participant] = position + 1
+        call.values[rank] = message["values"]
+        call.waiting[rank] = channel
 
         kind = message["kind"]
         if kind == "broadcast":
-            values = participants[message["source"]][1]["values"]
-        elif kind == "gather":
-            values = [value for _, call in calls for value in call["values"]]
-        elif kind == "minimum":
-            dtype = getattr(torch, message["dtype"].removeprefix("torch."))
-            tensors = torch.tensor([call["values"] for _, call in calls], dtype=dtype)
-            values = tensors.amin(dim=0).tolist()
+            source = message["source"]
+            if source not in members:
+                raise ValueError("Native CPU broadcast source is not a group member")
+            if source not in call.values:
+                return
+
+            # Retaining the source payload permits local returns; broadcast is not an all-rank barrier.
+            values = call.values[source]
         else:
-            raise ValueError(f"Unknown native metadata collective: {kind}")
-        for participant, _ in calls:
+            if len(call.values) != len(members):
+                return
+            if kind == "gather":
+                values = [value for member in members for value in call.values[member]]
+            elif kind == "minimum":
+                dtype = getattr(torch, message["dtype"].removeprefix("torch."))
+                tensors = torch.tensor([call.values[member] for member in members], dtype=dtype)
+                values = tensors.amin(dim=0).tolist()
+            else:
+                raise ValueError(f"Unknown native metadata collective: {kind}")
+        for participant in call.waiting.values():
             participant.send(values)
-        del self.pending[key]
+        call.waiting.clear()
+        if len(call.values) == len(members):
+            del self.pending[key]
 
     def blocked(self):
-        return {channel for calls in self.pending.values() for channel, _ in calls.values()}
+        return {channel for call in self.pending.values() for channel in call.waiting.values()}

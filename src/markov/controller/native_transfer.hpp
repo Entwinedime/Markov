@@ -27,7 +27,7 @@ class NativeTransfer {
 public:
     explicit NativeTransfer(std::span<const NativeTransferRoute> routes);
 
-    nlohmann::json poll(const nlohmann::json & message) const;
+    nlohmann::json poll(const std::string & group, std::size_t request) const;
     void submit(const ServingAction & action, const nlohmann::json & payload);
     std::optional<ServingAction> plan(std::int64_t now_ns);
     void start(const ServingAction & action);

@@ -549,17 +549,23 @@ void TemplateInstance::expand_operation(std::size_t identity, const TemplateDefi
     work["arguments"] = prototype.arguments.instantiate(own_values, parameters, input_groups, bindings.literals);
     work["keywords"] = prototype.keywords.instantiate(own_values, parameters, input_groups, bindings.literals);
     if (prototype.communication) work["communication"] = prototype.communication->instantiate(own_values, parameters, input_groups, bindings.literals);
-    if (const auto found = bindings.execution.find(identity); found != bindings.execution.end()) {
-        const auto & execution = asset_.execution_binding(found->second, parameters);
-        const auto & pattern = asset_.execution_pattern(execution.pattern);
-        if (execution.reduction) {
-            const auto & group = execution.reduction->group();
-            auto plan = execution.reduction->instantiate(pattern, definition.input_groups.at(group), parameters, invocation.input_groups.at(group));
-            graph_.execution.append(plan.pattern, execution.resources, graph_.operations.size(), region);
+    const auto found = bindings.execution.find(identity);
+    const auto * execution = found == bindings.execution.end() ? nullptr : &asset_.execution_binding(found->second, parameters);
+    const auto * pattern = execution ? &asset_.execution_pattern(execution->pattern) : nullptr;
+
+    // Geometry alone cannot qualify communication; try another observed candidate before publishing any graph.
+    if (prototype.communication && (!pattern || !pattern->communication))
+        throw LayoutMismatch(role_ + " communication has no observed execution ports");
+
+    if (execution) {
+        if (execution->reduction) {
+            const auto & group = execution->reduction->group();
+            auto plan = execution->reduction->instantiate(*pattern, definition.input_groups.at(group), parameters, invocation.input_groups.at(group));
+            graph_.execution.append(plan.pattern, execution->resources, graph_.operations.size(), region);
             work["execution_parts"] = std::move(plan.parts);
         }
-        else graph_.execution.append(pattern, execution.resources, graph_.operations.size(), region);
-        work["execution_pattern"] = execution.pattern;
+        else graph_.execution.append(*pattern, execution->resources, graph_.operations.size(), region);
+        work["execution_pattern"] = execution->pattern;
     }
 
     graph_.operations.push_back(std::move(operation));

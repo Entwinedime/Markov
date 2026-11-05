@@ -30,6 +30,13 @@ nlohmann::json execution_signature(const nlohmann::json & frame) {
     std::map<std::pair<std::string, std::int64_t>, std::map<std::size_t, std::vector<nlohmann::json *>>> orders;
     for (auto & operation : result["operations"]) {
         operation.erase("candidate");
+        auto & observation = operation.at("observation");
+        if (observation.contains("native_work")) {
+
+            // An opaque service's internal profiling evidence does not change its execution contract.
+            observation = { { "native_work", observation.at("native_work") } };
+            continue;
+        }
         auto & host = operation.at("observation").at("host_scope");
         if (!host.is_null()) {
             host.erase("source_event");

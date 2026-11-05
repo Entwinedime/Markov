@@ -34,6 +34,7 @@ add_library(markov_core
     src/markov/graph/region_graph.cpp
     src/markov/graph/source_graph.cpp
     src/markov/production/source_projection.cpp
+    src/markov/production/source_services.cpp
     src/markov/production/source_partitions.cpp
     src/markov/production/execution_source.cpp
     src/markov/production/execution_reuse.cpp

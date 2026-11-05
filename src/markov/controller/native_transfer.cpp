@@ -10,20 +10,35 @@ namespace markov {
 
 NativeTransfer::NativeTransfer(std::span<const NativeTransferRoute> routes) : routes_(routes.begin(), routes.end()) {}
 
-nlohmann::json NativeTransfer::poll(const nlohmann::json & message) const {
-    const auto request = message.at("request").get<std::size_t>();
-    const auto group = message.at("group").get<std::string>();
+nlohmann::json NativeTransfer::poll(const std::string & group, std::size_t request) const {
     const auto found = handoffs_.find(request);
-    if (found == handoffs_.end()) return { { "state", "bootstrapping" }, { "payload", nullptr } };
+    if (found == handoffs_.end())
+        return {
+            {   "state", "bootstrapping" },
+            { "payload",         nullptr }
+        };
     const auto & handoff = found->second;
     if (const auto source = handoff.sources.find(group); source != handoff.sources.end()) {
         const auto & endpoint = source->second;
-        return { { "state", endpoint.published == Progress::Complete ? "completed" : endpoint.connected == Progress::Complete ? "ready" : "bootstrapping" },
-                 { "payload", nullptr } };
+        return {
+            {   "state",
+             endpoint.published == Progress::Complete   ? "completed"
+             : endpoint.connected == Progress::Complete ? "ready"
+             : "bootstrapping"                                            },
+            { "payload",                                           nullptr }
+        };
     }
     const auto destination = handoff.destinations.find(group);
-    if (destination == handoff.destinations.end()) return { { "state", "bootstrapping" }, { "payload", nullptr } };
-    if (destination->second.published != Progress::Complete) return { { "state", "ready" }, { "payload", nullptr } };
+    if (destination == handoff.destinations.end())
+        return {
+            {   "state", "bootstrapping" },
+            { "payload",         nullptr }
+        };
+    if (destination->second.published != Progress::Complete)
+        return {
+            {   "state", "ready" },
+            { "payload", nullptr }
+        };
 
     nlohmann::json payload;
     for (const auto & route : routes_) {
@@ -34,7 +49,10 @@ nlohmann::json NativeTransfer::poll(const nlohmann::json & message) const {
         if (!payload.is_null() && payload != source.payload) throw std::invalid_argument("native transfer fragments disagree on metadata");
         payload = source.payload;
     }
-    return { { "state", "completed" }, { "payload", std::move(payload) } };
+    return {
+        {   "state",        "completed" },
+        { "payload", std::move(payload) }
+    };
 }
 
 void NativeTransfer::submit(const ServingAction & action, const nlohmann::json & payload) {
@@ -49,7 +67,11 @@ void NativeTransfer::submit(const ServingAction & action, const nlohmann::json &
 }
 
 ServingAction NativeTransfer::endpoint_event(std::size_t request, const std::string & group, ServingStep step, std::int64_t now_ns) {
-    return { { "kv", sequence_++ }, TransferEndpoint{ request, group }, now_ns, 0, 0, std::nullopt, step };
+    return {
+        {    "kv", sequence_++ },
+        TransferEndpoint{ request,       group },
+        now_ns, 0, 0, std::nullopt, step
+    };
 }
 
 std::optional<ServingAction> NativeTransfer::plan(std::int64_t now_ns) {
@@ -63,9 +85,8 @@ std::optional<ServingAction> NativeTransfer::plan(std::int64_t now_ns) {
             }
 
             // Native sender success follows all its destinations, rather than each rank-pair copy.
-            if (source.published == Progress::Waiting && !source.payload.is_null() && std::ranges::all_of(routes_, [&](const auto & route) {
-                    return route.binding.source != group || handoff.copied.contains(route.binding);
-                })) {
+            if (source.published == Progress::Waiting && !source.payload.is_null()
+                && std::ranges::all_of(routes_, [&](const auto & route) { return route.binding.source != group || handoff.copied.contains(route.binding); })) {
                 source.published = Progress::Submitted;
                 return endpoint_event(request, group, ServingStep::Notify, now_ns);
             }
@@ -78,7 +99,9 @@ std::optional<ServingAction> NativeTransfer::plan(std::int64_t now_ns) {
             auto & source = source_entry->second;
             for (auto & [flow, fragment] : source.fragments) {
                 if (!fragment.ready || fragment.submitted.contains(binding)) continue;
-                const std::array demands{ KvDemand{ request, 0 } };
+                const std::array demands{
+                    KvDemand{ request, 0 }
+                };
                 auto batch = route.destination.plan(Phase::Prefill, demands);
                 auto & member = batch.members.front();
                 member.context_tokens = fragment.member.context_tokens;
@@ -93,8 +116,11 @@ std::optional<ServingAction> NativeTransfer::plan(std::int64_t now_ns) {
                 fragment.submitted.insert(binding);
 
                 // Copy flow names the source send task; the detached copy keeps its own task identity.
-                return ServingAction{ { "kv", sequence_++ }, std::make_shared<const BatchWork>(std::move(work)), now_ns, flow, 0, std::nullopt,
-                                      ServingStep::Transfer, {}, binding };
+                return ServingAction{
+                    { "kv", sequence_++ },
+                    std::make_shared<const BatchWork>(std::move(work)), now_ns, flow, 0, std::nullopt, ServingStep::Transfer, {},
+                    binding
+                };
             }
         }
 
@@ -116,8 +142,7 @@ void NativeTransfer::start(const ServingAction & action) {
     auto & handoff = handoffs_[request];
 
     // Advertising creates only transport intent; source registration does not gate native bootstrap reception.
-    if (!handoff.destinations.try_emplace(action.task.group).second)
-        throw std::invalid_argument("native destination advertised the same live handoff twice");
+    if (!handoff.destinations.try_emplace(action.task.group).second) throw std::invalid_argument("native destination advertised the same live handoff twice");
     for (const auto & route : routes_) {
         if (route.binding.destination == action.task.group) handoff.sources.try_emplace(route.binding.source);
     }
@@ -155,8 +180,7 @@ void NativeTransfer::finish(const ServingAction & action) {
             if (released) handoff.sources.at(action.task.group).released = true;
         }
 
-        if (handoff.copied.size() == routes_.size()
-            && std::ranges::all_of(handoff.sources, [](const auto & entry) { return entry.second.released; })
+        if (handoff.copied.size() == routes_.size() && std::ranges::all_of(handoff.sources, [](const auto & entry) { return entry.second.released; })
             && std::ranges::all_of(handoff.destinations, [](const auto & entry) { return entry.second.consumed; }))
             handoffs_.erase(member.request);
     }

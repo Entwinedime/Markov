@@ -199,20 +199,22 @@ class NativeDisaggregatedSession:
             time.sleep(0.2)
         raise RuntimeError(f"{role} server exited ({process.returncode}); see {log}")
 
-    def query(self, device: int, path: str, payload: Any = None, *, timeout: int | None = 120) -> bytes:
+    def query(self, device: int, path: str, payload: Any = None, *, timeout: int | None = None) -> bytes:
         data = None if payload is None else json.dumps(payload).encode()
         request = Request(
             f"http://127.0.0.1:{self.http_ports[device]}{path}",
             data=data,
             headers={"Content-Type": "application/json"},
         )
+
+        # Phase commands share the task deadline; startup probes explicitly bound a single readiness request.
         with urlopen(request, timeout=timeout) as response:
             return response.read()
 
     def stop_profiles(self, executor: ThreadPoolExecutor, devices: list[int]) -> None:
 
         # Both services flush raw observations before CPU analysis; the outer native budget bounds the operation.
-        futures = [executor.submit(self.query, device, "/stop_profile", timeout=None) for device in devices]
+        futures = [executor.submit(self.query, device, "/stop_profile") for device in devices]
         for future in futures:
             future.result()
 

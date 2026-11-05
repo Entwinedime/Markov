@@ -41,7 +41,7 @@ class ScheduleInvocation:
                 }
             else:
                 identity = len(owner.recording.batches)
-                contexts.enter_context(owner.recording.markers.scope(f"markov.baseline/{identity}"))
+                contexts.enter_context(owner.recording.baseline(identity))
             self.contexts = contexts.pop_all()
         return self
 

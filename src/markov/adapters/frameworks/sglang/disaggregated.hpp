@@ -21,8 +21,7 @@ class DisaggregatedStructure final : public BatchExpansion {
 public:
     DisaggregatedStructure(std::span<const TemplateAsset> assets, ServingSettings prefill, ServingSettings decode, std::span<const Request> requests,
                            const DisaggregatedGroups & groups, const ServingTopology & topology, std::vector<std::string> resource_owners,
-                           const nlohmann::json & prefill_routes,
-                           const nlohmann::json & decode_routes);
+                           const nlohmann::json & prefill_routes, const nlohmann::json & decode_routes);
 
     GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
@@ -55,7 +54,7 @@ private:
         std::set<std::size_t> released;
     };
 
-    void require(std::span<const std::size_t> producers, std::size_t begin, const std::string & kind);
+    void require(std::span<const std::size_t> producers, std::size_t begin, std::size_t dependency_begin, const std::string & kind);
     void transfer(const ServingAction & action, Handoff & handoff);
     BatchProgram transport_event(const ServingAction & action, Handoff & handoff);
     void bind_readiness(const ServingAction & action, const BatchProgram & program, std::span<const std::size_t> drained, RankPorts & ports);

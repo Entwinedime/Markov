@@ -12,9 +12,9 @@ from markov_collection.instrumentation.recording import Recording
 
 
 class ModuleState:
-    """Bind finalized module state once; ordinal ports keep repeated call records small."""
+    """Bind model and explicit runtime state once; keep parameter ports ordinal."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, resources: dict[str, torch.Tensor]) -> None:
         self.tensors = {}
         self.names = {}
         for kind, entries in (("parameters", model.named_parameters()), ("buffers", model.named_buffers())):
@@ -22,6 +22,9 @@ class ModuleState:
                 port = f"{kind}.{index}"
                 self.tensors[port] = tensor
                 self.names[port] = name
+
+        self.tensors.update(resources)
+        self.names.update({name: name for name in resources})
 
 
 class ModuleObservation:
@@ -61,11 +64,13 @@ class ModuleObservation:
 
             owned = "forward" in module.__dict__
             original = module.forward
-            self.originals.append((module, owned, original))
             call = self.root_call if not path else self.calls.get(type(module), NativeCall)
             module.forward = call(
                 self.recording, self.values, path, original, self.inputs if not path else {}, role="module"
             )
+
+            # Only an installed override belongs to this observation's restoration work.
+            self.originals.append((module, owned, original))
 
     def describe(self, path: str, module: Any) -> dict[str, Any]:
         parameters = []

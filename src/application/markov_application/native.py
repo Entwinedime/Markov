@@ -97,10 +97,11 @@ class NativeExecution:
         print(f"Prediction saved to {self.output}; logs: {self.logs}")
 
     def container(self, role: str, version: str, mounts: dict[Path, tuple[str, str]]) -> list[str]:
+
+        # This owner removes both containers after their launchers exit; Docker must not race that removal.
         command = [
             "docker",
             "run",
-            "--rm",
             "--init",
             "-i",
             "--network",

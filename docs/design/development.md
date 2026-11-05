@@ -178,7 +178,7 @@ scripts/markov.sh expand \
 
 `probe.py`、`state.py`、`collectives.py`分别观察真实操作、页池和collective。`physical.py`消费来源记录、trace及`--profile`指定的原始SDK元数据目录，可用`--runtime`交出API记录；trace输出位置不再决定其时钟或通信元数据来源。名称与数量一致只证明工作清单，没有时序或成本资格。
 
-`produce` 和 `templates` 可在 `--source` 后接 `--physical path/to/physical.json`，消费同一捕获的设备事实。`physical_coverage` 区分未观察、全部已归属及部分未归属，并聚合列出缺少公开操作的工作。此结果只说明归属，不能代替资源顺序或读写端口的资格；区域输出用 `source_physical_coverage` 保留来源整体状态。
+`produce` 和 `templates` 可在 `--source` 后接 `--physical path/to/physical.json`，消费同一捕获的设备事实。`physical_coverage` 区分未观察、逐任务归属完整、由已声明不透明服务承接的公开覆盖及仍有未知，并聚合列出缺少公开操作的工作。不透明服务的内部任务单列保留，不伪称已对应到具体调用；此结果不能代替资源顺序或读写端口资格。区域输出用 `source_physical_coverage` 保留来源整体状态。
 
 完整 serving 使用带物理事实编译的来源域模板目录：
 

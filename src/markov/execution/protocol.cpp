@@ -127,28 +127,30 @@ void ExecutionGraph::sequence(std::size_t node, std::size_t resource) {
 
 void ExecutionGraph::depend(std::size_t source, std::size_t target, std::string kind) { dependencies_.push_back({ source, target, std::move(kind) }); }
 
-std::vector<std::size_t> ExecutionGraph::initial_nodes(std::size_t begin) const {
-    std::set<std::size_t> dependent;
-    for (const auto & edge : dependencies_) {
-        if (edge.source >= begin && edge.target >= begin) dependent.insert(edge.target);
+std::vector<std::size_t> ExecutionGraph::initial_nodes(std::size_t begin, std::size_t dependency_begin) const {
+    std::vector<bool> dependent(first_node_ + nodes_.size() - begin);
+
+    // Existing edges cannot refer to this fragment's newly allocated nodes.
+    for (const auto & edge : dependencies().subspan(dependency_begin)) {
+        if (edge.source >= begin && edge.target >= begin) dependent[edge.target - begin] = true;
     }
 
     std::vector<std::size_t> result;
     for (auto node = begin; node < first_node_ + nodes_.size(); ++node) {
-        if (!dependent.contains(node)) result.push_back(node);
+        if (!dependent[node - begin]) result.push_back(node);
     }
     return result;
 }
 
-std::vector<std::size_t> ExecutionGraph::terminal_nodes(std::size_t begin) const {
-    std::set<std::size_t> continued;
-    for (const auto & edge : dependencies_) {
-        if (edge.source >= begin && edge.target >= begin) continued.insert(edge.source);
+std::vector<std::size_t> ExecutionGraph::terminal_nodes(std::size_t begin, std::size_t dependency_begin) const {
+    std::vector<bool> continued(first_node_ + nodes_.size() - begin);
+    for (const auto & edge : dependencies().subspan(dependency_begin)) {
+        if (edge.source >= begin && edge.target >= begin) continued[edge.source - begin] = true;
     }
 
     std::vector<std::size_t> result;
     for (auto node = begin; node < first_node_ + nodes_.size(); ++node) {
-        if (!continued.contains(node)) result.push_back(node);
+        if (!continued[node - begin]) result.push_back(node);
     }
     return result;
 }
@@ -168,7 +170,10 @@ void ExecutionGraph::separate_entry(std::size_t region) {
     auto & ports = host_calls_.at({ ExecutionOwner::Kind::Region, region });
     const auto entry = first_node_ + nodes_.size();
     const auto resource = nodes_.at(ports.entry - first_node_).step.resource;
-    nodes_.push_back({ { ExecutionKind::WaitEntry, resource, std::nullopt, "call_entry" }, { ExecutionOwner::Kind::Region, region } });
+    nodes_.push_back({
+        { ExecutionKind::WaitEntry, resource, std::nullopt, "call_entry" },
+        { ExecutionOwner::Kind::Region, region }
+    });
 
     // A remote effect can depend on call entry without waiting for the local CPU service to return.
     for (auto & edge : dependencies_) {

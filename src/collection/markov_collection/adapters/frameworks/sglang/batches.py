@@ -99,6 +99,17 @@ class BatchTransitionCall(NativeCall):
         self, values: Any, original: Any, batch: Any, other: Any = None, *,
         fields: dict[str, str] = BatchTensors.fields, selection_view: str | None = None
     ) -> None:
+        tensors = BatchTensors.read(batch, fields)
+        if other is not None:
+            right = BatchTensors.read(other, fields)
+
+            # Native merge drops optional columns unless both sides have a tensor.
+            fields = {name: path for name, path in fields.items() if name in tensors and name in right}
+            tensors = {
+                **{f"left.{name}": tensors[name] for name in fields},
+                **{f"right.{name}": right[name] for name in fields},
+            }
+        self.input_tensors = tensors
         inputs = {f"self.{path}": {0: "before_members"} for path in fields.values()}
         if other is not None:
             inputs.update({f"other.{path}": {0: "added_members"} for path in fields.values()})
@@ -119,16 +130,34 @@ class BatchTransitionCall(NativeCall):
 
     def resources(self, arguments: dict[str, Any]) -> tuple[Any, Any]:
         self.value_begin = len(self.recording.values)
-        inputs = BatchTensors.read(self.batch, self.fields)
-        if self.other is not None:
-            inputs = {
-                **{f"left.{name}": tensor for name, tensor in inputs.items()},
-                **{f"right.{name}": tensor for name, tensor in BatchTensors.read(self.other, self.fields).items()},
-            }
-
-        self.input_ports = self.values.port_values(inputs)
+        self.input_ports = self.values.port_values(self.input_tensors)
         self.region = self.recording.current_scope.get()
-        return tuple(inputs.values()), ()
+        return tuple(self.input_tensors.values()), ()
+
+    @staticmethod
+    def declare(regions: list[dict[str, Any]]) -> None:
+        for region in regions:
+            metadata = region["metadata"]
+            if metadata.get("entrypoint") != "batch_merge":
+                continue
+            ports = metadata["ports"]["inputs"]
+            left = {name.removeprefix("left.") for name in ports if name.startswith("left.")}
+            right = {name.removeprefix("right.") for name in ports if name.startswith("right.")}
+            paired = left & right
+            inputs = {name: value for name, value in ports.items() if name.split(".", 1)[1] in paired}
+            removed = set(ports.values()) - set(inputs.values())
+
+            # Reinterpret the recorded presence contract; no discarded column becomes a caller dependency.
+            metadata["ports"]["inputs"] = inputs
+            metadata["inputs"] = list(dict.fromkeys(inputs.values()))
+            metadata["opaque_inputs"] = metadata["inputs"]
+            metadata["required_inputs"] = sorted(inputs)
+            metadata["argument_relations"] = [
+                {"mapping": [[name, {"value": value}] for name, value in inputs.items()]}
+            ]
+            metadata["shape_contracts"] = [
+                contract for contract in metadata.get("shape_contracts", []) if contract["value"] not in removed
+            ]
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
 

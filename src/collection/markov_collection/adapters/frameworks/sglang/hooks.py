@@ -32,7 +32,7 @@ class SGLangObservation:
         self.directory = Path(description["output"])
         self.rank_offset = description["rank_offset"]
         self.recording = Recording(TorchMarkers())
-        self.synchronization = SynchronizationObservation(self.recording.markers)
+        self.synchronization = SynchronizationObservation(self.recording)
         self.workspaces = AscendWorkspaces(self.synchronization, Path(description["native_library"]))
         self.workspace_states: dict[str, list[dict[str, int]]] = {}
         self.operators = AscendOperatorObservation(self.recording)
@@ -214,6 +214,7 @@ class SGLangObservation:
             shapes.bind_shape(mapping, (shapes.symbol("slot_capacity") + 1, mapping.shape[1]))
 
     def run_batch(self, original: Any, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+        import torch
         from sglang.srt.layers.radix_attention import RadixAttention
 
         from markov_collection.adapters.frameworks.sglang.attention import AttentionCall
@@ -227,7 +228,7 @@ class SGLangObservation:
 
         phase = self.recording.batches[identity]["phase"]
         if self.recording.batches[identity]["observation"] == "baseline":
-            with self.recording.markers.scope(f"markov.baseline/{identity}"):
+            with self.recording.baseline(identity):
                 result = original(scheduler, batch, *args, **kwargs)
             if self.pipeline is not None:
                 self.pipeline.remember(identity, result)
@@ -296,7 +297,15 @@ class SGLangObservation:
 
             if self.model_state is None:
                 with self.operators.values.metadata():
-                    self.model_state = ModuleState(self.model)
+                    backend = scheduler.tp_worker.model_runner.attn_backend
+
+                    # The backend owns these persistent masks independently of model parameters and batch metadata.
+                    resources = {
+                        f"attention.state.{name}": tensor
+                        for name, tensor in vars(backend.ascend_attn_mask_builder).items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                    self.model_state = ModuleState(self.model, resources)
 
             with ModuleObservation(
                 self.recording,
@@ -353,7 +362,7 @@ class SGLangObservation:
         if identity is None:
             return original(scheduler, batch, result)
         if self.recording.batches[identity]["observation"] == "baseline":
-            with self.recording.markers.scope(f"markov.baseline/{identity}"):
+            with self.recording.baseline(identity):
                 return original(scheduler, batch, result)
 
         with self.recording.scope("ResultProcessed", batch=identity) as scope, self.operators:
@@ -590,6 +599,10 @@ class SGLangObservation:
             write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
 
         self.workspace_states[self.window.phase] = self.workspaces.snapshot()
+        if self.selected and self.disaggregation is not None and self.window.phase in ("baseline", "source"):
+
+            # A later source failure must not erase SDK calls from an already drained baseline.
+            self.disaggregation.transport.write(self.directory / "runtime")
         if self.selected and self.window.phase == "source":
             self.write()
 
@@ -605,8 +618,7 @@ class SGLangObservation:
         import torch
         import torch_npu
 
-        self.recording.write(
-            self.directory / f"rank-{self.parallel['rank']}.json",
+        observation = self.recording.document(
             {
                 "framework": "sglang",
                 "torch": torch.__version__,
@@ -632,6 +644,10 @@ class SGLangObservation:
                 "model_state": self.model_state.names if self.model_state is not None else {},
             },
         )
+
+        # Dispatch timing is observation evidence, not part of a template's environment or identity.
+        observation["request_receipts"] = self.window.receipts
+        write_json(self.directory / f"rank-{self.parallel['rank']}.json", observation)
         self.synchronization.write(self.directory / "runtime")
 
     def install(self) -> None:

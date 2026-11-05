@@ -66,7 +66,7 @@ class GraphSender(BaseKVSender):
     def poll(self):
         if self.conclude_state is not None:
             return self.conclude_state
-        state = self.manager.peer.call("transfer_poll", request=self.request)["state"]
+        state = self.readiness["state"]
         if state == "completed":
             self.conclude_state = KVPoll.Success
             return self.conclude_state
@@ -104,7 +104,7 @@ class GraphReceiver(BaseKVReceiver):
             return KVPoll.Bootstrapping
         if self.index is None:
             return KVPoll.WaitingForInput
-        result = self.manager.peer.call("transfer_poll", request=self.request)
+        result = self.readiness
         if result["state"] != "completed":
             return KVPoll.WaitingForInput
 
@@ -182,11 +182,18 @@ class DisaggregatedScheduler(NativeScheduler):
         HookRegistry.apply_hooks()
 
     def poll_readiness(self, original, pollers):
-        if pollers:
+        if not pollers:
+            return original(pollers)
 
-            # Advance the observation boundary before native code reads resources and reaches its own consensus.
-            self.peer.call("poll", requests=[poller.request for poller in pollers])
-        return original(pollers)
+        # The completed CPU boundary supplies all reads; native pollers still decide status and metadata admission.
+        result = self.peer.call("poll", requests=[poller.request for poller in pollers])
+        for poller in pollers:
+            poller.readiness = result["transfers"][str(poller.request)]
+        try:
+            return original(pollers)
+        finally:
+            for poller in pollers:
+                del poller.readiness
 
     def process_input_requests(self, requests):
 

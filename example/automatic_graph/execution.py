@@ -15,6 +15,34 @@ class DependencyPaths:
             self.successors[edge["source"]].add(edge["target"])
             predecessors[edge["target"]].add(edge["source"])
         self.order = {node: position for position, node in enumerate(TopologicalSorter(predecessors).static_order())}
+        self.chains = self.sequence_chains(graph)
+
+    @staticmethod
+    def sequence_chains(graph: dict[str, Any]) -> dict[int, int]:
+        following = {}
+        previous = {}
+        for edge in graph["dependencies"]:
+            if edge["kind"] not in {"resource_order", "call_entry"}:
+                continue
+            source, target = edge["source"], edge["target"]
+            if following.setdefault(source, target) != target:
+                following[source] = None
+            if previous.setdefault(target, source) != source:
+                previous[target] = None
+
+        # Forks and joins end a chain; every retained step is an actual edge in the DAG.
+        following = {
+            source: target for source, target in following.items()
+            if target is not None and previous[target] == source
+        }
+        roots = following.keys() - set(following.values())
+        chains = {}
+        for root in roots:
+            node = root
+            while node is not None:
+                chains[node] = root
+                node = following.get(node)
+        return chains
 
     def missing(self, links: set[tuple[int, int]]) -> set[tuple[int, int]]:
         required: dict[int, set[int]] = defaultdict(set)
@@ -32,6 +60,11 @@ class DependencyPaths:
             unreachable = {target for target in targets if self.order.get(target, -1) <= position}
             missing.update((source, target) for target in unreachable)
             targets.difference_update(unreachable)
+
+            # Forward queries on one explicit sequence already have a path; other queries still use the full DAG.
+            chain = self.chains.get(source)
+            if chain is not None:
+                targets.difference_update({target for target in targets if self.chains.get(target) == chain})
             if not targets:
                 continue
 
@@ -94,12 +127,22 @@ class ExecutionComparison:
         paths: DependencyPaths,
     ) -> None:
         self.native = native
+        self.observations = {}
+        self.services = {}
+        for position, operation in enumerate(native):
+            observation = operation["execution_observation"]
+            if "native_work" in observation:
+                self.services[position] = observation["native_work"]
+            else:
+                self.observations[position] = observation
         self.physical = physical
         self.positions = {operation["id"]: position for position, operation in enumerate(target)}
         self.execution = execution
         self.paths = paths
-        self.nodes = [node for node in execution["nodes"] if node.get("operation") in self.positions]
-        self.order = DependencyPaths.resource_order(execution, self.nodes)
+        nodes = [node for node in execution["nodes"] if node.get("operation") in self.positions]
+        self.nodes = [node for node in nodes if self.positions[node["operation"]] in self.observations]
+        self.service_nodes = [node for node in nodes if self.positions[node["operation"]] in self.services]
+        self.order = DependencyPaths.resource_order(execution, nodes)
 
     @staticmethod
     def issue(action: dict[str, Any]) -> tuple[int, int]:
@@ -115,7 +158,8 @@ class ExecutionComparison:
         report = self.events()
         queues = self.queue_frontiers()
         streams = self.stream_frontiers()
-        checks = report["same"], queues["same"], streams["same"]
+        services = self.service_inventory()
+        checks = report["same"], queues["same"], streams["same"], services["same"]
         if False in checks:
             same = False
         elif None in checks:
@@ -128,14 +172,31 @@ class ExecutionComparison:
             "status": "matched" if same else "partial" if same is None else "differences",
             "queue_frontiers": queues,
             "stream_frontiers": streams,
-            "scope": ("API inventory, event/stream completion and queue drain; host service duration is separate"),
+            "opaque_services": services,
+            "scope": "Native services and API/stream/queue relations; service internals and durations are separate",
+        }
+
+    def service_inventory(self) -> dict[str, Any]:
+        expected = Counter(
+            (position, work["kind"], work["name"], work["resource"])
+            for position, work in self.services.items()
+        )
+        actual = Counter(
+            (
+                self.positions[node["operation"]], node["kind"], node["name"],
+                self.execution["resources"][node["resource"]],
+            )
+            for node in self.service_nodes
+        )
+        return {
+            "same": expected == actual, "services": len(self.services),
+            "scope": "service inventory and resource kinds",
         }
 
     def queue_frontiers(self) -> dict[str, Any]:
         items = {}
         waits = []
-        for position, operation in enumerate(self.native):
-            observation = operation["execution_observation"]
+        for position, observation in self.observations.items():
             for action in observation["device_work"] + observation["runtime_actions"]:
                 submission = action["submission"]
                 if submission is not None and (queue := submission["queue"]) is not None:
@@ -268,8 +329,7 @@ class ExecutionComparison:
     def stream_frontiers(self) -> dict[str, Any]:
         self.streams: dict[int, list[dict[str, Any]]] = defaultdict(list)
         waits = defaultdict(list)
-        for position, operation in enumerate(self.native):
-            observation = operation["execution_observation"]
+        for position, observation in self.observations.items():
             actions = observation["runtime_actions"]
             if any(item["submission"] is None for item in observation["device_work"] + actions):
                 return {"same": None, "reason": "stream completion needs native submission identities"}
@@ -527,8 +587,8 @@ class ExecutionComparison:
     def events(self) -> dict[str, Any]:
         expected = Counter()
         events = []
-        for position, operation in enumerate(self.native):
-            for action in operation["execution_observation"]["runtime_actions"]:
+        for position, observation in self.observations.items():
+            for action in observation["runtime_actions"]:
                 expected[position, action["kind"], action["native_api"]] += 1
                 if action["kind"] in ("record_event", "wait_event", "wait_event_complete"):
                     events.append((position, action))

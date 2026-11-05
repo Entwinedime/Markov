@@ -30,12 +30,19 @@ public:
         auto & regions = source_["regions"];
         std::vector<std::vector<std::size_t>> children(regions.size());
         std::vector<std::size_t> roots;
-        for (std::size_t identity = 0; identity < regions.size(); ++identity) {
+        for (std::size_t identity = 0; identity < count; ++identity) {
             if (removed_.contains(identity)) continue;
             const auto & parent = regions[identity].at("parent");
             if (parent.is_null()) roots.push_back(identity);
             else children[parent.get<std::size_t>()].push_back(identity);
         }
+
+        // Native IDs already follow call entry order; continuations bracket the retained resource calls.
+        for (const auto & [parent, prefix] : continuations_) {
+            children[parent].insert(children[parent].begin(), prefix);
+            children[parent].push_back(prefix + 1);
+        }
+
         std::vector<std::size_t> order;
         for (const auto root : roots) visit(root, children, order);
         std::map<std::size_t, std::size_t> identities;
@@ -82,10 +89,6 @@ private:
                 calls.push_back(child);
         }
         if (calls.empty()) throw std::invalid_argument("partitioned caller has no observed resource call");
-        std::ranges::sort(calls,
-                          [&](auto left, auto right) { return regions[left].at("host_scope").at("order") < regions[right].at("host_scope").at("order"); });
-        const auto first = regions[calls.front()].at("host_scope").at("order").get<std::size_t>();
-        const auto last = regions[calls.back()].at("host_scope").at("completion_order").get<std::size_t>();
 
         std::set<std::size_t> wrappers;
         for (const auto call : calls) {
@@ -104,10 +107,16 @@ private:
             bool resource = false;
             for (const auto call : calls) resource = resource || contains(call, child);
             if (resource) continue;
-            const auto & scope = regions[child].at("host_scope");
-            if (scope.at("completion_order").get<std::size_t>() <= first) parts[child] = 0;
-            else if (scope.at("order").get<std::size_t>() >= last) parts[child] = 1;
+            if (child < calls.front() && regions[child].at("ended_ns") <= regions[calls.front()].at("started_ns")) parts[child] = 0;
+            else if (child > calls.back() && regions[child].at("started_ns") >= regions[calls.back()].at("ended_ns")) parts[child] = 1;
             else throw std::invalid_argument("work between resource calls needs its own declared continuation");
+        }
+
+        const auto first_position = regions[calls.front()].at("operation_begin").get<std::size_t>();
+        auto suffix_position = regions[calls.back()].at("operation_begin").get<std::size_t>();
+        for (const auto & operation : source_.at("operations")) {
+            if (contains(calls.back(), operation.at("region").get<std::size_t>()))
+                suffix_position = std::max(suffix_position, operation.at("position").get<std::size_t>() + 1);
         }
 
         // Body operations can belong directly to a caller whose private wrappers are being folded.
@@ -115,29 +124,25 @@ private:
         for (auto & operation : source_["operations"]) {
             const auto owner = operation.at("region").get<std::size_t>();
             if (owner != identity && !wrappers.contains(owner)) continue;
-            const auto & scope = operation.at("execution_observation").at("host_scope");
-            const auto part = scope.at("completion_order").get<std::size_t>() <= first ? 0 : 1;
-            if (part == 1 && scope.at("order").get<std::size_t>() < last) throw std::invalid_argument("caller work crosses a resource boundary");
+            const auto position = operation.at("position").get<std::size_t>();
+            const auto part = position < first_position ? 0 : 1;
+            if (part == 1 && position < suffix_position) throw std::invalid_argument("caller work crosses a resource boundary");
             direct[part].push_back(operation.at("id").get<std::size_t>());
         }
 
         const auto prefix = regions.size();
-        auto suffix_position = regions[calls.back()].at("operation_begin").get<std::size_t>();
-        for (const auto & operation : source_.at("operations")) {
-            if (contains(calls.back(), operation.at("region").get<std::size_t>()))
-                suffix_position = std::max(suffix_position, operation.at("position").get<std::size_t>() + 1);
-        }
+        continuations_.emplace(identity, prefix);
         for (int part = 0; part < 2; ++part) {
             auto stage = original;
             stage["id"] = prefix + part;
             stage["parent"] = identity;
             stage["interface_owner"] = nullptr;
             if (part == 1) stage["operation_begin"] = suffix_position;
-            stage["host_scope"]["order"] = part == 0 ? original.at("host_scope").at("order") : nlohmann::json(last);
-            stage["host_scope"]["completion_order"] = part == 0 ? nlohmann::json(first) : original.at("host_scope").at("completion_order");
+            stage["host_scope"] = nullptr;
 
             // A structural partition is not an observed call; its source reference retains the actual control seams.
             for (const auto * key : { "started_ns", "ended_ns", "completed" }) stage.erase(key);
+
             auto & metadata = stage["metadata"];
             const auto role = declaration.at("entrypoint").get<std::string>() + (part == 0 ? "_inputs" : "_outputs");
             metadata["entrypoint"] = role;
@@ -273,6 +278,7 @@ private:
     nlohmann::json source_;
     std::set<std::size_t> removed_;
     std::map<std::size_t, const nlohmann::json *> values_;
+    std::map<std::size_t, std::size_t> continuations_;
 };
 
 } // namespace

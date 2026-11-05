@@ -372,9 +372,10 @@ class Investigation:
         self, arguments: list[str], output: Path, timeout: int = 30, owner: Exploration | None = None
     ) -> subprocess.CompletedProcess[str]:
         output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("a") as log:
+        with output.open("a+") as log:
+            start = log.tell()
             try:
-                return subprocess.run(
+                result = subprocess.run(
                     [sys.executable, "-m", "markov_application.exploration", *arguments],
                     cwd=self.root,
                     stdout=log,
@@ -385,6 +386,11 @@ class Investigation:
                 if owner is not None:
                     owner.environment.cleanup()
                 raise
+
+            # Preserve the log history, but let this invocation own only its new output.
+            log.seek(start)
+            result.stdout = log.read()
+            return result
 
     def released(self, task: Exploration) -> bool:
         return not subprocess.check_output(
@@ -478,7 +484,7 @@ class Investigation:
             passed = (
                 result.returncode == 0
                 if kind == "help"
-                else result.returncode != 0 and "ValueError" in output.read_text()
+                else result.returncode != 0 and "ValueError" in result.stdout
             )
             return {"status": "complete" if passed else "differences", "returncode": result.returncode}
         if kind == "budget":
@@ -488,7 +494,7 @@ class Investigation:
             state = json.loads((task.directory / "state.json").read_text())
             passed = (
                 result.returncode != 0
-                and "BudgetExceeded" in output.read_text()
+                and "BudgetExceeded" in result.stdout
                 and state["pending"] is None
                 and state["native_attempts"] == 0
                 and self.released(task)

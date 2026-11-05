@@ -724,7 +724,6 @@ RankProgram RankStructure::accept(const Batch & batch, const BatchEffects & effe
     // The source supplies one member copy; target requests supply its slot, length and output offset.
     std::int64_t token_offset = 0;
     for (const auto & member : batch.members) {
-        graph_.append("prefix_match", "decode", {});
         call.sequences["prebuilt_members"].push_back({
             {  "request_slot", static_cast<std::int64_t>(member.slot) + 1 },
             { "prefix_tokens",                      member.context_tokens },

@@ -118,19 +118,23 @@ class WorkerCompletions:
         metadata = region["metadata"]
         if metadata["selection_view"] != "previous" or not metadata["requests"]:
             return []
-        schedule = next(parent for parent in self.ancestors(region) if parent["role"] == "Schedule")
-        slots = metadata["ports"]["outputs"]["request_slots"]
-        merged = [
-            child for child in self.descendants(schedule["id"])
-            if child["metadata"].get("entrypoint") == "batch_merge"
-            and child["metadata"]["ports"]["inputs"].get("right.request_slots") == slots
-            and child["started_ns"] >= region["ended_ns"]
-        ]
 
-        # Previous-batch selection may include the following merge; connect it by the actual column value.
+        slots = metadata["ports"]["outputs"]["request_slots"]
+        merged = []
+
+        # Only this caller's merge completes selection; nested Mixed preparation owns its later merge.
+        for identity in self.children[region["parent"]]:
+            child = self.regions[identity]
+            if (
+                child["metadata"].get("entrypoint") == "batch_merge"
+                and child["metadata"]["ports"]["inputs"].get("right.request_slots") == slots
+                and child["started_ns"] >= region["ended_ns"]
+            ):
+                merged.append(identity)
+
         if len(merged) > 1:
             raise ValueError(f"native selection {region['id']} feeds more than one batch merge")
-        return [child["id"] for child in merged]
+        return merged
 
     def cache_action(self, region: dict, service: str) -> dict:
         metadata = region["metadata"]
@@ -264,7 +268,12 @@ class WorkerCompletions:
                     raise ValueError(f"result scope {region['id']} has multiple publication boundaries")
                 if publications and not publications[0]["completed"]:
                     raise ValueError(f"result scope {region['id']} has an incomplete publication")
-                published = publications[0]["ended_ns"] if publications else None
+
+                # An empty output call consumes CPU work but publishes no request.
+                published = (
+                    publications[0]["ended_ns"]
+                    if publications and publications[0]["metadata"]["requests"] else None
+                )
 
                 # Native admission prepares the prebuilt batch before publishing its result in the same action.
                 records.append(self.action(

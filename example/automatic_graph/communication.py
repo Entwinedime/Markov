@@ -20,6 +20,11 @@ class CommunicationComparison:
         self.target = target
         self.rank_count = len(ranks)
         self.page_size = page_size
+        worlds = {
+            directory: json.loads((directory / "session.json").read_text())["output"]
+            for directory in {Path(case["source"]).parent for case in ranks}
+        }
+        self.worlds = {case["rank"]: worlds[Path(case["source"]).parent] for case in ranks}
         self.transfers = {
             (decision["task"]["group"], decision["task"]["sequence"]): decision
             for decision in decisions if decision["step"] == "transfer"
@@ -66,7 +71,7 @@ class CommunicationComparison:
             ))
 
         facts: dict[str, Any] = {
-            "rank": rank, "groups": [], "calls": [], "copies": [], "received": [],
+            "rank": rank, "world": self.worlds[rank], "groups": [], "calls": [], "copies": [], "received": [],
             "expected_calls": len(expected), "covered_calls": 0,
         }
         covered = set()
@@ -124,8 +129,10 @@ class CommunicationComparison:
         return facts
 
     def compare(self, observations: list[dict[str, Any]]) -> dict[str, Any]:
-        groups: dict[str, set[int]] = defaultdict(set)
-        calls: dict[tuple[str, str], dict[int, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+        groups: dict[tuple[str, str], set[int]] = defaultdict(set)
+        calls: dict[tuple[tuple[str, str], str], dict[int, list[dict[str, Any]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         received: dict[tuple[Any, int], list[dict[str, Any]]] = defaultdict(list)
         copies: dict[tuple[Any, int, int], dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
         metadata_slots: dict[tuple[Any, int], set[int]] = defaultdict(set)
@@ -138,10 +145,12 @@ class CommunicationComparison:
         for observation in observations:
             rank = observation["rank"]
             missing += observation["expected_calls"] - observation["covered_calls"]
+
+            # SDK group names belong to one native world; independent worlds may reuse the same name.
             for group in observation["groups"]:
-                groups[group].add(rank)
+                groups[observation["world"], group].add(rank)
             for call in observation["calls"]:
-                calls[call["group"], call["primitive"]][rank].append(call)
+                calls[(observation["world"], call["group"]), call["primitive"]][rank].append(call)
             for entry in observation["received"]:
                 received[entry["room"], rank].append(entry)
             for copy in observation["copies"]:

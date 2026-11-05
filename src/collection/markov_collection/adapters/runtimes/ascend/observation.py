@@ -44,11 +44,10 @@ class AscendOperatorObservation(OperatorObservation):
 
             # A local call gives serving and component observations the same reusable definition.
             with self.recording.scope("call", path=str(operation)):
-                identity = len(self.recording.operations)
-                result = super().record_operation(operation, args, kwargs)
                 guards, storage = materialization
-                self.recording.operations[identity].update(execution_guards=guards, contiguous_storage=storage)
-                return result
+                return super().record_operation(
+                    operation, args, kwargs, execution_guards=guards, contiguous_storage=storage,
+                )
 
         if str(operation) not in AscendMatrices.apis:
             return super().record_operation(operation, args, kwargs)
@@ -80,10 +79,8 @@ class AscendOperatorObservation(OperatorObservation):
                         "outputs": {},
                     }
                     scope.metadata["inputs"] = list(scope.metadata["ports"]["inputs"].values())
-                    identity = len(self.recording.operations)
-                result = super().record_operation(operation, args, kwargs)
+                result = super().record_operation(operation, args, kwargs, matrix_selection=geometry)
                 with self.values.metadata():
-                    self.recording.operations[identity]["matrix_selection"] = geometry
                     scope.metadata["ports"]["outputs"] = self.values.port_values({"result": result})
 
         with self.values.metadata():

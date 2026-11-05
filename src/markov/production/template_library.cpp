@@ -75,7 +75,6 @@ private:
         std::size_t position;
         bool operation;
         std::size_t identity;
-        std::size_t host_order = 0;
     };
 
     struct Repetition {
@@ -133,11 +132,11 @@ public:
         if (added) {
             const auto & record = *source_.values_.at(source);
             values.push_back({
-                {    "kind",                                                        "tensor" },
-                { "storage",               resource(record.at("storage").get<std::size_t>()) },
-                {   "shape", normalized_shape(source_.shape(region_, source, scope_)) },
-                {   "dtype",                                              record.at("dtype") },
-                {  "device",                                             record.at("device") }
+                { "kind", "tensor" },
+                { "storage", resource(record.at("storage").get<std::size_t>()) },
+                { "shape", normalized_shape(source_.shape(region_, source, scope_)) },
+                { "dtype", record.at("dtype") },
+                { "device", record.at("device") }
             });
         }
 
@@ -291,6 +290,7 @@ void SourceTemplates::index() {
     for (std::size_t identity = 0; identity < regions_.size(); ++identity) {
         const auto & region = source_.at("regions")[identity];
         const auto & owner = region.at("interface_owner");
+        if (region.contains("host_service_owner")) continue;
         if (!owner.is_null() && owner.get<std::size_t>() != identity) continue;
         if (region.at("parent").is_null()) roots_.push_back(identity);
         else regions_[region.at("parent").get<std::size_t>()].children.push_back(identity);
@@ -433,22 +433,18 @@ std::map<std::size_t, std::map<std::string, SourceTemplates::Repetition>> Source
 
 std::optional<std::size_t> SourceTemplates::host_resource(std::size_t identity, const std::vector<Item> & items) {
     const auto & record = source_.at("regions")[identity];
-    const auto & scope = record.at("host_scope");
 
     // A native interface's operation already owns its complete caller service.
-    if (scope.is_null() || !record.at("interface_owner").is_null()) return std::nullopt;
+    if (!record.at("interface_owner").is_null()) return std::nullopt;
 
-    auto cursor = scope.at("order").get<std::size_t>();
+    // The recorded caller owns CPU service independently of profiler marker availability.
+    const auto thread = record.at("thread").get<std::int64_t>();
     for (const auto & item : items) {
-        const auto & child = item.operation ? source_.at("operations")[item.identity].at("execution_observation").at("host_scope")
-                                            : source_.at("regions")[item.identity].at("host_scope");
-        if (child.is_null() || child.at("thread") != scope.at("thread") || child.at("order").get<std::size_t>() < cursor
-            || child.at("completion_order") > scope.at("completion_order"))
-            throw std::invalid_argument("region host children must be ordered, nested calls on its caller thread");
-        cursor = child.at("completion_order").get<std::size_t>();
+        const auto owner = item.operation ? source_.at("operations")[item.identity].at("region").get<std::size_t>() : item.identity;
+        if (source_.at("regions")[owner].at("thread") != thread) throw std::invalid_argument("region host children must execute on the caller thread");
     }
 
-    return execution_.resource("thread", scope.at("thread").get<std::int64_t>());
+    return execution_.resource("thread", thread);
 }
 
 void SourceTemplates::compile(std::size_t identity) {
@@ -462,48 +458,17 @@ void SourceTemplates::compile(std::size_t identity) {
     std::vector<Item> items;
     for (const auto child : region.children) items.push_back({ source_.at("regions")[child].at("operation_begin").get<std::size_t>(), false, child });
 
-    const bool dynamic_calls = metadata.value("dynamic_calls", false);
-    std::set<std::size_t> exposed;
-    if (dynamic_calls && !region.operations.empty()) {
-        exposed.insert(region.outputs.begin(), region.outputs.end());
-        for (const auto child : region.children) {
-            exposed.insert(regions_[child].inputs.begin(), regions_[child].inputs.end());
-            for (const auto & [_, values] : regions_[child].input_groups) exposed.insert(values.begin(), values.end());
-        }
-    }
+    if (metadata.value("dynamic_calls", false) && !region.operations.empty())
+        throw std::invalid_argument("dynamic caller exposes public operations: " + record.at("role").get<std::string>());
 
     for (const auto operation_id : region.operations) {
         const auto & operation = source_.at("operations")[operation_id];
-        if (!dynamic_calls) {
-            items.push_back({ operation.at("position").get<std::size_t>(), true, operation_id });
-            continue;
-        }
-
-        // Private control calculations belong to caller CPU service; crossing data and device work stay explicit.
-        const auto & observation = operation.at("execution_observation");
-        const auto cpu_values = [this](const nlohmann::json & values) {
-            return std::ranges::all_of(values, [this](const auto & value) { return values_.at(value.template get<std::size_t>())->at("device") == "cpu"; });
-        };
-        const auto escapes =
-            std::ranges::any_of(operation.at("outputs"), [&](const auto & value) { return exposed.contains(value.template get<std::size_t>()); });
-        const auto writes_state =
-            std::ranges::any_of(operation.at("writes"), [&](const auto & value) { return external_resources_.contains(value.template get<std::size_t>()); });
-        if (!cpu_values(operation.at("inputs")) || !cpu_values(operation.at("outputs")) || escapes || writes_state || !observation.at("device_work").empty()
-            || !observation.at("runtime_actions").empty() || !observation.at("communication").is_null())
-            throw std::invalid_argument("dynamic caller exposes operation data or execution effects: " + record.at("role").get<std::string>());
+        items.push_back({ operation.at("position").get<std::size_t>(), true, operation_id });
     }
 
-    // Empty continuations share an operation position; their observed calls still have a strict order.
-    if (!record.at("host_scope").is_null()) {
-        for (auto & item : items) {
-            const auto & host = item.operation ? source_.at("operations")[item.identity].at("execution_observation").at("host_scope")
-                                              : source_.at("regions")[item.identity].at("host_scope");
-            if (!host.is_null()) item.host_order = host.at("order").get<std::size_t>();
-        }
-    }
+    // Call identities follow source entry order; an empty call precedes the next operation at its position.
     std::ranges::sort(items, [](const auto & left, const auto & right) {
-        return std::tie(left.position, left.host_order, left.operation, left.identity)
-               < std::tie(right.position, right.host_order, right.operation, right.identity);
+        return std::tie(left.position, left.operation, left.identity) < std::tie(right.position, right.operation, right.identity);
     });
 
     const auto repetitions = this->repetitions(items);

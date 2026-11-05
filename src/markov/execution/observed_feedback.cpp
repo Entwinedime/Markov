@@ -121,7 +121,9 @@ void ObservedFeedback::submit(const RegionGraph &, const ServingAction & action,
 
     // Source-local task numbers are not shared; match semantic work and its repeated occurrences.
     auto & record = records_.at(found->second.front());
-    if (record.publishes != program.publication.has_value()) throw std::invalid_argument("observed boundary and generated publication ports disagree");
+    if (record.publishes != program.publication.has_value())
+        throw std::invalid_argument("observed boundary and generated publication ports disagree for " + work.dump()
+                                    + ": observed=" + std::to_string(record.publishes) + ", generated=" + std::to_string(program.publication.has_value()));
     record.task = action.task;
     found->second.pop_front();
     if (found->second.empty()) remaining_.erase(found);
@@ -135,7 +137,12 @@ std::optional<ExecutionEvent> ObservedFeedback::advance_until(std::optional<std:
     }
     const auto & [order, next] = *events_.begin();
     const auto & record = records_.at(next.record);
-    if (order.first < now_ns_ || !record.task) throw std::invalid_argument("observed feedback cannot follow the current submitted work: " + record.work.dump());
+    if (order.first < now_ns_)
+        throw std::invalid_argument("observed feedback precedes the current time: " + record.work.dump() + ", event_ns=" + std::to_string(order.first)
+                                    + ", now_ns=" + std::to_string(now_ns_));
+    if (!record.task)
+        throw std::invalid_argument("observed feedback work has not been submitted: " + record.work.dump() + ", event_ns=" + std::to_string(order.first)
+                                    + ", now_ns=" + std::to_string(now_ns_));
     const ExecutionEvent event{ order.first, *record.task, next.kind };
     now_ns_ = order.first;
     events_.erase(events_.begin());

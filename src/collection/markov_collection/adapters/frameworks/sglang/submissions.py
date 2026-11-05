@@ -80,7 +80,11 @@ class NativeSubmissions(ABC):
         return responses
 
     async def submit_at(self, endpoint: Any, payload: dict, record: dict, started_ns: int) -> dict:
-        await asyncio.sleep(max(0, started_ns + record["arrival_ns"] - time.perf_counter_ns()) / 1e9)
+        deadline_ns = started_ns + record["arrival_ns"]
+
+        # Event-loop timers may wake early; release only after the shared workload clock reaches arrival.
+        while (remaining_ns := deadline_ns - time.perf_counter_ns()) > 0:
+            await asyncio.sleep(remaining_ns / 1e9)
         record["submitted_ns"] = time.perf_counter_ns() - started_ns
         return await self.send(endpoint, payload, record["requests"])
 

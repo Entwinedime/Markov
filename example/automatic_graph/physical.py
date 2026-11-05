@@ -26,13 +26,13 @@ class PhysicalComparison:
             tuple((member["new_tokens"], member["context_tokens"]) for member in batch["members"]),
         )
 
-    def batch(self, region: int) -> int:
+    def batch(self, region: int) -> int | None:
         while True:
             record = self.source["regions"][region]
             if "batch" in record["metadata"]:
                 return record["metadata"]["batch"]
             if record["parent"] is None:
-                raise ValueError(f"observed region {region} has no batch")
+                return None
             region = record["parent"]
 
     @staticmethod
@@ -69,15 +69,20 @@ class PhysicalComparison:
         event_actions: dict[int, list[dict[str, Any]]] = defaultdict(list)
         assigned = Counter()
         outside = Counter()
+        outside_runtime = Counter()
         for task in physical["work"]:
             if task["observer"] or task["auxiliary"]:
                 continue
 
+            # Private SDK tasks belong to their opaque call, rather than a model-batch kernel prototype.
             # Direct Triton launches can belong to a native region without a torch dispatch operation.
             if task["baseline"] is not None:
                 batch = task["baseline"]
             elif task["region"] is not None:
                 batch = self.batch(task["region"])
+                if batch is None:
+                    outside[task["name"]] += 1
+                    continue
                 owner = (
                     self.source["operations"][task["operation"]]["name"]
                     if task["operation"] is not None
@@ -98,6 +103,9 @@ class PhysicalComparison:
                 batch = action["baseline"]
             elif action["region"] is not None:
                 batch = self.batch(action["region"])
+                if batch is None:
+                    outside_runtime[action["native_api"]] += 1
+                    continue
             else:
                 continue
             runtime[batch][action["native_api"]] += 1
@@ -170,9 +178,16 @@ class PhysicalComparison:
             "comparisons": comparisons,
             "assigned_by_operation": dict(assigned),
             "outside_selected_batches": dict(outside),
+            "runtime_outside_selected_batches": dict(outside_runtime),
+            "opaque_services": {
+                **physical["native_services"],
+                "internal_tasks": sum("native_service" in task for task in physical["unassociated_tasks"]),
+                "scope": "declared native resources and API calls; internal tasks have no per-call attribution",
+            },
             "unassociated_tasks": physical["unassociated_tasks"],
             "unassociated_submissions": [
-                task["source_event"] for task in physical["work"] if task["submission"] is None
+                task["source_event"]
+                for task in physical["work"] if task["submission"] is None
             ],
             "submission_entries": dict(
                 Counter(

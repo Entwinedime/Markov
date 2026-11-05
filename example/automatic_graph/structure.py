@@ -52,8 +52,6 @@ class StructureComparison:
         self.work_origins = WorkOrigins(
             prediction.get("observed_work", []), self.rank, self.source["regions"], self.target_actions,
         )
-        self.native_controls = self.region_labels(self.source["regions"], True, "control_only")
-        self.excluded_control, self.control_scope = self.controller_scope()
 
         self.decisions: dict[int, dict[str, Any]] = {}
         self.batches: dict[int, dict[str, Any]] = {}
@@ -247,7 +245,7 @@ class StructureComparison:
             if not modeled[region]:
                 continue
             if observed:
-                if region not in self.serving_regions or operation["id"] in self.excluded_control:
+                if region not in self.serving_regions:
                     continue
             elif graph["regions"][region].get("rank") != self.rank:
                 continue
@@ -260,48 +258,60 @@ class StructureComparison:
             region = self.source["operations"][record["operation"]]["region"]
         return region
 
-    def controller_scope(self) -> tuple[set[int], dict[str, Any]]:
-        operations = [
-            operation for operation in self.observed["operations"] if self.native_controls[operation["region"]]
-        ]
-        identities = {operation["id"] for operation in operations}
-        crossing = sum(
-            (edge["source"] in identities) != (edge["target"] in identities)
-            for edge in self.observed["dependencies"]
-        )
-        actions = chain(
-            (work for work in self.physical["work"] if work["kind"] == "device"),
-            self.physical["runtime_actions"],
-        )
+    def host_services(self) -> dict[str, Any]:
+        services = {
+            service["source_region"]: service["operations"]
+            for service in self.observed["host_services"]
+            if service["source_region"] in self.serving_regions
+        }
+        graph = self.prediction["graph"]
+        returns = {}
+        work_returns = defaultdict(set)
+        for call in graph["execution"]["host_calls"]:
+            if "region" not in call:
+                continue
+            region = graph["regions"][call["region"]]
+            if region.get("rank") == self.rank and region.get("composition") == "target_calls":
+                returns[call["return"]] = region["role"]
+                work_returns[self.target_actions[call["region"]], region["role"]].add(call["return"])
 
-        # Some runtime actions belong directly to a region, without an attached logical operation.
-        submitted_work = sum(
-            1
-            for action in actions
-            if not action["observer"]
-            and not action["auxiliary"]
-            and action["baseline"] is None
-            and (region := self.native_region(action)) is not None
-            and self.native_controls[region]
-        )
-        communications = sum(bool(operation.get("communication")) for operation in operations)
-        closed = not crossing and not submitted_work and not communications
+        decisions = {
+            (decision["task"]["group"], decision["task"]["sequence"]): decision
+            for decision in self.prediction["decisions"]
+        }
+        completions = defaultdict(set)
+        candidates = defaultdict(set)
+        for binding in self.prediction.get("observed_work", []):
+            task = binding["task"]["group"], binding["task"]["sequence"]
+            ports = decisions[task]["execution_ports"]["completions"]
+            for origin in binding["observations"]:
+                source = origin["region"]
+                if origin["rank"] != self.rank or source not in services:
+                    continue
+                role = self.source["regions"][source]["role"]
+                completions[source].update(ports)
+                candidates[source].update(work_returns[task, role])
 
-        # A declaration cannot hide data consumed by shared work or an unrepresented device/API dependency.
-        return (identities if closed else set()), {
-            "closed": closed,
-            "declared_operations": len(operations),
-            "crossing_dependencies": crossing,
-            "device_and_runtime_actions": submitted_work,
-            "communication_contracts": communications,
-            "native_calls": sorted(
-                {
-                    region["metadata"]["path"]
-                    for region in self.source["regions"]
-                    if region["metadata"].get("control_only")
-                }
-            ),
-            "scope": "declared native controller decisions; retained in observations, separate from modeled work",
+                # A suspended caller can start in an earlier action and close at this exact return port.
+                candidates[source].update(
+                    port for port in ports if returns.get(port) == role
+                )
+
+        # Match one caller in observed work; its CPU return must precede the enclosing completion.
+        required = {}
+        for source in services:
+            if len(candidates[source]) == 1:
+                (caller,) = candidates[source]
+                required[source] = {(caller, port) for port in completions[source]}
+        missing_paths = self.target.execution_paths.missing(set().union(*required.values()))
+        matched = {source for source, links in required.items() if links - missing_paths}
+        missing = services.keys() - matched
+        return {
+            "status": "partial" if missing else "matched",
+            "source_calls": len(services),
+            "private_cpu_operations": sum(services.values()),
+            "matched_callers": len(matched),
+            "unmatched_source_regions": sorted(missing)[:8],
         }
 
     def native_work(self, model_only: bool = False) -> dict[int | None, Counter[str]]:
@@ -329,8 +339,6 @@ class StructureComparison:
                     region is None or region not in self.serving_regions
                     or (model_only and not self.native_model[region])
                 ):
-                    continue
-                if self.control_scope["closed"] and self.native_controls[region]:
                     continue
 
                 # Request-owned transport remains in the window even without a model-batch label.
@@ -434,8 +442,7 @@ class StructureComparison:
         native = [
             operation
             for operation in self.observed["operations"]
-            if operation["id"] not in self.excluded_control
-            and operation["region"] in self.serving_regions
+            if operation["region"] in self.serving_regions
         ]
         graph = self.prediction["graph"]
         target = [
@@ -521,7 +528,8 @@ class StructureComparison:
             call_correspondence=True if correspondence["complete"] else None,
             consistent_bindings=correspondence["consistent_bindings"],
         )
-        if pairs:
+        # Complete model pairs enter the window check; only incomplete local matches need a separate check.
+        if pairs and not correspondence["complete"]:
             report["execution"] = ExecutionComparison(
                 matched, predicted, self.prediction["graph"]["execution"], self.physical, self.target.execution_paths,
             ).compare()
@@ -581,11 +589,18 @@ class StructureComparison:
             for item in checks
             for name, value in item.items()
         )
-        unassociated = len(self.physical["unassociated_tasks"]) + len(self.physical["unassociated_runtime_actions"])
+        services = self.host_services()
+        unassociated = (
+            self.observed["physical_coverage"]["unassociated_tasks"]
+            + len(self.physical["unassociated_runtime_actions"])
+        )
         status = "matched"
-        if unmatched or unmatched_target or unassociated or unverified or not comparisons:
+        if (
+            unmatched or unmatched_target or unassociated or unverified or not comparisons
+            or services["status"] != "matched"
+        ):
             status = "partial"
-        if failures or not self.control_scope["closed"]:
+        if failures:
             status = "differences"
 
         # Coverage gaps do not erase a difference already established between paired calls.
@@ -598,8 +613,8 @@ class StructureComparison:
                 "batch and observed caller/serialized order reported separately; "
                 "opaque geometry, captured inputs, policy equivalence, timing and distributed progress unqualified"
             ),
-            "controller_scope": self.control_scope,
             "status": status,
+            "host_services": services,
             "rank": self.rank,
             "same_batch_order": same_batch_order,
             "window": window,
@@ -607,6 +622,7 @@ class StructureComparison:
             "unmatched_native_batches": unmatched,
             "unmatched_target_batches": unmatched_target,
             "unassociated_tasks": len(self.physical["unassociated_tasks"]),
+            "physical_coverage": self.observed["physical_coverage"],
             "unassociated_runtime_actions": len(self.physical["unassociated_runtime_actions"]),
         }
 

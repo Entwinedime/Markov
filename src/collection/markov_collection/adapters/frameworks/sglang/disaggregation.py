@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from contextvars import copy_context
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar, copy_context
 from functools import partial
 from typing import Any
 
@@ -21,7 +21,6 @@ class DisaggregationObservation:
         self.recording = serving.recording
         self.operators = serving.operators
         self.values = self.operators.values
-        self.rooms: dict[int, dict[str, Any]] = {}
         self.inputs = {
             room: {"request": identity, "room": room, "parameters": {"B": 1, "M": request["prompt_tokens"]}}
             for room, identity, request in zip(
@@ -29,7 +28,8 @@ class DisaggregationObservation:
                 description["content"]["requests"], strict=True,
             )
         }
-        self.transfers: Any = WeakIdKeyDictionary()
+        self.chunks: Any = WeakIdKeyDictionary()
+        self.current_transfer: ContextVar[tuple[str, int] | None] = ContextVar("markov_transfer", default=None)
         self.transport = MemfabricObservation(self.recording)
 
     def advertise(
@@ -71,6 +71,8 @@ class DisaggregationObservation:
         if self.role == "prefill":
             manager.send_kvcache = partial(self.transfer, manager.send_kvcache, grouping="buffers")
             manager.send_kvcache_slice = partial(self.transfer, manager.send_kvcache_slice, grouping="buffer_tokens")
+        if self.serving.selected:
+            self.transport.install()
 
         pool = queue.token_to_kv_pool
         heads = queue.scheduler.model_config.get_total_num_kv_heads()
@@ -282,12 +284,9 @@ class DisaggregationObservation:
             metadata_slot=request.metadata_buffer_index,
             handoff_id=request.bootstrap_room,
         )
-        self.rooms[request.bootstrap_room] = metadata
-
         # PP can send the previous chunk outside both scheduling and result processing.
         observation = self.operators if self.recording.current_scope.get() is None else nullcontext()
         with observation, self.recording.scope("KvSend", **metadata) as scope:
-            metadata["send_region"] = scope.identity
             scope.metadata["send_region"] = scope.identity
             self.bind_metadata(scheduler.disagg_metadata_buffers, scope.metadata)
 
@@ -326,18 +325,57 @@ class DisaggregationObservation:
             metadata["metadata_buffers"] = self.values.port_values(tensors)
 
     def enqueue(self, original: Any, manager: Any, room: int, indices: Any, *args: Any, **kwargs: Any) -> Any:
-        metadata = self.rooms.get(room)
+        region = self.recording.current_scope.get()
+        baseline = self.recording.current_baseline.get()
+        origin = None
+        if region is not None:
+            origin = ("region", region)
+        elif baseline is not None:
+            origin = ("baseline", baseline)
+        token = self.current_transfer.set(origin)
+        try:
+            if region is not None:
+                self.recording.regions[region]["metadata"]["source_pages"] = indices.tolist()
 
-        # Native chunks retain this array; equal page lists can belong to different concurrent transfers.
-        if metadata is not None:
-            self.transfers[indices] = metadata
-            scope = self.recording.regions[self.recording.current_scope.get()]["metadata"]
-            scope["source_pages"] = indices.tolist()
+                # Publish intent before queueing; the worker may finish before this call returns.
+                with self.recording.scope("KvSubmit"):
+                    pass
+            return original(manager, room, indices, *args, **kwargs)
+        finally:
+            self.current_transfer.reset(token)
 
-            # Publish intent before the native queue call; its worker may finish before the caller returns.
-            with self.recording.scope("KvSubmit"):
-                pass
-        return original(manager, room, indices, *args, **kwargs)
+    def enqueue_chunk(self, original: Any, queue: Any, chunk: Any) -> Any:
+        origin = self.current_transfer.get()
+        if origin is not None:
+            self.chunks[chunk] = origin
+        return original(queue, chunk)
+
+    def next_chunk(self, original: Any, queue: Any) -> Any:
+
+        # Observation follows the native queue item, even when its page array is replaced or sliced.
+        self.current_transfer.set(None)
+        chunk = original(queue)
+        self.current_transfer.set(self.chunks.get(chunk))
+        return chunk
+
+    @contextmanager
+    def transfer_scope(self, role: str) -> Any:
+        origin = self.current_transfer.get()
+        if origin is None:
+            yield None
+            return
+        kind, identity = origin
+        if kind == "baseline":
+            with self.recording.baseline(identity):
+                yield None
+            return
+
+        # Queue ownership carries request context, not the sender's ports, bindings or page observations.
+        caller = self.recording.regions[identity]["metadata"]
+        metadata = {field: caller[field] for field in ("request", "room", "lane", "send_region")}
+        metadata["parameters"] = dict(caller["parameters"])
+        with self.recording.scope(role, **metadata) as scope:
+            yield scope
 
     def transfer(
         self,
@@ -350,31 +388,25 @@ class DisaggregationObservation:
         grouping: str,
     ) -> Any:
         self.serving.parallel["kv_layout"]["copy_grouping"] = grouping
-        metadata = self.transfers.get(source)
-        if metadata is None:
-            return original(session, source, destination_buffers, destination, *args)
-
-        with self.recording.scope(
-            "KvTransfer", **metadata, source_pages=source.tolist(), destination_pages=destination.tolist(),
-            destination_session=session,
-        ) as scope:
+        with self.transfer_scope("KvTransfer") as scope:
+            if scope is not None:
+                scope.metadata.update(
+                    source_pages=source.tolist(), destination_pages=destination.tolist(), destination_session=session,
+                )
             result = original(session, source, destination_buffers, destination, *args)
-            scope.metadata["status"] = result
+            if scope is not None:
+                scope.metadata["status"] = result
             return result
 
     def metadata_transfer(self, original: Any, manager: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        metadata = self.rooms.get(request.room)
-        if metadata is None:
-            return original(manager, request, *args, **kwargs)
-
-        with self.recording.scope(
-            "KvMetadataTransfer",
-            **metadata,
-            destination_session=request.mooncake_session_id,
-            destination_metadata_slot=request.dst_aux_index,
-        ) as scope:
+        with self.transfer_scope("KvMetadataTransfer") as scope:
+            if scope is not None:
+                scope.metadata.update(
+                    destination_session=request.mooncake_session_id, destination_metadata_slot=request.dst_aux_index,
+                )
             result = original(manager, request, *args, **kwargs)
-            scope.metadata["status"] = result
+            if scope is not None:
+                scope.metadata["status"] = result
             return result
 
     def release(self, original: Any, request: Any, cache: Any, *args: Any, **kwargs: Any) -> Any:
@@ -394,7 +426,8 @@ class DisaggregationObservation:
 
     def submit(self, original: Any, executor: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
         scope = self.recording.current_scope.get()
-        if scope is None or self.recording.regions[scope]["role"] != "KvTransfer":
+        source = scope is not None and self.recording.regions[scope]["role"] in {"KvTransfer", "KvMetadataTransfer"}
+        if not source and self.recording.current_baseline.get() is None:
             return original(executor, function, *args, **kwargs)
 
         # Carry observation ownership into native copy workers without changing their lifecycle.
@@ -409,6 +442,8 @@ class DisaggregationObservation:
             "sglang.srt.mem_cache.common.release_kv_cache": self.release,
             "sglang.srt.disaggregation.utils._poll_with_failure_injection": self.poll_readiness,
             "concurrent.futures.ThreadPoolExecutor.submit": self.submit,
+            "sglang.srt.disaggregation.common.utils.FastQueue.put": self.enqueue_chunk,
+            "sglang.srt.disaggregation.common.utils.FastQueue.get": self.next_chunk,
             "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager": self.registration,
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._init_kv_manager": self.registration,
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc": self.reserve,

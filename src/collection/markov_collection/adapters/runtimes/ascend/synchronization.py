@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any
 
@@ -15,15 +16,26 @@ import torch_npu
 from torch_npu.utils import _npu_trace
 
 from markov_collection.artifacts import write_json
+from markov_collection.instrumentation.recording import Recording
+
+
+class DlInfo(ctypes.Structure):
+    _fields_ = [
+        ("filename", ctypes.c_char_p),
+        ("base", ctypes.c_void_p),
+        ("symbol", ctypes.c_char_p),
+        ("address", ctypes.c_void_p),
+    ]
 
 
 class SynchronizationObservation:
-    def __init__(self, markers: Any) -> None:
-        self.markers = markers
+    def __init__(self, recording: Recording) -> None:
+        self.recording = recording
+        self.markers = recording.markers
         self.enabled = True
         self.records: list[dict[str, Any]] = []
         self.lock = threading.Lock()
-        self.events: dict[int, int] = {}
+        self.events: dict[int, tuple[int, bool]] = {}
         self.next_event = 0
         self.queue_scope = "stream" if int(os.environ.get("PER_STREAM_QUEUE", "0")) else "device"
 
@@ -62,7 +74,7 @@ class SynchronizationObservation:
 
     def create_event(self, event: int) -> None:
         with self.lock:
-            self.events[event] = self.next_event
+            self.events[event] = self.next_event, False
             self.next_event += 1
 
     def delete_event(self, event: int) -> None:
@@ -81,7 +93,12 @@ class SynchronizationObservation:
     def observe(self, kind: str, stream: int | None, event: int | None = None) -> None:
         if not self.enabled:
             return
-        record: dict[str, Any] = {"kind": kind, "queue_scope": self.queue_scope}
+        record: dict[str, Any] = {
+            "kind": kind,
+            "queue_scope": self.queue_scope,
+            "operation": self.recording.native_operation(kind),
+        }
+        capture_callers = event is None
 
         # Native callbacks may arrive on different threads; reserve the identity before ctypes releases the GIL.
         with self.lock:
@@ -91,12 +108,17 @@ class SynchronizationObservation:
             # Events created before observation still receive an identity; a reused handle starts a new lifetime.
             if event is not None:
                 if event not in self.events:
-                    self.events[event] = self.next_event
+                    self.events[event] = self.next_event, False
                     self.next_event += 1
-                record["event"] = self.events[event]
+                event_identity, callers_recorded = self.events[event]
+                record["event"] = event_identity
+
+                # One trace identifies the event's first observed use; repeated callbacks keep the same lifetime ID.
+                capture_callers = not callers_recorded
+                self.events[event] = event_identity, True
 
         with self.markers.scope(f"markov.runtime/{os.getpid()}/{identity}"):
-            if event is None:
+            if capture_callers:
                 record["stack"] = torch.utils.get_cpp_backtrace()
             device = ctypes.c_int32(-1)
             native_stream = ctypes.c_int32(-1)
@@ -116,35 +138,88 @@ class SynchronizationObservation:
 
     def write(self, directory: Path) -> None:
 
-        # Resolve native callers once after observation; hidden symbols need the matching ELF symbol table.
+        # dladdr supplies the load base; its nearest exported symbol cannot identify a hidden caller.
+        locate = ctypes.CDLL(None).dladdr
+        locate.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
+        locate.restype = ctypes.c_int
         frames = []
         offsets: dict[str, set[str]] = {}
         for record in self.records:
             native = []
-            for name, offset, library in re.findall(
-                r"frame #\d+: (.+) \+ (0x[0-9a-f]+) \([^ ]+ in (.+)\)", record.get("stack", "")
+            for address, library in re.findall(
+                r"frame #\d+: .+ \((0x[0-9a-f]+) in (.+)\)", record.get("stack", "")
             ):
                 if Path(library).name != "libtorch_npu.so":
+
+                    # A foreign-library gap must not turn an outer NPU frame into an immediate caller.
+                    if native and native[-1][1] is not None:
+                        native.append((library, None))
                     continue
 
-                native.append((name, library, offset))
-                if name == "<unknown function>":
-                    offsets.setdefault(library, set()).add(offset)
+                address = int(address, 16)
+                image = DlInfo()
+                if not locate(address, ctypes.byref(image)):
+                    raise RuntimeError(f"native frame has no loaded shared object: {address:#x}")
+                offset = hex(address - image.base)
+                native.append((library, offset))
+                offsets.setdefault(library, set()).add(offset)
             frames.append(native)
 
-        symbols = {}
-        for library, addresses in offsets.items():
-            addresses = sorted(addresses)
-            lines = subprocess.run(
-                ["addr2line", "-f", "-C", "-e", library, *addresses], check=True, capture_output=True, text=True
-            ).stdout.splitlines()
-            symbols.update(((library, address), name) for address, name in zip(addresses, lines[::2], strict=True))
+        symbols = {
+            (library, address): name
+            for library, addresses in offsets.items()
+            for address, name in self.resolve_callers(library, addresses).items()
+        }
 
         output = []
         for record, native in zip(self.records, frames, strict=True):
-            callers = [
-                symbols[(library, offset)] if name == "<unknown function>" else name for name, library, offset in native
-            ]
-            output.append({**{key: value for key, value in record.items() if key != "stack"}, "callers": callers})
+            entry = {
+                **{key: value for key, value in record.items() if key != "stack"},
+                "callers": [symbols[frame] if frame[1] is not None else "<external frame>" for frame in native],
+            }
+
+            # Keep source addresses compactly so later symbol interpretation does not require another native run.
+            if native:
+                entry["frames"] = [{"library": library, "offset": offset} for library, offset in native]
+            output.append(entry)
 
         write_json(directory / f"{os.getpid()}-callbacks.json", output)
+
+    @staticmethod
+    def resolve_callers(library: str, addresses: set[str]) -> dict[str, str]:
+        table = subprocess.run(
+            ["readelf", "--wide", "--symbols", library], check=True, capture_output=True, text=True
+        ).stdout
+        functions: dict[int, dict[str, int]] = {}
+        for line in table.splitlines():
+            fields = line.split(maxsplit=7)
+            if len(fields) != 8 or fields[3] != "FUNC" or fields[6] == "UND":
+                continue
+            start = int(fields[1], 16)
+            size = int(fields[2], 16 if fields[2].startswith("0x") else 10)
+            if size:
+                name = fields[7].partition("@")[0]
+                functions.setdefault(start, {})[name] = start + size
+
+        starts = sorted(functions)
+        matched = {}
+        for address in addresses:
+            position = int(address, 16)
+            preceding = bisect_right(starts, position) - 1
+            if preceding < 0:
+                continue
+
+            # Stripped libraries expose gaps and aliases; neither proves a unique containing function.
+            names = {name for name, end in functions[starts[preceding]].items() if position < end}
+            if len(names) == 1:
+                matched[address] = names.pop()
+
+        names = sorted(set(matched.values()))
+        demangled = subprocess.run(
+            ["c++filt"], input="\n".join(names), check=True, capture_output=True, text=True
+        ).stdout.splitlines()
+        symbols = dict(zip(names, demangled, strict=True))
+        return {
+            address: symbols[matched[address]] if address in matched else "<unknown function>"
+            for address in addresses
+        }

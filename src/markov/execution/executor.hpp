@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <optional>
 #include <set>
@@ -69,7 +68,8 @@ private:
     void notify(const Notification & notification);
 
     const NodeDurations & durations_;
-    std::deque<Work> work_;
+    std::map<std::size_t, Work> work_;
+    std::vector<std::size_t> completed_work_;
     std::set<std::size_t> completed_frontiers_;
     std::map<std::size_t, Resource> resources_;
     std::set<std::pair<std::int64_t, std::size_t>> completions_;
@@ -77,7 +77,7 @@ private:
 
     // Same-time task feedback follows submission order, with publication before its own completion.
     std::map<std::tuple<std::int64_t, std::size_t, ExecutionEvent::Kind>, ExecutionEvent> feedback_;
-    std::size_t first_node_ = 0;
+    std::size_t next_node_ = 0;
     std::size_t consumed_edges_ = 0;
     std::size_t next_submission_ = 0;
     std::int64_t now_ns_ = 0;

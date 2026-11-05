@@ -383,6 +383,7 @@ class NativeEvidence:
         self.mismatches = []
         self.difference_count = 0
         self.unobserved = 0
+        self.receipts = []
 
     def input_delivery(self) -> dict[str, Any]:
         if len(self.delivery) != 1:
@@ -408,8 +409,40 @@ class NativeEvidence:
             "requests": sum(len(row["requests"]) for row in submissions),
             "min_delay_ns": min(delays, default=None),
             "max_delay_ns": max(delays, default=None),
-            "scope": "sender_release_only; scheduler_receive_timing_not_observed",
+            "scope": "sender_release; scheduler_dispatch_reported_separately; predicted_ingress_timing_not_compared",
         }
+
+    def scheduler_receipts(self, source: dict, session: dict) -> None:
+        rank = source["environment"]["rank"]
+        records = source.get("request_receipts")
+        if records is None:
+            self.receipts.append({"rank": rank, "status": "not_observed"})
+            return
+
+        delivery = self.delivery[0]
+        submitted = {
+            session["source_requests"][index]: row["submitted_ns"]
+            for row in delivery["submissions"] for index in row["requests"]
+        }
+        received = [row["received_ns"] for row in records]
+        delays = [row["received_ns"] - delivery["origin_ns"] - submitted[row["request"]] for row in records]
+        checks = {
+            "every_request_once": Counter(row["request"] for row in records) == Counter(session["source_requests"]),
+            "not_received_before_submission": all(delay >= 0 for delay in delays),
+            "dispatch_clock_order": received == sorted(received),
+        }
+        for name, passed in checks.items():
+            if not passed:
+                self.difference(("scheduler_receipts", rank), name)
+
+        self.receipts.append({
+            "rank": rank,
+            "status": "matched" if all(checks.values()) else "differences",
+            "checks": checks,
+            "requests": len(records),
+            "min_sender_to_dispatch_ns": min(delays, default=None),
+            "max_sender_to_dispatch_ns": max(delays, default=None),
+        })
 
     def difference(self, key: tuple, check: str) -> None:
         self.difference_count += 1
@@ -421,6 +454,7 @@ class NativeEvidence:
         session = json.loads((path.parent / "session.json").read_text())
         names = dict(zip(session["source_requests"], (item["id"] for item in self.target["requests"]), strict=True))
         environment = source["environment"]
+        self.scheduler_receipts(source, session)
         instance = environment["implementation"]["disaggregation_mode"]
         instance = "model" if instance == "null" else instance
         batches = {batch["id"]: batch for batch in source["batches"] if batch["observation"] == "source"}
@@ -474,6 +508,7 @@ class NativeEvidence:
                 self.difference(("input_delivery",), check)
         for path in self.sources:
             self.collect(path)
+        delivery["scheduler_receipts"] = self.receipts
         rows = padding = calls = 0
         for key, peers in self.groups.items():
             instance, _, _, members, layer, _ = key

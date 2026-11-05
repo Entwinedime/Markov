@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 from bisect import bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Sequence
 from decimal import Decimal
 from itertools import accumulate, pairwise
 from operator import itemgetter
 from pathlib import Path
 from typing import Any
+
+from markov_collection.adapters.runtimes.ascend.transfer import MemfabricObservation
 
 
 def event_time_ns(event: dict[str, Any], field: str = "ts") -> int:
@@ -17,7 +20,7 @@ def event_time_ns(event: dict[str, Any], field: str = "ts") -> int:
 
 
 class NativeRuntimeCalls:
-    def __init__(self, directory: Path, profiler: Path) -> None:
+    def __init__(self, directory: Path, profiler: Path, process: int) -> None:
         if not directory.is_dir():
             raise NotADirectoryError(directory)
 
@@ -29,22 +32,32 @@ class NativeRuntimeCalls:
         self.offset_ns = int(Decimal(str(clock["collectionTimeBegin"])) * 1000) - int(clock["clockMonotonicRaw"])
 
         self.calls: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-        for path in directory.glob("*.jsonl"):
+        for path in directory.glob(f"{process}.jsonl"):
             for index, line in enumerate(path.read_text().splitlines()):
                 call = json.loads(line)
-                if call["end_raw_ns"] < call["begin_raw_ns"]:
-                    raise ValueError("native runtime call ends before it begins")
                 call["source"] = {"process": int(path.stem), "record": index}
                 self.calls[(call["thread"], call["api"])].append(call)
 
-        self.prefix_ends = {}
-        for key, calls in self.calls.items():
-            calls.sort(key=itemgetter("begin_raw_ns"))
-            self.prefix_ends[key] = list(accumulate((call["end_raw_ns"] for call in calls), max))
+        self.prefix_ends = self.index_intervals(self.calls)
+
+        self.native_services: dict[int, dict[str, Any]] = {}
+        self.service_calls: Counter[str] = Counter()
+        for path in directory.glob(f"{process}-memfabric.json"):
+            recording = json.loads(path.read_text())
+            for identity, allocation in enumerate(recording["allocations"]):
+
+                # The SDK owns this private queue until shutdown; its tasks need no guessed per-call owner.
+                self.native_services[allocation["stream"]] = {
+                    "work": dict(MemfabricObservation.service), "stream": allocation["stream"],
+                    "process": process, "allocation": identity,
+                }
+            self.service_calls.update(
+                "baseline" if call["baseline"] is not None else "source"
+                for call in recording["copies"] if call["status"] == 0
+            )
 
         self.callbacks: dict[str, dict[str, Any]] = {}
-        for path in directory.glob("*-callbacks.json"):
-            process = int(path.stem.removesuffix("-callbacks"))
+        for path in directory.glob(f"{process}-callbacks.json"):
             for identity, call in enumerate(json.loads(path.read_text())):
                 call["source"] = {"process": process, "callback": identity}
                 call["queue_scope"] = self.queue_scope(call)
@@ -64,6 +77,33 @@ class NativeRuntimeCalls:
                 self.callbacks[f"markov.runtime/{process}/{identity}"] = call
 
         self.callback_kinds = {call["kind"] for call in self.callbacks.values()}
+
+    @staticmethod
+    def index_intervals(groups: dict[Any, list[dict[str, Any]]]) -> dict[Any, list[int]]:
+        ends = {}
+        for key, calls in groups.items():
+            if any(call["end_raw_ns"] < call["begin_raw_ns"] for call in calls):
+                raise ValueError("native work ends before it begins")
+            calls.sort(key=itemgetter("begin_raw_ns"))
+            ends[key] = list(accumulate((call["end_raw_ns"] for call in calls), max))
+        return ends
+
+    @staticmethod
+    def enclosing_call(
+        calls: Sequence[dict[str, Any]], prefix_ends: list[int], begin_ns: int, end_ns: int,
+    ) -> dict[str, Any] | None:
+        position = bisect_right(calls, begin_ns, key=itemgetter("begin_raw_ns"))
+        match = None
+
+        # Complete containment and uniqueness are required, including nested native calls.
+        while position and prefix_ends[position - 1] >= end_ns:
+            position -= 1
+            call = calls[position]
+            if call["end_raw_ns"] >= end_ns:
+                if match is not None:
+                    return None
+                match = call
+        return match
 
     @staticmethod
     def queue_scope(call: dict[str, Any]) -> str | None:
@@ -105,18 +145,7 @@ class NativeRuntimeCalls:
         instant = timestamp_ns - self.offset_ns
         key = arguments["Thread Id"], arguments["id"]
         calls = self.calls.get(key, ())
-        position = bisect_right(calls, instant, key=itemgetter("begin_raw_ns"))
-        match = None
-
-        # Prefix ends retain nested/ambiguous calls while skipping intervals that have already ended.
-        while position and self.prefix_ends[key][position - 1] > instant:
-            position -= 1
-            call = calls[position]
-            if instant < call["end_raw_ns"]:
-                if match is not None:
-                    return None
-                match = call
-
+        match = self.enclosing_call(calls, self.prefix_ends.get(key, []), instant, instant + 1)
         return None if match is None else self.parameters(match)
 
     @staticmethod
@@ -152,7 +181,8 @@ class NativeRuntimeCalls:
 
     def bind_callbacks(
         self, events: list[dict[str, Any]], actions: list[dict[str, Any]], owners: dict[int, dict[str, Any]]
-    ) -> None:
+    ) -> list[tuple[int, int, int]]:
+        bound = []
         markers: dict[tuple[Any, ...], list[int]] = defaultdict(list)
         calls: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for identity, event in enumerate(events):
@@ -216,3 +246,7 @@ class NativeRuntimeCalls:
 
                 parameters["queue_scope"] = callback.get("queue_scope")
                 action["native_call"] = parameters
+                operation = callback.get("operation")
+                if operation is not None:
+                    bound.append((operation, action["source_event"], identity))
+        return bound
