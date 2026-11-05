@@ -82,3 +82,15 @@ study 使用 space、model、database、scenarios、workloads、sources、refere
 路径相对该文件，workloads/sources/reference_reports 按场景列出明确文件。输入请求、来源与共同模型先确定，参照只在所有运行之后由评价步骤读取，不传给子搜索进程。
 `--phase run|report` 可分开执行；runs.json 保留命令、失败和实际墙钟，comparison.json 保存所有种子及条件于找到可行点的成本差距。
 三种报价的敏感性使用同一批查询结果重新排序，不能冒充三套独立在线搜索。
+
+研究中的固定条件确认使用 `confirm.py`，沿用原始采集账本，不重新维护失败用量：
+
+```bash
+PYTHONPATH=python python3 examples/hicache_search/confirm.py \
+  --plan /path/to/confirmation_plan.json --output data/confirmation
+```
+
+plan 的 cases 预先列出 scene、target、roles、request、predicted_sec、applicable_limits_sec 和 hourly_cost_units；request 是正式 measure 请求，声明实际资源档位。
+initial_repetitions、maximum_repetitions、extra_cv_ratio、near_ceiling_ratio、maximum_extra_conditions 规定重复与追加规则。
+正常采集严格串行，轮换场景及条件顺序；追加依据正常波动和固定门槛，不按预测误差挑样。additional_cases.json 保存首次追加决定，续跑不重选。
+`--phase report` 只读已有正常观察；results.json 区分采集完整、预测误差与是否满足耗时要求。报告中的实际主机配额从正式请求读取，报价是声明情景。初测未齐或追加未完成时保持 incomplete，保留所有成功观察与失败尝试。
