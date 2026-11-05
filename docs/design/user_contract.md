@@ -88,7 +88,7 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 
 ## 有限资源搜索
 
-`search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名）、maximum_time_ratio、
+`search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名）、maximum_time_sec 或 maximum_time_ratio、
 fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以搜索请求所在目录为起点。
 每个资源档位声明 name、device_gib_per_rank、host_gib 和 hourly_cost_units；GiB 配额为正整数，其余量为有限正数，名字不重复。
 候选组合由调用方提供，搜索不重写结构规则、不读取 target 真值，也不比较多套搜索算法。
@@ -99,7 +99,9 @@ HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、hos
 未提供这种资源表示的框架明确为 resource_accounting_unavailable，不借用 HiCache 公式或填零。
 档位须使用相同设备、runtime 与 I/O 条件，只改变可用配额和声明报价；接口不模拟单独改变硬件带宽或竞争。
 
-流程调用同一 predict，选择能容纳各候选的最低报价档位，列出时间/报价 Pareto，再在 baseline 预测耗时乘 maximum_time_ratio 的约束内选最低报价。
+maximum_time_sec 与 maximum_time_ratio 必须恰好提供一个正数。绝对上限直接使用；相对要求以 baseline 的预测耗时乘比例确定上限。
+流程调用同一 predict，选择能容纳各候选的最低报价档位，列出时间/报价 Pareto，再在这份固定上限内选最低报价。
+正常确认使用同一 maximum_time_sec，不用正常 baseline 重新计算门槛；相对正常 baseline 的改善单列。
 同价按耗时、名字稳定排序，Pareto 保留并列；没有满足时间约束的候选时 selected=null，不降低要求。
 缺成本或结构保留缺项并标记 incomplete；即使有暂定选择，也不能声称全部候选已比较。明确资源不可行者可排除，仍保留原预测状态。
 报价只在调用方提供的价格情景内有效，不代表真实采购支出；完整有限集合的预测最优也不表示真实全局最优。

@@ -29,14 +29,14 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
             **actual,
             "ape_percent": None,
             "normal_relative_time_ratio": None,
-            "normal_meets_relative_constraint": None,
+            "normal_meets_time_constraint": None,
             "errors": measurements.get(name, {"errors": []})["errors"],
         }
         if actual["mean_sec"] is not None:
             row["ape_percent"] = 100 * abs(row["predicted_sec"] - actual["mean_sec"]) / actual["mean_sec"]
+            row["normal_meets_time_constraint"] = actual["mean_sec"] <= result["maximum_time_sec"]
             if baseline is not None:
                 row["normal_relative_time_ratio"] = actual["mean_sec"] / baseline
-                row["normal_meets_relative_constraint"] = actual["mean_sec"] <= baseline * result["maximum_time_ratio"]
         confirmed.append(row)
     result["confirmation"] = confirmed
     result["confirmation_complete"] = all(row["n"] == repetitions for row in confirmed)
@@ -75,7 +75,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         "# 有限资源搜索结果",
         "",
         f"候选 {result['expected']} 个，已进入排名 {result['ranked']} 个；状态 {result['status']}。",
-        f"约束为默认配置预测耗时的 {result['maximum_time_ratio']:.0%}，{selection}",
+        f"固定正式 HTTP 上限为 {result['maximum_time_sec']:.4f} 秒，预测筛选与正常确认共用此上限；{selection}",
         "",
         "资源档位使用声明的固定预留与原生 KV 池占用，报价为示例成本单位，不代表真实支出。",
         "",
@@ -121,8 +121,8 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         ratio = f"{row['normal_relative_time_ratio']:.1%}" if row["normal_relative_time_ratio"] is not None else "缺失"
         meets = (
             "缺失"
-            if row["normal_meets_relative_constraint"] is None
-            else ("是" if row["normal_meets_relative_constraint"] else "否")
+            if row["normal_meets_time_constraint"] is None
+            else ("是" if row["normal_meets_time_constraint"] else "否")
         )
         lines.append(
             f"| {row['name']} | {row['predicted_sec']:.4f} | {observed} | {row['n']} | {error} | {ratio} | {meets} |"

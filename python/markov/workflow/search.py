@@ -52,8 +52,9 @@ class SearchPolicy:
     baseline: str
     fixed_device_gib_per_rank: float
     fixed_host_gib: float
-    maximum_time_ratio: float
+    maximum_time_ratio: float | None
     plans: tuple[ResourcePlan, ...]
+    maximum_time_sec: float | None = None
 
     @classmethod
     def parse(cls, raw: dict) -> SearchPolicy:
@@ -65,6 +66,7 @@ class SearchPolicy:
                 "fixed_device_gib_per_rank",
                 "fixed_host_gib",
                 "maximum_time_ratio",
+                "maximum_time_sec",
                 "resource_plans",
             },
             "resource search",
@@ -72,12 +74,15 @@ class SearchPolicy:
         plans = tuple(ResourcePlan.parse(plan) for plan in raw["resource_plans"])
         if not plans or len({plan.name for plan in plans}) != len(plans):
             raise ValueError("Resource plans must be nonempty and have unique names")
+        if ("maximum_time_sec" in raw) == ("maximum_time_ratio" in raw):
+            raise ValueError("Declare exactly one of maximum_time_sec and maximum_time_ratio")
         return cls(
             required_text(raw["baseline"], "baseline"),
             positive_number(raw["fixed_device_gib_per_rank"], "fixed_device_gib_per_rank"),
             positive_number(raw["fixed_host_gib"], "fixed_host_gib"),
-            positive_number(raw["maximum_time_ratio"], "maximum_time_ratio"),
+            positive_number(raw["maximum_time_ratio"], "maximum_time_ratio") if "maximum_time_ratio" in raw else None,
             plans,
+            positive_number(raw["maximum_time_sec"], "maximum_time_sec") if "maximum_time_sec" in raw else None,
         )
 
     def rank(self, prediction: dict) -> dict:
@@ -120,7 +125,9 @@ class SearchPolicy:
 
         ranked = [row for row in rows if row["status"] == "ranked"]
         baseline = next(row for row in rows if row["name"] == self.baseline)
-        limit = baseline["predicted_sec"] * self.maximum_time_ratio if baseline["status"] == "ranked" else None
+        limit = self.maximum_time_sec
+        if self.maximum_time_ratio is not None and baseline["status"] == "ranked":
+            limit = baseline["predicted_sec"] * self.maximum_time_ratio
         feasible = [row for row in ranked if limit is not None and row["predicted_sec"] <= limit]
         chosen = (
             min(feasible, key=lambda row: (row["hourly_cost_units"], row["predicted_sec"], row["name"]))
@@ -149,7 +156,7 @@ class SearchPolicy:
             row for row in rows if row["status"] not in {"ranked", "resource_envelope_exceeded", "resource_infeasible"}
         ]
         return {
-            "status": "completed" if not unresolved and baseline["status"] == "ranked" else "incomplete",
+            "status": "completed" if not unresolved and limit is not None else "incomplete",
             "baseline": self.baseline,
             "maximum_time_sec": limit,
             "selected": chosen["name"] if chosen else None,

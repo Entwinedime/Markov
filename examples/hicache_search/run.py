@@ -60,6 +60,10 @@ def candidates(settings: dict) -> list[dict]:
                     "configuration": configuration,
                 }
             )
+
+    if not any(row["name"] == settings["policy"]["baseline"] for row in result):
+        result.append({"name": settings["policy"]["baseline"], "configuration": settings["base_configuration"]})
+
     return result
 
 
@@ -67,17 +71,24 @@ class SearchExample:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.settings = read_json(args.settings)
-        policy = SearchPolicy.parse({"prediction": "prediction.json", **self.settings["policy"]})
+        self.output = args.output.resolve()
+        saved = args.phase in {"confirm", "report"}
+        policy = SearchPolicy.parse(
+            read_json(self.output / "requests/search.json")
+            if saved
+            else {"prediction": "prediction.json", **self.settings["policy"]}
+        )
         if policy.baseline in {".", ".."} or Path(policy.baseline).name != policy.baseline:
             raise ValueError("The example baseline name must be a single path component")
-        self.output = args.output.resolve()
-        if args.phase in {"confirm", "report"}:
-            self.targets = read_json(self.output / "requests/prediction.json")["targets"]
+        if saved:
+            request = read_json(self.output / "requests/prediction.json")
+            self.targets = request["targets"]
+            self.capture = dict(request["execution"]["capture"])
         else:
             self.targets = candidates(self.settings)
+            self.capture = dict(self.settings["capture"])
         if not any(target["name"] == policy.baseline for target in self.targets):
             raise ValueError("The example space must include its declared base configuration")
-        self.capture = dict(self.settings["capture"])
         if args.devices is not None:
             self.capture["devices"] = args.devices
         self.repetitions = self.settings["normal_repetitions"]
