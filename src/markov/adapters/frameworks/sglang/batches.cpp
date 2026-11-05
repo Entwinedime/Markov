@@ -22,13 +22,6 @@ std::map<std::string, std::size_t> BatchViews::columns(const std::map<std::strin
     return result;
 }
 
-std::size_t BatchViews::admission_members() const {
-    if (prefill_only_) return 0;
-
-    // Native admission precedes Decode filtering, while the preceding Prefill is filtered first.
-    return (running_ ? running_->requests.size() : 0) + (prefill_ ? prefill_->kept_rows.size() : 0);
-}
-
 void BatchViews::advance(Phase phase) {
 
     // Coarse batch actions compose their transitions here; native control submits Select separately.

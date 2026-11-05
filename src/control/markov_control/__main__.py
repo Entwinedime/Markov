@@ -1,4 +1,4 @@
-"""Native control endpoint; its standard streams connect to markov simulate --control native."""
+"""Native control endpoint; standard streams carry the shared control protocol."""
 
 import argparse
 import os

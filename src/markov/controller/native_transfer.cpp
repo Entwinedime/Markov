@@ -187,10 +187,10 @@ void NativeTransfer::finish(const ServingAction & action) {
 }
 
 bool NativeTransfer::running() const {
-    for (const auto & [_, handoff] : handoffs_) {
-        for (const auto & [_, source] : handoff.sources) {
+    for (const auto & [request, handoff] : handoffs_) {
+        for (const auto & [group, source] : handoff.sources) {
             if (source.connected == Progress::Submitted || source.published == Progress::Submitted) return true;
-            for (const auto & [_, fragment] : source.fragments)
+            for (const auto & [flow, fragment] : source.fragments)
                 if (fragment.submitted.size() != fragment.completed.size()) return true;
         }
         if (std::ranges::any_of(handoff.destinations, [](const auto & entry) { return entry.second.published == Progress::Submitted; })) return true;

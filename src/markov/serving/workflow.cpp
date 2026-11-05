@@ -51,7 +51,7 @@ nlohmann::json ServingWorkflow::run(bool details) {
 
     while (true) {
         if (trace_) trace_->context(executor_.now_ns(), state_order, "plan");
-        if (auto action = controller_.plan(executor_.now_ns(), expansion_.admission())) {
+        if (auto action = controller_.plan(executor_.now_ns())) {
             if (pending.contains(action->task)) throw std::invalid_argument("control reused an in-flight task identity");
 
             // Resolve graph work before execution acceptance; a control backend may already hold its reservations.

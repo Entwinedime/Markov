@@ -790,7 +790,6 @@ TargetRegion RankStructure::transfer(std::int64_t bytes, std::int64_t segments) 
     return result;
 }
 
-std::size_t RankStructure::admission_members(std::size_t lane) const { return views_.at(lane).admission_members(); }
 PageReuse RankStructure::page_reuse() const { return page_reuse_; }
 
 nlohmann::json RankStructure::source_summary() const {

@@ -28,7 +28,6 @@ public:
     ServingStructure(const ServingStructure &) = delete;
     ServingStructure & operator=(const ServingStructure &) = delete;
 
-    GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
     BatchProgram expand(const ServingAction & action, const std::map<std::size_t, std::vector<std::size_t>> & prerequisites);
     const RegionGraph & graph() const override;
@@ -42,7 +41,6 @@ public:
     void live_state(GraphRoots & roots);
 
 private:
-
     struct RankViews {
 
         // A present empty column set is still live work; absence means it was consumed.
@@ -64,7 +62,6 @@ private:
     const ServingTopology & topology_;
     const RankGroup & instance_;
     ParallelComposition parallel_;
-    std::int64_t prefill_token_granularity_;
     std::vector<const TemplateAsset *> assets_;
 
     // Rank builders borrow this immutable routing condition for the lifetime of the expansion.

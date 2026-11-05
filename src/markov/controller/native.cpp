@@ -123,7 +123,7 @@ void NativeController::release_idle(const std::string & instance) {
     }
 }
 
-std::optional<ServingAction> NativeController::plan(std::int64_t now_ns, const GroupAdmission &) {
+std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
     while (!done()) {
         if (transfer_) {
             if (auto action = transfer_->plan(now_ns)) return action;

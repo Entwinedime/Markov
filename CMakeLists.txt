@@ -10,15 +10,12 @@ find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(markov_core
     src/markov/serving/workflow.cpp
-    src/markov/controller/batch_replay.cpp
-    src/markov/controller/disaggregated.cpp
     src/markov/controller/native.cpp
     src/markov/controller/native_group.cpp
     src/markov/controller/native_transfer.cpp
     src/markov/resources/kv_pool.cpp
     src/markov/resources/prefix_index.cpp
     src/markov/resources/trace.cpp
-    src/markov/controller/serving.cpp
     src/markov/execution/protocol.cpp
     src/markov/execution/durations.cpp
     src/markov/execution/executor.cpp
@@ -50,22 +47,3 @@ add_library(markov_core
 target_include_directories(markov_core PUBLIC src)
 target_link_libraries(markov_core PUBLIC nlohmann_json::nlohmann_json)
 target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-
-add_executable(markov src/markov/cli/main.cpp)
-add_library(markov_application
-    src/markov/adapters/frameworks/sglang/batch_record.cpp
-    src/markov/adapters/frameworks/sglang/batches.cpp
-    src/markov/adapters/frameworks/sglang/expert_routing.cpp
-    src/markov/adapters/frameworks/sglang/disaggregated.cpp
-    src/markov/adapters/frameworks/sglang/kv_transfer.cpp
-    src/markov/adapters/frameworks/sglang/topology.cpp
-    src/markov/adapters/frameworks/sglang/structure.cpp
-    src/markov/adapters/frameworks/sglang/rank_structure.cpp
-    src/markov/adapters/frameworks/sglang/rank_indices.cpp
-    src/markov/application/simulation.cpp
-    src/markov/application/control_stream.cpp
-)
-target_link_libraries(markov_application PUBLIC markov_core)
-target_compile_options(markov_application PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-target_link_libraries(markov PRIVATE markov_application)
-target_compile_options(markov PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

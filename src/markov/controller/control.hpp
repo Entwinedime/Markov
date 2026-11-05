@@ -14,7 +14,7 @@ class ServingControl {
 public:
     virtual ~ServingControl() = default;
 
-    virtual std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) = 0;
+    virtual std::optional<ServingAction> plan(std::int64_t now_ns) = 0;
 
     // Preparing native work may reserve resources; start accepts execution and finish commits completion effects.
     virtual void start(const ServingAction & action) = 0;

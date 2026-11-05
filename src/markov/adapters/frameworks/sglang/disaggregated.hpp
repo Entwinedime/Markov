@@ -11,10 +11,15 @@
 
 #include "markov/adapters/frameworks/sglang/kv_transfer.hpp"
 #include "markov/adapters/frameworks/sglang/structure.hpp"
-#include "markov/controller/disaggregated.hpp"
 #include "markov/templates/batch_expansion.hpp"
 
 namespace markov::sglang {
+
+struct DisaggregatedGroups {
+    std::string prefill;
+    std::string decode;
+    std::string transfer;
+};
 
 // Each instance translates its native calls; only explicit data-ready ports cross the PD boundary.
 class DisaggregatedStructure final : public BatchExpansion {
@@ -23,7 +28,6 @@ public:
                            const DisaggregatedGroups & groups, const ServingTopology & topology, std::vector<std::string> resource_owners,
                            const nlohmann::json & prefill_routes, const nlohmann::json & decode_routes);
 
-    GroupAdmission admission() const override;
     BatchProgram expand(const ServingAction & action) override;
     const RegionGraph & graph() const override;
     std::vector<std::size_t> retire() override;

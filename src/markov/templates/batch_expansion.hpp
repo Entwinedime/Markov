@@ -13,8 +13,6 @@ class BatchExpansion {
 public:
     virtual ~BatchExpansion() = default;
 
-    // Native occupancy and budget units accompany each controller decision.
-    virtual GroupAdmission admission() const = 0;
     virtual BatchProgram expand(const ServingAction & action) = 0;
 
     virtual const RegionGraph & graph() const = 0;

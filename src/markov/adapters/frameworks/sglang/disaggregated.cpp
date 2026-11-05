@@ -33,12 +33,6 @@ DisaggregatedStructure::DisaggregatedStructure(std::span<const TemplateAsset> as
     for (const auto & request : requests) prompt_tokens_.push_back(request.prompt_tokens);
 }
 
-GroupAdmission DisaggregatedStructure::admission() const {
-    auto result = prefill_.admission();
-    result.merge(decode_.admission());
-    return result;
-}
-
 PageReuse DisaggregatedStructure::page_reuse() const { return prefill_.page_reuse(); }
 const ServingTopology & DisaggregatedStructure::topology() const { return topology_; }
 

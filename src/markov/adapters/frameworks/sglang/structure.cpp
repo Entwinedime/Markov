@@ -14,8 +14,7 @@ ServingStructure::ServingStructure(RegionGraph & graph, std::span<const Template
     : graph_(graph),
       topology_(topology),
       instance_(topology.instance(instance)),
-      parallel_(graph_),
-      prefill_token_granularity_(settings.page_size) {
+      parallel_(graph_) {
     for (const auto rank : instance_.members) {
         const auto source = std::ranges::find_if(assets, [&](const auto & asset) { return asset.environment().at("rank") == rank; });
         assets_.push_back(&*source);
@@ -54,16 +53,6 @@ ServingStructure::ServingStructure(RegionGraph & graph, std::span<const Template
             rank,
             std::make_unique<RankStructure>(asset, settings, graph_, offset, rank, topology_.stage_count(instance), routing_ ? &*routing_ : nullptr));
     }
-}
-
-GroupAdmission ServingStructure::admission() const {
-
-    // PrefillAdder._update_prefill_budget charges whole pages on the fixed-output, cold-cache path.
-    GroupAdmission result;
-    std::vector<std::size_t> occupied;
-    for (std::size_t lane = 0; lane < topology_.stage_count(instance_.id); ++lane) occupied.push_back(ranks_.begin()->second->admission_members(lane));
-    result.emplace(instance_.id, AdmissionConstraints{ std::move(occupied), prefill_token_granularity_ });
-    return result;
 }
 
 BatchProgram ServingStructure::expand(const ServingAction & action) { return expand(action, {}); }

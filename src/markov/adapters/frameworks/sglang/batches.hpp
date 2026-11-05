@@ -18,7 +18,6 @@ class BatchViews {
 public:
     BatchViews(TargetGraph & graph, const TemplateAsset & asset);
 
-    std::size_t admission_members() const;
     void advance(Phase phase);
     void consume_running();
     std::size_t select(const BatchSelection & selection);

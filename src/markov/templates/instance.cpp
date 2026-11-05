@@ -44,9 +44,9 @@ Parameters bind_parameters(Parameters inherited, const Parameters & fixed, const
                            const TemplateDefinition & definition) {
 
     // Collection aggregates belong to this call, even when its caller uses the same parameter names.
-    for (const auto & [_, group] : definition.input_groups) {
+    for (const auto & [group_name, group] : definition.input_groups) {
         inherited.erase(group.count);
-        for (const auto & [name, _] : group.sums) inherited.erase(name);
+        for (const auto & [name, expression] : group.sums) inherited.erase(name);
     }
     for (const auto & [name, value] : fixed) inherited.insert_or_assign(name, value);
 
@@ -554,8 +554,7 @@ void TemplateInstance::expand_operation(std::size_t identity, const TemplateDefi
     const auto * pattern = execution ? &asset_.execution_pattern(execution->pattern) : nullptr;
 
     // Geometry alone cannot qualify communication; try another observed candidate before publishing any graph.
-    if (prototype.communication && (!pattern || !pattern->communication))
-        throw LayoutMismatch(role_ + " communication has no observed execution ports");
+    if (prototype.communication && (!pattern || !pattern->communication)) throw LayoutMismatch(role_ + " communication has no observed execution ports");
 
     if (execution) {
         if (execution->reduction) {

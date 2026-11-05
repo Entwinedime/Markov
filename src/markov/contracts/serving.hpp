@@ -42,14 +42,6 @@ struct ServingSettings {
 
 enum class PageReuse { Immediate, DeferredSorted };
 
-// Framework facts constrain admission; control selects requests and the resource pool owns their pages.
-struct AdmissionConstraints {
-    std::vector<std::size_t> occupied_members;
-    std::int64_t prefill_token_granularity;
-};
-
-using GroupAdmission = std::map<std::string, AdmissionConstraints>;
-
 // Group-local sequences remain unique when independent controllers share one executor.
 struct TaskIdentity {
     std::string group;
@@ -102,7 +94,7 @@ struct RequestCompletion {
 struct BatchEffects {
     std::vector<RequestCompletion> members;
 
-    // Native results supply actual request order, including an empty sequence; policy control leaves it unspecified.
+    // Native results supply actual request order, including an empty sequence.
     std::optional<std::vector<std::size_t>> cache_order{};
 };
 

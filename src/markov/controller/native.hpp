@@ -45,7 +45,7 @@ public:
     NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer, const nlohmann::json & prefixes,
                      std::span<const NativeTransferRoute> transfers = {});
 
-    std::optional<ServingAction> plan(std::int64_t now_ns, const GroupAdmission & admission) override;
+    std::optional<ServingAction> plan(std::int64_t now_ns) override;
     void start(const ServingAction & action) override;
     void finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) override;
     std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const override;

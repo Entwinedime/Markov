@@ -37,7 +37,6 @@ public:
     RankStructure(const RankStructure &) = delete;
     RankStructure & operator=(const RankStructure &) = delete;
 
-    std::size_t admission_members(std::size_t lane) const;
     PageReuse page_reuse() const;
     nlohmann::json source_summary() const;
     RankProgram expand(const ServingAction & action);
