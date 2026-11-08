@@ -1,686 +1,516 @@
-"""Associate device work and runtime effects through native queues and host scopes."""
+"""Index native marker, queue and connection evidence without building an operator graph."""
 
 from __future__ import annotations
 
-import heapq
 import json
-import shutil
-import sqlite3
-from bisect import bisect_right
+import struct
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from collections.abc import Iterator
-from contextlib import closing
+from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
-from markov_collection.adapters.runtimes.ascend.native_calls import NativeRuntimeCalls, event_time_ns
+from markov_collection.adapters.runtimes.ascend.clock import AscendClock
+from markov_collection.adapters.runtimes.ascend.queues import NativeQueues, ServiceExecutions
 
 
-class NativeQueues:
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        self.events = events
-        timestamps = [event_time_ns(event) for event in events]
-        completions = [
-            start + (event_time_ns(event, "dur") if "dur" in event else 0)
-            for event, start in zip(events, timestamps, strict=True)
-        ]
+def nanoseconds(microseconds: Any) -> int:
+    return int(Decimal(str(microseconds)) * 1000)
 
-        # Preserve relative order with compact indices; timestamps remain source evidence only.
-        positions = {timestamp: index for index, timestamp in enumerate(sorted(set(timestamps + completions)))}
-        self.order = [positions[timestamp] for timestamp in timestamps]
-        self.completion_order = [positions[timestamp] for timestamp in completions]
 
-        self.enqueues: dict[tuple[int, int], int] = {}
-        self.dequeues: dict[int, list[int]] = defaultdict(list)
-        for index, event in enumerate(events):
-            if event.get("cat") == "enqueue":
-                key = (event["pid"], event["args"]["correlation_id"])
-                if key in self.enqueues:
-                    raise ValueError("native queue correlation has multiple enqueue records")
-                self.enqueues[key] = index
-            elif event.get("cat") == "dequeue":
-                self.dequeues[event["tid"]].append(index)
+@dataclass
+class Interval:
+    begin: int
+    end: int
+    thread: int
+    record: dict[str, Any]
 
-        for queue in self.dequeues.values():
-            queue.sort(key=lambda index: event_time_ns(events[index]))
-        self.positions = {
-            thread: [event_time_ns(events[index]) for index in queue] for thread, queue in self.dequeues.items()
-        }
+    @classmethod
+    def read(cls, record: dict[str, Any], offset_ns: int) -> Interval:
+        begin = nanoseconds(record["ts"]) - offset_ns
+        return cls(begin, begin + nanoseconds(record["dur"]), int(record["tid"]), record)
 
-    def item(self, event: dict[str, Any]) -> tuple[int, int] | None:
-        thread = event.get("args", {}).get("Thread Id", event["tid"])
-        start = event_time_ns(event)
-        position = bisect_right(self.positions.get(thread, []), start) - 1
-        if position < 0:
+    def contains(self, other: Interval) -> bool:
+        return self.thread == other.thread and self.begin <= other.begin and other.end <= self.end
+
+
+class ThreadIntervals:
+    def __init__(self, intervals: list[Interval]) -> None:
+        self.threads: dict[int, tuple[list[int], list[Interval], list[int], list[int]]] = {}
+        grouped: dict[int, list[Interval]] = defaultdict(list)
+        for interval in intervals:
+            grouped[interval.thread].append(interval)
+        for thread, values in grouped.items():
+            values.sort(key=lambda value: (value.begin, -value.end))
+            parents = []
+            furthest = []
+            active = []
+            for index, value in enumerate(values):
+                while active and not values[active[-1]].contains(value):
+                    active.pop()
+                parents.append(active[-1] if active else -1)
+                active.append(index)
+                furthest.append(max(value.end, furthest[-1] if furthest else value.end))
+            self.threads[thread] = [value.begin for value in values], values, parents, furthest
+
+    def enclosing(self, interval: Interval) -> Interval | None:
+        if interval.thread not in self.threads:
             return None
+        starts, values, parents, _ = self.threads[interval.thread]
+        index = bisect_right(starts, interval.begin) - 1
+        while index >= 0:
+            if values[index].contains(interval):
+                return values[index]
+            index = parents[index]
+        return None
 
-        identity = self.dequeues[thread][position]
-        dequeue = self.events[identity]
+    def inside(self, interval: Interval) -> list[Interval]:
+        if interval.thread not in self.threads:
+            return []
+        starts, values, _, _ = self.threads[interval.thread]
+        begin = bisect_right(starts, interval.begin - 1)
+        end = bisect_right(starts, interval.end)
+        return [value for value in values[begin:end] if interval.contains(value)]
 
-        # Containment identifies the queue item; a nearby dequeue is not an association.
-        if start + event_time_ns(event, "dur") > event_time_ns(dequeue) + event_time_ns(dequeue, "dur"):
-            return None
+    def overlapping(self, interval: Interval) -> list[Interval]:
+        if interval.thread not in self.threads:
+            return []
+        starts, values, _, furthest = self.threads[interval.thread]
+        index = bisect_right(starts, interval.end) - 1
+        result = []
+        while index >= 0 and furthest[index] >= interval.begin:
+            if values[index].end >= interval.begin:
+                result.append(values[index])
+            index -= 1
+        return result
 
-        enqueue = self.enqueues.get((dequeue["pid"], dequeue["args"]["correlation_id"]))
-        return None if enqueue is None else (enqueue, identity)
 
-    def origin(self, event: dict[str, Any]) -> dict[str, Any] | None:
-        item = self.item(event)
-        return None if item is None else self.events[item[0]]
+@dataclass
+class DeviceTask:
+    begin: int
+    end: int
+    record: dict[str, Any]
+    service: int | None = None
 
-    def submission(self, identity: int) -> dict[str, Any]:
-        event = self.events[identity]
-        item = self.item(event)
-        queue = None
-        if item is not None:
-            enqueue = self.events[item[0]]
-            queue = {
-                "process": enqueue["pid"],
-                "correlation": enqueue["args"]["correlation_id"],
-                "producer_thread": enqueue["tid"],
-                "enqueue_event": item[0],
-                "dequeue_event": item[1],
-                "enqueue_order": self.order[item[0]],
-                "dequeue_order": self.order[item[1]],
-                "dequeue_completion_order": self.completion_order[item[1]],
-            }
+    @property
+    def stream(self) -> int:
+        return int(self.record["args"]["Physic Stream Id"])
 
-        return {
-            "source_event": identity,
-            "order": self.order[identity],
-            "completion_order": self.completion_order[identity],
-            "native_entry": event["name"],
-            "thread": event.get("args", {}).get("Thread Id", event["tid"]),
-            "queue": queue,
-        }
+
+@dataclass
+class StreamWait:
+    api: Interval
+    stream: int
+    scope: int
+    begin: int = 0
+    end: int = 0
+
+
+@dataclass
+class DevicePoint:
+    host: Interval
+    api: Interval
+    task: DeviceTask
+    stream: int
+
+    @property
+    def order(self) -> int:
+        return self.task.end
 
 
 class AscendTrace:
-    @staticmethod
-    def capture_handler(original: Any, directory: str) -> Any:
+    host_waits = frozenset({
+        "aclrtSynchronizeStream", "aclrtSynchronizeStreamWithTimeout", "aclrtSynchronizeEvent",
+        "aclrtSynchronizeEventWithTimeout", "aclrtSynchronizeDeviceWithTimeout",
+    })
+    stream_waits = frozenset({"aclrtStreamWaitEvent", "aclrtStreamWaitEventWithTimeout"})
 
-        # Close every native recording window before spending time on CPU-side analysis.
-        return original(directory, analyse_flag=False)
+    def __init__(self, profile: Path, runtime: Path, native_points: set[int], services: list[dict], trace: Path, clock_samples: list[dict]) -> None:
 
-    @classmethod
-    def from_capture(
-        cls, directory: Path, output: Path, runtime_directory: Path, *, device: int, communication: bool = False,
-    ) -> AscendTrace:
-        from torch_npu.profiler.analysis._npu_profiler import NpuProfiler
-        from torch_npu.profiler.analysis.prof_common_func._constant import Constant
-        from torch_npu.profiler.analysis.prof_common_func._path_manager import ProfilerPathManager
+        # Native service/API intervals use RAW; device time needs an independent counter calibration.
+        start, = profile.glob("PROF_*/host/start_info")
+        device, = profile.glob("PROF_*/device_*")
+        host_offset = self.clock_offset(start)
+        self.clock = AscendClock(device, clock_samples)
+        rows = json.loads(trace.read_text(), parse_float=Decimal)
+        flips = self.task_flips(profile)
+        intervals = [self.device_interval(row) if "Task Type" in row.get("args", {}) else Interval.read(row, host_offset)
+                     for row in rows if row.get("ph") == "X"]
+        self.scopes = {}
+        self.points = {}
+        windows = []
+        self.excluded = []
+        enqueues, dequeues = [], []
+        self.apis: dict[int, Interval] = {}
+        self.tasks: dict[int, list[DeviceTask]] = defaultdict(list)
+        self.payload = []
+        processes = set()
+        streams = defaultdict(list)
+        for interval in intervals:
+            row = interval.record
+            name = row["name"]
+            if name == "markov.window":
+                windows.append(interval)
+            elif name.startswith("markov.scope/"):
+                identity = int(name.split("/")[1])
+                if identity in self.scopes:
+                    raise ValueError(f"duplicate semantic scope marker: {identity}")
+                self.scopes[identity] = interval
+                processes.add(row["pid"])
+            elif name.startswith("markov.point/"):
+                identity = int(name.split("/")[1])
+                if identity in self.points:
+                    raise ValueError(f"duplicate device point marker: {identity}")
+                self.points[identity] = interval
 
-        (profile,) = ProfilerPathManager.get_profiler_path_list(str(directory))
-        trace = output / "trace_view.json"
-        trace.parent.mkdir(parents=True, exist_ok=True)
+                # Exported native Event.record is business work; only inserted observer fences are auxiliary.
+                if identity not in native_points:
+                    self.excluded.append(interval)
+            elif name in {"markov.observer", "markov.auxiliary"}:
+                self.excluded.append(interval)
+            elif row.get("cat") == "enqueue":
+                enqueues.append(interval)
+            elif row.get("cat") == "dequeue":
+                dequeues.append(interval)
+            elif "Thread Id" in row.get("args", {}) and "connection_id" in row["args"]:
+                connection = row["args"]["connection_id"]
+                if connection in self.apis:
+                    raise ValueError(f"duplicate native API connection: {connection}")
+                self.apis[connection] = interval
+            elif "Task Type" in row.get("args", {}):
+                args = row["args"]
+                stream = int(args["Physic Stream Id"])
 
-        # SDK output is not atomic; an existing trace can belong to an interrupted analysis.
-        trace.unlink(missing_ok=True)
-
-        # The SDK writes logs and CANN tables beside its input, even with an external trace destination.
-        with TemporaryDirectory(prefix="sdk-", dir=output) as temporary:
-            workspace = Path(temporary) / Path(profile).name
-            shutil.copytree(profile, workspace, ignore=shutil.ignore_patterns(Constant.OUTPUT_DIR, "logs"))
-            try:
-                NpuProfiler.analyse(
-                    str(workspace), analysis_type=Constant.EXPORT_CHROME_TRACE,
-                    output_path=str(trace), export_type=[Constant.Text],
-                )
-
-                # Load clocks and communication tables before releasing the writable SDK workspace.
-                return cls(trace, workspace, runtime_directory, device=device, communication=communication)
-            finally:
-                logs = workspace / "logs"
-                if logs.is_dir():
-                    shutil.copytree(logs, output / "logs", dirs_exist_ok=True)
-
-    runtime_kinds = {
-        "aclrtMemcpy": "copy",
-        "aclrtMemcpyAsync": "copy_async",
-        "aclrtSynchronizeStream": "wait_stream",
-        "aclrtSynchronizeStreamWithTimeout": "wait_stream",
-        "aclrtSynchronizeDeviceWithTimeout": "wait_device",
-        "aclrtRecordEvent": "record_event",
-        "aclrtStreamWaitEvent": "wait_event",
-        "aclrtSynchronizeEvent": "wait_event_complete",
-        "aclrtSynchronizeEventWithTimeout": "wait_event_complete",
-    }
-
-    def __init__(
-        self, path: Path, profile: Path, runtime_directory: Path | None = None,
-        *, device: int, communication: bool = False,
-    ) -> None:
-        self.device = device
-        self.communication_calls = self.read_communications(profile) if communication else None
-
-        categories = {"async_npu", "async_task_queue", "enqueue", "dequeue", "HostToDevice"}
-        self.events = []
-        for event in self.read_events(path):
-            arguments = event.get("args", {})
-            task = "Task Type" in arguments
-            launch = "connection_id" in arguments and (
-                event.get("name") == "Node@launch" or event.get("name", "").startswith("AscendCL@")
-            )
-            runtime = self.runtime_api(event) is not None
-            if (
-                event.get("cat") not in categories
-                and not task
-                and not launch
-                and not runtime
-                and not event.get("name", "").startswith("markov.")
-            ):
-                continue
-
-            projected = {
-                key: event[key] for key in ("name", "pid", "tid", "ts", "dur", "ph", "cat", "id", "bp") if key in event
-            }
-            if task or launch or runtime or event.get("cat") in ("enqueue", "dequeue"):
-                projected["args"] = arguments
-            self.events.append(projected)
-
-        # Retain native API entries needed by device connections, rather than every ACL_NN call.
-        connections = {
-            event["args"]["connection_id"]
-            for event in self.events
-            if "Task Type" in event.get("args", {}) and "connection_id" in event["args"]
-        }
-        self.events = [
-            event
-            for event in self.events
-            if not event.get("name", "").startswith("AscendCL@")
-            or self.runtime_api(event) is not None
-            or event["args"].get("connection_id") in connections
-        ]
-        self.queues = NativeQueues(self.events)
-        self.runtime = None
-        if runtime_directory is not None:
-            processes = {int(event["pid"]) for event in self.events if event.get("name", "").startswith("markov.")}
-            if len(processes) != 1:
-                raise ValueError("Ascend runtime evidence requires one observed host process")
-            self.runtime = NativeRuntimeCalls(runtime_directory, profile, processes.pop())
-
-    @staticmethod
-    def read_communications(profile: Path) -> list[dict[str, Any]] | None:
-        databases = list(profile.glob("PROF*/host/sqlite/hccl.db"))
-        if not databases:
-            return None
-
-        (database,) = databases
-        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-            rows = connection.execute("SELECT group_name, op_type, connection_id, count, data_type FROM HCCLOP")
-            return [
-                dict(group=group, primitive=primitive, connection=identity, elements=count, dtype=dtype)
-                for group, primitive, identity, count, dtype in rows
-            ]
-
-    @staticmethod
-    def runtime_api(event: dict[str, Any]) -> str | None:
-        if not event.get("name", "").startswith("AscendCL@"):
-            return None
-        name = event.get("args", {}).get("id", "")
-        if name.startswith(("aclrtMemcpy", "aclrtSynchronize", "aclrtRecordEvent", "aclrtStreamWaitEvent")):
-            return name
-        return None
-
-    @staticmethod
-    def read_events(path: Path) -> Iterator[dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        with path.open() as stream:
-            buffer = stream.read(131072)
-            position = len(buffer) - len(buffer.lstrip())
-            if buffer[position : position + 1] != "[":
-                raise ValueError("Ascend trace_view must contain an event array")
-
-            position += 1
-            first = True
-            while True:
-                while position < len(buffer) and buffer[position].isspace():
-                    position += 1
-
-                if position == len(buffer):
-                    buffer = stream.read(131072)
-                    position = 0
-                    if not buffer:
-                        raise ValueError("incomplete Ascend event array")
+                # Only an identified runtime flip is bookkeeping; other placeholder SQEs can perform memory work.
+                if args["Task Type"] == "PLACE_HOLDER_SQE" and (stream, int(args["Task Id"]), int(args["Batch Id"])) in flips:
                     continue
+                streams[stream].append(interval)
 
-                if buffer[position] == "]":
-                    if (buffer[position + 1 :] + stream.read()).strip():
-                        raise ValueError("unexpected content after Ascend event array")
-                    return
-
-                if not first:
-                    if buffer[position] != ",":
-                        raise ValueError("missing Ascend event separator")
-                    position += 1
-
-                # Keep only the incomplete event when a record crosses a read boundary.
-                while True:
-                    while position < len(buffer) and buffer[position].isspace():
-                        position += 1
-                    try:
-                        event, position = decoder.raw_decode(buffer, position)
-                        break
-                    except json.JSONDecodeError:
-                        more = stream.read(131072)
-                        if not more:
-                            raise
-                        buffer = buffer[position:] + more
-                        position = 0
-
-                yield event
-                first = False
-
-    def launch_sources(self) -> dict[int, int]:
-        launches = defaultdict(list)
-        for identity, event in enumerate(self.events):
-            if "connection_id" in event.get("args", {}) and (
-                event.get("name") == "Node@launch" or event.get("name", "").startswith("AscendCL@")
-            ):
-                launches[event["args"]["connection_id"]].append(identity)
-
-        sources = {}
-        for connection, group in launches.items():
-            direct = [identity for identity in group if self.events[identity]["name"] == "Node@launch"]
-            candidates = direct or group
-            if len(candidates) == 1:
-                sources[connection] = candidates[0]
-
-        return sources
-
-    def ownership(self, queries: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
-        scopes = defaultdict(list)
-        for event in self.events:
-            if event.get("ph") == "X" and event.get("name", "").startswith("markov."):
-                scopes[event["tid"]].append(event)
-
-        grouped = defaultdict(list)
-        for identity, event in queries.items():
-            thread = event.get("args", {}).get("Thread Id", event["tid"])
-            grouped[thread].append((identity, event))
-
-        result = {}
-        for thread, group in grouped.items():
-            intervals = sorted(
-                (
-                    (event_time_ns(scope), event_time_ns(scope) + event_time_ns(scope, "dur"), scope)
-                    for scope in scopes[thread]
-                ),
-                key=lambda interval: interval[0],
+        # A zero-time wait still has distinct entry and completion. Wall-clock coincidence must not change graph topology.
+        for tasks in streams.values():
+            tasks.sort(key=lambda value: (value.begin, value.record["args"]["Batch Id"], value.record["args"]["Task Id"], value.record["args"]["Subtask Id"]))
+            for order, interval in enumerate(tasks):
+                task = DeviceTask(2 * order, 2 * order + 1, interval.record)
+                self.tasks[task.record["args"]["connection_id"]].append(task)
+                self.payload.append(task)
+        self.process, = processes
+        if len(windows) != 1:
+            raise ValueError("native recording requires one closed observation window")
+        self.window, = windows
+        for scope in services:
+            identity = scope["id"]
+            if identity in self.scopes:
+                raise ValueError(f"service has two competing host observations: {identity}")
+            interval = scope["host_interval"]
+            self.scopes[identity] = Interval(
+                interval["begin_raw_ns"], interval["end_raw_ns"],
+                scope["thread"], {"name": f"markov.scope/{identity}"},
             )
+        self.scope_ranges = ThreadIntervals(list(self.scopes.values()))
+        self.excluded_ranges = ThreadIntervals(self.excluded)
+        self.enqueue_ranges = ThreadIntervals(enqueues)
+        self.dequeue_ranges = ThreadIntervals(dequeues)
+        self.enqueue = self.queue_index(enqueues)
+        self.dequeue = self.queue_index(dequeues)
+        self.api_ranges = ThreadIntervals(list(self.apis.values()))
 
-            active = []
-            position = 0
-            for identity, event in sorted(group, key=lambda item: event_time_ns(item[1])):
-                timestamp = event_time_ns(event)
-                end = timestamp + (event_time_ns(event, "dur") if "dur" in event else 0)
-                while position < len(intervals) and intervals[position][0] <= timestamp:
-                    active.append(intervals[position])
-                    position += 1
-                active = [interval for interval in active if interval[1] >= timestamp]
-                owners = [interval[2] for interval in active if interval[1] >= end]
+        self.runtime = []
+        for line in (runtime / f"{self.process}.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            if row["result"] != 0:
+                raise RuntimeError(f"native runtime call failed: {row['api']} ({row['result']})")
+            self.runtime.append(Interval(row["begin_raw_ns"], row["end_raw_ns"], row["thread"], row))
+        queues = NativeQueues(self.runtime)
+        self.services = ServiceExecutions(services, queues)
+        for native in self.runtime:
+            row = native.record
+            if row["api"].startswith("aclrt") and row["stream_status"] == 0 and row["stream"] in self.services.streams:
+                raise ValueError("a private transport queue has external runtime operations; explicit ports are required")
+        self.services.assign(self.payload)
 
-                # CANN uses a synthetic pid; its native Thread Id refers to the host marker thread.
-                result[identity] = {
-                    "operation": self.innermost(owners, "markov.operation/"),
-                    "region": self.innermost(owners, "markov.region/"),
-                    "baseline": self.innermost(owners, "markov.baseline/"),
-                    "observer": any(scope["name"] == "markov.observer" for scope in owners),
-                    "auxiliary": any(scope["name"] == "markov.auxiliary" for scope in owners),
-                }
+        self.runtime_ranges = ThreadIntervals(self.runtime)
+        self.synchronizations = []
+        records = {}
+        for native in sorted(self.runtime, key=lambda value: value.begin):
+            row = native.record
+            if row["api"] == "aclrtRecordEvent":
+                records[row["event"]] = native
+            elif row["api"] == "aclrtDestroyEvent":
+                records.pop(row["event"], None)
+            elif row["api"] in self.host_waits | self.stream_waits:
 
+                # Resolve the generation while the handle is live; a later record can reuse the same handle.
+                self.synchronizations.append((native, records.get(row.get("event"))))
+        self.order_stream_commands()
+        self.device_points = {identity: self.device_point(identity) for identity in self.points}
+        observed = {point.api.record["args"]["connection_id"] for identity, point in self.device_points.items() if identity not in native_points}
+
+        # A native fence waits for submitted business work, not the observer's synthetic stream markers.
+        submitted: dict[int, list[tuple[int, DeviceTask | StreamWait]]] = defaultdict(list)
+        submitting = []
+        groups = {}
+        for command in self.commands:
+            if isinstance(command, StreamWait):
+                submitted[command.stream].append((command.api.end, command))
+                submitting.append(Interval(command.api.begin, command.api.end, command.stream, {}))
+                continue
+            connection = command.record["args"]["connection_id"]
+            if command.service is None and connection in self.apis and connection not in observed and not self.auxiliary(command) and not self.outside_window(command):
+                key = command.stream, connection
+                if key not in groups or command.end > groups[key].end:
+                    groups[key] = command
+
+        # SDK correlations may group several device tasks; driver submissions bound when the whole group is accepted.
+        for (stream, connection), command in groups.items():
+            begin, end = queues.window(self.apis[connection], stream)
+            submitting.append(Interval(begin, end, stream, {}))
+            submitted[stream].append((end, command))
+        self.submitting = ThreadIntervals(submitting)
+        self.frontiers = {}
+        for stream, values in submitted.items():
+            values.sort(key=lambda value: value[0])
+            latest = []
+            for _, task in values:
+                latest.append(task if not latest or task.end > latest[-1].end else latest[-1])
+            self.frontiers[stream] = [time for time, _ in values], latest
+
+    @staticmethod
+    def clock_offset(path: Path) -> int:
+        clock = json.loads(path.read_text())
+        return nanoseconds(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
+
+    def device_interval(self, record: dict) -> Interval:
+        begin, end = self.clock.interval(record)
+        return Interval(begin, end, int(record["tid"]), record)
+
+    @staticmethod
+    def task_flips(profile: Path) -> set[tuple[int, int, int]]:
+        directory, = profile.glob("PROF_*/device_*/data")
+        files = [path for path in directory.glob("ts_track.data.*.slice_*") if path.name.rsplit("_", 1)[1].isdigit()]
+        files.sort(key=lambda path: int(path.name.rsplit("_", 1)[1]))
+        data = b"".join(path.read_bytes() for path in files)
+        record = struct.Struct("=BBHLQHHHH16B")
+
+        # Match the SDK TsTrack parser's aged-prefix alignment and TS_TASK_FLIP layout.
+        records = [row for row in record.iter_unpack(data[len(data) % record.size:]) if row[1] == 14]
+        batches: dict[int, int] = defaultdict(int)
+        flips = set()
+        for row in sorted(records, key=lambda row: row[4]):
+            stream, flip, task = row[5], row[6], row[8]
+
+            # DeviceTaskCollector increments the epoch for every flip, including stream destruction (65535).
+            batches[stream] += 1
+            if flip != 65535:
+                flips.add((stream, task, batches[stream]))
+        return flips
+
+    def order_stream_commands(self) -> None:
+        self.waits: dict[int, StreamWait] = {}
+        waits: dict[int, list[StreamWait]] = defaultdict(list)
+        for native, _ in self.synchronizations:
+            if native.record["api"] not in self.stream_waits:
+                continue
+            api = self.native_api(native)
+            origin = self.origin(api)
+            owner = self.owner(origin)
+            if owner is None or self.excluded_ranges.enclosing(origin) is not None:
+                continue
+            if native.record["stream_status"] != 0:
+                raise ValueError("stream wait has no observed native stream identity")
+            wait = StreamWait(api, native.record["stream"], owner)
+            self.waits[api.record["args"]["connection_id"]] = wait
+            waits[wait.stream].append(wait)
+
+        streams: dict[int, list[DeviceTask]] = defaultdict(list)
+        for task in self.payload:
+            if task.record["args"]["connection_id"] not in self.waits:
+                streams[task.stream].append(task)
+        self.commands: list[DeviceTask | StreamWait] = []
+        for stream in sorted(streams.keys() | waits.keys()):
+            tasks = sorted(streams[stream], key=lambda task: task.begin)
+            positions = [task.begin for task in tasks]
+            gaps: dict[int, list[StreamWait]] = defaultdict(list)
+            for wait in waits[stream]:
+                observed = self.tasks[wait.api.record["args"]["connection_id"]]
+                if observed:
+                    task, = observed
+                    if task.stream != stream or task.record["args"]["Task Type"] != "EVENT_WAIT":
+                        raise ValueError("stream wait differs from its SDK device task")
+                    position = bisect_left(positions, task.begin)
+                else:
+
+                    # Submission order bounds the missing command; unknown or concurrent commands cannot be guessed past.
+                    lower, upper = 0, len(tasks)
+                    for index, task in enumerate(tasks):
+                        api = self.apis.get(task.record["args"]["connection_id"])
+                        if api is None:
+                            continue
+                        if api.end <= wait.api.begin:
+                            lower = max(lower, index + 1)
+                        elif api.begin >= wait.api.end:
+                            upper = min(upper, index)
+                    if lower != upper:
+                        raise ValueError(f"stream {stream} wait in scope {wait.scope} has no unique command position: {lower}..{upper}")
+                    position = lower
+                gaps[position].append(wait)
+
+            ordered = []
+            for position in range(len(tasks) + 1):
+                local = gaps[position]
+                physical = [self.tasks[wait.api.record["args"]["connection_id"]] for wait in local]
+                if all(physical):
+                    local.sort(key=lambda wait: self.tasks[wait.api.record["args"]["connection_id"]][0].begin)
+                else:
+                    local.sort(key=lambda wait: wait.api.begin)
+                    if any(left.api.end > right.api.begin for left, right in zip(local, local[1:])):
+                        raise ValueError(f"concurrent stream waits have no established order on stream {stream}")
+                ordered.extend(local)
+                if position < len(tasks):
+                    ordered.append(tasks[position])
+
+            # The API defines a wait even when hardware elides its task; both use the same logical entry/exit coordinates.
+            for index, command in enumerate(ordered):
+                command.begin, command.end = 2 * index, 2 * index + 1
+                if isinstance(command, StreamWait):
+                    for task in self.tasks[command.api.record["args"]["connection_id"]]:
+                        task.begin, task.end = command.begin, command.end
+            self.commands.extend(ordered)
+        self.payload = [command for command in self.commands if isinstance(command, DeviceTask)]
+
+    @staticmethod
+    def queue_index(intervals: list[Interval]) -> dict[int, Interval]:
+        result = {}
+        for interval in intervals:
+            correlation = interval.record["args"]["correlation_id"]
+            if correlation in result:
+                raise ValueError(f"duplicate native queue correlation: {correlation}")
+            result[correlation] = interval
         return result
 
-    def physical_work(self, region_count: int, operation_count: int) -> dict[str, Any]:
-        tasks: dict[tuple[Any, Any, int], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
-        records = {}
-        starts = {}
-        finishes = {}
-        observer_controls = []
+    @staticmethod
+    def anchors(observation: dict):
+        for edge in observation["dependencies"]:
+            yield edge["source"]
+            yield edge["target"]
+        for scope in observation["scopes"]:
+            for port in scope["ports"]:
+                yield port["at"]
+                if "wait" in port:
+                    yield port["wait"]["begin"]
+                if "rendezvous" in port:
+                    yield port["rendezvous"]
+            for field in ("kv_accesses", "slot_accesses"):
+                for access in scope[field]:
+                    yield access["start"]
+                    yield access["finish"]
 
-        for index, event in enumerate(self.events):
-            key = (event.get("pid"), event.get("tid"))
-            if event.get("ph") == "X" and "Task Type" in event.get("args", {}):
-                if event["args"]["Task Type"] in ("PROFILING_ENABLE", "PROFILING_DISABLE"):
-                    observer_controls.append({"source_event": index, "name": event["name"]})
-                    continue
-                tasks[(*key, event_time_ns(event))].append((index, event))
-                records[index] = event
+    def measurements(self, observation: dict) -> dict:
+        spans, resources = observation["spans"], observation["resources"]
+        positions = [set() for _ in resources]
+        for span in spans:
+            positions[span["resource"]].update((span["begin"], span["end"]))
+        for anchor in self.anchors(observation):
+            positions[spans[anchor["span"]]["resource"]].add(anchor["order"])
 
-            if event.get("cat") == "async_npu":
-                if event["ph"] == "s":
-                    starts[event["id"]] = event
-                elif event["ph"] == "f":
-                    finishes[event["id"]] = event
+        clocks = {}
+        for command in self.commands:
+            if isinstance(command, DeviceTask):
+                interval = self.device_interval(command.record)
+            else:
+                physical = self.tasks[command.api.record["args"]["connection_id"]]
+                interval = self.device_interval(physical[0].record) if physical else None
 
-        # Prefer explicit profiler flows, then native launch connections for the remaining device tasks.
-        claims = {}
-        for identity, finish in finishes.items():
-            start = starts.get(identity)
-            if start is not None:
-                endpoint = (finish["pid"], finish["tid"], event_time_ns(finish))
-                for index, _ in tasks.get(endpoint, []):
-                    claims[index] = (start, "torch_to_npu_flow")
+            # An elided device wait has a proved order, but no measured device timestamp.
+            clocks[command.stream, command.begin] = interval.begin if interval else None
+            clocks[command.stream, command.end] = interval.end if interval else None
 
-        launches = self.launch_sources()
-        for index, task in records.items():
-            if index not in claims and task["args"].get("connection_id") in launches:
-                event = self.events[launches[task["args"]["connection_id"]]]
-                origin = self.queues.origin(event)
-                claims[index] = (origin if origin is not None else event, "native_connection")
+        coordinates = []
+        for resource, orders in enumerate(positions):
+            descriptor = resources[resource]
+            stream = int(descriptor["identity"].split("/")[1]) if descriptor["kind"] == "stream" else None
+            for order in sorted(orders):
 
-        queries = {index: event for index, (event, _) in claims.items()}
-        actions = []
-        for index, event in enumerate(self.events):
-            api = self.runtime_api(event)
-            if api is None:
-                continue
-
-            submission = self.queues.submission(index)
-            queue = submission["queue"]
-            queries[index] = self.events[queue["enqueue_event"]] if queue is not None else event
-            actions.append(
-                {
-                    "source_event": index,
-                    "kind": self.runtime_kinds.get(api, "unclassified"),
-                    "native_api": api,
-                    "context": "runtime_queue" if queue is not None else "host",
-                    "submission": submission,
-                    "native_call": self.runtime.arguments(event, event_time_ns(event))
-                    if self.runtime is not None
-                    else None,
-                }
-            )
-
-        if self.runtime is not None:
-            for index, event in enumerate(self.events):
-                if event.get("name") in self.runtime.callbacks:
-                    queries[index] = self.queues.origin(event) or event
-
-        # Native group identity comes from CANN; its launch connection resolves the original caller.
-        for call in self.communication_calls or ():
-            launch = launches.get(call["connection"])
-            if launch is not None:
-                queries[launch] = self.queues.origin(self.events[launch]) or self.events[launch]
-
-        owners = self.ownership(queries)
-        native_scopes = []
-        native_operations = set()
-        if self.runtime is not None:
-            for operation, api, callback in self.runtime.bind_callbacks(self.events, actions, owners):
-                owners[api] = {**owners[api], "operation": operation}
-                native_operations.add(api)
-                submission = self.queues.submission(api)
-                queue = submission["queue"]
-                caller = api if queue is None else queue["enqueue_event"]
-                event = self.events[caller]
-
-                # The callback may precede or follow the API; both boundaries belong to this logical call.
-                native_scopes.append({
-                    "kind": "operation", "identity": operation, "source_event": api,
-                    "thread": event.get("args", {}).get("Thread Id", event["tid"]),
-                    "order": min(self.queues.order[caller], self.queues.order[callback]),
-                    "completion_order": max(
-                        self.queues.completion_order[caller], self.queues.completion_order[callback],
-                    ),
-                })
-
-        services = self.runtime.native_services if self.runtime is not None else {}
-
-        result = []
-        for index, task in records.items():
-            if index not in claims or task["args"]["Physic Stream Id"] in services:
-                continue
-            launch = launches.get(task["args"].get("connection_id"))
-            if launch in native_operations:
-                owners[index] = owners[launch]
-            result.append(
-                {
-                    "name": task["name"],
-                    "kind": "transfer" if task["args"]["Task Type"] == "SDMA_SQE" else "device",
-                    "stream": task["args"]["Physic Stream Id"],
-                    "task_type": task["args"]["Task Type"],
-                    "duration_ns": event_time_ns(task, "dur"),
-                    **owners[index],
-                    "source_event": index,
-                    "association": claims[index][1],
-                    "order": self.queues.order[index],
-                    "submission": self.queues.submission(launch) if launch is not None else None,
-                }
-            )
-
-        for action in actions:
-            action.update(owners[action["source_event"]])
-            parameters = action["native_call"]
-            target = None
-            if parameters is not None:
-                if (
-                    action["kind"] in ("copy_async", "wait_stream", "record_event", "wait_event")
-                    and parameters["stream_status"] == 0
-                ):
-                    target = {"kind": "stream", "identity": parameters["stream"]}
-                elif action["kind"] in ("copy", "wait_device") and parameters["device_status"] == 0:
-                    target = {"kind": "device", "identity": parameters["device"]}
-                elif action["kind"] == "wait_event_complete" and "event" in parameters:
-                    target = {"kind": "event", "identity": parameters["event"]}
-
-            # Each source worker is restricted to its declared single physical device.
-            if action["kind"] == "wait_device":
-                if target is not None and target["identity"] != self.device:
-                    raise ValueError("device wait disagrees with the source device declaration")
-                target = {"kind": "device", "identity": self.device}
-            action["target"] = target
-
-        limits = {"region": region_count, "operation": operation_count}
-        observed = {
-            identity
-            for identity, owner in owners.items()
-            if all(owner[kind] is None or owner[kind] < count for kind, count in limits.items())
-        }
-
-        communications = None if self.communication_calls is None else []
-        for call in self.communication_calls or ():
-            launch = launches.get(call["connection"])
-            if launch is not None and launch not in observed:
-                continue
-            communications.append({
-                **call,
-                "owner": owners.get(launch),
-                "submission": self.queues.submission(launch) if launch is not None else None,
-            })
-
-        # The profiler can stop after the source flush; later scopes belong to the next observation window.
-        outside = {
-            "device_tasks": sum(task["source_event"] not in observed for task in result),
-            "runtime_actions": sum(action["source_event"] not in observed for action in actions),
-        }
-        result = [task for task in result if task["source_event"] in observed]
-        actions = [action for action in actions if action["source_event"] in observed]
-        self.bind_transfers(result, actions)
-
-        # Queue-drain dependencies need both the API's stream and the worker serving that stream.
-        queues_by_stream: dict[int, set[int]] = defaultdict(set)
-        for task in result:
-            submission = task["submission"]
-            if submission is not None and submission["queue"] is not None:
-                queues_by_stream[task["stream"]].add(submission["thread"])
-        for action in actions:
-            if action["kind"] == "copy_async" and action["target"] is not None and action["context"] == "runtime_queue":
-                queues_by_stream[action["target"]["identity"]].add(action["submission"]["thread"])
-
-        # Driver-private SDK queues are not CANN stream handles; their own synchronous call proves completion.
-        streams = {task["stream"] for task in result}
-        streams.update(
-            action["target"]["identity"]
-            for action in actions
-            if action["target"] is not None and action["target"]["kind"] == "stream"
-        )
-        for action in actions:
-            action["wait_frontiers"] = None
-            parameters = action["native_call"]
-            if action["kind"] not in ("wait_stream", "wait_device") or action["target"] is None:
-                continue
-
-            frontiers = {
-                "queues": [],
-                "streams": sorted(streams) if action["kind"] == "wait_device" else [action["target"]["identity"]],
-            }
-
-            # NPUStream's accessor drains the queue serving this stream; native queue items identify its worker.
-            if (
-                action["kind"] == "wait_stream"
-                and action["context"] == "host"
-                and parameters is not None
-                and parameters.get("queue_scope") is not None
-                and action["target"] is not None
-            ):
-                threads = queues_by_stream[parameters["stream"]]
-                if len(threads) == 1:
-                    frontiers["queues"] = list(threads)
-            elif (
-                action["kind"] == "wait_device"
-                and action["context"] == "host"
-                and parameters is not None
-                and parameters.get("queue_scope") == "device"
-            ):
-                frontiers["queues"] = sorted({thread for threads in queues_by_stream.values() for thread in threads})
-            action["wait_frontiers"] = frontiers
-
-        host_threads = {
-            event["tid"]
-            for event in self.events
-            if event.get("name", "").startswith(("markov.region/", "markov.operation/", "markov.baseline/"))
-        }
-        unassociated_runtime = [
-            action["source_event"]
-            for action in actions
-            if action["context"] == "host"
-            and self.events[action["source_event"]]["args"]["Thread Id"] not in host_threads
-        ]
-        unmatched = []
-        for index, task in records.items():
-            service = services.get(task["args"]["Physic Stream Id"])
-            if index in claims and service is None:
-                continue
-            record = {"source_event": index, "name": task["name"]}
-            if service is not None:
-                record["native_service"] = service["allocation"]
-            unmatched.append(record)
-
-        host_scopes = [scope for scope in native_scopes if scope["identity"] < operation_count]
-        for identity, event in enumerate(self.events):
-            if event.get("ph") != "X" or not event.get("name", "").startswith(("markov.operation/", "markov.region/")):
-                continue
-            kind, scope = event["name"].split("/", 1)
-            kind, scope = kind.removeprefix("markov."), int(scope)
-            if scope >= limits[kind]:
-                continue
-            host_scopes.append(
-                {
-                    "kind": kind,
-                    "identity": scope,
-                    "thread": event["tid"],
-                    "source_event": identity,
-                    "order": self.queues.order[identity],
-                    "completion_order": self.queues.completion_order[identity],
-                }
-            )
-
+                # Host/service coordinates are RAW timestamps; stream coordinates are strictly ordinal.
+                measured = clocks[stream, order] if stream is not None else order
+                if stream is not None and measured is not None and not self.clock.begin_ns <= measured <= self.clock.end_ns:
+                    raise ValueError("observed device boundary lies outside the clock calibration window")
+                coordinates.append({"resource": resource, "order": order, "time_ns": measured})
         return {
-            "snapshot": {**limits, "outside": outside},
-            "work": result,
-            "runtime_actions": actions,
-            "host_scopes": host_scopes,
-            "unassociated_runtime_actions": unassociated_runtime,
-            "unassociated_tasks": unmatched,
-            "native_services": {
-                "resources": {str(service["allocation"]): service for service in services.values()},
-                "calls": dict(self.runtime.service_calls) if self.runtime is not None else {},
-            },
-            "observer_controls": observer_controls,
-            "communication": communications,
+            "clock": "monotonic_raw_ns",
+            "window_ns": [self.window.begin, self.window.end],
+            "coordinates": coordinates,
         }
 
-    @staticmethod
-    def bind_transfers(work: list[dict[str, Any]], actions: list[dict[str, Any]]) -> None:
-        copies: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
-        for action in actions:
-            if action["kind"] != "copy_async" or action["target"] is None:
-                continue
-            submission = action["submission"]
-            if submission["order"] > submission["completion_order"]:
-                continue
-            queue = submission["queue"]
-            key = (
-                submission["thread"],
-                None if queue is None else (queue["process"], queue["correlation"]),
-                action["target"]["identity"],
-            )
-            copies[key].append(submission)
+    def origin(self, api: Interval) -> Interval:
+        dequeue = self.dequeue_ranges.enclosing(api)
+        if dequeue is None:
+            return api
+        return self.enqueue[dequeue.record["args"]["correlation_id"]]
 
-        # A parent ACLNN launch can own the DMA connection; its nested memcpy API is the actual submitter.
-        pending: dict[tuple[Any, ...], dict[int, list[dict[str, Any]]]] = defaultdict(dict)
-        for task in work:
-            submission = task["submission"]
-            if task["kind"] != "transfer" or submission is None:
-                continue
-            queue = submission["queue"]
-            key = (
-                submission["thread"],
-                None if queue is None else (queue["process"], queue["correlation"]),
-                task["stream"],
-            )
-            pending[key].setdefault(submission["source_event"], []).append(task)
+    def owner(self, interval: Interval) -> int | None:
+        scope = self.scope_ranges.enclosing(interval)
+        return None if scope is None else int(scope.record["name"].split("/")[1])
 
-        for key, launches in pending.items():
-            calls = copies[key]
-            queries = [
-                (identity, tasks[0]["submission"]) for identity, tasks in launches.items()
-                if tasks[0]["submission"]["order"] <= tasks[0]["submission"]["completion_order"]
-            ]
-            candidates = {identity: set() for identity in launches}
+    def device_point(self, identity: int) -> DevicePoint:
+        marker = self.points[identity]
+        queues = self.enqueue_ranges.inside(marker)
+        if len(queues) != 1:
+            raise ValueError(f"device point {identity} does not have one native enqueue")
+        dequeue = self.dequeue[queues[0].record["args"]["correlation_id"]]
+        calls = [api for api in self.api_ranges.inside(dequeue) if api.record["args"]["id"] == "aclrtRecordEvent"]
+        if len(calls) != 1:
+            raise ValueError(f"device point {identity} does not identify one record API")
+        api = calls[0]
+        native = self.runtime_call(api)
+        if native is None:
+            raise ValueError(f"device point {identity} has no recorded API instance")
+        tasks = self.tasks[api.record["args"]["connection_id"]]
+        if len(tasks) != 1 or tasks[0].record["args"]["Task Type"] != "EVENT_RECORD":
+            raise ValueError(f"device point {identity} does not identify one native event task")
+        stream = int(tasks[0].record["args"]["Physic Stream Id"])
+        if native.record["stream_status"] != 0 or native.record["stream"] != stream:
+            raise ValueError(f"device point {identity} disagrees with its native stream")
+        return DevicePoint(marker, api, tasks[0], stream)
 
-            # Two extreme ends distinguish one match from ambiguity; scan containing and contained calls separately.
-            for inner_copies in (False, True):
-                ordered = sorted(enumerate(calls), key=lambda item: item[1]["order"], reverse=inner_copies)
-                queries.sort(key=lambda item: item[1]["order"], reverse=inner_copies)
-                extremes = []
-                position = 0
-                for identity, launch in queries:
-                    while position < len(ordered):
-                        index, copy = ordered[position]
-                        eligible = (
-                            copy["order"] >= launch["order"] if inner_copies
-                            else copy["order"] <= launch["order"]
-                        )
-                        if not eligible:
-                            break
-                        priority = -copy["completion_order"] if inner_copies else copy["completion_order"]
-                        heapq.heappush(extremes, (priority, index))
-                        if len(extremes) > 2:
-                            heapq.heappop(extremes)
-                        position += 1
+    def runtime_call(self, api: Interval) -> Interval | None:
 
-                    for _, index in extremes:
-                        copy = calls[index]
-                        if (
-                            copy["completion_order"] <= launch["completion_order"] if inner_copies
-                            else copy["completion_order"] >= launch["completion_order"]
-                        ):
-                            candidates[identity].add(index)
+        # SDK clock conversion has finite precision: require one overlapping call of the same API and thread.
+        calls = [native for native in self.runtime_ranges.overlapping(api) if native.record["api"] == api.record["args"]["id"]]
+        if len(calls) > 1:
+            raise ValueError(f"ambiguous native API instance: {api.record['args']['id']}")
+        return calls[0] if calls else None
 
-            for identity, tasks in launches.items():
-                if len(candidates[identity]) == 1:
-                    (index,) = candidates[identity]
-                    for task in tasks:
-                        task["submission"] = calls[index]
+    def native_api(self, native: Interval) -> Interval:
+        calls = [api for api in self.api_ranges.overlapping(native) if api.record["args"]["id"] == native.record["api"]]
+        if len(calls) != 1:
+            raise ValueError(f"native call does not identify one profiler API: {native.record['api']}")
+        return calls[0]
 
-    @staticmethod
-    def innermost(scopes: list[dict[str, Any]], prefix: str) -> int | None:
-        candidates = [scope for scope in scopes if scope["name"].startswith(prefix)]
-        if not candidates:
-            return None
+    def auxiliary(self, task: DeviceTask) -> bool:
+        api = self.apis.get(task.record["args"]["connection_id"])
+        return api is not None and self.excluded_ranges.enclosing(self.origin(api)) is not None
 
-        scope = min(candidates, key=lambda item: event_time_ns(item, "dur"))
-        return int(scope["name"].removeprefix(prefix))
+    def outside_window(self, task: DeviceTask) -> bool:
+        api = self.apis.get(task.record["args"]["connection_id"])
+        if api is None:
+            return False
+        origin = self.origin(api)
+        return origin.end <= self.window.begin or self.window.end <= origin.begin
+
+    def submitted(self, before: int, stream: int | None) -> list[DeviceTask | StreamWait]:
+        result = []
+        if stream is not None and stream not in self.frontiers:
+
+            # An observed stream may contain only markers; the preceding warmup was drained.
+            return result
+        selected = self.frontiers if stream is None else {stream: self.frontiers[stream]}
+        for stream, (starts, latest) in selected.items():
+
+            # Without per-SQE correspondence, an overlapping dispatch cannot identify the fence's exact frontier.
+            if any(window.begin < before < window.end for window in self.submitting.overlapping(Interval(before, before, stream, {}))):
+                raise ValueError(f"stream {stream} fence overlaps a native command-group submission")
+            index = bisect_right(starts, before) - 1
+            if index >= 0:
+                result.append(latest[index])
+        return result

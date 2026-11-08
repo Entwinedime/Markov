@@ -1,9 +1,11 @@
-"""Expose native CPU metadata waits to the worker broker without advancing simulation time."""
+"""Transport CPU metadata; framework action boundaries own simulation time."""
 
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as distributed
+
+from markov_control.adapters.runtimes.metadata import MetadataWork
 
 
 class CpuCollectives:
@@ -19,42 +21,39 @@ class CpuCollectives:
             setattr(distributed, name, operation)
             setattr(distributed.distributed_c10d, name, operation)
 
-    def exchange(self, kind, tensor, group, async_op, **parameters):
-        if tensor.device.type != "cpu" or async_op:
-            raise ValueError("Native metadata collectives require blocking CPU tensors")
+    def exchange(self, kind, tensor, output, group, async_op, **parameters):
+        if tensor.device.type != "cpu" or output.device.type != "cpu":
+            raise ValueError("Native metadata collectives require CPU tensors")
 
-        # Gloo returns locally for an empty reduction; waiting for peers would introduce a barrier.
-        if kind == "minimum" and tensor.numel() == 0:
-            return []
-        group = distributed.group.WORLD if group is None else group
-        members = tuple(self.world[rank] for rank in distributed.get_process_group_ranks(group))
-        return self.peer.exchange(
-            "collective",
-            {
-                "group": group.group_name,
-                "members": members,
-                "kind": kind,
-                "dtype": str(tensor.dtype),
-                "values": tensor.flatten().tolist(),
-                **parameters,
-            },
-        )
+        # Gloo returns locally for an empty reduction; posting it would introduce a peer rendezvous.
+        handle = None
+        if kind != "minimum" or tensor.numel() != 0:
+            group = distributed.group.WORLD if group is None else group
+            members = tuple(self.world[rank] for rank in distributed.get_process_group_ranks(group))
+            handle = self.peer.exchange(
+                "collective_post",
+                {
+                    "group": group.group_name, "members": members, "kind": kind,
+                    "dtype": str(tensor.dtype), "values": tensor.flatten().tolist(), **parameters,
+                },
+            )
+        work = MetadataWork(self.peer, handle, output, "collective_wait")
+        if async_op:
+            return work
+        work.wait()
 
     def broadcast(self, tensor, src=None, group=None, async_op=False, group_src=None):
         if group_src is not None:
             src = distributed.get_process_group_ranks(group)[group_src]
-        values = self.exchange("broadcast", tensor, group, async_op, source=self.world[src])
-        tensor.copy_(torch.tensor(values, dtype=tensor.dtype).reshape_as(tensor))
+        return self.exchange("broadcast", tensor, tensor, group, async_op, source=self.world[src])
 
     def all_gather_into_tensor(self, output_tensor, input_tensor, group=None, async_op=False):
-        values = self.exchange("gather", input_tensor, group, async_op)
-        output_tensor.copy_(torch.tensor(values, dtype=output_tensor.dtype).reshape_as(output_tensor))
+        return self.exchange("gather", input_tensor, output_tensor, group, async_op)
 
     def all_reduce(self, tensor, op=distributed.ReduceOp.SUM, group=None, async_op=False):
         if op != distributed.ReduceOp.MIN:
             raise ValueError("Native metadata polling requires a MIN reduction")
-        values = self.exchange("minimum", tensor, group, async_op)
-        tensor.copy_(torch.tensor(values, dtype=tensor.dtype).reshape_as(tensor))
+        return self.exchange("minimum", tensor, tensor, group, async_op)
 
 
 @dataclass
@@ -62,6 +61,8 @@ class CollectiveCall:
     header: dict
     values: dict = field(default_factory=dict)
     waiting: dict = field(default_factory=dict)
+    consumed: set = field(default_factory=set)
+    result: list | None = None
 
 
 class CollectiveCalls:
@@ -69,7 +70,7 @@ class CollectiveCalls:
         self.pending = {}
         self.positions = {}
 
-    def submit(self, channel, rank, message) -> None:
+    def post(self, channel, rank, message) -> None:
         members = message["members"]
         if rank not in members:
             raise ValueError("Native CPU collective has an invalid participant")
@@ -78,7 +79,7 @@ class CollectiveCalls:
         group = members, message["group"]
         participant = group, rank
         position = self.positions.get(participant, 0)
-        key = group, position
+        key = (*group, position)
         header = {name: value for name, value in message.items() if name != "values"}
         call = self.pending.setdefault(key, CollectiveCall(header))
         if call.header != header:
@@ -87,33 +88,47 @@ class CollectiveCalls:
             raise ValueError("Native CPU collective participants disagree on tensor extent")
         self.positions[participant] = position + 1
         call.values[rank] = message["values"]
-        call.waiting[rank] = channel
-
         kind = message["kind"]
         if kind == "broadcast":
             source = message["source"]
             if source not in members:
                 raise ValueError("Native CPU broadcast source is not a group member")
-            if source not in call.values:
-                return
 
-            # Retaining the source payload permits local returns; broadcast is not an all-rank barrier.
-            values = call.values[source]
-        else:
-            if len(call.values) != len(members):
-                return
+            # A root can enter another broadcast while late receivers still need this payload.
+            if source in call.values:
+                call.result = call.values[source]
+        elif len(call.values) == len(members):
             if kind == "gather":
-                values = [value for member in members for value in call.values[member]]
+                call.result = [value for member in members for value in call.values[member]]
             elif kind == "minimum":
                 dtype = getattr(torch, message["dtype"].removeprefix("torch."))
                 tensors = torch.tensor([call.values[member] for member in members], dtype=dtype)
-                values = tensors.amin(dim=0).tolist()
+                call.result = tensors.amin(dim=0).tolist()
             else:
                 raise ValueError(f"Unknown native metadata collective: {kind}")
-        for participant in call.waiting.values():
-            participant.send(values)
+
+        # Acknowledge submission independently of result readiness, so every actor can submit its graph.
+        channel.send(key)
+        self.complete(key, call)
+
+    def wait(self, channel, rank, handle) -> None:
+        key = tuple(handle)
+        call = self.pending[key]
+        if rank not in call.values or rank in call.consumed:
+            raise ValueError("Native CPU collective wait has no outstanding local operation")
+        call.waiting[rank] = channel
+        self.complete(key, call)
+
+    def complete(self, key, call) -> None:
+        if call.result is None:
+            return
+        for rank, channel in call.waiting.items():
+            channel.send(call.result)
+            call.consumed.add(rank)
         call.waiting.clear()
-        if len(call.values) == len(members):
+
+        # Completion of one actor never reclaims data still owned by another actor's native Work.
+        if len(call.consumed) == len(call.header["members"]):
             del self.pending[key]
 
     def blocked(self):

@@ -8,12 +8,14 @@ from markov_workload import WorkloadContent
 
 
 class RoutedContent:
-    def __init__(self, content: WorkloadContent, assignments: list[dict]) -> None:
-        changes = {identity: defaultdict(dict) for identity in content.requests}
+    def __init__(self, content: WorkloadContent, assignments: list[dict], layers: set[int]) -> None:
+        changes = {identity: defaultdict(dict, {0: {}}) for identity in content.requests}
         for assignment in assignments:
             begin, _ = assignment["tokens"]
-            for layer in range(*assignment["layers"]):
-                changes[assignment["request"]][begin][layer] = tuple(assignment["experts"])
+            first, last = assignment["layers"]
+            for layer in layers:
+                if first <= layer < last:
+                    changes[assignment["request"]][begin][layer] = tuple(assignment["experts"])
 
         signatures = {}
         self.segments = {}

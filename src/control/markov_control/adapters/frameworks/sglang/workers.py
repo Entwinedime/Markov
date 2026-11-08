@@ -1,7 +1,7 @@
 """Keep native worker returns independent and expose their control waits to the broker."""
 
 import json
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 import torch.multiprocessing as multiprocessing
 from markov_control.adapters.runtimes.collectives import CollectiveCalls, CpuCollectives
 from markov_control.adapters.runtimes.cpu import CpuDeclarations
+from markov_control.adapters.runtimes.point_to_point import CpuPointToPoint, PointToPointCalls
 from markov_control.peer import ControlPeer
 
 
@@ -27,20 +28,19 @@ class StopInput:
 class WorkerPeer(ControlPeer):
     def __init__(self, connection) -> None:
         self.connection = connection
-        self.context = {}
 
     def exchange(self, operation, message=None):
         self.connection.send((operation, message))
         return self.connection.recv()
 
     def send(self, message) -> None:
-        self.exchange("send", {**self.context, **message})
+        self.exchange("send", message)
 
-    def receive(self):
-        return self.exchange("receive")
+    def receive(self, *, waiting, context):
+        return self.exchange("receive", {"waiting": waiting, "context": context})
 
     def call(self, kind: str, **parameters):
-        return self.exchange("call", {**self.context, "kind": kind, **parameters})
+        return self.exchange("call", {"kind": kind, **parameters})
 
 
 class NativeWorkers:
@@ -55,22 +55,9 @@ class NativeWorkers:
             workers, groups = [], []
             for instance in source["instances"]:
                 configured = configurations[instance["id"]]
-                settings = configured["settings"]
+                settings = {**configured["settings"], "observe": configuration["observe"]}
 
-                # Cold Decode admission must fit even in an empty pool, before any worker starts polling.
-                if instance["mode"] == "decode":
-                    from sglang.srt.server_args import ServerArgs
-
-                    capacity = settings["max_total_tokens"] // settings["page_size"] * settings["page_size"]
-                    for request in configuration["workload"]["requests"]:
-                        required = request["prompt_tokens"] + ServerArgs.num_reserved_decode_tokens
-                        if required > capacity:
-                            raise ValueError(
-                                f"native Decode reservation cannot admit request {request['id']}: "
-                                f"{required} tokens exceed the {capacity}-token pool"
-                            )
-
-                model = Path(directory, instance["id"])
+                model = Path(directory, f"instance-{len(workers)}")
                 model.mkdir()
 
                 # Each native world reads its own metadata and rendezvous; no model weights are loaded.
@@ -78,8 +65,9 @@ class NativeWorkers:
                 first = len(workers)
                 for rank in range(instance["tp"] * instance["pp"]):
                     workers.append((instance, settings, str(model), rank))
+                ranks = [worker["rank"] for worker in instance["workers"]]
                 for group in configured["groups"]:
-                    local = instance["ranks"].index(group["rank"])
+                    local = ranks.index(group["rank"])
                     groups.append(
                         {**group, "instance": instance["id"], "members": (first + local,), "ingress": local == 0}
                     )
@@ -118,24 +106,27 @@ class NativeWorkers:
         CpuDeclarations.install(kernel_python)
 
         from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler
+        from markov_adapters.sglang.metadata_collectives import MetadataCollectives
         from sglang.srt.distributed import parallel_state
+        from sglang.srt.plugins.hook_registry import HookRegistry
 
         peer = WorkerPeer(connections[index])
         try:
-            from markov_control.adapters.frameworks.sglang.pipeline import PipelineScheduler
-
-            if source["mode"] != "null":
-                from markov_control.adapters.frameworks.sglang.disaggregated import (
-                    DisaggregatedScheduler,
-                    PipelineDisaggregatedScheduler,
-                )
-
-                implementation = PipelineDisaggregatedScheduler if source["pp"] > 1 else DisaggregatedScheduler
-            else:
-                implementation = PipelineScheduler if source["pp"] > 1 else NativeScheduler
-            scheduler = implementation(peer, settings, directory, source, rank, workload)
+            scheduler = NativeScheduler(peer, settings, directory, source, rank, workload, workers, index)
             world = tuple(position for position, worker in enumerate(workers) if worker[0]["id"] == source["id"])
             CpuCollectives.install(peer, world)
+
+            # Wrap the installed CPU transport, otherwise its replacement would discard the graph boundary hook.
+            MetadataCollectives(scheduler.calls).install()
+            if source["pp"] > 1:
+                from markov_control.adapters.frameworks.sglang.transfers import PipelineTransfers
+
+                PipelineTransfers(scheduler, world, [worker["rank"] for worker in source["workers"]]).install()
+            else:
+                CpuPointToPoint(peer, world).install()
+
+            # Apply once after every serving adapter registers; early application silently skips later hooks.
+            HookRegistry.apply_hooks()
             peer.send({"kind": "ready"})
             try:
                 scheduler.run_event_loop()
@@ -153,13 +144,7 @@ class WorkerCall:
     operation: str
     message: dict
     participants: tuple
-
-
-@dataclass
-class ObjectSend:
-    value: object
-    finished: bool = False
-    waiter: object = None
+    deliveries: tuple = ()
 
 
 class NativeCalls:
@@ -171,10 +156,8 @@ class NativeCalls:
         self.context = context
         self.membership = {rank: group for group in groups for rank in group["members"]}
         self.collectives = CollectiveCalls()
-        self.packets = defaultdict(deque)
-        self.staged_packets = {}
-        self.receivers = {}
-        self.object_sends = {}
+        self.transfers = PointToPointCalls()
+        self.messages = {rank: [] for rank in range(len(connections))}
         self.closing = False
         self.stopped = set()
         self.pending = {}
@@ -185,56 +168,32 @@ class NativeCalls:
         self.initialized = False
         self.next_rank = 0
 
-    def finish_object(self, identity) -> None:
-        send = self.object_sends[identity]
-        send.value = None
-        send.finished = True
-        if send.waiter is not None:
-            send.waiter.send(None)
-            del self.object_sends[identity]
-
-    def publish_object(self, key, identity) -> None:
-        if key in self.receivers:
-            self.receivers.pop(key).send(self.object_sends[identity].value)
-            self.finish_object(identity)
-        else:
-            self.packets[key].append(identity)
-
     def receive_worker(self, channel, rank, operation, message) -> None:
         group = self.membership[rank]
-        if operation == "collective":
-            self.collectives.submit(channel, rank, message)
-            return
-        if operation == "wait_object":
-            identity = message["identity"]
-            send = self.object_sends[identity]
-            if send.finished:
-                channel.send(None)
-                del self.object_sends[identity]
+        if operation == "messages":
+            deliveries = tuple({"source": rank, **delivery} for delivery in message["deliveries"])
+            if message["completion"] is not None:
+
+                # Keep the caller free to run; only publication waits for the core's actual completion events.
+                self.ready.append(WorkerCall(
+                    "delivery", {**message["completion"], "kind": "completion_notice", "group": group["id"]}, (), deliveries,
+                ))
             else:
-                send.waiter = channel
+                self.deliver(deliveries)
+            channel.send(self.messages[rank])
+            self.messages[rank] = []
             return
-        if operation in ("send_object", "receive_object"):
-            key = (group["instance"], message["source"], message["target"], message["channel"])
-            if operation == "send_object":
-                identity = self.sequence
-                self.sequence += 1
-                self.object_sends[identity] = ObjectSend(message["value"])
-                if self.closing and message["channel"] == "requests":
-                    self.finish_object(identity)
-                elif message["channel"] == "tensors":
-                    self.staged_packets[channel] = key, identity
-                else:
-                    self.publish_object(key, identity)
-                channel.send(identity)
-            elif self.closing and message["channel"] == "requests":
-                channel.send([StopInput()])
-            elif self.packets[key]:
-                identity = self.packets[key].popleft()
-                channel.send(self.object_sends[identity].value)
-                self.finish_object(identity)
-            else:
-                self.receivers[key] = channel
+        if operation == "collective_post":
+            self.collectives.post(channel, rank, message)
+            return
+        if operation == "collective_wait":
+            self.collectives.wait(channel, rank, message)
+            return
+        if operation == "metadata_post":
+            self.transfers.post(channel, rank, message)
+            return
+        if operation == "metadata_wait":
+            self.transfers.wait(channel, rank, message)
             return
         if operation == "receive":
             if not group["ingress"]:
@@ -242,7 +201,7 @@ class NativeCalls:
             if self.closing:
                 channel.send({"kind": "stop"})
             else:
-                self.ready.append(WorkerCall(operation, {"kind": "input", "group": group["id"]}, (channel,)))
+                self.ready.append(WorkerCall(operation, {"kind": "input", "group": group["id"], **message}, (channel,)))
             return
         message = {**message, "group": group["id"]}
 
@@ -266,6 +225,17 @@ class NativeCalls:
             for participant in members:
                 del self.pending[participant]
 
+    def deliver(self, deliveries):
+        if not deliveries:
+            return
+        for packet in deliveries:
+            self.messages[packet["target"]].append({"source": packet["source"], "value": packet["value"]})
+
+        # Publish the wakeup after queuing metadata; a receiver must never miss that change while parking.
+        source = self.membership[deliveries[0]["source"]]["id"]
+        recipients = sorted({self.membership[packet["target"]]["id"] for packet in deliveries})
+        self.ready.append(WorkerCall("notify", {"kind": "wake", "group": source, "groups": recipients}, ()))
+
     def receive_core(self) -> None:
         message = self.peer.receive()
         if message.get("kind") == "poll":
@@ -275,32 +245,25 @@ class NativeCalls:
         elif message.get("kind") == "shutdown":
             self.closing = True
 
-            # Serving is drained; retire idle control packets before native send waits leave their loops.
-            for key in list(self.packets):
-                if key[3] == "requests":
-                    for identity in self.packets.pop(key):
-                        self.finish_object(identity)
+            # Serving is drained; release only native ingress waits before stopping workers.
             for identity, call in list(self.awaiting.items()):
                 if call.operation == "receive":
                     call.participants[0].send({"kind": "stop"})
                     del self.awaiting[identity]
-            for key, channel in list(self.receivers.items()):
-                if key[3] == "requests":
-                    channel.send([StopInput()])
-                    del self.receivers[key]
         else:
             call = self.awaiting.pop(message["reply"])
-            for channel in call.participants:
-                channel.send(message["result"])
+            if call.operation == "delivery":
+                self.deliver(call.deliveries)
+            else:
+                for channel in call.participants:
+                    channel.send(message["result"])
 
     def quiescent(self) -> bool:
-        blocked = self.stopped | set(self.pending) | set(self.receivers.values()) | self.collectives.blocked()
+        blocked = self.stopped | set(self.pending) | self.collectives.blocked() | self.transfers.blocked()
         calls = [*self.ready, *self.awaiting.values()]
         for call in calls:
             blocked.update(call.participants)
 
-        send_waiters = {send.waiter for send in self.object_sends.values() if send.waiter is not None}
-        blocked.update(send_waiters)
         return len(blocked) == len(self.connections)
 
     def dispatch(self) -> None:
@@ -311,8 +274,10 @@ class NativeCalls:
                 call = self.ready.popleft()
             else:
 
-                # Local statistics cannot change state or time and may unblock a native CPU collective.
-                call = next((item for item in self.ready if item.message["kind"] in {"capacity", "free_slots"}), None)
+                # Read-only replies and observations must not consume a native scheduling turn.
+                call = next((item for item in self.ready if item.message["kind"] in {
+                    "capacity", "free_slots", "describe", "completed", "completion_notice", "wake", "query_result", "action_values",
+                } or (item.message["kind"] == "state_slots" and item.message["operation"] == "available")), None)
                 if call is None:
                     if not self.quiescent():
                         return
@@ -332,7 +297,7 @@ class NativeCalls:
             identity = self.sequence
             self.sequence += 1
             self.peer.send({"kind": "call", "id": identity, "message": call.message})
-            if call.operation == "send":
+            if call.operation in {"send", "notify"}:
                 if call.message["kind"] == "ready":
                     self.initialized = True
                 if call.message["kind"] == "stopped":
@@ -342,11 +307,6 @@ class NativeCalls:
             else:
                 self.awaiting[identity] = call
 
-            # The next core poll follows graph submission; peers need not wait for the sender's API return.
-            if call.message["kind"] == "send":
-                for channel in call.participants:
-                    key, packet = self.staged_packets.pop(channel)
-                    self.publish_object(key, packet)
         else:
             if not self.quiescent():
                 return
@@ -372,7 +332,7 @@ class NativeCalls:
                     try:
                         self.receive_core()
                     except EOFError:
-                        if self.awaiting or self.pending or self.ready or self.collectives.pending:
+                        if self.awaiting or self.pending or self.ready or self.collectives.pending or self.transfers.pending:
                             raise
                         core_open = False
                         self.polled = False
@@ -386,3 +346,6 @@ class NativeCalls:
                         raise EOFError("Native worker requested work after core exit")
                     self.receive_worker(channel, channels[channel], *request)
             self.dispatch()
+
+        if self.awaiting or self.pending or self.ready or self.collectives.pending or self.transfers.pending:
+            raise RuntimeError("Native workers exited with unfinished calls or metadata transport")

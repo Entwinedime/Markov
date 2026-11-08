@@ -19,47 +19,49 @@ class ObservationWindow:
             phase: set(description[field])
             for phase, field in (
                 ("warmup", "warmup_requests"),
-                ("baseline", "baseline_requests"),
                 ("source", "source_requests"),
             )
         }
+        self.pending = {phase: set(requests) for phase, requests in self.requests.items()}
 
         self.phase: str | None = None
-        self.native_idle = True
         self.drained = False
         self.prepared_phase: str | None = None
         self.receipts: list[dict[str, Any]] = []
+        self.receive_rounds: list[dict[str, Any]] = []
+        self.ingress: list[dict[str, Any]] = []
+        self.input_attempts: list[dict[str, Any]] = []
 
     def begin(self, identity: str) -> None:
         for phase, requests in self.requests.items():
             if identity in requests:
+                self.pending[phase].discard(identity)
                 self.phase = phase
-                self.native_idle = False
                 self.drained = False
                 if phase == "source":
 
                     # This hook runs at native request dispatch, after receive and rank broadcast.
-                    self.receipts.append({"request": identity, "received_ns": time.perf_counter_ns()})
+                    self.receipts.append({"request": identity, "received_raw_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)})
                 return
 
-    def observation(self, requests: Iterable[Any]) -> str | None:
-        identities = {request.rid for request in requests}
-        for phase in ("source", "baseline"):
-            if identities and identities <= self.requests[phase]:
-                return phase
-        return None
+    def receive(self, requests: list[str], time_ns: int, *, ingress: bool, attempt=None) -> None:
+        observed = [request for request in requests if request in self.requests["source"]]
+        if attempt is not None and (observed or (self.phase == "source" and not self.drained)):
+
+            # Keep the first source pull and in-window empty reads, not idle polls before or after the window.
+            self.input_attempts.append({**attempt, "requests": observed, "received_raw_ns": time_ns})
+        if observed:
+
+            # One receive round may admit several requests; it does not prescribe their execution batches.
+            records = self.ingress if ingress else self.receive_rounds
+            records.append({"requests": observed, "received_raw_ns": time_ns})
 
     @staticmethod
     def marker(directory: Path, rank: int) -> Path:
         return directory / "runtime" / f"window-rank-{rank}.json"
 
-    @staticmethod
-    def request_drain(directory: Path, phase: str) -> None:
-        write_json(directory / "runtime/window-close.json", {"phase": phase})
-
-    def close_requested(self) -> bool:
-        path = self.directory / "runtime/window-close.json"
-        return path.is_file() and json.loads(path.read_text())["phase"] == self.phase
+    def inputs_complete(self) -> bool:
+        return self.phase is not None and not self.pending[self.phase]
 
     def drain(self, rank: int) -> None:
         write_json(self.marker(self.directory, rank), {"phase": self.phase, "state": "drained"})

@@ -51,9 +51,26 @@ std::int64_t floor_divide(std::int64_t numerator, std::int64_t denominator) {
 
 } // namespace
 
+Parameters read_parameters(const nlohmann::json & source) {
+    if (!source.is_object()) throw std::invalid_argument("parameters must be an object");
+
+    Parameters result;
+    for (const auto & [name, value] : source.items()) {
+        if (!value.is_number_integer()
+            || (value.is_number_unsigned() && value.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))
+            throw std::invalid_argument("parameter must be a signed 64-bit integer: " + name);
+        result.emplace(name, value.get<std::int64_t>());
+    }
+    return result;
+}
+
 Expression Expression::read(const nlohmann::json & value) {
     Expression result;
-    if (value.is_number_integer()) result.value_ = value.get<std::int64_t>();
+    if (value.is_number_integer()) {
+        if (value.is_number_unsigned() && value.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+            throw std::out_of_range("expression integer exceeds signed 64-bit range");
+        result.value_ = value.get<std::int64_t>();
+    }
     else if (value.is_string()) result.value_ = value.get<std::string>();
     else {
         const auto kind = operations.at(value.at(0).get<std::string>());

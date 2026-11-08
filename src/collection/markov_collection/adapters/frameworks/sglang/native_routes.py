@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-
-from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
-from markov_collection.adapters.frameworks.sglang.routes import ExpertRouteConditions
+from markov_adapters.sglang.batches import BatchTensors
+from markov_adapters.sglang.experts import ExpertBatch
+from markov_workload.expert_routes import ExpertRoutes
 
 
 class NativeExpertRoutes:
@@ -15,52 +15,43 @@ class NativeExpertRoutes:
         self.values = values
         self.input = description["serving_input"]
         settings = self.input["configuration"]
-        if "pd" in settings:
-            settings = settings["pd"][description["disaggregation_role"]]
         topology = settings["ep"]
         self.size = topology["size"]
         self.source = self.input["ep_routes"][topology["id"]]
 
         self.aliases = {
             native: request["id"]
-            for field in ("baseline_requests", "source_requests")
-            for native, request in zip(description[field], self.input["requests"], strict=True)
+            for native, request in zip(description["source_requests"], self.input["requests"], strict=True)
         }
 
         self.members: list[dict[str, Any]] | None = None
 
-    def configure(self, model: Any, layers: int) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-        from sglang.srt.layers.moe.topk import TopK
+    def configure(self, experts: dict, layers: list[dict], model_layers: int) -> None:
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.server_args import get_global_server_args
 
-        experts = [module for module in model.modules() if isinstance(module, FusedMoE)]
-        topk = next(module for module in model.modules() if isinstance(module, TopK))
-        if any(module.moe_ep_size != self.size for module in experts):
+        if any(module.moe_ep_size != self.size for module in experts.values()):
             raise ValueError("injected routes must match the native expert group")
 
-        self.conditions = ExpertRouteConditions(
-            {
-                "num_hidden_layers": layers,
-                "num_experts": experts[0]._num_global_routed,
-                "num_experts_per_tok": topk.topk_config.top_k,
-            },
-            self.size,
-        )
-        self.conditions.check(self.source, self.input["requests"])
+        self.conditions = ExpertRoutes(self.source, self.input["requests"], layers, model_layers, self.size - 1)
+        args = get_global_server_args()
+        self.geometry = ExpertBatch(self.conditions, self.size, get_moe_ep_group().rank_in_group, args.moe_a2a_backend, args.deepep_mode)
 
         # A module pre-hook runs before the observation wrapper snapshots the expert's input ports.
-        for module in experts:
+        for module in experts.values():
             module.register_forward_pre_hook(self.expert, with_kwargs=True)
 
     def run_batch(self, original: Any, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
 
-        # Uniform warmup has its own requests; baseline and capture share the supplied logical identities.
+        # Uniform warmup has its own requests; capture uses the supplied logical identities.
         if not batch.reqs or batch.reqs[0].rid not in self.aliases:
             return original(scheduler, batch, *args, **kwargs)
 
         previous = self.members
         with self.values.metadata():
             self.members = BatchTensors.members(batch)
+            for member in self.members:
+                member["id"] = self.aliases[member["id"]]
         try:
             return original(scheduler, batch, *args, **kwargs)
         finally:
@@ -75,24 +66,13 @@ class NativeExpertRoutes:
         from sglang.srt.server_args import get_global_server_args
 
         result = args[1] if len(args) > 1 else kwargs["topk_output"]
-        if result.topk_ids.shape[1] != self.conditions.top_k:
+        if result.topk_ids.shape[1] != experts.top_k:
             raise ValueError("native expert input does not match the supplied route top-k")
 
-        # The native EP group partitions the padded token vector before dispatch in this DeepEP backend.
+        # DeepEP partitions padded tokens; a local expert group retains the entire token vector.
         with self.values.auxiliary():
             group = get_moe_ep_group()
-            rows = []
-            for member in self.members:
-                begin = member["context_tokens"]
-                rows.extend(
-                    self.conditions.rows(
-                        self.aliases[member["id"]], experts.layer_id, begin, begin + member["new_tokens"]
-                    )
-                )
-            padded_rows = result.topk_ids.shape[0] * group.world_size
-            rows.extend(self.conditions.rows(None, experts.layer_id, 0, padded_rows - len(rows)))
-            if len(rows) != padded_rows:
-                raise ValueError("native token layout exceeds the supplied route coverage")
+            rows = self.conditions.batch_rows(self.members, experts.layer_id, result.topk_ids.shape[0] * group.world_size)
 
             selected = torch.tensor(rows, dtype=result.topk_ids.dtype, device="cpu").tensor_split(group.world_size)[
                 group.rank_in_group

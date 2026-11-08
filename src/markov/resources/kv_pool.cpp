@@ -5,57 +5,37 @@
 #include <stdexcept>
 #include <utility>
 
-#include "markov/resources/trace.hpp"
 
 namespace markov {
 
-KvPool::KvPool(std::size_t request_count, const ServingSettings & settings, PageReuse reuse, ResourceTrace * trace, std::string pool)
+KvPool::KvPool(std::size_t request_count, const ServingSettings & settings)
     : request_capacity_(settings.max_running_requests),
       page_size_(settings.page_size),
       capacity_{ static_cast<std::size_t>(settings.max_running_requests), static_cast<std::size_t>(settings.max_total_tokens / settings.page_size) },
       residences_(request_count),
       free_slots_(capacity_.slots),
       free_pages_(capacity_.pages),
-      reuse_(reuse),
-      ready_pages_(static_cast<std::int64_t>(free_pages_.size())),
-      trace_(trace),
-      pool_(std::move(pool)),
-      prefixes_(settings.page_size, trace_, pool_) {
+      ordered_pages_(static_cast<std::int64_t>(free_pages_.size())),
+      prefixes_(settings.page_size) {
     std::iota(free_slots_.begin(), free_slots_.end(), std::size_t{ 0 });
     std::iota(free_pages_.begin(), free_pages_.end(), std::size_t{ 0 });
-    if (trace_)
-        trace_->append(pool_,
-                       "pool_init",
-                       {
-                           { "slots", capacity_.slots },
-                           { "pages", capacity_.pages }
-        });
 }
 
 std::int64_t KvPool::pages_for(std::int64_t tokens) const { return tokens == 0 ? 0 : (tokens - 1) / page_size_ + 1; }
-std::int64_t KvPool::page_size() const { return page_size_; }
 const KvResidence & KvPool::residence(std::size_t request) const { return residences_.at(request); }
-std::span<const KvResidence> KvPool::residences() const { return residences_; }
 const std::deque<std::size_t> & KvPool::free_slots() const { return free_slots_; }
 const std::deque<std::size_t> & KvPool::free_pages() const { return free_pages_; }
-std::int64_t KvPool::deferred_pages() const { return static_cast<std::int64_t>(free_pages_.size()) - ready_pages_; }
 const KvCapacity & KvPool::capacity() const { return capacity_; }
 PrefixIndex & KvPool::prefixes() { return prefixes_; }
 const PrefixIndex & KvPool::prefixes() const { return prefixes_; }
 
-void KvPool::declare_slots(std::size_t capacity) {
-    if (capacity < static_cast<std::size_t>(request_capacity_)
-        || std::ranges::any_of(residences_, [](const auto & resident) { return resident.slot.has_value(); }))
-        throw std::invalid_argument("slot capacity must cover running requests and be declared before allocation");
-    free_slots_.resize(capacity);
-    capacity_.slots = capacity;
+void KvPool::declare_resources(std::size_t slots, PageReuse reuse) {
+    if (slots < static_cast<std::size_t>(request_capacity_) || reuse_)
+        throw std::invalid_argument("resources must be declared once and cover running requests");
+    free_slots_.resize(slots);
+    capacity_.slots = slots;
     std::iota(free_slots_.begin(), free_slots_.end(), std::size_t{ 0 });
-    if (trace_)
-        trace_->append(pool_,
-                       "slots",
-                       {
-                           { "slots", capacity_.slots }
-        });
+    reuse_ = reuse;
 }
 
 void KvPool::bind_prefix(std::size_t request, std::size_t node, std::int64_t tokens) {
@@ -72,76 +52,72 @@ void KvPool::bind_prefix(std::size_t request, std::size_t node, std::int64_t tok
     }
     resident.pages = std::move(pages);
     resident.allocated_tokens = tokens;
-    if (trace_)
-        trace_->append(pool_,
-                       "bind",
-                       {
-                           { "request",        request },
-                           {    "node",           node },
-                           {  "tokens",         tokens },
-                           {   "pages", resident.pages }
-        });
 }
 
-Batch KvPool::describe(Phase phase, std::span<const KvDemand> demands) const {
-    Batch batch{ phase, request_capacity_, static_cast<std::int64_t>(free_pages_.size()), 0, {}, deferred_pages(), static_cast<std::int64_t>(capacity_.slots) };
+KvAllocation KvPool::allocate(std::span<const KvDemand> demands) {
+    const auto reuse = reuse_.value();
+    auto allocation = plan(demands);
+
+    // Deferred pages join the ordered prefix only when that prefix cannot satisfy the demand.
+    if (reuse == PageReuse::DeferredSorted && allocation.allocated_pages > ordered_pages_) {
+        std::ranges::sort(free_pages_);
+        ordered_pages_ = static_cast<std::int64_t>(free_pages_.size());
+    }
+    auto next = free_pages_.begin();
+    for (auto & member : allocation.members) {
+        for (auto & page : member.new_pages) page = *next++;
+    }
+    reserve(allocation);
+    return allocation;
+}
+
+KvAllocation KvPool::plan(std::span<const KvDemand> demands) const {
+    KvAllocation allocation;
     std::size_t new_slots = 0;
     for (const auto & [request, tokens] : demands) {
         const auto & resident = residence(request);
         const auto slot = resident.slot ? *resident.slot : free_slots_.at(new_slots++);
-        BatchMember member{ request, slot, resident.allocated_tokens, tokens, resident.pages.empty() ? std::nullopt : std::optional(resident.pages.back()),
-                            {},      phase };
+        KvReservation member{ request, slot, resident.allocated_tokens, tokens, {} };
 
-        batch.members.push_back(std::move(member));
-    }
-    return batch;
-}
-
-Batch KvPool::plan(Phase phase, std::span<const KvDemand> demands) const {
-    auto batch = describe(phase, demands);
-    for (auto & member : batch.members) {
-        const auto & resident = residence(member.request);
-
-        // Concrete page identities are selected only after the controller has made room.
+        // Check the complete demand before selecting identities or changing either free list.
         const auto pages = pages_for(member.context_tokens + member.new_tokens) - static_cast<std::int64_t>(resident.pages.size());
-        if (batch.allocated_pages + pages > static_cast<std::int64_t>(free_pages_.size())) throw std::invalid_argument("batch exceeds available KV pages");
-        for (std::int64_t index = 0; index < pages; ++index)
-            member.new_pages.push_back(free_pages_.at(static_cast<std::size_t>(batch.allocated_pages + index)));
-        batch.allocated_pages += pages;
+        if (allocation.allocated_pages + pages > static_cast<std::int64_t>(free_pages_.size()))
+            throw std::invalid_argument("allocation exceeds available KV pages");
+        member.new_pages.resize(static_cast<std::size_t>(pages));
+        allocation.allocated_pages += pages;
+        allocation.members.push_back(std::move(member));
     }
-
-    assign_pages(batch);
-    return batch;
+    return allocation;
 }
 
-void KvPool::assign_pages(Batch & batch) const {
-    if (batch.allocated_pages <= ready_pages_) return;
+std::vector<KvPageRange> KvPool::ranges(std::size_t request, std::int64_t begin, std::int64_t end) const {
+    const auto & resident = residence(request);
+    if (begin < 0 || end < begin || end > resident.allocated_tokens) throw std::invalid_argument("KV access is outside the request's allocated token range");
 
-    // Deferred identities become ordered together only when the ready prefix cannot satisfy this allocation.
-    auto available = free_pages_;
-    std::ranges::sort(available);
-    auto next = available.begin();
-    for (auto & member : batch.members) {
-        for (auto & page : member.new_pages) page = *next++;
-    }
-}
-
-std::vector<std::int64_t> KvPool::indices(std::size_t request, std::int64_t begin, std::int64_t end) const {
-    const auto & pages = residence(request).pages;
-    std::vector<std::int64_t> result;
-    for (auto token = begin; token < end; ++token) {
-        const auto page = pages.at(static_cast<std::size_t>(token / page_size_));
-        result.push_back(static_cast<std::int64_t>(page) * page_size_ + token % page_size_);
+    // Prefix bindings already share physical pages; preserve sub-page boundaries instead of widening the access.
+    std::vector<KvPageRange> result;
+    for (auto token = begin; token < end;) {
+        const auto offset = token % page_size_;
+        const auto length = std::min(page_size_ - offset, end - token);
+        result.push_back({ resident.pages.at(static_cast<std::size_t>(token / page_size_)), offset, offset + length });
+        token += length;
     }
     return result;
 }
 
-void KvPool::reserve(const Batch & batch) {
-    if (batch.allocated_pages > ready_pages_) {
-        std::ranges::sort(free_pages_);
-        ready_pages_ = static_cast<std::int64_t>(free_pages_.size());
+std::vector<std::int64_t> KvPool::indices(std::size_t request, std::int64_t begin, std::int64_t end) const {
+    const auto pages = ranges(request, begin, end);
+    std::vector<std::int64_t> result;
+    result.reserve(static_cast<std::size_t>(end - begin));
+    for (const auto & range : pages) {
+        const auto base = static_cast<std::int64_t>(range.page) * page_size_;
+        for (auto offset = range.begin; offset < range.end; ++offset) result.push_back(base + offset);
     }
-    for (const auto & member : batch.members) {
+    return result;
+}
+
+void KvPool::reserve(const KvAllocation & allocation) {
+    for (const auto & member : allocation.members) {
         auto & state = residences_.at(member.request);
         if (!state.slot) {
             state.slot = member.slot;
@@ -149,44 +125,24 @@ void KvPool::reserve(const Batch & batch) {
         }
         state.pages.insert(state.pages.end(), member.new_pages.begin(), member.new_pages.end());
         state.allocated_tokens = member.context_tokens + member.new_tokens;
-        if (trace_)
-            trace_->append(pool_,
-                           "reserve",
-                           {
-                               { "request",         member.request },
-                               {    "slot",            member.slot },
-                               {  "tokens", state.allocated_tokens },
-                               {   "pages",       member.new_pages }
-            });
     }
-    free_pages_.erase(free_pages_.begin(), free_pages_.begin() + batch.allocated_pages);
-    ready_pages_ -= batch.allocated_pages;
+    free_pages_.erase(free_pages_.begin(), free_pages_.begin() + allocation.allocated_pages);
+    ordered_pages_ -= allocation.allocated_pages;
 }
 
 void KvPool::release(std::size_t request) {
     auto & state = residences_.at(request);
     free_slots_.push_back(state.slot.value());
     state = {};
-    if (trace_)
-        trace_->append(pool_,
-                       "release",
-                       {
-                           { "request", request }
-        });
 }
 
 void KvPool::return_pages(std::span<const std::size_t> pages) {
 
-    // The native release graph supplies order; this pool remains the sole owner of reusable identities.
-    const auto position = reuse_ == PageReuse::DeferredSorted ? free_pages_.end() : free_pages_.begin();
+    // Control returns logical ownership here; execution dependencies separately protect outstanding accesses.
+    const auto reuse = reuse_.value();
+    const auto position = reuse == PageReuse::DeferredSorted ? free_pages_.end() : free_pages_.begin();
     free_pages_.insert(position, pages.begin(), pages.end());
-    if (reuse_ == PageReuse::Immediate) ready_pages_ += static_cast<std::int64_t>(pages.size());
-    if (trace_ && !pages.empty())
-        trace_->append(pool_,
-                       "return_pages",
-                       {
-                           { "pages", pages }
-        });
+    if (reuse == PageReuse::Prepend) ordered_pages_ += static_cast<std::int64_t>(pages.size());
 }
 
 } // namespace markov

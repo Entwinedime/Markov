@@ -14,6 +14,8 @@ namespace markov {
 
 using Parameters = std::map<std::string, std::int64_t>;
 
+Parameters read_parameters(const nlohmann::json & source);
+
 // The same integer expression is checked on source observations and evaluated for targets.
 class Expression {
 public:

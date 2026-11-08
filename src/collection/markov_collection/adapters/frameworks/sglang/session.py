@@ -1,248 +1,94 @@
-"""Native SGLang session; the framework owns requests, KV and worker lifetimes."""
+"""Coordinate native instances with one workload clock and independent engine lifecycles."""
 
-from __future__ import annotations
-
-import json
+import multiprocessing
 import os
+import signal
+import socket
 import time
-from collections.abc import Sequence
+from multiprocessing.connection import wait
 from pathlib import Path
-from typing import Any
 
-from markov_collection.adapters.frameworks.sglang.submissions import EngineSubmissions
-from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
+from markov_adapters.sglang.configuration import CaptureInput
+from markov_collection.adapters.frameworks.sglang.instance import NativeServingInstance
 from markov_collection.artifacts import write_json
 
 
+class ArrivalClock:
+    def __init__(self, context):
+        self.origin = context.Value("q", 0)
+
+    def __call__(self):
+
+        # Worker receipts and profiler host anchors use the same machine's unadjusted monotonic clock.
+        self.origin.value = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+
+
 class NativeServingSession:
-    def __init__(
-        self,
-        model: str,
-        requests: tuple[tuple[int, int], ...],
-        output: Path,
-        profile: bool,
-        tp_size: int,
-        rank: int,
-        *,
-        configuration: dict[str, int],
-        matrix_selection: dict[str, object],
-        native_library: str,
-        pp_size: int = 1,
-        ep_size: int = 1,
-        dtype: str = "bfloat16",
-        attention_backend: str = "ascend",
-        observe_all_workers: bool = False,
-        serving_input: dict[str, Any] | None = None,
-        submissions: Sequence[Sequence[int]] | None = None,
-    ) -> None:
-
-        self.native_group = pp_size > 1 or ep_size > 1 or observe_all_workers
-        self.roles = self.source_roles(tp_size, pp_size, rank, ep_size)
-        if self.native_group:
-            self.roles = range(tp_size * pp_size)
-        self.observed_roles = tuple(self.roles)
-        self.model = model
-        self.requests = requests
+    def __init__(self, source, output: Path, resource_trace: bool = False) -> None:
+        serving = CaptureInput(source)
         self.output = output.resolve()
-        self.profile = profile
-        self.tp_size = tp_size
-        self.rank = rank
-        self.pp_size = pp_size
-        self.ep_size = ep_size
-        self.dtype = dtype
-        self.attention_backend = attention_backend
-        self.configuration = configuration
-        self.matrix_selection = matrix_selection
-        self.native_library = native_library
-        self.observe_all_workers = observe_all_workers
-        self.serving_input = serving_input
-        self.submissions = [list(range(len(requests)))] if submissions is None else submissions
-        if (
-            serving_input is not None
-            and tuple((request["prompt_tokens"], request["output_tokens"]) for request in serving_input["requests"])
-            != requests
-        ):
-            raise ValueError("injected workload must describe the submitted native requests")
-        self.inputs = EngineSubmissions(self.content_input(requests, serving_input), self.submissions)
-        self.deliveries: dict[str, Any] = {}
+        self.instances = []
+        offset = 0
+        for index, description in enumerate(serving.instances):
+            instance = NativeServingInstance(serving, description, self.output, index, offset, serving.observe_all_workers, resource_trace)
+            self.instances.append(instance)
+            offset += len(instance.roles)
 
     @staticmethod
-    def source_roles(tp: int, pp: int, rank: int, ep: int = 1) -> range:
+    def execute(instance, barrier, clock, bootstrap, connection):
 
-        # The pinned upstream Ascend capability table explicitly excludes PP2.
-        if pp == 2:
-            raise ValueError("this SGLang Ascend implementation does not support PP2")
-        if ep > 1 and ep != tp:
-            raise ValueError("this SGLang DeepEP implementation requires EP to equal TP")
-        return range(tp * pp) if pp > 1 or ep > 1 else range(rank, rank + 1)
-
-    @staticmethod
-    def warmup_requests(page_size: int) -> tuple[tuple[int, int], ...]:
-
-        # Keep warmup independent of target requests while covering page and batch transitions.
-        return (
-            (max(1, page_size - 1), 4),
-            (page_size + 1, 1),
-            (page_size // 2 + 1, 3),
-            (page_size // 4 + 1, 2),
-            (1, 1),
-        )
-
-    @classmethod
-    def structure_requests(cls, page_size: int) -> tuple[tuple[int, int], ...]:
-        *initial, tail = cls.warmup_requests(page_size)
-
-        # Page-aligned input and a live tail cover identity padding and native batch merge.
-        initial[2] = (page_size, initial[2][1])
-        return (*initial, (tail[0], 3))
-
-    def generate(self, engine: object, prefix: str, requests: tuple[tuple[int, int], ...]) -> None:
-        print(f"markov: native {prefix} begin", flush=True)
-        inputs = (
-            EngineSubmissions(self.content_input(requests), [list(range(len(requests)))])
-            if prefix == "warmup"
-            else self.inputs
-        )
-        inputs.content.check_vocabulary(engine.tokenizer_manager.model_config.vocab_size)
+        # Each Engine owns descendants; cancellation must also stop that instance's native workers.
+        os.setsid()
         try:
-            engine.loop.run_until_complete(inputs.run(engine, prefix))
+            connection.send(instance.run(barrier, clock, bootstrap))
         finally:
-
-            # Actual submission delay is evidence; it never rewrites the declared workload.
-            self.deliveries[prefix] = inputs.delivery
-            write_json(self.output / "request-delivery.json", self.deliveries, indent=2)
-        print(f"markov: native {prefix} complete", flush=True)
-
-    @staticmethod
-    def content_input(requests, source=None) -> dict:
-        return {
-            "requests": source["requests"]
-            if source is not None
-            else [
-                {"id": str(index), "arrival_ns": 0, "prompt_tokens": prompt, "output_tokens": output}
-                for index, (prompt, output) in enumerate(requests)
-            ],
-            "prefixes": source.get("prefixes", []) if source is not None else [],
-        }
-
-    def reset(self, engine: object, phase: str) -> None:
-        print("markov: native pool reset begin", flush=True)
-        ObservationWindow.request_drain(self.output, phase)
-        response = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
-        if not response.success:
-            raise RuntimeError(f"native idle/cache reset failed: {response.message}")
-        ObservationWindow.wait(self.output, self.roles, phase, "complete")
-        print("markov: native pool reset complete", flush=True)
+            connection.close()
 
     def run(self) -> None:
-        warmup = self.warmup_requests(self.configuration["page_size"])
-        self.output.mkdir(parents=True, exist_ok=True)
-        (self.output / "runtime").mkdir(exist_ok=True)
-        description = self.output / "session.json"
-        session = {
-            "output": str(self.output),
-            "warmup_requests": [f"warmup/{index}" for index in range(len(warmup))],
-            "source_requests": [f"capture/{index}" for index in range(len(self.requests))],
-            "baseline_requests": [f"baseline/{index}" for index in range(len(self.requests))],
-            "matrix_selection": self.matrix_selection,
-            "native_library": self.native_library,
-            "rank_offset": 0,
-            "native_participants": list(self.roles),
-            "pp_size": self.pp_size,
-            "ep_size": self.ep_size,
-            "observe_all_workers": self.observe_all_workers,
-            "serving_input": self.serving_input,
-            "content": self.content_input(self.requests, self.serving_input),
-            "submissions": self.submissions,
-        }
-        if self.tp_size > 1 and not self.native_group:
-            session["shard"] = {"size": self.tp_size, "rank": self.rank}
-        if description.exists():
-            raise FileExistsError(f"native session already exists: {description}")
-        write_json(description, session)
-        os.environ["MARKOV_GRAPH_SESSION"] = str(description)
-        os.environ["SGLANG_PLUGINS"] = "markov"
-
-        expert_options = {}
-
-        # Select the qualified native all-to-all implementation before workers start.
-        if self.ep_size > 1:
-            os.environ.update(DEEP_USE_ALLTOALL_MODE="1", DEEPEP_HCCL_BUFFSIZE="1024", HCCL_BUFFSIZE="1024")
-            expert_options = {"ep_size": self.ep_size, "moe_a2a_backend": "deepep", "deepep_mode": "normal"}
-
-        from sglang.srt.entrypoints.engine import Engine
-
-        started = time.perf_counter_ns()
-        engine = Engine(
-            model_path=self.model,
-            skip_tokenizer_init=True,
-            device="npu",
-            dtype=self.dtype,
-            tp_size=self.tp_size if self.native_group else 1,
-            pp_size=self.pp_size,
-            **expert_options,
-            load_format="dummy",
-            attention_backend=self.attention_backend,
-            **{"chunked_prefill_size": -1, "disable_radix_cache": True, **self.configuration},
-            disable_overlap_schedule=True,
-            disable_cuda_graph=True,
-            sleep_on_idle=True,
-            mem_fraction_static=0.8,
-            log_level="warning",
-        )
+        self.output.mkdir(parents=True)
+        (self.output / "instances").mkdir()
+        (self.output / "runtime").mkdir()
+        bootstrap = None
+        if len(self.instances) > 1:
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                bootstrap = {"host": "127.0.0.1", "port": reservation.getsockname()[1]}
+        context = multiprocessing.get_context("spawn")
+        clock = ArrivalClock(context)
+        barrier = context.Barrier(len(self.instances), action=clock)
+        processes, pending, results = [], {}, {}
         try:
-            initialized = time.perf_counter_ns()
-            if self.native_group:
-                plan = json.loads((self.output / "role-plan.json").read_text())
-                self.observed_roles = tuple(plan["observed_roles"])
-            print("markov: native initialization complete", flush=True)
+            for index, instance in enumerate(self.instances):
+                reader, writer = context.Pipe(duplex=False)
+                process = context.Process(target=self.execute, args=(instance, barrier, clock, bootstrap, writer))
+                try:
+                    process.start()
+                except BaseException:
+                    reader.close()
+                    raise
+                finally:
+                    writer.close()
+                processes.append(process)
+                pending[reader] = index
 
-            self.generate(engine, "warmup", warmup)
-            self.reset(engine, "warmup")
-            warmed = time.perf_counter_ns()
-            if self.profile:
-                engine.start_profile(
-                    output_dir=str(self.output / "native"),
-                    activities=["CPU", "GPU"],
-                    record_shapes=False,
-                    with_stack=False,
-                )
-                ObservationWindow.wait(self.output, self.roles, "profiler", "complete")
-            try:
-                self.generate(engine, "baseline", self.requests)
-                self.reset(engine, "baseline")
-                self.generate(engine, "capture", self.requests)
-                self.reset(engine, "source")
-            finally:
-                if self.profile:
-                    engine.stop_profile()
-                    if self.native_group:
-                        directories = [self.output / "native" / f"rank-{rank}" for rank in self.observed_roles]
-                        while not all(directory.is_dir() for directory in directories):
-                            time.sleep(0.05)
-            captured = time.perf_counter_ns()
+            while pending:
+                for connection in wait(pending):
+                    results[pending[connection]] = connection.recv()
+                    del pending[connection]
+                    connection.close()
+            for process in processes:
+                process.join()
+                if process.exitcode != 0:
+                    raise RuntimeError(f"native capture worker exited with {process.exitcode}")
+            write_json(self.output / "capture.json", {"instances": [results[index] for index in range(len(results))]}, indent=2, replace=False)
         finally:
-            engine.shutdown()
-
-        summary = {
-            "initialization_ns": initialized - started,
-            "warmup_ns": warmed - initialized,
-            "warmup_requests": warmup,
-            "capture_and_flush_ns": captured - warmed,
-            "profile": self.profile,
-            "model": self.model,
-            "weight_source": "native_dummy_loader_full_model",
-            "logical_tp": self.tp_size,
-            "logical_pp": self.pp_size,
-            "logical_ep": self.ep_size,
-            "rank": self.rank,
-            "native_participants": list(self.roles),
-            "observed_roles": list(self.observed_roles),
-            "configuration": self.configuration,
-            "matrix_selection": self.matrix_selection,
-            "worker_limits": engine._scheduler_init_result.scheduler_infos,
-            "routing_source": "workload" if (self.serving_input or {}).get("ep_routes") else "native",
-            "content_source": "declared_prefixes_and_private_continuations",
-        }
-        write_json(self.output / "session-summary.json", summary, indent=2)
-        print(json.dumps(summary))
+            for connection in pending:
+                connection.close()
+            for process in processes:
+                if process.exitcode != 0:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        if process.is_alive():
+                            process.kill()
+                process.join()

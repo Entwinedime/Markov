@@ -4,14 +4,10 @@
 #include <stdexcept>
 #include <utility>
 
-#include "markov/resources/trace.hpp"
 
 namespace markov {
 
-PrefixIndex::PrefixIndex(std::int64_t page_size, ResourceTrace * trace, std::string pool)
-    : page_size_(static_cast<std::size_t>(page_size)),
-      trace_(trace),
-      pool_(std::move(pool)) {
+PrefixIndex::PrefixIndex(std::int64_t page_size) : page_size_(static_cast<std::size_t>(page_size)) {
     if (page_size <= 0) throw std::invalid_argument("prefix index requires a positive page size");
     nodes_.try_emplace(0).first->second.references = 1;
 }
@@ -33,13 +29,6 @@ void PrefixIndex::touch(std::size_t identity, std::size_t recency) {
     leaves_.erase({ node.recency, identity });
     node.recency = recency;
     update_leaf(identity);
-    if (trace_ && identity != 0)
-        trace_->append(pool_,
-                       "prefix_touch",
-                       {
-                           {    "node", identity },
-                           { "recency",  recency }
-        });
 }
 
 std::size_t PrefixIndex::split(std::size_t identity, std::size_t tokens) {
@@ -61,17 +50,6 @@ std::size_t PrefixIndex::split(std::size_t identity, std::size_t tokens) {
     child.parent = prefix;
     child.tokens.erase(child.tokens.begin(), child.tokens.begin() + static_cast<std::ptrdiff_t>(tokens));
     child.pages.erase(child.pages.begin(), child.pages.begin() + static_cast<std::ptrdiff_t>(pages));
-    if (trace_)
-        trace_->append(pool_,
-                       "prefix_split",
-                       {
-                           {       "node",        identity },
-                           {     "prefix",          prefix },
-                           {     "parent",     node.parent },
-                           {      "pages",      node.pages },
-                           { "references", node.references },
-                           {    "recency",    node.recency }
-        });
     return prefix;
 }
 
@@ -89,12 +67,7 @@ PrefixMatch PrefixIndex::walk(std::span<const std::int64_t> tokens) {
         const auto & child = nodes_.at(identity);
         const auto end = std::ranges::mismatch(tokens, child.tokens).in1;
         const auto matched = static_cast<std::size_t>(end - tokens.begin()) / page_size_ * page_size_;
-        PrefixStep step{ identity, static_cast<std::int64_t>(matched), std::nullopt };
-        if (matched < child.tokens.size()) {
-            identity = split(identity, matched);
-            step.split_prefix = identity;
-        }
-        result.path.push_back(step);
+        if (matched < child.tokens.size()) identity = split(identity, matched);
 
         result.matched_tokens += matched;
         result.node = identity;
@@ -143,24 +116,13 @@ PrefixInsertion PrefixIndex::insert(std::span<const std::int64_t> tokens, std::s
         evictable_tokens_ += static_cast<std::int64_t>(suffix.size());
         update_leaf(matched.node);
         update_leaf(identity);
-        if (trace_)
-            trace_->append(pool_,
-                           "prefix_insert",
-                           {
-                               {    "node",     identity },
-                               {  "parent",  node.parent },
-                               {   "pages",   node.pages },
-                               { "recency", node.recency }
-            });
         matched.node = identity;
     }
-    return { matched.node, static_cast<std::int64_t>(existing), std::move(matched.path), !suffix.empty() };
+    return { matched.node, static_cast<std::int64_t>(existing) };
 }
 
 std::int64_t PrefixIndex::lock(std::size_t identity, bool acquire) {
     std::int64_t delta = 0;
-    nlohmann::json changed;
-    if (trace_) changed = nlohmann::json::array();
     while (identity != 0) {
         auto & node = nodes_.at(identity);
         if (!acquire && node.references == 0) throw std::invalid_argument("cached prefix released without a reference");
@@ -169,42 +131,24 @@ std::int64_t PrefixIndex::lock(std::size_t identity, bool acquire) {
             delta += acquire ? -tokens : tokens;
         }
         node.references += acquire ? 1 : -1;
-        if (trace_)
-            changed.push_back({
-                {       "node",        identity },
-                { "references", node.references }
-            });
         update_leaf(identity);
         identity = node.parent;
     }
     evictable_tokens_ += delta;
     protected_tokens_ -= delta;
-    if (trace_ && !changed.empty())
-        trace_->append(pool_,
-                       "prefix_lock",
-                       {
-                           { "acquire",            acquire },
-                           {   "nodes", std::move(changed) }
-        });
     return delta;
 }
 
-std::vector<std::size_t> PrefixIndex::evict(std::int64_t tokens) {
+std::vector<std::vector<std::size_t>> PrefixIndex::evict(std::int64_t tokens) {
     if (tokens < 0) throw std::invalid_argument("prefix eviction demand must be nonnegative");
-    std::vector<std::size_t> released;
+    std::vector<std::vector<std::size_t>> released;
     while (tokens > 0 && !leaves_.empty()) {
         const auto identity = leaves_.begin()->second;
         auto & node = nodes_.at(identity);
         const auto parent = node.parent;
         const auto count = static_cast<std::int64_t>(node.tokens.size());
-        if (trace_)
-            trace_->append(pool_,
-                           "prefix_evict",
-                           {
-                               { "node", identity }
-            });
         nodes_.at(parent).children.erase(first_page(node.tokens));
-        released.push_back(identity);
+        released.push_back(std::move(node.pages));
         leaves_.erase(leaves_.begin());
         nodes_.erase(identity);
         update_leaf(parent);
@@ -212,20 +156,11 @@ std::vector<std::size_t> PrefixIndex::evict(std::int64_t tokens) {
         tokens -= count;
     }
 
-    // Each compressed leaf is one release, including overshoot; callers commit pool reuse after graph completion.
+    // Preserve leaf release grouping; the allocator owns identities and execution owns outstanding accesses.
     return released;
 }
 
 std::int64_t PrefixIndex::evictable_tokens() const { return evictable_tokens_; }
 std::int64_t PrefixIndex::protected_tokens() const { return protected_tokens_; }
-
-std::vector<PrefixResidence> PrefixIndex::residences() const {
-    std::vector<PrefixResidence> result;
-    result.reserve(nodes_.size() - 1);
-    for (const auto & [identity, node] : nodes_) {
-        if (identity != 0) result.push_back({ identity, node.references, node.pages });
-    }
-    return result;
-}
 
 } // namespace markov

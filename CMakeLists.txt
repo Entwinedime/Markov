@@ -9,41 +9,45 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(markov_core
-    src/markov/serving/workflow.cpp
     src/markov/controller/native.cpp
-    src/markov/controller/native_group.cpp
-    src/markov/controller/native_transfer.cpp
+    src/markov/controller/delivery.cpp
     src/markov/resources/kv_pool.cpp
+    src/markov/resources/service.cpp
+    src/markov/resources/slot_pool.cpp
     src/markov/resources/prefix_index.cpp
-    src/markov/resources/trace.cpp
-    src/markov/execution/protocol.cpp
-    src/markov/execution/durations.cpp
-    src/markov/execution/executor.cpp
-    src/markov/execution/observed_feedback.cpp
     src/markov/contracts/expression.cpp
-    src/markov/contracts/expert_routes.cpp
-    src/markov/contracts/input_group.cpp
     src/markov/contracts/serving.cpp
-    src/markov/contracts/index_work.cpp
-    src/markov/contracts/topology.cpp
-    src/markov/contracts/integer_data.cpp
-    src/markov/graph/access.cpp
-    src/markov/graph/region_graph.cpp
-    src/markov/graph/source_graph.cpp
-    src/markov/production/source_projection.cpp
-    src/markov/production/source_services.cpp
-    src/markov/production/source_partitions.cpp
-    src/markov/production/execution_source.cpp
-    src/markov/production/execution_reuse.cpp
-    src/markov/production/execution_pattern.cpp
-    src/markov/production/template_library.cpp
-    src/markov/templates/group_execution.cpp
-    src/markov/templates/catalog.cpp
-    src/markov/templates/asset.cpp
+    src/markov/graph/types.cpp
+    src/markov/graph/state.cpp
+    src/markov/graph/observation.cpp
+    src/markov/graph/graph.cpp
+    src/markov/execution/timeline.cpp
+    src/markov/execution/dependencies.cpp
+    src/markov/execution/communication.cpp
+    src/markov/serving/session.cpp
+    src/markov/controller/boundary_times.cpp
+    src/markov/production/projection.cpp
+    src/markov/production/templates.cpp
+    src/markov/production/entries.cpp
+    src/markov/templates/library.cpp
+    src/markov/templates/interface.cpp
+    src/markov/templates/local.cpp
+    src/markov/templates/selection.cpp
+    src/markov/templates/validation.cpp
     src/markov/templates/instance.cpp
-    src/markov/templates/target_graph.cpp
-    src/markov/templates/parallel_composition.cpp
 )
 target_include_directories(markov_core PUBLIC src)
 target_link_libraries(markov_core PUBLIC nlohmann_json::nlohmann_json)
-target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+
+add_library(markov_sglang
+    src/markov/adapters/sglang/templates.cpp
+    src/markov/adapters/sglang/workers.cpp
+    src/markov/adapters/sglang/actions.cpp
+)
+target_link_libraries(markov_sglang PUBLIC markov_core)
+
+add_executable(markov src/markov/cli/main.cpp src/markov/cli/serving.cpp src/markov/cli/execution_trace.cpp)
+target_link_libraries(markov PRIVATE markov_sglang)
+foreach(target markov_core markov_sglang markov)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endforeach()

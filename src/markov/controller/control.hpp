@@ -2,10 +2,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
 
 #include "markov/contracts/serving.hpp"
+#include "markov/graph/types.hpp"
 
 namespace markov {
 
@@ -16,11 +20,15 @@ public:
 
     virtual std::optional<ServingAction> plan(std::int64_t now_ns) = 0;
 
-    // Preparing native work may reserve resources; start accepts execution and finish commits completion effects.
-    virtual void start(const ServingAction & action) = 0;
-    virtual void finish(const ServingAction & action, const BatchProgram & program, std::int64_t completed_ns) = 0;
+    // The native caller remains suspended until its action return boundary completes.
+    virtual void finish(const ServingAction & action, std::size_t returned_event, std::int64_t completed_ns,
+                        const std::map<std::string, StorageBinding> & values) = 0;
 
-    virtual std::optional<std::int64_t> next_arrival_ns(std::int64_t now_ns) const = 0;
+    // An observed device boundary can wake polling even when no CPU action returns.
+    virtual bool notify(std::size_t event) = 0;
+    virtual std::set<std::size_t> retained_events() const = 0;
+
+    virtual std::optional<std::int64_t> next_wakeup_ns(std::int64_t now_ns) const = 0;
     virtual bool done() const = 0;
 
     // Results read the owner's state without keeping another request or page ledger.

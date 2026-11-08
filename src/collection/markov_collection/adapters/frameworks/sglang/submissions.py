@@ -3,45 +3,38 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Any
 
 from markov_workload import WorkloadContent
 
 
-class NativeSubmissions(ABC):
-    roles: tuple[str, ...]
+class EngineSubmissions:
 
-    def __init__(self, source: dict[str, Any], groups: list[list[int]]) -> None:
+    def __init__(self, source: dict[str, Any], mode: str, groups: list[list[str]] | None = None) -> None:
+        self.mode = mode
         self.requests = source["requests"]
         self.content = WorkloadContent(self.requests, source["prefixes"])
-        if not all(groups) or sorted(index for group in groups for index in group) != list(range(len(self.requests))):
-            raise ValueError("native submissions must contain every request exactly once")
-        for request in self.requests:
-            arrival = request["arrival_ns"]
-            if type(arrival) is not int or not 0 <= arrival <= (1 << 63) - 1:
-                raise ValueError("native arrival_ns must be a nonnegative signed 64-bit integer")
-
-        # Discovery rounds may prime caches; each round has its own workload time origin.
-        self.rounds = []
-        for group in groups:
+        indices = {request["id"]: index for index, request in enumerate(self.requests)}
+        self.groups = []
+        for group in groups if groups is not None else [list(indices)]:
             arrivals: dict[int, list[int]] = defaultdict(list)
-            for index in sorted(group):
+            for identity in group:
+                index = indices[identity]
                 arrivals[self.requests[index]["arrival_ns"]].append(index)
-            self.rounds.append(sorted(arrivals.items()))
+            self.groups.append(sorted(arrivals.items()))
         self.delivery: list[dict[str, Any]] = []
 
-    async def run(self, endpoint: Any, prefix: str) -> dict[str, list[dict[str, Any]]]:
+    def prepare(self, prefix: str, bootstrap: dict | None, first_room: int) -> None:
+        self.prefix = prefix
+        self.protocol_requests = {}
 
-        # Materialize inputs before the clock starts; prompt construction is not arrival delay.
+        # Construct prompts before observation; each group preserves its own declared arrival offsets.
         prompts = [self.content.prompt(request["id"]) for request in self.requests]
-        responses = {role: [] for role in self.roles}
-        self.delivery = []
-        for arrivals in self.rounds:
-            submissions = []
+        self.submissions = []
+        for group, arrivals in enumerate(self.groups):
+            self.submissions.append([])
             for arrival, indices in arrivals:
                 payload = {
                     "input_ids": [prompts[index] for index in indices],
@@ -49,48 +42,57 @@ class NativeSubmissions(ABC):
                         {"max_new_tokens": self.requests[index]["output_tokens"], "temperature": 0, "ignore_eos": True}
                         for index in indices
                     ],
-                    "rid": [f"{prefix}/{index}" for index in indices],
-                    "stream": True,
+                    "rid": [f"{prefix}/{index}" for index in indices], "stream": True,
                 }
-                submissions.append((payload, {"arrival_ns": arrival, "requests": indices}))
+                if self.mode != "null":
+                    payload.update(
+                        bootstrap_host=[bootstrap["host"]] * len(indices),
+                        bootstrap_port=[bootstrap["port"]] * len(indices),
+                        bootstrap_room=[first_room + index for index in indices],
+                    )
 
+                    # Workers can receive remote reservations before dispatching their own copy of the request.
+                    self.protocol_requests.update(
+                        (str(room), self.requests[index]["id"])
+                        for room, index in zip(payload["bootstrap_room"], indices, strict=True)
+                    )
+                self.submissions[-1].append((payload, {"group": group, "arrival_ns": arrival, "requests": indices}))
 
-            # Semantic scopes use this same process-independent performance clock on the serving host.
-            started_ns = time.perf_counter_ns()
-            self.delivery.append({"origin_ns": started_ns, "submissions": [record for _, record in submissions]})
-            tasks = [
-                asyncio.create_task(self.submit_at(endpoint, payload, record, started_ns))
-                for payload, record in submissions
-            ]
+    async def run(self, endpoint: Any, clock: Any, barrier: Any) -> None:
+        origin_ns = clock.origin.value
+        records = [record for group in self.submissions for _, record in group]
+        self.delivery = [{"clock": "monotonic_raw_ns", "origin_ns": origin_ns, "submissions": records}]
+        for index, group in enumerate(self.submissions):
+            if index:
+
+                # Prefill may return before Decode; both instances finish the group before sharing its successor's clock.
+                barrier.wait()
+            offset_ns = clock.origin.value - origin_ns
+            for _, record in group:
+                record["scheduled_ns"] = offset_ns + record["arrival_ns"]
+            tasks = [asyncio.create_task(self.submit_at(endpoint, payload, record, origin_ns)) for payload, record in group]
             try:
-                results = await asyncio.gather(*tasks)
+                responses = await asyncio.gather(*tasks)
             except BaseException:
-
-                # Failed or cancelled runs must not keep submitting requests in a later phase.
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
+            indices = [request for _, record in group for request in record["requests"]]
+            self.check_responses(self.prefix, [row for response in responses for row in response], indices)
 
-            indices = [index for _, group in arrivals for index in group]
-            for role in self.roles:
-                rows = [row for result in results for row in result[role]]
-                self.check_responses(role, prefix, rows, indices)
-                responses[role].extend(rows)
-        return responses
-
-    async def submit_at(self, endpoint: Any, payload: dict, record: dict, started_ns: int) -> dict:
-        deadline_ns = started_ns + record["arrival_ns"]
+    async def submit_at(self, endpoint: Any, payload: dict, record: dict, started_ns: int) -> list[dict]:
+        deadline_ns = started_ns + record["scheduled_ns"]
 
         # Event-loop timers may wake early; release only after the shared workload clock reaches arrival.
-        while (remaining_ns := deadline_ns - time.perf_counter_ns()) > 0:
+        while (remaining_ns := deadline_ns - time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)) > 0:
             await asyncio.sleep(remaining_ns / 1e9)
-        record["submitted_ns"] = time.perf_counter_ns() - started_ns
-        return await self.send(endpoint, payload, record["requests"])
+        record["submitted_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - started_ns
+        return await self.send(endpoint, payload)
 
-    def check_responses(self, role: str, prefix: str, rows: list[dict], indices: list[int]) -> None:
+    def check_responses(self, prefix: str, rows: list[dict], indices: list[int]) -> None:
         expected = {
-            f"{prefix}/{index}": 1 if role == "prefill" else self.requests[index]["output_tokens"]
+            f"{prefix}/{index}": 1 if self.mode == "prefill" else self.requests[index]["output_tokens"]
             for index in indices
         }
         tokens = {
@@ -112,57 +114,12 @@ class NativeSubmissions(ABC):
         if completed != expected.keys():
             raise RuntimeError(f"native responses omitted requests: {sorted(expected.keys() - completed)}")
 
-    @abstractmethod
-    async def send(self, endpoint: Any, payload: dict, indices: list[int]) -> dict:
-        pass
-
-
-class EngineSubmissions(NativeSubmissions):
-    roles = ("model",)
-
-    async def send(self, endpoint: Any, payload: dict, indices: list[int]) -> dict:
+    @staticmethod
+    async def send(endpoint: Any, payload: dict) -> list[dict]:
         rows = []
 
         # Keep native streaming semantics while retaining only terminal responses.
         async for row in await endpoint.async_generate(**payload):
             if row["meta_info"]["finish_reason"] is not None:
                 rows.append(row)
-        return {"model": rows}
-
-
-class DisaggregatedSubmissions(NativeSubmissions):
-    roles = ("prefill", "decode")
-
-    async def send(self, endpoint: Any, payload: dict, indices: list[int]) -> dict:
-        session, ports, bootstrap_port, room_begin = endpoint
-        payload.update(
-            bootstrap_host=["127.0.0.1"] * len(indices),
-            bootstrap_port=[bootstrap_port] * len(indices),
-            bootstrap_room=[room_begin + index for index in indices],
-        )
-        tasks = [asyncio.create_task(self.generate(session, port, payload)) for port in ports]
-        try:
-            return dict(zip(self.roles, await asyncio.gather(*tasks), strict=True))
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    @staticmethod
-    async def generate(session: Any, port: int, payload: dict) -> list[dict]:
-        rows = []
-        async with session.post(f"http://127.0.0.1:{port}/generate", json=payload) as response:
-            response.raise_for_status()
-
-            # Token arrays may exceed aiohttp's readline limit; keep only the unfinished SSE line.
-            pending = b""
-            async for chunk in response.content.iter_any():
-                *lines, pending = (pending + chunk).split(b"\n")
-                for line in lines:
-                    if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
-                        continue
-                    row = json.loads(line[6:])
-                    if row["meta_info"]["finish_reason"] is not None:
-                        rows.append(row)
         return rows

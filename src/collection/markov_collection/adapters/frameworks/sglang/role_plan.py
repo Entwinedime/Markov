@@ -1,76 +1,15 @@
-"""Plan representative workers from native modules, role duties and declared shard bindings."""
+"""Choose representatives before observation and retain actual worker/group bindings."""
 
 from __future__ import annotations
 
-import inspect
 from typing import Any
+
+from markov_collection.adapters.frameworks.sglang.module_layout import LayerCommunication
 
 
 class WorkerRolePlan:
-    @staticmethod
-    def mask_fields() -> tuple[str, ...]:
-        from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
-
-        return tuple(inspect.signature(get_masked_input_and_mask).parameters)[1:]
-
     @classmethod
-    def vocabulary(cls, model: Any, size: int) -> tuple[list[dict[str, int]], bool]:
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-
-        tables = [
-            module
-            for module in model.modules()
-            if (
-                isinstance(module, VocabParallelEmbedding)
-                and not isinstance(module, ParallelLMHead)
-                and module.enable_tp
-            )
-        ]
-        fields = cls.mask_fields()
-        bindings = [{} for _ in range(size)]
-        reusable = True
-
-        for table in tables:
-            for rank in range(size):
-                indices = table._get_indices(
-                    table.num_embeddings_padded,
-                    table.org_vocab_size_padded,
-                    table.num_embeddings,
-                    table.org_vocab_size,
-                    rank,
-                    size,
-                )
-                for field in fields:
-                    name, value = "vocab_" + field, getattr(indices, field)
-                    if name in bindings[rank] and bindings[rank][name] != value:
-                        reusable = False
-                    bindings[rank][name] = value
-
-        return bindings, reusable
-
-    @classmethod
-    def from_model(cls, model: Any, size: int) -> dict[str, Any]:
-        bindings, reusable = cls.vocabulary(model, size)
-
-        # Native root/peer control differs; a shared mask contract must also cover every input table.
-        representatives = list(range(size)) if not reusable else list(range(min(size, 2)))
-        instances = [
-            {
-                "representative": 1,
-                "environment": {"rank": rank, "tp_rank": rank, "pp_rank": 0, "ep_rank": 0},
-                "bindings": bindings[rank],
-            }
-            for rank in range(2, size)
-            if rank not in representatives
-        ]
-        return {
-            "basis": "native_vocabulary_partitions_and_root_peer_control",
-            "representatives": representatives,
-            "instances": instances,
-        }
-
-    @classmethod
-    def module_key(cls, module: Any, first_layer: int, storages: dict[int, int]) -> Any:
+    def module_key(cls, module: Any, layers: dict[int, int], storages: dict[int, int]) -> Any:
         import torch
         from sglang.srt.layers.utils.common import PPMissingLayer
 
@@ -96,8 +35,11 @@ class WorkerRolePlan:
             field = name.lstrip("_")
             if field in identities:
                 continue
-            if isinstance(value, int) and field in {"layer_id", "layer_idx", "start_layer", "end_layer"}:
-                value -= first_layer
+            if type(value) is int and field in {"layer_id", "layer_idx", "start_layer", "end_layer"} and value in layers:
+
+                # A local layer reference is distinct from an unrelated literal with the same numeric value.
+                fields[name] = ("local_layer", layers[value])
+                continue
             if isinstance(value, torch.device):
                 value = value.type
             elif isinstance(value, torch.dtype):
@@ -106,6 +48,10 @@ class WorkerRolePlan:
                 fields[name] = value
             elif field in {"quant_method", "dispatcher"}:
                 fields[name] = f"{type(value).__module__}.{type(value).__qualname__}"
+
+        communicator = LayerCommunication.read(module)
+        if communicator is not None:
+            fields["layer_communicator"] = communicator.document()
 
         tensors = []
         for name, value in (*module.named_parameters(recurse=False), *module.named_buffers(recurse=False)):
@@ -124,72 +70,61 @@ class WorkerRolePlan:
             )
         children = []
         for name, child in module.named_children():
-            key = cls.module_key(child, first_layer, storages)
+            key = cls.module_key(child, layers, storages)
             if key is not None:
                 children.append((str(len(children)) if isinstance(module, torch.nn.ModuleList) else name, key))
 
-        # Role and layer identities become bindings; implementation, local geometry and flags remain significant.
+        # Placement is bound per worker; native implementation, local geometry and flags remain significant.
         return f"{type(module).__module__}.{type(module).__qualname__}", fields, tensors, children
 
-    @classmethod
-    def from_group(cls, model: Any, parallel: dict[str, Any]) -> dict[str, Any]:
+    def __init__(self, model: Any, facts: dict[str, Any]) -> None:
         import torch.distributed as distributed
         from sglang.srt.distributed import get_world_group
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        vocabulary, reusable = cls.vocabulary(model, parallel["logical_tp"])
-        first, last = parallel["layer_range"]
-        expert = any(isinstance(module, FusedMoE) for module in model.modules())
+        parallel = facts["parallel"]
         identity = parallel["rank"]
+        layout = dict(facts["kv_layout"])
+        first, last = layout["start_layer"], layout["end_layer"]
+        layers = {layer: index for index, layer in enumerate(range(first, last + 1))}
+        layout.update(start_layer=0, end_layer=last - first)
         facts = {
-            "environment": {name: parallel[name] for name in ("rank", "tp_rank", "pp_rank", "ep_rank", "layer_range")},
-            "bindings": vocabulary[parallel["tp_rank"]],
-            "experts": expert,
+            **facts,
             "key": (
                 parallel["tp_rank"] == 0,
                 parallel["pp_rank"] == 0,
                 parallel["pp_rank"] + 1 == parallel["logical_pp"],
-                last - first,
-                cls.module_key(model, first, {}),
-                identity if not reusable else None,
+                [(name, group["role"], len(group["members"]), group["members"][0] == identity) for name, group in facts["groups"].items()],
+                layout,
+                self.module_key(model, layers, {}),
             ),
         }
         group = get_world_group().cpu_group
-        workers = [None] * distributed.get_world_size(group)
+        self.workers = [None] * distributed.get_world_size(group)
 
-        # Protocol peers already exist; exchange only initialization metadata before selecting observation.
-        distributed.all_gather_object(workers, facts, group=group)
+        # PP forwards control requests after local handling, so whole-world exchange belongs to initialization.
+        distributed.all_gather_object(self.workers, facts, group=group)
+
+    def document(self, peers) -> dict[str, Any]:
         representatives = []
-        instances = []
-
-        # Compare complete keys in memory; persist only the representative and target bindings.
-        for worker in workers:
+        bindings = {}
+        for initialized in self.workers:
+            worker = dict(initialized)
+            if peers is not None:
+                rank = worker["parallel"]["rank"]
+                worker["kv_peers"] = peers.layouts(rank)
+                worker["key"] = (worker["key"], peers.signature(rank))
             source = next((previous for previous in representatives if previous["key"] == worker["key"]), None)
             if source is None:
+                source = worker
                 representatives.append(worker)
-                continue
-            bindings: dict[str, Any] = dict(worker["bindings"])
-            offset = worker["environment"]["layer_range"][0] - source["environment"]["layer_range"][0]
-            if offset:
-                bindings["layer"] = ["add", "layer", offset]
-            if worker["experts"]:
-                bindings.update(
-                    expert_rank=worker["environment"]["ep_rank"],
-                    expert_begin=["mul", worker["environment"]["ep_rank"], "local_expert_count"],
-                )
-                if offset:
-                    bindings["expert_layer"] = ["add", "expert_layer", offset]
-            instances.append(
-                {
-                    "representative": source["environment"]["rank"],
-                    "environment": worker["environment"],
-                    "bindings": bindings,
-                }
-            )
+            bindings[str(worker["parallel"]["rank"])] = {
+                "representative": source["parallel"]["rank"],
+                **{name: value for name, value in worker.items() if name != "key"},
+            }
 
         return {
             "basis": "native_module_layout_and_group_roles",
-            "participants": len(workers),
-            "representatives": [worker["environment"]["rank"] for worker in representatives],
-            "instances": instances,
+            "participants": len(self.workers),
+            "representatives": [worker["parallel"]["rank"] for worker in representatives],
+            "workers": bindings,
         }

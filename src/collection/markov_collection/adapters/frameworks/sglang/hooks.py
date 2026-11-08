@@ -1,724 +1,430 @@
-"""Install native observation at SGLang's existing plugin boundary."""
+"""Observe native serving calls through semantic scopes and real stream boundaries."""
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
-import sys
-from collections import deque
+import time
+from contextlib import ExitStack, contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
 
+from markov_adapters.sglang.batches import BatchTensors
+from markov_adapters.sglang.pipeline import PipelineABI
+from markov_adapters.sglang.state_calls import RequestStateCalls
+
 from markov_collection.artifacts import write_json
-from markov_collection.instrumentation.recording import Recording
+from markov_collection.instrumentation.capture import SemanticCapture
 
 
 class SGLangObservation:
     def __init__(self, description: dict[str, Any]) -> None:
-        from torch.utils.weak import WeakIdKeyDictionary
-
         from markov_collection.adapters.frameworks.sglang.content import NativeContent
-        from markov_collection.adapters.frameworks.sglang.experts import ExpertObservation
-        from markov_collection.adapters.frameworks.sglang.primitives import IndexedWritePrototypes
         from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
-        from markov_collection.adapters.runtimes.ascend.concatenation import AscendConcatenation
-        from markov_collection.adapters.runtimes.ascend.matrices import AscendMatrices
-        from markov_collection.adapters.runtimes.ascend.observation import AscendOperatorObservation
-        from markov_collection.adapters.runtimes.ascend.synchronization import SynchronizationObservation
-        from markov_collection.adapters.runtimes.ascend.workspaces import AscendWorkspaces
-        from markov_collection.adapters.runtimes.pytorch.observation import TorchMarkers
+        from markov_collection.adapters.runtimes.ascend.markers import AscendMarkers
+        from markov_collection.adapters.runtimes.pytorch.boundaries import TensorBoundaries
 
+        self.description = description
         self.directory = Path(description["output"])
-        self.rank_offset = description["rank_offset"]
-        self.recording = Recording(TorchMarkers())
-        self.synchronization = SynchronizationObservation(self.recording)
-        self.workspaces = AscendWorkspaces(self.synchronization, Path(description["native_library"]))
-        self.workspace_states: dict[str, list[dict[str, int]]] = {}
-        self.operators = AscendOperatorObservation(self.recording)
-        self.content = NativeContent(self.operators.values, description)
-        self.concatenation = AscendConcatenation(self.operators)
-        selection = description["matrix_selection"]
-        self.matrices = AscendMatrices(
-            self.operators, selection["binary"], selection["limits"], self.concatenation.version
-        )
-        self.allocation: Any = None
-        self.materializations: Any = None
-        self.indexed_writes = IndexedWritePrototypes(self.operators, selection["limits"]["B"])
-        self.experts = ExpertObservation(self)
-        self.ep_size = description["ep_size"]
-
         self.window = ObservationWindow(self.directory, description)
-        self.requests = self.window.requests["source"]
-        self.shard = None
-        if "shard" in description:
-            from markov_collection.adapters.frameworks.sglang.parallel import SingleDeviceShard
-
-            shard = description["shard"]
-            self.shard = SingleDeviceShard(shard["size"], shard["rank"], self.operators.values)
-
-        self.model: Any = None
-        self.model_state: Any = None
-        self.model_stream: Any = None
+        self.capture = SemanticCapture(AscendMarkers())
+        self.request_state = RequestStateCalls(observe=description["resource_trace"])
+        self.action_values = []
+        self.tensors = TensorBoundaries(self.capture)
+        self.content = NativeContent(self.tensors, description)
+        self.native = ctypes.CDLL(None).markov_set_runtime_enabled
+        self.native.argtypes = [ctypes.c_int]
+        self.native.restype = None
+        self.native(0)
         self.selected = True
-        self.derived_role = False
-        self.observe_all_workers = description.get("observe_all_workers", False)
-        self.batch_ids: Any = WeakIdKeyDictionary()
-        self.batch_lane = 0
-        self.process_groups = None
-        if (
-            description["pp_size"] > 1
-            or description["ep_size"] > 1
-            or "disaggregation_role" in description
-            or self.observe_all_workers
-        ):
-            from markov_collection.adapters.frameworks.sglang.parallel import ProcessGroupObservation
+        self.active = False
+        self.resource_history = None
+        if description["resource_trace"]:
+            from markov_collection.adapters.frameworks.sglang.resource_history import NativeResourceHistory
 
-            self.process_groups = ProcessGroupObservation(self)
-
-        self.pipeline = None
-        if description["pp_size"] > 1:
-            from markov_collection.adapters.frameworks.sglang.pipeline import PipelineObservation
-
-            self.pipeline = PipelineObservation(self)
-
-        self.disaggregation = None
-        if "disaggregation_role" in description:
-            from markov_collection.adapters.frameworks.sglang.disaggregation import DisaggregationObservation
-
-            self.disaggregation = DisaggregationObservation(self, description["disaggregation_role"], description)
-
+            self.resource_history = NativeResourceHistory(self)
+        self.parallel = {}
         self.routing = None
-        if (description.get("serving_input") or {}).get("ep_routes"):
+        if "ep" in description["serving_input"]["configuration"]:
             from markov_collection.adapters.frameworks.sglang.native_routes import NativeExpertRoutes
 
-            self.routing = NativeExpertRoutes(self.operators.values, description)
+            self.routing = NativeExpertRoutes(self.tensors, description)
+
+    @contextmanager
+    def call(self, role: str, original: Any, *, parameters=None, arguments=None, work=None, device=False, stream=None):
+        outer = self.capture.current.get() == 0
+        try:
+            with ExitStack() as contexts:
+                call = contexts.enter_context(self.capture.call(
+                    role, original.__qualname__, f"{original.__module__}.{original.__qualname__}",
+                    parameters=parameters, arguments=arguments, work=work, device=device, stream=stream,
+                    constants=None if parameters is None else {
+                        name: parameters[name] for name in ("page_size", "sequence_capacity") if name in parameters
+                    },
+                ))
+                if outer:
+                    contexts.enter_context(self.tensors)
+                with self.request_state.record() as accesses:
+                    yield call
+                for key, requests in accesses.members.items():
+                    identities = [self.content.aliases[request] for request in requests]
+                    if not identities:
+                        continue
+                    field, mode = key.split("/")
+                    call.record["work"][key] = identities
+                    call.record.setdefault("state_accesses", []).append({
+                        "space": "slot", "pool": "local", "field": field, "access": mode,
+                        "members": key, "requests": identities, "interval": "device",
+                    })
+            if accesses.values:
+                self.action_values.append({"scope": call.identity, "values": {"state": [
+                    {**value, "request": self.content.aliases[value["request"]]} for value in accesses.values
+                ]}})
+        finally:
+            if outer:
+                self.tensors.retire()
+        if outer:
+            self.capture.runtime.retire()
 
     def load_model(self, original: Any, runner: Any) -> Any:
         from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.runtime_context import get_parallel
 
+        from markov_adapters.sglang.groups import ParallelGroups
+        from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
+
         result = original(runner)
         self.model = runner.model
         self.content.content.check_vocabulary(runner.model_config.vocab_size)
-
-        if self.routing is not None:
-            self.routing.configure(self.model, runner.model_config.hf_config.num_hidden_layers)
-
-        tp_size = self.shard.size if self.shard is not None else runner.tp_size
-        tp_rank = self.shard.rank if self.shard is not None else runner.tp_rank
-
-        # Wrapper properties vary by model; the loaded attention modules identify the actual local layer interval.
         layers = [module.layer_id for module in self.model.modules() if isinstance(module, RadixAttention)]
+        topology = get_parallel()
         self.parallel = {
-            "rank": self.rank_offset + runner.pp_rank * tp_size + tp_rank,
-            "tp_rank": tp_rank,
-            "pp_rank": runner.pp_rank,
-            "logical_tp": tp_size,
-            "logical_pp": runner.pp_size,
-            "logical_ep": get_parallel().moe_ep_size,
-            "ep_rank": get_parallel().moe_ep_rank,
+            "rank": self.description["rank_offset"] + runner.pp_rank * runner.tp_size + runner.tp_rank,
+            "tp_rank": runner.tp_rank, "pp_rank": runner.pp_rank,
+            "logical_tp": runner.tp_size, "logical_pp": runner.pp_size,
+            "logical_ep": topology.moe_ep_size, "ep_rank": topology.moe_ep_rank,
             "layer_range": [min(layers), max(layers) + 1],
         }
-        if self.process_groups is not None:
-            from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
+        self.tensors.namespace = f"rank/{self.parallel['rank']}/"
 
-            plan = WorkerRolePlan.from_group(self.model, self.parallel)
-            self.derived_role = self.parallel["rank"] not in plan["representatives"]
-            self.selected = self.observe_all_workers or not self.derived_role
-            plan["observed_roles"] = (
-                list(range(self.rank_offset, self.rank_offset + plan["participants"]))
-                if self.observe_all_workers
-                else plan["representatives"]
-            )
-            self.synchronization.set_enabled(self.selected)
-            if runner.pp_rank == 0 and tp_rank == 0:
-                write_json(self.directory / "role-plan.json", plan, indent=2)
-        elif self.shard is not None and tp_rank == 0:
-            from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
-
-            self.parallel["worker_roles"] = WorkerRolePlan.from_model(self.model, tp_size)
+        self.groups = ParallelGroups()
         self.implementation = {
-            "model_path": runner.server_args.model_path,
-            "model_config": runner.model_config.hf_config.to_dict(),
-            "dtype": str(runner.model_config.dtype),
+            "model": runner.model_config.hf_config.to_dict(), "dtype": str(runner.model_config.dtype),
             "attention_backend": runner.server_args.attention_backend,
-            "chunked_prefill_size": runner.server_args.chunked_prefill_size,
-            "enable_mixed_chunk": runner.server_args.enable_mixed_chunk,
-            "disable_radix_cache": runner.server_args.disable_radix_cache,
-            "ascend_use_fa": os.environ.get("ASCEND_USE_FA", "False").lower() in {"1", "true"},
-            "ascend_use_fia": os.environ.get("ASCEND_USE_FIA", "False").lower() in {"1", "true"},
+            "page_size": runner.server_args.page_size,
             "load_format": runner.server_args.load_format,
-            "disaggregation_mode": runner.server_args.disaggregation_mode,
-            "moe_a2a_backend": runner.server_args.moe_a2a_backend,
-            "deepep_mode": runner.server_args.deepep_mode,
-            "expert_transport": os.environ.get("DEEP_USE_ALLTOALL_MODE", "0"),
+            "disaggregation_mode": self.description["mode"],
         }
+        self.modules = ModelScopes(self, self.model)
+        if self.routing is not None:
+            from markov_collection.adapters.frameworks.sglang.expert_scopes import ExpertScopes
 
+            self.routing.configure(self.modules.experts, self.modules.expert_layers, runner.model_config.hf_config.num_hidden_layers)
+            self.experts = ExpertScopes(self, self.modules.experts)
         return result
 
-    def record_batch(self, scheduler: Any, batch: Any, observation: str) -> int:
-        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
+    def prepare_roles(self) -> None:
+        from markov_collection.adapters.frameworks.sglang.role_plan import WorkerRolePlan
 
-        phase = "control"
-        members = []
-        if batch is not None:
-            phase = BatchTensors.phase(batch)
-            with self.operators.values.metadata():
-                members = BatchTensors.members(batch)
+        # All model stages are initialized together; a later scheduler request cannot run a world collective.
+        sites = set(self.modules.bindings)
+        if self.routing is not None:
+            sites.update(self.experts.sites)
+        facts = {
+            "parallel": self.parallel,
+            "groups": self.groups.document(self.description["rank_offset"]),
+            "kv_layout": self.kv_layout.document(),
+            "modules": [path for path, _ in self.model.named_modules() if path in sites],
+            "expert_layers": self.modules.expert_layers,
+        }
+        self.roles = WorkerRolePlan(self.model, facts)
+        if any(worker["expert_layers"] for worker in self.roles.workers) != (self.routing is not None):
+            raise ValueError("MoE models require a declared expert topology and routes; dense models do not accept them")
+        self.content.configure(self.roles.workers)
 
-        identity = len(self.recording.batches)
-        self.recording.batches.append(
-            {
-                "id": identity,
-                "phase": phase,
-                "rank": self.parallel["rank"],
-                "lane": self.batch_lane,
-                "members": members,
-                "parameters": {
-                    "M": sum(item["new_tokens"] for item in members),
-                    "max_query_tokens": max((item["new_tokens"] for item in members), default=0),
-                    "B": len(members),
-                    "prefill_members": sum(item["phase"] == "prefill" for item in members),
-                    "decode_members": sum(item["phase"] == "decode" for item in members),
-                    "prefill_tokens": sum(item["new_tokens"] for item in members if item["phase"] == "prefill"),
-                    "R": scheduler.req_to_token_pool.size,
-                    "slot_capacity": scheduler.req_to_token_pool.req_to_token.shape[0] - 1,
-                    "kv_pages": scheduler.token_to_kv_pool_allocator.size
-                    // scheduler.token_to_kv_pool_allocator.page_size,
-                    "max_sequence_tokens": max(
-                        (item["context_tokens"] + item["new_tokens"] for item in members), default=0
-                    ),
-                },
-                "observation": observation,
-            }
-        )
-        if batch is not None:
-            self.batch_ids[batch] = identity
-        return identity
+    def plan_roles(self) -> None:
+        peers = None
+        if self.description["mode"] != "null":
+            from markov_adapters.sglang.kv_peers import PdPeerBindings
 
-    def observation(self, requests: Any) -> str | None:
-        return self.window.observation(requests) if self.selected else None
+            workers = {}
+            for path in (self.directory / "kv-pools").glob("*.json"):
+                worker = json.loads(path.read_text())
+                workers[worker["parallel"]["rank"]] = worker
+            peers = PdPeerBindings(workers)
+
+        # The shared warmup barrier already published every endpoint; final selection needs no native collective.
+        plan = self.roles.document(peers)
+        self.worker_roles = plan["workers"]
+        self.selected = self.description["observe_all_workers"] or self.parallel["rank"] in plan["representatives"]
+        plan["observed_roles"] = self.description["native_participants"] if self.description["observe_all_workers"] else plan["representatives"]
+        if self.parallel["pp_rank"] == 0 and self.parallel["tp_rank"] == 0:
+            write_json(Path(self.description["instance_directory"]) / "role-plan.json", plan, indent=2)
 
     def request(self, original: Any, scheduler: Any, request: Any) -> Any:
         self.window.begin(request.rid)
+        if self.window.phase == "source" and self.selected and not self.active:
+            self.capture.runtime.calibrate()
+            self.window_scope = self.capture.runtime.scope("markov.window")
+            self.window_scope.__enter__()
+            self.active = True
+            self.native(1)
+            if self.resource_history is not None:
+                self.resource_history.begin()
         return original(scheduler, request)
 
-    def begin_batch(self, scheduler: Any) -> None:
-        self.operators.begin_batch()
-        with self.operators.values.metadata():
-            mapping = scheduler.req_to_token_pool.req_to_token
-            shapes = self.operators.values.shapes
+    def receive(self, original: Any, receiver: Any, *, ingress=False) -> Any:
+        from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
 
-            # Pool capacity belongs to every value version, before preparation first reads or writes it.
-            shapes.bind_shape(mapping, (shapes.symbol("slot_capacity") + 1, mapping.shape[1]))
+        attempt = None
+        if (ingress and self.resource_history is not None and self.selected
+                and receiver.ps.pp_rank == 0 and receiver.ps.attn_tp_rank == 0 and receiver.ps.attn_cp_rank == 0):
+
+            # The first source pull precedes profiler activation; warmup requests have no source identities.
+            context = self.calls.scheduler_work()["context"] if self.window.phase != "warmup" else None
+            attempt = {"context": context, "begin_raw_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)}
+
+        requests = original(receiver)
+        received_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        if ingress and receiver.ps.pp_rank != 0:
+            return requests
+        identities = []
+
+        # Non-ingress ranks return None before broadcast; later PP stages receive forwarded input, not new arrivals.
+        for item in requests or ():
+            if isinstance(item, BatchTokenizedGenerateReqInput):
+                identities.extend(request.rid for request in item)
+            elif isinstance(item, TokenizedGenerateReqInput):
+                identities.append(item.rid)
+
+        if attempt is not None:
+            attempt["message_count"] = len(requests or ())
+        self.window.receive(identities, received_ns, ingress=ingress, attempt=attempt)
+        return requests
+
+    def batch_work(self, batch: Any) -> dict[str, Any]:
+        members = BatchTensors.members(batch)
+        for member in members:
+            member["id"] = self.content.aliases[member["id"]]
+        return {
+            "phase": BatchTensors.phase(batch), "rank": self.parallel["rank"], "members": members,
+            "context": {"members": self.calls.progress(batch.reqs)},
+        }
+
+    def model_work(self, batch: Any):
+        work = self.batch_work(batch)
+        parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in work["members"]))
+        parameters.update(BatchTensors.model_parameters(batch, parameters["input_tokens"]))
+        if self.routing is not None:
+            parameters.update(self.routing.geometry.parameters(work["members"], parameters["model_tokens"]))
+        return parameters, work
 
     def run_batch(self, original: Any, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
-        import torch
-        from sglang.srt.layers.radix_attention import RadixAttention
-
-        from markov_collection.adapters.frameworks.sglang.attention import AttentionCall
-        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
-        from markov_collection.adapters.frameworks.sglang.preparation import BatchPreparationCall
-        from markov_collection.adapters.runtimes.pytorch.modules import ModuleObservation
-
-        identity = self.batch_ids.get(batch)
-        if identity is None:
+        if not self.active:
             return original(scheduler, batch, *args, **kwargs)
+        parameters, work = self.model_work(batch)
+        with self.request_state.members(batch), self.call("run_batch", original, parameters=parameters, work=work, device=True) as call:
+            if self.resource_history is not None:
+                self.resource_history.batch(call.record["id"], batch)
+            parent = self.capture.scopes[call.record["parent"]]
+            if parent["role"] == "launch":
 
-        phase = self.recording.batches[identity]["phase"]
-        if self.recording.batches[identity]["observation"] == "baseline":
-            with self.recording.baseline(identity):
-                result = original(scheduler, batch, *args, **kwargs)
-            if self.pipeline is not None:
-                self.pipeline.remember(identity, result)
+                # PP launch and its run_batch child share the same declared batch ABI.
+                call.record["arguments"] = {name: name for name in parameters if name not in call.record["constants"]}
+            result = original(scheduler, batch, *args, **kwargs)
+            self.result_port(call, result, "output")
             return result
 
-        # Decode relays tokens before the model wrapper binds inputs; serving batches are nonempty by contract.
-        with self.recording.scope(phase.capitalize(), batch=identity) as scope, self.operators:
-            with self.operators.values.metadata():
-                for name in ("M", "B"):
-                    self.operators.values.bounded_parameter(name, 1, sys.maxsize)
-                AttentionCall.bind_cache(self.operators.values, scheduler.token_to_kv_pool_allocator.get_kvcache())
-                for tensor in BatchTensors.read(batch).values():
-                    self.operators.values.bind(tensor, {0: "B"})
-                if phase == "mixed":
-                    self.operators.values.bind(batch.prefill_input_ids_cpu, {0: "prefill_tokens"})
-                    self.operators.values.bind(batch.mix_running_indices, {0: "decode_members"})
-                self.operators.values.bind_shape(
-                    scheduler.future_map.output_tokens_buf, (self.operators.values.shapes.symbol("slot_capacity") + 1,)
-                )
+    def batch_ports(
+        self, call: Any, batch: Any, direction: str,
+        *, names=("request_slots", "sequence_lengths", "cache_locations"),
+    ) -> None:
+        columns = BatchTensors.boundaries(batch)
+        for name in names:
+            tensor, shape = columns[name]
+            call.port(name, direction, self.tensors.observe(tensor, shape), use="device")
 
-            fields = self.pipeline.fields if self.pipeline is not None and phase == "decode" else BatchTensors.fields
-            scope.metadata["ports"] = {
-                "inputs": self.operators.values.port_values(
-                    {
-                        **BatchPreparationCall.model_inputs(batch, fields),
-                        "token_relay": scheduler.future_map.output_tokens_buf,
-                    }
-                ),
-                "outputs": {},
-            }
+    def sample(self, original: Any, runner: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.active:
+            return original(runner, *args, **kwargs)
+        with self.call("sample", original, device=True):
+            return original(runner, *args, **kwargs)
 
-            # Decode contributes one token per member, so its token axis is B by definition.
-            token_axis = "B" if phase == "decode" else "M"
-            member_axis = "B"
-            if self.ep_size > 1:
-                from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
+    def forward(self, original: Any, runner: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.active:
+            return original(runner, batch, *args, **kwargs)
 
-                with self.operators.values.metadata():
-                    ExpertModelGeometry.bind_batch(self.operators.values, token_axis, member_axis, self.ep_size)
-                token_axis, member_axis = "model_tokens", "model_members"
-            proxy = args[0] if args else kwargs.get("pp_proxy_tensors")
-            if proxy is not None:
-                payload = self.pipeline.payload(proxy.tensors)
-                with self.operators.values.metadata():
-                    for name, tensor in payload.items():
-                        axis = f"proxy_{name}_tokens"
-                        scope.metadata.setdefault("parameters", {})[axis] = tensor.shape[0]
-                        self.operators.values.bounded_parameter(axis, 1, sys.maxsize)
+        # The initialized native registry owns these allocations across calls; a module path does not.
+        with self.tensors.metadata():
+            registry = runner.eager_runner._eager_registry
+            owners = {}
+            for name in sorted(registry.slot_names()):
+                tensor = registry.get_slot(name).buffer
+                if tensor is not None:
+                    owner = owners.setdefault(tensor.untyped_storage()._cdata, f"eager/{name}")
+                    self.tensors.bind_buffer(tensor, owner)
+        with self.call("model", original, device=True) as call:
+            call.record["parameters"].update(input_tokens=int(batch.input_ids.numel()), members=int(batch.batch_size))
+            self.batch_ports(call, batch, "input")
+            return original(runner, batch, *args, **kwargs)
 
-                        # The previous stage supplies this geometry; EP can forward a local token shard.
-                        self.operators.values.bind(tensor, {0: axis})
-                    scope.metadata["ports"]["inputs"].update(
-                        self.operators.values.port_values({f"proxy.{name}": tensor for name, tensor in payload.items()})
-                    )
-            scope.metadata["required_inputs"] = sorted(set(scope.metadata["ports"]["inputs"]) - {"token_relay"})
-            inputs = {
-                "input_ids": {0: token_axis},
-                "positions": {0: token_axis},
-                "forward_batch.out_cache_loc": {0: token_axis},
-                "forward_batch.seq_lens": {0: member_axis},
-                "forward_batch.req_pool_indices": {0: member_axis},
-                "forward_batch.extend_seq_lens": {0: member_axis},
-            }
-            from markov_collection.adapters.frameworks.sglang.model import ModelForwardCall
-            from markov_collection.adapters.runtimes.pytorch.modules import ModuleState
+    def model_geometry(self, tokens: int, members: int) -> None:
 
-            if self.model_state is None:
-                with self.operators.values.metadata():
-                    backend = scheduler.tp_worker.model_runner.attn_backend
+        # Check actual model tensors against the shared native padding contract, without replacing predicted features.
+        parameters = self.capture.scopes[self.capture.current.get()]["parameters"]
+        if (tokens, members) != (parameters["model_tokens"], parameters["model_members"]):
+            raise ValueError("native model geometry differs from the declared eager batch layout")
 
-                    # The backend owns these persistent masks independently of model parameters and batch metadata.
-                    resources = {
-                        f"attention.state.{name}": tensor
-                        for name, tensor in vars(backend.ascend_attn_mask_builder).items()
-                        if isinstance(tensor, torch.Tensor)
-                    }
-                    self.model_state = ModuleState(self.model, resources)
+    def result_port(self, call: Any, output: Any, direction: str) -> None:
+        tensor = output.next_token_ids
+        if tensor is not None:
+            use = "host" if tensor.device.type == "cpu" else "device"
+            call.port("next_token_ids", direction, self.tensors.observe(tensor, ["members"]), use=use)
 
-            with ModuleObservation(
-                self.recording,
-                self.model,
-                self.operators.values,
-                inputs,
-                {
-                    RadixAttention: AttentionCall,
-                    **self.experts.module_calls(self.model),
-                },
-                root_call=partial(ModelForwardCall, state=self.model_state),
-            ):
-                result = original(scheduler, batch, *args, **kwargs)
+        proxy = output.pp_hidden_states_proxy_tensors
+        if proxy is not None:
+            for name, tensor in PipelineABI.proxy_tensors(proxy).items():
+                rule = self.tensors.shape_rule(tensor)
+                call.port(f"proxy.{name}", direction, self.tensors.observe(tensor, rule), use="device")
 
-            scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
-                {
-                    **BatchTensors.read(batch),
-                    "token_relay": scheduler.future_map.output_tokens_buf,
-                }
-            )
-            if result.next_token_ids is not None:
-                scope.metadata["ports"]["outputs"].update(
-                    self.operators.values.port_values({"sampled_tokens": result.next_token_ids})
-                )
-            if self.pipeline is not None:
-                self.pipeline.remember(identity, result)
-                if result.pp_hidden_states_proxy_tensors is not None:
-                    scope.metadata["ports"]["outputs"].update(
-                        self.operators.values.port_values(
-                            {
-                                f"proxy.{name}": tensor
-                                for name, tensor in result.pp_hidden_states_proxy_tensors.tensors.items()
-                            }
-                        )
-                    )
-            return result
+    def pending(self, scheduler: Any) -> bool:
+        return self.description["pp_size"] > 1 and bool(scheduler.send_proxy_work or scheduler.send_output_work)
 
-    def forward(self, original: Any, *args: Any, **kwargs: Any) -> Any:
+    def can_flush(self) -> bool:
+        if not self.scheduler.is_fully_idle() or self.pending(self.scheduler):
+            return False
+
+        # Input dispatch may be mid-pipeline round; only on_idle closes the observed control flow.
+        return self.window.phase is None or self.window.drained
+
+    def flush_wrapper(self, original: Any, wrapper: Any, *, flush_cache: Any, is_fully_idle: Any, ipc_channels: Any) -> None:
+        self.scheduler = flush_cache.__self__
+        original(wrapper, flush_cache=flush_cache, is_fully_idle=self.can_flush, ipc_channels=ipc_channels)
+
+    def drain(self, scheduler: Any) -> None:
+        if not self.window.inputs_complete() or self.window.drained or self.pending(scheduler):
+            return
+        if not scheduler.is_fully_idle() or self.capture.current.get() != 0:
+            return
         import torch
 
-        # Warmup discovers the context actually used by the model, including native PP's forward stream.
-        self.model_stream = torch.npu.current_stream()
-        if self.allocation is None:
-            with self.matrices:
-                return original(*args, **kwargs)
-        if self.recording.current_scope.get() is None:
-            return original(*args, **kwargs)
-
-        with self.recording.scope("ModelSubmit"):
-            return original(*args, **kwargs)
-
-    def process_result(self, original: Any, scheduler: Any, batch: Any, result: Any) -> Any:
-        identity = self.batch_ids.get(batch)
-        if identity is None:
-            return original(scheduler, batch, result)
-        if self.recording.batches[identity]["observation"] == "baseline":
-            with self.recording.baseline(identity):
-                return original(scheduler, batch, result)
-
-        with self.recording.scope("ResultProcessed", batch=identity) as scope, self.operators:
-            scope.metadata["ports"] = {
-                "inputs": self.operators.values.port_values(
-                    {
-                        "sampled_tokens": result.next_token_ids,
-                        "free_pages": scheduler.token_to_kv_pool_allocator.free_pages,
-                    }
-                ),
-                "outputs": {},
-            }
-            scope.metadata["shape_contracts"] = [
-                {"value": scope.metadata["ports"]["inputs"]["sampled_tokens"], "shape": ["B"]}
-            ]
-
-            returned = original(scheduler, batch, result)
-            scope.metadata["ports"]["outputs"] = self.operators.values.port_values(
-                {"free_pages": scheduler.token_to_kv_pool_allocator.free_pages}
-            )
-
-            # Capture effects after native result handling has updated request lifetimes.
-            with self.operators.values.metadata():
-                scope.metadata["effects"] = [
-                    {"id": request.rid, "generated_tokens": len(request.output_ids), "finished": request.finished()}
-                    for request in batch.reqs
-                ]
-
-            return returned
-
-    def publish(self, original: Any, sender: Any, output: Any, *args: Any, **kwargs: Any) -> Any:
-        from sglang.srt.managers.io_struct import BatchTokenIDOutput
-
-        # A prefill server acknowledges ownership transfer; only decode publishes user tokens.
-        if (
-            self.disaggregation is not None
-            and self.disaggregation.role == "prefill"
-            and isinstance(output, BatchTokenIDOutput)
-            and set(output.rids) <= self.requests
-            and output.rids
-        ):
-            with self.recording.scope("KvAcknowledged", requests=list(output.rids)):
-                return original(sender, output, *args, **kwargs)
-
-        if (
-            self.recording.current_scope.get() is None
-            or not isinstance(output, BatchTokenIDOutput)
-            or sender.socket is None
-        ):
-            return original(sender, output, *args, **kwargs)
-
-        with self.recording.scope(
-            "RequestOutput", requests=list(output.rids), generated_tokens=list(output.completion_tokens)
-        ):
-            return original(sender, output, *args, **kwargs)
-
-    def stash(self, original: Any, relay: Any, indices: Any, payload: Any) -> Any:
-        from markov_collection.instrumentation.calls import NativeCall
-
-        if self.recording.current_scope.get() is None:
-            return original(relay, indices, payload)
-
-        values = self.operators.values
-
-        # ReqToTokenPool reserves slot zero; FutureMap uses the same padded capacity.
-        with values.metadata():
-            values.bind_shape(relay.output_tokens_buf, (values.shapes.symbol("slot_capacity") + 1,))
-
-        return NativeCall(
-            self.recording,
-            values,
-            "sglang.FutureMap.stash",
-            original,
-            {"future_indices": {0: "B"}, "payload.bonus_tokens": {0: "B"}},
-        )(relay, indices, payload)
-
-    def release_pages(self, original: Any, pool: Any, free_index: Any) -> Any:
-        from markov_collection.adapters.frameworks.sglang.state import PageReleaseCall
-
-        if self.recording.current_scope.get() is None:
-            return original(pool, free_index)
-
-        with self.operators.values.metadata():
-            call = PageReleaseCall(self.recording, self.operators.values, original, pool)
-        return call(pool, free_index)
-
-    def request_cache(self, original: Any, cache: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        from sglang.srt.mem_cache.radix_cache import RadixCache
-
-        from markov_collection.adapters.frameworks.sglang.prefix import PrefixServiceCall
-        from markov_collection.adapters.frameworks.sglang.state import RequestCacheCall
-
-        if self.recording.current_scope.get() is None:
-            return original(cache, request, *args, **kwargs)
-
-        values = self.operators.values
-        if isinstance(cache, RadixCache):
-            if not cache.disable:
-                return PrefixServiceCall(
-                    self.recording, values, original.__qualname__, original, {},
-                    scope_metadata={"requests": [request.rid]},
-                )(cache, request, *args, **kwargs)
-
-            # Disabled RadixCache keeps no unfinished mapping; ChunkCache has a different native contract.
-            if original.__name__ == "cache_unfinished_req":
-                return original(cache, request, *args, **kwargs)
-        call = RequestCacheCall(values, original, cache, request, original.__name__ == "cache_finished_req")
-        return call(cache, request, *args, **kwargs)
+        # Drain the observed device tails before native flush changes logical KV state.
+        torch.npu.synchronize()
+        self.native(0)
+        if self.active:
+            self.window_scope.__exit__(None, None, None)
+            self.capture.runtime.calibrate()
+            self.active = False
+            if self.resource_history is not None:
+                self.resource_history.close()
+            if self.description["pp_size"] > 1:
+                self.pipeline.signals.enabled = False
+        self.window.drain(self.parallel["rank"])
 
     def flush(self, original: Any, scheduler: Any, empty_cache: bool = True) -> Any:
-
-        # Reset logical pools without discarding the allocator state established by uniform warmup.
         result = original(scheduler, empty_cache=False)
-        if not result or not self.window.drained:
-            return result
+        if result and self.window.drained:
+            registration = self.kv_transfers.registration()
+            if registration is not None:
 
-        self.complete_window(scheduler)
+                # Every endpoint supplies layout evidence even when its computation is represented by another worker.
+                write_json(self.directory / "kv-pools" / f"{self.parallel['rank']}.json", {
+                    "mode": self.description["mode"], "parallel": self.parallel, "layout": self.kv_layout.document(),
+                    "page_size": self.implementation["page_size"], "registration": registration,
+                })
+            if self.window.phase == "source" and self.selected:
+                import torch
+                import torch_npu
+
+                self.active = False
+                self.implementation["scheduling"] = {
+                    "chunked_prefill": scheduler.chunked_prefill_size is not None,
+                    "mixed_batches": scheduler.is_mixed_chunk,
+                }
+                recording = self.capture.document({
+                    "framework": "sglang", "torch": torch.__version__, "torch_npu": torch_npu.__version__,
+                    "device": torch.npu.get_device_name(), "device_index": torch.npu.current_device(),
+                    "parallel": self.parallel, "implementation": self.implementation, "kv_layout": self.kv_layout.document(),
+                    "worker_roles": self.worker_roles,
+                    "initial_state": {"logical_kv": "empty_after_native_flush", "workspace": "uniform_native_warmup"},
+                    "closure": {"native_idle": True, "device_drained": True, "pending_native_transfers": 0},
+                })
+                role = self.worker_roles[str(self.parallel["rank"])]
+                for name in ("expert_layers", "kv_peers"):
+                    if name in role:
+                        recording["environment"][name] = role[name]
+                recording["request_receipts"] = self.window.receipts
+                recording["device_clock"] = self.capture.runtime.clock_samples
+                recording["request_receive_rounds"] = self.window.receive_rounds
+                recording["request_ingress"] = self.window.ingress
+                recording["state_queries"] = self.calls.queries
+                recording["protocol_states"] = self.kv_transfers.states
+                recording["kv_session"] = None if registration is None else registration["session"]
+                recording["kv_endpoint"] = None if registration is None else registration["control_endpoint"]
+                if self.resource_history is not None:
+                    recording["request_input_attempts"] = self.window.input_attempts
+                    recording["action_values"] = self.action_values
+                    write_json(self.directory / "resources" / f"rank-{self.parallel['rank']}.json", self.resource_history.document())
+                write_json(self.directory / f"rank-{self.parallel['rank']}.json", recording)
+            self.window.prepared_phase = self.window.phase
         return result
 
     def idle(self, original: Any, scheduler: Any) -> Any:
         if scheduler.is_fully_idle():
-            self.window.native_idle = True
-            self.drain_if_ready(scheduler)
+            self.drain(scheduler)
             if self.window.prepared_phase is not None:
                 self.window.complete(self.parallel["rank"], scheduler.idle_sleeper is not None)
-
-        # Publish readiness before an optional native idle sleep can wait for the next phase's input.
         return original(scheduler)
 
-    def flush_wrapper(
-        self, original: Any, wrapper: Any, *, flush_cache: Any, is_fully_idle: Any, ipc_channels: Any,
-    ) -> None:
-        self.scheduler = flush_cache.__self__
-        original(wrapper, flush_cache=flush_cache, is_fully_idle=self.can_flush, ipc_channels=ipc_channels)
-
-    def can_flush(self) -> bool:
-        if not self.scheduler.is_fully_idle():
-            return False
-        if self.window.phase is not None and self.window.close_requested():
-
-            # The native deferred flush waits for the same device and send drain as the observation window.
-            self.drain_if_ready(self.scheduler)
-            return self.window.drained
-        return True
-
-    def sleep_on_idle(self, original: Any, sleeper: Any) -> None:
-        if self.window.prepared_phase is not None:
+    def sleep(self, original: Any, sleeper: Any) -> None:
+        if self.window.prepared_phase is not None or self.pending(self.scheduler):
             return
-        if self.pipeline is not None and self.pipeline.pending_work(self.scheduler):
-            return
-        if self.window.phase is not None and self.window.close_requested():
-            return
-
-        # Acquisition preserves warmed allocators and waits for real ingress instead of restarting idle PP cycles.
+        # Preserve warmed allocation caches while waiting for the next phase, outside observed serving work.
         sleeper.poller.poll()
-
-    def profile(self, original: Any, profiler: Any, request: Any) -> Any:
-        from sglang.srt.managers.io_struct import ProfileReqType
-
-        if self.process_groups is None:
-            result = original(profiler, request)
-        else:
-            result = self.process_groups.profile_request(original, profiler, request)
-
-        # Every participant completes the phase even when only representatives export a profile.
-        if request.req_type == ProfileReqType.START_PROFILE:
-            self.window.prepared_phase = "profiler"
-        return result
-
-    def drain_if_ready(self, scheduler: Any) -> None:
-        if (
-            self.window.phase is None or self.window.drained or not self.window.native_idle
-            or self.recording.current_scope.get() is not None
-        ):
-            return
-        if self.pipeline is not None and self.pipeline.pending_work(scheduler):
-            return
-        if not self.window.close_requested():
-            return
-
-        import torch
-
-        # Finish device tails before the parent asks native flush to change the pool and cache state.
-        torch.npu.synchronize()
-        self.window.drain(self.parallel["rank"])
-
-    def complete_window(self, scheduler: Any) -> None:
-        import torch
-
-        from markov_collection.adapters.frameworks.sglang.allocation import SGLangAllocation
-        from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
-        from markov_collection.adapters.runtimes.ascend.materialization import AscendMaterializations
-
-        if self.allocation is None:
-            pool = scheduler.token_to_kv_pool_allocator
-            self.allocation = SGLangAllocation(self.operators, pool.page_size, str(pool.device), pool.need_sort)
-            self.indexed_writes.request_map(scheduler.req_to_token_pool.req_to_token)
-
-            # Prefill members remain unpadded; Decode follows native MLP token alignment.
-            self.materializations = AscendMaterializations(
-                self.operators,
-                pool.page_size,
-                scheduler.req_to_token_pool.req_to_token.dtype,
-                ("B", "max_sequence_tokens"),
-                (1, self.ep_size),
-            )
-            with torch.npu.stream(self.model_stream):
-                self.matrices.prepare()
-            self.workspace_policy = self.workspaces.reserve(
-                self.matrices.description["cube_cores"],
-                SGLangPrimitives.attention_geometries(self.model),
-                [torch.npu.current_stream().npu_stream, self.model_stream.npu_stream],
-            )
-        self.concatenation.warmup()
-        self.allocation.warmup()
-        with torch.npu.stream(self.model_stream):
-            self.materializations.warmup()
-        self.indexed_writes.warmup()
-
-        has_source = self.selected and self.window.phase == "source"
-        if has_source:
-            self.concatenation.capture()
-            self.allocation.capture()
-            with torch.npu.stream(self.model_stream):
-                self.matrices.capture()
-                self.materializations.capture()
-            self.indexed_writes.capture()
-            self.preparation.transitions.capture()
-
-        # Observation helpers run after native work and finish before the next acquisition phase starts.
-        torch.npu.synchronize()
-
-        if self.disaggregation is not None and self.derived_role:
-            write_json(self.directory / f"rank-{self.parallel['rank']}-layout.json", self.parallel["kv_layout"])
-
-        self.workspace_states[self.window.phase] = self.workspaces.snapshot()
-        if self.selected and self.disaggregation is not None and self.window.phase in ("baseline", "source"):
-
-            # A later source failure must not erase SDK calls from an already drained baseline.
-            self.disaggregation.transport.write(self.directory / "runtime")
-        if self.selected and self.window.phase == "source":
-            self.write()
-
-        if self.disaggregation is not None:
-
-            # Native queues borrow this allocator; keep the object and canonicalize only its released slots.
-            allocator = scheduler.req_to_metadata_buffer_idx_allocator
-            allocator.free_slots = deque(sorted(allocator.free_slots))
-
-        self.window.prepared_phase = self.window.phase
-
-    def write(self) -> None:
-        import torch
-        import torch_npu
-
-        observation = self.recording.document(
-            {
-                "framework": "sglang",
-                "torch": torch.__version__,
-                "torch_npu": torch_npu.__version__,
-                "cann": self.concatenation.version,
-                "matrix_selection": self.matrices.description,
-                "observer": __file__,
-                "observation_window": {
-                    "start": "prewarmed_idle_ingress", "native_flush": True,
-                    "native_idle": True, "pending_transfers": 0,
-                },
-                **self.parallel,
-                "source_transport": "native_disaggregation"
-                if self.disaggregation is not None
-                else "native_process_groups"
-                if self.process_groups is not None
-                else "physical_group_of_one",
-                "implementation": self.implementation,
-                "device": torch.npu.get_device_name(),
-                "device_index": torch.npu.current_device(),
-                "workspace_boundaries": self.workspace_states,
-                "workspace_policy": self.workspace_policy,
-                "model_state": self.model_state.names if self.model_state is not None else {},
-            },
-        )
-
-        # Dispatch timing is observation evidence, not part of a template's environment or identity.
-        observation["request_receipts"] = self.window.receipts
-        write_json(self.directory / f"rank-{self.parallel['rank']}.json", observation)
-        self.synchronization.write(self.directory / "runtime")
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-        from markov_collection.adapters.frameworks.sglang.batches import BatchTensors
-        from markov_collection.adapters.frameworks.sglang.prefix import PrefixObservation
-        from markov_collection.adapters.frameworks.sglang.preparation import SGLangPreparation
-        from markov_collection.adapters.frameworks.sglang.primitives import SGLangPrimitives
-        from markov_collection.adapters.frameworks.sglang.scheduling import SGLangScheduling
-        from markov_collection.adapters.runtimes.ascend.functions import AscendFunctionObservation
-        from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
+        from markov_collection.adapters.frameworks.sglang.communications import NativeCommunications
+        from markov_collection.adapters.frameworks.sglang.profiles import NativeProfiles
+        from markov_collection.adapters.frameworks.sglang.kv_scopes import NativeKvScopes
+        from markov_collection.adapters.frameworks.sglang.flow_scopes import FlowScopes
 
-        functions = AscendFunctionObservation(self.operators.values)
-        SGLangPrimitives(self.operators.values).install()
-        self.experts.install()
-        fields = BatchTensors.fields
-
-        # PP keeps returned tokens in the batch until its next model invocation.
-        if self.pipeline is not None:
-            fields = self.pipeline.fields
-        self.preparation = SGLangPreparation(self.operators, fields, self.ep_size > 1)
-        self.preparation.install()
-        SGLangScheduling(self).install()
-        PrefixObservation(self.operators.values, self.preparation.match_prefix).install()
-        if self.ep_size > 1:
-            from markov_collection.adapters.frameworks.sglang.expert_geometry import ExpertModelGeometry
-
-            ExpertModelGeometry(self.operators.values).install()
-
-        # Framework-specific hook paths stay at this installation boundary.
         targets = {
             "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.load_model,
             "sglang.srt.model_executor.model_runner.ModelRunner.forward": self.forward,
-            "sglang.srt.managers.scheduler.Scheduler.run_batch": self.run_batch,
             "sglang.srt.managers.scheduler.Scheduler.handle_generate_request": self.request,
-            "sglang.srt.managers.scheduler.Scheduler.process_batch_result": self.process_result,
+            "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver.recv_requests": self.receive,
+            "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver._pull_raw_reqs": partial(self.receive, ingress=True),
+            "sglang.srt.managers.scheduler.Scheduler.run_batch": self.run_batch,
+            "sglang.srt.model_executor.model_runner.ModelRunner.sample": self.sample,
             "sglang.srt.managers.scheduler.Scheduler.flush_cache": self.flush,
             "sglang.srt.managers.scheduler.Scheduler.on_idle": self.idle,
-            "sglang.srt.managers.scheduler_components.idle_sleeper.IdleSleeper.maybe_sleep": self.sleep_on_idle,
+            "sglang.srt.managers.scheduler_components.idle_sleeper.IdleSleeper.maybe_sleep": self.sleep,
             "sglang.srt.managers.scheduler_components.flush_wrapper.SchedulerFlushWrapper.__init__": self.flush_wrapper,
-            "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile": self.profile,
-            "sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output": self.publish,
-            "sglang.srt.managers.overlap_utils.FutureMap.stash": self.stash,
-            "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.free": self.release_pages,
-            "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_finished_req": self.request_cache,
-            "sglang.srt.mem_cache.chunk_cache.ChunkCache.cache_unfinished_req": self.request_cache,
-            "sglang.srt.mem_cache.radix_cache.RadixCache.cache_finished_req": self.request_cache,
-            "sglang.srt.mem_cache.radix_cache.RadixCache.cache_unfinished_req": self.request_cache,
-            "torch_npu.profiler.tensorboard_trace_handler": AscendTrace.capture_handler,
-            functions.target: functions.split_qkv,
-            "flash_attn_npu_v3.flash_attn_with_kvcache": functions.flash_attention,
         }
-        for target, observer in targets.items():
-            HookRegistry.register(target, observer, HookType.AROUND)
+        for target, hook in targets.items():
+            HookRegistry.register(target, hook, HookType.AROUND)
+        self.request_state.install()
+        NativeProfiles(self).install()
+        NativeCommunications(self).install()
+        self.kv_transfers = NativeKvScopes(self)
+        self.kv_transfers.install()
+        self.calls = FlowScopes(self)
+        self.calls.install()
+        if self.description["pp_size"] > 1:
+            from markov_collection.adapters.frameworks.sglang.pipeline_scopes import PipelineScopes
 
+            self.pipeline = PipelineScopes(self)
+            self.pipeline.install()
+        self.content.install()
         if self.routing is not None:
             self.routing.install()
-        self.content.install()
-
-        if self.shard is not None:
-            self.shard.install()
-        if self.process_groups is not None:
-            self.process_groups.install()
-        if self.pipeline is not None:
-            self.pipeline.install()
-        if self.disaggregation is not None:
-            self.disaggregation.install()
 
 
 def install() -> None:
-    description = os.environ.get("MARKOV_GRAPH_SESSION")
-    if description is not None:
-        SGLangObservation(json.loads(Path(description).read_text())).install()
+    path = os.environ.get("MARKOV_GRAPH_SESSION")
+    if path is not None:
+        SGLangObservation(json.loads(Path(path).read_text())).install()

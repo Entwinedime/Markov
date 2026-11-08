@@ -8,18 +8,6 @@
 
 namespace markov {
 
-const char * phase_name(Phase phase) {
-    switch (phase) {
-    case Phase::Prefill:
-        return "prefill";
-    case Phase::Decode:
-        return "decode";
-    case Phase::Mixed:
-        return "mixed";
-    }
-    throw std::logic_error("unknown serving phase");
-}
-
 std::vector<Request> Request::read(const nlohmann::json & source) {
     if (!source.is_array() || source.empty()) throw std::invalid_argument("serving needs a nonempty request array");
     constexpr std::array fields{ "id", "arrival_ns", "prompt_tokens", "output_tokens", "prefix_id" };
@@ -58,72 +46,6 @@ ServingSettings::ServingSettings(std::int64_t requests, std::int64_t tokens, std
       max_prefill_tokens(prefill) {
     if (requests <= 0 || page <= 0 || tokens < page || prefill <= 0)
         throw std::invalid_argument("serving needs positive request/prefill capacity and at least one KV page");
-}
-
-// Prefill can contribute several tokens per member; Decode contributes one.
-std::int64_t Batch::new_tokens() const {
-    std::int64_t result = 0;
-    for (const auto & member : members) result += member.new_tokens;
-
-    return result;
-}
-
-std::string_view ServingAction::step_name() const {
-    switch (step) {
-    case ServingStep::Batch:
-        return "batch";
-    case ServingStep::Schedule:
-        return "schedule";
-    case ServingStep::Select:
-        return "select";
-    case ServingStep::Retain:
-        return "retain";
-    case ServingStep::Stage:
-        return "stage";
-    case ServingStep::PrepareInputs:
-        return "prepare_inputs";
-    case ServingStep::Allocate:
-        return "allocate";
-    case ServingStep::PrepareOutputs:
-        return "prepare_outputs";
-    case ServingStep::Prepare:
-        return "prepare";
-    case ServingStep::Compute:
-        return "compute";
-    case ServingStep::Send:
-        return "send";
-    case ServingStep::Receive:
-        return "receive";
-    case ServingStep::Wait:
-        return "wait";
-    case ServingStep::PrepareResult:
-        return "prepare_result";
-    case ServingStep::ReadResult:
-        return "read_result";
-    case ServingStep::Result:
-        return "result";
-    case ServingStep::Reserve:
-        return "reserve";
-    case ServingStep::Advertise:
-        return "advertise";
-    case ServingStep::Handshake:
-        return "handshake";
-    case ServingStep::Notify:
-        return "notify";
-    case ServingStep::Poll:
-        return "poll";
-    case ServingStep::Model:
-        return "model";
-    case ServingStep::Transfer:
-        return "transfer";
-    case ServingStep::Accept:
-        return "accept";
-    case ServingStep::Release:
-        return "release";
-    case ServingStep::Indices:
-        return "indices";
-    }
-    throw std::logic_error("unknown serving step");
 }
 
 } // namespace markov

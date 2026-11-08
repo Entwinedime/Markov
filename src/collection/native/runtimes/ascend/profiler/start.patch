@@ -1,7 +1,8 @@
 diff --git a/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp b/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp
 --- a/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp
 +++ b/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp
-@@ -46,7 +46,10 @@
+@@ -45,10 +45,13 @@
+
  void DataDumper::Start()
  {
 -    if (!init_.load() || Thread::Start() != 0) {
@@ -13,7 +14,10 @@ diff --git a/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp b/torch_npu/csr
 +        start_.store(false);
 +    }
  }
-@@ -174,7 +177,10 @@
+
+ void DataDumper::Stop()
+@@ -173,10 +176,13 @@
+
  void TraceDataDumper::Start()
  {
 -    if (!init_.load() || Thread::Start() != 0) {
@@ -25,3 +29,5 @@ diff --git a/torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp b/torch_npu/csr
 +        start_.store(false);
 +    }
  }
+
+ void TraceDataDumper::Stop()

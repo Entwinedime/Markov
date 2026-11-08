@@ -12,8 +12,8 @@ description = "Native inference observations for Markov"
 markov = "markov_collection.adapters.frameworks.sglang.hooks:install"
 
 [tool.setuptools.packages.find]
-where = ["src/collection", "src/workload"]
-include = ["markov_collection*", "markov_workload*"]
+where = ["src/collection", "src/workload", "src/adapters"]
+include = ["markov_collection*", "markov_workload*", "markov_adapters*"]
 
 [tool.ruff]
 line-length = 120

@@ -3,7 +3,7 @@
 from array import array
 
 import zmq
-from markov_control.adapters.frameworks.sglang.workers import NativeStopped, StopInput
+from markov_control.adapters.frameworks.sglang.workers import StopInput
 from markov_control.peer import ControlPeer
 from markov_workload import WorkloadContent
 from markov_workload.routing import RoutedContent
@@ -13,21 +13,22 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 class RequestInput:
     def __init__(
-        self, peer: ControlPeer, vocab_size: int, bootstrap: tuple[str, int] | None, workload: dict, routes
+        self, peer: ControlPeer, vocab_size: int, workload: dict, routes, mode: str, expert_layers: set[int]
     ) -> None:
         self.peer = peer
         self.vocab_size = vocab_size
-        self.bootstrap = bootstrap
+        self.mode = mode
         self.arrivals = None
+        self.waiting = False
+        self.context = None
         self.requests = workload["requests"]
         self.content = WorkloadContent(self.requests, workload["prefixes"])
         self.content.check_vocabulary(vocab_size)
-        self.routing = RoutedContent(self.content, routes["assignments"]) if routes is not None else None
+        self.routing = RoutedContent(self.content, routes["assignments"], expert_layers) if routes is not None else None
         if self.routing is not None:
             from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
             HookRegistry.register("sglang.srt.mem_cache.radix_cache.RadixKey.__init__", self.cache_key, HookType.AROUND)
-            HookRegistry.apply_hooks()
 
     def cache_key(self, original, key, token_ids, extra_key=None, is_bigram=False, limit=None):
         if extra_key is not None:
@@ -37,7 +38,7 @@ class RequestInput:
 
     def recv_pyobj(self, flags):
         if self.arrivals is None:
-            advance = self.peer.receive()
+            advance = self.peer.receive(waiting=self.waiting, context=self.context)
             if advance["kind"] == "stop":
                 self.arrivals = iter([StopInput()])
             elif advance["kind"] == "advance":
@@ -73,10 +74,9 @@ class RequestInput:
             top_logprobs_num=0,
             token_ids_logprob=None,
             stream=True,
-            bootstrap_host=self.bootstrap[0] if self.bootstrap else None,
-            bootstrap_port=self.bootstrap[1] if self.bootstrap else None,
-            bootstrap_room=identity + 1 if self.bootstrap else None,
             extra_key=request["id"] if self.routing is not None else None,
+            bootstrap_host="markov-prefill" if self.mode != "null" else None,
+            bootstrap_room=identity + 1 if self.mode != "null" else None,
         )
 
     def output_token(self, identity: str) -> int:
@@ -84,11 +84,20 @@ class RequestInput:
 
 
 class NativeRequestReceiver:
-    def __init__(self, receiver) -> None:
+    def __init__(self, receiver, scheduler) -> None:
         self.receiver = receiver
+        self.scheduler = scheduler
 
     def recv_requests(self):
+        scheduler = self.scheduler
+
+        # Finish native post-idle cleanup before parking at the next receive boundary.
+        scheduler.request_input.waiting = (
+            scheduler.waiting_for_change and scheduler.pd.waiting() and scheduler.is_fully_idle(for_health_check=True)
+        )
+        scheduler.waiting_for_change = False
+        scheduler.request_input.context = scheduler.calls.scheduler_work()["context"]
         requests = self.receiver.recv_requests()
         if any(isinstance(request, StopInput) for request in requests):
-            raise NativeStopped()
+            self.scheduler.stop(requests)
         return requests

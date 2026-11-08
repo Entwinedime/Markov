@@ -11,20 +11,25 @@ class NativeContent:
         self.content = WorkloadContent(source["requests"], source["prefixes"])
         self.aliases = {
             native: request["id"]
-            for field in ("baseline_requests", "source_requests")
-            for native, request in zip(description[field], source["requests"], strict=True)
+            for native, request in zip(description["source_requests"], source["requests"], strict=True)
         }
         self.values = values
         self.tokens = None
         self.routing = None
-        serving = description.get("serving_input")
-        if serving and serving.get("ep_routes"):
+        self.route_assignments = None
+        serving = description["serving_input"]
+        if "ep" in serving["configuration"]:
             settings = serving["configuration"]
-            if "pd" in settings:
-                settings = settings["pd"][description["disaggregation_role"]]
             if settings.get("prefix_cache", False):
                 routes = serving["ep_routes"][settings["ep"]["id"]]
-                self.routing = RoutedContent(self.content, routes["assignments"])
+                self.route_assignments = routes["assignments"]
+
+    def configure(self, workers) -> None:
+        if self.route_assignments is not None:
+
+            # Cache identity covers the whole model, including expert layers on other PP stages.
+            layers = {layer["layer"] for worker in workers for layer in worker["expert_layers"]}
+            self.routing = RoutedContent(self.content, self.route_assignments, layers)
 
     def request(self, original, req, *args, **kwargs):
         original(req, *args, **kwargs)
@@ -63,6 +68,6 @@ class NativeContent:
 
         HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.run_batch", self.run_batch, HookType.AROUND)
         HookRegistry.register("sglang.srt.model_executor.model_runner.ModelRunner.sample", self.sample, HookType.AROUND)
-        if self.routing is not None:
+        if self.route_assignments is not None:
             HookRegistry.register("sglang.srt.managers.schedule_batch.Req.__init__", self.request, HookType.AROUND)
             HookRegistry.register("sglang.srt.mem_cache.radix_cache.RadixKey.__init__", self.cache_key, HookType.AROUND)
