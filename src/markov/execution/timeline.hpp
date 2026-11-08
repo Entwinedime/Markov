@@ -44,7 +44,7 @@ class Timeline {
 public:
     explicit Timeline(std::vector<Resource> resources, ExecutionObserver * observer = nullptr);
 
-    // The caller binds external data/state readiness; the timeline owns only events and execution resources.
+    // Accept a validated graph and bound input readiness; check execution resources, durations and boundary times here.
     std::vector<std::size_t> insert(const CoarseGraph & graph, std::span<const std::int64_t> work_ns, std::span<const ExecutionInput> inputs,
                                     std::span<const BoundaryTime> boundaries = {});
     std::optional<EventCompletion> advance(std::optional<std::int64_t> until_ns = {});

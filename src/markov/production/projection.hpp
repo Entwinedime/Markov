@@ -11,6 +11,7 @@
 namespace markov {
 
 struct ProjectionEvidence {
+
     // Shared serial boundaries may have several anchors; one observed span supplies the same resource coordinate.
     std::vector<NativeAnchor> events;
     std::vector<std::size_t> work_spans;

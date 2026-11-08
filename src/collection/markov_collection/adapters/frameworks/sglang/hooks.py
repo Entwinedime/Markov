@@ -381,6 +381,7 @@ class SGLangObservation:
     def sleep(self, original: Any, sleeper: Any) -> None:
         if self.window.prepared_phase is not None or self.pending(self.scheduler):
             return
+
         # Preserve warmed allocation caches while waiting for the next phase, outside observed serving work.
         sleeper.poller.poll()
 

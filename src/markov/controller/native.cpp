@@ -431,6 +431,7 @@ void NativeController::finish(const ServingAction & action, std::size_t returned
 std::optional<std::int64_t> NativeController::next_wakeup_ns(std::int64_t now_ns) const {
     std::optional<std::int64_t> next;
     for (const auto & [_, input] : inputs_) {
+
         // Arrivals and measured read returns wake control independently; elapsed boundaries cannot stall the clock.
         for (const auto boundary : { input.delivery.next_ns(), input.return_ns }) {
             if (boundary && *boundary > now_ns && (!next || *boundary < *next)) next = boundary;

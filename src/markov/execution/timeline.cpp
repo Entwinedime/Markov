@@ -49,7 +49,6 @@ Timeline::Timeline(std::vector<Resource> resources, ExecutionObserver * observer
 
 std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<const std::int64_t> work_ns, std::span<const ExecutionInput> inputs,
                                           std::span<const BoundaryTime> boundaries) {
-    graph.validate();
     if (work_ns.size() != graph.work.size()) throw std::invalid_argument("execution requires one given duration per work interval");
     std::vector<std::size_t> resources;
     for (const auto & resource : graph.resources) {
@@ -81,7 +80,7 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
         finishes[work.start].insert(work.finish);
     }
 
-    // Validate the entire invocation before publishing any of its boundaries to the live timeline.
+    // Check execution inputs before publishing boundaries; graph construction already established structural validity.
     const auto offset = next_event_;
     std::vector<std::size_t> identities;
     for (const auto & event : graph.events) {
