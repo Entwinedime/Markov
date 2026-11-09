@@ -225,9 +225,16 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                 else:
                     needed = math.ceil(work["features"]["elements"] / page)
                 segments = int(work["features"].get("segments", 1))
-                io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
-                if segments > 1:
-                    io_cases.add((page, max(needed, segments), segments))
+
+                # Each segment owns at least one page; cover deeper legal
+                # preparation paths before their first missing cost stops execution.
+                if operation == "cache.load.prepare":
+                    maximum = max(needed, math.ceil(context["max_context_tokens"] / page))
+                    io_cases.update((page, pages, count) for pages, count in ((1, 1), (maximum, 1), (maximum, maximum)))
+                else:
+                    io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
+                    if segments > 1:
+                        io_cases.add((page, max(needed, segments), segments))
         elif operation in ("cache.prefetch.issue", "cache.prefetch.check", "cache.prefetch.accept"):
             control_pages.update(int(cells[name]["configuration"]["page_size"]) for name in requirement["targets"])
         elif operation == "cache.prefetch.query":
