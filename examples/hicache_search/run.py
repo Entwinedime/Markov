@@ -1,4 +1,4 @@
-"""Enumerate a bounded HiCache space, predict once, then confirm three fixed roles."""
+"""Search a bounded HiCache space, then confirm the baseline and same-budget recommendation."""
 
 from __future__ import annotations
 
@@ -200,7 +200,7 @@ def main() -> None:
             json.dumps(
                 {
                     "candidates": len(example.targets),
-                    "normal_roles": ["baseline", "fastest", "selected"],
+                    "normal_roles": ["baseline", "recommended"],
                     "normal_repetitions": example.repetitions,
                     "method": args.method,
                     "budgets": args.budgets if args.method != "enumerate" else None,

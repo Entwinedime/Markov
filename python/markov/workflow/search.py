@@ -34,17 +34,38 @@ class ResourcePlan:
     name: str
     device_gib_per_rank: int
     host_gib: int
-    hourly_cost_units: float
 
     @classmethod
     def parse(cls, raw: dict) -> ResourcePlan:
-        reject_unknown(raw, {"name", "device_gib_per_rank", "host_gib", "hourly_cost_units"}, "resource plan")
+        reject_unknown(raw, {"name", "device_gib_per_rank", "host_gib"}, "resource plan")
         return cls(
             required_text(raw["name"], "resource plan name"),
             positive_integer(raw["device_gib_per_rank"], "device_gib_per_rank"),
             positive_integer(raw["host_gib"], "host_gib"),
-            positive_number(raw["hourly_cost_units"], "hourly_cost_units"),
         )
+
+
+@dataclass(frozen=True)
+class ResourcePricing:
+    device_gib_hour: float
+    host_gib_hour: float
+    device_host_reference_hour: float
+    host_storage_reference_hour: float
+
+    @classmethod
+    def parse(cls, raw: dict) -> ResourcePricing:
+        names = ("device_gib_hour", "host_gib_hour", "device_host_reference_hour", "host_storage_reference_hour")
+        reject_unknown(raw, set(names), "resource pricing")
+        return cls(*(positive_number(raw[name], name) for name in names))
+
+    def costs(self, device_gib: float, host_gib: float) -> dict[str, float]:
+        # Only the current reference links are supported; workload traffic does not resize their bandwidth.
+        return {
+            "device_storage": device_gib * self.device_gib_hour,
+            "host_storage": host_gib * self.host_gib_hour,
+            "device_host_bandwidth": self.device_host_reference_hour,
+            "host_storage_bandwidth": self.host_storage_reference_hour,
+        }
 
 
 @dataclass(frozen=True)
@@ -54,6 +75,7 @@ class SearchPolicy:
     fixed_host_gib: float
     maximum_time_ratio: float | None
     plans: tuple[ResourcePlan, ...]
+    pricing: ResourcePricing
     maximum_time_sec: float | None = None
 
     @classmethod
@@ -68,6 +90,7 @@ class SearchPolicy:
                 "maximum_time_ratio",
                 "maximum_time_sec",
                 "resource_plans",
+                "pricing",
             },
             "resource search",
         )
@@ -82,6 +105,7 @@ class SearchPolicy:
             positive_number(raw["fixed_host_gib"], "fixed_host_gib"),
             positive_number(raw["maximum_time_ratio"], "maximum_time_ratio") if "maximum_time_ratio" in raw else None,
             plans,
+            ResourcePricing.parse(raw["pricing"]),
             positive_number(raw["maximum_time_sec"], "maximum_time_sec") if "maximum_time_sec" in raw else None,
         )
 
@@ -98,6 +122,9 @@ class SearchPolicy:
                 "hourly_cost_units": None,
                 "device_reserved_gib_per_rank": None,
                 "host_reserved_gib": None,
+                "device_reserved_gib": None,
+                "hourly_cost_breakdown": None,
+                "window_cost_units": None,
                 "cost_gaps": cell["cost_gaps"],
             }
             reservation = cell.get("resource_reservation")
@@ -110,15 +137,28 @@ class SearchPolicy:
             device = self.fixed_device_gib_per_rank + reservation["device_kv_bytes_per_rank"] / GIB
             host = self.fixed_host_gib + participants * reservation["host_kv_bytes_per_rank"] / GIB
             row.update(device_reserved_gib_per_rank=device, host_reserved_gib=host)
+            device_total = participants * device
+            breakdown = self.pricing.costs(device_total, host)
+            hourly = sum(breakdown.values())
+            row.update(
+                device_reserved_gib=device_total,
+                device_kv_gib=participants * reservation["device_kv_bytes_per_rank"] / GIB,
+                host_kv_gib=participants * reservation["host_kv_bytes_per_rank"] / GIB,
+                fixed_storage_hourly_cost_units=(
+                    participants * self.fixed_device_gib_per_rank * self.pricing.device_gib_hour
+                    + self.fixed_host_gib * self.pricing.host_gib_hour
+                ),
+                hourly_cost_units=hourly,
+                hourly_cost_breakdown=breakdown,
+                window_cost_units=hourly * row["predicted_sec"] / 3600 if row["predicted_sec"] is not None else None,
+            )
 
             fits = [plan for plan in self.plans if device <= plan.device_gib_per_rank and host <= plan.host_gib]
             if not fits:
                 row["status"] = "resource_envelope_exceeded"
             else:
-                plan = min(
-                    fits, key=lambda plan: (plan.hourly_cost_units, plan.host_gib, plan.device_gib_per_rank, plan.name)
-                )
-                row.update(resource_plan=plan.name, hourly_cost_units=plan.hourly_cost_units)
+                plan = min(fits, key=lambda plan: (plan.host_gib, plan.device_gib_per_rank, plan.name))
+                row.update(resource_plan=plan.name)
                 if cell["status"] == "predicted":
                     row["status"] = "ranked"
             rows.append(row)
@@ -137,6 +177,16 @@ class SearchPolicy:
         fastest = (
             min(ranked, key=lambda row: (row["predicted_sec"], row["hourly_cost_units"], row["name"]))
             if ranked
+            else None
+        )
+        within_budget = [
+            row
+            for row in ranked
+            if baseline["status"] == "ranked" and row["hourly_cost_units"] <= baseline["hourly_cost_units"]
+        ]
+        recommended = (
+            min(within_budget, key=lambda row: (row["predicted_sec"], row["hourly_cost_units"], row["name"]))
+            if within_budget
             else None
         )
         pareto = [
@@ -162,6 +212,7 @@ class SearchPolicy:
             "selected": chosen["name"] if chosen else None,
             "selection_status": "selected" if chosen else "no_ranked_candidate_meets_time_constraint",
             "fastest": fastest["name"] if fastest else None,
+            "recommended": recommended["name"] if recommended else None,
             "pareto": pareto,
             "expected": len(rows),
             "ranked": len(ranked),
@@ -170,8 +221,10 @@ class SearchPolicy:
             "fixed_host_gib": self.fixed_host_gib,
             "maximum_time_ratio": self.maximum_time_ratio,
             "resource_plans": [asdict(plan) for plan in self.plans],
+            "pricing": asdict(self.pricing),
+            "bandwidth_ratios": {"device_host": 1.0, "host_storage": 1.0},
             "candidates": rows,
-            "qualification": "Finite supplied candidates, complete formal HTTP. Resource plans assume identical devices/runtime/I/O and differ in reservation and declared price only. Fixed reserves are caller assumptions including weights, workspace and external buffers; KV pools include native padding and in-pool buffers. Price units do not establish actual spending. Missing predictions do not enter ranking; any selection from incomplete coverage is provisional. No target measurements or refitting.",
+            "qualification": "Finite supplied candidates, complete formal HTTP. Deployable envelopes use identical devices/runtime/I/O. Costs include device/host storage and two shared reference bandwidth links only; CPU, whole-card compute rental, SSD capacity and per-byte traffic fees are excluded. Fixed storage reserves are caller assumptions; KV pools include native padding and in-pool buffers. Link bandwidth is fixed at the reference configuration, not inferred from workload throughput. Window cost covers formal HTTP, not startup or a complete bill. Missing predictions do not enter ranking; incomplete coverage makes selection provisional. No target measurements or refitting.",
         }
 
 

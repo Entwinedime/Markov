@@ -17,7 +17,7 @@ import time
 
 from markov.artifacts.request import read_json, resolve_path
 from markov.artifacts.writing import write_json
-from markov.workflow.search import ResourcePlan, SearchPolicy
+from markov.workflow.search import ResourcePricing, SearchPolicy
 
 
 EXAMPLE = Path(__file__).resolve().parent
@@ -169,11 +169,11 @@ class Comparison:
         for scene, reference in references.items():
             baseline = next(c["formal_http_sec"] for c in reference["cells"] if c["name"] == base_policy.baseline)
             for ratio in self.settings["baseline_relative_limits"]:
-                for price, plans in self.settings["prices"].items():
+                for price, pricing in self.settings["prices"].items():
                     key = scene, ratio, price
                     policies[key] = replace(
                         base_policy,
-                        plans=tuple(ResourcePlan.parse(p) for p in plans),
+                        pricing=ResourcePricing.parse(pricing),
                         maximum_time_ratio=None,
                         maximum_time_sec=baseline * ratio,
                     )

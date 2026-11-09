@@ -10,7 +10,7 @@ from markov.workflow.evaluation import normal_statistics
 
 
 def confirmation_names(result: dict) -> list[str]:
-    return list(dict.fromkeys(name for name in (result["baseline"], result["fastest"], result["selected"]) if name))
+    return list(dict.fromkeys(name for name in (result["baseline"], result["recommended"]) if name))
 
 
 def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
@@ -35,6 +35,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         if actual["mean_sec"] is not None:
             row["ape_percent"] = 100 * abs(row["predicted_sec"] - actual["mean_sec"]) / actual["mean_sec"]
             row["normal_meets_time_constraint"] = actual["mean_sec"] <= result["maximum_time_sec"]
+            row["normal_window_cost_units"] = row["hourly_cost_units"] * actual["mean_sec"] / 3600
             if baseline is not None:
                 row["normal_relative_time_ratio"] = actual["mean_sec"] / baseline
         confirmed.append(row)
@@ -53,6 +54,11 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
                 "status": row["status"],
                 "resource_plan": row["resource_plan"],
                 "hourly_cost_units": row["hourly_cost_units"],
+                **{
+                    f"cost_{key}": (row["hourly_cost_breakdown"] or {}).get(key)
+                    for key in ("device_storage", "host_storage", "device_host_bandwidth", "host_storage_bandwidth")
+                },
+                "window_cost_units": row["window_cost_units"],
                 "predicted_sec": row["predicted_sec"],
                 "device_reserved_gib_per_rank": row["device_reserved_gib_per_rank"],
                 "host_reserved_gib": row["host_reserved_gib"],
@@ -78,10 +84,10 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         f"已进入排名 {result['ranked']} 个；状态 {result['status']}。",
         f"固定正式 HTTP 上限为 {result['maximum_time_sec']:.4f} 秒，预测筛选与正常确认共用此上限；{selection}",
         "",
-        "资源档位使用声明的固定预留与原生 KV 池占用，报价为示例成本单位，不代表真实支出。",
+        "资源成本按 device/host 预留存储与两条固定参考链路计算。物理档位只限定能否部署；成本单位为声明情景，不代表真实支出。",
         "",
-        "| 资源档位 | 主机配额 GiB | 成本单位/小时 | 该档最快预测秒 | 条件 |",
-        "| --- | ---: | ---: | ---: | --- |",
+        "| 资源档位 | 主机配额 GiB | 该档最快预测秒 | 条件 |",
+        "| --- | ---: | ---: | --- |",
     ]
     for plan in result["resource_plans"]:
         supported = [
@@ -90,7 +96,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         best = min(supported, key=lambda row: (row["predicted_sec"], row["name"])) if supported else None
         time = f"{best['predicted_sec']:.4f}" if best else "无候选"
         name = best["name"] if best else "—"
-        lines.append(f"| {plan['name']} | {plan['host_gib']} | {plan['hourly_cost_units']} | {time} | {name} |")
+        lines.append(f"| {plan['name']} | {plan['host_gib']} | {time} | {name} |")
 
     records_by_name = {row["name"]: row for row in records}
     lines += [
@@ -103,7 +109,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         configuration = records_by_name[name]
         roles = "、".join(
             label
-            for label, key in (("默认", "baseline"), ("预测最快", "fastest"), ("约束下最低成本", "selected"))
+            for label, key in (("默认", "baseline"), ("同预算推荐", "recommended"), ("约束下最低成本", "selected"))
             if result[key] == name
         )
         timeout = configuration["prefetch_timeout_sec"]

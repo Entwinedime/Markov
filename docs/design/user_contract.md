@@ -90,17 +90,25 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 
 `search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名）、maximum_time_sec 或 maximum_time_ratio、
 fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以搜索请求所在目录为起点。
-每个资源档位声明 name、device_gib_per_rank、host_gib 和 hourly_cost_units；GiB 配额为正整数，其余量为有限正数，名字不重复。
+pricing 为必填的资源单价声明。
+每个资源档位声明 name、device_gib_per_rank 和 host_gib；GiB 配额为正整数，名字不重复。档位只限定能否部署。
+pricing 声明 device_gib_hour、host_gib_hour、device_host_reference_hour 和 host_storage_reference_hour，均为有限正数；
+分别表示 device/host 每 GiB·小时价格和两条参考链路的每小时价格。当前只支持相同硬件的参考带宽，不从请求平均吞吐推算预留带宽。
 候选组合由调用方提供，搜索不重写结构规则、不读取 target 真值，也不比较多套搜索算法。
 
 HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、host_kv_bytes_per_rank，单位为 bytes。
 它来自原生池布局，包括设备 dummy 页、主机池对齐及池内缓冲；浮点表示避免外部极大配额的整数乘法溢出，正常硬件范围的字节量仍可精确表示。
 固定设备预留按 rank，固定主机预留按整个 TP 组，分别覆盖权重、workspace、运行时与池外缓冲；它们是部署合同，不是拟合系数或自动测量值。
 未提供这种资源表示的框架明确为 resource_accounting_unavailable，不借用 HiCache 公式或填零。
-档位须使用相同设备、runtime 与 I/O 条件，只改变可用配额和声明报价；接口不模拟单独改变硬件带宽或竞争。
+档位须使用相同设备、runtime 与 I/O 条件；接口不模拟单独改变硬件带宽或竞争。
+每格成本为所有 rank 的 device 存储费用、整组 host 存储费用及两条共享参考链路费用之和，
+包含声明的固定存储和原生 KV 池，不包含 CPU、整卡算力租价、SSD 容量或流量费。
+hourly_cost_breakdown 给出四项费用，window_cost_units 为每小时资源成本乘正式 HTTP 秒数再除以 3600，
+不覆盖服务启动或完整账单。固定存储、可变 KV 容量和部署档位分别报告，归一化单价不代表实际采购价。
 
 maximum_time_sec 与 maximum_time_ratio 必须恰好提供一个正数。绝对上限直接使用；相对要求以 baseline 的预测耗时乘比例确定上限。
-流程调用同一 predict，选择能容纳各候选的最低报价档位，列出时间/报价 Pareto，再在这份固定上限内选最低报价。
+流程调用同一 predict，选择能容纳各候选的最小主机配额档位，列出时间/成本 Pareto，再在这份固定上限内选最低资源成本 selected。
+recommended 为每小时资源成本不高于 baseline 时耗时最短的候选；fastest 则是在所有可部署候选中耗时最短者。
 正常确认使用同一 maximum_time_sec，不用正常 baseline 重新计算门槛；相对正常 baseline 的改善单列。
 同价按耗时、名字稳定排序，Pareto 保留并列；没有满足时间约束的候选时 selected=null，不降低要求。
 缺成本或结构保留缺项并标记 incomplete；即使有暂定选择，也不能声称全部候选已比较。明确资源不可行者可排除，仍保留原预测状态。
