@@ -98,6 +98,7 @@ KTransformers 单 NPU dense/Torch 入口已接通真实来源、独立阶段/控
 - [架构](docs/design/architecture.md)、[用户合同](docs/design/user_contract.md)、[成本与数据库](docs/design/cost_models.md)
 - [验证口径](docs/design/validation.md)、[工程约束](docs/design/engineering_constraints.md)
 - [项目工作流与重建结果](docs/workflow.md)
+- 下一窗口：[三类负载配置搜索状态](docs/windows/2026-11-09_workload_search/status.md) · [计划](docs/windows/2026-11-09_workload_search/plan.md) · [日志](docs/windows/2026-11-09_workload_search/log.md)
 
 Python 的 workflow 组织正式任务，artifacts 定义输入，adapters 处理框架/runtime 差异；
 C++ 的 trace_graph 维护源依据、目标规则、成本查询与共同执行器。scripts 保持薄入口，examples 承担研究案例。
