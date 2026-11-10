@@ -147,3 +147,25 @@ settings 可用 `"scenes": ["alternating"]` 只执行已准备输入的一部分
 plan 保存并核对所选场景的正式请求；predict 为每个所选场景采集一个 base 并扫描全部套餐/策略；confirm 在全部覆盖后保存同预算最好/最差清单，再各测一次。
 后两个场景可交替端点顺序；角色重合只测一次，不额外测正常 base。report 单独读取正常评价，不更新成本模型。
 成本域和全部候选未闭合时不开始确认。单次观察只能说明所选端点的差距，不能证明波动范围、真实全局最优或问答质量。
+
+## 既有大请求量来源的全量离线扫描
+
+`full_scan.py` 复用已经固定的正式预测请求、base 和独立模型，不采集设备数据或自动补成本：
+
+```bash
+PYTHONPATH=python python3 examples/hicache_search/full_scan.py \
+  --input /path/to/task.json --phase representatives
+PYTHONPATH=python python3 examples/hicache_search/full_scan.py \
+  --input /path/to/task.json --phase scan
+PYTHONPATH=python python3 examples/hicache_search/full_scan.py \
+  --input /path/to/task.json --phase report
+```
+
+task 提供 requests、deployment、formal_requests、预先固定的 representatives 名单和 wall_limit_sec；同目录的 settings.json 提供现行 policy，usage.json 记录累计执行用量，初始值为 `{"wall_sec": 0, "invocations": []}`。
+requests 指向显式已有 manifest/models 的正式请求。代表点计入完整空间，后续每批最多 48 点、最多两路预测；外围编排需另受 4 GiB 约束。
+恢复时先检查保留的容器句柄，活跃任务不重复启动；来源、模型或空间改变时使用新的执行目录。
+
+完成后，在装有 Matplotlib 的 Python 环境运行 `python3 examples/hicache_search/full_scan_report.py --input /path/to/task.json`，
+读取结构化结果及窗口复核形成的 full_scan_qualification.json、source_qualification.json，导出候选 CSV、并列项、时间—费用/Pareto 图、工作量及运行开销报告。后处理设 4 GiB 地址空间上限。
+本例用于 ShareGPT、BurstGPT 长度回放和程序生成三类已完成面板，机制说明需对照实际工作计数；预测完成不授予正常精度或真实排名资格。
+本轮已固定的输入和复核证据位于 `data/workload_full_scan_current_20261111/execution/`；复现本轮应使用其中的冻结源码与模型，不能将当前工作区的新实现或模型混入旧批次。
