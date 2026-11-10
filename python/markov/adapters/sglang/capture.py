@@ -195,6 +195,16 @@ class Capture(SerialHttpClient):
             gate = stack.enter_context(control.open("r+b", buffering=0)) if profiling_requested else None
             with inference_server(command, self.directory / "server.log", self):
                 try:
+                    if rates := self.plan["server"].get("hicache_transfer_bandwidth"):
+                        participants = self.plan["deployment"]["tensor_parallel"]
+                        for rank in range(participants):
+                            effective = read_json(self.directory / f"transfer_bandwidth_rank_{rank}.json")
+                            if (
+                                effective["bytes_per_sec"] != rates
+                                or effective["rank"] != rank
+                                or effective["participants"] != participants
+                            ):
+                                raise RuntimeError("The runtime transfer quotas differ from the declared configuration")
                     if profiling_requested:
                         self.http(
                             "/start_profile",

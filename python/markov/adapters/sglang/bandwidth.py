@@ -73,12 +73,16 @@ class TransferQuotas:
         self.pacer = None
 
     def controller(self, original, controller, *args, **kwargs):
+        from sglang.srt.plugins.hook_registry import HookRegistry
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_rank,
             get_tensor_model_parallel_world_size,
         )
 
         result = original(controller, *args, **kwargs)
+        missing = set(self.targets) - HookRegistry._patched
+        if missing:
+            raise RuntimeError(f"Transfer quota hooks were not applied: {sorted(missing)}")
         rank, participants = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         path = Path("/capture/transfer_admission.bin")
         self.pacer = BandwidthPacer(self.rates, participants, rank, path)
@@ -135,16 +139,23 @@ class TransferQuotas:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         controller = "sglang.srt.managers.cache_controller.HiCacheController."
-        for method, wrapper in (
-            ("__init__", self.controller),
-            ("start_writing", self.backup),
-            ("start_loading", self.load),
-        ):
-            HookRegistry.register(controller + method, wrapper, HookType.AROUND)
-        HookRegistry.register("sglang.srt.mem_cache.hicache_storage.HiCacheFile.get", self.read, HookType.AROUND)
-        HookRegistry.register(
-            "sglang.srt.mem_cache.storage.file.lru_file_evictor.LRUFileEvictor.reserve", self.reserve, HookType.AROUND
+        registrations = [
+            (controller + method, wrapper)
+            for method, wrapper in (
+                ("__init__", self.controller),
+                ("start_writing", self.backup),
+                ("start_loading", self.load),
+            )
+        ]
+        registrations.extend(
+            [
+                ("sglang.srt.mem_cache.hicache_storage.HiCacheFile.get", self.read),
+                ("sglang.srt.mem_cache.storage.file.lru_file_evictor.LRUFileEvictor.reserve", self.reserve),
+            ]
         )
+        self.targets = [target for target, _ in registrations]
+        for target, wrapper in registrations:
+            HookRegistry.register(target, wrapper, HookType.AROUND)
 
 
 def install() -> None:
