@@ -24,6 +24,16 @@ EXAMPLE = Path(__file__).resolve().parent
 
 def candidates(settings: dict) -> list[dict]:
     axes = settings["axes"]
+    resources = (
+        [(package["name"], package["configuration"]) for package in settings["resource_packages"]]
+        if "resource_packages" in settings
+        else [
+            ("candidate", {"max_total_tokens": device, "hicache_ratio": host})
+            for device, host in product(axes["device_tokens"], axes["host_ratios"])
+        ]
+    )
+    if not resources:
+        raise ValueError("Search needs at least one declared resource combination")
     reference = {
         **settings["base_configuration"],
         "hicache_storage_backend_extra_config": json.loads(
@@ -31,24 +41,27 @@ def candidates(settings: dict) -> list[dict]:
         ),
     }
     result = []
-    for device, host, page, write, threshold, policy in product(
-        axes["device_tokens"],
-        axes["host_ratios"],
+    for (resource_name, resource), page, write, threshold, policy in product(
+        resources,
         axes["page_tokens"],
         axes["write_policies"],
         axes["prefetch_threshold_tokens"],
         axes["prefetch_policies"],
     ):
         for timeout in axes["timeout_sec"] if policy == "timeout" else [None]:
-            extra = {"prefetch_threshold": threshold}
+            configuration = {**settings["base_configuration"], **resource}
+            extra = {
+                **json.loads(configuration["hicache_storage_backend_extra_config"]),
+                "prefetch_threshold": threshold,
+            }
+            for key in ("prefetch_timeout_base", "prefetch_timeout_per_ki_token", "prefetch_timeout_max"):
+                extra.pop(key, None)
             if timeout is not None:
                 extra.update(
                     prefetch_timeout_base=timeout, prefetch_timeout_per_ki_token=0.0, prefetch_timeout_max=timeout
                 )
             configuration = {
-                **settings["base_configuration"],
-                "max_total_tokens": device,
-                "hicache_ratio": host,
+                **configuration,
                 "page_size": page,
                 "hicache_write_policy": write,
                 "hicache_storage_prefetch_policy": policy,
@@ -57,7 +70,7 @@ def candidates(settings: dict) -> list[dict]:
             same = {**configuration, "hicache_storage_backend_extra_config": extra} == reference
             result.append(
                 {
-                    "name": settings["policy"]["baseline"] if same else f"candidate_{len(result):03d}",
+                    "name": settings["policy"]["baseline"] if same else f"{resource_name}_{len(result):03d}",
                     "configuration": configuration,
                 }
             )
@@ -107,7 +120,9 @@ class SearchExample:
             else {"configuration": self.settings["base_configuration"]},
             "workload": str(self.args.workload.resolve()),
             "targets": self.targets,
-            "performance": {
+            "performance": {"models": str(self.args.models.resolve())}
+            if self.args.models
+            else {
                 "database": str(
                     self.args.database.resolve() if self.args.database else self.output / "performance.sqlite"
                 ),
@@ -127,7 +142,10 @@ class SearchExample:
 
     def recover(self) -> None:
         request = PredictionRequest.load(self.output / "requests/prediction.json")
-        for directory, budget in (("base", "source_budget"), ("performance/sampling", "sampling_budget")):
+        preparations = [("base", "source_budget")]
+        if request.sampling_budget is not None:
+            preparations.append(("performance/sampling", "sampling_budget"))
+        for directory, budget in preparations:
             settings = replace(request.execution.capture, budget=self.settings[budget])
             DeviceTask(settings, request.execution.output / directory).recover()
         for target in self.targets:
@@ -186,7 +204,11 @@ def main() -> None:
     parser.add_argument("--workload", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--devices", type=int, nargs="+")
-    parser.add_argument("--database", type=Path)
+    performance = parser.add_mutually_exclusive_group()
+    performance.add_argument("--database", type=Path)
+    performance.add_argument(
+        "--models", type=Path, help="Use one explicit independent selection without automatic sampling"
+    )
     parser.add_argument("--base-manifest", type=Path)
     parser.add_argument("--settings", type=Path, default=EXAMPLE / "space.json")
     parser.add_argument("--phase", choices=("plan", "predict", "confirm", "report", "all"), default="all")

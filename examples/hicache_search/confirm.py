@@ -22,6 +22,10 @@ class Confirmation:
             PredictionRequest.load(resolve_path(path.resolve().parent, case["request"])) for case in self.plan["cases"]
         ]
         self.selection_path = self.output / "additional_cases.json"
+        reference = self.plan.get("comparison_reference", "baseline")
+        for scene in {case["scene"] for case in self.plan["cases"]}:
+            if sum(reference in case["roles"] for case in self.plan["cases"] if case["scene"] == scene) != 1:
+                raise ValueError(f"Declare one {reference} comparison reference for {scene}")
 
     def case_result(self, index: int) -> dict:
         case = self.plan["cases"][index]
@@ -78,6 +82,9 @@ class Confirmation:
                     return False
 
         if not self.selection_path.exists():
+            if initial == self.plan["maximum_repetitions"] or self.plan["maximum_extra_conditions"] == 0:
+                write_json(self.selection_path, {"indices": [], "rule": "No additional observations requested"})
+                return True
             eligible = []
             for index in range(len(self.requests)):
                 row = self.case_result(index)
@@ -116,7 +123,8 @@ class Confirmation:
             for i, row in enumerate(rows)
         )
 
-        baselines = {row["scene"]: row for row in rows if "baseline" in row["roles"]}
+        reference = self.plan.get("comparison_reference", "baseline")
+        baselines = {row["scene"]: row for row in rows if reference in row["roles"]}
         for row in rows:
             base = baselines[row["scene"]]
             measured = row["normal"]["mean_sec"]
@@ -145,7 +153,7 @@ class Confirmation:
             f"所有条件在读取正常结果前确定；每条件先测 {self.plan['initial_repetitions']} 次，再按预先规则追加。表中误差覆盖完整 HTTP，不扣 gap、未归属成本或计算。",
             "耗时门槛沿用预测时的同一秒数；完成采集不代表推荐达标。资源价格为声明情景。",
             "",
-            "| 场景 | 条件 | 次数 | 预测 sec | 正常均值 sec | 误差 % | CV % | 耗时门槛 sec | 是否达标 | 相对基准改善 % |",
+            "| 场景 | 条件 | 次数 | 预测 sec | 正常均值 sec | 误差 % | CV % | 耗时门槛 sec | 是否达标 | 相对对照改善 % |",
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |",
         ]
         for row in rows:
