@@ -93,9 +93,10 @@ class InputFactsProbe:
 
 def install() -> None:
     """The framework loads this plugin in each worker; ordinary inference is unchanged."""
-    from markov.adapters.sglang import idle_control
+    from markov.adapters.sglang import bandwidth, idle_control
 
     idle_control.install()
+    bandwidth.install()
     measurements = os.environ.get("MARKOV_REGION_MEASUREMENTS")
     region_writer = None
     if measurements:

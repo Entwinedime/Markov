@@ -45,6 +45,12 @@ struct OperationPosition {
     std::optional<std::vector<std::int64_t>> data = std::nullopt;
 };
 
+// A declared service quota reserves future admission, independently of native work cost.
+struct BandwidthReservation {
+    std::size_t bytes;
+    double bytes_per_sec;
+};
+
 struct PlannedOperation {
     std::size_t resource;
 
@@ -57,6 +63,7 @@ struct PlannedOperation {
     std::optional<std::size_t> source_native_work = std::nullopt;
     std::optional<simulation::Component> owner = std::nullopt;
     std::optional<OperationPosition> position = std::nullopt;
+    std::optional<BandwidthReservation> reservation = std::nullopt;
 };
 
 struct PlannedMutation {

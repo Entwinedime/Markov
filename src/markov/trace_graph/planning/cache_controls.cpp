@@ -117,6 +117,17 @@ bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn
         call_return = begin + 2;
         copy_done = begin + 1;
     }
+    if (bandwidth_) {
+        const auto load = kind == CopyKind::Load;
+        const auto gate = bandwidth_->admit(mutation,
+                                            begin,
+                                            load ? TransferDirection::HostToDevice : TransferDirection::DeviceToHost,
+                                            pages * page_tokens_ * backend_.bytes_per_token,
+                                            rank,
+                                            load ? begin : cause);
+        mutation.dependencies.push_back({ gate, load ? begin + 1 : begin, graph::EdgeKind::DataDependency });
+        mutation.dependencies.push_back({ gate, copy_done, graph::EdgeKind::DataDependency });
+    }
     if (const auto previous = queues_.native.find(resource); previous != queues_.native.end()) {
         mutation.dependencies.push_back({ previous->second, kind == CopyKind::Load ? begin + 1 : begin, graph::EdgeKind::ResourceOrder });
         mutation.dependencies.push_back({ previous->second, copy_done, graph::EdgeKind::ResourceOrder });

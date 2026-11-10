@@ -32,10 +32,15 @@ hicache_write_policy、hicache_io_backend、hicache_mem_layout，以及下述文
 最后取整页数加一；主机池必须大于设备池。当前只支持 hicache_ratio，不支持正的显式 hicache_size。
 主机分配不足时按整次申请量淘汰可回收的 LRU 段，不只释放容量差额；被保护或在途的页不能回收。
 
-文件存储通过 hicache_storage_backend="file" 开启，初始为空且不设文件容量上限。
+文件存储通过 hicache_storage_backend="file" 开启，初始为空。max_size 可声明每 rank 文件容量字节数，0 表示不设上限；有限容量复用原生 LRU。
 hicache_storage_prefetch_policy 可选 wait_complete、best_effort、timeout。
 hicache_storage_backend_extra_config 仅接收内联 JSON 字符串，允许原生 prefetch_threshold、
-prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max 四项；不读外部 @file，其他设置明确拒绝。
+prefetch_timeout_base、prefetch_timeout_per_ki_token、prefetch_timeout_max，以及 max_size、min_free_space、eviction_ratio。有限容量要求 min_free_space=0、eviction_ratio=1；不读外部 @file，其他设置明确拒绝。
+hicache_transfer_bandwidth 可声明 device_to_host、host_to_device、host_to_storage、storage_to_host、storage_shared 五个有限正数，单位 bytes/sec。
+前两项按 rank，文件两向及 shared 按整组；shared 约束读写竞争，不是第五条收费链路。配额采用允许一个原生操作突发的准入节拍，
+后续搬运等待先前的方向及共同预留结束，再执行原生数据通路。仿真生成相同依赖，不缩放 CPU 控制、原生成本或 E2E。
+这是软件服务配额，不代表更换硬件；原生争用、操作粒度突发及宿主唤醒仍影响实际性能。普通预测、base 和正常测量共用该适配，独立原生成本采样排除配额。
+
 文件 worker 按独立正常采样估计，发起与准入检查分开。首轮准备前的 source 控制残余在准入前支付一次，
 预取可在其间推进；这不是源控制已完成正常校正或 target 查询成本的独立预测。
 best_effort 在首次准入检查时停止，timeout 从发起计时，在实际检查回合比较已用时间与当前命中页数对应的预算。
@@ -53,7 +58,7 @@ cache_capacity_pages 按参与进程报告 device/host 页容量；文件目标�
 issue_finished_ns 是发起响应结束，stopped_ns 是固定停止快照，accepted_ns 是接受/就绪完成；它们都是预测时钟，不是 source 观测坐标。
 storage 中的 rank_read_pages、rank_copied_pages、rank_rejected_copies、rank_new_pages、rank_existing_pages
 累计所有 rank 的文件 worker 工作量；请求级页数仍表示逻辑 KV 页。例如 TP2 的同一逻辑页读两份，计为两个 rank_read_pages。
-page-work 的 rank_disk_evictions 同样累计各 rank，peak_rank_stored_pages 则是单 rank 文件驻留的峰值。
+rank_disk_evictions 同样累计各 rank，peak_rank_stored_pages 则是单 rank 文件驻留的峰值。
 issued_ns、first_check_ns、accepted_ns、worker_finished_ns 分别报告同一仿真时钟的发起、首次检查、接受与后台返回；
 相应操作未发生时为 null。后台读完并不自动插入缓存，接受仍依赖请求端检查及已发布的前缀。
 cost_requirements 将整组中相同的成本缺口归并，并列出受影响目标；每次只覆盖首个无法提交的片段。
@@ -92,30 +97,20 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以搜索请求所在目录为起点。
 pricing 为必填的资源单价声明。
 每个资源档位声明 name、device_gib_per_rank 和 host_gib；GiB 配额为正整数，名字不重复。档位只限定能否部署。
-pricing 声明 device_gib_hour、host_gib_hour、device_host_reference_hour 和 host_storage_reference_hour，均为有限正数；
-分别表示 device/host 每 GiB·小时价格和两条参考链路的每小时价格。当前只支持相同硬件的参考带宽，不从请求平均吞吐推算预留带宽。
+pricing 声明 device_gib_hour、host_gib_hour、storage_gib_hour 三项每 GiB·小时单价，以及
+四项 <direction>_gibps_hour（direction 为 device_to_host、host_to_device、host_to_storage、storage_to_host），均为有限正数。
+带宽按整组 GiB/s·小时计价，不按流量或请求平均吞吐收费。
 候选组合由调用方提供，搜索不重写结构规则、不读取 target 真值，也不比较多套搜索算法。
 
-HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、host_kv_bytes_per_rank，单位为 bytes。
-它来自原生池布局，包括设备 dummy 页、主机池对齐及池内缓冲；浮点表示避免外部极大配额的整数乘法溢出，正常硬件范围的字节量仍可精确表示。
-固定设备预留按 rank，固定主机预留按整个 TP 组，分别覆盖权重、workspace、运行时与池外缓冲；它们是部署合同，不是拟合系数或自动测量值。
-未提供这种资源表示的框架明确为 resource_accounting_unavailable，不借用 HiCache 公式或填零。
-档位须使用相同设备、runtime 与 I/O 条件；接口不模拟单独改变硬件带宽或竞争。
-每格成本为所有 rank 的 device 存储费用、整组 host 存储费用及两条共享参考链路费用之和，
-包含声明的固定存储和原生 KV 池，不包含 CPU、整卡算力租价、SSD 容量或流量费。
-hourly_cost_breakdown 给出四项费用，window_cost_units 为每小时资源成本乘正式 HTTP 秒数再除以 3600，
-不覆盖服务启动或完整账单。固定存储、可变 KV 容量和部署档位分别报告，归一化单价不代表实际采购价。
+HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、host_kv_bytes_per_rank 来自原生池布局，包含 padding 及池内缓冲；
+有限文件缓存提供整组 storage_reserved_bytes，传输配额提供整组 bandwidth_bytes_per_sec。未声明有限文件容量或带宽时仍可预测，
+但七项资源计价返回 resource_accounting_unavailable，不填零报价。固定 device 预留按 rank、host 预留按组，覆盖权重、workspace 和池外缓冲。
 
-maximum_time_sec 与 maximum_time_ratio 必须恰好提供一个正数。绝对上限直接使用；相对要求以 baseline 的预测耗时乘比例确定上限。
-流程调用同一 predict，选择能容纳各候选的最小主机配额档位，列出时间/成本 Pareto，再在这份固定上限内选最低资源成本 selected。
-recommended 为每小时资源成本不高于 baseline 时耗时最短的候选；fastest 则是在所有可部署候选中耗时最短者。
-正常确认使用同一 maximum_time_sec，不用正常 baseline 重新计算门槛；相对正常 baseline 的改善单列。
-同价按耗时、名字稳定排序，Pareto 保留并列；没有满足时间约束的候选时 selected=null，不降低要求。
-缺成本或结构保留缺项并标记 incomplete；即使有暂定选择，也不能声称全部候选已比较。明确资源不可行者可排除，仍保留原预测状态。
-报价只在调用方提供的价格情景内有效，不代表真实采购支出；完整有限集合的预测最优也不表示真实全局最优。
-
-结果位于预测 output/search/report.json。正常确认属于调用方的实验步骤，在预测完成后运行，不回写参数或 readiness。
-示例声明、整组成本预算和正常确认见 [搜索例子](../../examples/hicache_search/README.md)。
+费用包含三级预留容量与四向带宽。PCIe 两向为各 rank 独立全双工预留；文件两向共同收费量不超过 shared，
+按各向声明速率的比例分配共同资源份额。比如两向合计要求大于共同上限时，不能把共同服务全额重复收费。
+配额只限定部署，单价是声明假设；不含 CPU、整卡算力租价或按字节的流量费。
+hourly_cost_breakdown 给七项费用，window_cost_units 为小时资源成本乘正式 HTTP 秒数除以 3600，不覆盖启动和完整账单。
+recommended 与 worst_within_budget 分别为不超过 baseline 小时费用时的预测最快/最慢；并列按较低费用及稳定名字选择，正常真值不参与选点。
 
 ## 独立 target 评价
 

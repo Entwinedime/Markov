@@ -1,4 +1,5 @@
 #include "markov/trace_graph/planning/storage.hpp"
+#include "markov/trace_graph/planning/bandwidth.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -7,7 +8,7 @@
 namespace markov::trace_graph::planning {
 
 Storage::Storage(Cache & cache, const TokenPaths & paths, std::size_t page_tokens, std::size_t bytes_per_token, std::size_t participants,
-                 std::size_t resource_begin, std::size_t requests, StorageConfig config, StorageBackend backend)
+                 std::size_t resource_begin, std::size_t requests, StorageConfig config, StorageBackend backend, Bandwidth * bandwidth)
     : cache_(cache),
       paths_(paths),
       page_tokens_(page_tokens),
@@ -16,6 +17,7 @@ Storage::Storage(Cache & cache, const TokenPaths & paths, std::size_t page_token
       resource_begin_(resource_begin),
       config_(config),
       backend_(std::move(backend)),
+      bandwidth_(bandwidth),
       results_(requests),
       workers_(participants),
       foreground_(requests) {}
@@ -50,6 +52,11 @@ bool Storage::service(ProgramRuntime & runtime, const WorkKind & kind, std::size
         }
     }
     if (cause) mutation.dependencies.push_back({ *cause, node, graph::EdgeKind::DataDependency });
+    if (bandwidth_ && (kind == backend_.read_page || kind == backend_.new_page)) {
+        const auto gate =
+            bandwidth_->admit(mutation, node, writer ? TransferDirection::HostToStorage : TransferDirection::StorageToHost, pages * page_bytes_, rank, cause);
+        mutation.dependencies.push_back({ gate, node, graph::EdgeKind::DataDependency });
+    }
     return runtime.submit(std::move(mutation)).has_value();
 }
 

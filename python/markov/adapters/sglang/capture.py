@@ -36,6 +36,12 @@ def server_arguments(deployment, configuration):
         raise ValueError("Model, dtype and TP belong to deployment; capture owns the isolated endpoint and startup")
     if configuration.get("disable_cuda_graph", True) is not True:
         raise ValueError("The restored base capture currently supports eager execution")
+    if configuration.get("hicache_transfer_bandwidth") is not None:
+        from markov.adapters.sglang.bandwidth import limits
+
+        limits(configuration["hicache_transfer_bandwidth"])
+        if not configuration.get("enable_hierarchical_cache") or configuration.get("hicache_storage_backend") != "file":
+            raise ValueError("Transfer quotas require HiCache file storage")
     return {
         "disable_cuda_graph": True,
         "attention_backend": "ascend",
@@ -64,6 +70,7 @@ def capture_environment(profiling: bool, calibration: bool = False, *, semantic:
         "MARKOV_NATIVE_PROBE": "",
         "MARKOV_REGION_MEASUREMENTS": "/capture/regions" if calibration else "",
         "MARKOV_FILE_MEASUREMENTS": "",
+        "MARKOV_TRANSFER_BANDWIDTH": "",
         "LD_PRELOAD": "",
         "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/capture/storage",
         "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "0",
@@ -434,6 +441,10 @@ def main():
         Capture(args.input).run()
         return
 
+    server = dict(read_json(args.input)["server"])
+    if rates := server.pop("hicache_transfer_bandwidth", None):
+        os.environ["MARKOV_TRANSFER_BANDWIDTH"] = json.dumps(rates)
+
     from sglang.launch_server import run_server
     from sglang.srt.plugins import load_plugins
     from sglang.srt.server_args import ServerArgs
@@ -441,7 +452,7 @@ def main():
 
     load_plugins()
     try:
-        run_server(ServerArgs(**read_json(args.input)["server"]))
+        run_server(ServerArgs(**server))
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
 

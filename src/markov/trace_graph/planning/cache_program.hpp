@@ -1,5 +1,7 @@
 #pragma once
 
+#include "markov/trace_graph/planning/bandwidth.hpp"
+
 #include "markov/trace_graph/planning/cache.hpp"
 #include "markov/trace_graph/planning/compute_program.hpp"
 #include "markov/trace_graph/planning/program.hpp"
@@ -58,7 +60,7 @@ class CacheProgram final : public Program, public RequestControls {
 public:
     CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
                  std::optional<StorageConfig> storage = std::nullopt, std::optional<KernelCacheInitial> kernel_cache_initial = std::nullopt,
-                 std::optional<RegionBackend> regions = std::nullopt);
+                 std::optional<RegionBackend> regions = std::nullopt, std::optional<BandwidthLimits> bandwidth = std::nullopt);
 
     // Storage borrows this cache, so the program must remain at one address.
     CacheProgram(const CacheProgram &) = delete;
@@ -67,7 +69,8 @@ public:
     bool complete() const override;
 
     std::size_t resources() const {
-        return compute_resource_begin() + (regions_ ? 2 * backend_.participants : source_.observations().collective_groups.size());
+        return compute_resource_begin() + (regions_ ? 2 * backend_.participants : source_.observations().collective_groups.size())
+               + (bandwidth_ ? bandwidth_->resources() : 0);
     }
     ComputeStats compute_stats() const;
     const Storage * storage() const { return storage_ ? &*storage_ : nullptr; }
@@ -202,7 +205,10 @@ private:
     bool region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
-    std::size_t compute_resource_begin() const { return source_.observations().resources.size() + (storage_ ? 4 : 2) * backend_.participants + bool(storage_); }
+    std::size_t compute_resource_begin(bool storage) const {
+        return source_.observations().resources.size() + (storage ? 4 : 2) * backend_.participants + storage;
+    }
+    std::size_t compute_resource_begin() const { return compute_resource_begin(storage_.has_value()); }
 
     const source::SourceContext & source_;
     const std::size_t page_tokens_;
@@ -211,6 +217,7 @@ private:
     PreparationCache preparations_;
     std::optional<RegionBackend> regions_;
     RegionPreparation region_preparation_;
+    std::optional<Bandwidth> bandwidth_;
     std::optional<Storage> storage_;
     ExecutionQueues queues_;
     std::vector<RunningRequest> running_;

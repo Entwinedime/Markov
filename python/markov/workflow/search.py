@@ -49,22 +49,30 @@ class ResourcePlan:
 class ResourcePricing:
     device_gib_hour: float
     host_gib_hour: float
-    device_host_reference_hour: float
-    host_storage_reference_hour: float
+    storage_gib_hour: float
+    device_to_host_gibps_hour: float
+    host_to_device_gibps_hour: float
+    host_to_storage_gibps_hour: float
+    storage_to_host_gibps_hour: float
 
     @classmethod
     def parse(cls, raw: dict) -> ResourcePricing:
-        names = ("device_gib_hour", "host_gib_hour", "device_host_reference_hour", "host_storage_reference_hour")
+        names = tuple(cls.__dataclass_fields__)
         reject_unknown(raw, set(names), "resource pricing")
         return cls(*(positive_number(raw[name], name) for name in names))
 
-    def costs(self, device_gib: float, host_gib: float) -> dict[str, float]:
-        # Only the current reference links are supported; workload traffic does not resize their bandwidth.
+    def costs(self, device_gib: float, host_gib: float, reservation: dict) -> dict[str, float]:
+        rates = reservation["bandwidth_bytes_per_sec"]
+        # File directions share one service pool; charge each only its allocated share.
+        file_share = min(1.0, rates["storage_shared"] / (rates["host_to_storage"] + rates["storage_to_host"]))
         return {
             "device_storage": device_gib * self.device_gib_hour,
             "host_storage": host_gib * self.host_gib_hour,
-            "device_host_bandwidth": self.device_host_reference_hour,
-            "host_storage_bandwidth": self.host_storage_reference_hour,
+            "storage_capacity": reservation["storage_reserved_bytes"] / GIB * self.storage_gib_hour,
+            "device_to_host_bandwidth": rates["device_to_host"] / GIB * self.device_to_host_gibps_hour,
+            "host_to_device_bandwidth": rates["host_to_device"] / GIB * self.host_to_device_gibps_hour,
+            "host_to_storage_bandwidth": rates["host_to_storage"] * file_share / GIB * self.host_to_storage_gibps_hour,
+            "storage_to_host_bandwidth": rates["storage_to_host"] * file_share / GIB * self.storage_to_host_gibps_hour,
         }
 
 
@@ -128,7 +136,7 @@ class SearchPolicy:
                 "cost_gaps": cell["cost_gaps"],
             }
             reservation = cell.get("resource_reservation")
-            if reservation is None:
+            if reservation is None or not {"storage_reserved_bytes", "bandwidth_bytes_per_sec"} <= reservation.keys():
                 if cell["status"] == "predicted":
                     row["status"] = "resource_accounting_unavailable"
                 rows.append(row)
@@ -138,7 +146,7 @@ class SearchPolicy:
             host = self.fixed_host_gib + participants * reservation["host_kv_bytes_per_rank"] / GIB
             row.update(device_reserved_gib_per_rank=device, host_reserved_gib=host)
             device_total = participants * device
-            breakdown = self.pricing.costs(device_total, host)
+            breakdown = self.pricing.costs(device_total, host, reservation)
             hourly = sum(breakdown.values())
             row.update(
                 device_reserved_gib=device_total,
@@ -150,6 +158,10 @@ class SearchPolicy:
                 ),
                 hourly_cost_units=hourly,
                 hourly_cost_breakdown=breakdown,
+                storage_reserved_gib=reservation["storage_reserved_bytes"] / GIB,
+                bandwidth_gib_per_sec={
+                    key: value / GIB for key, value in reservation["bandwidth_bytes_per_sec"].items()
+                },
                 window_cost_units=hourly * row["predicted_sec"] / 3600 if row["predicted_sec"] is not None else None,
             )
 
@@ -189,6 +201,11 @@ class SearchPolicy:
             if within_budget
             else None
         )
+        worst = (
+            min(within_budget, key=lambda row: (-row["predicted_sec"], row["hourly_cost_units"], row["name"]))
+            if within_budget
+            else None
+        )
         pareto = [
             row["name"]
             for row in ranked
@@ -213,6 +230,7 @@ class SearchPolicy:
             "selection_status": "selected" if chosen else "no_ranked_candidate_meets_time_constraint",
             "fastest": fastest["name"] if fastest else None,
             "recommended": recommended["name"] if recommended else None,
+            "worst_within_budget": worst["name"] if worst else None,
             "pareto": pareto,
             "expected": len(rows),
             "ranked": len(ranked),
@@ -222,9 +240,8 @@ class SearchPolicy:
             "maximum_time_ratio": self.maximum_time_ratio,
             "resource_plans": [asdict(plan) for plan in self.plans],
             "pricing": asdict(self.pricing),
-            "bandwidth_ratios": {"device_host": 1.0, "host_storage": 1.0},
             "candidates": rows,
-            "qualification": "Finite supplied candidates, complete formal HTTP. Deployable envelopes use identical devices/runtime/I/O. Costs include device/host storage and two shared reference bandwidth links only; CPU, whole-card compute rental, SSD capacity and per-byte traffic fees are excluded. Fixed storage reserves are caller assumptions; KV pools include native padding and in-pool buffers. Link bandwidth is fixed at the reference configuration, not inferred from workload throughput. Window cost covers formal HTTP, not startup or a complete bill. Missing predictions do not enter ranking; incomplete coverage makes selection provisional. No target measurements or refitting.",
+            "qualification": "Finite supplied candidates, complete formal HTTP. Seven charges cover device/host/file capacity and four transfer reservations; shared file service is apportioned once. PCIe limits are per rank and group totals are charged. No CPU, compute rental or per-byte traffic charge. Fixed reserves and prices are declared assumptions. Transfer admission permits one native-operation burst and retains native operation costs; these are software quotas, not replacement hardware. Incomplete coverage makes selection provisional. No target observations or refitting.",
         }
 
 

@@ -13,7 +13,8 @@
 namespace markov::trace_graph::planning {
 
 CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t page_tokens, CacheConfig config, CacheBackend backend,
-                           std::optional<StorageConfig> storage, std::optional<KernelCacheInitial> kernel_cache_initial, std::optional<RegionBackend> regions)
+                           std::optional<StorageConfig> storage, std::optional<KernelCacheInitial> kernel_cache_initial, std::optional<RegionBackend> regions,
+                           std::optional<BandwidthLimits> bandwidth)
     : source_(source),
       page_tokens_(page_tokens),
       cache_(config),
@@ -23,6 +24,10 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
       region_preparation_(kernel_cache_initial),
       running_(source.observations().requests.size()),
       requests_(source.observations().requests.size()) {
+    if (bandwidth) {
+        if (!regions_ || !storage) throw std::runtime_error("Bandwidth admission currently requires regional execution with file storage");
+        bandwidth_.emplace(*bandwidth, backend_.participants, compute_resource_begin(storage.has_value()) + 2 * backend_.participants);
+    }
     if (std::ranges::any_of(source.observations().requests, [](const source::RequestWindow & request) { return !request.received || !request.sent; })) {
         issue_ = "request_boundaries_unavailable";
         return;
@@ -57,7 +62,8 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
                          source.observations().resources.size() + 2 * backend_.participants,
                          requests_.size(),
                          *storage,
-                         backend_.storage);
+                         backend_.storage,
+                         bandwidth_ ? &*bandwidth_ : nullptr);
 }
 
 bool CacheProgram::make_host_room(std::size_t pages) {

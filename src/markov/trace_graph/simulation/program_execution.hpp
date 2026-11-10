@@ -36,6 +36,7 @@ struct ProgramResult {
     std::vector<std::size_t> scale_matches;
     std::optional<GeneratedGraph> graph;
     std::vector<OperationEvidence> operations;
+    graph::Time work_finished_ns = 0;
 };
 
 // Bridge typed work to the existing clock. Rules never receive cost responses;
@@ -67,6 +68,7 @@ private:
     // discovery order in gaps_ while merging repeated missing work points.
     std::set<const cost::Response *> seen_gaps_;
     std::map<cost::Coverage, std::size_t> coverage_;
+    std::optional<graph::Time> work_finished_ns_;
 };
 
 } // namespace markov::trace_graph::simulation

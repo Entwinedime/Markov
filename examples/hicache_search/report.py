@@ -44,6 +44,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
     write_json(output / "results.json", result)
 
     configurations = {target["name"]: target["configuration"] for target in targets}
+    cost_names = sorted({key for row in result["candidates"] for key in (row["hourly_cost_breakdown"] or {})})
     records = []
     for row in result["candidates"]:
         configuration = configurations[row["name"]]
@@ -54,10 +55,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
                 "status": row["status"],
                 "resource_plan": row["resource_plan"],
                 "hourly_cost_units": row["hourly_cost_units"],
-                **{
-                    f"cost_{key}": (row["hourly_cost_breakdown"] or {}).get(key)
-                    for key in ("device_storage", "host_storage", "device_host_bandwidth", "host_storage_bandwidth")
-                },
+                **{f"cost_{key}": (row["hourly_cost_breakdown"] or {}).get(key) for key in cost_names},
                 "window_cost_units": row["window_cost_units"],
                 "predicted_sec": row["predicted_sec"],
                 "device_reserved_gib_per_rank": row["device_reserved_gib_per_rank"],
@@ -84,7 +82,7 @@ def write_report(output: Path, targets: list[dict], repetitions: int) -> dict:
         f"已进入排名 {result['ranked']} 个；状态 {result['status']}。",
         f"固定正式 HTTP 上限为 {result['maximum_time_sec']:.4f} 秒，预测筛选与正常确认共用此上限；{selection}",
         "",
-        "资源成本按 device/host 预留存储与两条固定参考链路计算。物理档位只限定能否部署；成本单位为声明情景，不代表真实支出。",
+        "资源成本按三级预留容量与四向带宽配额计算，文件共同服务按份额计费。物理档位限定部署范围，价格为声明情景。",
         "",
         "| 资源档位 | 主机配额 GiB | 该档最快预测秒 | 条件 |",
         "| --- | ---: | ---: | --- |",

@@ -1,8 +1,10 @@
 #include "markov/adapters/prediction.hpp"
 #include "markov/adapters/ktransformers/prediction.hpp"
+#include "markov/trace_graph/planning/cache_program.hpp"
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -60,7 +62,8 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
                                           "hicache_mem_layout",
                                           "hicache_storage_backend",
                                           "hicache_storage_prefetch_policy",
-                                          "hicache_storage_backend_extra_config" };
+                                          "hicache_storage_backend_extra_config",
+                                          "hicache_transfer_bandwidth" };
     std::vector<PredictionTarget> targets;
     for (const auto & target : raw.at("targets")) {
         auto configuration = base;
@@ -87,11 +90,11 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
             {  "host_layout",   configuration.at("hicache_mem_layout") }
         };
         auto cache = sglang::read_cache_settings(settings);
+        cache.bandwidth = sglang::configured_bandwidth(configuration);
         if (!configuration.at("enable_hierarchical_cache").get<bool>()) {
             cache.host_pages = 0;
             cache.backup_after_hits.reset();
         }
-        cache.storage = sglang::configured_storage(configuration, cache.device_pages, cache.host_pages);
         const auto result_implementation =
             configuration.at("enable_hierarchical_cache").get<bool>() ? "sglang.ascend.eager:HiRadixCache" : "sglang.ascend.eager:RadixCache";
         targets.push_back({
@@ -107,6 +110,15 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     }
     auto source = prepare_source(manifest, std::nullopt, SourceDetail::Regions);
     const auto & observations = source.context.observations();
+    const auto cache_backend = sglang::cache_backend(source.context);
+    for (auto & target : targets) {
+        if (target.page_tokens > std::numeric_limits<std::size_t>::max() / cache_backend.bytes_per_token)
+            throw std::runtime_error("KV page bytes exceed the supported size range");
+        target.cache.storage = sglang::configured_storage(target.configuration,
+                                                          target.cache.device_pages,
+                                                          target.cache.host_pages,
+                                                          target.page_tokens * cache_backend.bytes_per_token);
+    }
     if (observations.counts.contains("schedule_input_facts.unsupported"))
         throw std::runtime_error("Regional prediction currently supports plain eager inputs without speculative, multimodal or logprob branches");
     const auto & workload = raw.at("workload");

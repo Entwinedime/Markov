@@ -1,7 +1,9 @@
 #include "markov/trace_graph/simulation/program_execution.hpp"
 
+#include <cmath>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -49,9 +51,18 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
         }
         if (response) ++coverage[*response->coverage];
         const bool delay = operation.delay || (response && !std::holds_alternative<std::reference_wrapper<const planning::Work>>(operation.cost));
-        const auto kind = !response ? graph::NodeKind::Boundary : delay ? graph::NodeKind::Delay : graph::NodeKind::Service;
+        auto duration = response ? *response->duration_ns : 0;
+        auto kind = !response ? graph::NodeKind::Boundary : delay ? graph::NodeKind::Delay : graph::NodeKind::Service;
+        if (operation.reservation) {
+            const auto & reservation = *operation.reservation;
+            const auto ns = std::ceil(static_cast<long double>(reservation.bytes) * 1e9L / reservation.bytes_per_sec);
+            if (!std::isfinite(ns) || ns < 0 || ns >= std::numeric_limits<graph::Time>::max())
+                throw std::runtime_error("Bandwidth reservation exceeds the execution clock range");
+            duration = static_cast<graph::Time>(ns);
+            kind = graph::NodeKind::Service;
+        }
         bound.operations.push_back({
-            { response ? *response->duration_ns : 0, operation.resource, kind },
+            { duration, operation.resource, kind },
             operation.completion,
             operation.owner
         });
@@ -83,7 +94,10 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
     return begin;
 }
 
-void ProgramExecution::on_event(Execution &, const Event & event) { program_.on_event(*this, event); }
+void ProgramExecution::on_event(Execution &, const Event & event) {
+    program_.on_event(*this, event);
+    if (!work_finished_ns_ && program_.complete()) work_finished_ns_ = clock_.now_ns();
+}
 
 ProgramResult ProgramExecution::run() {
     program_.start(*this);
@@ -92,8 +106,13 @@ ProgramResult ProgramExecution::run() {
 
     auto graph = record_graph_ && gaps_.empty() ? std::optional(clock_.generated_graph()) : std::nullopt;
     return {
-        clock_.take_result(), std::move(gaps_),      std::move(coverage_), { scaling_.matched().begin(), scaling_.matched().end() },
-        std::move(graph),     std::move(operations_)
+        clock_.take_result(),
+        std::move(gaps_),
+        std::move(coverage_),
+        { scaling_.matched().begin(), scaling_.matched().end() },
+        std::move(graph),
+        std::move(operations_),
+        work_finished_ns_.value_or(clock_.now_ns())
     };
 }
 

@@ -54,10 +54,24 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {   "host",   target.cache.host_pages }
         };
         const auto pool_bytes = adapters::sglang::cache_pool_bytes(target.cache, target.page_tokens, backend.bytes_per_token);
-        const Json reservation{
+        Json reservation{
             { "device_kv_bytes_per_rank", pool_bytes.device_per_rank },
             {   "host_kv_bytes_per_rank",   pool_bytes.host_per_rank }
         };
+        if (target.cache.storage && target.cache.storage->capacity_pages) {
+            const auto extra = Json::parse(target.configuration.at("hicache_storage_backend_extra_config").get<std::string>());
+            reservation["storage_reserved_bytes"] = extra.at("max_size").get<double>() * backend.participants;
+        }
+        if (target.cache.bandwidth) {
+            const auto & rates = *target.cache.bandwidth;
+            reservation["bandwidth_bytes_per_sec"] = {
+                {  "device_to_host", rates.bytes_per_sec[0] * backend.participants },
+                {  "host_to_device", rates.bytes_per_sec[1] * backend.participants },
+                { "host_to_storage",                        rates.bytes_per_sec[2] },
+                { "storage_to_host",                        rates.bytes_per_sec[3] },
+                {  "storage_shared",            rates.storage_shared_bytes_per_sec }
+            };
+        }
         if (target.infeasible) {
             cells.push_back({
                 {                  "name",           target.name },
@@ -89,7 +103,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                                        backend,
                                        target.cache.storage,
                                        input.initial,
-                                       target.regions);
+                                       target.regions,
+                                       target.cache.bandwidth);
         simulation::ProgramResult result;
         if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale, input.record_graph).run();
         const bool complete =
@@ -173,7 +188,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             {             "cost_gaps",                                                                                    std::move(gaps) },
             {         "e2e_predicted",                                                                                           complete },
             {       "formal_http_sec", complete && formal_begin && formal_end ? Json((*formal_end - *formal_begin) / 1e9) : Json(nullptr) },
-            { "background_finish_sec",           complete ? Json(std::ranges::max(result.execution.completions_ns) / 1e9) : Json(nullptr) },
+            { "background_finish_sec",                                     complete ? Json(result.work_finished_ns / 1e9) : Json(nullptr) },
             {       "generated_nodes",                                                                     result.execution.states.size() },
             {        "executed_nodes",                                                                          result.execution.executed },
             {       "generated_edges",                                                                             result.execution.edges },
@@ -189,20 +204,22 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             const auto & stats = storage->stats();
             cells.back()["host_evicted_pages"] = program.host_evicted_pages();
             cells.back()["storage"] = {
-                {              "queries",stats.queries                                         },
-                {           "prefetches",           stats.prefetches },
-                {      "rank_read_pages",      stats.rank_read_pages },
-                {    "rank_copied_pages",    stats.rank_copied_pages },
-                { "rank_rejected_copies", stats.rank_rejected_copies },
-                {       "write_enqueues",               stats.writes },
-                {       "rank_new_pages",       stats.rank_new_pages },
-                {  "rank_existing_pages",  stats.rank_existing_pages },
-                {                 "idle",            storage->idle() },
-                {        "qualification",
+                {                "queries",stats.queries                                           },
+                {             "prefetches",             stats.prefetches },
+                {        "rank_read_pages",        stats.rank_read_pages },
+                {      "rank_copied_pages",      stats.rank_copied_pages },
+                {   "rank_rejected_copies",   stats.rank_rejected_copies },
+                {         "write_enqueues",                 stats.writes },
+                {         "rank_new_pages",         stats.rank_new_pages },
+                {    "rank_existing_pages",    stats.rank_existing_pages },
+                {    "rank_disk_evictions",    stats.rank_disk_evictions },
+                { "peak_rank_stored_pages", stats.peak_rank_stored_pages },
+                {                   "idle",              storage->idle() },
+                {          "qualification",
                  "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control reuses the source "
                  "residual outside replaced controls. Issue/check/accept responses retain caller ownership; background query groups and idle turns are "
                  "separate. Concurrent file changes remain "
-                 "approximate."                                     }
+                 "approximate."                                         }
             };
         }
     }

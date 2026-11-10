@@ -64,6 +64,10 @@ class InferenceCapture:
             raise ValueError("Inference capture does not support this framework")
 
         workload = self.workload if self.workload is not None else Workload.load(self.request.workload)
+        if self.calibration and self.request.base.configuration.get("hicache_transfer_bandwidth") is not None:
+            raise ValueError(
+                "Independent native cost calibration excludes transfer quotas; remove hicache_transfer_bandwidth"
+            )
         server = adapter.server_arguments(self.request.deployment, self.request.base.configuration)
         task = DeviceTask(self.settings, self.directory)
         task.recover()

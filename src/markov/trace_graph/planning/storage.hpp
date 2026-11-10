@@ -16,6 +16,8 @@
 
 namespace markov::trace_graph::planning {
 
+class Bandwidth;
+
 // Request queues preserve native worker ownership across multiple service
 // fragments. They choose work; all resource time still belongs to ProgramRuntime.
 class Storage {
@@ -23,7 +25,7 @@ public:
     static constexpr simulation::Component owner = 1;
 
     Storage(Cache & cache, const TokenPaths & paths, std::size_t page_tokens, std::size_t bytes_per_token, std::size_t participants, std::size_t resource_begin,
-            std::size_t requests, StorageConfig config, StorageBackend backend);
+            std::size_t requests, StorageConfig config, StorageBackend backend, Bandwidth * bandwidth = nullptr);
     Storage(const Storage &) = delete;
 
     // Issue once at enqueue; admission checks consume only the progress already
@@ -121,6 +123,7 @@ private:
     const std::size_t page_tokens_, page_bytes_, participants_, resource_begin_;
     const StorageConfig config_;
     const StorageBackend backend_;
+    Bandwidth * bandwidth_;
     std::vector<PrefetchResult> results_;
     StorageStats stats_;
     std::vector<Worker> workers_;

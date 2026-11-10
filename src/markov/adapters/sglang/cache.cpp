@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -87,7 +88,8 @@ trace_graph::planning::StorageConfig read_storage(const nlohmann::json & raw, st
 
 } // namespace
 
-std::optional<trace_graph::planning::StorageConfig> configured_storage(const nlohmann::json & configuration, std::size_t device_pages, std::size_t host_pages) {
+std::optional<trace_graph::planning::StorageConfig> configured_storage(const nlohmann::json & configuration, std::size_t device_pages, std::size_t host_pages,
+                                                                       std::size_t page_bytes) {
     using Json = nlohmann::json;
     if (!configuration.contains("hicache_storage_backend") || configuration.at("hicache_storage_backend").is_null()) return std::nullopt;
     if (configuration.at("hicache_storage_backend") != "file" || !configuration.at("enable_hierarchical_cache").get<bool>())
@@ -99,23 +101,55 @@ std::optional<trace_graph::planning::StorageConfig> configured_storage(const nlo
         if (value.starts_with("@")) throw std::runtime_error("Storage prediction requires inline extra configuration, not an external target file");
         extra = Json::parse(value);
     }
-    const std::set<std::string> fields{ "prefetch_threshold", "prefetch_timeout_base", "prefetch_timeout_per_ki_token", "prefetch_timeout_max" };
+    const std::set<std::string> fields{ "prefetch_threshold", "prefetch_timeout_base", "prefetch_timeout_per_ki_token", "prefetch_timeout_max", "max_size",
+                                        "min_free_space",     "eviction_ratio" };
     for (const auto & [key, value] : extra.items()) {
         if (!fields.contains(key)) throw std::runtime_error("Storage prediction does not yet support extra setting: " + key);
     }
-    return read_storage(
-        {
-            { "backend", "file" },
-            { "initial_state", "empty" },
-            { "prefetch_stop_policy", configuration.value("hicache_storage_prefetch_policy", "timeout") },
-            { "prefetch_threshold_tokens", extra.value("prefetch_threshold", Json(256)) },
-            { "prefetch_timeout",
-             { { "base_sec", extra.value("prefetch_timeout_base", 2.0) },
-                { "per_ki_token_sec", extra.value("prefetch_timeout_per_ki_token", 0.1) },
-                { "max_sec", extra.value("prefetch_timeout_max", 30.0) } } }
-    },
-        device_pages,
-        host_pages);
+    if ((extra.contains("min_free_space") && extra.at("min_free_space") != 0)
+        || (extra.contains("max_size") && extra.at("max_size") != 0 && extra.value("eviction_ratio", 0.9) != 1.0))
+        throw std::runtime_error("File-capacity prediction requires min_free_space=0 and eviction_ratio=1");
+
+    Json storage{
+        { "backend", "file" },
+        { "initial_state", "empty" },
+        { "prefetch_stop_policy", configuration.value("hicache_storage_prefetch_policy", "timeout") },
+        { "prefetch_threshold_tokens", extra.value("prefetch_threshold", Json(256)) },
+        { "prefetch_timeout",
+         { { "base_sec", extra.value("prefetch_timeout_base", 2.0) },
+            { "per_ki_token_sec", extra.value("prefetch_timeout_per_ki_token", 0.1) },
+            { "max_sec", extra.value("prefetch_timeout_max", 30.0) } } }
+    };
+    if (extra.contains("max_size")) {
+        if (!extra.at("max_size").is_number_integer() || extra.at("max_size").get<std::int64_t>() < 0)
+            throw std::runtime_error("File max_size must be nonnegative bytes per rank");
+        const auto bytes = extra.at("max_size").get<std::size_t>();
+        if (bytes) {
+            const auto pages = bytes / page_bytes;
+            if (!pages) throw std::runtime_error("File cache capacity cannot hold one KV page per rank");
+            storage["capacity_pages"] = pages;
+        }
+    }
+    return read_storage(storage, device_pages, host_pages);
+}
+
+std::optional<trace_graph::planning::BandwidthLimits> configured_bandwidth(const nlohmann::json & configuration) {
+    using namespace trace_graph::planning;
+    if (!configuration.contains("hicache_transfer_bandwidth") || configuration.at("hicache_transfer_bandwidth").is_null()) return std::nullopt;
+    if (!configuration.at("enable_hierarchical_cache").get<bool>() || configuration.value("hicache_storage_backend", "") != "file")
+        throw std::runtime_error("Transfer admission requires HiCache file storage");
+    const auto & raw = configuration.at("hicache_transfer_bandwidth");
+    const std::array<std::string, 5> fields{ "device_to_host", "host_to_device", "host_to_storage", "storage_to_host", "storage_shared" };
+    if (!raw.is_object() || raw.size() != fields.size()) throw std::runtime_error("Declare all five transfer bandwidth limits in bytes/sec");
+    std::array<double, 5> rates{};
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        rates[index] = raw.at(fields[index]).get<double>();
+        if (!std::isfinite(rates[index]) || rates[index] <= 0) throw std::runtime_error("Transfer bandwidth must be positive finite bytes/sec");
+    }
+    return BandwidthLimits{
+        { rates[0], rates[1], rates[2], rates[3] },
+        rates[4]
+    };
 }
 
 CacheSettings read_cache_settings(const nlohmann::json & raw) {
