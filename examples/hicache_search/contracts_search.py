@@ -19,6 +19,7 @@ from markov.workflow.search import SearchPolicy
 from markov.instrumentation.containers import container_state
 
 from confirm import Confirmation
+from contracts_report import write_report
 from run import candidates
 
 
@@ -256,32 +257,7 @@ class ContractSearch:
         return path
 
     def report(self) -> dict:
-        normal = read_json(self.output / "confirmation/results.json")
-        scenes = {}
-        for scene in self.scenes:
-            search = read_json(self.output / "scenes" / scene / "run/search/report.json")
-            rows = [row for row in normal["rows"] if row["scene"] == scene]
-            best = next(row for row in rows if "best" in row["roles"])
-            worst = next(row for row in rows if "worst" in row["roles"])
-            better, worse = best["normal"]["mean_sec"], worst["normal"]["mean_sec"]
-            scenes[scene] = {
-                "search": str(self.output / "scenes" / scene / "run/search/report.json"),
-                "expected": search["expected"],
-                "statuses": search["statuses"],
-                "best": best,
-                "worst": worst,
-                "actual_improvement_percent": 100 * (1 - better / worse)
-                if better is not None and worse is not None
-                else None,
-            }
-        result = {
-            "status": normal["status"],
-            "scenes": scenes,
-            "models": str(self.models),
-            "qualification": "Full declared package/policy scan; single fixed normal observation per endpoint. No target trace or refitting. Software transfer-admission quotas; no significance or real global optimum claim.",
-        }
-        write_json(self.output / "results.json", result)
-        return result
+        return write_report(self.output, self.settings, self.workloads, self.models, self.scenes, self.targets)
 
 
 def main() -> None:
@@ -305,7 +281,8 @@ def main() -> None:
                 raise RuntimeError("Normal confirmation is incomplete; all observations and failures are retained")
             confirmation.report()
         if args.phase in ("report", "all"):
-            print(json.dumps(experiment.report(), ensure_ascii=False), flush=True)
+            result = experiment.report()
+            print(json.dumps({"status": result["status"], "report": str(experiment.output / "results.md")}), flush=True)
 
 
 if __name__ == "__main__":
