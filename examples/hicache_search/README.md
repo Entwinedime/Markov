@@ -141,6 +141,9 @@ PYTHONPATH=python python3 examples/hicache_search/contracts_search.py \
   --models /path/to/selected_models.json --output data/contract_search --phase plan
 ```
 
-plan 保存并核对三组正式请求；predict 采集三个 base 并扫描全部套餐/策略；confirm 在全部覆盖后保存同预算最好/最差清单，再各测一次。
+settings 可用 `"scenes": ["alternating"]` 只执行已准备输入的一部分；省略时使用 summary.json 中的全部场景。
+`prediction_processes` 可设为 1 或 2，每个场景据此划分互不重叠的 CPU 分区，最多两份预测同时运行，各受声明的内存上限约束。
+每份进程只整理一次相同来源；合并全部配置后才统一计价和选点，逐进程的整理开销和内存分别保留。
+plan 保存并核对所选场景的正式请求；predict 为每个所选场景采集一个 base 并扫描全部套餐/策略；confirm 在全部覆盖后保存同预算最好/最差清单，再各测一次。
 后两个场景可交替端点顺序；角色重合只测一次，不额外测正常 base。report 单独读取正常评价，不更新成本模型。
 成本域和全部候选未闭合时不开始确认。单次观察只能说明所选端点的差距，不能证明波动范围、真实全局最优或问答质量。

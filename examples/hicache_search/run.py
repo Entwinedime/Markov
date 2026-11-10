@@ -24,6 +24,9 @@ EXAMPLE = Path(__file__).resolve().parent
 
 def candidates(settings: dict) -> list[dict]:
     axes = settings["axes"]
+    names = [settings["policy"]["baseline"], *(package["name"] for package in settings.get("resource_packages", []))]
+    if any(not name or name in {".", ".."} or Path(name).name != name for name in names):
+        raise ValueError("Resource package and baseline names must be single path components")
     resources = (
         [(package["name"], package["configuration"]) for package in settings["resource_packages"]]
         if "resource_packages" in settings

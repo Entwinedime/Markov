@@ -15,6 +15,7 @@ import time
 from markov.artifacts.request import PredictionRequest, read_json
 from markov.artifacts.writing import write_json
 from markov.workflow.capture import InferenceCapture
+from markov.workflow.search import SearchPolicy
 from markov.instrumentation.containers import container_state
 
 from confirm import Confirmation
@@ -25,7 +26,12 @@ class ContractSearch:
     def __init__(self, settings: Path, workloads: Path, models: Path, output: Path):
         self.settings = read_json(settings)
         self.workloads, self.models, self.output = workloads.resolve(), models.resolve(), output.resolve()
-        self.scenes = list(read_json(self.workloads / "summary.json")["scenes"])
+        available = read_json(self.workloads / "summary.json")["scenes"]
+        self.scenes = self.settings.get("scenes", list(available))
+        if not self.scenes or len(set(self.scenes)) != len(self.scenes) or not set(self.scenes) <= set(available):
+            raise ValueError("Select a nonempty, unique subset of the available scenes")
+        if any(not scene or scene in {".", ".."} or Path(scene).name != scene for scene in self.scenes):
+            raise ValueError("Scene names must be single path components")
         self.targets = candidates(self.settings)
         self.output.mkdir(parents=True, exist_ok=True)
 
@@ -62,6 +68,10 @@ class ContractSearch:
 
     def predict(self) -> None:
         running = []
+        groups = {}
+        partitions = self.settings.get("prediction_processes", 1)
+        if type(partitions) is not int or partitions not in (1, 2):
+            raise ValueError("prediction_processes must be 1 or 2")
         try:
             for scene in self.scenes:
                 directory = self.output / "scenes" / scene
@@ -74,6 +84,7 @@ class ContractSearch:
                             f"The recorded CPU prediction is still running: {scene}; wait for its existing handle"
                         )
                 path = directory / "requests/prediction.json"
+                raw = read_json(path)
                 request = PredictionRequest.load(path)
                 memory = {
                     row.split(":")[0]: int(row.split()[1]) * 1024
@@ -89,38 +100,55 @@ class ContractSearch:
                 captured = InferenceCapture(request).run(reuse=True)
                 if captured["status"] not in ("completed", "reused"):
                     raise RuntimeError(f"Base capture did not complete: {scene}: {captured}")
-                while len(running) >= 2:
-                    self.finish(running[0])
-                    running.pop(0)
-                with (directory / "search.log").open("a") as stream:
-                    process = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "markov",
-                            "search",
-                            "--request",
-                            str(directory / "requests/search.json"),
-                        ],
-                        stdout=stream,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
+                groups[scene] = []
+                for partition in range(partitions):
+                    worker = directory / "run/partitions" / str(partition)
+                    targets = self.targets[partition::partitions]
+                    worker_request = directory / "requests" / f"prediction_part_{partition}.json"
+                    body = {
+                        **raw,
+                        "base": {"manifest": captured["manifest"]},
+                        "targets": targets,
+                        "execution": {**raw["execution"], "output": str(worker)},
+                    }
+                    if worker_request.exists() and read_json(worker_request) != body:
+                        raise ValueError("The saved CPU partition has different inputs; use a new output")
+                    write_json(worker_request, body)
+                    groups[scene].append(worker)
+                    result = worker / "prediction/report.json"
+                    if result.exists() and read_json(result).get("status") == "completed":
+                        continue
+                    if state := container_state(worker / "prediction/container.id"):
+                        if state["Running"]:
+                            raise ValueError(f"The recorded CPU partition is still running: {worker}")
+                    while len(running) >= 2:
+                        self.finish(running[0])
+                        running.pop(0)
+                    worker.mkdir(parents=True, exist_ok=True)
+                    with (worker / "workflow.log").open("a") as stream:
+                        process = subprocess.Popen(
+                            [sys.executable, "-m", "markov", "predict", "--request", str(worker_request)],
+                            stdout=stream,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                    running.append((worker, process))
+                    write_json(
+                        worker / "cpu_process.json",
+                        {"pid": process.pid, "started_at_sec": time.time(), "request": str(worker_request)},
                     )
-                running.append((scene, process))
                 write_json(
                     directory / "cpu_process.json",
-                    {
-                        "pid": process.pid,
-                        "started_at_sec": time.time(),
-                        "search_request": str(directory / "requests/search.json"),
-                    },
+                    {"owner_pid": os.getpid(), "partitions": [str(worker) for worker in groups[scene]]},
                 )
             for entry in running:
                 self.finish(entry)
             running.clear()
+            for scene, workers in groups.items():
+                self.rank(scene, workers)
         finally:
-            for scene, process in running:
-                cid = self.output / "scenes" / scene / "run/prediction/container.id"
+            for worker, process in running:
+                cid = worker / "prediction/container.id"
                 state = container_state(cid)
                 if state is not None and state["Running"]:
                     subprocess.run(["docker", "rm", "-f", cid.read_text().strip()], check=True, timeout=30)
@@ -133,11 +161,43 @@ class ContractSearch:
                         process.wait(timeout=10)
 
     def finish(self, entry) -> None:
-        scene, process = entry
-        if process.wait() != 0:
-            raise RuntimeError(f"Search failed for {scene}; its log and formal report are retained")
-        report = read_json(self.output / "scenes" / scene / "run/search/report.json")
-        if report["status"] != "completed" or report["expected"] != len(self.targets):
+        worker, process = entry
+        if process.wait() not in (0, 1):
+            raise RuntimeError(f"Prediction failed for {worker}; its log and report are retained")
+
+    def rank(self, scene: str, workers: list[Path]) -> None:
+        reports = [read_json(worker / "prediction/report.json") for worker in workers]
+        if any(report.get("status") not in {"completed", "incomplete"} for report in reports):
+            raise RuntimeError(f"A CPU partition failed for {scene}; its log and report are retained")
+        first = reports[0]
+        if any(
+            any(report[key] != first[key] for key in ("manifest", "models", "deployment")) for report in reports[1:]
+        ):
+            raise ValueError("CPU partitions must use the same source, models and deployment")
+        cells = [cell for report in reports for cell in report["cells"]]
+        by_name = {cell["name"]: cell for cell in cells}
+        if len(cells) != len(by_name) or set(by_name) != {target["name"] for target in self.targets}:
+            raise ValueError("CPU partitions must cover every declared target exactly once")
+        prediction = {
+            **first,
+            "cells": [by_name[target["name"]] for target in self.targets],
+            "status": "completed" if all(cell["e2e_predicted"] for cell in cells) else "incomplete",
+            "source_sessions": [str(worker / "prediction/report.json") for worker in workers],
+            "source_prepare_sec": sum(report["source_prepare_sec"] for report in reports),
+            "source_records_read": sum(report["source_records_read"] for report in reports),
+            "process_peak_rss_bytes": max(report["process_peak_rss_bytes"] for report in reports)
+            if all(report["process_peak_rss_bytes"] is not None for report in reports)
+            else None,
+            "model_sources": sorted({source for report in reports for source in report["model_sources"]}),
+            "cost_assumptions": sorted({item for report in reports for item in report["cost_assumptions"]}),
+        }
+        directory = self.output / "scenes" / scene / "run"
+        for name in ("prediction", "search"):
+            (directory / name).mkdir(parents=True, exist_ok=True)
+        write_json(directory / "prediction/report.json", prediction)
+        search = SearchPolicy.parse(read_json(directory.parent / "requests/search.json")).rank(prediction)
+        write_json(directory / "search/report.json", search)
+        if search["status"] != "completed":
             raise ValueError(f"Full declared coverage is incomplete: {scene}")
 
     def confirmation_plan(self) -> Path:
