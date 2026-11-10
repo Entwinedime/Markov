@@ -98,7 +98,7 @@ fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以�
 pricing 为必填的资源单价声明。
 每个资源档位声明 name、device_gib_per_rank 和 host_gib；GiB 配额为正整数，名字不重复。档位只限定能否部署。
 pricing 声明 device_gib_hour、host_gib_hour、storage_gib_hour 三项每 GiB·小时单价，以及
-四项 <direction>_gibps_hour（direction 为 device_to_host、host_to_device、host_to_storage、storage_to_host），均为有限正数。
+四项 `<direction>_gibps_hour`（direction 为 device_to_host、host_to_device、host_to_storage、storage_to_host），均为有限正数。
 带宽按整组 GiB/s·小时计价，不按流量或请求平均吞吐收费。
 候选组合由调用方提供，搜索不重写结构规则、不读取 target 真值，也不比较多套搜索算法。
 
