@@ -6,8 +6,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 import time
 
-from markov.artifacts.capture import DeviceCommand
-from markov.artifacts.performance import PerformanceData, encoded
+from markov.artifacts.performance import PerformanceData
 from markov.artifacts.request import PredictionRequest, read_json
 from markov.artifacts.writing import write_json
 from markov.workflow.device_task import CaptureBudgetExceeded, DeviceTask
@@ -40,7 +39,7 @@ class PerformancePreparation:
         self.rounds.append(summary)
         for command in commands:
             begin = time.monotonic()
-            existing = self.find_capture(command)
+            existing = self.task.completed_capture(command)
             if existing is None:
                 try:
                     result = self.task.run(command)
@@ -96,21 +95,6 @@ class PerformancePreparation:
                 summary["failure"] = "The cumulative performance budget was reached during maintenance"
                 return None
         return models
-
-    def find_capture(self, command: DeviceCommand) -> Path | None:
-        wanted = encoded(command.payload)
-        for attempt in self.task.state["attempts"]:
-            if attempt["status"] != "completed" or attempt["result_key"] != command.result_key:
-                continue
-            output = Path(attempt["output"])
-            actual = read_json(output / "capture_input.json")
-            actual.pop("budget", None)
-            if encoded(actual) == wanted:
-                artifact = output / attempt["artifact"]
-                ports = read_json(artifact).get("measurement_ports", [])
-                if set(command.required_measurement_ports) <= set(ports):
-                    return artifact
-        return None
 
     def approved_training(self, selected: dict, adapter: str) -> set[Path]:
         # Keep prior anchors for required kinds. Other responses stay selected,

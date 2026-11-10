@@ -10,7 +10,7 @@ from markov.artifacts.request import Deployment
 from markov.adapters.sglang.capture import CAPTURE_OWNED_ARGUMENTS, capture_environment, server_arguments
 
 
-def _capture_command(deployment: Deployment, configuration: dict, workload: dict, adapter: str) -> DeviceCommand:
+def capture_command(deployment: Deployment, configuration: dict, workload: dict, adapter: str) -> DeviceCommand:
     file_workers = adapter == "sglang_file_workers"
     environment = capture_environment(False, not file_workers)
     required_ports = ()
@@ -112,7 +112,7 @@ def region_workload(maximum: int, page: int, final_phases: list[str]) -> dict:
     return {"requests": requests, "formal_begin_index": 0}
 
 
-def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -> DeviceCommand:
+def failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -> DeviceCommand:
     # One prefix fits with admission headroom; two disjoint prefixes exceed
     # the host pool even at the smaller size, so native write-back must fail.
     maximum = max(7, needed_pages)
@@ -139,7 +139,7 @@ def _failed_load_capture(deployment: Deployment, page: int, needed_pages: int) -
         "hicache_ratio": 1.0,
         "hicache_write_policy": "write_back",
     }
-    return _capture_command(
+    return capture_command(
         deployment, configuration, {"requests": requests, "formal_begin_index": 0}, "sglang_cache_controls"
     )
 
@@ -172,7 +172,7 @@ def _prefetch_capture(
         "hicache_storage_prefetch_policy": policy,
         "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
     }
-    return _capture_command(deployment, configuration, {"requests": requests, "formal_begin_index": 1}, adapter)
+    return capture_command(deployment, configuration, {"requests": requests, "formal_begin_index": 1}, adapter)
 
 
 def sampling_commands(deployment: Deployment, report: dict, requirements: list[dict]) -> list[DeviceCommand]:
@@ -248,7 +248,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
 
     commands = []
     for page, pages in sorted(failed_load_pages.items()):
-        commands.append(_failed_load_capture(deployment, page, pages))
+        commands.append(failed_load_capture(deployment, page, pages))
     for page in sorted(control_pages):
         commands.append(_prefetch_capture(deployment, page, "wait_complete"))
         commands.append(_prefetch_capture(deployment, page, "best_effort"))
@@ -262,6 +262,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             "hicache_storage_backend",
             "hicache_storage_prefetch_policy",
             "hicache_storage_backend_extra_config",
+            "hicache_transfer_bandwidth",
         ):
             configuration.pop(key, None)
         configuration.update(
@@ -272,7 +273,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             max_total_tokens=capacity,
             max_prefill_tokens=math.ceil(context["max_context_tokens"] / page) * page,
         )
-        commands.append(_capture_command(deployment, configuration, workload, "sglang_regions"))
+        commands.append(capture_command(deployment, configuration, workload, "sglang_regions"))
     if scheduler_pages:
         page = min(scheduler_pages)
         # Two alternating prefixes exceed both small pools; later requests
@@ -301,7 +302,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             "hicache_storage_prefetch_policy": "wait_complete",
             "hicache_storage_backend_extra_config": json.dumps({"prefetch_threshold": page}),
         }
-        commands.append(_capture_command(deployment, configuration, workload, "sglang_scheduler"))
+        commands.append(capture_command(deployment, configuration, workload, "sglang_scheduler"))
     if "file" in io_operations:
         file_pages.update(page for page, _, _ in io_cases)
         io_operations.remove("file")

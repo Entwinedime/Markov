@@ -112,6 +112,55 @@ class CacheIOSampler:
             "host_capacity_pages": host.size // controller.page_size,
         }
 
+    def measure_bandwidth(self, controller, pages: int, directory: Path) -> dict:
+        from markov.adapters.sglang.file_io import FileIOSampler
+
+        torch, host = self.torch, controller.mem_pool_host
+        indices = self.prepare_indices(controller, pages)
+        selected = host.alloc(len(indices))
+        host_indices, device_indices = controller.move_indices(selected, indices)
+        torch.npu.synchronize()
+
+        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+        with torch.npu.stream(controller.write_stream):
+            start.record()
+            host.backup_from_device_all_layer(
+                controller.mem_pool_device, host_indices, device_indices, controller.io_backend
+            )
+            end.record()
+        end.synchronize()
+        backup_ns = round(start.elapsed_time(end) * 1e6)
+
+        pool = controller.mem_pool_device
+        pool.k_buffer_contiguous.zero_()
+        pool.v_buffer_contiguous.zero_()
+        torch.npu.synchronize()
+        with torch.npu.stream(controller.load_stream):
+            start.record()
+            for layer in range(self.geometry["layers"]):
+                host.load_to_device_per_layer(pool, host_indices, device_indices, layer, controller.io_backend)
+            end.record()
+        end.synchronize()
+        load_ns = round(start.elapsed_time(end) * 1e6)
+        values = indices.cpu()
+        shape = (self.geometry["layers"], -1, self.geometry["kv_heads"], self.geometry["head_dim"])
+        if not bool(torch.all(pool.k_buffer_contiguous.view(shape)[:, values] == 1)) or not bool(
+            torch.all(pool.v_buffer_contiguous.view(shape)[:, values] == 2)
+        ):
+            raise RuntimeError("Independent data-path bandwidth copy changed KV values")
+
+        file = FileIOSampler(self, controller, directory).measure(pages, measure_shared=True)
+        return {
+            "transfer_bytes": len(indices) * host.get_size_per_token(),
+            "device_to_host_data_ns": backup_ns,
+            "host_to_device_data_ns": load_ns,
+            "host_to_storage_data_ns": sum(file["file_new_page_ns"]),
+            "storage_to_host_data_ns": sum(file["file_read_page_ns"]),
+            "storage_shared_data_ns": file["file_shared_ns"],
+            "storage_shared_bytes": file["file_shared_bytes"],
+            "physical_pages_verified": pages,
+        }
+
     def measure_load(self, controller, pages: int, segments: int) -> dict:
         torch = self.torch
         host = controller.mem_pool_host
@@ -209,10 +258,10 @@ def main() -> None:
     if (
         not isinstance(operations, list)
         or not operations
-        or set(operations) - {"backup", "load", "file"}
+        or set(operations) - {"backup", "load", "file", "bandwidth"}
         or len(set(operations)) != len(operations)
     ):
-        raise ValueError("operations must select backup, load, or file")
+        raise ValueError("operations must select backup, load, file, or bandwidth")
     cases = recipe["cases"]
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases must be a nonempty array")
@@ -240,6 +289,8 @@ def main() -> None:
                             measurement = sampler.measure_backup(controller, case["pages"])
                         elif operation == "load":
                             measurement = sampler.measure_load(controller, case["pages"], case.get("segments", 1))
+                        elif operation == "bandwidth":
+                            measurement = sampler.measure_bandwidth(controller, case["pages"], args.output)
                         else:
                             from markov.adapters.sglang.file_io import FileIOSampler
 
@@ -273,8 +324,12 @@ def main() -> None:
                 "backend": "kernel_ascend",
                 "host_layout": "page_first_direct",
                 "scope": "Independent initialized idle controller/host/file I/O; no weights, profiler, snapshot or target",
-                "completion_boundary": "Device responses include finish-event observation. File responses cover native buffer allocation/read/publication and materialize/batch_set intervals.",
-                "limitations": "No competing I/O or CPU load; initialization and verification outside timing; idle sync is retained without subtraction",
+                "completion_boundary": "Data-path NPU event intervals; file get/set data service and concurrent read/write, with initialization and value checks outside timing."
+                if "bandwidth" in operations
+                else "Device responses include finish-event observation. File responses cover native buffer allocation/read/publication and materialize/batch_set intervals.",
+                "limitations": "Buffered warm-file service, not cold SSD or physical PCIe specifications; mixed file test uses two CPU workers."
+                if "bandwidth" in operations
+                else "No competing I/O or CPU load; initialization and verification outside timing; idle sync is retained without subtraction",
             },
             indent=2,
         )

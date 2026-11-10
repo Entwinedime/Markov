@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from markov.artifacts.capture import CaptureSettings, DeviceCommand
+from markov.artifacts.performance import encoded
 from markov.artifacts.request import read_json
 from markov.artifacts.writing import write_json
 from markov.adapters.ascend.capture import AscendDevices
@@ -64,6 +65,22 @@ class DeviceTask:
         self.state["processing_wall_sec"] = self.state.get("processing_wall_sec", 0) + wall_sec
         self.directory.mkdir(parents=True, exist_ok=True)
         write_json(self.state_path, self.state)
+
+    def completed_capture(self, command: DeviceCommand) -> Path | None:
+        wanted = encoded(command.payload)
+        for attempt in self.state["attempts"]:
+            if attempt["status"] != "completed" or attempt["result_key"] != command.result_key:
+                continue
+
+            output = Path(attempt["output"])
+            actual = read_json(output / "capture_input.json")
+            actual.pop("budget", None)
+            if encoded(actual) == wanted:
+                artifact = output / attempt["artifact"]
+                ports = read_json(artifact).get("measurement_ports", [])
+                if set(command.required_measurement_ports) <= set(ports):
+                    return artifact
+        return None
 
     @staticmethod
     def remove_container(output: Path) -> None:

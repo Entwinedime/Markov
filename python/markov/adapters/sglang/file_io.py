@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
@@ -79,7 +80,7 @@ class FileIOSampler:
             "total_ns": end - begin,
         }
 
-    def measure(self, pages: int) -> dict[str, int | list[int]]:
+    def measure(self, pages: int, *, measure_shared: bool = False) -> dict[str, int | list[int]]:
         torch = self.sampler.torch
         controller = self.controller
         host = controller.mem_pool_host
@@ -102,6 +103,27 @@ class FileIOSampler:
             new = self.write(backend, keys, slots, (0, pages))
             existing = self.write(backend, keys, slots, (pages, 0))
             file_bytes = sum(path.stat().st_size for path in Path(backend.file_path).iterdir())
+            shared = {}
+            if measure_shared:
+                values = [
+                    host.get_data_page(int(slots[offset]), flat=True) for offset in range(0, len(slots), page_tokens)
+                ]
+                targets = [host.get_dummy_flat_data_page() for _ in keys]
+                backend.read_calls = []
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    begin = time.perf_counter_ns()
+                    read = workers.submit(backend.batch_get, keys, targets)
+                    write = workers.submit(backend.batch_set, ["mixed_" + key for key in keys], values)
+                    fetched, written = read.result(), write.result()
+                    elapsed = time.perf_counter_ns() - begin
+                if not written or any(value is None for value in fetched):
+                    raise RuntimeError("Mixed native file service failed")
+                if any(not torch.equal(value, target) for value, target in zip(values, targets)):
+                    raise RuntimeError("Mixed native file service changed KV values")
+                shared = {
+                    "file_shared_ns": elapsed,
+                    "file_shared_bytes": 2 * pages * page_tokens * host.get_size_per_token(),
+                }
 
             # Clear destinations outside timing so a successful read must
             # restore the independently written K/V payload, not old values.
@@ -137,6 +159,7 @@ class FileIOSampler:
                 copies.append(stamp - previous)
                 previous = stamp
             measurement = {
+                **shared,
                 "file_allocate_ns": stages["read"] - begin - sum(backend.read_calls),
                 "file_read_page_ns": backend.read_calls,
                 "file_copy_publish_ns": copies,
