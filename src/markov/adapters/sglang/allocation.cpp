@@ -17,11 +17,13 @@ using namespace trace_graph::planning;
 class DecodeAllocation final : public CallSequence {
 public:
     NativeSequence describe(Phase, const FrameInput & input, std::span<const Work>) const override;
+    SequencePreparations preparations(Phase, const FrameInput &, std::span<const Work>) const override { return {}; }
 };
 
 class ExtendAllocation final : public CallSequence {
 public:
     NativeSequence describe(Phase, const FrameInput & input, std::span<const Work>) const override;
+    SequencePreparations preparations(Phase phase, const FrameInput & input, std::span<const Work> work) const override;
 };
 
 void append(std::vector<NativeCall> & calls, const Features & shape, const std::string & operation, const std::string & implementation,
@@ -112,6 +114,15 @@ NativeSequence DecodeAllocation::describe(Phase, const FrameInput & input, std::
         {}
     });
     return { std::move(calls), std::nullopt };
+}
+
+SequencePreparations ExtendAllocation::preparations(Phase phase, const FrameInput & input, std::span<const Work> work) const {
+    const auto prefix = input.context_tokens - input.query_tokens;
+    const auto pages = std::ceil(input.context_tokens / input.page_tokens) - std::ceil(prefix / input.page_tokens);
+
+    // The native >=200-page path uses Torch operations, with no Triton specialization.
+    if (input.query_tokens > 0 && pages >= 200) return {};
+    return CallSequence::preparations(phase, input, work);
 }
 
 NativeSequence ExtendAllocation::describe(Phase, const FrameInput & input, std::span<const Work>) const {

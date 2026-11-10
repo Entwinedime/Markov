@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <numeric>
 #include <set>
 #include <sys/resource.h>
@@ -48,7 +49,14 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     };
     cost::Queries costs(input.costs.models, &source);
     auto cells = Json::array();
+    const auto session_begin = Clock::now();
+    const auto target_count = std::get<std::vector<adapters::PredictionTarget>>(input.targets).size();
     for (const auto & target : std::get<std::vector<adapters::PredictionTarget>>(input.targets)) {
+        if (cells.size() % 32 == 0) {
+            const auto predicted = std::ranges::count_if(cells, [](const Json & cell) { return cell.at("status") == "predicted"; });
+            std::clog << "prediction " << cells.size() + 1 << '/' << target_count << ", predicted so far: " << predicted
+                      << ", elapsed after source preparation: " << std::chrono::duration<double>(Clock::now() - session_begin).count() << " sec" << std::endl;
+        }
         const Json capacity{
             { "device", target.cache.device_pages },
             {   "host",   target.cache.host_pages }

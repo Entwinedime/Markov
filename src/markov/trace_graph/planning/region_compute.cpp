@@ -212,13 +212,12 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id) {
             issue_ = "semantic_preparation_rule_unavailable";
             return;
         }
-        const auto calls = sequence.definition->describe(frame.phase, frame.description.input, sequence.source_work);
-        if (calls.issue) {
-            issue_ = calls.issue;
+        const auto planned = sequence.definition->preparations(frame.phase, frame.description.input, sequence.source_work);
+        if (planned.issue) {
+            issue_ = planned.issue;
             return;
         }
-        for (const auto & call : calls.calls)
-            if (call.preparation) preparations.push_back(call.preparation->specialization);
+        preparations.insert(preparations.end(), planned.specializations.begin(), planned.specializations.end());
     }
     frame.features = preparation_.enter(frame.caller, frame.phase, frame.description.input, preparations);
     const auto phase = frame.phase == Phase::Prefill ? "prefill" : "decode";

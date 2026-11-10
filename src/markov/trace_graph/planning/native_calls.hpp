@@ -107,6 +107,11 @@ struct NativeSequence {
     std::optional<NativeProducer> result_ready = std::nullopt;
 };
 
+struct SequencePreparations {
+    std::vector<Work> specializations;
+    std::optional<std::string> issue;
+};
+
 enum class KernelCacheInitial { Empty, Prepared };
 enum class KernelUse { Prepared, FirstLoad, Load };
 
@@ -135,6 +140,7 @@ class CallSequence {
 public:
     virtual ~CallSequence() = default;
     virtual NativeSequence describe(Phase phase, const FrameInput & input, std::span<const Work> work = {}) const = 0;
+    virtual SequencePreparations preparations(Phase phase, const FrameInput & input, std::span<const Work> work = {}) const;
 };
 
 struct CallResources {

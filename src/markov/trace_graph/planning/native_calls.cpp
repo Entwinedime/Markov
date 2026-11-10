@@ -8,6 +8,14 @@
 
 namespace markov::trace_graph::planning {
 
+SequencePreparations CallSequence::preparations(Phase phase, const FrameInput & input, std::span<const Work> work) const {
+    const auto sequence = describe(phase, input, work);
+    SequencePreparations result{ {}, sequence.issue };
+    for (const auto & call : sequence.calls)
+        if (call.preparation) result.specializations.push_back(call.preparation->specialization);
+    return result;
+}
+
 void CallerSchedule::acquire(ProgramRuntime & runtime, std::size_t caller, simulation::Component owner, simulation::Action granted,
                              std::optional<graph::NodeId> cause) {
     auto & lane = lanes_[caller];
