@@ -239,24 +239,29 @@ class ResourceEffectComparison:
         self.requests = []
         self.counts = {}
         self.reads = {"native": {}, "predicted": {}}
-        self.unobserved_reads = set()
-        self.unqualified_reads = Counter()
 
-    def observed(self, history, graph, group):
+    def observed(self, history, graph, group, raw):
         source = ResourceEffects(history["initial"]["page_size"])
         scopes = {origin: scope for scope in graph["scopes"] for origin in scope["bindings"]["source_scopes"]}
         source.native(history, scopes, graph["environment"]["implementation"]["cache"]["disabled"])
         self.native[group] = source
         self.predicted[group] = ResourceEffects(source.page_size)
 
-        if "reads" not in history:
-            self.unobserved_reads.add(group)
-            return
+        queries = {query["scope"]: query for query in raw["state_queries"] if query["kind"] == "resource"}
         for record in history["reads"]:
-            if (record["scope"] not in scopes or type(record["begin_raw_ns"]) is not int
-                    or type(record["end_raw_ns"]) is not int or not 0 <= record["begin_raw_ns"] <= record["end_raw_ns"]):
-                raise ValueError("native capacity read has no actual scope and ordered interval")
+            if type(record["control"]) is not bool:
+                raise ValueError("native resource getter lacks its control/resource ownership")
+
+            # Resource implementations keep their own internal checks; only controller reads cross this interface.
+            if not record["control"]:
+                continue
+            query = queries.pop(record["scope"], None)
+            if (query is None or query["read"] != record["operation"] or query["result"] != record["result"]
+                    or not query["begin_raw_ns"] <= record["begin_raw_ns"] <= record["end_raw_ns"] <= query["end_raw_ns"]):
+                raise ValueError("native resource getter differs from its semantic read boundary, resource or result")
             self.capacity_read("native", group, record["operation"], record["result"])
+        if queries:
+            raise ValueError("semantic resource query has no original getter observation")
 
     def capacity_read(self, origin, group, operation, result):
         kind = operation["kind"]
@@ -278,12 +283,7 @@ class ResourceEffectComparison:
         operation, group = row["operation"], row["group"]
         kind = operation["kind"]
         if kind == "capacity":
-            if "resource" not in operation:
-
-                # An old aggregate reply does not identify which capacity native code consumed.
-                self.unqualified_reads[group] += 1
-            else:
-                self.capacity_read("predicted", group, operation, row["result"])
+            self.capacity_read("predicted", group, operation, row["result"])
         elif kind == "state_slots" and operation["operation"] == "available":
             self.capacity_read("predicted", group, operation, row["result"])
         if group in self.predicted:
@@ -295,12 +295,6 @@ class ResourceEffectComparison:
                 for name, value in operation.items()}
 
     def compare(self):
-        for group in sorted(self.unobserved_reads | self.unqualified_reads.keys()):
-            yield "resource_read_evidence", {"group": group}, {
-                "native_reads_observed": group not in self.unobserved_reads,
-                "unqualified_predicted_reads": self.unqualified_reads[group],
-                "reason": "actual scalar capacity observations are incomplete; mutation snapshots cannot replace reads",
-            }
         matched, totals = 0, Counter()
         for group, source in self.native.items():
             target = self.predicted[group]
@@ -334,9 +328,7 @@ class ResourceEffectComparison:
                            **{origin: [{"group": group, "kind": kind, "resource": resource, **value}
                                        for (group, kind, resource), value in sorted(reads.items())]
                               for origin, reads in self.reads.items()},
-                           "unobserved_native": sorted(self.unobserved_reads),
-                           "unqualified_predicted": dict(self.unqualified_reads),
-                           "scope": "Actual scalar read counts and ranges within each run; no cross-run occurrence or timing correspondence is inferred. Native allocator-internal and constant cache reads need not be core queries.",
+                           "scope": "Controller scalar reads are checked against original getters and summarized within each run. Resource-internal checks remain diagnostic; no cross-run occurrence or timing correspondence is inferred.",
                        },
                        "state_slots": {"groups_matched": state_matched, "unobserved_native": state_unobserved,
                                        "predicted_operations": sum(len(target.fields.operations) for target in self.predicted.values())},

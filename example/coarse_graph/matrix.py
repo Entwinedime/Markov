@@ -233,10 +233,10 @@ class MatrixRun:
                 row['status'] = 'target-mapping-unverified'
                 rows.append(row)
                 continue
-            self.evaluate(f'{identity}/timing', 'boundary_times.py', '--capture', native, '--graphs', production / 'work', '--output', output / 'timing')
-            timing_report = output / 'timing/boundary-times-report.json'
+            self.evaluate(f'{identity}/timing', 'execution_inputs.py', '--capture', native, '--graphs', production / 'work', '--output', output / 'timing')
+            timing_report = output / 'timing/execution-inputs-report.json'
             row['timing'] = json.loads(timing_report.read_text())['status'] if timing_report.exists() else 'evaluation-error'
-            timing = output / 'timing/boundary-times.json'
+            timing = output / 'timing/execution-inputs.json'
             if not productions or not timing.exists():
                 row['status'] = 'source-unavailable' if not productions else 'timing-unavailable'
                 rows.append(row)
@@ -253,7 +253,7 @@ class MatrixRun:
             command = self.commands.command(
                 'predict', *collected.arguments(primary), '--input', self.root / case['prediction_input'], '--output', prediction,
                 '--binary', self.binary, '--modeling-image', self.images['modeling'], '--control-image', self.images['control'],
-                '--timeout', self.budget['task_seconds'], '--execution-trace', '--boundary-times', timing,
+                '--timeout', self.budget['task_seconds'], '--execution-trace', '--execution-inputs', timing,
             )
             if self.process(f'{identity}/predict', command) != 0:
                 row['status'] = 'prediction-error'

@@ -17,6 +17,13 @@ class CpuProtocolEvidence:
         self.points = {origin: set() for origin in self.messages}
         self.edges = {origin: set() for origin in self.messages}
         self.last_cpu, self.returns, self.horizons = {}, {}, {}
+        self.services, self.service_returns, self.wires = {}, {}, {}
+        self.wire_events = set()
+        self.wire_inputs = defaultdict(dict)
+        self.wire_bounds = {}
+        self.service_gates = set()
+        self.communication_edges = set()
+        self.finished_services, self.finished_wires = set(), set()
         self.terminals = []
         self.terminals_checked = False
         self.sequence = Counter()
@@ -40,6 +47,14 @@ class CpuProtocolEvidence:
                 positions = self.native_threads[rank, thread]
                 positions[evidence["order"]].append((rank, event))
 
+    @staticmethod
+    def execution(interval, operation):
+        execution = interval["execution"]
+        if (execution["operation"] != operation or type(execution["in_flow"]) is not bool
+                or not isinstance(execution["work"], dict)):
+            raise ValueError("CPU protocol interval changes its native operation or entering context")
+        return execution
+
     def native_interval(self, rank, interval):
         begin, end = interval["begin_counter"], interval["end_counter"]
         if type(begin) is not int or type(end) is not int or begin > end:
@@ -62,12 +77,15 @@ class CpuProtocolEvidence:
                 or source == target or rank != (target if descriptor["receiving"] else source)
                 or type(descriptor["receiving"]) is not bool
                 or type(position) is not int or position < 0
-                or any(type(size) is not int or size < 0 for size in descriptor["shape"])):
+                or any(type(size) is not int or size < 0 for size in descriptor["shape"])
+                or type(descriptor["elements"]) is not int or descriptor["elements"] != prod(descriptor["shape"])
+                or type(descriptor["element_bytes"]) is not int or descriptor["element_bytes"] <= 0):
             raise ValueError("CPU protocol post has inconsistent route, actor or tensor geometry")
         peers = self.messages[origin][key]
         if rank in peers:
             raise ValueError("CPU protocol repeats a local post identity")
-        peers[rank] = {"entered": entered, "consumed": None, "dtype": descriptor["dtype"], "elements": prod(descriptor["shape"])}
+        peers[rank] = {"entered": entered, "consumed": None, "dtype": descriptor["dtype"],
+                       "elements": descriptor["elements"], "element_bytes": descriptor["element_bytes"]}
         self.counts[origin + "_posts"] += 1
         return peers[rank]
 
@@ -110,9 +128,14 @@ class CpuProtocolEvidence:
                 source, target = key[1:3]
                 if self.native_groups[source] != self.native_groups[target] or self.native_groups[rank] != self.native_groups[source]:
                     raise ValueError("CPU protocol crosses independent native worlds")
+                operation = post["operation"]
+                if operation not in {"send", "recv", "isend", "irecv"} or post["descriptor"]["receiving"] != (operation in {"recv", "irecv"}):
+                    raise ValueError("CPU protocol operation disagrees with its receive/send descriptor")
+                self.execution(post["interval"], operation)
                 entered, returned = self.native_interval(rank, post["interval"])
                 endpoint = self.post("native", rank, key, post["descriptor"], entered)
                 if post["consumed"] is not None:
+                    self.execution(post["consumed"], operation + ("_wait" if operation in {"isend", "irecv"} else ""))
                     _, consumed = self.native_interval(rank, post["consumed"])
                     if post["consumed"]["end_counter"] < post["interval"]["end_counter"]:
                         raise ValueError("CPU Work consumption precedes its post return")
@@ -138,7 +161,32 @@ class CpuProtocolEvidence:
             rank = graph["resources"][graph["events"][entered["event"]]["resource"]]["rank"]
             if rank in self.last_cpu:
                 self.edges["predicted"].add((self.last_cpu[rank], (rank, ports["call.enter"])))
-            self.returns[ports["call.return"]] = rank
+            if graph["scopes"][0]["role"] == "cpu_service":
+                self.service(graph, events, rank, ports)
+            else:
+                self.returns[ports["call.return"]] = rank
+        elif kind == "completion":
+            event = row["event"]
+            if event in self.service_returns:
+                rank, _, _ = self.service_returns[event]
+                self.finished_services.add(event)
+                self.last_cpu[rank] = rank, event
+            if event in self.wire_events:
+                self.finished_wires.add(event)
+        elif kind == "edge":
+            edge = row["source"], row["target"]
+            if row["target"] in self.wire_events:
+                if row["relation"] != "communication" or row["source"] in self.wire_inputs[row["target"]]:
+                    raise ValueError("CPU wire has a duplicate or noncommunication prerequisite")
+                self.wire_inputs[row["target"]][row["source"]] = row["delay_ns"]
+                self.communication_edges.add(edge)
+            if edge in self.service_gates:
+                if row["relation"] != "communication" or row["delay_ns"] != 0:
+                    raise ValueError("CPU API return changes its wire completion dependency")
+                self.service_gates.remove(edge)
+                self.communication_edges.add(edge)
+        elif kind == "boundary_time" and row["event"] in self.wire_events:
+            self.wire_bounds[row["event"]] = row["begin_ns"], row["end_ns"]
         elif kind == "action_values" and "outputs" in row["values"]:
             rank, _ = self.predicted_groups[row["group"]]
             if self.returns.pop(row["boundary"]) != rank:
@@ -160,31 +208,107 @@ class CpuProtocolEvidence:
             actor = record["rank"]
             if not self.predicted_scope or self.actors[actor] != group:
                 raise ValueError("CPU broker actor changes its native participant")
-            point = self.point("predicted", rank)
-            if rank in self.last_cpu:
-                self.edges["predicted"].add((self.last_cpu[rank], point))
-            self.last_cpu[rank] = point
             key = tuple(record["key"])
-            if record["phase"] == "post":
-                if self.predicted_groups[self.actors[key[1]]][1] != self.predicted_groups[self.actors[key[2]]][1]:
-                    raise ValueError("CPU broker P2P crosses independent native worlds")
-                self.post("predicted", actor, key, record["descriptor"], point)
-            elif record["phase"] == "consumed":
+            phase = record["phase"]
+            if phase == "wire":
+                if key in self.wires or type(record["event"]) is not int:
+                    raise ValueError("CPU protocol repeats or omits its wire completion event")
+                self.wires[key] = {"event": (rank, record["event"]), "ready": False}
+                self.wire_events.add(record["event"])
+                return
+            if phase == "ready":
                 peers = self.messages["predicted"][key]
                 if len(peers) != 2:
+                    raise ValueError("CPU wire completes without both actual posts")
+                parents = {peer["entered"][1] for peer in peers.values() if peer["entered"][1] >= 0}
+                service = record["service_ns"]
+                if ((service is not None and (type(service) is not int or service < 0)) or set(record["prerequisites"]) != parents):
+                    raise ValueError("CPU wire changes its post prerequisites or service duration")
+                if record["event"] is not None:
+                    wire = self.wires[key]
+                    if wire["ready"] or wire["event"] != (rank, record["event"]) or record["event"] not in self.finished_wires:
+                        raise ValueError("CPU wire was published before its declared event completed")
+                    delay = 0 if service is None else service
+                    if self.wire_inputs[record["event"]] != dict.fromkeys(parents, delay):
+                        raise ValueError("CPU wire declaration differs from the executor's actual dependency edges")
+                    if service is None and record["event"] not in self.wire_bounds:
+                        raise ValueError("unknown CPU wire service has no explicit completion condition")
+                    if row["time_ns"] < max(peer["time_ns"] for peer in peers.values()) + delay:
+                        raise ValueError("CPU wire completed before its supplied service lower bound")
+                    wire["ready"] = True
+                elif parents or row["time_ns"] != 0 or service != 0:
+                    raise ValueError("CPU initial readiness includes timed serving work")
+                for peer in peers.values():
+                    peer["ready_ns"] = row["time_ns"]
+                self.counts["predicted_ready_messages"] += 1
+                return
+            execution = record["execution"]
+            operation = execution["operation"]
+            self.execution(record, operation)
+            if record["event"] is None:
+                if execution["in_flow"]:
+                    raise ValueError("CPU serving operation has no execution service")
+                point = self.point("predicted", rank)
+                if rank in self.last_cpu:
+                    self.edges["predicted"].add((self.last_cpu[rank], point))
+                self.last_cpu[rank] = point
+            else:
+                point = rank, record["event"]
+            if phase == "post":
+                if self.predicted_groups[self.actors[key[1]]][1] != self.predicted_groups[self.actors[key[2]]][1]:
+                    raise ValueError("CPU broker P2P crosses independent native worlds")
+                if (operation not in {"send", "recv", "isend", "irecv"}
+                        or record["descriptor"]["receiving"] != (operation in {"recv", "irecv"})):
+                    raise ValueError("CPU post changes its native operation")
+                if record["event"] is not None and self.services.pop(record["event"]) != (rank, key, record["descriptor"], execution):
+                    raise ValueError("CPU post differs from its submitted service")
+                endpoint = self.post("predicted", actor, key, record["descriptor"], point)
+                endpoint.update(time_ns=row["time_ns"], execution=execution)
+            elif phase == "consumed":
+                peers = self.messages["predicted"][key]
+                if len(peers) != 2 or "ready_ns" not in peers[actor] or peers[actor]["ready_ns"] > row["time_ns"]:
                     raise ValueError("CPU broker consumption precedes the matching peer post")
                 endpoint = peers[actor]
                 if endpoint["consumed"] is not None:
                     raise ValueError("CPU Work consumption is recorded twice")
+                post_operation = endpoint["execution"]["operation"]
+                if operation != post_operation + ("_wait" if post_operation in {"isend", "irecv"} else ""):
+                    raise ValueError("CPU consumption changes its posted operation")
+                if record["event"] is not None:
+                    if record["event"] not in self.finished_services or self.service_returns[record["event"]] != (rank, key, execution):
+                        raise ValueError("CPU consumption precedes or changes its own service return")
                 endpoint["consumed"] = point
             else:
                 raise ValueError("CPU protocol has an unknown observation phase")
+
+    def service(self, graph, events, rank, ports):
+        root = graph["scopes"][0]
+        binding = root["bindings"]["cpu_protocol"]
+        key, descriptor, execution = tuple(binding["key"]), binding["descriptor"], binding["execution"]
+        self.execution(binding, execution["operation"])
+        if (len(graph["scopes"]) != 1 or len(graph["resources"]) != 1 or len(graph["events"]) != 2
+                or len(graph["work"]) != 1 or len(ports) != 2 or ports["call.enter"] != events[0] or ports["call.return"] != events[1]
+                or graph["resources"][0]["kind"] != "thread" or graph["resources"][0]["role"] != "control"
+                or not execution["in_flow"] or root["work"] != execution["work"]
+                or graph["work"] != [{"scope": 0, "resource": 0, "kind": "host", "start": 0, "finish": 1}]
+                or root["kv_accesses"] or root["slot_accesses"] or graph["edges"]):
+            raise ValueError("CPU service is not one declared protocol interval on its actor's control thread")
+        if execution["operation"] not in {"send", "recv", "isend", "irecv", "isend_wait", "irecv_wait"}:
+            raise ValueError("CPU service declares an unobserved protocol operation")
+        if execution["operation"] in {"send", "recv", "isend", "irecv"}:
+            self.services[events[0]] = rank, key, descriptor, execution
+        if execution["operation"] not in {"isend", "irecv"} and key in self.wires:
+
+            # Check actual executor edges, not only the service's claimed prerequisites or observed timestamps.
+            self.service_gates.add((self.wires[key]["event"][1], events[1]))
+        self.service_returns[events[1]] = rank, key, execution
+        self.counts["predicted_service_intervals"] += 1
 
     def connect_messages(self, origin):
         for key, peers in self.messages[origin].items():
             self.counts[origin + "_consumptions"] += sum(peer["consumed"] is not None for peer in peers.values())
             self.counts[origin + "_unconsumed_posts"] += sum(peer["consumed"] is None for peer in peers.values())
-            if len({(peer["dtype"], peer["elements"]) for peer in peers.values()}) != 1:
+            if len({(peer["dtype"], peer["elements"], peer["element_bytes"]) for peer in peers.values()}) != 1:
                 raise ValueError("CPU protocol endpoints disagree on wire dtype or element count")
             if len(peers) == 2:
                 self.counts[origin + "_messages"] += 1
@@ -253,6 +377,9 @@ class CpuProtocolEvidence:
     def prediction(self, predicted, predicted_edges):
         if not self.predicted_scope:
             self.missing("missing_predicted_protocol_scope")
+        if (self.services or self.service_gates or self.service_returns.keys() != self.finished_services
+                or any(not wire["ready"] for wire in self.wires.values())):
+            raise ValueError("CPU protocol has an unobserved service or unfinished wire")
         self.connect_messages("predicted")
 
         # Keep each run's observed paths available; protocol completeness gates cross-run negative conclusions.
@@ -261,4 +388,4 @@ class CpuProtocolEvidence:
     def report(self):
         return {"complete": not self.findings and not self.returns and (not self.terminals or self.terminals_checked),
                 "unreturned_actions": len(self.returns), **self.counts,
-                "scope": "Actual CPU/Gloo post and successful consumption, run-local routes only. Native thread counters and actual predicted action returns anchor protocol paths. Prefix posts outside the window and unconsumed tails are explicit; no cross-run message pairing or CPU cost qualification."}
+                "scope": "Actual CPU/Gloo post and successful consumption, run-local routes only. Native operation/scope/thread intervals are checked against their own call boundaries; counters and actual predicted action returns anchor protocol paths. Prefix posts outside the window and unconsumed tails are explicit; no cross-run message pairing or CPU cost qualification."}

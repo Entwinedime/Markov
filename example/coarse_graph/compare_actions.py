@@ -7,10 +7,10 @@ from pathlib import Path
 
 from actions import ActionIdentity, QueryResults
 from contents import GraphContents
+from execution_times import ExecutionTimes
 from native_case import NativeCase
 from ingress import IngressEvidence
 from dependencies import ActionBoundaries, ActionOrderComparison, CausalGraph
-from resource_effects import ResourceEffectComparison
 from protocol_reads import PdPollingEvidence, PdPredictionEvidence
 from state_values import ActionResults, StateValueComparison
 
@@ -22,7 +22,6 @@ class ActionComparison:
         "ambiguous_native_identity", "ambiguous_predicted_identity",
         "unpaired_native_context", "unpaired_predicted_context",
         "incomplete_execution", "unfinished_events",
-        "resource_read_evidence",
     })
 
     def __init__(self, capture, graphs, execution, output, details):
@@ -109,8 +108,7 @@ class ActionComparison:
             f"资源历史差异 {counts.get('resource_effects', 0)}；不是独立 Bug 数 |",
             f"| 资源条件读取 | 已记录：原生 {sum(value['count'] for value in reads['native'])} 次、"
             f"预测 {sum(value['count'] for value in reads['predicted'])} 次标量查询 | "
-            f"缺原生读取记录的 worker {len(reads['unobserved_native'])} 个，"
-            f"未明确所读资源的预测查询 {sum(reads['unqualified_predicted'].values())} 次；不按次数配对 |",
+            "原始 getter 与语义切口已核对；次数和值域不作为跨运行逐次对应证明 |",
             "", "控制交互还需核对输入交付、查询、通知、准入及决定性时间条件；内容或状态安全通过不能代替它们。",
             f"输入读取按实际serving活动范围对照；范围外{outside_flow}次空读取仍保留于执行记录，全部非空请求交付继续检查。",
             "未配对、协议缺失和未触发的复用继续保留证据限制；零在途页归还不证明在途复用正确。",
@@ -144,6 +142,8 @@ class ActionComparison:
                 action_results.source(raw, groups[rank], instance["mode"], source.source_ids)
                 ingress.native(instance["id"], raw)
                 for query in raw["state_queries"]:
+                    if query["kind"] == "clock":
+                        continue
                     index = source.source_ids[query["scope"]]
                     native_reads[groups[rank], index] = query["result"], identities[index]
         native_case.finish()
@@ -165,13 +165,9 @@ class ActionComparison:
                 expected.setdefault(key, (source, index, identity))
 
         connections, bindings = native_case.connections, native_case.bindings
-        effects = ResourceEffectComparison()
+        effects = native_case.effects
         ordering = ActionOrderComparison(self.details)
-        for rank, (source, _, _) in sources.items():
-            group = groups[rank]
-            if group in native_case.histories:
-                effects.observed(native_case.histories[group], source.graph, group)
-            predicted_dependencies[rank] = CausalGraph()
+        predicted_dependencies = {rank: CausalGraph() for rank in sources}
         native_evidence = native_case.report(self.details)
         sources.clear()
 
@@ -187,29 +183,35 @@ class ActionComparison:
         event_ranks, completed, pending = {}, set(), []
         cross_rank_edges = set()
         queries = QueryResults()
+        execution_times = ExecutionTimes()
         protocol_readiness = native_case.readiness
         protocol = PdPredictionEvidence(protocol_source, protocol_readiness, ingress.origin_ns)
         with self.execution.open() as stream:
             for line in stream:
                 row = json.loads(line)
+                execution_times.observe(row)
                 cpu_protocol.observe(row)
-                ingress.observe(row)
-                effects.observe(row)
-                connections.observe(row)
-                state_values.observe(row)
-                action_results.observe(row)
-                query = queries.observe(row)
-                protocol.observe(row, query, queries)
+                cpu_service = row["kind"] == "graph" and row["graph"]["scopes"][0]["role"] == "cpu_service"
+                if not cpu_service:
+                    ingress.observe(row)
+                    effects.observe(row)
+                    connections.observe(row)
+                    state_values.observe(row)
+                    action_results.observe(row)
+                    query = queries.observe(row)
+                    protocol.observe(row, query, queries)
                 ended = row["kind"] == "end"
                 if row["kind"] == "resources":
                     bindings.initialized(row)
                     effects.requests = [request["id"] for request in row["requests"]]
-                elif row["kind"] == "notification_declared":
-                    rank, = [rank for rank, group in groups.items() if group == row["identity"]["group"]]
-                    if row["event"] in event_ranks:
-                        raise ValueError("notification reuses an execution event identity")
-                    event_ranks[row["event"]] = rank
-                    predicted_dependencies[rank].add_events([row["event"]])
+                elif row["kind"] == "notification_declared" or (row["kind"] == "native_protocol" and row["record"]["phase"] == "wire"):
+                    group = row["identity"]["group"] if row["kind"] == "notification_declared" else row["group"]
+                    event = row["event"] if row["kind"] == "notification_declared" else row["record"]["event"]
+                    rank, = [rank for rank, owner in groups.items() if owner == group]
+                    if event in event_ranks:
+                        raise ValueError("external completion reuses an execution event identity")
+                    event_ranks[event] = rank
+                    predicted_dependencies[rank].add_events([event])
                 elif row["kind"] == "resource":
                     bindings.released(row)
                 elif row["kind"] == "binding":
@@ -217,14 +219,16 @@ class ActionComparison:
                 elif row["kind"] == "state_binding":
                     bindings.lifetimes.state_bound(row)
                 if row["kind"] == "edge":
-                    if row["relation"] == "communication":
+
+                    # CPU wire and wait edges have their own checked owner; every edge still enters the full graph below.
+                    if row["relation"] == "communication" and (row["source"], row["target"]) not in cpu_protocol.communication_edges:
                         connections.communication_edges.add((row["source"], row["target"]))
                     if row["relation"] == "signal":
                         connections.signal_edges.add((row["source"], row["target"]))
                     source_rank, target_rank = event_ranks[row["source"]], event_ranks[row["target"]]
                     if source_rank == target_rank:
                         predicted_dependencies[source_rank].connect(row["source"], row["target"], row["relation"])
-                    elif row["relation"] != "communication":
+                    else:
                         cross_rank_edges.add((row["source"], row["target"], row["relation"]))
                 elif row["kind"] == "completion":
                     event = row["event"]
@@ -245,6 +249,10 @@ class ActionComparison:
                     raise ValueError("execution has invalid invocation event identities")
                 event_ranks.update(dict.fromkeys(events, rank))
                 predicted_dependencies[rank].add_events(events)
+                if cpu_service:
+
+                    # Runtime protocol intervals are independently checked before joining action causality.
+                    continue
                 group = ActionIdentity.group(graph, ranks[rank])
                 target = GraphContents(graph)
                 try:
@@ -342,11 +350,8 @@ class ActionComparison:
         connections.compare_signals(pairs)
         connections.compare_predicted_communication(predicted_dependencies)
         connections.compare_communication(pairs)
-        predicted_communication = {((event_ranks[source], source), (event_ranks[target], target))
-                                   for source, target in connections.communication_edges}
         predicted_links = {((event_ranks[source], source), (event_ranks[target], target), relation)
                            for source, target, relation in cross_rank_edges}
-        predicted_links.update((source, target, "communication") for source, target in predicted_communication)
         actual_graph = native_case.graph
         predicted_graph = cpu_protocol.prediction(predicted_dependencies, predicted_links)
         connections.check_predicted_readiness(predicted_graph, event_ranks)
@@ -487,6 +492,7 @@ class ActionComparison:
             "state_values": state_values.counts,
             "action_results": dict(action_results.counts),
             "query_results_recorded": recorded_queries,
+            "execution_times": execution_times.finish(),
             "completion_reads_checked": queries.completion_reads,
             "completion_notifications_checked": queries.notifications,
             "pd_read_prerequisites": protocol.finish(),

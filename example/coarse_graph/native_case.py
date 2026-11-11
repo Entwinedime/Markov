@@ -11,6 +11,8 @@ from cpu_protocol import CpuProtocolEvidence
 from dependencies import CausalGraph
 from pd_payload import PdPayloadEvidence
 from protocol_reads import PdStateEvidence
+from resource_effects import ResourceEffectComparison
+from source_clock import ClockConstraints
 
 
 class NativeCase:
@@ -23,7 +25,7 @@ class NativeCase:
         if len(self.groups) != sum(len(instance["observed_roles"]) for instance in manifest["instances"]):
             raise ValueError("native case repeats an observed worker")
 
-        self.sources, self.dependencies = {}, {}
+        self.sources, self.dependencies, self.clocks = {}, {}, {}
         self.connections = Connections()
         self.cpu = CpuProtocolEvidence(capture, manifest["instances"])
         self.protocol = PdStateEvidence()
@@ -36,6 +38,17 @@ class NativeCase:
             raise ValueError("native worker was already observed")
         source = GraphContents(graph)
         source.validate_source(raw, rank)
+        dependencies = CausalGraph.observed(graph)
+        clock = ClockConstraints(graph, raw["device_clock"])
+        anchors = [event for event, point in enumerate(clock.points) if point is not None]
+
+        # Project across unknown nodes, retaining one shared calibration for all measured causal paths.
+        for left, targets in dependencies.projected(anchors).next.items():
+            for right in targets:
+                clock.constrain("causal", None, anchors[left], anchors[right])
+        if clock.conflict:
+            raise ValueError(f"native rank {rank} measurements have no common causal calibration: {clock.conflict}")
+        self.clocks[rank] = clock
         identities = {}
         for index, scope in enumerate(graph["scopes"]):
             if not ActionIdentity.selected(index, scope):
@@ -52,7 +65,7 @@ class NativeCase:
 
         self.cpu.native_graph(rank, graph)
         self.protocol.observe(raw, self.groups[rank])
-        self.dependencies[rank] = CausalGraph.observed(graph)
+        self.dependencies[rank] = dependencies
         self.sources[rank] = source, raw, identities
         return source
 
@@ -76,6 +89,7 @@ class NativeCase:
             if path.is_file():
                 self.histories[group] = json.loads(path.read_text())
         self.bindings = BindingComparison(self.histories, {session: self.groups[rank] for session, rank in registered_ranks.items()})
+        self.effects = ResourceEffectComparison()
         payload = PdPayloadEvidence(registrations, self.protocol.sessions)
         for rank, (source, raw, identities) in self.sources.items():
             group = self.groups[rank]
@@ -84,6 +98,7 @@ class NativeCase:
             self.connections.native(source, raw, rank, self.ranks[rank], self.dependencies[rank], identities)
             if group in self.histories:
                 self.bindings.observed(source, raw, group, identities)
+                self.effects.observed(self.histories[group], source.graph, group, raw)
             else:
                 self.bindings.findings.append(("binding_evidence", {"group": group}, {"reason": "native resource history is absent"}))
         self.findings.extend(payload.findings)
@@ -126,5 +141,6 @@ class NativeCase:
                                   "unconsumed_snapshots": self.bindings.unconsumed_snapshots},
             "all_rank_events": None if self.graph is None else len(self.graph.next),
             "pd_payload": self.payload_counts,
-            "scope": "Original worker declarations, pool endpoints/bindings, copied PD byte footprints and metadata rows, run-local model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
+            "resource_reads": sum(value["count"] for value in self.effects.reads["native"].values()),
+            "scope": "Original worker declarations, resource getter checkpoints, pool bindings, PD byte footprints/metadata, model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
         }

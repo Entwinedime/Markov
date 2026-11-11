@@ -223,23 +223,6 @@ class CausalGraph:
                     masks[target] |= masks[source]
         return masks
 
-    def time_conflict(self, times):
-        latest = [None] * len(self.positions)
-        for event, position in self.positions.items():
-            predecessor = latest[position]
-            if event in times:
-                if predecessor is not None and predecessor[0] > times[event]:
-                    return predecessor[1], event
-                predecessor = times[event], event
-
-            # Propagate through unmeasured nodes; endpoint-only checks miss conflicts across hidden paths.
-            if predecessor is not None:
-                for target in self.successors[position]:
-                    if latest[target] is None or predecessor[0] > latest[target][0]:
-                        latest[target] = predecessor
-        return None
-
-
 class ActionOrderComparison:
     def __init__(self, details=False):
         self.details = details

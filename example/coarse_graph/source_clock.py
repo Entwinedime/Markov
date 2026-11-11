@@ -1,6 +1,7 @@
 """Check one shared affine device clock against retained source measurements."""
 
 from fractions import Fraction
+from math import ceil, floor
 
 
 class ClockConstraints:
@@ -69,6 +70,16 @@ class ClockConstraints:
         self.region = clipped
         if not self.region:
             self.conflict = {"kind": kind, "index": index, "source": source, "target": target}
+
+    def window(self, event):
+        point = self.points[event]
+        if point is None:
+            return None
+
+        # Preserve the envelope of the same feasible calibration, rather than asserting its midpoint as exact.
+        a, b, timestamp = point
+        values = [a * x + b * y + timestamp for x, y in self.region]
+        return floor(min(values)), ceil(max(values))
 
     def report(self):
         return {

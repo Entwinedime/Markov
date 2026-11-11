@@ -7,19 +7,36 @@ from collections import Counter, defaultdict
 class QueryResults:
     """Check reads against this execution's producers, without pairing native polling counts."""
 
+    result_types = {"event": bool, "transport": int, "metadata": bool, "resource": int, "clock": int}
+
     def __init__(self):
         self.groups, self.pending = {}, {}
+        self.clock_epoch_ns = None
         self.signals, self.signal_completions = {}, {}
         self.results = {}
         self.counts = Counter()
         self.completion_reads = 0
         self.notifications = 0
-        self.notices, self.bounds = {}, {}
+        self.notices = {}
         self.notice_inputs = defaultdict(set)
+
+    @staticmethod
+    def clock(record, time_ns=None, epoch_ns=None):
+        read, value = record["read"], record["result"]
+        if (read.keys() != {"kind", "clock", "consumer"} or read["kind"] != "clock"
+                or read["clock"] not in {"time", "monotonic", "perf_counter"}
+                or not isinstance(read["consumer"], str) or not read["consumer"]
+                or type(value) is not int or value < 0):
+            raise ValueError("clock read requires its native API, policy consumer and integer nanoseconds")
+        if time_ns is not None and value != time_ns + epoch_ns:
+            raise ValueError("native policy clock differs from the completed core read and declared epoch")
 
     def observe(self, record):
         kind = record["kind"]
         if kind == "resources":
+            self.clock_epoch_ns = record["clock_epoch_ns"]
+            if type(self.clock_epoch_ns) is not int or self.clock_epoch_ns <= 0:
+                raise ValueError("native control clock requires a positive declared epoch")
             self.groups = {group["rank"]: group["id"] for instance in record["instances"] for group in instance["groups"]}
         elif kind == "graph":
             graph = record["graph"]
@@ -45,16 +62,10 @@ class QueryResults:
                 raise ValueError("notification has a duplicate event or unknown participant")
             self.notices[event] = record["identity"]
             self.signal_completions[event] = None
-        elif kind == "boundary_time":
-            self.bounds[record["event"]] = record["begin_ns"], record["end_ns"]
         elif kind == "edge" and record["target"] in self.notices:
             self.notice_inputs[record["target"]].add(record["source"])
         elif kind == "completion":
             event = record["event"]
-            if event in self.bounds:
-                begin, end = self.bounds.pop(event)
-                if not begin <= record["time_ns"] <= end:
-                    raise ValueError("completed event violates its measured time interval")
             if event in self.pending:
                 self.pending[event]["returned_ns"] = record["time_ns"]
             if event in self.signal_completions:
@@ -84,23 +95,29 @@ class QueryResults:
             return query
         elif kind == "state_query":
             query = self.pending.pop(record["boundary"])
-            expected_type = int if query["kind"] == "transport" else bool
+            expected_type = self.result_types.get(query["kind"])
 
             # A protocol poll can use cached state or multiple reads; an event query reads exactly one signal.
             last_read = query["last_read"]
-            if (query["kind"] not in {"event", "transport", "metadata"} or type(record["result"]) is not expected_type
+            if (type(record["result"]) is not expected_type
                     or record["group"] != query["group"] or query["returned_ns"] is None
                     or record["time_ns"] < query["returned_ns"] or record["completion_reads"] != query["reads"]
                     or (last_read is not None and record["time_ns"] < last_read["time_ns"])
                     or (query["kind"] == "event" and (query["reads"] != 1 or record["result"] != last_read["result"]))):
                 raise ValueError("query result disagrees with its worker, result type, boundary or actual reads")
-            self.results[query["group"], query["entered"]] = record["result"]
+            for clock in record["clocks"]:
+                self.clock(clock, query["returned_ns"], self.clock_epoch_ns)
+            if query["kind"] == "clock":
+                self.clock({"read": query["work"]["context"]["read"], "result": record["result"]}, query["returned_ns"], self.clock_epoch_ns)
+            else:
+                self.results[query["group"], query["entered"]] = record["result"]
+            self.counts["nested_clocks"] += len(record["clocks"])
             self.counts[query["kind"]] += 1
             return query
 
     def finish(self):
-        if self.pending or self.notices or self.bounds:
-            raise ValueError("execution has unfinished query, notification or measured boundary observations")
+        if self.pending or self.notices:
+            raise ValueError("execution has unfinished query or notification observations")
         return dict(self.counts)
 
 
@@ -186,6 +203,8 @@ class ActionScopes:
 
                 # A blocking host read consumes by return, regardless of the tensor's storage device.
                 if port.get("at_return", False):
+                    if observed["role"] == "segment":
+                        raise ValueError("completed host reads require a separate native materialization action")
                     if (port["direction"] != "input" or port["use"] != "host" or boundary["use"] != "data"
                             or boundary["event"] != ports["call.return", "output"]["event"]):
                         raise ValueError(f"graph scope {index} changes completed host read {port['name']}")
@@ -202,13 +221,21 @@ class ActionScopes:
             reads.add(scope)
             observed = raw["scopes"][scope]
             kind = query["kind"]
-            result_type = int if kind == "transport" else bool
-            if (kind not in {"event", "transport", "metadata"} or type(query["result"]) is not result_type
+            condition = {"query": kind}
+            if kind in {"resource", "clock"}:
+                condition["read"] = query["read"]
+                if observed["work"]["context"]["read"] != query["read"]:
+                    raise ValueError("query changes its native resource, clock or consumer")
+            if (type(query["result"]) is not QueryResults.result_types.get(kind)
                     or observed["role"] != "query" or not observed["bindings"].get("action")
-                    or observed["bindings"]["condition"] != {"query": kind}
+                    or observed["bindings"]["condition"] != condition
                     or observed["work"]["context"]["query"] != kind):
                 raise ValueError("query observation disagrees with its action or result contract")
-            if kind != "event" and not observed["work"]["context"]["request"]["id"]:
+            for clock in query["clocks"]:
+                QueryResults.clock(clock)
+            if kind == "clock":
+                QueryResults.clock({"read": query["read"], "result": query["result"]})
+            if kind in {"transport", "metadata"} and not observed["work"]["context"]["request"]["id"]:
                 raise ValueError("protocol and metadata queries require a logical request")
         if reads != {index for index, scope in enumerate(raw["scopes"]) if scope["role"] == "query"}:
             raise ValueError("query actions lack observed results")
@@ -262,12 +289,10 @@ class ActionScopes:
                         and port["point"] in contexts):
                     self.placements[self.source_ids[scope["id"]]] = contexts[port["point"]]
 
-        # Preparation and result entry consume a PP value produced in the same native loop position.
+        # Preparation and actual materialization consume the PP value produced in that native loop position.
         for index, scope in enumerate(self.graph["scopes"]):
-            continuation = scope["work"].get("continuation", {})
-            result_entry = (scope["role"] == "segment" and continuation.get("owner") == "result"
-                            and continuation.get("entry") == "call.enter")
-            if scope["role"] != "output_prepare" and not result_entry:
+            materialization = scope["role"] == "host_read"
+            if scope["role"] != "output_prepare" and not materialization:
                 continue
             for port in scope["ports"]:
                 if port["name"] != "next_token_ids" or port["direction"] != "input":
@@ -278,7 +303,7 @@ class ActionScopes:
                     placement = self.placements.get(writer, owner["work"].get("context", {}).get("pipeline"))
                     if placement is not None:
                         self.placements[index] = placement
-                        if result_entry:
+                        if materialization:
                             self.placements[scope["parent"]] = placement
                         break
                     writer = owner["parent"]
@@ -373,8 +398,7 @@ class ActionIdentity:
                                 or (scope["parent"] == 0 and scope["role"] != "invocation"))
 
     @staticmethod
-    def record(scope, group):
-        work = scope["work"]
+    def work_identity(work):
 
         # Preserve submitted token ranges; later request progress can be shared by different in-flight batches.
         logical = {
@@ -384,17 +408,16 @@ class ActionIdentity:
             "continuation": work.get("continuation"), "observation_context": work.get("observation_context"),
         }
         if not isinstance(logical["context"], dict) or not isinstance(logical["callers"], list):
-            raise ValueError(f"{scope['role']} has no valid logical work/caller context")
+            raise ValueError("work has no valid logical work/caller context")
         if logical["continuation"] is not None and not isinstance(logical["continuation"], dict):
-            raise ValueError(f"{scope['role']} has invalid continuation context")
+            raise ValueError("work has invalid continuation context")
         if logical["observation_context"] is not None and not isinstance(logical["observation_context"], dict):
-            raise ValueError(f"{scope['role']} has invalid observation context")
+            raise ValueError("work has invalid observation context")
+        return logical
 
-        return {"group": group, "action": scope["role"], "parameters": scope["parameters"], "work": logical}
-
-    @staticmethod
-    def timing_key(record):
-        return json.dumps(record, sort_keys=True)
+    @classmethod
+    def record(cls, scope, group):
+        return {"group": group, "action": scope["role"], "parameters": scope["parameters"], "work": cls.work_identity(scope["work"])}
 
     @staticmethod
     def logical_key(record):

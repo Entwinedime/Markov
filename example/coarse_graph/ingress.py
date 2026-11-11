@@ -108,15 +108,6 @@ class IngressEvidence:
                 groups[json.dumps(row["identity"], sort_keys=True)].append(row)
         return groups
 
-    @classmethod
-    def feedback(cls, reads):
-
-        # Returned work qualifies the source read, but never becomes its lookup key; empty reads can recur.
-        return [{"identity": rows[0]["identity"], "observed_calls": len(rows),
-                 "time_ns": rows[0]["time_ns"] if (len(rows) == 1 and rows[0]["requests"]
-                                                   and ActionIdentity.request_progress(rows[0]["identity"]["context"])) else None}
-                for rows in cls.groups(reads).values()]
-
     def observe(self, row):
         if row["kind"] == "resources":
             self.requests = [request["id"] for request in row["requests"]]
