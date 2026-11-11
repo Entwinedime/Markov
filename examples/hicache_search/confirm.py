@@ -150,7 +150,7 @@ class Confirmation:
         lines = [
             "# 固定条件的正常实测确认",
             "",
-            f"所有条件在读取正常结果前确定；每条件先测 {self.plan['initial_repetitions']} 次，再按预先规则追加。表中误差覆盖完整 HTTP，不扣 gap、未归属成本或计算。",
+            f"所有条件在读取正常结果前确定；每条件初始 {self.plan['initial_repetitions']} 次、最多 {self.plan['maximum_repetitions']} 次，额外条件上限为 {self.plan['maximum_extra_conditions']}。表中误差覆盖完整 HTTP，不扣 gap、未归属成本或计算。",
             "耗时门槛沿用预测时的同一秒数；完成采集不代表推荐达标。资源价格为声明情景。",
             "",
             "| 场景 | 条件 | 次数 | 预测 sec | 正常均值 sec | 误差 % | CV % | 耗时门槛 sec | 是否达标 | 相对对照改善 % |",

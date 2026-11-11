@@ -47,6 +47,10 @@ def collect(root, task):
     qualification = read(root / "full_scan_qualification.json")
     source_evidence = read(root / "source_qualification.json")["scenes"]
     assert qualification["status"] == "complete"
+    normal_path = root.parent / "normal_confirmation/results.json"
+    confirmation = read(normal_path) if normal_path.exists() else None
+    if confirmation is not None and confirmation["status"] != "completed":
+        raise ValueError("Complete the declared normal observations before publishing the combined report")
     records, scenes = [], []
     for scene, request_path in task["requests"].items():
         request = read(request_path)
@@ -131,6 +135,33 @@ def collect(root, task):
         by_name = {row["name"]: row for row in rows}
         values = sorted(row["predicted_sec"] for row in eligible)
         percentiles = quantiles(values, n=100, method="inclusive")
+        normal = None
+        if confirmation is not None:
+            measured = {}
+            for role in ("best", "worst"):
+                point = next(row for row in confirmation["rows"] if row["scene"] == scene and role in row["roles"])
+                if (
+                    point["target"] != endpoints[role]["name"]
+                    or point["predicted_sec"] != endpoints[role]["predicted_sec"]
+                ):
+                    raise ValueError("The measured endpoint differs from the completed prediction")
+                if point["normal"]["n"] != 1:
+                    raise ValueError("This endpoint confirmation declares one observation per condition")
+                measured[role] = point
+            best, worst = (measured[role]["normal"]["mean_sec"] for role in ("best", "worst"))
+            normal = {
+                "rows": measured,
+                "best_sec": best,
+                "worst_sec": worst,
+                "difference_sec": worst - best,
+                "improvement_percent": 100 * (1 - best / worst),
+                "speedup": worst / best,
+                "ranking_consistent": best <= worst,
+                "wape_percent": 100
+                * sum(abs(point["predicted_sec"] - point["normal"]["mean_sec"]) for point in measured.values())
+                / (best + worst),
+                "maximum_ape_percent": max(point["ape_percent"] for point in measured.values()),
+            }
         scenes.append(
             {
                 "scene": scene,
@@ -171,7 +202,7 @@ def collect(root, task):
                 "mean_target_simulation_sec": sum(batch["simulation_sec"] for batch in batches) / len(rows),
                 "cpp_peak_rss_bytes": max(batch["process_peak_rss_bytes"] for batch in batches),
                 "failed_load_attempts": sum(row["formal_failed_load_attempts"] for row in rows),
-                "normal_accuracy": None,
+                "normal_accuracy": normal,
             }
         )
         flattened = []
@@ -261,7 +292,7 @@ def markdown(root, summary):
         "",
         "三组各 1,296 个唯一配置，合计 3,888 点全部预测成功、可部署，无缺成本、不支持、失败、超时或未运行。采用固定三份语义 base、39 类独立模型、8 个资源套餐与七项报价；请求、顺序、输出及八条准备请求均沿用原实验。ShareGPT/BurstGPT 输出上限为 16 tokens，程序生成固定 8 tokens。",
         "",
-        "端点从每小时费用不超过 baseline 的配置中选择；并列时依次按较低费用、稳定名字选择，全部同耗时并列项保存在 analysis.json 和候选 CSV。相同费用上限不表示端点费用相同。以下均为模型预测，没有新增正常实测。",
+        "端点从每小时费用不超过 baseline 的配置中选择；并列时依次按较低费用、稳定名字选择，全部同耗时并列项保存在 analysis.json 和候选 CSV。相同费用上限不表示端点费用相同。下表及配置分布图为原始模型预测，正常确认有独立标注。",
         "",
         "| 负载 | baseline 秒 | 最好秒 | 最坏秒 | 最好较最坏耗时减少 | 最好较 baseline 耗时减少 |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
@@ -278,6 +309,38 @@ def markdown(root, summary):
         "[全部候选 CSV](candidates.csv) · [端点、并列项和统计 JSON](analysis.json)。原始逐请求报告、固定输入、模型与隔离检查位于 execution/；CSV 保留完整配置、七项费用、工作量、模型覆盖标记及报告路径。",
         "",
     ]
+    measured_scenes = [scene for scene in summary["scenes"] if scene["normal_accuracy"] is not None]
+    if measured_scenes:
+        lines += [
+            "## 六个预选端点的正常实测",
+            "",
+            "每个最好/最差点各测一次，不为防波动追加重复。使用扫描中的完整目标配置、原请求和输出长度，关闭 profiler 和探针；完整正式 HTTP 不扣任何成本。正常结果只评分，不改模型或重新选点。",
+            "",
+            "| 负载 | 预选角色 | 条件 | 原预测秒 | 正常秒 | APE |",
+            "| --- | --- | --- | ---: | ---: | ---: |",
+        ]
+        for scene in measured_scenes:
+            for role, point in scene["normal_accuracy"]["rows"].items():
+                label = "预测最好" if role == "best" else "预测最差"
+                lines.append(
+                    f"| {scene['scene']} | {label} | {point['target']} | {point['predicted_sec']:.3f} | {point['normal']['mean_sec']:.3f} | {point['ape_percent']:.3f}% |"
+                )
+        lines += [
+            "",
+            "| 负载 | 预选最好点实测秒 | 预选最差点实测秒 | 实际耗时减少 | 两点 WAPE | 排序一致 |",
+            "| --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for scene in measured_scenes:
+            normal = scene["normal_accuracy"]
+            lines.append(
+                f"| {scene['scene']} | {normal['best_sec']:.3f} | {normal['worst_sec']:.3f} | {normal['improvement_percent']:.2f}% | {normal['wape_percent']:.3f}% | {'是' if normal['ranking_consistent'] else '否'} |"
+            )
+        lines += [
+            "",
+            "APE 为单点绝对误差除以正常耗时；WAPE 为两点绝对误差之和除以两点正常耗时之和。实际收益以预选最差点为分母，反序保留负数；角色不按实测重新命名。没有正常 baseline，表中收益仅指这两个端点。单次观察不提供波动区间、显著性或真实全空间极值。",
+            "[六点正常原始报告与设备账本](normal_confirmation/results.md)保留全部观察和失败；这部分设备开销单独记录，不加入此前 CPU 扫描用时。",
+            "",
+        ]
     for scene in summary["scenes"]:
         lines += [
             f"## {scene['scene']}",
@@ -368,7 +431,7 @@ def markdown(root, summary):
         lines.append(f"| {base['scene']} base | {base['bytes'] / 1024**3:.3f} |")
     lines += [
         "",
-        f"45 份独立成本来源文件合计 {assets['independent_source_total_bytes'] / 1024**2:.2f} MiB，不含未被引用的采样目录其他文件。冻结模型选择 {assets['frozen_models_bytes'] / 1024**2:.2f} MiB，已计入新增输出。",
+        f"45 份独立来源的入口 JSON 合计 {assets['independent_source_total_bytes'] / 1024**2:.2f} MiB；不含入口引用的测量记录、采集输入和日志，不能将此数当作完整采集数据大小。模型选择 {assets['frozen_models_bytes'] / 1024**2:.2f} MiB，已计入新增输出。",
     ]
     lines += [
         "",
@@ -382,7 +445,7 @@ def markdown(root, summary):
         "",
         "费用为现行七项归一化假设，按实际预留计价，共同文件服务按份额收费一次，不包括 CPU、算力租价或物理流量费。公开排名、配置及全部并列项保留于 execution/*/results.json 与候选 CSV；90% baseline 耗时上限是否有解另见 selected/selection_status，不临时放宽约束。",
         "",
-        "本轮没有对应正常实测，精度留空；旧六个正常条件的 max_prefill_tokens 为 4096，本轮为 8192，声明配置未完全匹配，核对见 execution/historical_normal_compatibility.json。不推广旧六点误差、不认证细微排序或真实全局最优。旧 3×96 抽样的空间、报价与模型不同，不能作为同条件算法收益对照。本轮只覆盖声明部署上的限长、串行固定输出，不推广到完整原始输出、高并发或长期稳态。",
+        "旧六个正常条件的 max_prefill_tokens 为 4096，本轮为 8192，声明配置未完全匹配，核对见 execution/historical_normal_compatibility.json；不推广旧六点误差。新增匹配实测只在上方正常确认表中报告，未确认条件的精度仍留空，不认证细微排序或真实全局最优。旧 3×96 抽样的空间、报价与模型不同，不能作为同条件算法收益对照。本轮只覆盖声明部署上的限长、串行固定输出，不推广到完整原始输出、高并发或长期稳态。",
         "",
     ]
     (root.parent / "results.md").write_text("\n".join(lines), encoding="utf-8")

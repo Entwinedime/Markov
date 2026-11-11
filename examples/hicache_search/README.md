@@ -153,6 +153,11 @@ plan 保存并核对所选场景的正式请求；predict 为每个所选场景�
 它同时保留端点的七项费用、正常误差、逻辑工作量、并列项、设备账本和来源/仿真开销。
 `preflight/` 中已记录的生命周期、空间和恢复证据会一并引用，未记录的瞬时峰值或外围精确结束时刻不补造。
 
+已有全量扫描的端点也可单独用 confirm.py 测量：按原 recommended / worst_within_budget 保存 best / worst 两个角色，
+comparison_reference 设为 worst，initial_repetitions 和 maximum_repetitions 均为1，maximum_extra_conditions 为0，即每点一次且不追加。
+将确认结果保存在扫描目录的 normal_confirmation/ 后，full_scan_report.py 会核对端点与原预测相符，再并入实际跨度及 APE/WAPE；
+没有正常结果时只报告预测，有未完成观察时拒绝发布完整的合并报告。正常数据不参与重新选点或拟合。
+
 ## 既有大请求量来源的全量离线扫描
 
 `full_scan.py` 复用已经固定的正式预测请求、base 和独立模型，不采集设备数据或自动补成本：
