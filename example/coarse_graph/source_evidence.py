@@ -7,7 +7,10 @@ from collections import Counter, defaultdict
 from heapq import heappop, heappush
 from pathlib import Path
 
+from actions import ActionScopes
+from native_case import NativeCase
 from source_clock import ClockConstraints
+from source_effects import NativeEffectEvidence
 
 
 class SourceEvidence:
@@ -66,13 +69,16 @@ class SourceEvidence:
         self.require(edges == native_edges | orders, "projected dependencies omit or add source/serial relations")
         self.require(len(edges) == len(graph["edges"]), "projected dependencies repeat")
 
-
-        # Expressions are normalized by the compiler; unchanged call identity and communication facts are not.
+        # Projection may commute binary terms, but must preserve every declared formula and condition.
         transformed = {"arguments", "guards", "ports", "kv_accesses", "slot_accesses"}
         for index, (native, projected) in enumerate(zip(facts["scopes"], graph["scopes"], strict=True)):
             self.require({key: value for key, value in native.items() if key not in transformed} ==
                          {key: value for key, value in projected.items() if key not in transformed},
                          f"scope {index} changes source identity, context or communication")
+            native_expressions = ActionScopes.declaration_expressions(native)
+            projected_expressions = ActionScopes.declaration_expressions(projected)
+            for field in native_expressions:
+                self.require(native_expressions[field] == projected_expressions[field], f"scope {index} changes source {field}")
             self.require(len(native["ports"]) == len(projected["ports"]), f"scope {index} port count differs")
             for port, target in zip(native["ports"], projected["ports"], strict=True):
                 expected = {key: value for key, value in port.items() if key not in {"at", "wait", "rendezvous"}}
@@ -84,7 +90,10 @@ class SourceEvidence:
                 if "rendezvous" in port:
                     expected["rendezvous"] = coordinates[self.coordinate(port["rendezvous"])]
 
-                # This check compares observed geometry, not symbolic formulas normalized by the expression compiler.
+                if "tensor" in expected:
+                    self.require(ActionScopes.expression_list_key(expected["tensor"].get("shape_rule"))
+                                 == ActionScopes.expression_list_key(target["tensor"].get("shape_rule")),
+                                 f"scope {index} port {port['name']} changes its declared shape rule")
                 observed = dict(target)
                 for value in (expected, observed):
                     if "tensor" in value:
@@ -93,6 +102,8 @@ class SourceEvidence:
             for field in ("kv_accesses", "slot_accesses"):
                 self.require(len(native[field]) == len(projected[field]), f"scope {index} {field} count differs")
                 for access, target in zip(native[field], projected[field], strict=True):
+                    self.require(ActionScopes.expression_key(access.get("rule")) == ActionScopes.expression_key(target.get("rule")),
+                                 f"scope {index} {field} changes its declared token rule")
                     expected = {key: value for key, value in access.items() if key != "rule"}
                     expected.update({side: coordinates[self.coordinate(access[side])] for side in ("start", "finish")})
                     observed = {key: value for key, value in target.items() if key != "rule"}
@@ -223,6 +234,10 @@ class ProductionEvidence:
 
     def run(self):
         publication = json.loads((self.production / "result.json").read_text())
+        capture = json.loads((self.capture / "capture.json").read_text())
+        ranks = [rank for instance in capture["instances"] for rank in instance["observed_roles"]]
+        SourceEvidence.require(publication["observed_roles"] == ranks, "production omits or changes the captured worker set")
+        native_case = NativeCase(self.capture, capture)
         reports = []
         for rank in publication["observed_roles"]:
             try:
@@ -230,35 +245,79 @@ class ProductionEvidence:
                 graph = json.loads((self.production / f"work/{rank}-graph.json").read_text())
                 native = json.loads((self.capture / f"rank-{rank}.json").read_text())
                 SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
+                contents = native_case.observe(rank, graph, native)
+                native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
+                boundaries = native_evidence.inspect_boundaries(graph)
+                effects = native_evidence.inspect()
+                signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank])
                 report = SourceEvidence(facts, graph, native["device_clock"], self.details).inspect()
+                report["native_effects"] = effects
+                report["native_boundaries"] = boundaries
+                report["native_signals"] = signals
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
 
                 # A malformed or absent source is a finding; continue the remaining independent ranks.
                 report = {"mapping": "unverified", "timing": {"status": "unverified"}, "error": str(error)}
             reports.append({"rank": rank, **report})
 
+        case_report = {"status": "unverified", "error": "one or more worker mappings are unverified"}
+        if all(report["mapping"] == "consistent" for report in reports):
+            try:
+                native_case.finish()
+                case_report = native_case.report(self.details)
+            except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+                case_report = {"status": "unverified", "error": str(error)}
         self.output.mkdir(parents=True)
-        document = {"production": str(self.production.resolve()), "capture": str(self.capture.resolve()), "ranks": reports}
+        document = {"production": str(self.production.resolve()), "capture": str(self.capture.resolve()),
+                    "ranks": reports, "native_case": case_report}
         (self.output / "source-evidence.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
         lines = [
-            "# 来源证据检查", "", "本检查核对解释结果到粗图的环境、调用层级与上下文、通信声明、完整工作/顺序区间、边界及其语义归属、几何、依赖和状态访问，以及实测时间是否满足图中因果；工作区间不能遗漏或重复，等待和无载荷区间保留顺序而不计为工作。不证明原生插桩完整、符号表达式与条件变换、模板泛化或目标预测正确。",
-            "", "| rank | 来源映射 | 校准约束 | 名义时间倒置数 | 最大名义倒置/ns |", "| --- | --- | --- | ---: | ---: |",
+            "# 来源证据检查", "", "本检查核对原始声明、解释结果与粗图的环境、调用层级与上下文、通信声明、规则保留、完整工作/顺序区间、边界及其语义归属、几何、依赖和状态访问，以及实测时间是否满足图中因果；工作区间不能遗漏或重复，等待和无载荷区间保留顺序而不计为工作。不证明原生插桩完整、规则对目标配置成立、模板泛化或目标预测正确。",
+            "", "原生作用检查直接读取同次运行的 SDK API、设备任务、runtime 及队列生命周期：核对非零异步拷贝和 stream 等待的完整交接；嵌套 API 只有在原始提交相同且归属一致时才共用设备工作。没有 SDK 任务的拷贝仍须保留工作，不因此获得测量时间。",
+            "", "| rank | 来源映射 | 原生拷贝 / 流等待 | 校准约束 | 名义时间倒置数 | 最大名义倒置/ns |", "| --- | --- | ---: | --- | ---: | ---: |",
         ]
         labels = {"consistent": "一致", "compatible": "校准范围内相容", "inconsistent": "不存在共同校准", "incomplete": "缺少测量", "unverified": "未能核对"}
         for report in reports:
+            effects = report.get("native_effects")
+            native_counts = f"{effects.get('copies', 0)} / {effects.get('stream_waits', 0)}" if effects is not None else "—"
             lines.append(
-                f"| {report['rank']} | {labels[report['mapping']]} | {labels[report['timing']['status']]} | "
+                f"| {report['rank']} | {labels[report['mapping']]} | {native_counts} | {labels[report['timing']['status']]} | "
                 f"{report.get('counts', {}).get('time_inversion', '—')} | {report.get('maximum_inversion_ns', '—')} |"
             )
         for report in reports:
             if "error" in report:
                 lines.extend(["", f"rank {report['rank']} 无法完成检查：{report['error']}", ""])
+            elif "native_boundaries" in report:
+                boundaries, signals = report["native_boundaries"], report["native_signals"]
+                lines.extend([
+                    "", f"rank {report['rank']}：核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
+                    f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
+                    f"SDK 完成导出 {signals.get('exported_completions', 0)} 处、实际等待 {signals.get('signal_waits', 0)} 处、"
+                    f"返回 true 的完成读取 {signals.get('true_completion_reads', 0)} 处。"
+                    f"地址派生的 PD 状态访问 {boundaries.get('derived_state_accesses', 0)} 项需由池/传输证据另行核对。",
+                ])
+        lines.extend(["", f"原生整组检查：{case_report['status']}。"])
+        if "error" in case_report:
+            lines.extend(["", case_report["error"]])
+        else:
+            model = case_report["model_communication"]
+            payload = case_report["pd_payload"]
+            lines.extend([
+                "", f"模型通信 {model['communication_exchanges']} 轮、跨rank关系 {case_report['model_links']} 条，"
+                f"PD必要关系 {case_report['pd_links']} 条；原生CPU协议完整：{case_report['cpu_protocol']['complete']}。"
+                f"已观察物理请求绑定 {case_report['physical_bindings']['observed_request_bindings']} 项。",
+                "", f"PD 载荷范围：核对 {payload.get('scopes_checked', 0)} 个传输组、"
+                f"{payload.get('kv_accesses_checked', 0)} 项 KV 访问和 {payload.get('metadata_accesses_checked', 0)} 项元数据访问；"
+                "依据注册缓冲区、真实复制字节及请求页表，不证明数值内容或重复复制次数。",
+            ])
+            for finding in case_report["findings"]:
+                lines.extend(["", f"{finding['category']}：{finding.get('reason', finding['kind'])}"])
         lines.extend([
             "", "名义倒置按原始中点时间统计；校准约束则核对同一rank全部已测关系能否共同满足两端实测查询区间，不能逐边选择不同的时钟。相容只证明现有仿射时钟假设下没有测量矛盾，不证明精确偏移、插桩完整或SDK关联正确。原始时间和图不修改，也不输出拟合后的时间。unknown_time仍是缺少测量。",
-            "", "只有映射一致、全部时间已测且存在共同校准才返回 0；其余返回 1，并保留所有 rank 的结果。默认 JSON 每类仅列前三个名义时间问题，--details 输出全部位置。", "",
+            "", "只有各rank映射、原生整组检查一致，且全部时间已测并存在共同校准才返回 0；其余返回 1。整组检查不需要预测结果；参与者、CPU协议或绑定证据不足不会被弱图替代。默认 JSON 每类仅列前三个名义时间问题，--details 输出全部位置。", "",
         ])
         (self.output / "source-evidence.md").write_text("\n".join(lines))
-        return 0 if reports and all(report["mapping"] == "consistent" and report["timing"]["status"] == "compatible"
+        return 0 if reports and case_report["status"] == "consistent" and all(report["mapping"] == "consistent" and report["timing"]["status"] == "compatible"
                                    for report in reports) else 1
 
 

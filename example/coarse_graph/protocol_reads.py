@@ -87,6 +87,41 @@ class PdStateEvidence:
 
         return required
 
+    def causal_dependencies(self, sources, groups):
+        services, reservations = defaultdict(set), defaultdict(set)
+        for rank, (contents, raw, _) in sources.items():
+            group = groups[rank]
+            for observed in raw["scopes"]:
+                scope = contents.graph["scopes"][contents.source_ids[observed["id"]]]
+                if "native_transfer" in observed:
+                    member, = raw["scopes"][observed["submitted_by"]]["work"]["members"]
+                    port, = [port for port in scope["ports"] if port["name"] == "service.complete" and port["direction"] == "output"]
+                    services[group, member["id"]].add((rank, port["event"]))
+                if "reservation_publication" in observed:
+                    publication = observed["reservation_publication"]
+                    recipient = self.addresses[tuple(publication["target"])]
+                    port, = [port for port in scope["ports"] if port["name"] == "reservation.ready" and port["direction"] == "output"]
+                    reservations[recipient, publication["request"]].add((rank, port["event"]))
+
+        required = self.requirements()
+        dependencies = set()
+        for rank, (contents, raw, _) in sources.items():
+            for query in raw["state_queries"]:
+                if query["kind"] != "transport" or query["result"] < 2:
+                    continue
+                observed = raw["scopes"][query["scope"]]
+                key = groups[rank], observed["work"]["context"]["request"]["id"]
+                scope = contents.graph["scopes"][contents.source_ids[query["scope"]]]
+                returned, = [port for port in scope["ports"] if port["name"] == "call.return" and port["direction"] == "output"]
+
+                # A successful native read proves these prerequisites, without inventing a notification timestamp.
+                predecessors = set(reservations[key])
+                if query["result"] == 4:
+                    for sender in required[key]:
+                        predecessors.update(services[sender])
+                dependencies.update((source, (rank, returned["event"]), "observation") for source in predecessors)
+        return dependencies
+
     @staticmethod
     def state_windows(key, records):
         windows = {}

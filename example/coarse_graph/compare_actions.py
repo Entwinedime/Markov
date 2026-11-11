@@ -5,134 +5,24 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from actions import ActionIdentity, ActionScopes, QueryResults
-from bindings import BindingComparison
+from actions import ActionIdentity, QueryResults
+from contents import GraphContents
+from native_case import NativeCase
 from ingress import IngressEvidence
-from connections import Connections
 from dependencies import ActionBoundaries, ActionOrderComparison, CausalGraph
 from resource_effects import ResourceEffectComparison
-from protocol_reads import PdPollingEvidence, PdStateEvidence, PdPredictionEvidence
+from protocol_reads import PdPollingEvidence, PdPredictionEvidence
 from state_values import ActionResults, StateValueComparison
 
 
-class GraphContents(ActionScopes):
-    def __init__(self, graph):
-        super().__init__(graph)
-        self.pools = {}
-
-    def observed_pools(self, raw, registrations, groups):
-
-        # The native session identifies the actual destination independently of the predictor's routing rules.
-        for index, observed in enumerate(raw["scopes"]):
-            if not (transfer := observed.get("native_transfer")):
-                continue
-            target = groups[registrations[transfer["session"]]]
-            scope = self.graph["scopes"][index]
-            accesses = scope["kv_accesses"] + scope["slot_accesses"]
-            if not accesses and not transfer["blocks"]:
-                continue
-            destinations = {access["pool"] for access in accesses if access["access"] == "write"}
-            if len(destinations) != 1 or "local" in destinations:
-                raise ValueError("native transfer has no unique remote graph pool")
-            pool, = destinations
-            if self.pools.setdefault(pool, target) != target:
-                raise ValueError("source pool interface identifies different native owners")
-
-    def pool(self, name, group):
-        return group if name == "local" else self.pools.get(name, name)
-
-    def resource(self, index):
-        resource = self.graph["resources"][index]
-        return {name: resource[name] for name in ("kind", "role", "rank", "serial")}
-
-    def paths(self, root):
-        paths, pending = {root: "root"}, [root]
-        for index in pending:
-            for child, scope in enumerate(self.children[index]):
-                paths[scope] = f"{paths[index]}/{child}"
-                pending.append(scope)
-        return paths
-
-    def snapshot(self, root, group):
-        graph, paths = self.graph, self.paths(root)
-
-        # Relative versions and alias partitions survive different addresses and allocation histories.
-        versions = {}
-        for index in paths:
-            for port in graph["scopes"][index]["ports"]:
-                if port["use"] == "data" and (tensor := port.get("tensor")):
-                    storage = tensor["storage"]
-                    versions[storage] = min(versions.get(storage, tensor["version"]), tensor["version"])
-        storages, resources, channels = {}, {}, {}
-        channel_origins = {}
-        for index in paths:
-            if communication := graph["scopes"][index].get("communication"):
-                channel = communication["channel"]
-                channel_origins[channel] = min(channel_origins.get(channel, communication["order"]), communication["order"])
-
-        result = {}
-        for index in paths:
-            scope = graph["scopes"][index]
-            contents = {name: scope[name] for name in ("role", "site", "implementation", "parameters")}
-            contents["weights"] = scope["bindings"].get("weights")
-            ports = {}
-            for port in sorted(scope["ports"], key=lambda value: (value["name"], value["direction"])):
-
-                # These ports are added during action cutting; cross-action serial frontiers need their own check.
-                if index == root and port["name"].startswith(("resource.enter/", "resource.exit/")):
-                    continue
-                boundary = {name: port[name] for name in ("use", "relation")}
-                resource = graph["events"][port["event"]]["resource"]
-                resources.setdefault(resource, len(resources))
-                boundary["resource"] = {**self.resource(resource), "alias": resources[resource]}
-                if "wait" in port:
-                    waited = port["wait"]["resource"]
-                    resources.setdefault(waited, len(resources))
-                    boundary["wait_resource"] = {**self.resource(waited), "alias": resources[waited]}
-                boundary["rendezvous"] = "rendezvous" in port
-                if tensor := port.get("tensor"):
-                    boundary["tensor"] = {"dtype": tensor["dtype"], "shape": tensor["shape"]}
-
-                    # Metadata describes layout; its runtime buffer lifecycle is not a graph data dependency.
-                    if port["use"] == "data":
-                        storage = tensor["storage"]
-                        storages.setdefault(storage, len(storages))
-                        boundary["tensor"].update(
-                            storage_alias=storages[storage], version=tensor["version"] - versions[storage],
-                            writer=paths.get(tensor["writer"], "external"),
-                            allocation="internal" if tensor["allocation"] in paths else "external",
-                            buffer=tensor["buffer"],
-                        )
-                ports[f"{port['direction']}:{port['name']}"] = boundary
-            contents["ports"] = ports
-
-            for field in ("kv_accesses", "slot_accesses"):
-                accesses = []
-                for access in scope[field]:
-                    value = {name: value for name, value in access.items() if name not in {"start", "finish", "rule"}}
-                    value["pool"] = self.pool(value["pool"], group)
-                    accesses.append(value)
-                contents[field] = accesses
-            communication = scope.get("communication")
-            if communication:
-                channel = communication["channel"]
-                channels.setdefault(channel, len(channels))
-                communication = {**communication, "channel": channels[channel], "order": communication["order"] - channel_origins[channel]}
-            contents["communication"] = communication
-            work = Counter(json.dumps({"kind": item["kind"], "resource": self.resource(item["resource"])}, sort_keys=True)
-                           for item in self.work[index])
-            contents["work"] = dict(work)
-            result[paths[index]] = contents
-        return result
-
-
 class ActionComparison:
-    evidence_categories = frozenset({
-        "native_evidence", "binding_evidence", "ordering_evidence", "input_read_evidence",
-        "missing_native_identity", "missing_predicted_identity",
+    evidence_categories = NativeCase.evidence_categories | frozenset({
+        "state_binding_evidence", "ordering_evidence", "input_read_evidence",
+        "missing_predicted_identity",
         "ambiguous_native_identity", "ambiguous_predicted_identity",
         "unpaired_native_context", "unpaired_predicted_context",
         "incomplete_execution", "unfinished_events",
+        "resource_read_evidence",
     })
 
     def __init__(self, capture, graphs, execution, output, details):
@@ -183,82 +73,106 @@ class ActionComparison:
     def publish(self, report):
         self.output.mkdir(parents=True)
         (self.output / "actions.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+
+        checks, state, counts = report["action_checks"], report["state_lifetimes"], report["counts"]
+        connections = report["connections"]
+        reads = report["resource_effects"]["reads"]
+        order = report["action_order"]
+        outside_flow = sum(value["input_reads"]["outside_flow"] for value in report["request_ingress"].values() if "input_reads" in value)
+        rows = [
+            "# 执行结构独立对照", "",
+            f"整例结果：`{report['status']}`；证据覆盖：`{report['coverage']}`。", "",
+            "以下分别说明实际证明了什么。局部对应不能替代整例通过，轨迹差异数也不是独立 Bug 数。", "",
+            "| 检查对象 | 已检查 | 结果与未覆盖范围 |", "| --- | --- | --- |",
+        ]
+        for name, label in (("contents", "模板展开内容"), ("dependencies", "调用内具名边界依赖")):
+            value = checks[name]
+            rows.append(f"| {label} | {value['checked']} / {checks['predicted_occurrences']} 次预测调用 | "
+                        f"对应 {value['matched']}，差异 {value['checked'] - value['matched']}，未验证 "
+                        f"{checks['predicted_occurrences'] - value['checked']}；共享内容检查不建立逐次调用配对 |")
+
+        rows.extend([
+            f"| 运行内生产与消费 | {connections['predicted_data_inputs_checked']} 个非空外部数据输入、"
+            f"{connections['predicted_signal_inputs_checked']} 个完成等待 | 数据就绪保护 "
+            f"{connections['predicted_data_inputs_ready']} 项、完成等待保护 {connections['predicted_signal_inputs_ready']} 项；"
+            "不依赖跨运行调用配对，查询不当作等待 |",
+            f"| 运行内物理状态 | {state.get('kv_regions_checked', 0)} 个 KV 逻辑区间、"
+            f"{state.get('field_bindings_checked', 0)} 条字段绑定 | 未完整绑定的 KV 区间 "
+            f"{state.get('kv_regions_unbound', 0)}、字段访问 {state.get('field_bindings_missing', 0)}；"
+            f"{state.get('pending_conflicts_ordered', 0)} / {state.get('pending_conflicts', 0)} 个在途冲突有保护路径 |",
+            f"| 跨运行逐次对应 | {report['actions_compared']} 个唯一工作调用 | 内容对应 "
+            f"{report['actions_contents_matched']}，内部依赖对应 {report['actions_dependencies_matched']}；"
+            f"其余原生 / 预测调用未配对 {report['unpaired_calls']['native']} / {report['unpaired_calls']['predicted']} |",
+            f"| 执行轨迹 | 两次运行的最小次序关系和资源历史 | 原生关系在预测中不成立 "
+            f"{order.get('missing_relations', 0)} 条，预测关系在原生中不成立 {order.get('extra_relations', 0)} 条；"
+            f"事件别名差异 {order.get('alias_conflicts', 0)}，重复位置差异 {counts.get('repeated_call_order', 0)}，"
+            f"资源历史差异 {counts.get('resource_effects', 0)}；不是独立 Bug 数 |",
+            f"| 资源条件读取 | 已记录：原生 {sum(value['count'] for value in reads['native'])} 次、"
+            f"预测 {sum(value['count'] for value in reads['predicted'])} 次标量查询 | "
+            f"缺原生读取记录的 worker {len(reads['unobserved_native'])} 个，"
+            f"未明确所读资源的预测查询 {sum(reads['unqualified_predicted'].values())} 次；不按次数配对 |",
+            "", "控制交互还需核对输入交付、查询、通知、准入及决定性时间条件；内容或状态安全通过不能代替它们。",
+            f"输入读取按实际serving活动范围对照；范围外{outside_flow}次空读取仍保留于执行记录，全部非空请求交付继续检查。",
+            "未配对、协议缺失和未触发的复用继续保留证据限制；零在途页归还不证明在途复用正确。",
+            "完整分类、代表问题与各检查边界保留在 actions.json。", "",
+        ])
+        (self.output / "actions.md").write_text("\n".join(rows))
         return 0 if report["status"] == "actions_matched" else 1
 
     def run(self):
         capture = json.loads((self.capture / "capture.json").read_text())
-        groups = {rank: f"{instance['id']}/{rank}" for instance in capture["instances"] for rank in instance["observed_roles"]}
-        ranks, expected, actual_dependencies, predicted_dependencies = {}, {}, {}, {}
-        sources, occurrences, full_occurrences = {}, defaultdict(list), defaultdict(list)
-        native_reads = {}
-        protocol_source = PdStateEvidence()
+        native_case = NativeCase(self.capture, capture)
+        groups, ranks = native_case.groups, native_case.ranks
+        sources = native_case.sources
+        cpu_protocol, protocol_source = native_case.cpu, native_case.protocol
+        expected, predicted_dependencies = {}, {}
+        occurrences, full_occurrences = defaultdict(list), defaultdict(list)
+        native_classes, predicted_classes = defaultdict(set), defaultdict(set)
+        native_scope_keys, native_reads = {}, {}
         native_polling = PdPollingEvidence(protocol_source.admission_members)
         state_values = StateValueComparison(groups)
         action_results = ActionResults(groups)
         ingress = IngressEvidence(self.capture, capture["instances"])
-        observed_actions = 0
         for instance in capture["instances"]:
             for rank in instance["observed_roles"]:
-                ranks[rank] = instance["id"]
                 graph = json.loads((self.graphs / f"{rank}-graph.json").read_text())
-                source = GraphContents(graph)
                 raw = json.loads((self.capture / f"rank-{rank}.json").read_text())
-                source.validate_source(raw, rank)
-                protocol_source.observe(raw, groups[rank])
+                source = native_case.observe(rank, graph, raw)
+                identities = sources[rank][2]
                 native_polling.native(raw, groups[rank])
                 state_values.source(raw, groups[rank])
-                action_results.source(raw, groups[rank], instance["mode"])
+                action_results.source(raw, groups[rank], instance["mode"], source.source_ids)
                 ingress.native(instance["id"], raw)
-                identities = {}
-                sources[rank] = source, raw, identities
-                for index, scope in enumerate(graph["scopes"]):
-                    if not ActionIdentity.selected(index, scope):
-                        continue
-                    observed_actions += 1
-                    try:
-                        identity = ActionIdentity.record(scope, groups[rank])
-                    except ValueError as error:
-                        identities[index] = {"group": groups[rank], "scope": index, "action": scope["role"]}
-                        self.finding("missing_native_identity", identities[index], {"reason": str(error)})
-                        continue
-                    identities[index] = identity
-                    key = ActionIdentity.structure_key(identity)
-                    occurrences[key].append(index)
-                    full_occurrences[ActionIdentity.occurrence_key(identity)].append(index)
-                    expected.setdefault(key, (source, index, identity))
+                for query in raw["state_queries"]:
+                    index = source.source_ids[query["scope"]]
+                    native_reads[groups[rank], index] = query["result"], identities[index]
+        native_case.finish()
+        observed_actions, controls = native_case.observed_actions, native_case.controls
+        for category, identity, detail in native_case.findings:
+            self.finding(category, identity, detail)
 
-                native_reads.update({(groups[rank], query["scope"]): (query["result"], identities[query["scope"]])
-                                     for query in raw["state_queries"]})
-        if not observed_actions:
-            raise ValueError("native case contains no observed actions")
+        # Use the native ABI only when every declaration is host-only; predicted contents never select a source class.
+        for rank, (source, _, identities) in sources.items():
+            for index, identity in identities.items():
+                if "work" not in identity:
+                    continue
+                key = source.structure_key(index, identity, controls)
+                full_key = ActionIdentity.logical_key(identity)
+                occurrences[key].append(index)
+                full_occurrences[full_key].append(index)
+                native_classes[full_key].add(key)
+                native_scope_keys[rank, index] = key
+                expected.setdefault(key, (source, index, identity))
 
-        registrations = {}
-        for path in sorted((self.capture / "kv-pools").glob("*.json")):
-            registration = json.loads(path.read_text())
-            session = registration["registration"]["session"]
-            if session in registrations:
-                raise ValueError("native session identifies more than one registered pool")
-            registrations[session] = registration["parallel"]["rank"]
-        connections = Connections()
-        histories = {}
-        for rank, group in groups.items():
-            path = self.capture / "resources" / f"rank-{rank}.json"
-            if path.is_file():
-                histories[group] = json.loads(path.read_text())
-        bindings = BindingComparison(histories, {session: groups[rank] for session, rank in registrations.items()})
+        connections, bindings = native_case.connections, native_case.bindings
         effects = ResourceEffectComparison()
-        ordering = ActionOrderComparison()
-        for rank, (source, raw, identities) in sources.items():
+        ordering = ActionOrderComparison(self.details)
+        for rank, (source, _, _) in sources.items():
             group = groups[rank]
-            source.observed_pools(raw, registrations, groups)
-            actual_dependencies[rank] = CausalGraph.observed(source.graph)
-            connections.native(source, raw, rank, ranks[rank], actual_dependencies[rank], identities)
-            if group in histories:
-                bindings.observed(source, raw, group, identities)
-                effects.observed(histories[group], source.graph, group)
-            else:
-                bindings.findings.append(("binding_evidence", {"group": group}, {"reason": "native resource history is absent"}))
+            if group in native_case.histories:
+                effects.observed(native_case.histories[group], source.graph, group)
             predicted_dependencies[rank] = CausalGraph()
+        native_evidence = native_case.report(self.details)
         sources.clear()
 
         # Compare contents independently of occurrence pairing, after native remote pools have their actual owners.
@@ -273,12 +187,14 @@ class ActionComparison:
         event_ranks, completed, pending = {}, set(), []
         cross_rank_edges = set()
         queries = QueryResults()
-        protocol_readiness = protocol_source.inspect()
+        protocol_readiness = native_case.readiness
         protocol = PdPredictionEvidence(protocol_source, protocol_readiness, ingress.origin_ns)
         with self.execution.open() as stream:
             for line in stream:
                 row = json.loads(line)
+                cpu_protocol.observe(row)
                 ingress.observe(row)
+                effects.observe(row)
                 connections.observe(row)
                 state_values.observe(row)
                 action_results.observe(row)
@@ -296,10 +212,10 @@ class ActionComparison:
                     predicted_dependencies[rank].add_events([row["event"]])
                 elif row["kind"] == "resource":
                     bindings.released(row)
-                    if row["group"] in effects.predicted:
-                        effects.predicted[row["group"]].predicted(row, effects.requests)
                 elif row["kind"] == "binding":
                     bindings.bound(row)
+                elif row["kind"] == "state_binding":
+                    bindings.lifetimes.state_bound(row)
                 if row["kind"] == "edge":
                     if row["relation"] == "communication":
                         connections.communication_edges.add((row["source"], row["target"]))
@@ -336,9 +252,11 @@ class ActionComparison:
                 except ValueError as error:
                     identity = {"group": group, "event": events[port["event"]], "action": root["role"]}
                     self.finding("missing_predicted_identity", identity, {"reason": str(error)})
-                key = ActionIdentity.structure_key(identity)
+                key = target.structure_key(0, identity, controls) if "work" in identity else ActionIdentity.structure_key(identity)
                 predicted_counts[key] += 1
-                full_predicted_counts[ActionIdentity.occurrence_key(identity)] += 1
+                full_key = ActionIdentity.logical_key(identity)
+                full_predicted_counts[full_key] += 1
+                predicted_classes[full_key].add(key)
                 target_key = group, events[port["event"]]
 
                 # Run-local identities retain every writer and occurrence; cross-run pairing happens after multiplicity is known.
@@ -363,7 +281,7 @@ class ActionComparison:
             if not predicted_counts[key]:
                 self.finding("unmatched_native", identity, {})
         for key, indices in full_occurrences.items():
-            if not full_predicted_counts[key] and predicted_counts[ActionIdentity.structure_key(json.loads(key))]:
+            if not full_predicted_counts[key] and any(predicted_counts[value] for value in native_classes[key]):
                 self.finding("unpaired_native_context", json.loads(key), {"observed_calls": len(indices)})
             if len(indices) > 1:
                 self.finding("ambiguous_native_identity", json.loads(key), {
@@ -371,7 +289,7 @@ class ActionComparison:
                     "reason": "complete logical context repeats; structure is checked independently",
                 })
         for key, count in full_predicted_counts.items():
-            if not full_occurrences[key] and ActionIdentity.structure_key(json.loads(key)) in expected:
+            if not full_occurrences[key] and predicted_classes[key] & expected.keys():
                 self.finding("unpaired_predicted_context", json.loads(key), {"predicted_calls": count})
             if count > 1 and len(full_occurrences[key]) <= 1:
                 self.finding("ambiguous_predicted_identity", json.loads(key), {"predicted_calls": count})
@@ -383,73 +301,96 @@ class ActionComparison:
         # Dynamic waits and state hazards are recorded after graph insertion; compare only after reading the whole execution.
         for graph in predicted_dependencies.values():
             graph.prepare()
-        pairs, signatures = {}, {}
+        pairs, signatures, checks = {}, {}, []
         dependency_checks, dependency_matches = Counter(), Counter()
-        action_groups = defaultdict(list)
-        repeated_groups = defaultdict(dict)
+        actions, repeated_groups = [], {}
         for key, rank, identity, source, index, target_key, predicted, content_match, snapshot in pending:
-            full_key = ActionIdentity.occurrence_key(identity)
-            indices = full_occurrences[full_key]
-            paired = len(indices) == full_predicted_counts[full_key] == 1
-            native = ActionBoundaries(source, index)
-            if key not in signatures:
-                actual = actual_dependencies[rank].signature(native)
-                signatures[key] = actual
-
-                # A common body does not establish common ordering; inspect every observed occurrence separately.
-                for repeated_index in occurrences[key][1:]:
-                    repeated = actual_dependencies[rank].signature(ActionBoundaries(source, repeated_index))
-                    if next(actual.differences(repeated), None) is not None:
-                        signatures[key] = None
-                        break
-            actual = signatures[key]
+            full_key = ActionIdentity.logical_key(identity)
+            indices = [index for index in full_occurrences[full_key] if native_scope_keys[rank, index] == key]
+            unique = len(indices) == len(full_occurrences[full_key]) == full_predicted_counts[full_key] == 1
+            paired = unique and ActionIdentity.occurrence_anchored(identity)
+            if unique and not paired:
+                self.finding("unpaired_native_context", identity, {
+                    "observed_calls": 1, "predicted_calls": 1,
+                    "reason": "repeatable read or no request work anchor; common structure is checked without occurrence pairing",
+                })
 
             # A shared structure is not an occurrence. Pair with its own source scope, never the class representative.
+            native = ActionBoundaries(source, indices[0] if paired else index).ranked(rank)
+            predicted = predicted.ranked(rank)
             if paired:
-                native = ActionBoundaries(source, indices[0])
-                if actual is None:
-                    actual = actual_dependencies[rank].signature(native)
                 if content_match is None:
                     content_match = self.compare_contents(identity, source.snapshot(indices[0], identity["group"]), snapshot)
                     content_checks[key] += 1
                     content_matches[key] += content_match
-            if actual is not None:
-                dependency_checks[key] += 1
-                estimate = predicted_dependencies[rank].signature(predicted)
-                different = False
-                for category, detail in actual.differences(estimate):
-                    self.finding(category, identity, detail)
-                    different = True
-                dependency_matches[key] += not different
+            checks.append((key, rank, identity, native, predicted, paired))
 
             # Only occurrence pairs may identify external producers, query results and communication rounds.
             if not paired:
-                repeated = repeated_groups[rank]
-                if full_key not in repeated:
-                    repeated[full_key] = identity, [ActionBoundaries(source, index) for index in indices], []
-                repeated[full_key][2].append(predicted)
+                repeated_key = rank, full_key, key
+                if repeated_key not in repeated_groups:
+                    repeated_groups[repeated_key] = identity, [ActionBoundaries(source, index).ranked(rank) for index in indices], []
+                repeated_groups[repeated_key][2].append(predicted)
                 continue
             pairs[identity["group"], indices[0]] = target_key
             paired_counts[key] += 1
-            action_groups[rank].append((identity, native, predicted))
+            actions.append((identity, native, predicted))
             compared += 1
             matched += content_match
-            matched_dependencies += not different
+        pending.clear()
 
-        for rank in action_groups.keys() | repeated_groups.keys():
-            actions = action_groups[rank]
-            ordering.compare(actual_dependencies[rank], predicted_dependencies[rank], actions)
-            ordering.compare_repeated(actual_dependencies[rank], predicted_dependencies[rank], actions, repeated_groups[rank])
-
-        connections.compare_values(predicted_dependencies, pairs)
         connections.compare_signals(pairs)
         connections.compare_predicted_communication(predicted_dependencies)
-        connections.compare_communication(actual_dependencies, pairs)
+        connections.compare_communication(pairs)
+        predicted_communication = {((event_ranks[source], source), (event_ranks[target], target))
+                                   for source, target in connections.communication_edges}
+        predicted_links = {((event_ranks[source], source), (event_ranks[target], target), relation)
+                           for source, target, relation in cross_rank_edges}
+        predicted_links.update((source, target, "communication") for source, target in predicted_communication)
+        actual_graph = native_case.graph
+        predicted_graph = cpu_protocol.prediction(predicted_dependencies, predicted_links)
+        connections.check_predicted_readiness(predicted_graph, event_ranks)
+        connections.compare_values(predicted_graph, pairs)
+        cpu_scope = cpu_protocol.report()
+        order_ready = (connections.counts["native_communication_protocol_complete"]
+                       and connections.counts["predicted_communication_protocol_complete"] and cpu_scope["complete"])
+        if order_ready:
+            for key, rank, identity, native, predicted, paired in checks:
+                if key not in signatures:
+                    source, index, _ = expected[key]
+                    actual = actual_graph.signature(ActionBoundaries(source, index).ranked(rank))
+                    signatures[key] = actual
+
+                    # An alternate route through another rank can supply any local boundary dependency.
+                    for index in occurrences[key][1:]:
+                        repeated = actual_graph.signature(ActionBoundaries(source, index).ranked(rank))
+                        if next(actual.differences(repeated), None) is not None:
+                            signatures[key] = None
+                            break
+                actual = signatures[key]
+                if paired and actual is None:
+                    actual = actual_graph.signature(native)
+                if actual is not None:
+                    dependency_checks[key] += 1
+                    different = False
+                    for category, detail in actual.differences(predicted_graph.signature(predicted)):
+                        self.finding(category, identity, detail)
+                        different = True
+                    dependency_matches[key] += not different
+                    matched_dependencies += paired and not different
+            ordering.compare(actual_graph, predicted_graph, actions)
+            ordering.compare_repeated(actual_graph, predicted_graph, actions, repeated_groups)
+        else:
+            self.finding("ordering_evidence", {}, {
+                "reason": "all-rank causal comparison needs complete model communication and CPU protocols",
+                "native_model_protocol": connections.counts["native_communication_protocol_complete"],
+                "predicted_model_protocol": connections.counts["predicted_communication_protocol_complete"],
+                "cpu_protocol": cpu_scope["complete"],
+            })
         bindings.compare(pairs)
-        bindings.lifetimes.compare(predicted_dependencies, [
-            *cross_rank_edges, *((source, target, "communication") for source, target in connections.communication_edges),
-        ])
-        for category, identity, detail in (*connections.findings, *bindings.findings, *bindings.lifetimes.findings, *ordering.findings):
+        bindings.lifetimes.compare(predicted_graph, event_ranks)
+        for category, identity, detail in (*connections.findings, *bindings.findings, *bindings.lifetimes.findings,
+                                          *ordering.findings, *cpu_protocol.findings):
             self.finding(category, identity, detail)
         for category, identity, detail in effects.compare():
             self.finding(category, identity, detail)
@@ -515,22 +456,33 @@ class ActionComparison:
         unpaired_calls = {"native": observed_actions - compared, "predicted": sum(predicted_counts.values()) - compared}
         incomplete = (payload_incomplete or any(unpaired_calls.values()) or input_incomplete or metadata_incomplete or admission_incomplete
                       or connections_incomplete or batch_sync_incomplete or bindings_incomplete or queries_incomplete
-                      or bool(effects.counts["state_slots"]["unobserved_native"]) or bool(unverified_cross_rank))
+                      or bool(effects.counts["state_slots"]["unobserved_native"]) or bool(unverified_cross_rank)
+                      or not cpu_scope["complete"] or not ordering.qualified)
         report = {
             **self.outcome(incomplete),
+            "native_case": native_evidence,
             "native_actions_checked": observed_actions, "predicted_actions_checked": sum(predicted_counts.values()),
             "actions_compared": compared,
             "actions_contents_matched": matched,
             "actions_dependencies_matched": matched_dependencies,
+            "action_checks": {
+                "predicted_occurrences": sum(predicted_counts.values()),
+                "contents": {"checked": sum(content_checks.values()), "matched": sum(content_matches.values())},
+                "dependencies": {"checked": sum(dependency_checks.values()), "matched": sum(dependency_matches.values())},
+            },
+            "declared_control_classes": len(controls),
             "unpaired_calls": unpaired_calls,
             "counts": dict(self.counts), "findings": self.findings,
             "connections": connections.counts,
+            "cpu_protocol": cpu_scope,
             "batch_synchronization": dict(connections.batch_sync.counts),
-            "cross_action_order": ordering.counts,
+            "action_order": {**ordering.counts, "graph": "all_ranks_model_cpu_pd_and_state",
+                             "coverage": "checked_scope" if ordering.qualified else "unqualified",
+                             "scope": "Project full all-rank paths onto already-paired named events, preserving aliases and paths through unpaired intermediates. Compare each order's minimal relations to the opposite reachable order; both directions together retain strict order equality. A differing relation is not a proven core defect, and an opposite reverse path forbids simply adding that edge. No new occurrence pairing, timing or state-safety qualification."},
             "repeated_call_order": {**ordering.repeated_counts,
-                                    "scope": "Sets of rank-local causal positions relative to uniquely paired call entries/returns. Counts, payloads, effects, cross-rank rounds and timing are not paired; no source occurrence is selected by matching its position."},
+                                    "scope": "Sets of all-rank causal positions relative to uniquely paired call entries/returns in the same joined graphs. Counts, payloads, effects, cross-rank rounds and timing are not paired; no source occurrence is selected by matching its position."},
             "physical_bindings": bindings.counts,
-            "kv_lifetimes": bindings.lifetimes.report(),
+            "state_lifetimes": bindings.lifetimes.report(),
             "resource_effects": effects.counts,
             "state_values": state_values.counts,
             "action_results": dict(action_results.counts),
@@ -543,7 +495,8 @@ class ActionComparison:
             "native_admission_decisions": native_polling.commit_counts(),
             "query_outcomes": dict(query_counts),
             "request_ingress": input_delivery,
-            "repeated_calls": [{"work": expected[key][2], "classification": "structural_class", "paired_calls": paired_counts[key],
+            "repeated_calls": [{"work": expected[key][2], "classification": "declared_control" if key in controls else "structural_class",
+                                "paired_calls": paired_counts[key],
                                 "observed_calls": len(occurrences[key]), "predicted_calls": predicted_counts[key],
                                 "source_contents_uniform": key not in varied,
                                 "contents_checked": content_checks[key], "contents_matched": content_matches[key],
@@ -553,9 +506,9 @@ class ActionComparison:
             "cross_rank_dependencies": {"protocol_checked_edges": dict(checked_cross_rank), "unverified_edges": dict(unverified_cross_rank)},
             "not_checked": ["unpaired query outcomes and exact PD notification arrival times", "unpaired external input reads", "unnamed internal event topology",
                             "cross-rank causality outside verified communication and notification protocols",
-                            "intra-call resource effect timing and in-flight resource lifetimes", "request-slot bindings during native transport",
+                            "intra-call resource effect timing, tensor lifetimes and native in-flight resource reuse outside observed cases", "request-slot bindings during native transport",
                             "per-occurrence pairing, placement and timing of calls whose full logical context repeats", "PD unused padding and unsupported multimodal/logprob/speculative values; controller output values outside recorded progress and publication fields"],
-            "scope": "Every invocation retains its run-local identity; only one-to-one full logical matches, including ancestor contexts, enter cross-run pairing. Structural classes omit ancestor state only for common-content checks; they never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A unique full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. Paths include the full rank-local graph and dynamic prediction edges, including unnamed intermediates. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
+            "scope": "Every invocation retains its run-local identity; cross-run occurrence pairs require one-to-one full logical matches and request work anchors. Repeatable reads and unanchored control calls remain unpaired even if observed once. Logical matches retain ancestor contexts and exclude time-only observation placement. Structural classes omit ancestor state for common-content checks. Native ABIs whose every observed declaration is independently verified host-only also share CPU contents across queue snapshots and continuation cuts; their predicted body never selects a class, and logical/time identities remain unchanged. Classes never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. Every nonempty predicted external data input is separately checked against its own published storage/version export and the shared all-rank causal graph. Every explicit signal wait is checked against its actual generation and recorded direct signal edge; completion queries do not acquire a wait. These run-local checks do not require native occurrence pairs. Signal cross-run matched counts concern producer identity. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A qualified full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. All causal comparisons use the same per-run all-rank graphs, including unnamed intermediates, dynamic prediction edges and verified model/CPU communication. A path may cross ranks and return. Missing protocol coverage withholds causal qualification rather than proving a negative from an isolated rank. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
         }
         return self.publish(report)
 

@@ -1,4 +1,4 @@
-"""Check native value provenance and communication peers against observed prediction edges."""
+"""Check each run's producer readiness and compare native value provenance and communication peers."""
 
 from collections import defaultdict
 
@@ -14,6 +14,7 @@ class Connections:
         self.channels = defaultdict(lambda: defaultdict(list))
         self.predicted_channels = defaultdict(lambda: defaultdict(list))
         self.communication_edges = set()
+        self.native_communication_edges = set()
         self.metadata_returns = {}
         self.endpoints = {}
         self.action_returns = {}
@@ -36,8 +37,11 @@ class Connections:
             if "collective" not in record["values"]:
                 continue
             index = record["scope"]
-            if index in metadata or type(index) is not int or not 0 < index < len(raw["scopes"]) or raw["scopes"][index]["role"] != "metadata_collective":
+            if type(index) is not int or not 0 < index < len(raw["scopes"]) or raw["scopes"][index]["role"] != "metadata_collective":
                 raise ValueError("metadata evidence requires a unique observed collective")
+            index = contents.source_ids[index]
+            if index in metadata:
+                raise ValueError("metadata collective has competing native observations")
             metadata[index] = record["values"]["collective"]
         for root, scope in enumerate(graph["scopes"]):
             if not ActionIdentity.selected(root, scope):
@@ -53,7 +57,9 @@ class Connections:
         signals, inputs = defaultdict(set), []
         for index, (key, path, identity) in owners.items():
             projected = {(port["name"], port["direction"]): port for port in graph["scopes"][index]["ports"]}
-            for port in raw["scopes"][index]["ports"]:
+            origins = graph["scopes"][index]["bindings"]["source_scopes"]
+            native_ports = (port for origin in origins for port in raw["scopes"][origin]["ports"])
+            for port in native_ports:
                 if port["use"] != "signal":
                     continue
                 label = key, path, port["direction"], port["name"]
@@ -74,7 +80,7 @@ class Connections:
         for query in raw["state_queries"]:
             if query["kind"] != "event":
                 continue
-            key, path, identity = owners[query["scope"]]
+            key, path, identity = owners[contents.source_ids[query["scope"]]]
             inputs.append(((key, path, "query", "completion"), ("point", query["point"]), identity))
         for label, generation, identity in inputs:
             producers = signals[generation]
@@ -120,8 +126,10 @@ class Connections:
 
             if communication := scope.get("communication"):
                 entered = next(port["event"] for port in scope["ports"] if port["name"] == "call.enter")
+                completion = next(port for port in scope["ports"] if "rendezvous" in port)
                 endpoint = {
                     **communication, "entered": entered, "scope": (key, path), "work": identity,
+                    "ready": completion["rendezvous"], "complete": completion["event"],
                     "metadata": scope["role"] == "metadata_collective", "values": metadata.get(index),
                     "elements": scope["parameters"].get("elements"), "group_role": scope["bindings"].get("collective_group"),
                 }
@@ -134,11 +142,12 @@ class Connections:
                 continue
             parts = record["values"]["segments"]
             if (not parts or any(type(part) is not int or not 0 < part < len(raw["scopes"]) for part in parts)
-                    or parts != sorted(set(parts)) or record["scope"] != parts[-1] or parts[-1] in observed):
+                    or parts != sorted(set(parts)) or record["scope"] != parts[-1] or contents.source_ids[parts[-1]] in observed):
                 raise ValueError("batch synchronization requires its actual ordered segment span")
             parent = raw["scopes"][parts[0]]["parent"]
             if parts != [i for i, scope in enumerate(raw["scopes"]) if scope["parent"] == parent and scope["role"] == "segment"]:
                 raise ValueError("batch synchronization observation omits or borrows an invocation segment")
+            parts = [contents.source_ids[part] for part in parts]
             self.batch_sync.span([identities[part] for part in parts])
             identity = identities[parts[-1]]
             candidates = [endpoint for endpoint in endpoints if parts[0] <= endpoint["scope"][0][1] <= parts[-1]]
@@ -158,7 +167,7 @@ class Connections:
             scope = graph["scopes"][index]
             if scope["role"] == "query" and scope["work"]["context"]["query"] == "event":
                 returned = next(port["event"] for port in scope["ports"] if port["name"] == "call.return")
-                self.query_consumers[events[returned]] = key, path, "query", "completion"
+                self.query_consumers[events[returned]] = (key, path, "query", "completion"), identity
             if communication := scope.get("communication"):
                 entered = next(port["event"] for port in scope["ports"] if port["name"] == "call.enter")
                 rank = graph["resources"][graph["events"][entered]["resource"]]["rank"]
@@ -183,7 +192,7 @@ class Connections:
                             raise ValueError("predicted completion generation was published twice")
                         self.signal_outputs[port["signal"]] = label
                     else:
-                        self.signal_reads[label] = self.signal_outputs.get(port["signal"])
+                        self.signal_reads[label] = self.signal_outputs.get(port["signal"]), identity
                 if "rendezvous" in port:
                     self.ready[key, path] = events[port["rendezvous"]]
                     self.complete[key, path] = events[port["event"]]
@@ -196,10 +205,10 @@ class Connections:
                     continue
                 writer = tensor["writer"]
                 if writer is not None:
-                    producer = key, paths[writer]
+                    producer, output = (key, paths[writer]), None
                 else:
-                    producer = self.published.get((group, tensor["storage"], tensor["version"]))
-                self.reads[label] = producer
+                    producer, output = self.published.get((group, tensor["storage"], tensor["version"]), (None, None))
+                self.reads[label] = producer, output, identity
 
         # Only root exports cross an invocation boundary; internal or pass-through ports cannot replace the producer.
         for port in graph["scopes"][0]["ports"]:
@@ -207,7 +216,9 @@ class Connections:
                 continue
             tensor = port["tensor"]
             if tensor["writer"] is not None:
-                self.published[group, tensor["storage"], tensor["version"]] = (key, paths[tensor["writer"]])
+                self.published[group, tensor["storage"], tensor["version"]] = (
+                    (key, paths[tensor["writer"]]), (key, paths[0], "output", port["name"]),
+                )
 
     def observe(self, record):
         if record["kind"] == "completion" and record["event"] in self.action_returns:
@@ -236,8 +247,8 @@ class Connections:
             for part in parts:
                 del self.action_returns[part]
         if record["kind"] == "completion_read" and record["boundary"] in self.query_consumers:
-            consumer = self.query_consumers.pop(record["boundary"])
-            self.signal_reads[consumer] = self.signal_outputs[record["signal"]]
+            consumer, identity = self.query_consumers.pop(record["boundary"])
+            self.signal_reads[consumer] = self.signal_outputs[record["signal"]], identity
         elif record["kind"] == "completion" and record["event"] in self.metadata_returns:
             self.metadata_returns[record["event"]]["completed_ns"] = record["time_ns"]
         elif record["kind"] == "action_values" and "collective" in record["values"]:
@@ -306,6 +317,41 @@ class Connections:
         key = pairs.get(label[0])
         return None if key is None else (key, *label[1:])
 
+    def check_predicted_readiness(self, dependencies, event_ranks):
+        checked, ready = 0, 0
+        for consumer, (writer, output, identity) in self.reads.items():
+            if writer is not None and writer[0] == consumer[0]:
+                continue
+            checked += 1
+            if output is None:
+                self.finding("data_producer", identity, scope=consumer[1], port=consumer[3],
+                             origin="predicted", reason="external data input has no published storage/version producer")
+                continue
+            source, target = self.ports[output], self.ports[consumer]
+            if not dependencies.reaches((event_ranks[source], source), (event_ranks[target], target)):
+                self.finding("data_readiness", identity, scope=consumer[1], port=consumer[3], origin="predicted",
+                             producer=output, reason="external data input is not gated by its own producer export")
+            else:
+                ready += 1
+        self.counts.update(predicted_data_inputs_checked=checked, predicted_data_inputs_ready=ready)
+
+        checked, ready = 0, 0
+        for consumer, (producer, identity) in self.signal_reads.items():
+
+            # A query observes completion; only an explicit wait requires a dependency on that generation.
+            if consumer[2] == "query":
+                continue
+            checked += 1
+            if producer is None:
+                self.finding("signal_producer", identity, scope=consumer[1], port=consumer[3],
+                             origin="predicted", reason="completion wait has no published generation")
+            elif (self.signal_events[producer], self.signal_events[consumer]) not in self.signal_edges:
+                self.finding("signal_dependency", identity, scope=consumer[1], port=consumer[3],
+                             origin="predicted", reason="wait has no direct dependency on its bound completion event")
+            else:
+                ready += 1
+        self.counts.update(predicted_signal_inputs_checked=checked, predicted_signal_inputs_ready=ready)
+
     def compare_signals(self, pairs):
         matched, unpaired = 0, 0
         targets = set(pairs.values())
@@ -314,16 +360,14 @@ class Connections:
                 continue
             consumer = self.mapped(native_consumer, pairs)
             producers = {self.mapped(producer, pairs) for producer in native_producers}
-            producer = self.signal_reads.get(consumer)
+            read = self.signal_reads.get(consumer)
+            producer = read[0] if read is not None else None
             if consumer is None or None in producers or (producer is not None and producer[0] not in targets):
                 unpaired += 1
                 continue
             if producer not in producers:
                 self.finding("signal_producer", identity, scope=consumer[1], port=consumer[3],
                              expected_producers=sorted(producers), predicted_producer=producer)
-            elif consumer[2] != "query" and (self.signal_events[producer], self.signal_events[consumer]) not in self.signal_edges:
-                self.finding("signal_dependency", identity, scope=consumer[1], port=consumer[3],
-                             reason="wait has no direct dependency on its bound completion event")
             else:
                 matched += 1
         self.counts.update(signal_inputs=len(self.signal_inputs), signal_inputs_matched=matched, signal_inputs_unpaired=unpaired)
@@ -334,7 +378,8 @@ class Connections:
         for native_consumer, (native_writer, native_outputs, rank, identity) in self.values.items():
             consumer, writer = self.mapped(native_consumer, pairs), self.mapped(native_writer, pairs)
             outputs = [self.mapped(output, pairs) for output in native_outputs]
-            predicted_writer = self.reads.get(consumer)
+            read = self.reads.get(consumer)
+            predicted_writer = read[0] if read is not None else None
             if (consumer is None or writer is None or None in outputs
                     or (predicted_writer is not None and predicted_writer[0] not in targets)):
                 unpaired += 1
@@ -344,7 +389,7 @@ class Connections:
                              expected_writer=writer, predicted_writer=predicted_writer)
             elif consumer not in self.ports or any(output not in self.ports for output in outputs):
                 self.finding("data_readiness", identity, scope=consumer[1], port=consumer[3], reason="mapped data boundary is absent")
-            elif any(not dependencies[rank].reaches(self.ports[output], self.ports[consumer]) for output in outputs):
+            elif any(not dependencies.reaches((rank, self.ports[output]), (rank, self.ports[consumer])) for output in outputs):
                 self.finding("data_readiness", identity, scope=consumer[1], port=consumer[3], reason="consumer is not gated by its producer exports")
             else:
                 matched += 1
@@ -421,14 +466,29 @@ class Connections:
                            predicted_communication_edges_matched=len(expected & self.communication_edges),
                            predicted_communication_protocol_complete=not (unresolved or missing or extra))
 
-    def compare_communication(self, dependencies, pairs):
-        expected, unresolved, exchanges, unpaired = set(), False, 0, 0
-        for endpoints in self.exchanges(self.channels, dependencies, "native_evidence"):
+    def native_communication(self, dependencies):
+        self.native_rounds = list(self.exchanges(self.channels, dependencies, "native_evidence"))
+        complete = True
+        exchanges = 0
+        for endpoints in self.native_rounds:
             if endpoints is None:
-                unresolved = True
+                complete = False
                 continue
             exchanges += 1
             self.check_metadata(endpoints, "native")
+            peers = {endpoint["rank"]: endpoint for endpoint in endpoints}
+            for endpoint in endpoints:
+                for rank in endpoint["required"]:
+                    self.native_communication_edges.add(((rank, peers[rank]["ready"]), (endpoint["rank"], endpoint["complete"])))
+        self.counts.update(communication_channels=len(self.channels), communication_exchanges=exchanges,
+                           native_communication_protocol_complete=complete)
+
+    def compare_communication(self, pairs):
+        expected, unresolved, unpaired = set(), False, 0
+        for endpoints in self.native_rounds:
+            if endpoints is None:
+                unresolved = True
+                continue
             peers = {endpoint["rank"]: endpoint for endpoint in endpoints}
             for endpoint in endpoints:
                 destination_scope = self.mapped(endpoint["scope"], pairs)
@@ -466,7 +526,6 @@ class Connections:
         # Incomplete native evidence cannot label unaccounted prediction edges as spurious.
         if extra and not unresolved:
             self.finding("communication_dependency", {}, extra=len(extra), examples=self.edge_details(extra))
-        self.counts.update(communication_channels=len(self.channels), communication_exchanges=exchanges,
-                           communication_edges_expected=len(expected), communication_edges_observed=len(self.communication_edges),
+        self.counts.update(communication_edges_expected=len(expected), communication_edges_observed=len(self.communication_edges),
                            communication_edges_matched=len(expected & self.communication_edges), communication_edges_unpaired=unpaired,
                            communication_evidence_complete=not unresolved)

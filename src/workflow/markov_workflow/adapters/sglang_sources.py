@@ -2,7 +2,8 @@
 
 import json
 
-from markov_adapters.sglang.configuration import ServingInput
+from markov_adapters.sglang.allocation import AllocationABI
+from markov_adapters.sglang.configuration import NativeConfiguration, ServingInput
 from markov_workload import WorkloadContent
 from markov_workflow.adapters.sglang_probes import LifecycleProbes
 
@@ -12,10 +13,44 @@ class RepresentativeSources:
 
     def __init__(self, workloads: dict[str, dict]) -> None:
         self.workloads = workloads
-        self.contents = {name: WorkloadContent(value["requests"], value["prefixes"]) for name, value in workloads.items()}
 
-    def conditions(self, serving: ServingInput, workload: str) -> set[str]:
-        requests = self.workloads[workload]["requests"]
+    @staticmethod
+    def prefill_page_bounds(config, requests, resident_pages):
+        page_size = config["page_size"]
+        capacity = config["max_total_tokens"] // page_size
+        members = NativeConfiguration.batch_capacity(config)
+        cohorts = {}
+        for request, total in zip(requests, resident_pages, strict=True):
+            if total <= capacity:
+                pages = (request["prompt_tokens"] + page_size - 1) // page_size
+                cohorts.setdefault(request["arrival_ns"], []).append(pages)
+
+        bound, repeated = 0, 0
+        for pages in cohorts.values():
+            pages.sort()
+            chunk = config["prefill_chunk_tokens"]
+            input_budget = (config["max_prefill_tokens"] + page_size - 1) // page_size
+
+            # Native ignore-EOS admission checks the input budget after adding a whole request.
+            budget = ((chunk + page_size - 1) // page_size if chunk else
+                      input_budget - 1 + pages[-1])
+            cohort_bound = min(capacity, budget, sum(pages[-members:]))
+            bound = max(bound, cohort_bound)
+
+            # A later write needs a second member in this call, not merely another request in the workload.
+            if (members > 1 and len(pages) > 1 and sum(pages[:2]) <= capacity
+                    and pages[0] < min(input_budget, budget)):
+                repeated = max(repeated, cohort_bound)
+        return bound, repeated
+
+    @staticmethod
+    def conditions(instances, workload: dict) -> set[str]:
+        requests = workload["requests"]
+        content = WorkloadContent(requests, workload["prefixes"])
+        decode_cohorts = {}
+        for request in requests:
+            if request["output_tokens"] > 1:
+                decode_cohorts.setdefault(request["arrival_ns"], []).append(request["output_tokens"])
         conditions = {"prefill"}
         if any(request["output_tokens"] == 1 for request in requests):
             conditions.add("prefill_completion")
@@ -25,21 +60,58 @@ class RepresentativeSources:
             conditions.add("repeated_decode")
         if len({request["arrival_ns"] for request in requests}) > 1:
             conditions.add("later_arrival")
-        for instance in serving.instances:
+        for instance in instances:
             config = instance.configuration.values
             prefix = instance.mode + "/"
-            if config["max_running_requests"] > 1 and len(requests) > 1:
+            if NativeConfiguration.batch_capacity(config) > 1 and len(requests) > 1:
                 conditions.add(prefix + "multiple_requests")
                 if len({request["output_tokens"] for request in requests}) > 1:
                     conditions.add(prefix + "unequal_output_lengths")
+                if any(len(lengths) > 1 for lengths in decode_cohorts.values()):
+                    conditions.add(prefix + "concurrent_decode_inputs")
+                if any(len(set(lengths)) > 1 for lengths in decode_cohorts.values()):
+                    conditions.add(prefix + "decode_turnover_inputs")
+
+            # Prefill hands off after its prompt; other roles retain KV as Decode extends each request.
+            page_size = config["page_size"]
+            pages = [(request["prompt_tokens"] + (0 if instance.mode == "prefill" else request["output_tokens"] - 1)
+                      + page_size - 1) // page_size for request in requests]
+
+            # PD defers returned pages even without caching; sharing and admission still decide actual pressure.
+            if (config["prefix_cache"] or instance.mode != "null") and max(pages) <= config["max_total_tokens"] // page_size < sum(pages):
+                conditions.add(prefix + "aggregate_kv_demand_exceeds_pool")
+            if instance.mode != "decode":
+
+                # A cold-input bound preserves the allocator path opportunity; native admission may still split it.
+                bound, repeated = RepresentativeSources.prefill_page_bounds(config, requests, pages)
+                if repeated:
+                    conditions.add(prefix + "multiple_prefill_inputs")
+                if page_size > 1 and AllocationABI.extend_branch(bound) == "extend_naive":
+                    conditions.add(prefix + "naive_allocation_inputs")
+                if page_size > 1 and AllocationABI.extend_branch(repeated) == "extend_naive":
+                    conditions.add(prefix + "naive_repeated_allocation_inputs")
             chunk = config["prefill_chunk_tokens"]
             if chunk and any(request["prompt_tokens"] > chunk for request in requests):
                 conditions.add(prefix + "chunk_continuation")
             if any(request["prompt_tokens"] % config["page_size"] for request in requests):
                 conditions.add(prefix + "partial_page")
-            if config["prefix_cache"] and LifecycleProbes.shared_prefix_requests(self.contents[workload], config["page_size"]):
+            if config["prefix_cache"] and LifecycleProbes.shared_prefix_requests(content, page_size):
                 conditions.add(prefix + "shared_prefix")
         return conditions
+
+    @staticmethod
+    def model_coverage(mode, configuration, conditions):
+        if configuration["tp"] == 1 or NativeConfiguration.batch_capacity(configuration) == 1:
+            return set()
+
+        # PD consumes the transferred first token before choosing a Decode model batch.
+        if mode == "decode" and "decode" not in conditions:
+            return set()
+
+        # Ordinary batches need a declared input opportunity; PD readiness can combine separately admitted requests.
+        if mode == "null" and not {"null/multiple_prefill_inputs", "null/concurrent_decode_inputs"}.intersection(conditions):
+            return set()
+        return {"single_model_batch", "multiple_model_batch"}
 
     @staticmethod
     def cost(workload, instances) -> dict:
@@ -94,7 +166,7 @@ class RepresentativeSources:
         for configuration, name, serving in candidates:
             instances[configuration] = serving.instances
             groups.setdefault((configuration, self.padding(serving)), []).append({
-                "name": name, "conditions": self.conditions(serving, name),
+                "name": name, "conditions": self.conditions(serving.instances, self.workloads[name]),
                 "cost": self.cost(serving.workload, serving.instances),
             })
         required = set().union(*(item["conditions"] for group in groups.values() for item in group))
@@ -126,9 +198,23 @@ class RepresentativeSources:
             names = sorted(item["name"] for item in selected)
             topologies = [name for name, _ in padding]
             probes = LifecycleProbes(instances[configuration], topologies)
-            normalized = {name: probes.normalize(self.workloads[name]) for name in names}
+            normalized = {}
+            for item in selected:
+                name, conditions = item["name"], item["conditions"]
+                original = self.workloads[name]
+                normalized[name] = original
+
+                # Fixed arrival gaps cannot be rescaled without knowing native execution time.
+                if "later_arrival" not in conditions:
+                    shortened = probes.normalize(original)
+                    shortened_conditions = self.conditions(instances[configuration], shortened)
+                    if conditions <= shortened_conditions:
+                        normalized[name] = shortened
+                        covered.update(shortened_conditions)
             workload, submissions = self.combine(names, topologies, normalized)
-            probes.extend(workload, submissions)
+            single_model = any(self.model_coverage(instance.mode, instance.configuration.values, covered)
+                               for instance in instances[configuration])
+            probes.extend(workload, submissions, single_model=single_model)
             cost = self.cost(workload, instances[configuration])
             cost.pop("last_arrival_ns")
             requests = {request["id"]: request for request in workload["requests"]}

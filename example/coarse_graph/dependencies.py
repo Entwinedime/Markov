@@ -1,6 +1,7 @@
 """Compare causal relationships without pairing opaque event numbers or measured times."""
 
 from collections import Counter, defaultdict
+from types import SimpleNamespace
 
 from actions import ActionIdentity
 
@@ -13,24 +14,27 @@ class ActionBoundaries:
         self.events, self.work, self.resources = {}, [], {}
         for scope, path in paths.items():
             node = graph["scopes"][scope]
+            boundaries = {}
             for port in sorted(node["ports"], key=lambda value: (value["name"], value["direction"])):
 
                 # Generated action frontiers have no source port; their edges still participate in reachability.
                 if scope == root and port["name"].startswith(("resource.enter/", "resource.exit/")):
                     continue
                 name = f"{path}/{port['direction']}:{port['name']}"
-                self.events[name] = event_ids[port["event"]]
+                boundaries[name] = event_ids[port["event"]]
                 resource = graph["events"][port["event"]]["resource"]
                 resources.setdefault(resource, len(resources))
                 if "wait" in port:
-                    self.events[name + "/wait.begin"] = event_ids[port["wait"]["begin"]]
+                    boundaries[name + "/wait.begin"] = event_ids[port["wait"]["begin"]]
                     resources.setdefault(port["wait"]["resource"], len(resources))
                 if "rendezvous" in port:
-                    self.events[name + "/rendezvous"] = event_ids[port["rendezvous"]]
+                    boundaries[name + "/rendezvous"] = event_ids[port["rendezvous"]]
             for field in ("kv_accesses", "slot_accesses"):
                 for index, access in enumerate(node[field]):
                     for side in ("start", "finish"):
-                        self.events[f"{path}/{field}/{index}/{side}"] = event_ids[access[side]]
+                        boundaries[f"{path}/{field}/{index}/{side}"] = event_ids[access[side]]
+
+            self.events.update(boundaries)
 
         for scope, path in paths.items():
             for work in contents.work[scope]:
@@ -40,9 +44,16 @@ class ActionBoundaries:
                 identity = (path, work["kind"], resource)
                 self.work.append((identity, event_ids[work["start"]], event_ids[work["finish"]]))
 
+    def ranked(self, rank):
+        return SimpleNamespace(
+            events={name: (rank, event) for name, event in self.events.items()},
+            work=[(identity, (rank, start), (rank, finish)) for identity, start, finish in self.work],
+            resources=self.resources,
+        )
+
 
 class CausalGraph:
-    relations = ("order", "submission", "data", "signal", "control", "state", "communication")
+    relations = ("order", "submission", "data", "signal", "control", "state", "communication", "observation")
 
     def __init__(self):
         self.next = {}
@@ -55,6 +66,49 @@ class CausalGraph:
             result.connect(edge["source"], edge["target"], edge["kind"])
         for work in graph["work"]:
             result.connect(work["start"], work["finish"], "order")
+        result.prepare()
+        return result
+
+    @classmethod
+    def joined(cls, graphs, dependencies):
+        result = cls()
+        result.next = {(rank, event): {(rank, target): relations for target, relations in targets.items()}
+                       for rank, graph in graphs.items() for event, targets in graph.next.items()}
+        for source, target, relation in dependencies:
+            result.connect(source, target, relation)
+        result.prepare()
+        return result
+
+    def projected(self, anchors):
+        indices = {event: index for index, event in enumerate(anchors)}
+        result = CausalGraph()
+        result.add_events(range(len(anchors)))
+        frontier = {}
+
+        # Each active frontier holds its maximal retained predecessors and their full reflexive closure.
+        for event, position in self.positions.items():
+            maximal, closure = frontier.pop(position, (0, 0))
+            anchor = indices.get(event)
+            if anchor is not None:
+                while maximal:
+                    bit = maximal & -maximal
+                    result.connect(bit.bit_length() - 1, anchor, "order")
+                    maximal ^= bit
+                maximal = 1 << anchor
+                closure |= maximal
+
+            if not maximal:
+                continue
+            for target in self.successors[position]:
+                following = frontier.get(target)
+                if following is None:
+                    frontier[target] = maximal, closure
+                    continue
+                other, previous = following
+
+                # Remove strict ancestors on either side; a shared maximal boundary remains maximal.
+                frontier[target] = (maximal & ~previous) | (other & ~closure) | (maximal & other), closure | previous
+
         result.prepare()
         return result
 
@@ -118,6 +172,11 @@ class CausalGraph:
 
     def reaches(self, source, target):
         start, finish = self.positions[source], self.positions[target]
+        if start >= finish:
+            return start == finish
+        if target in self.next[source]:
+            return True
+
         pending, visited = [start], {start}
         while pending:
             current = pending.pop()
@@ -182,9 +241,11 @@ class CausalGraph:
 
 
 class ActionOrderComparison:
-    def __init__(self):
+    def __init__(self, details=False):
+        self.details = details
         self.counts, self.findings = Counter(), []
         self.repeated_counts = Counter()
+        self.qualified = False
 
     @staticmethod
     def frontiers(graph, origins, events):
@@ -248,59 +309,71 @@ class ActionOrderComparison:
                                   "predicted_only_positions": len(extra), "examples": examples}))
 
     def compare(self, actual, predicted, actions):
-        boundaries, identities = {}, {}
+        labels, identities = defaultdict(list), {}
         for identity, native, estimate in actions:
             if native.events.keys() != estimate.events.keys():
                 self.findings.append(("ordering_evidence", identity, {"reason": "action boundary sets differ"}))
                 return
-            key = ActionIdentity.occurrence_key(identity)
+            key = ActionIdentity.logical_key(identity)
             identities[key] = identity
             for name, event in native.events.items():
-                boundaries[key, name] = event, estimate.events[name]
-        labels = sorted(boundaries)
-        positions = [(actual.positions[boundaries[label][0]], predicted.positions[boundaries[label][1]]) for label in labels]
-        differences = {}
+                labels[event, estimate.events[name]].append((key, name))
+        pairs = list(labels)
+        self.counts.update(actions_compared=len(identities), boundaries_compared=sum(map(len, labels.values())),
+                           paired_events=len(pairs))
+        if not pairs:
+            return
 
-        # Bound per-event masks to 1024 bits; do not retain a quadratic whole-case reachability table.
-        for begin in range(0, len(labels), 1024):
-            origins = labels[begin : begin + 1024]
-            native_masks = actual.reachable_masks([boundaries[label][0] for label in origins])
-            predicted_masks = predicted.reachable_masks([boundaries[label][1] for label in origins])
-            local = defaultdict(int)
-            for bit, (key, _) in enumerate(origins):
-                local[key] |= 1 << bit
-            for label, (native_position, predicted_position) in zip(labels, positions, strict=True):
-
-                # Within-action order already has its own comparison; these masks contain only other actions.
-                mask = ~local[label[0]]
-                native = native_masks[native_position] & mask
-                estimate = predicted_masks[predicted_position] & mask
-                self.counts["predecessor_pairs_expected"] += native.bit_count()
-                self.counts["predecessor_pairs_matched"] += (native & estimate).bit_count()
-                if native == estimate:
+        # Equal ports may alias one event; their partitions must agree before comparing partial orders.
+        for side, origin in enumerate(("native", "predicted")):
+            aliases = defaultdict(list)
+            for pair in pairs:
+                aliases[pair[side]].append(pair)
+            for event, entries in aliases.items():
+                if len(entries) == 1:
                     continue
-                detail = differences.setdefault(label, {
-                    "boundary": label[1], "missing_predecessors": 0, "extra_predecessors": 0,
-                    "missing_examples": [], "extra_examples": [],
-                })
-                for kind, missing in (("missing", native & ~estimate), ("extra", estimate & ~native)):
-                    detail[kind + "_predecessors"] += missing.bit_count()
-                    self.counts[kind + "_predecessor_pairs"] += missing.bit_count()
-                    examples = detail[kind + "_examples"]
-                    while missing and len(examples) < 3:
-                        bit = missing & -missing
-                        key, name = origins[bit.bit_length() - 1]
-                        side, graph = (0, actual) if kind == "missing" else (1, predicted)
-                        path = graph.witness(boundaries[key, name][side], boundaries[label][side])
-                        examples.append({"work": identities[key], "boundary": name, "path": path})
-                        missing ^= bit
-        self.counts.update(
-            groups_compared=1, actions_compared=len(identities), boundaries_compared=len(labels),
-            actions_matched=len(identities) - len({key for key, _ in differences}),
-            boundaries_matched=len(labels) - len(differences),
-        )
-        for (key, _), detail in differences.items():
-            self.findings.append(("cross_action_order", identities[key], detail))
+                self.counts["alias_conflicts"] += 1
+                key, _ = labels[entries[0]][0]
+                self.findings.append(("action_order_alias", identities[key], {
+                    "origin": origin, "event": event, "opposite_events": len(entries),
+                    "reason": "named boundaries alias one event in only one run",
+                }))
+        if self.findings:
+            return
+
+        projections = [graph.projected([pair[side] for pair in pairs]) for side, graph in enumerate((actual, predicted))]
+        covers = [{(source, target) for source, targets in graph.next.items() for target in targets} for graph in projections]
+        names = [min(labels[pair]) for pair in pairs]
+        differences = []
+        for side, kind in enumerate(("missing", "extra")):
+            other = projections[1 - side]
+            self.counts[("native" if side == 0 else "predicted") + "_relations"] = len(covers[side])
+            for source, target in covers[side]:
+                if other.reaches(source, target):
+                    continue
+                reverse = other.reaches(target, source)
+                differences.append((side, source, target, reverse))
+                self.counts[kind + "_relations"] += 1
+                self.counts[kind + "_reversed_relations"] += reverse
+                self.counts[kind + "_cross_rank_relations"] += (
+                    identities[names[source][0]]["group"] != identities[names[target][0]]["group"]
+                )
+        self.qualified = True
+
+        # Covers generate the whole order. Checking both directions preserves strict reachability equality.
+        # The first native topological position is a representative, not a unique first cause under concurrency.
+        differences.sort(key=lambda item: (actual.positions[pairs[item[2]][0]], item[0], item[1]))
+        shown = set()
+        for side, source, target, reverse in differences:
+            source_key, source_name = names[source]
+            target_key, target_name = names[target]
+            kind = "missing" if side == 0 else "extra"
+            detail = {"source": {"work": identities[source_key], "boundary": source_name}, "boundary": target_name,
+                      "opposite_order_reversed": reverse}
+            if self.details or kind not in shown:
+                detail["path"] = (actual, predicted)[side].witness(pairs[source][side], pairs[target][side])
+                shown.add(kind)
+            self.findings.append((kind + "_order", identities[target_key], detail))
 
 
 class BoundarySignature:

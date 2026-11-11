@@ -108,7 +108,7 @@ class LifecycleProbes:
         # A producer can cache its entire prompt; a consumer must leave its last token for model execution.
         return [request for identity, request in content.requests.items() if identity in shared and request["prompt_tokens"] > page_size]
 
-    def extend(self, workload, groups):
+    def extend(self, workload, groups, *, single_model):
         requests = {request["id"]: request for request in workload["requests"]}
         if self.prefix_cache:
             content = WorkloadContent(workload["requests"], workload["prefixes"])
@@ -123,15 +123,16 @@ class LifecycleProbes:
                     self.append(workload, groups, source, "cache_seed")
                 self.append(workload, groups, source, "cache_reuse")
                 requests = {request["id"]: request for request in workload["requests"]}
-        if any(len(group) == 1 and requests[group[0]]["output_tokens"] >= 3 for group in groups):
-            return
         candidates = [request for request in requests.values() if request["output_tokens"] >= 3]
-        if not candidates:
+        if not candidates and single_model:
+            candidates = list(requests.values())
+        identities = {request["id"] for request in candidates}
+        if not candidates or any(len(group) == 1 and group[0] in identities for group in groups):
             return
 
         source = min(candidates, key=lambda request: (request["prompt_tokens"] + request["output_tokens"], request["id"]))
 
-        # A lone request exercises continuation and completion without another request finishing on every iteration.
+        # The same singleton supplies degenerate model geometry and, when present, Decode continuation.
         self.append(workload, groups, source, "isolated")
 
     @staticmethod

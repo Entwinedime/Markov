@@ -8,6 +8,56 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+class WorkflowCommands:
+    """Call the formal task CLI from a coordinator sharing the host daemon's paths."""
+
+    def __init__(self, repository, images):
+        self.repository, self.images = repository, images
+
+    def command(self, action, *arguments, model=None):
+
+        # The coordinator and host daemon must see the same absolute paths for child mounts.
+        mounts = [(self.repository, self.repository, False)]
+        if action in {"capture", "acquire-sources"}:
+            model = Path(model).resolve(strict=True)
+            mounts.append((model, model, True))
+            for name in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
+                mounts.append((Path(name).resolve(strict=True), Path(name), True))
+        mounts.extend([
+            (Path("/var/run/docker.sock"), Path("/var/run/docker.sock"), False),
+            (Path(shutil.which("docker")).resolve(strict=True), Path("/usr/bin/docker"), True),
+        ])
+        command = ["docker", "run", "--rm", "--init", "-i", "--network", "none"]
+        for source, destination, readonly in mounts:
+            command.extend(["--mount", f"type=bind,src={source},dst={destination}" + (",readonly" if readonly else "")])
+        command.extend([
+            "--workdir", str(self.repository),
+            "--env", "PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload",
+            "--entrypoint", "python3", self.images["control"], "-m", "markov_workflow", action,
+        ])
+        return command + [str(value) for value in arguments]
+
+
+class SourceProductions:
+    """Read the published finite collection and preserve primary/local assembly roles."""
+
+    def __init__(self, directory, plan):
+        self.plan = json.loads((plan / "plan.json").read_text())
+        publication = json.loads((directory / "result.json").read_text())
+        if not len(self.plan["domains"]) == len(publication["productions"]) == len(publication["captures"]):
+            raise ValueError("source publication does not match the planned domains")
+
+        self.paths = {domain["id"]: directory / name
+                      for domain, name in zip(self.plan["domains"], publication["productions"])}
+        self.captures = {domain["id"]: directory / name
+                         for domain, name in zip(self.plan["domains"], publication["captures"])}
+
+    def arguments(self, primary):
+        result = ["--production", self.paths[primary]]
+        result.extend(value for identity, path in self.paths.items() if identity != primary for value in ("--local-production", path))
+        return result
+
+
 class ExplorationRun:
     def __init__(self, arguments):
         self.arguments = arguments
@@ -26,35 +76,13 @@ class ExplorationRun:
                 ("modeling", "markov-next-modeling:ubuntu24.04"),
             )
         }
+        self.commands = WorkflowCommands(self.repository, self.images)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         self.output = self.repository / "data" / f"{stamp}_coarse-graph"
         self.results = []
 
-    def command(self, action, *arguments):
-
-        # The coordinator and host daemon must see the same absolute paths for child mounts.
-        mounts = [(self.repository, self.repository, False)]
-        if action == "acquire-sources":
-            model = Path(self.source["model"]["path"])
-            mounts.append((model, model, True))
-            for name in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
-                mounts.append((Path(name).resolve(strict=True), Path(name), True))
-        mounts.extend([
-            (Path("/var/run/docker.sock"), Path("/var/run/docker.sock"), False),
-            (Path(shutil.which("docker")).resolve(strict=True), Path("/usr/bin/docker"), True),
-        ])
-        command = ["docker", "run", "--rm", "--init", "-i", "--network", "none"]
-        for source, destination, readonly in mounts:
-            command.extend(["--mount", f"type=bind,src={source},dst={destination}" + (",readonly" if readonly else "")])
-        command.extend([
-            "--workdir", str(self.repository),
-            "--env", "PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload",
-            "--entrypoint", "python3", self.images["control"], "-m", "markov_workflow", action,
-        ])
-        return command + [str(value) for value in arguments]
-
     def execute(self, name, action, *arguments):
-        command = self.command(action, *arguments)
+        command = self.commands.command(action, *arguments, model=self.source["model"]["path"])
         log = self.output / "logs" / f"{name}.log"
         log.with_suffix(".command.json").write_text(json.dumps(command, indent=2) + "\n")
         print(f"{name}: {log}", flush=True)
@@ -113,16 +141,15 @@ class ExplorationRun:
                 "--attempt-limit", args.attempt_limit, "--storage-bytes", args.storage_bytes,
                 *(["--keep-intermediates", "--resource-trace"] if args.details else []),
             )
-            publication = json.loads((self.output / "collection/result.json").read_text())
-            productions = [item for name in publication["productions"]
-                           for item in ("--production", self.output / "collection" / name)]
+            collected = SourceProductions(self.output / "collection", self.output / "plan")
             for index, (configuration, workload, target) in enumerate(self.targets()):
+                primary = collected.plan["targets"]["configurations"][configuration]
                 directory = self.output / "targets" / str(index)
                 directory.mkdir()
                 task = directory / "input.json"
                 task.write_text(json.dumps(target, indent=2) + "\n")
                 self.execute(
-                    f"predict-{index}", "predict", *productions, "--input", task, "--output", directory / "prediction",
+                    f"predict-{index}", "predict", *collected.arguments(primary), "--input", task, "--output", directory / "prediction",
                     "--binary", binary, "--modeling-image", self.images["modeling"],
                     "--control-image", self.images["control"], "--timeout", args.timeout,
                     *(["--execution-trace"] if args.details else []),

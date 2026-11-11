@@ -8,8 +8,8 @@ class AscendDeployment:
         if source.keys() - {"physical_devices", "store_url", "transfer_protocol"}:
             raise ValueError("Ascend deployment contains unsupported fields")
         devices = source["physical_devices"]
-        if any(type(device) is not int or device < 0 for device in devices) or len(set(devices)) != len(devices):
-            raise ValueError("physical devices must be distinct nonnegative integers")
+        if any(type(device) is not int or device < 0 for device in devices) or devices != sorted(set(devices)):
+            raise ValueError("Ascend physical_devices must be distinct nonnegative integers in increasing order")
         if len(devices) < workers:
             raise ValueError(f"native protocol requires {workers} physical devices, got {len(devices)}")
         self.devices = devices[:workers]

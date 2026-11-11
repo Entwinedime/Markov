@@ -120,14 +120,14 @@ class ActionResults:
         self.requests = []
         self.counts = Counter()
 
-    def source(self, raw, group, mode):
+    def source(self, raw, group, mode, source_ids):
         for index, scope in enumerate(raw["scopes"]):
             if not ActionIdentity.selected(index, scope):
                 continue
 
             # Prefill's sender acknowledges transfer; Decode publishes the user's serving response.
             publication = [] if mode == "prefill" else scope.get("publication", [])
-            self.native[group, index] = {"progress": scope.get("effects", []), "publication": publication}
+            self.native[group, source_ids[index]] = {"progress": scope.get("effects", []), "publication": publication}
 
     def observe(self, row):
         if row["kind"] == "resources":

@@ -15,10 +15,13 @@ class GraphTimes:
     def __init__(self, graph, group, origin_ns):
         self.graph, self.group, self.origin_ns = graph, group, origin_ns
         self.scopes = ActionScopes(graph)
+        self.repeatable_reads = 0
+        self.unanchored_calls = 0
 
     def check_queries(self, raw):
         producers = {}
-        for scope, observed in zip(self.graph["scopes"], raw["scopes"], strict=True):
+        for observed in raw["scopes"]:
+            scope = self.graph["scopes"][self.scopes.source_ids[observed["id"]]]
             outputs = {port["name"]: port["event"] for port in scope["ports"]
                        if port["use"] == "signal" and port["direction"] == "output"}
             for port in observed["ports"]:
@@ -28,7 +31,8 @@ class GraphTimes:
                     if previous != event:
                         raise ValueError("one native signal generation has different projected completion events")
 
-        for scope, observed in zip(self.graph["scopes"], raw["scopes"], strict=True):
+        for observed in raw["scopes"]:
+            scope = self.graph["scopes"][self.scopes.source_ids[observed["id"]]]
             if scope["role"] != "kv_reservation":
                 continue
             ready, = [port for port in scope["ports"] if port["name"] == "reservation.ready"]
@@ -59,8 +63,8 @@ class GraphTimes:
 
     def ambiguous_enclosures(self, raw):
         identities = {
-            index: ActionIdentity.occurrence_key({**ActionIdentity.record(scope, self.group), "site": scope["site"]})
-            for index, scope in enumerate(self.graph["scopes"]) if raw["scopes"][index].get("envelope", False)
+            index: ActionIdentity.timing_key({**self.scopes.record(index, self.group), "site": scope["site"]})
+            for index, scope in enumerate(self.graph["scopes"]) if any(raw["scopes"][origin].get("envelope", False) for origin in scope["bindings"]["source_scopes"])
         }
         counts = Counter(identities.values())
         ambiguous = set()
@@ -82,14 +86,10 @@ class GraphTimes:
             action = scope["role"]
             if not ActionIdentity.selected(index, scope):
                 continue
-            identity = ActionIdentity.record(scope, self.group)
-
-            # Equal local work can move around arrivals; only the complete observed context supplies exact times.
-            key = ActionIdentity.occurrence_key(identity)
-            occurrences[key].append(index)
+            identity = self.scopes.record(index, self.group)
 
             # CPU returns release native callers; exported signals release asynchronous queries and waits.
-            boundaries = []
+            boundaries = {"control": [], "completion": []}
             call_times = {}
             for port in scope["ports"]:
                 name = port["name"]
@@ -101,14 +101,32 @@ class GraphTimes:
                 time_ns = measured - self.origin_ns
                 if time_ns < 0:
                     raise ValueError(f"scope {index} ({action}) boundary {name} precedes workload origin")
-                boundaries.append({"port": name, "direction": port["direction"], "time_ns": time_ns})
+                boundary = {"port": name, "direction": port["direction"], "time_ns": time_ns}
+                if name == "call.return":
+                    boundaries["control"].append(boundary)
+                if port["use"] == "signal" and port["direction"] == "output":
+                    boundaries["completion"].append(boundary)
                 times[port["event"]] = time_ns
                 labels[port["event"]] = f"scope {index} {action}/{name}"
                 if name in {"call.enter", "call.return"}:
                     call_times[name] = time_ns
             if call_times.keys() != {"call.enter", "call.return"} or call_times["call.enter"] > call_times["call.return"]:
                 raise ValueError(f"scope {index} ({action}) lacks an ordered call interval")
-            actions[key] = {**identity, "boundaries": boundaries}
+            for basis, values in boundaries.items():
+                if basis == "completion" and not values:
+                    continue
+                work = identity["work"]
+                if basis == "completion":
+
+                    # A producer's completion is independent of ancestor batch snapshots; its own work stays exact.
+                    work = {**work, "observation_context": None, "callers": [
+                        {name: value for name, value in caller.items() if name != "context"}
+                        for caller in work["callers"]
+                    ]}
+                record = {**identity, "basis": basis, "work": work}
+                key = ActionIdentity.timing_key(record)
+                occurrences[key].append(index)
+                actions[key] = {**record, "boundaries": values}
         if not actions:
             raise ValueError("graph has no native actions")
 
@@ -118,15 +136,22 @@ class GraphTimes:
             raise ValueError(f"native feedback times contradict source dependencies: {labels[source]} at {times[source]} ns "
                              f"precedes {labels[target]} at {times[target]} ns ({times[source] - times[target]} ns inversion)")
 
-        # Entry measurements validate the source; only returns and completion signals feed target control.
+        # Each basis has its own uniqueness domain; several placements cannot provide one guessed completion.
         for key, action in actions.items():
             indices = occurrences[key]
             action["observed_calls"] = len(indices)
+            repeatable = action["action"] == "query"
+            anchored = ActionIdentity.request_work(action)
+            qualified = anchored and not repeatable and len(indices) == 1
+            if action["basis"] == "control":
+                self.repeatable_reads += len(indices) if repeatable else 0
+                self.unanchored_calls += len(indices) if not anchored else 0
 
-            # A conditional child observed once can recur when peers see completion in different polling rounds.
-            action["boundaries"] = [] if len(indices) > 1 or any(index in ambiguous for index in indices) else [
-                boundary for boundary in action["boundaries"] if boundary["port"] != "call.enter"
-            ]
+                # CPU returns retain the actual caller position, even when a logical producer is unique.
+                missing_placement = action["action"] in {"launch", "output_prepare", "output_skip"} and action["work"]["observation_context"] is None
+                qualified &= not missing_placement and not any(index in ambiguous for index in indices)
+            if not qualified:
+                action["boundaries"] = []
         return list(actions.values())
 
 
@@ -179,11 +204,12 @@ class NativeTiming:
                     observed = timing.actions(raw)
                     actions.extend(observed)
                     unconstrained = sum(action["observed_calls"] for action in observed if not action["boundaries"])
-                    reports.append({"group": group, "status": "partial" if unconstrained else "extracted", "actions": len(observed),
+                    reports.append({"group": group, "status": "partial" if unconstrained else "extracted", "timing_records": len(observed),
                                     "state_queries": {kind: sum(query["kind"] == kind for query in raw["state_queries"])
                                                       for kind in ("event", "transport", "metadata")},
                                     "boundaries": sum(len(action["boundaries"]) for action in observed),
-                                    "unconstrained_calls": unconstrained,
+                                    "unconstrained_records": unconstrained,
+                                    "repeatable_reads": timing.repeatable_reads, "unanchored_calls": timing.unanchored_calls,
                                     "received": received, "input_attempts": input_attempts})
                 except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
                     reports.append({"group": group, "status": "unverified", "error": str(error)})
@@ -212,7 +238,13 @@ class NativeTiming:
             "capture": str(self.capture.resolve()), "graphs": str(self.graphs.resolve()),
             "status": "extracted" if complete else "partial" if usable else "unverified", "origin_ns": sorted(origins), "participants": reports,
             "protocol_readiness": protocol_report,
-            "scope": "Calls unique by their full logical identity and outside repeated enclosing invocations supply measured returns and exported completion signals; entry times only validate source intervals and causality. A child observed once under a repeated parent can recur when peer observations change, so its exact time remains uncovered. External input reads use entering native state and prior deliveries, never returned request members or poll ordinals. Only unique observed reads supply return times; unknown, repeated and control-only reads remain uncovered. Repeated actions and their descendants retain given work durations, actual queries and effects; occurrence counts and times are not paired. Partial timing is diagnostic, not complete feedback qualification. Query results bound completion but never prescribe target decisions. Internal graph timing and cross-rank protocol visibility remain independently unqualified.",
+            "scope": (
+                "CPU returns retain full context and placement. Completion retains producer work and caller entry "
+                "operands, excluding ancestor scheduling snapshots. Only unique request-owned work supplies times. "
+                "Input reads and notifications preserve measured bounds; no batches, query values or allocations "
+                "are supplied. Partial timing does not establish a unique trajectory; internal structure and "
+                "cross-rank protocols need independent checks."
+            ),
         }
         (self.output / "boundary-times-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         if usable:

@@ -16,6 +16,22 @@ from markov_workflow.limits import OperationLimit
 
 
 class CaptureProcess:
+    @staticmethod
+    def published(directory: Path, job: dict) -> Path:
+        """Resolve an explicit completed observation without changing its native provenance."""
+        directory = directory.resolve(strict=True)
+        state = json.loads((directory / "execution.json").read_text())
+        if state["inputs"]["job"] != job or json.loads((directory / "input.json").read_text()) != job:
+            raise ValueError(f"published capture differs from the planned native input: {directory}")
+        attempt = state["attempts"][-1]
+        if attempt["status"] != "exited" or attempt["exit_code"] != 0:
+            raise ValueError(f"published capture has no successful terminal attempt: {directory}")
+        publication = json.loads((directory / "result.json").read_text())
+        source = (directory / publication["source"]).resolve(strict=True)
+        if not source.is_relative_to(directory):
+            raise ValueError("published source lies outside its native task")
+        return source
+
     def __init__(self, arguments, limit=None) -> None:
         self.arguments = arguments
         self.operation_limit = limit if limit is not None else OperationLimit()

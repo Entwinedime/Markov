@@ -30,7 +30,7 @@ class FieldEffects:
                 raise ValueError("slot allocation failed with available rows")
             self.operations.append(record)
             return
-        if not isinstance(slot, int) or not 0 <= slot < self.capacities[field]:
+        if type(slot) is not int or not 0 <= slot < self.capacities[field]:
             raise ValueError("slot operation lies outside its physical pool")
         key = field, slot
         if operation == "allocate":
@@ -54,6 +54,21 @@ class FieldEffects:
         elif operation != "allocate":
             raise ValueError("unknown observed slot operation")
         self.operations.append(value)
+
+    def row_histories(self):
+        rows, failures = {}, Counter()
+        for record in self.operations:
+            field, slot = record["field"], record["slot"]
+            if slot is None:
+                failures[field] += 1
+                continue
+            rows.setdefault((field, slot), []).append((record["operation"], record.get("request")))
+
+        # Independent rows commute; each row retains its full allocation, owner and reuse history.
+        histories = Counter()
+        for (field, _), operations in rows.items():
+            histories[field, tuple(operations)] += 1
+        return histories, failures
 
 
 class ResourceEffects:
@@ -191,7 +206,7 @@ class ResourceEffects:
                              slots=[member["slot"] for member in result])
         elif kind == "allocate":
             operation.update(requests=[[requests[member["request"]], member["tokens"]] for member in observed["members"]],
-                             indices=chain.from_iterable(member["indices"] for member in result))
+                             indices=chain.from_iterable(member["indices"] for member in result["members"]))
         elif kind == "release_request":
             slot, = row["returned_slots"]
             operation.update(request=requests[observed["request"]], slot=slot)
@@ -223,12 +238,56 @@ class ResourceEffectComparison:
         self.native, self.predicted = {}, {}
         self.requests = []
         self.counts = {}
+        self.reads = {"native": {}, "predicted": {}}
+        self.unobserved_reads = set()
+        self.unqualified_reads = Counter()
 
     def observed(self, history, graph, group):
         source = ResourceEffects(history["initial"]["page_size"])
-        source.native(history, graph["scopes"], graph["environment"]["implementation"]["cache"]["disabled"])
+        scopes = {origin: scope for scope in graph["scopes"] for origin in scope["bindings"]["source_scopes"]}
+        source.native(history, scopes, graph["environment"]["implementation"]["cache"]["disabled"])
         self.native[group] = source
         self.predicted[group] = ResourceEffects(source.page_size)
+
+        if "reads" not in history:
+            self.unobserved_reads.add(group)
+            return
+        for record in history["reads"]:
+            if (record["scope"] not in scopes or type(record["begin_raw_ns"]) is not int
+                    or type(record["end_raw_ns"]) is not int or not 0 <= record["begin_raw_ns"] <= record["end_raw_ns"]):
+                raise ValueError("native capacity read has no actual scope and ordered interval")
+            self.capacity_read("native", group, record["operation"], record["result"])
+
+    def capacity_read(self, origin, group, operation, result):
+        kind = operation["kind"]
+        name = operation["resource"] if kind == "capacity" else operation["field"]
+        if (kind == "capacity" and name not in {"slots", "pages", "evictable_tokens", "protected_tokens"}
+                or kind == "state_slots" and operation["operation"] != "available"
+                or kind not in {"capacity", "state_slots"} or not isinstance(name, str) or not name
+                or type(result) is not int or result < 0):
+            raise ValueError("capacity observation requires a declared scalar resource and nonnegative integer")
+
+        summary = self.reads[origin].setdefault((group, kind, name), {"count": 0, "minimum": result, "maximum": result})
+        summary["count"] += 1
+        summary["minimum"] = min(summary["minimum"], result)
+        summary["maximum"] = max(summary["maximum"], result)
+
+    def observe(self, row):
+        if row["kind"] != "resource":
+            return
+        operation, group = row["operation"], row["group"]
+        kind = operation["kind"]
+        if kind == "capacity":
+            if "resource" not in operation:
+
+                # An old aggregate reply does not identify which capacity native code consumed.
+                self.unqualified_reads[group] += 1
+            else:
+                self.capacity_read("predicted", group, operation, row["result"])
+        elif kind == "state_slots" and operation["operation"] == "available":
+            self.capacity_read("predicted", group, operation, row["result"])
+        if group in self.predicted:
+            self.predicted[group].predicted(row, self.requests)
 
     @staticmethod
     def summary(operation):
@@ -236,6 +295,12 @@ class ResourceEffectComparison:
                 for name, value in operation.items()}
 
     def compare(self):
+        for group in sorted(self.unobserved_reads | self.unqualified_reads.keys()):
+            yield "resource_read_evidence", {"group": group}, {
+                "native_reads_observed": group not in self.unobserved_reads,
+                "unqualified_predicted_reads": self.unqualified_reads[group],
+                "reason": "actual scalar capacity observations are incomplete; mutation snapshots cannot replace reads",
+            }
         matched, totals = 0, Counter()
         for group, source in self.native.items():
             target = self.predicted[group]
@@ -257,7 +322,7 @@ class ResourceEffectComparison:
             target = self.predicted[group]
             if target.fields.capacities and not source.fields.capacities:
                 state_unobserved.append(group)
-            elif source.fields.capacities == target.fields.capacities and source.fields.operations == target.fields.operations:
+            elif source.fields.capacities == target.fields.capacities and source.fields.row_histories() == target.fields.row_histories():
                 state_matched += 1
             else:
                 yield "state_slot_effects", {"group": group}, {
@@ -265,6 +330,14 @@ class ResourceEffectComparison:
                     "native_operations": len(source.fields.operations), "predicted_operations": len(target.fields.operations),
                 }
         self.counts = {"groups": len(self.native), "groups_matched": matched, "operations": dict(totals),
+                       "reads": {
+                           **{origin: [{"group": group, "kind": kind, "resource": resource, **value}
+                                       for (group, kind, resource), value in sorted(reads.items())]
+                              for origin, reads in self.reads.items()},
+                           "unobserved_native": sorted(self.unobserved_reads),
+                           "unqualified_predicted": dict(self.unqualified_reads),
+                           "scope": "Actual scalar read counts and ranges within each run; no cross-run occurrence or timing correspondence is inferred. Native allocator-internal and constant cache reads need not be core queries.",
+                       },
                        "state_slots": {"groups_matched": state_matched, "unobserved_native": state_unobserved,
                                        "predicted_operations": sum(len(target.fields.operations) for target in self.predicted.values())},
-                       "scope": "Per-worker observed allocation/cache/free operation inputs and results under opaque identity renaming. Excludes queries, explicit request-prefix rebinding between snapshots, and intra-call effect timing."}
+                       "scope": "Per-worker observed allocation/cache/free inputs and results under opaque identity renaming. State fields compare per-row allocation/bind/release histories, reuse and failure counts; independent rows commute. Capacity and ownership validity are checked within each run. Excludes queries, explicit request-prefix rebinding between snapshots, and intra-call effect timing."}

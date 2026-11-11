@@ -4,7 +4,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 
 from actions import ActionIdentity
-from lifetimes import KvLifetimes
+from lifetimes import StateLifetimes
 
 
 class NativePoolHistory:
@@ -64,7 +64,7 @@ class BindingComparison:
         self.page_epochs, self.slot_epochs = Counter(), Counter()
         self.findings, self.counts = [], {}
         self.unconsumed_snapshots = 0
-        self.lifetimes = KvLifetimes()
+        self.lifetimes = StateLifetimes()
 
     @staticmethod
     def coverage(ranges):
@@ -81,7 +81,7 @@ class BindingComparison:
     def observations(self, contents, raw, group):
         graph = contents.graph
         for binding in self.pools[group].history["bindings"]:
-            scope = graph["scopes"][binding["scope"]]
+            scope = graph["scopes"][contents.source_ids[binding["scope"]]]
             events = {port["name"]: port["event"] for port in scope["ports"]}
             window = tuple(graph["evidence"]["events"][events[name]]["time_ns"] for name in ("call.enter", "call.return"))
             yield binding, group, window
@@ -125,7 +125,7 @@ class BindingComparison:
                         accesses[key, pool, region["request"]].append((region["begin"], region["end"]))
 
         for binding, pool, window in self.observations(contents, raw, group):
-            owner = binding["scope"]
+            owner = contents.source_ids[binding["scope"]]
             while not ActionIdentity.selected(owner, graph["scopes"][owner]):
                 owner = graph["scopes"][owner]["parent"]
                 if owner is None:

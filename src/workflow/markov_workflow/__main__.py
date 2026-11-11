@@ -22,7 +22,7 @@ class ServingProcess:
         args = self.arguments
         templates = []
         productions = []
-        for directory in args.production:
+        for directory in [args.production, *args.local_production]:
             directory = directory.resolve(strict=True)
             publication = json.loads((directory / "result.json").read_text())
             libraries = []
@@ -34,7 +34,7 @@ class ServingProcess:
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
         source = json.loads(args.input.read_text())
-        document = SGLangTask(productions).document(source)
+        document = SGLangTask(productions[0], productions[1:]).document(source)
         if args.boundary_times is not None:
             document["boundary_times"] = json.loads(args.boundary_times.read_text())
         binary = args.binary.resolve(strict=True)
@@ -126,13 +126,15 @@ def main() -> None:
     planning.add_argument("--input", type=Path, required=True)
     planning.add_argument("--output", type=Path, required=True)
     prediction = commands.add_parser("predict", help="predict from published template productions")
-    prediction.add_argument("--production", type=Path, action="append", required=True)
+    prediction.add_argument("--production", type=Path, required=True, help="one complete source job supplying target workers")
+    prediction.add_argument("--local-production", type=Path, action="append", default=[], help="additional source of compatible local implementations")
     prediction.add_argument("--input", type=Path, required=True)
     prediction.add_argument("--timeout", type=float, required=True)
     prediction.add_argument("--control-image", default="markov-next-control:ubuntu22.04")
     prediction.add_argument("--execution-trace", action="store_true", help="stream optional expanded graphs, dependencies and completion events")
     prediction.add_argument("--boundary-times", type=Path, help="supply logical-work port times and optional native ingress rounds")
-    production = commands.add_parser("produce", help="export and compile a closed native capture into templates")
+    production = commands.add_parser("produce", help="project a closed native capture into graphs or source templates")
+    production.add_argument("--product", choices=("graphs", "templates"), default="templates")
     production.add_argument("--capture", type=Path, required=True)
     production.add_argument("--budget-seconds", type=float, required=True, help="cumulative allowance across resumes; may be explicitly raised")
     production.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
@@ -145,9 +147,10 @@ def main() -> None:
     capture.add_argument("--budget-seconds", type=float, required=True, help="cumulative native allowance across attempts and resumes")
     capture.add_argument("--attempt-limit", type=int, required=True, help="cumulative native attempts; each invocation starts at most one")
     capture.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
-    capture.add_argument("--resource-trace", action="store_true", help="record optional native resource and input-read evidence")
+    capture.add_argument("--resource-trace", action="store_true", help="record optional resource, input-read and CPU protocol evidence")
     acquisition = commands.add_parser("acquire-sources", help="capture and compile a finite plan under shared cumulative allowances")
     acquisition.add_argument("--plan", type=Path, required=True)
+    acquisition.add_argument("--observations", type=Path, help="JSON map of planned domain IDs to published capture task paths; native inputs must match")
     acquisition.add_argument("--deployment", type=Path, required=True)
     acquisition.add_argument("--timeout", type=float, required=True, help="maximum seconds per native attempt")
     acquisition.add_argument("--native-budget-seconds", type=float, required=True)
@@ -156,7 +159,7 @@ def main() -> None:
     acquisition.add_argument("--storage-bytes", type=int, required=True, help="monitored logical bytes under this collection root")
     acquisition.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
     acquisition.add_argument("--keep-intermediates", action="store_true")
-    acquisition.add_argument("--resource-trace", action="store_true")
+    acquisition.add_argument("--resource-trace", action="store_true", help="record optional resource, input-read and CPU protocol evidence")
     for command in (production, prediction, acquisition):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--binary", type=Path, required=True)
@@ -167,9 +170,9 @@ def main() -> None:
 
         PlanningProcess(arguments).run()
     elif arguments.command == "produce":
-        from markov_workflow.production import TemplateProduction
+        from markov_workflow.production import CaptureProduction
 
-        TemplateProduction(arguments).run()
+        CaptureProduction(arguments).run()
     elif arguments.command == "capture":
         from markov_workflow.capture import CaptureProcess
 

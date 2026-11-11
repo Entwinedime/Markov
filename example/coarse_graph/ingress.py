@@ -3,6 +3,8 @@
 import json
 from collections import defaultdict
 
+from actions import ActionIdentity
+
 
 class IngressEvidence:
     def __init__(self, capture, instances):
@@ -94,8 +96,7 @@ class IngressEvidence:
             identity = None if record["context"] is None else {
                 "instance": instance, "context": record["context"], "received": sorted(received),
             }
-            result.append({"identity": identity, "time_ns": time_ns, "requests": members,
-                           "eligible": record["message_count"] == 0 or bool(members)})
+            result.append({"identity": identity, "time_ns": time_ns, "requests": members})
             received.update(members)
         return result
 
@@ -109,8 +110,11 @@ class IngressEvidence:
 
     @classmethod
     def feedback(cls, reads):
+
+        # Returned work qualifies the source read, but never becomes its lookup key; empty reads can recur.
         return [{"identity": rows[0]["identity"], "observed_calls": len(rows),
-                 "time_ns": rows[0]["time_ns"] if len(rows) == 1 and rows[0]["eligible"] else None}
+                 "time_ns": rows[0]["time_ns"] if (len(rows) == 1 and rows[0]["requests"]
+                                                   and ActionIdentity.request_progress(rows[0]["identity"]["context"])) else None}
                 for rows in cls.groups(reads).values()]
 
     def observe(self, row):
@@ -126,23 +130,29 @@ class IngressEvidence:
                 raise ValueError("ingress has an invalid request index")
             members = [self.requests[index] for index in indices]
             previous = self.actual_reads[instance]
-            if (not isinstance(identity["context"], dict) or identity["received"] != sorted(self.received[instance])
+            in_flow = row["in_flow"]
+            if (type(in_flow) is not bool or (members and not in_flow)
+                    or not isinstance(identity["context"], dict) or identity["received"] != sorted(self.received[instance])
                     or len(set(members)) != len(members) or self.received[instance].intersection(members)
                     or type(row["time_ns"]) is not int or row["time_ns"] < 0
                     or (previous and row["time_ns"] < previous[-1]["time_ns"])):
                 raise ValueError("input read disagrees with its entering delivery history or clock")
             observed = {"requests": members, "time_ns": row["time_ns"]}
-            previous.append({"identity": identity, **observed})
+            previous.append({"identity": identity, "in_flow": in_flow, **observed})
             self.received[instance].update(members)
             if members:
                 self.actual[instance].append(observed)
 
     def compare_reads(self, instance):
+        reads = [row for row in self.actual_reads[instance] if row["in_flow"]]
+        outside = len(self.actual_reads[instance]) - len(reads)
         if self.input_attempts[instance]["status"] == "unobserved":
             self.findings.append(("input_read_evidence", {"instance": instance}, {"reason": "native input attempts were not recorded"}))
-            return {"status": "unobserved", "predicted_reads": len(self.actual_reads[instance])}
+            return {"status": "unobserved", "predicted_reads": len(reads), "outside_flow": outside}
         native = self.groups(self.native_reads[instance])
-        actual = self.groups(self.actual_reads[instance])
+
+        # Capture retains the first source pull and active-flow reads; keep later driver polls in the trace only.
+        actual = self.groups(reads)
         matched, ambiguous, unmatched_native, unmatched_predicted, differences = 0, 0, 0, 0, []
         for key in sorted(native.keys() | actual.keys()):
             left, right = native.get(key, []), actual.get(key, [])
@@ -153,9 +163,15 @@ class IngressEvidence:
             elif not right:
                 unmatched_native += len(left)
                 reason = "no predicted read with this entering context and delivery history"
-            elif len(left) != 1 or len(right) != 1 or not left[0]["eligible"]:
+            elif len(left) != 1 or len(right) != 1:
                 ambiguous += 1
-                reason = "native read includes non-workload messages" if len(left) == 1 and not left[0]["eligible"] else "logical read identity repeats"
+                reason = "logical read identity repeats"
+            elif not left[0]["requests"]:
+                ambiguous += 1
+                reason = "read returns no workload requests and may repeat"
+            elif not ActionIdentity.request_progress(left[0]["identity"]["context"]):
+                ambiguous += 1
+                reason = "entering context has no request work anchor for an exact read time"
             elif left[0]["time_ns"] == right[0]["time_ns"] and left[0]["requests"] == right[0]["requests"]:
                 matched += 1
             else:
@@ -173,6 +189,7 @@ class IngressEvidence:
             }))
         incomplete = ambiguous or unmatched_native or unmatched_predicted or unknown
         return {"status": "different" if differences else "partial" if incomplete else "matched", "matched": matched,
+                "outside_flow": outside,
                 "ambiguous": ambiguous, "unmatched_native": unmatched_native, "unmatched_predicted": unmatched_predicted,
                 "unknown_native_context": unknown, "differences": differences}
 

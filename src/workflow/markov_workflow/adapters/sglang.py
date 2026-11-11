@@ -45,9 +45,9 @@ class SourceDomain:
 class SGLangTask:
     role_fields = ("parallel", "kv_layout", "expert_layers", "kv_peers")
 
-    def __init__(self, productions: list[list[dict]]) -> None:
-        self.productions = productions
-        self.libraries = [library for production in productions for library in production]
+    def __init__(self, production: list[dict], local_productions: list[list[dict]]) -> None:
+        self.production = production
+        self.libraries = [*production, *(library for local in local_productions for library in local)]
 
     def participants(self, selected: range, description: InstanceConfiguration) -> list[dict]:
         candidates = [
@@ -89,17 +89,11 @@ class SGLangTask:
             raise ValueError("given_work_ns must be nonnegative signed 64-bit nanoseconds")
         serving = ServingInput(source)
         requested = SourceDomain.requested(serving)
-        matches = []
-        offset = 0
-        for production in self.productions:
-            if SourceDomain.observed(production) == requested:
-                matches.append(range(offset, offset + len(production)))
-            offset += len(production)
-        if len(matches) != 1:
-            raise ValueError(f"prediction requires one complete matching source production, found {len(matches)}")
+        if SourceDomain.observed(self.production) != requested:
+            raise ValueError("primary production does not match the complete target serving domain")
 
-        # PD peer duties belong to the same observed job; never splice locally matching halves from different jobs.
-        selected = matches[0]
+        # Only the primary job supplies workers; local implementations never replace PD peers or role bindings.
+        selected = range(len(self.production))
         instances = []
         for description in serving.instances:
             configuration = description.configuration
@@ -108,4 +102,7 @@ class SGLangTask:
                 "control": configuration.control(), "expert_routes": configuration.routes(serving.workload),
                 "participants": self.participants(selected, description),
             })
-        return {"instances": instances, "workload": serving.workload, "given_work_ns": duration}
+        return {
+            "instances": instances, "workload": serving.workload, "given_work_ns": duration,
+            "template_sources": list(range(len(self.libraries))),
+        }
