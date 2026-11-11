@@ -1,4 +1,4 @@
-"""Own profiler publication and optional CPU protocol evidence."""
+"""Publish native profiles and the CPU protocol facts needed to connect participants."""
 
 from __future__ import annotations
 
@@ -12,11 +12,9 @@ from markov_collection.artifacts import write_json
 class NativeProfiles:
     def __init__(self, observation: Any) -> None:
         self.observation = observation
-        self.protocol = None
-        if observation.description["resource_trace"]:
-            from markov_collection.adapters.runtimes.pytorch.protocol import CpuProtocol
+        from markov_collection.adapters.runtimes.pytorch.protocol import CpuProtocol
 
-            self.protocol = CpuProtocol(observation.capture.runtime, observation.description["native_participants"])
+        self.protocol = CpuProtocol(observation.capture, observation.description["native_participants"], observation.calls.communicating)
 
     @staticmethod
     def wait(directory: Path, ranks, participants) -> None:
@@ -45,10 +43,9 @@ class NativeProfiles:
                 distributed.barrier(manager.dp_tp_cpu_group)
             result = ProfileReqOutput(success=True, message="Worker has no assigned observation")
         if request.req_type == ProfileReqType.START_PROFILE and result.success:
-            if self.protocol is not None:
-                self.protocol.begin()
+            self.protocol.begin()
             owner.window.prepared_phase = "profiler"
-        elif request.req_type == ProfileReqType.STOP_PROFILE and result.success and self.protocol is not None:
+        elif request.req_type == ProfileReqType.STOP_PROFILE and result.success:
 
             # Protocol facts cover every participant, including workers represented by another device profile.
             write_json(owner.directory / "protocol" / f"rank-{owner.parallel['rank']}.json", self.protocol.document())
@@ -77,9 +74,8 @@ class NativeProfiles:
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-        if self.protocol is not None:
-            for target, hook in self.protocol.hooks():
-                HookRegistry.register(target, hook, HookType.AROUND)
+        for target, hook in self.protocol.hooks():
+            HookRegistry.register(target, hook, HookType.AROUND)
 
         manager = "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager."
         targets = {

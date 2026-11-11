@@ -28,7 +28,7 @@ class PipelineScopes:
                     call.port(f"proxy.{name}", "input", owner.tensors.observe(tensor, owner.modules.proxy_shape(tensor)), use="metadata")
             result, event = original(scheduler, mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue)
             self.signals.publish(call, event, "completion")
-            owner.result_port(call, result, "output")
+            owner.result_outputs(call, result)
             return result, event
 
     def prepare(self, original, scheduler, batch, mb_metadata, pp_outputs):
@@ -40,7 +40,7 @@ class PipelineScopes:
         with owner.request_state.members(batch), owner.call("output_prepare", original, parameters=parameters, work=work, device=True, stream=scheduler.copy_stream) as call:
             call.port("next_token_ids", "input", owner.tensors.observe(pp_outputs["next_token_ids"], ["members"]), use="device")
             result = original(scheduler, batch, mb_metadata, pp_outputs)
-            owner.result_port(call, result, "output")
+            owner.result_outputs(call, result)
             return result
 
     def skip_output(self, original, scheduler, batch, mb_metadata):
@@ -51,7 +51,7 @@ class PipelineScopes:
         parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in work["members"]))
         with owner.call("output_skip", original, parameters=parameters, work=work, device=True) as call, self.signals.observe(call):
             outputs, result, event = original(scheduler, batch, mb_metadata)
-            owner.result_port(call, result, "output")
+            owner.result_outputs(call, result)
             self.signals.publish(call, event, "completion")
             return outputs, result, event
 

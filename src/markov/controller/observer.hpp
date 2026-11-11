@@ -13,11 +13,12 @@ namespace markov {
 class ControlObserver {
 public:
     virtual ~ControlObserver() = default;
-    virtual void initialized(const nlohmann::json & instances, const nlohmann::json & requests) = 0;
+    virtual void initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) = 0;
     virtual void input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) = 0;
     virtual void observed_values(std::string_view group, std::size_t boundary, const nlohmann::json & values, std::int64_t time_ns) = 0;
     virtual void native_protocol(std::string_view group, const nlohmann::json & record, std::int64_t time_ns) = 0;
-    virtual void queried(std::string_view group, std::size_t boundary, const nlohmann::json & result, std::int64_t time_ns) = 0;
+    virtual void queried(std::string_view group, std::size_t boundary, const nlohmann::json & result,
+                         const nlohmann::json & clocks, std::int64_t time_ns) = 0;
     virtual void completion_read(std::string_view group, std::size_t boundary, std::string_view signal, std::size_t event,
                                  bool result, std::int64_t time_ns) = 0;
     virtual void notification_declared(const nlohmann::json & identity, std::size_t event) = 0;

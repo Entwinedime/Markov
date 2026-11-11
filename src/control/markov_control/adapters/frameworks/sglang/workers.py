@@ -50,7 +50,9 @@ class NativeWorkers:
             workers, groups = [], []
             for instance in source["instances"]:
                 configured = configurations[instance["id"]]
-                settings = {**configured["settings"], "observe": configuration["observe"]}
+                settings = {
+                    **configured["settings"], "observe": configuration["observe"], "clock_epoch_ns": configuration["clock_epoch_ns"],
+                }
 
                 model = Path(directory, f"instance-{len(workers)}")
                 model.mkdir()
@@ -119,7 +121,7 @@ class NativeWorkers:
 
                 PipelineTransfers(scheduler, world, [worker["rank"] for worker in source["workers"]]).install()
             else:
-                CpuPointToPoint(peer, world).install()
+                CpuPointToPoint(peer, world, scheduler.calls.communicating).install()
             MetadataTransfers(scheduler.calls).install()
 
             # Apply once after every serving adapter registers; early application silently skips later hooks.
@@ -153,7 +155,7 @@ class NativeCalls:
         self.context = context
         self.membership = {rank: group for group in groups for rank in group["members"]}
         self.collectives = CollectiveCalls()
-        self.transfers = PointToPointCalls(observe)
+        self.transfers = PointToPointCalls()
         self.messages = {rank: [] for rank in range(len(connections))}
         self.closing = False
         self.stopped = set()
@@ -197,12 +199,19 @@ class NativeCalls:
             self.collectives.wait(channel, rank, message)
             return
         if operation == "metadata_post":
-            self.transfers.post(channel, rank, message)
-            self.observe_transfers()
+            key = self.transfers.post(rank, message)
+            descriptor = {name: value for name, value in message.items() if name not in {"values", "execution"}}
+            message = {
+                "kind": "cpu_post", "group": group["id"], "key": key, "descriptor": descriptor,
+                "execution": message["execution"],
+                "source": self.membership[message["source"]]["id"], "target": self.membership[message["target"]]["id"],
+            }
+            self.ready.append(WorkerCall("cpu_post", message, (channel,)))
             return
         if operation == "metadata_wait":
-            self.transfers.wait(channel, rank, message)
-            self.observe_transfers()
+            self.ready.append(WorkerCall("cpu_wait", {
+                "kind": "cpu_wait", "group": group["id"], "key": message["key"], "execution": message["execution"],
+            }, (channel,)))
             return
         message = {**message, "group": group["id"]}
         if message["kind"] == "input" and not group["ingress"]:
@@ -228,12 +237,6 @@ class NativeCalls:
             for participant in members:
                 del self.pending[participant]
 
-    def observe_transfers(self):
-        for record in self.transfers.take_observations():
-            self.ready.append(WorkerCall("observe", {
-                "kind": "protocol", "group": self.membership[record["rank"]]["id"], "record": record,
-            }, ()))
-
     def deliver(self, deliveries, completion=None):
         if not deliveries:
             return
@@ -257,13 +260,22 @@ class NativeCalls:
             call = self.awaiting.pop(message["reply"])
             if call.operation == "delivery":
                 self.deliver(call.deliveries, message["result"]["event"])
+            elif call.operation == "cpu_post":
+                for channel in call.participants:
+                    channel.send(message["result"]["key"])
+            elif call.operation == "cpu_wait":
+                for channel in call.participants:
+                    rank = self.connections.index(channel)
+                    channel.send(self.transfers.consume(rank, message["result"]["key"]))
             else:
                 for channel in call.participants:
                     channel.send(message["result"])
 
     def shutdown(self):
         if self.ready or self.pending or not self.quiescent() or any(
-            call.message["kind"] not in {"input", "idle"} for call in self.awaiting.values()
+            call.message["kind"] not in {"input", "idle"}
+            and not (call.message["kind"] == "cpu_wait" and not call.message["execution"]["in_flow"])
+            for call in self.awaiting.values()
         ):
             raise ValueError("Native shutdown requires suspended participants and no unfinished serving calls")
         self.closing = True
@@ -277,7 +289,7 @@ class NativeCalls:
                 channel.send(NativeStopped())
 
     def quiescent(self) -> bool:
-        blocked = self.stopped | set(self.pending) | self.collectives.blocked() | self.transfers.blocked()
+        blocked = self.stopped | set(self.pending) | self.collectives.blocked()
         calls = [*self.ready, *self.awaiting.values()]
         for call in calls:
             blocked.update(call.participants)
@@ -295,7 +307,7 @@ class NativeCalls:
                 # Read-only replies and observations must not consume a native scheduling turn.
                 call = next((item for item in self.ready if item.message["kind"] in {
                     "capacity", "free_slots", "describe", "completed", "completion_notice", "observed_completion",
-                    "wake", "query_result", "action_values", "protocol",
+                    "wake", "query_result", "action_values", "protocol", "clock",
                 } or (item.message["kind"] == "state_slots" and item.message["operation"] == "available")), None)
                 if call is None:
                     if not self.quiescent():

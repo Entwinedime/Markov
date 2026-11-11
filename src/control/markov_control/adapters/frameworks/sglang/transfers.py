@@ -22,7 +22,7 @@ class TransferWork:
 
 class PipelineTransfers(CpuPointToPoint):
     def __init__(self, scheduler, world, ranks) -> None:
-        super().__init__(scheduler.peer, world)
+        super().__init__(scheduler.peer, world, scheduler.calls.communicating)
         self.scheduler = scheduler
         self.groups = ParallelGroups()
         self.ranks = dict(zip(world, ranks, strict=True))

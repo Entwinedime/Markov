@@ -10,7 +10,7 @@
 
 namespace markov {
 
-class ControlBoundaryTimes;
+class ExecutionInputs;
 
 struct ServingParticipant {
     ActionGraphs & graphs;
@@ -20,7 +20,7 @@ struct ServingParticipant {
 class ServingSession {
 public:
     ServingSession(ServingControl & control, Timeline & timeline, std::map<std::string, ServingParticipant> participants);
-    nlohmann::json run(std::int64_t given_work_ns, ControlBoundaryTimes * boundary_times = nullptr);
+    nlohmann::json run(std::int64_t given_work_ns, ExecutionInputs * inputs = nullptr);
 
 private:
     ServingControl & control_;

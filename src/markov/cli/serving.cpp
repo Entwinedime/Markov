@@ -1,5 +1,6 @@
 #include "markov/cli/serving.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -10,7 +11,7 @@
 #include "markov/adapters/sglang/actions.hpp"
 #include "markov/controller/native.hpp"
 #include "markov/serving/session.hpp"
-#include "markov/controller/boundary_times.hpp"
+#include "markov/controller/execution_inputs.hpp"
 
 namespace markov {
 namespace {
@@ -53,17 +54,12 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     })
                               .at("given_work_ns");
     if (duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
-    const auto timing = task.value("boundary_times", nlohmann::json::object());
-    if (!timing.is_object() || (task.contains("boundary_times") && timing.empty()))
-        throw std::invalid_argument("serving timing requires a nonempty boundary or ingress object");
-    for (const auto & [name, _] : timing.items()) {
-        if (name != "actions" && name != "ingress" && name != "notifications" && name != "input_reads")
-            throw std::invalid_argument("unknown serving timing field: " + name);
-    }
-    std::optional<ControlBoundaryTimes> boundary_times;
-    if (timing.contains("actions") || timing.contains("notifications") || timing.contains("input_reads")) boundary_times.emplace(timing);
-    const auto ingress = timing.value("ingress", nlohmann::json());
-    if (timing.contains("ingress") && !ingress.is_object()) throw std::invalid_argument("ingress must be an instance mapping");
+    const auto timing = task.value("execution_inputs", nlohmann::json());
+    if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
+    std::optional<ExecutionInputs> inputs;
+    if (!timing.is_null()) inputs.emplace(timing);
+    const auto ingress = timing.is_null() ? nlohmann::json() : timing.at("ingress");
+    if (!ingress.is_null() && !ingress.is_object()) throw std::invalid_argument("ingress must be an instance mapping");
     std::vector<Resource> resources;
     std::map<std::string, std::unique_ptr<Participant>> participants;
     std::map<std::string, ServingParticipant> execution;
@@ -137,12 +133,20 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                 local_resources[index].rank = rank;
             }
             resources.insert(resources.end(), local_resources.begin(), local_resources.end());
+            const auto control_count = std::ranges::count_if(local_resources, [](const auto & resource) {
+                return resource.kind == ResourceKind::Thread && resource.role == "control";
+            });
+            if (control_count != 1) throw std::invalid_argument("native CPU services require one declared control thread per participant");
+            const auto control_thread = *std::ranges::find_if(local_resources, [](const auto & resource) {
+                return resource.kind == ResourceKind::Thread && resource.role == "control";
+            });
             auto & participant =
                 *participants
                      .emplace(group,
                               std::make_unique<Participant>(library, environment, std::move(local_resources), group, id, capacity, requests, resource_observer))
                      .first->second;
-            instance.participants.push_back({ group, static_cast<std::size_t>(rank), participant.resources, participant.graphs, participant.dependencies });
+            instance.participants.push_back({ group, static_cast<std::size_t>(rank), control_thread,
+                                               participant.resources, participant.graphs, participant.dependencies });
             execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies });
         }
         if ((tp == 0 || ranks.size() % static_cast<std::size_t>(tp) != 0 || ranks.size() / static_cast<std::size_t>(tp) != static_cast<std::size_t>(pp))
@@ -181,9 +185,10 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
         { "instances", std::move(sources) }
     });
     Timeline timeline(std::move(resources), execution_observer);
-    NativeController control(std::move(requests), instances, peer, workload.at("prefixes"), timeline, ingress,
-                             boundary_times ? &*boundary_times : nullptr, resource_observer, control_observer);
-    auto result = ServingSession(control, timeline, std::move(execution)).run(duration, boundary_times ? &*boundary_times : nullptr);
+    NativeController control(std::move(requests), instances, peer, workload.at("prefixes"), timeline, ingress, duration,
+                             inputs ? &*inputs : nullptr, resource_observer, control_observer);
+    auto result = ServingSession(control, timeline, std::move(execution)).run(duration, inputs ? &*inputs : nullptr);
+    result.update(control.cpu_summary());
     if (!ingress.is_null()) result["arrival_basis"] = "supplied_ingress";
     return result;
 }

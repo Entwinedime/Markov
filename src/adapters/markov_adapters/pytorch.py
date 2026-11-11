@@ -1,13 +1,19 @@
-"""Describe explicit CPU point-to-point calls using each native world's actual ranks."""
-
-import torch.distributed as distributed
+"""Separate CPU transfer identity from its physical wire features."""
 
 
 class CpuTransfer:
     def __init__(self, world) -> None:
         self.world = world
 
+    @staticmethod
+    def identity(description):
+
+        # Private object serialization can change byte counts without changing the native control operation.
+        return {name: description[name] for name in ("group", "source", "target", "tag", "receiving", "dtype")}
+
     def describe(self, tensor, group, tag, endpoint, group_endpoint, receiving):
+        import torch.distributed as distributed
+
         group = distributed.group.WORLD if group is None else group
         if group_endpoint is not None:
             endpoint = distributed.get_global_rank(group, group_endpoint)
@@ -18,4 +24,5 @@ class CpuTransfer:
         return {
             "group": group.group_name, "source": self.world[source], "target": self.world[target],
             "tag": tag, "receiving": receiving, "dtype": str(tensor.dtype), "shape": list(tensor.shape),
+            "elements": tensor.numel(), "element_bytes": tensor.element_size(),
         }

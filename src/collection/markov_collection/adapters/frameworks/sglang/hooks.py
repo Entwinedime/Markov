@@ -234,7 +234,7 @@ class SGLangObservation:
                 # PP launch and its run_batch child share the same declared batch ABI.
                 call.record["arguments"] = {name: name for name in parameters if name not in call.record["constants"]}
             result = original(scheduler, batch, *args, **kwargs)
-            self.result_port(call, result, "output")
+            self.result_outputs(call, result)
             return result
 
     def batch_ports(
@@ -277,21 +277,17 @@ class SGLangObservation:
         if (tokens, members) != (parameters["model_tokens"], parameters["model_members"]):
             raise ValueError("native model geometry differs from the declared eager batch layout")
 
-    def result_port(self, call: Any, output: Any, direction: str) -> None:
+    def result_outputs(self, call: Any, output: Any) -> None:
         tensor = output.next_token_ids
         if tensor is not None:
-
-            # Result processing materializes tokens on the CPU; readiness gates the completed read.
-            use = "host" if direction == "input" or tensor.device.type == "cpu" else "device"
-            call.port(
-                "next_token_ids", direction, self.tensors.observe(tensor, ["members"]), use=use, at_return=direction == "input",
-            )
+            use = "host" if tensor.device.type == "cpu" else "device"
+            call.port("next_token_ids", "output", self.tensors.observe(tensor, ["members"]), use=use)
 
         proxy = output.pp_hidden_states_proxy_tensors
-        if direction == "output" and proxy is not None:
+        if proxy is not None:
             for name, tensor in PipelineABI.proxy_tensors(proxy).items():
                 rule = self.tensors.shape_rule(tensor)
-                call.port(f"proxy.{name}", direction, self.tensors.observe(tensor, rule), use="device")
+                call.port(f"proxy.{name}", "output", self.tensors.observe(tensor, rule), use="device")
 
     def can_flush(self) -> bool:
         if not self.scheduler.is_fully_idle() or PipelineABI.pending_model_sends(self.scheduler):
@@ -407,11 +403,11 @@ class SGLangObservation:
         for target, hook in targets.items():
             HookRegistry.register(target, hook, HookType.AROUND)
         self.request_state.install()
+        self.calls = FlowScopes(self)
         NativeProfiles(self).install()
         NativeCommunications(self).install()
         self.kv_transfers = NativeKvScopes(self)
         self.kv_transfers.install()
-        self.calls = FlowScopes(self)
         self.calls.install()
         if self.description["pp_size"] > 1:
             from markov_collection.adapters.frameworks.sglang.pipeline_scopes import PipelineScopes

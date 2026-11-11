@@ -13,15 +13,16 @@ namespace markov {
 class ExecutionTrace final : public ExecutionObserver, public ResourceObserver, public ControlObserver {
 public:
     explicit ExecutionTrace(const std::filesystem::path & path);
-    void inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const std::int64_t> work_ns, std::int64_t time_ns) override;
+    void inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const ServiceDuration> work_ns, std::int64_t time_ns) override;
     void connected(std::size_t source, std::size_t target, Relation relation, std::int64_t delay_ns) override;
     void completed(std::size_t event, std::int64_t time_ns) override;
     void constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns) override;
-    void initialized(const nlohmann::json & instances, const nlohmann::json & requests) override;
+    void initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) override;
     void input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) override;
     void observed_values(std::string_view group, std::size_t boundary, const nlohmann::json & values, std::int64_t time_ns) override;
     void native_protocol(std::string_view group, const nlohmann::json & record, std::int64_t time_ns) override;
-    void queried(std::string_view group, std::size_t boundary, const nlohmann::json & result, std::int64_t time_ns) override;
+    void queried(std::string_view group, std::size_t boundary, const nlohmann::json & result,
+                                    const nlohmann::json & clocks, std::int64_t time_ns) override;
     void completion_read(std::string_view group, std::size_t boundary, std::string_view signal, std::size_t event,
                          bool result, std::int64_t time_ns) override;
     void notification_declared(const nlohmann::json & identity, std::size_t event) override;

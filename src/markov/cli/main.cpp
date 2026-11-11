@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,6 +20,7 @@
 #include "markov/cli/execution_trace.hpp"
 #include "markov/cli/serving.hpp"
 #include "markov/execution/timeline.hpp"
+#include "markov/execution/timing.hpp"
 #include "markov/graph/observation.hpp"
 #include "markov/graph/types.hpp"
 #include "markov/production/projection.hpp"
@@ -72,35 +75,43 @@ constexpr std::string_view usage = "markov project <native-facts.json> <coarse.j
                                    "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>]\n";
 
 nlohmann::json execute(const markov::CoarseGraph & graph, const nlohmann::json & timing, markov::ExecutionObserver * observer) {
-    std::vector<std::int64_t> work_ns;
+    std::vector<markov::ServiceDuration> work_ns;
     for (const auto & value : timing.at("work_ns").get_ref<const nlohmann::json::array_t &>()) {
-        if (!value.is_number_integer()) throw std::invalid_argument("given work durations must be integer nanoseconds");
-        work_ns.push_back(value.get<std::int64_t>());
+        if (value.is_null()) work_ns.push_back(std::nullopt);
+        else work_ns.push_back(markov::read_parameters({ { "service_ns", value } }).at("service_ns"));
     }
     std::vector<markov::BoundaryTime> boundaries;
     if (timing.contains("boundaries")) {
         for (const auto & value : timing.at("boundaries").get_ref<const nlohmann::json::array_t &>()) {
             const auto fields = markov::read_parameters(value);
-            if (fields.size() != 2 || fields.at("event") < 0) throw std::invalid_argument("boundary time requires event and time_ns");
-            boundaries.push_back({ static_cast<std::size_t>(fields.at("event")), fields.at("time_ns") });
+            if (fields.size() != 3 || fields.at("event") < 0)
+                throw std::invalid_argument("completion condition requires event, begin_ns and end_ns");
+            boundaries.push_back({ static_cast<std::size_t>(fields.at("event")), { fields.at("begin_ns"), fields.at("end_ns") } });
         }
     }
 
     // This command executes supplied dependencies; it does not allocate state or choose serving actions.
     if (timing.at("initial_inputs") != "ready") throw std::invalid_argument("graph execution requires explicitly ready initial inputs");
+    auto supplied = markov::GraphTiming::conditioned(graph, std::move(work_ns), std::move(boundaries));
     markov::Timeline timeline(graph.resources, observer);
-    const auto events = timeline.insert(graph, work_ns, {}, boundaries);
+    const auto events = timeline.insert(graph, supplied.work_ns, {}, supplied.boundaries);
     std::size_t completed = 0;
     while (timeline.advance()) ++completed;
     if (!timeline.done()) throw std::runtime_error("graph execution stalled with " + std::to_string(events.size() - completed) + " unfinished boundaries");
+    const auto conditioned = std::ranges::count_if(supplied.work_ns, [](const auto & value) { return !value; });
     nlohmann::json result{
-        {   "duration_basis", boundaries.empty() ? "given_work_ns" : "given_work_ns_with_boundary_times" },
+        {   "duration_basis", conditioned ? "given_service_and_completion_conditions" : "given_service_durations" },
+        { "given_service_durations", supplied.work_ns.size() - static_cast<std::size_t>(conditioned) },
+        { "completion_conditioned_work", conditioned },
         {   "initial_inputs",                                                                    "ready" },
         {     "completed_ns",                                                          timeline.now_ns() },
         { "completed_events",                                                                  completed },
         {   "work_intervals",                                                          graph.work.size() }
     };
-    if (!boundaries.empty()) result["boundary_events"] = boundaries.size();
+    if (!supplied.boundaries.empty()) {
+        result["boundary_events"] = supplied.boundaries.size();
+        result["completion_time_selection"] = "earliest_causal_time_within_supplied_windows";
+    }
     return result;
 }
 
@@ -184,6 +195,11 @@ int main(int argc, char ** argv) {
         else if (command == "serve" && (argc == 5 || (argc == 7 && std::string_view(argv[5]) == "--trace"))) {
             destination = argv[4];
             const auto task = read_json(argv[3]);
+            for (const auto & [field, _] : task.items()) {
+                if (field != "template_sources" && field != "instances" && field != "workload"
+                    && field != "given_work_ns" && field != "execution_inputs")
+                    throw std::invalid_argument("unknown serving input field: " + field);
+            }
             std::map<std::size_t, markov::TemplateLibrary> libraries;
             for (const auto & source : task.at("template_sources")) {
                 const auto index = source.get<std::size_t>();

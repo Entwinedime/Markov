@@ -154,7 +154,7 @@ class NativeServingInstance:
                 barrier.wait()
             finally:
                 engine.stop_profile()
-                NativeProfiles.wait(self.output, selected, self.roles if self.resource_trace else ())
+                NativeProfiles.wait(self.output, selected, self.roles)
             captured_ns = time.monotonic_ns()
         finally:
             try:

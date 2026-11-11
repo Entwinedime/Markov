@@ -13,7 +13,7 @@ def main() -> None:
     capture = commands.add_parser("capture", help="run one normalized native observation job")
     capture.add_argument("--input", type=Path, required=True)
     capture.add_argument("--output", type=Path, required=True)
-    capture.add_argument("--resource-trace", action="store_true", help="observe resources, input reads and CPU protocol for independent comparison")
+    capture.add_argument("--resource-trace", action="store_true", help="observe resources and input reads for independent comparison")
     interpret = commands.add_parser("interpret", help="interpret an SDK-exported worker recording")
     interpret.add_argument("--trace", type=Path, required=True)
     interpret.add_argument("--evidence", action="store_true", help="retain measured boundary clocks for source auditing")

@@ -9,9 +9,9 @@ from markov_control.adapters.runtimes.metadata import MetadataWork
 
 
 class CpuPointToPoint(CpuTransfer):
-    def __init__(self, peer, world) -> None:
+    def __init__(self, peer, world, context) -> None:
         super().__init__(world)
-        self.peer = peer
+        self.peer, self.context = peer, context
 
     def install(self) -> None:
         for name in ("send", "recv", "isend", "irecv"):
@@ -22,11 +22,14 @@ class CpuPointToPoint(CpuTransfer):
     def post(self, tensor, group, tag, endpoint, group_endpoint, receiving):
         if tensor.device.type != "cpu":
             raise ValueError("Native metadata transport requires CPU tensors; device transfers belong to graph execution")
+        execution = self.context.get()
+        if execution is None:
+            raise ValueError("CPU metadata post requires its native protocol context")
         message = self.describe(tensor, group, tag, endpoint, group_endpoint, receiving)
         if not receiving:
             message["values"] = tensor.flatten().tolist()
-        handle = self.peer.exchange("metadata_post", message)
-        return MetadataWork(self.peer, handle, tensor if receiving else None, "metadata_wait")
+        handle = self.peer.exchange("metadata_post", {**message, "execution": execution})
+        return MetadataWork(self.peer, handle, tensor if receiving else None, "metadata_wait", context=self.context)
 
     def isend(self, tensor, dst=None, group=None, tag=0, group_dst=None):
         return self.post(tensor, group, tag, dst, group_dst, False)
@@ -45,72 +48,39 @@ class CpuPointToPoint(CpuTransfer):
 
 @dataclass
 class MetadataTransfer:
-    dtype: str
-    shape: list
-    posted: set = field(default_factory=set)
     values: list | None = None
-    waiting: dict = field(default_factory=dict)
     consumed: set = field(default_factory=set)
 
 
 class PointToPointCalls:
-    def __init__(self, observe=False) -> None:
+    """Keep payloads and native channel positions; the core owns readiness and suspended consumers."""
+
+    def __init__(self) -> None:
         self.positions = {}
         self.pending = {}
-        self.observe = observe
-        self.observations = []
 
-    def post(self, channel, rank, message) -> None:
+    def post(self, rank, message):
         source, target = message["source"], message["target"]
         receiving = message["receiving"]
         if source == target or rank != (target if receiving else source):
-            raise ValueError("Native metadata transfer has an invalid endpoint")
+            raise ValueError("native metadata transfer has an invalid endpoint")
         route = message["group"], source, target, message["tag"]
         endpoint = route, rank
         position = self.positions.get(endpoint, 0)
         key = (*route, position)
         self.positions[endpoint] = position + 1
-        transfer = self.pending.setdefault(key, MetadataTransfer(message["dtype"], message["shape"]))
-        if (transfer.dtype, transfer.shape) != (message["dtype"], message["shape"]):
-            raise ValueError("Native metadata endpoints disagree on tensor dtype or shape")
-        transfer.posted.add(rank)
+        transfer = self.pending.setdefault(key, MetadataTransfer())
         if not receiving:
             transfer.values = message["values"]
-        if self.observe:
-            self.observations.append({
-                "phase": "post", "key": key, "rank": rank,
-                "descriptor": {name: value for name, value in message.items() if name != "values"},
-            })
+        return key
 
-        # Posting is asynchronous. Completion requires the matching receive, even if a sender waits later.
-        channel.send(key)
-        self.complete(key, transfer)
-
-    def wait(self, channel, rank, handle) -> None:
+    def consume(self, rank, handle):
         key = tuple(handle)
         transfer = self.pending[key]
-        if rank not in transfer.posted or rank in transfer.consumed:
-            raise ValueError("Native metadata wait has no outstanding local operation")
-        transfer.waiting[rank] = channel
-        self.complete(key, transfer)
-
-    def complete(self, key, transfer) -> None:
-        if len(transfer.posted) != 2:
-            return
-        for rank, channel in transfer.waiting.items():
-            channel.send(transfer.values if rank == key[2] else None)
-            transfer.consumed.add(rank)
-            if self.observe:
-                self.observations.append({"phase": "consumed", "key": key, "rank": rank})
-        transfer.waiting.clear()
-
-        # Keep completed payload until both native Work handles have consumed their result.
+        if rank not in key[1:3] or rank in transfer.consumed or transfer.values is None:
+            raise ValueError("core released a metadata consumer without a live matching payload")
+        transfer.consumed.add(rank)
+        values = transfer.values if rank == key[2] else None
         if len(transfer.consumed) == 2:
             del self.pending[key]
-
-    def blocked(self):
-        return {channel for transfer in self.pending.values() for channel in transfer.waiting.values()}
-
-    def take_observations(self):
-        result, self.observations = self.observations, []
-        return result
+        return values

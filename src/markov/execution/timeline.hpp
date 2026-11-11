@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "markov/execution/observer.hpp"
+#include "markov/execution/timing.hpp"
 #include "markov/graph/graph.hpp"
 
 namespace markov {
@@ -19,18 +20,6 @@ namespace markov {
 struct EventCompletion {
     std::size_t event;
     std::int64_t time_ns;
-};
-
-// The caller has already matched this invocation's boundary; execution never matches source and target ordinals.
-struct BoundaryTime {
-    std::size_t event;
-    std::int64_t time_ns;
-};
-
-// A measured write interval permits a causal realization, not an asserted exact timestamp.
-struct TimeWindow {
-    std::int64_t begin_ns;
-    std::int64_t end_ns;
 };
 
 // An input connects an existing execution event to an event in the new invocation.
@@ -45,16 +34,17 @@ public:
     explicit Timeline(std::vector<Resource> resources, ExecutionObserver * observer = nullptr);
 
     // Accept a validated graph and bound input readiness; check execution resources, durations and boundary times here.
-    std::vector<std::size_t> insert(const CoarseGraph & graph, std::span<const std::int64_t> work_ns, std::span<const ExecutionInput> inputs,
+    std::vector<std::size_t> insert(const CoarseGraph & graph, std::span<const ServiceDuration> work_ns, std::span<const ExecutionInput> inputs,
                                     std::span<const BoundaryTime> boundaries = {});
     std::optional<EventCompletion> advance(std::optional<std::int64_t> until_ns = {});
     bool completed(std::size_t event) const;
     std::size_t defer();
     void resolve(std::size_t event, std::span<const std::size_t> sources, Relation relation = Relation::Communication,
-                 std::optional<TimeWindow> window = {});
+                 std::optional<TimeWindow> window = {}, ServiceDuration service_ns = 0);
     void retain(std::set<std::size_t> external);
     bool done() const;
     std::int64_t now_ns() const;
+    std::size_t work_count() const;
 
 private:
     struct Dependency {
@@ -100,6 +90,7 @@ private:
     using Ready = std::pair<std::int64_t, std::size_t>;
     std::priority_queue<Ready, std::vector<Ready>, std::greater<>> ready_;
     std::size_t unfinished_ = 0;
+    std::size_t work_count_ = 0;
     std::int64_t now_ns_ = 0;
     ExecutionObserver * observer_;
 };

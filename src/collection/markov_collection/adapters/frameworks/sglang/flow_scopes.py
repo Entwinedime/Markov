@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from markov_adapters.sglang.allocation import AllocationABI
 from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.calls import CallSegments
+from markov_adapters.sglang.clocks import DecisionClocks
 from markov_adapters.sglang.disaggregated_calls import DisaggregatedCalls
+from markov_adapters.sglang.host_reads import HostReads
 from markov_adapters.sglang.kv_layout import MhaKvLayout
 from markov_adapters.sglang.metadata_collectives import MetadataCollectives
 from markov_adapters.sglang.resources import ResourceCalls
@@ -24,6 +26,13 @@ class FlowScopes(CallSegments):
     @property
     def enabled(self):
         return self.observation.active and self.observation.selected
+
+    @property
+    def protocol_enabled(self):
+
+        # Protocol facts cover every worker, independently of representative device profiling.
+        window = self.observation.window
+        return window.phase == "source" and not window.drained
 
     @property
     def scheduler(self):
@@ -52,11 +61,13 @@ class FlowScopes(CallSegments):
         ]
 
     @contextmanager
-    def read_boundary(self, kind, original, work):
+    def read_boundary(self, kind, original, work, condition):
         owner = self.observation
         with owner.call("query", original, parameters={}, work=work) as call:
-            call.record["bindings"].update(action=True, condition={"query": kind})
+            call.record["bindings"].update(action=True, condition=condition)
             query = {"kind": kind, "scope": call.identity}
+            if "read" in condition:
+                query["read"] = condition["read"]
             with owner.capture.runtime.service_scope(query):
                 yield query
             self.queries.append(query)
@@ -89,7 +100,8 @@ class FlowScopes(CallSegments):
     @contextmanager
     def boundary(self, original, boundary):
         owner = self.observation
-        with owner.call(boundary.operation, original, parameters=boundary.parameters, work=boundary.work, device=True) as call:
+        with owner.call(boundary.operation, original, parameters=boundary.parameters, work=boundary.work,
+                        device=boundary.input_use == "device") as call:
 
             # Snapshot mutation epochs before native work; an early return may later discard unused ports.
             inputs = {name: owner.tensors.observe(tensor, shape) for name, (tensor, shape) in boundary.inputs.items()}
@@ -99,7 +111,7 @@ class FlowScopes(CallSegments):
             call.record["bindings"].update(action=True, condition=boundary.condition)
             call.record["guards"] = list(boundary.guards)
             for name in boundary.inputs:
-                call.port(name, "input", inputs[name], use="device")
+                call.port(name, "input", inputs[name], use=boundary.input_use, at_return=boundary.input_use == "host")
             for name, (tensor, shape) in boundary.outputs.items():
                 call.port(name, "output", owner.tensors.observe(tensor, shape), use="device")
 
@@ -127,8 +139,6 @@ class FlowScopes(CallSegments):
                 call.port(name, "input", owner.tensors.observe(tensor, shape), use="device")
             for name, (tensor, shape) in frame.metadata_inputs.items():
                 call.port(name, "input", owner.tensors.observe(tensor, shape), use="metadata")
-            if frame.first and frame.operation == "result":
-                owner.result_port(call, frame.inputs, "input")
             yield
             call.record["work"]["continuation"] = frame.continuation
             call.record["bindings"]["segment"] = {
@@ -156,7 +166,7 @@ class FlowScopes(CallSegments):
             return original(scheduler, batch, output)
         work = owner.batch_work(batch)
         parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in work["members"]))
-        with self.call("result", original, parameters=parameters, work=work, inputs=output) as frame:
+        with self.call("result", original, parameters=parameters, work=work, host_inputs=HostReads.result_inputs(output)) as frame:
             result = original(scheduler, batch, output)
 
             # A nested prebuilt result already publishes its own completion boundary.
@@ -194,9 +204,11 @@ class FlowScopes(CallSegments):
         # A PD receiver can finish without a model call; pool geometry belongs to construction, not attention.
         self.observation.kv_layout = MhaKvLayout.from_pool(allocator.get_kvcache())
         self.observation.prepare_roles()
-        self.resources.bind(result.tree_cache, allocator, result.req_to_token_pool)
         if self.observation.resource_history is not None:
             self.observation.resource_history.bind(result.tree_cache, allocator, result.req_to_token_pool)
+
+        # Diagnostics retain original readers before semantic cuts are installed; snapshots cannot create queries.
+        self.resources.bind(result.tree_cache, allocator, result.req_to_token_pool)
         return result
 
     def install(self) -> None:
@@ -209,6 +221,8 @@ class FlowScopes(CallSegments):
         ):
             HookRegistry.register(target, hook, HookType.AROUND)
         self.selection.install()
+        DecisionClocks(self).install()
+        HostReads(self).install()
         MetadataCollectives(self).install()
         if self.observation.description["mode"] != "null":
             DisaggregatedCalls(self).install(self.observation.description["mode"])

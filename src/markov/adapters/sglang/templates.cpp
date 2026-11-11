@@ -70,6 +70,11 @@ public:
         const auto & continuation = info.work.at("continuation");
         if (continuation.at("owner") != segment.at("owner"))
             throw std::invalid_argument("segment continuation names a different native owner: " + info.site);
+        const auto returned = graph_.scopes[scope].port("call.return", Direction::Output).event;
+        if (std::ranges::any_of(graph_.scopes[scope].ports, [&](const auto & port) {
+                return port.direction == Direction::Input && port.use == PortUse::Data && port.event == returned;
+            }))
+            throw std::invalid_argument("completed host reads require their own materialization action: " + info.site);
         nlohmann::json condition{
             { "owner", segment.at("owner") }
         };
@@ -110,8 +115,7 @@ public:
 
     void validate(std::size_t scope, std::string_view action, const nlohmann::json & condition) const {
         const bool control_transform = action == "batch_transform" && condition.at("transformation").at("effect") == "control";
-        const bool control_segment = action == "segment" && condition.value("effect", std::string{}) == "control";
-        if (control_transform || control_segment) validate_host(scope);
+        if (control_transform) validate_host(scope);
     }
 
 private:
@@ -217,14 +221,6 @@ nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::jso
 
         // These resource ABIs consume request/pool inputs, not the caller batch's forward mode.
         if (std::ranges::find(resource_calls, owner) != resource_calls.end()) facts.erase("phase");
-    }
-    if (action == "segment" && facts.at("owner") == "result") {
-
-        // Token-only results consume device output before request/cache processing; child calls own resource effects.
-        facts["effect"] = facts.at("entry") == "call.enter" ? "result_input" : "control";
-        facts.erase("entry");
-        facts.erase("exit");
-        return facts;
     }
     if (action != "batch_transform") return facts;
     auto & transformation = facts.at("transformation");

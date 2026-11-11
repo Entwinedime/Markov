@@ -68,7 +68,7 @@ void GraphDependencies::invalidate(const ResourceChanges & changes) {
     for (const auto & [field, slot] : changes.returned_fields) slots_[{ slot, field }].initialized.clear();
 }
 
-std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Timeline & timeline, std::span<const std::int64_t> durations,
+std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Timeline & timeline, std::span<const ServiceDuration> durations,
                                                    const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryTime> boundaries) {
     std::set<std::string> exposed;
     for (const auto & port : graph.scopes.front().ports) {

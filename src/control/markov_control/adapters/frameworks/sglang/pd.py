@@ -2,12 +2,16 @@
 
 from collections import defaultdict
 from functools import partial
+from threading import Lock
 
+from markov_adapters.sglang.clocks import DecisionClocks
 from markov_control.adapters.frameworks.sglang.kv_transfer import MetadataRows, PdTopology
 from markov_control.adapters.frameworks.sglang.resources import StateSlots
-from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver, MooncakeKVSender
 from sglang.srt.disaggregation.utils import KVClassType
+from sglang.srt.environ import envs
 
 
 class NativePdBackend:
@@ -77,8 +81,7 @@ class NativePdBackend:
         return room in self.failures
 
     def abort(self, room):
-        reason = f"native PD request {room} was aborted"
-        self.failures[room] = reason
+        reason = self.failures.setdefault(room, f"native PD request {room} was aborted")
         self.exchange([
             {"target": peer, "value": {"kind": "failed", "room": room, "reason": reason}}
             for peer in self.topology.peers
@@ -103,6 +106,8 @@ class NativePdBackend:
 
     def install_calls(self):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        self.scheduler.calls.resources.bind_field("metadata", self.scheduler.req_to_metadata_buffer_idx_allocator)
 
         # Serving hooks must join the graph wrappers before the registry patches their shared targets.
         HookRegistry.register("sglang.srt.disaggregation.utils.MetadataBuffers.set_buf", self.bind_metadata, HookType.AROUND)
@@ -135,6 +140,12 @@ class NativeKvManager(BaseKVManager):
         self.is_dummy_cp_rank = False
         self.enable_all_cp_ranks_for_transfer = False
         self.request_status = {}
+        self.addr_to_rooms_tracker = defaultdict(set)
+        self.failure_records = backend.failures
+        self.failure_lock = Lock()
+        self.enable_trace = False
+        self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         self.req_to_decode_prefix_len = {}
         self.prefill_info_table = {}
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -175,7 +186,7 @@ class NativeKvPolling:
         return self.poll_state
 
 
-class NativeKvSender(NativeKvPolling, CommonKVSender):
+class NativeKvSender(NativeKvPolling, MooncakeKVSender):
     def __init__(self, mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.backend = mgr.backend
@@ -186,23 +197,17 @@ class NativeKvSender(NativeKvPolling, CommonKVSender):
 
     def _poll(self):
         if self.backend.failed(self.bootstrap_room):
-            return KVPoll.Failed
-        if self.conclude_state is not None:
-            return self.conclude_state
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         state = self.kv_mgr.check_status(self.bootstrap_room)
-        if state == KVPoll.Bootstrapping:
-            return state
-        reservations = self.backend.reservations[self.bootstrap_room]
-        if self.aux_index is None:
+        if self.conclude_state is None and state == KVPoll.WaitingForInput and self.aux_index is None:
+            reservations = self.backend.reservations[self.bootstrap_room]
             prefixes = {value["prefix"] for value in reservations.values()}
             if len(prefixes) != 1:
                 raise ValueError("native PD destinations disagree on the reused prefix")
             self.kv_mgr.req_to_decode_prefix_len[self.bootstrap_room] = prefixes.pop()
-            return KVPoll.WaitingForInput
-        if state == KVPoll.Success:
-            self.conclude_state = KVPoll.Success
-            return self.conclude_state
-        return KVPoll.WaitingForInput
+
+        # Native poll owns terminal states and bootstrap timeout; only transport visibility is adapted.
+        return MooncakeKVSender.poll(self)
 
     def send(self, kv_indices, state_indices=None):
         if state_indices:
@@ -263,18 +268,14 @@ class NativeKvSender(NativeKvPolling, CommonKVSender):
         self.backend.reservations.pop(self.bootstrap_room, None)
 
     def abort(self):
+        super().abort()
         self.backend.abort(self.bootstrap_room)
 
-    def failure_exception(self):
-        raise RuntimeError(self.backend.failures.get(self.bootstrap_room, "native PD sender failed on a peer rank"))
 
-
-class NativeKvReceiver(NativeKvPolling, BaseKVReceiver):
+class NativeKvReceiver(NativeKvPolling, MooncakeKVReceiver):
     def __init__(self, mgr, bootstrap_addr, bootstrap_room=None):
-        self.kv_mgr = mgr
+        CommonKVReceiver.__init__(self, mgr, bootstrap_addr, bootstrap_room)
         self.backend = mgr.backend
-        self.bootstrap_room = bootstrap_room
-        self.conclude_state = None
         self.poll_state = None
         self.completions = {}
         self.visible = False
@@ -289,6 +290,8 @@ class NativeKvReceiver(NativeKvPolling, BaseKVReceiver):
     def init(self, prefill_dp_rank):
         if prefill_dp_rank != 0:
             raise ValueError("PD control has no data-parallel bootstrap mapping")
+        self.bootstrap_infos = tuple(self.backend.topology.peers.values())
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def send_metadata(self, kv_indices, aux_index=None, state_indices=None, decode_prefix_len=None):
         if state_indices:
@@ -327,6 +330,7 @@ class NativeKvReceiver(NativeKvPolling, BaseKVReceiver):
                 publication["signals"] = {"reservation.ready": signal}
                 with calls.separate("kv_reservation", publication):
                     scheduler.action("kv_reservation", {}, publication)
+            self.init_time = calls.clocks.read("time", DecisionClocks.receiver_publication)
 
         # Register before polling: native receive-side publication progresses independently of the next scheduler turn.
         request = work["context"]["request"]["id"]
@@ -341,34 +345,31 @@ class NativeKvReceiver(NativeKvPolling, BaseKVReceiver):
 
     def _poll(self):
         if self.backend.failed(self.bootstrap_room):
-            return KVPoll.Failed
-        if self.conclude_state is not None:
-            return self.conclude_state
-        if self.aux_index is None:
-            return KVPoll.WaitingForInput
-        acknowledgements = []
-        for source, packet in self.pending.items():
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if self.conclude_state is None and self.aux_index is not None and self.kv_mgr.check_status(self.bootstrap_room) != KVPoll.Failed:
+            acknowledgements = []
+            for source, packet in self.pending.items():
 
-            # Delivery already crossed the core completion gate; the receiver only joins native sender notifications.
-            if self.metadata is not None and self.metadata != packet["metadata"]:
-                raise ValueError("native PD producers disagree on the first-token metadata")
-            self.metadata = packet["metadata"]
-            self.finished.add(source)
-            acknowledgements.append({"target": source, "value": {"kind": "consumed", "publication": packet["publication"]}})
-        self.pending.clear()
-        if acknowledgements:
-            self.backend.exchange(acknowledgements)
-        if self.visible and self.finished == self.backend.topology.peers.keys():
-            self.kv_mgr.rows.write(self.aux_index, self.metadata)
-            self.conclude_state = KVPoll.Success
-            return self.conclude_state
-        return KVPoll.WaitingForInput
+                # Delivery crossed core completion; the receiver joins native producers and writes their metadata once.
+                if self.metadata is not None and self.metadata != packet["metadata"]:
+                    raise ValueError("native PD producers disagree on the first-token metadata")
+                self.metadata = packet["metadata"]
+                self.finished.add(source)
+                acknowledgements.append({"target": source, "value": {"kind": "consumed", "publication": packet["publication"]}})
+            self.pending.clear()
+            if acknowledgements:
+                self.backend.exchange(acknowledgements)
+            if self.visible and self.finished == self.backend.topology.peers.keys():
+                self.kv_mgr.rows.write(self.aux_index, self.metadata)
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+
+        # Waiting timeout and terminal-state handling remain the installed native policy.
+        return MooncakeKVReceiver.poll(self)
 
     def clear(self):
         del self.backend.receivers[self.bootstrap_room]
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(self.bootstrap_room)
 
-    def abort(self):
+    def _send_abort_notification(self):
         self.backend.abort(self.bootstrap_room)
-
-    def failure_exception(self):
-        raise RuntimeError(self.backend.failures.get(self.bootstrap_room, "native PD receiver failed on a peer rank"))

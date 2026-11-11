@@ -19,6 +19,7 @@ class ActionCall:
     outputs: dict[str, Any] = field(default_factory=dict)
     condition: dict[str, Any] = field(default_factory=dict)
     guards: tuple = ()
+    input_use: str = "device"
 
 
 @dataclass
@@ -43,10 +44,7 @@ class CallFrame:
     tensor_allocations: dict = field(default_factory=dict)
     tensor_outputs: dict = field(default_factory=dict)
     condition: dict = field(default_factory=dict)
-
-    @property
-    def first(self):
-        return self.entry == "call.enter"
+    host_inputs: dict = field(default_factory=dict)
 
     @property
     def terminal(self):
@@ -73,6 +71,12 @@ class CallFrame:
 class CallSegments:
     def __init__(self) -> None:
         self.current = ContextVar("native_call_segments", default=None)
+        self.reading = ContextVar("native_state_read", default=None)
+        self.communicating = ContextVar("native_cpu_protocol", default=None)
+
+    @property
+    def protocol_enabled(self):
+        return self.enabled
 
     def enclosing(self, frame):
         return nullcontext()
@@ -83,17 +87,46 @@ class CallSegments:
     def request_id(self, native_id):
         raise NotImplementedError
 
-    def read_boundary(self, kind, original, work):
+    def read_boundary(self, kind, original, work, condition):
         raise NotImplementedError
 
     @contextmanager
-    def read(self, kind, original, work):
+    def read(self, kind, original, work, *, read=None):
         work = dict(work)
         work["context"] = {**work["context"], "query": kind}
+        condition = {"query": kind}
+        if read is not None:
+            work["context"]["read"] = read
+            condition["read"] = read
 
         # Finish preceding CPU work before observing state; do not add a wait for the queried producer.
-        with self.separate("query", work), self.read_boundary(kind, original, work) as query:
-            yield query
+        with self.separate("query", work), self.read_boundary(kind, original, work, condition) as query:
+            query["clocks"] = []
+            previous = self.reading.set(query)
+            try:
+                yield query
+            finally:
+                self.reading.reset(previous)
+
+    def clock_sample(self, original, query):
+        value = original()
+        return value, round(value * 1_000_000_000)
+
+    def clock_read(self, original, description):
+        if not self.enabled:
+            return self.clock_sample(original, None)[0]
+        reading = self.reading.get()
+        if reading is not None:
+
+            # A poll's internal clock belongs to that read, not to a second independently expanded query.
+            value, ticks = self.clock_sample(original, reading)
+            reading["clocks"].append({"read": description, "result": ticks})
+            return value
+        parent = self.current.get()
+        work = self.scheduler_work() if parent is None else dict(parent.work)
+        with self.read("clock", original, work, read=description) as query:
+            value, query["result"] = self.clock_sample(original, query)
+        return value
 
     def progress(self, requests):
 
@@ -186,7 +219,7 @@ class CallSegments:
     @contextmanager
     def call(
         self, operation, original, *, parameters=None, work=None, inputs=None, guards=(),
-        host_only=False, tensor_inputs=None, tensor_outputs=None, metadata_inputs=None, allocations=None, condition=None,
+        host_only=False, tensor_inputs=None, tensor_outputs=None, metadata_inputs=None, allocations=None, condition=None, host_inputs=None,
     ):
         parent = self.current.get()
         work = dict(parent.work if work is None else work)
@@ -202,6 +235,7 @@ class CallSegments:
             metadata_inputs={} if metadata_inputs is None else metadata_inputs,
             tensor_allocations={} if allocations is None else allocations,
             condition={} if condition is None else condition,
+            host_inputs={} if host_inputs is None else host_inputs,
         )
         previous = self.current.set(frame)
         try:

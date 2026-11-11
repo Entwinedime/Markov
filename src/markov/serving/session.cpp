@@ -1,7 +1,8 @@
 #include "markov/serving/session.hpp"
 
 #include "markov/execution/communication.hpp"
-#include "markov/controller/boundary_times.hpp"
+#include "markov/execution/timing.hpp"
+#include "markov/controller/execution_inputs.hpp"
 
 #include <set>
 #include <stdexcept>
@@ -16,7 +17,7 @@ ServingSession::ServingSession(ServingControl & control, Timeline & timeline, st
       timeline_(timeline),
       participants_(std::move(participants)) {}
 
-nlohmann::json ServingSession::run(std::int64_t given_work_ns, ControlBoundaryTimes * boundary_times) {
+nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs * inputs) {
     if (given_work_ns < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
     CommunicationLinks communication;
     std::map<std::string, GraphDependencies *> pools;
@@ -28,7 +29,6 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ControlBoundaryTi
     std::map<std::size_t, ReturnedAction> pending;
     std::map<std::string, std::size_t> actions;
     std::size_t event_count = 0;
-    std::size_t work_count = 0;
     auto outputs = nlohmann::json::array();
     bool plan = true;
     while (!control_.done() || !timeline_.done()) {
@@ -41,13 +41,12 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ControlBoundaryTi
             }
             auto & participant = participants_.at(action->task.group);
             const auto graph = participant.graphs.build(*action);
-            const std::vector<std::int64_t> durations(graph.work.size(), given_work_ns);
-            const auto boundaries = boundary_times ? boundary_times->take(*action, graph) : std::vector<BoundaryTime>{};
-            const auto events = participant.dependencies.insert(graph, timeline_, durations, pools, boundaries);
+            auto timing = inputs ? inputs->graph(action->task.group, "action", ExecutionInputs::action_identity(*action), graph).timing
+                                 : GraphTiming{ std::vector<ServiceDuration>(graph.work.size(), given_work_ns), {} };
+            const auto events = participant.dependencies.insert(graph, timeline_, timing.work_ns, pools, timing.boundaries);
             communication.insert(graph, events, timeline_);
             const auto returned = events.at(graph.scopes.front().port("call.return", Direction::Output).event);
             ++actions[action->name];
-            work_count += graph.work.size();
             std::map<std::string, StorageBinding> values;
             for (const auto & port : graph.scopes.front().ports) {
                 if (port.use == PortUse::Data && port.direction == Direction::Output)
@@ -99,18 +98,17 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ControlBoundaryTi
     }
     if (!communication.empty()) throw std::runtime_error("serving ended with missing communication participants");
     nlohmann::json result{
-        {   "duration_basis",  "uniform_given_work_ns" },
-        {    "given_work_ns",            given_work_ns },
         {     "completed_ns",       timeline_.now_ns() },
         {          "actions",                  actions },
         { "completed_events",              event_count },
-        {   "work_intervals",               work_count },
+        {   "work_intervals",     timeline_.work_count() },
         { "communication_payloads", communication.payload_coverage() },
         {         "requests", control_.request_count() },
         {       "free_pages",    control_.free_pages() },
         {          "outputs",       std::move(outputs) }
     };
-    if (boundary_times) result.update(boundary_times->finish());
+    if (inputs) result.update(inputs->finish());
+    else result.update({ { "duration_basis", "uniform_given_work_ns" }, { "given_work_ns", given_work_ns } });
     return result;
 }
 

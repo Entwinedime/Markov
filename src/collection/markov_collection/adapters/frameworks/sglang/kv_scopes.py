@@ -118,6 +118,7 @@ class NativeKvScopes:
         original(allocator, size)
         if self.observation.resource_history is not None:
             self.observation.resource_history.bind_field("metadata", allocator)
+        self.observation.calls.resources.bind_field("metadata", allocator)
 
     def manager_init(self, original, manager, *args, **kwargs):
         result = original(manager, *args, **kwargs)

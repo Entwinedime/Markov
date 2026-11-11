@@ -16,7 +16,7 @@ class ProtocolWork:
     def wait(self, *args, **kwargs):
         if self.consumed:
             return self.native.wait(*args, **kwargs)
-        interval = {"thread": threading.get_native_id()}
+        interval = self.observer.interval()
         with self.observer.runtime.service_scope(interval):
             result = self.native.wait(*args, **kwargs)
         if result:
@@ -26,14 +26,22 @@ class ProtocolWork:
 
 
 class CpuProtocol:
-    def __init__(self, runtime, world) -> None:
-        self.runtime = runtime
+    def __init__(self, capture, world, context) -> None:
+        self.capture = capture
+        self.context = context
+        self.runtime = capture.runtime
         self.transfer = CpuTransfer(world)
         self.lock = threading.Lock()
         self.positions = {}
         self.posts = {}
         self.active = False
         self.enclosing = ContextVar("cpu_protocol", default=False)
+
+    def interval(self):
+        execution = self.context.get()
+        if execution is None:
+            raise ValueError("Native CPU protocol observation requires its entering execution context")
+        return {"thread": threading.get_native_id(), "scope": self.capture.current.get(), "execution": execution}
 
     def begin(self):
         with self.lock:
@@ -67,7 +75,8 @@ class CpuProtocol:
         with self.lock:
             position = self.positions.get(route, 0)
             self.positions[route] = position + 1
-        post = {"key": (*route, position), "descriptor": description, "interval": {"thread": threading.get_native_id()}}
+        post = {"key": (*route, position), "operation": name, "descriptor": description,
+                "interval": self.interval()}
 
         # Keep preposted Work facts on its handle; a wait can cross the observation's beginning.
         previous = self.enclosing.set(True)
@@ -85,8 +94,9 @@ class CpuProtocol:
     def hooks(self):
         import torch.distributed as distributed
 
-        return [(f"torch.distributed.{name}", partial(self.invoke, name, inspect.signature(getattr(distributed, name))))
-                for name in ("send", "recv", "isend", "irecv")]
+        return [(f"{module}.{name}", partial(self.invoke, name, inspect.signature(getattr(distributed, name))))
+                for name in ("send", "recv", "isend", "irecv")
+                for module in ("torch.distributed", "torch.distributed.distributed_c10d")]
 
     def document(self):
         with self.lock:

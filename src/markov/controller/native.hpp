@@ -13,9 +13,10 @@
 
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/action_graphs.hpp"
-#include "markov/controller/boundary_times.hpp"
+#include "markov/controller/execution_inputs.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/controller/control_peer.hpp"
+#include "markov/controller/cpu_messages.hpp"
 #include "markov/controller/delivery.hpp"
 #include "markov/controller/observer.hpp"
 #include "markov/execution/dependencies.hpp"
@@ -28,6 +29,7 @@ namespace markov {
 struct NativeParticipant {
     std::string group;
     std::size_t rank;
+    Resource control;
     ResourceService & resources;
     ActionGraphs & graphs;
     GraphDependencies & dependencies;
@@ -47,7 +49,8 @@ struct NativeInstance {
 class NativeController final : public ServingControl {
 public:
     NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer, const nlohmann::json & prefixes,
-                     Timeline & timeline, const nlohmann::json & ingress, ControlBoundaryTimes * boundary_times = nullptr, ResourceObserver * observer = nullptr,
+                     Timeline & timeline, const nlohmann::json & ingress, std::int64_t given_work_ns,
+                     ExecutionInputs * execution_inputs = nullptr, ResourceObserver * observer = nullptr,
                      ControlObserver * control_observer = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns) override;
@@ -60,6 +63,7 @@ public:
     std::size_t free_pages() const override;
     std::size_t request_count() const override;
     const Request & request(std::size_t identity) const override;
+    nlohmann::json cpu_summary() const;
 
 private:
     nlohmann::json receive_call();
@@ -68,6 +72,8 @@ private:
     bool release_idle(const std::string & instance);
     std::optional<std::size_t> completion_event(const std::string & signal) const;
     void resolve_notifications();
+    bool cpu_call(std::size_t call, const std::string & group, const nlohmann::json & message);
+    bool release_cpu();
 
     struct CompletionNotice {
         nlohmann::json identity;
@@ -106,9 +112,10 @@ private:
     std::map<std::string, std::string> instances_;
     ControlPeer & peer_;
     Timeline & timeline_;
-    ControlBoundaryTimes * boundary_times_;
+    ExecutionInputs * execution_inputs_;
     ResourceObserver * observer_;
     ControlObserver * control_observer_;
+    CpuMessages cpu_;
     std::map<std::size_t, std::set<std::string>> observed_;
     std::map<nlohmann::json, std::size_t> notification_ids_;
     std::map<std::size_t, CompletionNotice> notices_;

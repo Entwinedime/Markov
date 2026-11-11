@@ -22,7 +22,7 @@ namespace markov {
 class GraphDependencies {
 public:
     GraphDependencies(KvPool & pool, ResourceService & resources, std::span<const Request> requests, ResourceObserver * observer = nullptr);
-    std::vector<std::size_t> insert(const CoarseGraph & graph, Timeline & timeline, std::span<const std::int64_t> durations,
+    std::vector<std::size_t> insert(const CoarseGraph & graph, Timeline & timeline, std::span<const ServiceDuration> durations,
                                     const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryTime> boundaries = {});
     void invalidate(const ResourceChanges & changes);
     std::optional<std::size_t> signal(const std::string & name) const;

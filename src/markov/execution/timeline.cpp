@@ -47,9 +47,9 @@ Timeline::Timeline(std::vector<Resource> resources, ExecutionObserver * observer
       completed_commands_(resources_.size()),
       observer_(observer) {}
 
-std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<const std::int64_t> work_ns, std::span<const ExecutionInput> inputs,
+std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<const ServiceDuration> work_ns, std::span<const ExecutionInput> inputs,
                                           std::span<const BoundaryTime> boundaries) {
-    if (work_ns.size() != graph.work.size()) throw std::invalid_argument("execution requires one given duration per work interval");
+    if (work_ns.size() != graph.work.size()) throw std::invalid_argument("execution requires one service duration or completion condition per work interval");
     std::vector<std::size_t> resources;
     for (const auto & resource : graph.resources) {
         const auto found = std::ranges::find(resources_, resource);
@@ -57,18 +57,24 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
         resources.push_back(static_cast<std::size_t>(found - resources_.begin()));
     }
     for (const auto duration : work_ns) {
-        if (duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
+        if (duration && *duration < 0) throw std::invalid_argument("service duration must be nonnegative nanoseconds");
     }
     for (const auto & input : inputs) {
         if (!events_.contains(input.source) || input.target >= graph.events.size()) throw std::invalid_argument("undefined invocation input boundary");
     }
-    std::map<std::size_t, std::int64_t> times;
+    std::map<std::size_t, TimeWindow> times;
     for (const auto & boundary : boundaries) {
-        if (boundary.event >= graph.events.size() || boundary.time_ns < now_ns_)
-            throw std::invalid_argument("boundary time refers outside this invocation or before its submission: event="
-                                        + std::to_string(boundary.event) + " time_ns=" + std::to_string(boundary.time_ns)
-                                        + " submitted_ns=" + std::to_string(now_ns_));
-        if (!times.emplace(boundary.event, boundary.time_ns).second) throw std::invalid_argument("duplicate invocation boundary time");
+        const auto window = boundary.window;
+        if (boundary.event >= graph.events.size() || window.begin_ns < 0 || window.end_ns < std::max(now_ns_, window.begin_ns))
+            throw std::invalid_argument("invalid completion window for event " + std::to_string(boundary.event)
+                                        + " at submission " + std::to_string(now_ns_));
+        if (!times.emplace(boundary.event, window).second) throw std::invalid_argument("duplicate invocation completion condition");
+    }
+
+    for (std::size_t index = 0; index < graph.work.size(); ++index) {
+        if (!work_ns[index] && !times.contains(graph.work[index].finish))
+            throw std::invalid_argument("missing service cost and completion condition for work " + std::to_string(index)
+                                        + " in scope " + std::to_string(graph.work[index].scope));
     }
 
     std::map<std::size_t, std::vector<std::size_t>> launches;
@@ -90,12 +96,13 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
         events_.emplace(next_event_++, Event{ resources[event.resource], 0, 0, now_ns_, {}, {}, false, {}, {}, {} });
     }
     unfinished_ += graph.events.size();
+    work_count_ += graph.work.size();
     if (observer_) observer_->inserted(graph, identities, work_ns, now_ns_);
-    for (const auto & [event, time_ns] : times) {
+    for (const auto & [event, window] : times) {
         auto & node = events_.at(offset + event);
-        node.ready_ns = time_ns;
-        node.latest_ns = time_ns;
-        if (observer_) observer_->constrained(offset + event, time_ns, time_ns);
+        node.ready_ns = std::max(now_ns_, window.begin_ns);
+        node.latest_ns = window.end_ns;
+        if (observer_) observer_->constrained(offset + event, window.begin_ns, window.end_ns);
     }
     std::vector<bool> has_previous(graph.events.size()), has_next(graph.events.size());
     for (const auto & edge : graph.edges) {
@@ -107,7 +114,10 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     }
     for (std::size_t index = 0; index < graph.work.size(); ++index) {
         const auto & work = graph.work[index];
-        connect(offset + work.start, offset + work.finish, work_ns[index], Relation::Order);
+
+        // A conditioned work retains only causal order here; its finish window supplies time, not a zero service estimate.
+        if (const auto duration = work_ns[index]) connect(offset + work.start, offset + work.finish, *duration, Relation::Order);
+        else connect(offset + work.start, offset + work.finish, 0, Relation::Order);
         has_previous[work.finish] = true;
         has_next[work.start] = true;
     }
@@ -164,15 +174,18 @@ void Timeline::connect(std::size_t source, std::size_t target, std::int64_t dela
 std::size_t Timeline::defer() {
     const auto event = next_event_++;
 
-    // A notification has causal dependencies but occupies no device queue or CPU thread.
+    // External completions have causal dependencies but occupy no device queue or CPU thread.
     events_.emplace(event, Event{ {}, 1, 1, now_ns_, {}, {}, false, {}, {}, {} });
     ++unfinished_;
     return event;
 }
 
-void Timeline::resolve(std::size_t event, std::span<const std::size_t> sources, Relation relation, std::optional<TimeWindow> window) {
+void Timeline::resolve(std::size_t event, std::span<const std::size_t> sources, Relation relation, std::optional<TimeWindow> window,
+                       ServiceDuration service_ns) {
     auto & target = events_.at(event);
     if (target.holds == 0 || target.completed_ns) throw std::invalid_argument("communication completion is not awaiting peers");
+    if ((service_ns && *service_ns < 0) || (!service_ns && !window))
+        throw std::invalid_argument("external service requires nonnegative nanoseconds or an explicit completion window");
     for (const auto source : sources) {
         if (!events_.contains(source) || source == event) throw std::invalid_argument("invalid cross-action communication input");
     }
@@ -183,7 +196,9 @@ void Timeline::resolve(std::size_t event, std::span<const std::size_t> sources, 
         target.latest_ns = window->end_ns;
         if (observer_) observer_->constrained(event, window->begin_ns, window->end_ns);
     }
-    for (const auto source : sources) connect(source, event, 0, relation);
+    const auto delay = service_ns ? *service_ns : 0;
+    if (sources.empty()) target.ready_ns = std::max(target.ready_ns, after(now_ns_, delay));
+    for (const auto source : sources) connect(source, event, delay, relation);
     --target.holds;
     --target.pending;
     schedule(event);
@@ -271,5 +286,6 @@ void Timeline::retain(std::set<std::size_t> external) {
 
 bool Timeline::done() const { return unfinished_ == 0; }
 std::int64_t Timeline::now_ns() const { return now_ns_; }
+std::size_t Timeline::work_count() const { return work_count_; }
 
 } // namespace markov

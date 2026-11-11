@@ -10,6 +10,7 @@ find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(markov_core
     src/markov/controller/native.cpp
+    src/markov/controller/cpu_messages.cpp
     src/markov/controller/delivery.cpp
     src/markov/resources/kv_pool.cpp
     src/markov/resources/service.cpp
@@ -22,10 +23,11 @@ add_library(markov_core
     src/markov/graph/observation.cpp
     src/markov/graph/graph.cpp
     src/markov/execution/timeline.cpp
+    src/markov/execution/timing.cpp
     src/markov/execution/dependencies.cpp
     src/markov/execution/communication.cpp
     src/markov/serving/session.cpp
-    src/markov/controller/boundary_times.cpp
+    src/markov/controller/execution_inputs.cpp
     src/markov/production/projection.cpp
     src/markov/production/templates.cpp
     src/markov/production/entries.cpp

@@ -134,6 +134,7 @@ class NativeResourceHistory:
         if not self.enabled:
             return original(*args, **kwargs)
         with self.event(operation, query=True) as record:
+            record["control"] = not self.observation.calls.resources.in_resource.get()
             result = original(*args, **kwargs)
         record["result"] = int(result) // unit
         return result

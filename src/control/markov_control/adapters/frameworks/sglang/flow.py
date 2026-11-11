@@ -3,8 +3,10 @@
 from contextlib import contextmanager
 
 from markov_adapters.sglang.calls import CallSegments
+from markov_adapters.sglang.clocks import DecisionClocks
 from markov_adapters.sglang.disaggregated_calls import DisaggregatedCalls
 from markov_adapters.sglang.groups import ParallelGroups
+from markov_adapters.sglang.host_reads import HostReads
 from markov_adapters.sglang.metadata_collectives import MetadataCollectives
 from markov_adapters.sglang.pipeline import PipelineABI
 from markov_adapters.sglang.resources import ResourceCalls
@@ -41,9 +43,13 @@ class FlowExecution(CallSegments):
         self.pending_inputs = {str(index) for index in range(len(scheduler.request_input.requests))}
         self.request_state = scheduler.request_state
         self.groups = ParallelGroups()
+        self.clocks = DecisionClocks(self)
+        self.clocks.install()
+        HostReads(self).install()
         self.selection = BatchSelection(self)
         self.selection.install()
-        ResourceCalls(self).bind(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, scheduler.req_to_token_pool)
+        self.resources = ResourceCalls(self)
+        self.resources.bind(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, scheduler.req_to_token_pool)
         scheduler.output_streamer.send_to_detokenizer = PublishedRequests(
             self, scheduler.output_streamer.send_to_detokenizer.socket is not None,
         )
@@ -105,17 +111,26 @@ class FlowExecution(CallSegments):
             values["output"] = outputs.flatten().tolist()
             self.scheduler.peer.call("action_values", boundary=returned["observation"], values={"collective": values})
 
+    def clock_sample(self, original, query):
+        time_ns = self.scheduler.peer.call("clock") if query is None else query["time_ns"]
+
+        # Native policy uses zero as an unset timestamp; a shared positive epoch preserves elapsed durations.
+        ticks = time_ns + self.scheduler.clock_epoch_ns
+        return ticks / 1_000_000_000, ticks
+
     @contextmanager
-    def read_boundary(self, kind, original, work):
+    def read_boundary(self, kind, original, work, condition):
 
         # Return after observed read work and local synchronization, without waiting for the queried producer.
-        returned = self.scheduler.action("query", {}, work, condition={"query": kind})
-        query = {"observation": returned.get("observation")}
+        returned = self.scheduler.action("query", {}, work, condition=condition)
+        query = {"observation": returned.get("observation"), "time_ns": returned["completed_ns"]}
         yield query
 
         # Detailed tracing joins this result to the actual return event, never to a polling ordinal.
         if "observation" in returned:
-            self.scheduler.peer.call("query_result", boundary=returned["observation"], result=query["result"])
+            self.scheduler.peer.call(
+                "query_result", boundary=returned["observation"], result=query["result"], clocks=query["clocks"],
+            )
 
     @contextmanager
     def boundary(self, original, boundary):
@@ -166,7 +181,7 @@ class FlowExecution(CallSegments):
         parameters, work = self.scheduler.description(batch)
         if self.scheduler.ps.pp_size > 1:
             work["observation_context"] = {"pipeline": PipelineABI.control_context(self)}
-        with self.call("result", original, parameters=parameters, work=work) as frame:
+        with self.call("result", original, parameters=parameters, work=work, host_inputs=HostReads.result_inputs(result)) as frame:
             original(batch, result)
 
             # Prebuilt has its own result boundary, also used directly during native Decode selection.

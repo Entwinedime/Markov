@@ -11,14 +11,15 @@ namespace markov {
 
 NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
                                    const nlohmann::json & prefixes, Timeline & timeline, const nlohmann::json & ingress,
-                                   ControlBoundaryTimes * boundary_times, ResourceObserver * observer,
+                                   std::int64_t given_work_ns, ExecutionInputs * execution_inputs, ResourceObserver * observer,
                                    ControlObserver * control_observer)
     : requests_(std::move(requests)),
       peer_(peer),
       timeline_(timeline),
-      boundary_times_(boundary_times),
+      execution_inputs_(execution_inputs),
       observer_(observer),
-      control_observer_(control_observer) {
+      control_observer_(control_observer),
+      cpu_(timeline, given_work_ns, control_observer, execution_inputs) {
     auto configuration = nlohmann::json::array();
     if (!ingress.is_null() && (!ingress.is_object() || ingress.size() != instances.size()))
         throw std::invalid_argument("ingress must describe every serving instance");
@@ -29,6 +30,7 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
             groups_.emplace(participant.group, Participant{ participant.resources, participant.graphs, participant.dependencies });
             completed_.try_emplace(participant.group);
             instances_.emplace(participant.group, instance.id);
+            cpu_.add_actor(participant.group, { instance.id, participant.control });
             bindings.push_back({
                 {   "id", participant.group },
                 { "rank",  participant.rank }
@@ -49,6 +51,11 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
              { "microbatch_requests", instance.microbatch_requests ? nlohmann::json(*instance.microbatch_requests) : nlohmann::json(nullptr) } }   }
         });
     }
+    if (execution_inputs_) {
+        std::vector<std::string> names;
+        for (const auto & [name, _] : groups_) names.push_back(name);
+        execution_inputs_->bind(names);
+    }
     auto content = nlohmann::json::array();
     for (const auto & request : requests_) {
         nlohmann::json value{
@@ -59,10 +66,11 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         if (request.prefix_id) value["prefix_id"] = *request.prefix_id;
         content.push_back(std::move(value));
     }
-    if (control_observer_) control_observer_->initialized(configuration, content);
+    if (control_observer_) control_observer_->initialized(configuration, content, control_clock_epoch_ns);
     peer_.send({
         {      "kind",                                                      "configure" },
         { "observe", control_observer_ != nullptr },
+        { "clock_epoch_ns", control_clock_epoch_ns },
         { "instances",                                         std::move(configuration) },
         {  "workload", { { "requests", std::move(content) }, { "prefixes", prefixes } } }
     });
@@ -92,6 +100,7 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         }
         const auto & name = message.at("group").get_ref<const std::string &>();
         const auto identity = call.at("id").get<std::size_t>();
+        if (cpu_call(identity, name, message)) continue;
         if (kind == "idle") {
             reach_idle(name, identity, message.at("waiting").get<bool>());
         }
@@ -106,6 +115,21 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         }
         else reply(identity, resource_call(name, message));
     }
+    cpu_.prime();
+}
+
+bool NativeController::cpu_call(std::size_t call, const std::string & group, const nlohmann::json & message) {
+    if (message.at("kind") != "cpu_post" && message.at("kind") != "cpu_wait") return false;
+    if (message.at("execution").at("in_flow").get<bool>()) idle_.erase(group);
+    cpu_.call(call, group, message);
+    release_cpu();
+    return true;
+}
+
+bool NativeController::release_cpu() {
+    const auto replies = cpu_.take_replies();
+    for (const auto & [call, result] : replies) reply(call, result);
+    return !replies.empty();
 }
 
 nlohmann::json NativeController::receive_call() {
@@ -165,7 +189,6 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
                 const bool in_flow = input.in_flow || !arrivals.empty();
 
                 // The first nonempty pull enters serving; idle polls after local drain remain observable outside it.
-                if (boundary_times_ && in_flow) boundary_times_->input_completed(input.identity);
                 if (control_observer_) control_observer_->input_read(input.identity, arrivals, in_flow, now_ns);
                 reply(*input.call,
                       {
@@ -211,6 +234,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
                 if (resumed) continue;
                 return std::nullopt;
             }
+            if (!cpu_.shutdown_ready()) return std::nullopt;
 
             // All native actors are suspended after serving cleanup, and no execution work can still release a caller.
             peer_.send({ { "kind", "shutdown" } });
@@ -223,6 +247,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
         const auto identity = call.at("id").get<std::size_t>();
         const auto kind = message.at("kind").get<std::string>();
         const auto name = message.at("group").get<std::string>();
+        if (cpu_call(identity, name, message)) continue;
         auto & input = inputs_.at(instances_.at(name));
         if (kind == "input") {
             input.call = identity;
@@ -235,7 +260,12 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
 
             // Equal empty queues before and after a workload are different read states; reuse the delivery owner's history.
             input.identity = { { "instance", instances_.at(name) }, { "context", context }, { "received", received } };
-            input.return_ns = boundary_times_ ? boundary_times_->input(input.identity) : std::nullopt;
+            const auto condition = execution_inputs_ ? execution_inputs_->input(name, input.identity, input.in_flow) : std::nullopt;
+            if (condition) {
+                input.return_ns = std::max(now_ns, condition->begin_ns);
+                if (*input.return_ns > condition->end_ns) throw std::invalid_argument("native input entered after its supplied return window: " + input.identity.dump());
+            }
+            else input.return_ns.reset();
             continue;
         }
         if (kind == "wake") {
@@ -251,13 +281,13 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             if (std::ranges::all_of(completed_, [&](const auto & entry) { return entry.second.contains(request); }))
                 throw std::invalid_argument("notification belongs to an already completed request");
 
-            const auto key = ControlBoundaryTimes::notification_identity(message.at("notification"));
+            const auto key = ExecutionInputs::notification_identity(message.at("notification"));
             const auto event = notification_event(key, request);
             auto & notice = notices_.at(event);
             if (notice.call) throw std::invalid_argument("notification declared twice: " + key.dump());
             std::set<std::size_t> prerequisites;
             for (const auto & dependency : message.at("after"))
-                prerequisites.insert(notification_event(ControlBoundaryTimes::notification_identity(dependency), request));
+                prerequisites.insert(notification_event(ExecutionInputs::notification_identity(dependency), request));
             notice.call = identity;
             notice.signals = message.at("signals").get<std::vector<std::string>>();
             notice.prerequisites.assign(prerequisites.begin(), prerequisites.end());
@@ -276,9 +306,11 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
         if (kind == "query_result") {
             const auto boundary = message.at("boundary").get<std::size_t>();
             const auto & result = message.at("result");
-            if (!control_observer_ || !timeline_.completed(boundary) || (!result.is_boolean() && !result.is_number_integer()))
+            const auto & clocks = message.at("clocks");
+            if (!control_observer_ || !timeline_.completed(boundary) || !clocks.is_array()
+                || (!result.is_boolean() && !result.is_number_integer()))
                 throw std::invalid_argument("query observation requires a completed read boundary and scalar result");
-            control_observer_->queried(name, boundary, result, now_ns);
+            control_observer_->queried(name, boundary, result, clocks, now_ns);
             reply(identity, nullptr);
             continue;
         }
@@ -351,6 +383,8 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
 
 nlohmann::json NativeController::resource_call(const std::string & group, const nlohmann::json & message) {
     auto & participant = groups_.at(group);
+    if (message.at("kind") == "clock") return timeline_.now_ns();
+
     if (message.at("kind") == "protocol") {
         if (control_observer_) control_observer_->native_protocol(group, message.at("record"), timeline_.now_ns());
         return nullptr;
@@ -394,7 +428,7 @@ void NativeController::resolve_notifications() {
         // Bind when graph producers exist, before advancing time or waiting for the enclosing CPU return.
         notice.prerequisites.assign(prerequisites.begin(), prerequisites.end());
         timeline_.resolve(*pending, notice.prerequisites, Relation::Signal,
-                          boundary_times_ ? boundary_times_->notification(notice.identity) : std::nullopt);
+                          execution_inputs_ ? std::optional(execution_inputs_->notification(notice.identity)) : std::nullopt);
         notice.signals.clear();
         pending = pending_notices_.erase(pending);
     }
@@ -430,7 +464,7 @@ void NativeController::release_notifications(std::size_t request) {
 }
 
 std::set<std::size_t> NativeController::retained_events() const {
-    std::set<std::size_t> events;
+    auto events = cpu_.retained_events();
 
     // Retain notifications while their request is live, including later registrations by another participant.
     for (const auto & [event, _] : notices_) events.insert(event);
@@ -438,7 +472,8 @@ std::set<std::size_t> NativeController::retained_events() const {
 }
 
 bool NativeController::notify(std::size_t event) {
-    bool released = false;
+    cpu_.notify(event);
+    bool released = release_cpu();
 
     const auto notification = notices_.find(event);
     if (notification != notices_.end()) {
@@ -513,5 +548,6 @@ std::size_t NativeController::free_pages() const {
 }
 std::size_t NativeController::request_count() const { return requests_.size(); }
 const Request & NativeController::request(std::size_t identity) const { return requests_.at(identity); }
+nlohmann::json NativeController::cpu_summary() const { return cpu_.summary(); }
 
 } // namespace markov

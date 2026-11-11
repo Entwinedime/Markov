@@ -14,6 +14,9 @@
 
 namespace markov {
 
+// Native policy reserves zero for unset timestamps; all virtual clock APIs share this origin.
+inline constexpr std::int64_t control_clock_epoch_ns = 1'000'000'000;
+
 struct Request {
     std::string id;
     std::int64_t arrival_ns;

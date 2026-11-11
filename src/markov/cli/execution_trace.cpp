@@ -1,5 +1,6 @@
 #include "markov/cli/execution_trace.hpp"
 
+#include <utility>
 #include <vector>
 
 #include "markov/graph/graph.hpp"
@@ -13,7 +14,10 @@ ExecutionTrace::ExecutionTrace(const std::filesystem::path & path) {
     stream_.open(path, std::ios::out | std::ios::noreplace);
 }
 
-void ExecutionTrace::inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const std::int64_t> work_ns, std::int64_t time_ns) {
+void ExecutionTrace::inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const ServiceDuration> work_ns, std::int64_t time_ns) {
+
+    auto durations = nlohmann::json::array();
+    for (const auto duration : work_ns) durations.push_back(duration ? nlohmann::json(*duration) : nlohmann::json(nullptr));
 
     // Input and template assets own the environment; repeating it per invocation would dominate the trace.
     stream_ << nlohmann::json{
@@ -21,7 +25,7 @@ void ExecutionTrace::inserted(const CoarseGraph & graph, std::span<const std::si
         { "time_ns", time_ns },
         { "graph", graph.document(false) },
         { "event_ids", std::vector<std::size_t>(events.begin(), events.end()) },
-        { "work_ns", std::vector<std::int64_t>(work_ns.begin(), work_ns.end()) }
+        { "work_ns", std::move(durations) }
     } << '\n';
 }
 
@@ -52,13 +56,14 @@ void ExecutionTrace::constrained(std::size_t event, std::int64_t begin_ns, std::
     } << '\n';
 }
 
-void ExecutionTrace::initialized(const nlohmann::json & instances, const nlohmann::json & requests) {
+void ExecutionTrace::initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) {
 
     // Request indices in resource operations resolve through this input order, not through graph event numbers.
     stream_ << nlohmann::json{
         {      "kind", "resources" },
         { "instances",   instances },
-        {  "requests",    requests }
+        {  "requests",    requests },
+        { "clock_epoch_ns", clock_epoch_ns }
     } << '\n';
 }
 
@@ -89,10 +94,11 @@ void ExecutionTrace::native_protocol(std::string_view group, const nlohmann::jso
     } << '\n';
 }
 
-void ExecutionTrace::queried(std::string_view group, std::size_t boundary, const nlohmann::json & result, std::int64_t time_ns) {
+void ExecutionTrace::queried(std::string_view group, std::size_t boundary, const nlohmann::json & result,
+                                    const nlohmann::json & clocks, std::int64_t time_ns) {
     stream_ << nlohmann::json{
         { "kind", "state_query" }, { "group", group }, { "boundary", boundary }, { "result", result }, { "time_ns", time_ns },
-        { "completion_reads", completion_reads_[boundary] }
+        { "completion_reads", completion_reads_[boundary] }, { "clocks", clocks }
     } << '\n';
     completion_reads_.erase(boundary);
 }

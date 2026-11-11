@@ -32,6 +32,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 class NativeScheduler(Scheduler):
     def __init__(self, peer, settings, model_path: str, source, rank: int, workload, workers, local) -> None:
         self.peer = peer
+        self.clock_epoch_ns = settings["clock_epoch_ns"]
         self.instance_id = source["id"]
         worker = source["workers"][rank]
         self.graph_rank = worker["rank"]
