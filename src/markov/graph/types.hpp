@@ -16,7 +16,7 @@ namespace markov {
 
 enum class ResourceKind { Thread, Stream, Service };
 enum class WorkKind { Host, Device, Transfer, Communication, Wait, Boundary };
-enum class Relation { Order, Submission, Data, Signal, Control, State, Communication };
+enum class Relation { Order, Submission, Data, Signal, Control, State, Communication, Observation };
 enum class Direction { Input, Output };
 enum class PortUse { Control, Data, Metadata, Signal };
 
@@ -37,7 +37,15 @@ std::string_view direction_name(Direction direction);
 PortUse port_use(std::string_view name);
 std::string_view port_use_name(PortUse use);
 
-// Participants declare which input-ready peers their local completion requires.
+struct PayloadAgreement {
+    std::string port;
+    Direction direction;
+    bool shape;
+
+    bool operator==(const PayloadAgreement &) const = default;
+};
+
+// Participants declare dependencies and any observed tensor fields that must agree across peers.
 struct CommunicationGroup {
     std::string channel;
     std::string operation;
@@ -45,6 +53,7 @@ struct CommunicationGroup {
     std::vector<std::int64_t> required;
     std::int64_t rank;
     std::size_t order;
+    std::vector<PayloadAgreement> agreements{};
 
     static CommunicationGroup read(const nlohmann::json & source);
     nlohmann::json document() const;

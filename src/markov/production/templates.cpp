@@ -79,34 +79,36 @@ public:
             local.push_back(event);
         }
         for (std::size_t work = 0; work < source.work.size(); ++work) scopes_[source.work[work].scope].work.push_back(work);
-        for (std::size_t edge = 0; edge < source.edges.size(); ++edge) {
-            const auto & link = source.edges[edge];
-            const auto owner = source.common_scope(source.events[link.source].scope, source.events[link.target].scope);
-            scopes_[owner].edges.push_back(edge);
-        }
 
         // Derive interfaces before interning definitions; later callers cannot mutate a shared child's body.
+        std::vector<std::set<std::size_t>> boundaries(source.events.size());
+        const auto boundary = [&](std::size_t scope, std::size_t event) {
+            boundaries[event].insert(scope);
+            expose(scope, event);
+        };
         for (std::size_t scope = 0; scope < source.scopes.size(); ++scope) {
             for (const auto & port : source.scopes[scope].ports) {
-                expose(scope, port.event);
-                if (port.wait) expose(scope, port.wait->begin);
-                if (port.rendezvous) expose(scope, *port.rendezvous);
+                boundary(scope, port.event);
+                if (port.wait) boundary(scope, port.wait->begin);
+                if (port.rendezvous) boundary(scope, *port.rendezvous);
             }
             for (const auto & access : source.scopes[scope].slot_accesses) {
-                expose(scope, access.start);
-                expose(scope, access.finish);
+                boundary(scope, access.start);
+                boundary(scope, access.finish);
             }
             for (const auto & access : source.scopes[scope].kv_accesses) {
-                expose(scope, access.start);
-                expose(scope, access.finish);
+                boundary(scope, access.start);
+                boundary(scope, access.finish);
             }
         }
         for (const auto & piece : source.work) {
-            expose(piece.scope, piece.start);
-            expose(piece.scope, piece.finish);
+            boundary(piece.scope, piece.start);
+            boundary(piece.scope, piece.finish);
         }
-        for (const auto & edge : source.edges) {
-            const auto owner = source.common_scope(source.events[edge.source].scope, source.events[edge.target].scope);
+        for (std::size_t index = 0; index < source.edges.size(); ++index) {
+            const auto & edge = source.edges[index];
+            const auto owner = edge_owner(edge, boundaries);
+            scopes_[owner].edges.push_back(index);
             expose(owner, edge.source);
             expose(owner, edge.target);
         }
@@ -126,6 +128,21 @@ public:
     }
 
 private:
+    std::size_t edge_owner(const GraphEdge & edge, const std::vector<std::set<std::size_t>> & boundaries) const {
+        const auto owner = source_.common_scope(source_.events[edge.source].scope, source_.events[edge.target].scope);
+        std::optional<std::size_t> candidate;
+        for (const auto & [external, internal] : { std::pair{ edge.source, edge.target }, std::pair{ edge.target, edge.source } }) {
+            for (const auto scope : boundaries[external]) {
+                if (scope == owner || !source_.contains(owner, scope) || !source_.contains(scope, source_.events[internal].scope)) continue;
+
+                // A shared endpoint can belong to a parent while the child's declared operation owns its dependency.
+                if (!candidate || source_.contains(*candidate, scope)) candidate = scope;
+                else if (!source_.contains(scope, *candidate)) return owner;
+            }
+        }
+        return candidate.value_or(owner);
+    }
+
     void expose(std::size_t caller, std::size_t event) {
         auto owner = source_.events[event].scope;
         const auto common = source_.common_scope(caller, owner);
@@ -191,6 +208,14 @@ private:
         for (const auto & [name, value] : observed.info.constants) definition.fixed.insert(name);
 
         auto & frame = compiled.frame;
+
+        // Import identities follow named boundaries, not whichever implementation edge happens to mention them first.
+        for (const auto & port : observed.ports) {
+            reference(scope, port.event, definition, frame);
+            if (port.wait) reference(scope, port.wait->begin, definition, frame);
+            if (port.rendezvous) reference(scope, *port.rendezvous, definition, frame);
+        }
+
         std::set<nlohmann::json> predicates;
         for (const auto & predicate : observed.info.guards) {
             if (predicate.evaluate(observed.info.parameters) == 0) throw std::invalid_argument("native guard contradicts source at " + observed.info.site);
@@ -208,7 +233,8 @@ private:
                                                  access.value.access,
                                                  access.value.members,
                                                  reference(scope, access.start, definition, frame),
-                                                 reference(scope, access.finish, definition, frame) });
+                                                 reference(scope, access.finish, definition, frame),
+                                                 access.value.publication });
         }
         for (const auto & access : observed.kv_accesses) {
             if (!access.value.rule) throw std::invalid_argument("KV access has no declared member range rule at " + frame.site);

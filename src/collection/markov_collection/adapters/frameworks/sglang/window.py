@@ -23,6 +23,9 @@ class ObservationWindow:
             )
         }
         self.pending = {phase: set(requests) for phase, requests in self.requests.items()}
+        aliases = dict(zip((request["id"] for request in description["content"]["requests"]), description["source_requests"], strict=True))
+        self.groups = [{aliases[identity] for identity in group} for group in description["submission_groups"][:-1]]
+        self.group = 0
 
         self.phase: str | None = None
         self.drained = False
@@ -62,6 +65,14 @@ class ObservationWindow:
 
     def inputs_complete(self) -> bool:
         return self.phase is not None and not self.pending[self.phase]
+
+    def group_idle(self, rank: int) -> None:
+        if self.phase != "source" or self.group == len(self.groups) or self.groups[self.group] & self.pending["source"]:
+            return
+
+        # A terminal response can precede native removal from running batches; preserve cache while waiting for idle.
+        write_json(self.marker(self.directory, rank), {"phase": "source", "state": f"group/{self.group}"})
+        self.group += 1
 
     def drain(self, rank: int) -> None:
         write_json(self.marker(self.directory, rank), {"phase": self.phase, "state": "drained"})

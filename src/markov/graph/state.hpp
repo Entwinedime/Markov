@@ -69,6 +69,9 @@ struct SlotAccess {
     std::string members;
     std::vector<std::string> requests;
 
+    // Replicas of one request-scoped publication may write concurrently; different publications remain ordered.
+    std::string publication;
+
     static SlotAccess read(const nlohmann::json & source);
     nlohmann::json document() const;
 };

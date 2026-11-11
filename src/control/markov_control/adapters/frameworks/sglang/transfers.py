@@ -26,6 +26,7 @@ class PipelineTransfers(CpuPointToPoint):
         self.scheduler = scheduler
         self.groups = ParallelGroups()
         self.ranks = dict(zip(world, ranks, strict=True))
+        self.consensus = {}
 
     def post(self, tensor, group, tag, endpoint, group_endpoint, receiving):
         if not tensor.is_meta:
@@ -86,6 +87,21 @@ class PipelineTransfers(CpuPointToPoint):
             transported[name] = view
         return original(scheduler, transported, *args, **kwargs)
 
+    def send_consensus(self, original, scheduler, batches, *args, **kwargs):
+        works, data = original(scheduler, batches, *args, **kwargs)
+
+        # Each native slot buffer owns one consensus channel for the lifetime of this event loop.
+        if works and scheduler.pp_group.is_last_rank:
+            channel = id(batches)
+            payload = tuple(tuple(part) if isinstance(part, list) else part for part in data)
+            previous = self.consensus.get(channel)
+            self.consensus[channel] = payload
+
+            # Queue before waking; an unchanged ready set cannot unblock failed resource admission.
+            if payload != previous and any(payload):
+                scheduler.peer.send({"kind": "wake", "groups": [scheduler.group]})
+        return works, data
+
     def install(self):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -94,4 +110,6 @@ class PipelineTransfers(CpuPointToPoint):
         HookRegistry.register(
             "sglang.srt.managers.scheduler.Scheduler._pp_send_dict_to_next_stage", self.send_dict, HookType.AROUND,
         )
+        for name in ("_pp_pd_send_consensus_bootstrapped_ids", "_pp_pd_send_consensus_release_ids"):
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler." + name, self.send_consensus, HookType.AROUND)
         HookRegistry.register("sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather", self.gather, HookType.AROUND)

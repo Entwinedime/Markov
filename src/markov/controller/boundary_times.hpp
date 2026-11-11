@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "markov/contracts/serving.hpp"
@@ -12,14 +13,15 @@
 
 namespace markov {
 
-// Measured action, notification and input returns constrain time, never batches, allocations or graph contents.
+// Control returns keep full context; logical completions retain producer work and caller operands, not scheduling snapshots.
 class ControlBoundaryTimes {
 public:
     explicit ControlBoundaryTimes(const nlohmann::json & source);
     std::vector<BoundaryTime> take(const ServingAction & action, const CoarseGraph & graph);
     static nlohmann::json notification_identity(const nlohmann::json & value);
     std::optional<TimeWindow> notification(const nlohmann::json & identity);
-    std::optional<std::int64_t> input(const nlohmann::json & identity);
+    std::optional<std::int64_t> input(const nlohmann::json & identity) const;
+    void input_completed(const nlohmann::json & identity);
     nlohmann::json finish() const;
 
 private:
@@ -30,7 +32,7 @@ private:
     };
 
     static nlohmann::json identity(const std::string & group, const std::string & action, const Parameters & parameters,
-                                   const nlohmann::json & work);
+                                   const nlohmann::json & work, std::string_view basis);
 
     struct ActionTimes {
         std::vector<PortTime> boundaries;

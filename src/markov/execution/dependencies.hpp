@@ -26,6 +26,7 @@ public:
                                     const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryTime> boundaries = {});
     void invalidate(const ResourceChanges & changes);
     std::optional<std::size_t> signal(const std::string & name) const;
+    void observe_completion(std::size_t event);
     std::set<std::size_t> retain(const std::set<std::string> & bindings, const Timeline & timeline);
 
 private:
@@ -35,6 +36,7 @@ private:
         bool write;
         std::size_t start;
         std::size_t finish;
+        std::optional<std::pair<std::size_t, std::string>> publication{};
 
         auto operator<=>(const Access &) const = default;
     };
@@ -57,6 +59,7 @@ private:
     std::map<std::pair<std::size_t, std::string>, Contents> slots_;
     std::map<std::string, std::pair<std::int64_t, std::size_t>> values_;
     std::map<std::string, std::size_t> signals_;
+    std::set<std::size_t> observations_;
 };
 
 } // namespace markov

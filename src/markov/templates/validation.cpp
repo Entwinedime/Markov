@@ -34,7 +34,16 @@ void frame(const TemplateLibrary & library, const TemplateFrame & bindings, cons
         || bindings.kv_layers.size() != definition.kv_accesses.size())
         throw std::invalid_argument("template frame does not match its definition");
 
-    if (bindings.communication) bindings.communication->validate();
+    if (bindings.communication) {
+        bindings.communication->validate();
+        for (const auto & field : bindings.communication->agreements) {
+            const auto found = std::ranges::find_if(definition.ports, [&](const auto & port) {
+                return port.name == field.port && port.direction == field.direction;
+            });
+            if (found == definition.ports.end() || !found->tensor || (found->use != PortUse::Data && found->use != PortUse::Metadata))
+                throw std::invalid_argument("template communication payload agreement requires a tensor port");
+        }
+    }
     const auto rendezvous = std::ranges::count_if(definition.ports, [](const auto & port) { return port.rendezvous.has_value(); });
     if (rendezvous != (bindings.communication ? 1 : 0)) throw std::invalid_argument("template communication binding differs from its ports");
     for (const auto & name : definition.fixed) bindings.constants.at(name);
@@ -152,6 +161,8 @@ void TemplateLibrary::validate() const {
         for (const auto & access : definition.slot_accesses) {
             if (access.pool.empty() || access.field.empty() || access.members.empty())
                 throw std::invalid_argument("template slot access has an incomplete binding");
+            if (!access.publication.empty() && access.access != StateAccess::Write)
+                throw std::invalid_argument("only template slot writes can declare a replicated publication");
             reference(definition, access.start);
             reference(definition, access.finish);
         }

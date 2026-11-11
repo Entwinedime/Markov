@@ -108,6 +108,7 @@ struct TemplateSlotAccess {
     std::string members;
     TemplateReference start;
     TemplateReference finish;
+    std::string publication;
 };
 
 struct TemplateDefinition {
@@ -202,7 +203,9 @@ public:
     TemplateInterface call_interface(const TemplateFrame & frame) const;
     nlohmann::json local_contract(const TemplateFrame & frame, const std::vector<std::size_t> & position) const;
     void collect_local_implementations();
-    static void link_local_implementations(std::span<TemplateLibrary> libraries);
+    static void link_local_implementations(std::span<TemplateLibrary *> libraries);
+    std::optional<std::size_t> import_leaf(const TemplateDefinition & definition, TemplateEntry entry,
+                                         std::span<const std::size_t> recipient_resources);
     CoarseGraph instantiate(const TemplateEntry & entry, const GraphInvocation & invocation) const;
 
     nlohmann::json domain;

@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 
+from markov_adapters.sglang.allocation import AllocationABI
 from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.calls import CallSegments
 from markov_adapters.sglang.disaggregated_calls import DisaggregatedCalls
@@ -22,7 +23,7 @@ class FlowScopes(CallSegments):
 
     @property
     def enabled(self):
-        return self.serving and self.observation.active and self.observation.selected
+        return self.observation.active and self.observation.selected
 
     @property
     def scheduler(self):
@@ -122,9 +123,10 @@ class FlowScopes(CallSegments):
         owner = self.observation
         with owner.call("segment", frame.original, device=not frame.host_only and frame.operation != "kv_enqueue") as call:
             call.record["guards"] = list(frame.guards)
-            if frame.first:
-                for name, (tensor, shape) in frame.tensor_inputs.items():
-                    call.port(name, "input", owner.tensors.observe(tensor, shape), use="device")
+            for name, (tensor, shape) in frame.tensor_inputs.items():
+                call.port(name, "input", owner.tensors.observe(tensor, shape), use="device")
+            for name, (tensor, shape) in frame.metadata_inputs.items():
+                call.port(name, "input", owner.tensors.observe(tensor, shape), use="metadata")
             if frame.first and frame.operation == "result":
                 owner.result_port(call, frame.inputs, "input")
             yield
@@ -132,11 +134,11 @@ class FlowScopes(CallSegments):
             call.record["bindings"]["segment"] = {
                 "owner": frame.operation,
             }
+            call.record["bindings"]["condition"] = frame.condition
             if frame.host_only:
                 call.record["bindings"]["segment"]["host_only"] = True
-            if frame.terminal:
-                for name, (tensor, shape) in frame.tensor_outputs.items():
-                    call.output(name, owner.tensors.observe(tensor, shape), use="device", preceding=frame.observations)
+            for name, (tensor, shape) in frame.tensor_outputs.items():
+                call.output(name, owner.tensors.observe(tensor, shape), use="device", preceding=frame.observations)
             if frame.terminal and frame.operation in {"result", "prebuilt_result", "prefill_finish"}:
                 call.record["effects"] = frame.outputs
             if frame.terminal and frame.operation == "prebuilt_prepare" and owner.resource_history is not None:
@@ -178,6 +180,9 @@ class FlowScopes(CallSegments):
         result = original(*args, **kwargs)
         allocator = result.token_to_kv_pool_allocator
         cache_type = type(result.tree_cache)
+        allocator_type = type(allocator)
+        allocator._markov_allocation = AllocationABI(f"{allocator_type.__module__}.{allocator_type.__qualname__}")
+        self.observation.implementation["allocator"] = allocator._markov_allocation.implementation
 
         # Record the effective native choice, including model-driven cache disabling.
         self.observation.implementation["cache"] = {
@@ -203,7 +208,6 @@ class FlowScopes(CallSegments):
             ("sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output", self.publication),
         ):
             HookRegistry.register(target, hook, HookType.AROUND)
-        self.install_lifecycle()
         self.selection.install()
         MetadataCollectives(self).install()
         if self.observation.description["mode"] != "null":

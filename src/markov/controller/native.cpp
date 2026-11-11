@@ -1,6 +1,8 @@
 #include "markov/controller/native.hpp"
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -65,29 +67,43 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
         {  "workload", { { "requests", std::move(content) }, { "prefixes", prefixes } } }
     });
 
-    // Let native participants reach idle before workload time and graph observation start.
+    // No workload is delivered while native participants establish their empty control state.
+    bool initialized = false;
+    std::map<std::string, std::string> ingress_groups;
     while (idle_.size() != groups_.size()) {
         const auto call = receive_call();
         if (call.at("kind") == "waiting") {
+
+            // Pipeline peers can wait for their next metadata round while each ingress is already parked at idle.
+            if (initialized && ingress_groups.size() == inputs_.size() && std::ranges::all_of(ingress_groups, [&](const auto & entry) {
+                    const auto idle = idle_.find(entry.second);
+                    return idle != idle_.end() && idle->second.has_value();
+                }))
+                break;
             auto observed = nlohmann::json::array();
             for (const auto & [name, _] : idle_) observed.push_back(name);
             throw std::logic_error("native priming stopped: " + nlohmann::json{ { "observed_idle", observed } }.dump());
         }
         const auto & message = call.at("message");
         const auto kind = message.at("kind").get<std::string>();
-        if (kind == "ready") continue;
+        if (kind == "ready") {
+            initialized = true;
+            continue;
+        }
         const auto & name = message.at("group").get_ref<const std::string &>();
         const auto identity = call.at("id").get<std::size_t>();
         if (kind == "idle") {
             reach_idle(name, identity, message.at("waiting").get<bool>());
         }
-        else if (kind == "input")
+        else if (kind == "input") {
+            ingress_groups.insert_or_assign(instances_.at(name), name);
             reply(identity,
                   {
                       {     "kind",               "advance" },
                       {   "now_ns",                       0 },
                       { "arrivals", nlohmann::json::array() }
             });
+        }
         else reply(identity, resource_call(name, message));
     }
 }
@@ -112,52 +128,45 @@ void NativeController::reach_idle(const std::string & group, std::size_t call, b
     idle_.insert_or_assign(group, waiting ? std::optional(call) : std::nullopt);
 }
 
-void NativeController::release_idle(const std::string & instance) {
+bool NativeController::release_idle(const std::string & instance) {
+    bool resumed = false;
     for (auto group = idle_.begin(); group != idle_.end();) {
         if (instances_.at(group->first) != instance) {
             ++group;
             continue;
         }
-        if (group->second) reply(*group->second, nullptr);
+        if (group->second) {
+            reply(*group->second, nullptr);
+            resumed = true;
+        }
         group = idle_.erase(group);
     }
+    return resumed;
 }
 
 std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
     while (!done()) {
         resolve_notifications();
-        if (!shutdown_ && idle_.size() == groups_.size()
-            && std::ranges::none_of(inputs_, [](const auto & entry) { return entry.second.return_ns.has_value(); })
-            && std::ranges::all_of(completed_, [&](const auto & entry) { return entry.second.size() == requests_.size(); })) {
-
-            // Every group finishes native batch cleanup before leaving at its control receive boundary.
-            peer_.send({
-                { "kind", "shutdown" }
-            });
-            for (auto & [instance, input] : inputs_) {
-                release_idle(instance);
-                input.call.reset();
-            }
-            shutdown_ = true;
-        }
         for (auto & [instance, input] : inputs_) {
             const bool arrived = input.delivery.ready(now_ns);
 
-            // Full native idle waits for input; protocol polling and device completion use their own wakeups.
-            if (!shutdown_ && arrived) release_idle(instance);
+            // Real progress wakes either park; consume it only when a sleeping native actor actually resumes.
+            if (!shutdown_ && (arrived || input.woken) && release_idle(instance)) input.woken = false;
             if (!input.call) continue;
 
-            // Only this instance's actions advance its rounds; a declared wait still needs an external change.
-            const bool executing = !running_calls_.empty() || !observed_.empty() || !timeline_.done();
-            const bool runnable = !input.waiting && (input.action_progress || !executing);
             if (input.return_ns && *input.return_ns < now_ns)
                 throw std::invalid_argument("native input read reached after its observed return: " + input.identity.dump());
 
             // A measured read completes at its own boundary; it never prescribes which requests or batch to choose.
-            const bool ready = input.return_ns ? *input.return_ns == now_ns : arrived || input.woken || runnable;
+            // The adapter declares a safe wait; submitting another polling graph is not logical progress.
+            const bool ready = input.return_ns ? *input.return_ns == now_ns : arrived || input.woken || !input.waiting;
             if (ready) {
                 const auto arrivals = input.delivery.take(now_ns);
-                if (control_observer_) control_observer_->input_read(input.identity, arrivals, now_ns);
+                const bool in_flow = input.in_flow || !arrivals.empty();
+
+                // The first nonempty pull enters serving; idle polls after local drain remain observable outside it.
+                if (boundary_times_ && in_flow) boundary_times_->input_completed(input.identity);
+                if (control_observer_) control_observer_->input_read(input.identity, arrivals, in_flow, now_ns);
                 reply(*input.call,
                       {
                           {     "kind",           "advance" },
@@ -166,12 +175,50 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
                 });
                 input.call.reset();
                 input.return_ns.reset();
-                input.action_progress = false;
-                input.woken = false;
+
+                // Peers can publish midway through a PP round; keep that wake until the next declared wait consumes it.
+                if (input.waiting) input.woken = false;
             }
         }
         const auto call = receive_call();
-        if (call.at("kind") == "waiting") return std::nullopt;
+        if (call.at("kind") == "waiting") {
+            if (shutdown_ || !timeline_.done() || !running_calls_.empty()
+                || std::ranges::any_of(inputs_, [](const auto & entry) { return entry.second.return_ns.has_value(); })
+                || !std::ranges::all_of(completed_, [&](const auto & entry) { return entry.second.size() == requests_.size(); }))
+                return std::nullopt;
+
+            if (idle_.size() != groups_.size()) {
+
+                // Native peers can need another empty control turn before their final idle housekeeping.
+                std::set<std::string> draining;
+                for (const auto & [group, _] : groups_) {
+                    if (!idle_.contains(group)) draining.insert(instances_.at(group));
+                }
+                bool resumed = false;
+                for (auto & [instance, input] : inputs_) {
+                    if (draining.contains(instance) && input.call) {
+                        input.woken = true;
+                        resumed = true;
+                    }
+                }
+                for (auto & [group, idle_call] : idle_) {
+                    if (idle_call && draining.contains(instances_.at(group))) {
+                        reply(*idle_call, nullptr);
+                        idle_call.reset();
+                        resumed = true;
+                    }
+                }
+                if (resumed) continue;
+                return std::nullopt;
+            }
+
+            // All native actors are suspended after serving cleanup, and no execution work can still release a caller.
+            peer_.send({ { "kind", "shutdown" } });
+            for (auto & [_, input] : inputs_) input.call.reset();
+            idle_.clear();
+            shutdown_ = true;
+            continue;
+        }
         const auto & message = call.at("message");
         const auto identity = call.at("id").get<std::size_t>();
         const auto kind = message.at("kind").get<std::string>();
@@ -180,6 +227,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
         if (kind == "input") {
             input.call = identity;
             input.waiting = message.at("waiting").get<bool>();
+            input.in_flow = message.at("in_flow").get<bool>();
             const auto & context = message.at("context");
             if (!context.is_object()) throw std::invalid_argument("native input read requires its entering logical context");
             std::set<std::string> received;
@@ -246,8 +294,16 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
                     throw std::invalid_argument("completion read observation requires a completed query boundary");
                 control_observer_->completion_read(name, boundary, signal, event, completed, now_ns);
             }
-            if (!completed) observed_[event].insert(instances_.at(name));
+            if (completed) participant.dependencies.observe_completion(event);
+            else observed_[event].insert(instances_.at(name));
             reply(identity, completed);
+            continue;
+        }
+        if (kind == "observed_completion") {
+            const auto event = message.at("event").get<std::size_t>();
+            if (!timeline_.completed(event)) throw std::invalid_argument("control observed a pending completion");
+            participant.dependencies.observe_completion(event);
+            reply(identity, nullptr);
             continue;
         }
         if (kind == "describe") {
@@ -274,6 +330,9 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             continue;
         }
         if (kind == "action") {
+
+            // A new serving action ends this participant's previously reported idle interval.
+            idle_.erase(name);
             ServingAction action{
                 { name, next_action_++ },
                 message.at("action").get<std::string>(),
@@ -283,7 +342,6 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             if (action.name.empty() || !action.condition.is_object() || !action.work.is_object() || !action.outputs.is_array())
                 throw std::invalid_argument("native action has an incomplete declaration");
             running_calls_.emplace(action.task, identity);
-            input.action_progress = true;
             return action;
         }
         reply(identity, resource_call(name, message));
@@ -293,11 +351,17 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
 
 nlohmann::json NativeController::resource_call(const std::string & group, const nlohmann::json & message) {
     auto & participant = groups_.at(group);
+    if (message.at("kind") == "protocol") {
+        if (control_observer_) control_observer_->native_protocol(group, message.at("record"), timeline_.now_ns());
+        return nullptr;
+    }
     auto result = participant.resources.call(message, inputs_.at(instances_.at(group)).delivery.delivered());
 
     // Another participant may write this pool before its owner's next action; do not defer invalidation to that action.
     const auto changes = participant.resources.take_changes();
     participant.dependencies.invalidate(changes);
+    auto & input = inputs_.at(instances_.at(group));
+    if (changes.capacity_increased) input.woken = true;
     if (observer_) observer_->applied(group, message, result, changes, timeline_.now_ns());
     return result;
 }
@@ -380,7 +444,7 @@ bool NativeController::notify(std::size_t event) {
     if (notification != notices_.end()) {
         const auto & notice = notification->second;
         if (control_observer_) control_observer_->notification_ready(notice.identity, event, notice.prerequisites, timeline_.now_ns());
-        reply(*notice.call, nullptr);
+        reply(*notice.call, { { "event", event } });
         released = true;
     }
 
@@ -397,14 +461,16 @@ void NativeController::finish(const ServingAction & action, std::size_t returned
                               const std::map<std::string, StorageBinding> & values) {
     const auto call = running_calls_.at(action.task);
     auto & completed = completed_.at(action.task.group);
+    auto & input = inputs_.at(instances_.at(action.task.group));
     for (const auto & output : action.outputs) {
         const auto request = output.at("request").get<std::size_t>();
-        if (!inputs_.at(instances_.at(action.task.group)).delivery.delivered().contains(request))
+        if (!input.delivery.delivered().contains(request))
             throw std::invalid_argument("native action published an undelivered request");
 
         // Publishing a final token can precede native resource cleanup and the result call's return.
         if (!output.at("emits_output").get<bool>() && output.at("finished").get<bool>()) {
             if (!completed.insert(request).second) throw std::invalid_argument("native action completed a request twice");
+            input.woken = true;
             release_notifications(request);
         }
     }
@@ -425,7 +491,6 @@ void NativeController::finish(const ServingAction & action, std::size_t returned
     if (control_observer_) returned["observation"] = returned_event;
     reply(call, returned);
     running_calls_.erase(action.task);
-    inputs_.at(instances_.at(action.task.group)).action_progress = true;
 }
 
 std::optional<std::int64_t> NativeController::next_wakeup_ns(std::int64_t now_ns) const {

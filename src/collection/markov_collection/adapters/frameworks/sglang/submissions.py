@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import Any
 
 from markov_workload import WorkloadContent
+from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
 
 
 class EngineSubmissions:
@@ -58,14 +59,15 @@ class EngineSubmissions:
                     )
                 self.submissions[-1].append((payload, {"group": group, "arrival_ns": arrival, "requests": indices}))
 
-    async def run(self, endpoint: Any, clock: Any, barrier: Any) -> None:
+    async def run(self, endpoint: Any, clock: Any, barrier: Any, directory, ranks) -> None:
         origin_ns = clock.origin.value
         records = [record for group in self.submissions for _, record in group]
         self.delivery = [{"clock": "monotonic_raw_ns", "origin_ns": origin_ns, "submissions": records}]
         for index, group in enumerate(self.submissions):
             if index:
 
-                # Prefill may return before Decode; both instances finish the group before sharing its successor's clock.
+                # Worker idle, not client completion, closes a group; both PD instances join before advancing time.
+                await asyncio.to_thread(ObservationWindow.wait, directory, ranks, "source", f"group/{index - 1}")
                 barrier.wait()
             offset_ns = clock.origin.value - origin_ns
             for _, record in group:

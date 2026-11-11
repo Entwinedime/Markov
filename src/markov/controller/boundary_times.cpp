@@ -8,24 +8,43 @@
 namespace markov {
 
 nlohmann::json ControlBoundaryTimes::identity(const std::string & group, const std::string & action, const Parameters & parameters,
-                                              const nlohmann::json & work) {
+                                              const nlohmann::json & work, std::string_view basis) {
     const auto & context = work.at("context");
-    const auto callers = work.value("callers", nlohmann::json::array());
+    auto callers = work.value("callers", nlohmann::json::array());
     const auto continuation = work.value("continuation", nlohmann::json());
-    if (group.empty() || action.empty() || !context.is_object() || !callers.is_array()
-        || (!continuation.is_null() && !continuation.is_object()))
+    const auto observation_context = work.value("observation_context", nlohmann::json());
+    auto members = work.value("members", nlohmann::json::array());
+    if (group.empty() || action.empty() || !context.is_object() || !callers.is_array() || !members.is_array()
+        || (!continuation.is_null() && !continuation.is_object())
+        || (!observation_context.is_null() && !observation_context.is_object()))
         throw std::invalid_argument("boundary timing requires a group, action and logical work context");
 
-    // Transport handles, physical pages and invocation ordinals are deliberately outside this identity.
-    return { { "group", group }, { "action", action }, { "parameters", parameters },
-             { "context", context }, { "callers", callers }, { "continuation", continuation } };
+    // Batch token ranges identify the submitted work even when its shared native request has advanced.
+    for (auto & member : members) member.erase("slot");
+
+    // Completion belongs to its producer; ancestors' scheduling snapshots do not change that work.
+    if (basis == "completion") {
+        for (auto & caller : callers) caller.erase("context");
+    }
+    auto result = nlohmann::json{
+        { "basis", basis }, { "group", group }, { "action", action }, { "parameters", parameters },
+        { "members", std::move(members) }, { "context", context }, { "callers", std::move(callers) }, { "continuation", continuation }
+    };
+
+    // A caller's return depends on placement; a declared completion belongs to its logical producer.
+    if (basis == "control") result["observation_context"] = observation_context;
+    return result;
 }
 
 ControlBoundaryTimes::ControlBoundaryTimes(const nlohmann::json & source) {
     if (source.contains("actions")) {
         for (const auto & record : source.at("actions").get_ref<const nlohmann::json::array_t &>()) {
+            const auto basis = record.at("basis").get<std::string>();
+            if (basis != "control" && basis != "completion") throw std::invalid_argument("unknown boundary timing basis: " + basis);
+            if (!record.at("work").contains("members"))
+                throw std::invalid_argument("boundary timing requires observed logical members; regenerate feedback from the native graph");
             const auto key = identity(record.at("group").get<std::string>(), record.at("action").get<std::string>(),
-                                      read_parameters(record.at("parameters")), record.at("work"));
+                                      read_parameters(record.at("parameters")), record.at("work"), basis);
             const auto count = read_parameters({ { "count", record.at("observed_calls") } }).at("count");
             if (count < 1) throw std::invalid_argument("boundary timing requires a positive observed call count");
 
@@ -90,40 +109,53 @@ std::optional<TimeWindow> ControlBoundaryTimes::notification(const nlohmann::jso
 }
 
 std::vector<BoundaryTime> ControlBoundaryTimes::take(const ServingAction & action, const CoarseGraph & graph) {
-    const auto key = identity(action.task.group, action.name, action.parameters, action.work);
-
-    // Sparse timing evidence cannot restrict the native controller's legal action paths.
-    auto & timing = timings_.try_emplace(key, ActionTimes{ {}, 0 }).first->second;
-
-    // Unknown or explicitly uncovered actions retain their graph and given durations.
-    if (timing.boundaries.empty()) {
-        ++timing.predicted_calls;
-        return {};
-    }
-    if (timing.predicted_calls != 0) throw std::invalid_argument("boundary timing consumed twice: " + key.dump());
     std::map<std::size_t, std::int64_t> times;
-    for (const auto & boundary : timing.boundaries) {
-        const auto event = graph.scopes.front().port(boundary.port, boundary.direction).event;
-        const auto [position, inserted] = times.emplace(event, boundary.time_ns);
+    const auto & root = graph.scopes.front();
+    const auto publishes_completion = std::ranges::any_of(root.ports, [](const auto & port) {
+        return port.use == PortUse::Signal && port.direction == Direction::Output;
+    });
+    for (const std::string_view basis : { "control", "completion" }) {
+        const auto key = identity(action.task.group, action.name, action.parameters, action.work, basis);
+        auto found = timings_.find(key);
 
-        // Several exported names may denote the same boundary, but cannot assign it different times.
-        if (!inserted && position->second != boundary.time_ns)
-            throw std::invalid_argument("conflicting times for aliased action ports: " + key.dump());
+        // Do not invent a missing completion for a call that publishes none; known records still need validation.
+        if (found == timings_.end()) {
+            if (basis == "completion" && !publishes_completion) continue;
+            found = timings_.emplace(key, ActionTimes{ {}, 0 }).first;
+        }
+        auto & timing = found->second;
+        if (!timing.boundaries.empty() && timing.predicted_calls != 0)
+            throw std::invalid_argument("boundary timing consumed twice: " + key.dump());
+        ++timing.predicted_calls;
+        for (const auto & boundary : timing.boundaries) {
+            const auto & port = root.port(boundary.port, boundary.direction);
+            if (port.direction != Direction::Output
+                || (basis == "control" ? port.name != "call.return" : port.use != PortUse::Signal))
+                throw std::invalid_argument("boundary port does not match its timing basis: " + key.dump());
+            const auto [position, inserted] = times.emplace(port.event, boundary.time_ns);
+
+            // Several exported names may denote the same boundary, but cannot assign it different times.
+            if (!inserted && position->second != boundary.time_ns)
+                throw std::invalid_argument("conflicting times for aliased action ports: " + key.dump());
+        }
     }
     std::vector<BoundaryTime> result;
     for (const auto & [event, time_ns] : times) result.push_back({ event, time_ns });
-    ++timing.predicted_calls;
-    ++actions_;
+    if (!result.empty()) ++actions_;
     events_ += result.size();
     return result;
 }
 
-std::optional<std::int64_t> ControlBoundaryTimes::input(const nlohmann::json & identity) {
+std::optional<std::int64_t> ControlBoundaryTimes::input(const nlohmann::json & identity) const {
+    const auto found = inputs_.find(identity);
+    return found == inputs_.end() ? std::nullopt : found->second.time_ns;
+}
+
+void ControlBoundaryTimes::input_completed(const nlohmann::json & identity) {
     auto & timing = inputs_[identity];
     if (timing.time_ns && timing.predicted_calls != 0)
         throw std::invalid_argument("input timing consumed twice: " + identity.dump());
     ++timing.predicted_calls;
-    return timing.time_ns;
 }
 
 nlohmann::json ControlBoundaryTimes::finish() const {

@@ -1,4 +1,4 @@
-"""Own selected-worker profiler publication, separately from semantic capture."""
+"""Own profiler publication and optional CPU protocol evidence."""
 
 from __future__ import annotations
 
@@ -6,17 +6,25 @@ import time
 from pathlib import Path
 from typing import Any
 
+from markov_collection.artifacts import write_json
+
 
 class NativeProfiles:
     def __init__(self, observation: Any) -> None:
         self.observation = observation
+        self.protocol = None
+        if observation.description["resource_trace"]:
+            from markov_collection.adapters.runtimes.pytorch.protocol import CpuProtocol
+
+            self.protocol = CpuProtocol(observation.capture.runtime, observation.description["native_participants"])
 
     @staticmethod
-    def wait(directory: Path, ranks) -> None:
+    def wait(directory: Path, ranks, participants) -> None:
         published = [directory / "native" / f"rank-{rank}" for rank in ranks]
+        protocols = [directory / "protocol" / f"rank-{rank}.json" for rank in participants]
 
         # A PP ingress reply can precede downstream profiler shutdown; rename is each worker's publication boundary.
-        while not all(path.is_dir() for path in published):
+        while not all(path.is_dir() for path in published) or not all(path.is_file() for path in protocols):
             time.sleep(0.05)
 
     def request(self, original: Any, manager: Any, request: Any) -> Any:
@@ -37,7 +45,13 @@ class NativeProfiles:
                 distributed.barrier(manager.dp_tp_cpu_group)
             result = ProfileReqOutput(success=True, message="Worker has no assigned observation")
         if request.req_type == ProfileReqType.START_PROFILE and result.success:
+            if self.protocol is not None:
+                self.protocol.begin()
             owner.window.prepared_phase = "profiler"
+        elif request.req_type == ProfileReqType.STOP_PROFILE and result.success and self.protocol is not None:
+
+            # Protocol facts cover every participant, including workers represented by another device profile.
+            write_json(owner.directory / "protocol" / f"rank-{owner.parallel['rank']}.json", self.protocol.document())
         return result
 
     def start(self, original: Any, manager: Any, output_dir: str, *args: Any, **kwargs: Any) -> Any:
@@ -62,6 +76,10 @@ class NativeProfiles:
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        if self.protocol is not None:
+            for target, hook in self.protocol.hooks():
+                HookRegistry.register(target, hook, HookType.AROUND)
 
         manager = "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager."
         targets = {

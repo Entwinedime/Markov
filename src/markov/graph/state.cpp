@@ -144,9 +144,12 @@ SlotAccess SlotAccess::read(const nlohmann::json & source) {
                        source.at("field").get<std::string>(),
                        state_access(source.at("access").get<std::string>()),
                        source.at("members").get<std::string>(),
-                       source.at("requests").get<std::vector<std::string>>() };
+                       source.at("requests").get<std::vector<std::string>>(),
+                       source.value("publication", std::string{}) };
     if (result.pool.empty() || result.field.empty() || result.members.empty())
         throw std::invalid_argument("slot access requires a pool, field and member binding");
+    if (!result.publication.empty() && result.access != StateAccess::Write)
+        throw std::invalid_argument("only slot writes can declare a replicated publication");
     std::set<std::string> seen;
     for (const auto & request : result.requests) {
         if (request.empty() || !seen.insert(request).second) throw std::invalid_argument("slot access repeats or omits a request identity");
@@ -155,7 +158,7 @@ SlotAccess SlotAccess::read(const nlohmann::json & source) {
 }
 
 nlohmann::json SlotAccess::document() const {
-    return {
+    nlohmann::json result{
         {    "space",                    "slot" },
         {     "pool",                      pool },
         {    "field",                     field },
@@ -163,6 +166,8 @@ nlohmann::json SlotAccess::document() const {
         {  "members",                   members },
         { "requests",                  requests }
     };
+    if (!publication.empty()) result["publication"] = publication;
+    return result;
 }
 
 } // namespace markov

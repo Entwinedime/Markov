@@ -42,10 +42,19 @@ template <class Function> Function driver_original(const char * name) {
     return reinterpret_cast<Function>(symbol);
 }
 
-std::int64_t raw_time_ns() {
+struct HostTimestamp {
+    std::uint64_t counter;
+    std::int64_t raw_ns;
+};
+
+HostTimestamp host_timestamp() {
+    std::uint64_t counter;
+
+    // Match the profiler's AArch64 counter for ordering; RAW remains a separately observed measurement.
+    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(counter) : : "memory");
     timespec now;
     clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
+    return { counter, static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec };
 }
 
 void append_record(const char * directory, const char * record, int size, std::size_t capacity) {
@@ -66,21 +75,24 @@ public:
     explicit DriverQueueCall(const char * name, bool lifecycle = false)
         : directory_(lifecycle || runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
-          begin_ns_(directory_ == nullptr ? 0 : raw_time_ns()) {}
+          begin_(directory_ == nullptr ? HostTimestamp{} : host_timestamp()) {}
 
     drvError_t finish(drvError_t result, std::uint32_t device, std::uint32_t system, std::uint32_t queue, std::uint32_t stream = 0) const {
         if (directory_ == nullptr) return result;
 
-        const auto end_ns = raw_time_ns();
+        const auto end = host_timestamp();
         char record[512];
         const auto size = std::snprintf(record,
                                         sizeof(record),
-                                        "{\"api\":\"%s\",\"thread\":%ld,\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
+                                        "{\"api\":\"%s\",\"thread\":%ld,\"begin_counter\":%llu,\"end_counter\":%llu,"
+                                        "\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
                                         "\"device\":%u,\"task_system\":%u,\"queue\":%u,\"stream\":%u,\"service\":%lld,\"result\":%d}\n",
                                         name_,
                                         syscall(SYS_gettid),
-                                        static_cast<long long>(begin_ns_),
-                                        static_cast<long long>(end_ns),
+                                        static_cast<unsigned long long>(begin_.counter),
+                                        static_cast<unsigned long long>(end.counter),
+                                        static_cast<long long>(begin_.raw_ns),
+                                        static_cast<long long>(end.raw_ns),
                                         device,
                                         system,
                                         queue,
@@ -94,7 +106,7 @@ public:
 private:
     const char * directory_;
     const char * name_;
-    std::int64_t begin_ns_;
+    HostTimestamp begin_;
 };
 
 class RuntimeCall {
@@ -113,24 +125,27 @@ public:
         if (has_stream) stream_status_ = get_stream(stream, &stream_);
 
         // Exclude observer-side identity lookup from the measured native call interval.
-        begin_ns_ = raw_time_ns();
+        begin_ = host_timestamp();
     }
 
     aclError finish(aclError result, aclrtEvent created = nullptr) const {
         if (directory_ == nullptr) return result;
 
-        const auto end_ns = raw_time_ns();
+        const auto end = host_timestamp();
 
         char record[512];
         const auto size = std::snprintf(record,
                                         sizeof(record),
-                                        "{\"api\":\"%s\",\"thread\":%ld,\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
+                                        "{\"api\":\"%s\",\"thread\":%ld,\"begin_counter\":%llu,\"end_counter\":%llu,"
+                                        "\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
                                         "\"device\":%d,\"device_status\":%d,\"stream\":%d,\"stream_status\":%d,"
                                         "\"bytes\":%zu,\"direction\":%d,\"event\":\"%llx\",\"result\":%d}\n",
                                         name_,
                                         syscall(SYS_gettid),
-                                        static_cast<long long>(begin_ns_),
-                                        static_cast<long long>(end_ns),
+                                        static_cast<unsigned long long>(begin_.counter),
+                                        static_cast<unsigned long long>(end.counter),
+                                        static_cast<long long>(begin_.raw_ns),
+                                        static_cast<long long>(end.raw_ns),
                                         device_,
                                         device_status_,
                                         stream_,
@@ -155,10 +170,16 @@ private:
     std::int32_t stream_ = -1;
     aclError device_status_ = -1;
     aclError stream_status_ = -1;
-    std::int64_t begin_ns_ = 0;
+    HostTimestamp begin_{};
 };
 
 } // namespace
+
+extern "C" void markov_sample_host(std::uint64_t * values) {
+    const auto sample = host_timestamp();
+    values[0] = sample.counter;
+    values[1] = static_cast<std::uint64_t>(sample.raw_ns);
+}
 
 extern "C" void markov_set_runtime_enabled(int enabled) { runtime_enabled.store(enabled != 0, std::memory_order_relaxed); }
 

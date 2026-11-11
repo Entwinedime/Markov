@@ -73,7 +73,7 @@ class NativeCommunications:
                 with owner.tensors.metadata():
                     parent_output = list(parent_shape)
                     parent_output[dim] = ["mul", group.world_size, parent_shape[dim]]
-                    owner.tensors.declare_shape(result, parent_output)
+                    owner.tensors.declare_shape(result, parent_output, scope=call.identity if standalone else call.record["parent"])
             return result
 
     def distributed(self, signature, original, *args, **kwargs):

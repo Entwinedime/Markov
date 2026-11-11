@@ -280,20 +280,21 @@ class SGLangObservation:
     def result_port(self, call: Any, output: Any, direction: str) -> None:
         tensor = output.next_token_ids
         if tensor is not None:
-            use = "host" if tensor.device.type == "cpu" else "device"
-            call.port("next_token_ids", direction, self.tensors.observe(tensor, ["members"]), use=use)
+
+            # Result processing materializes tokens on the CPU; readiness gates the completed read.
+            use = "host" if direction == "input" or tensor.device.type == "cpu" else "device"
+            call.port(
+                "next_token_ids", direction, self.tensors.observe(tensor, ["members"]), use=use, at_return=direction == "input",
+            )
 
         proxy = output.pp_hidden_states_proxy_tensors
-        if proxy is not None:
+        if direction == "output" and proxy is not None:
             for name, tensor in PipelineABI.proxy_tensors(proxy).items():
                 rule = self.tensors.shape_rule(tensor)
                 call.port(f"proxy.{name}", direction, self.tensors.observe(tensor, rule), use="device")
 
-    def pending(self, scheduler: Any) -> bool:
-        return self.description["pp_size"] > 1 and bool(scheduler.send_proxy_work or scheduler.send_output_work)
-
     def can_flush(self) -> bool:
-        if not self.scheduler.is_fully_idle() or self.pending(self.scheduler):
+        if not self.scheduler.is_fully_idle() or PipelineABI.pending_model_sends(self.scheduler):
             return False
 
         # Input dispatch may be mid-pipeline round; only on_idle closes the observed control flow.
@@ -304,9 +305,12 @@ class SGLangObservation:
         original(wrapper, flush_cache=flush_cache, is_fully_idle=self.can_flush, ipc_channels=ipc_channels)
 
     def drain(self, scheduler: Any) -> None:
-        if not self.window.inputs_complete() or self.window.drained or self.pending(scheduler):
+        if PipelineABI.pending_model_sends(scheduler):
             return
         if not scheduler.is_fully_idle() or self.capture.current.get() != 0:
+            return
+        self.window.group_idle(self.parallel["rank"])
+        if not self.window.inputs_complete() or self.window.drained:
             return
         import torch
 
@@ -357,6 +361,7 @@ class SGLangObservation:
                         recording["environment"][name] = role[name]
                 recording["request_receipts"] = self.window.receipts
                 recording["device_clock"] = self.capture.runtime.clock_samples
+                recording["host_observation"] = self.capture.runtime.host_observation()
                 recording["request_receive_rounds"] = self.window.receive_rounds
                 recording["request_ingress"] = self.window.ingress
                 recording["state_queries"] = self.calls.queries
@@ -378,13 +383,6 @@ class SGLangObservation:
                 self.window.complete(self.parallel["rank"], scheduler.idle_sleeper is not None)
         return original(scheduler)
 
-    def sleep(self, original: Any, sleeper: Any) -> None:
-        if self.window.prepared_phase is not None or self.pending(self.scheduler):
-            return
-
-        # Preserve warmed allocation caches while waiting for the next phase, outside observed serving work.
-        sleeper.poller.poll()
-
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -392,6 +390,7 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.profiles import NativeProfiles
         from markov_collection.adapters.frameworks.sglang.kv_scopes import NativeKvScopes
         from markov_collection.adapters.frameworks.sglang.flow_scopes import FlowScopes
+        from markov_adapters.sglang.metadata_transfers import MetadataTransfers
 
         targets = {
             "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.load_model,
@@ -403,7 +402,6 @@ class SGLangObservation:
             "sglang.srt.model_executor.model_runner.ModelRunner.sample": self.sample,
             "sglang.srt.managers.scheduler.Scheduler.flush_cache": self.flush,
             "sglang.srt.managers.scheduler.Scheduler.on_idle": self.idle,
-            "sglang.srt.managers.scheduler_components.idle_sleeper.IdleSleeper.maybe_sleep": self.sleep,
             "sglang.srt.managers.scheduler_components.flush_wrapper.SchedulerFlushWrapper.__init__": self.flush_wrapper,
         }
         for target, hook in targets.items():
@@ -423,6 +421,9 @@ class SGLangObservation:
         self.content.install()
         if self.routing is not None:
             self.routing.install()
+
+        # The caller fragment must close before the runtime measures or blocks on CPU metadata.
+        MetadataTransfers(self.calls).install()
 
 
 def install() -> None:

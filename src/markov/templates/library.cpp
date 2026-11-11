@@ -120,7 +120,8 @@ TemplateDefinition TemplateDefinition::read(const nlohmann::json & source) {
                                          state_access(access.at("access").get<std::string>()),
                                          access.at("members").get<std::string>(),
                                          TemplateReference::read(access.at("start")),
-                                         TemplateReference::read(access.at("finish")) });
+                                         TemplateReference::read(access.at("finish")),
+                                         access.value("publication", std::string{}) });
     for (const auto & access : source.at("kv_accesses").get_ref<const nlohmann::json::array_t &>())
         result.kv_accesses.push_back({ access.at("pool").get<std::string>(),
                                        state_access(access.at("access").get<std::string>()),
@@ -184,7 +185,7 @@ nlohmann::json TemplateDefinition::document() const {
         {       "children", nlohmann::json::array() }
     };
     result["slot_accesses"] = nlohmann::json::array();
-    for (const auto & access : slot_accesses)
+    for (const auto & access : slot_accesses) {
         result["slot_accesses"].push_back({
             {    "pool",                      access.pool },
             {   "field",                     access.field },
@@ -193,6 +194,8 @@ nlohmann::json TemplateDefinition::document() const {
             {   "start",          access.start.document() },
             {  "finish",         access.finish.document() }
         });
+        if (!access.publication.empty()) result["slot_accesses"].back()["publication"] = access.publication;
+    }
     result["kv_accesses"] = nlohmann::json::array();
     for (const auto & endpoint : exports) result["exports"].push_back(endpoint.document());
     for (const auto & access : kv_accesses)

@@ -14,6 +14,7 @@ from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_mod
 from torch.utils.weak import WeakIdKeyDictionary
 
 from markov_collection.instrumentation.capture import SemanticCapture
+from markov_collection.instrumentation.parameters import ScopeParameters
 
 
 @dataclass
@@ -31,6 +32,7 @@ class TensorBoundaries(TorchDispatchMode):
     def __init__(self, capture: SemanticCapture) -> None:
         super().__init__()
         self.capture = capture
+        self.parameters = ScopeParameters(capture.scopes)
         self.tensors: Any = WeakIdKeyDictionary()
         self.shapes: Any = WeakIdKeyDictionary()
         self.storages: dict[tuple[int, str | None], StorageBoundary] = {}
@@ -74,18 +76,25 @@ class TensorBoundaries(TorchDispatchMode):
             raise ValueError("native buffer aliases require one declared storage owner")
         storage.buffer = name
 
-    def declare_shape(self, tensor: torch.Tensor, rule: list[Any]) -> None:
+    def declare_shape(self, tensor: torch.Tensor, rule: list[Any], *, scope: int | None = None) -> None:
         if len(rule) != tensor.ndim:
             raise ValueError("declared boundary geometry has a different rank from the native tensor")
-        self.shapes[tensor] = tuple(tensor.shape), list(rule)
+        scope = self.capture.current.get() if scope is None else scope
+        self.shapes[tensor] = tuple(tensor.shape), self.parameters.bind(rule, scope)
 
-    def shape_rule(self, tensor: torch.Tensor) -> list[Any]:
+    def declared_shape(self, tensor: torch.Tensor) -> list[Any] | None:
         declared = self.shapes.get(tensor)
         if declared is None:
-            raise ValueError("collective input needs a shape relation from its producer boundary")
+            return None
         observed, rule = declared
         if observed != tuple(tensor.shape):
             raise ValueError("tensor geometry changed after its boundary declaration")
+        return self.parameters.local(rule, self.capture.current.get())
+
+    def shape_rule(self, tensor: torch.Tensor) -> list[Any]:
+        rule = self.declared_shape(tensor)
+        if rule is None:
+            raise ValueError("boundary needs a shape relation from its producer")
         return rule
 
     def observe(self, tensor: torch.Tensor, shape: list[Any] | None, *, region: str | None = None) -> dict[str, Any]:

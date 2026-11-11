@@ -33,13 +33,59 @@ private:
 
 } // namespace
 
+std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition & definition, TemplateEntry entry,
+                                                     std::span<const std::size_t> recipient_resources) {
+    if (!definition.children.empty() || !definition.imports.empty() || !definition.kv_accesses.empty() || !definition.slot_accesses.empty()
+        || entry.frame.communication || !entry.frame.bindings.empty())
+        return std::nullopt;
+    for (const auto & tensor : entry.frame.tensors) {
+        if (tensor && (!tensor->buffer.empty() || (tensor->external && tensor->writer))) return std::nullopt;
+    }
+    for (const auto & port : definition.ports) {
+        if (port.use == PortUse::Signal || port.rendezvous) return std::nullopt;
+    }
+
+    // The adapter supplies the recipient lane; roles must be unique within it, including their original aliases.
+    const auto original_resources = entry.frame.resources;
+    entry.frame.resources.clear();
+    for (const auto & slot : definition.resources) {
+        std::vector<std::size_t> matches;
+        for (const auto index : recipient_resources) {
+            const auto & resource = resources.at(index);
+            if (resource.kind == slot.kind && resource.role == slot.role && resource.serial == slot.serial) matches.push_back(index);
+        }
+        if (matches.size() != 1) return std::nullopt;
+        entry.frame.resources.push_back(matches.front());
+    }
+    for (std::size_t left = 0; left < original_resources.size(); ++left) {
+        for (std::size_t right = 0; right < left; ++right) {
+            if ((original_resources[left] == original_resources[right]) != (entry.frame.resources[left] == entry.frame.resources[right]))
+                return std::nullopt;
+        }
+    }
+
+    const auto document = definition.document();
+    const auto found = std::ranges::find_if(definitions, [&](const auto & body) { return body.document() == document; });
+    entry.frame.definition = static_cast<std::size_t>(found - definitions.begin());
+    const auto frame = entry.frame.document();
+    for (const auto & existing : entries) {
+        if (existing.action == entry.action && existing.condition == entry.condition && existing.frame.document() == frame) return std::nullopt;
+    }
+    if (found == definitions.end()) definitions.push_back(definition);
+
+    // Imported calls were observed in another library, not at this recipient's scope numbers.
+    entry.observations.clear();
+    entries.push_back(std::move(entry));
+    return entries.size() - 1;
+}
+
 nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, const std::vector<std::size_t> & position) const {
     const auto & body = definitions.at(frame.definition);
     if (position.empty() || !frame.bindings.contains("local_implementation") || !body.children.empty() || !body.kv_accesses.empty()
         || !body.slot_accesses.empty())
         return nullptr;
     for (const auto & port : body.ports) {
-        if (port.wait || port.use == PortUse::Signal) return nullptr;
+        if (port.use == PortUse::Signal) return nullptr;
     }
 
     const auto event = [&](const TemplateReference & reference) { return reference.event + (reference.imported ? 0 : body.imports.size()); };
@@ -61,6 +107,12 @@ nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, cons
         if (port.rendezvous) {
             boundaries.push_back(event(*port.rendezvous));
             slots.push_back(resource(*port.rendezvous));
+        }
+        if (port.wait) {
+
+            // A replacement must wait on the same stream frontier at the same position in its caller-visible order.
+            boundaries.push_back(event(port.wait->begin));
+            slots.push_back(resource(port.wait->begin));
         }
     }
 
@@ -108,6 +160,7 @@ nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, cons
         for (const auto rank : group.required) required.push_back(member(rank));
         communication = { { "operation", group.operation }, { "size", group.members.size() }, { "rank", member(group.rank) },
                           { "required", std::move(required) } };
+        if (!group.agreements.empty()) communication["agreements"] = group.document().at("agreements");
     }
     return { { "interface", call_interface(frame).document() }, { "slots", slots }, { "causality", std::move(causality) },
              { "bindings", frame.bindings }, { "constants", frame.constants }, { "tensors", std::move(tensors) },
@@ -121,15 +174,17 @@ void TemplateLibrary::collect_local_implementations() {
     for (const auto & entry : entries) collection.add(entry.frame, position);
 }
 
-void TemplateLibrary::link_local_implementations(std::span<TemplateLibrary> libraries) {
+void TemplateLibrary::link_local_implementations(std::span<TemplateLibrary *> libraries) {
     using Key = std::pair<nlohmann::json, nlohmann::json>;
     std::map<Key, std::vector<std::pair<TemplateDefinition, Expression>>> candidates;
-    for (const auto & library : libraries) {
+    for (const auto * source : libraries) {
+        const auto & library = *source;
         for (const auto & local : library.implementations)
             candidates[{ library.local_domain, local.contract }].emplace_back(library.definitions.at(local.definition), local.guard);
     }
 
-    for (auto & library : libraries) {
+    for (auto * target : libraries) {
+        auto & library = *target;
         std::set<nlohmann::json> contracts;
         for (const auto & local : library.implementations) contracts.insert(local.contract);
         std::map<nlohmann::json, std::size_t> definitions;

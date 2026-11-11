@@ -3,20 +3,18 @@
 from contextlib import contextmanager
 
 import torch
+from markov_adapters.sglang.allocation import AllocationABI
 from markov_adapters.sglang.kv_layout import MhaKvLayout
 from markov_control.peer import ControlPeer
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 
-class AllocationCalls:
-    def __init__(self, schedule_batch) -> None:
-        self.extend = schedule_batch.alloc_for_extend
-        self.decode = schedule_batch.alloc_for_decode
-        schedule_batch.alloc_for_extend = self.for_extend
-        schedule_batch.alloc_for_decode = self.for_decode
-
+class AllocationDemand:
+    def __init__(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+        for method, hook in (("alloc_for_extend", self.for_extend), ("alloc_for_decode", self.for_decode)):
+            HookRegistry.register("sglang.srt.mem_cache.common." + method, hook, HookType.AROUND)
         HookRegistry.register(
             "sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc",
             self.preallocate, HookType.AROUND,
@@ -34,13 +32,13 @@ class AllocationCalls:
         finally:
             allocator.demand = None
 
-    def for_extend(self, batch):
+    def for_extend(self, original, batch):
         with self.demand(batch.token_to_kv_pool_allocator, batch.reqs, batch.extend_lens):
-            return self.extend(batch)
+            return original(batch)
 
-    def for_decode(self, batch, token_per_req):
+    def for_decode(self, original, batch, token_per_req):
         with self.demand(batch.token_to_kv_pool_allocator, batch.reqs, [token_per_req] * len(batch.reqs)):
-            return self.decode(batch, token_per_req)
+            return original(batch, token_per_req)
 
     def preallocate(self, original, queue, req, prefix_indices=None, prefix_len=None, total_prefix_len=None):
         prefix_len = 0 if prefix_len is None else prefix_len
@@ -73,7 +71,7 @@ class RequestSlots:
         self.req_to_token = torch.zeros((self._alloc_size, context), dtype=torch.int32)
 
     def available_size(self):
-        return self.peer.call("capacity")["slots"]
+        return self.peer.call("capacity", resource="slots")
 
     @property
     def free_slots(self):
@@ -153,8 +151,9 @@ class PageAllocator:
     free_group_begin = BaseTokenToKVPoolAllocator.free_group_begin
     free_group_end = BaseTokenToKVPoolAllocator.free_group_end
 
-    def __init__(self, peer: ControlPeer, size: int, page_size: int, layout) -> None:
+    def __init__(self, peer: ControlPeer, size: int, page_size: int, layout, implementation: str) -> None:
         self.peer = peer
+        self._markov_allocation = AllocationABI(implementation)
         self.size = size
         self.page_size = page_size
         self.device = "cpu"
@@ -164,32 +163,56 @@ class PageAllocator:
         self.demand = None
 
     def available_size(self):
-        return self.peer.call("capacity")["pages"] * self.page_size
+        return self.peer.call("capacity", resource="pages") * self.page_size
 
     def get_kvcache(self):
         return self.storage
 
-    def allocate(self):
-        bindings = self.peer.call("allocate", members=self.demand)
+    def reserve(self):
+        allocation = self.peer.call("allocate", members=self.demand)
+        if allocation["ordering"] is not None:
+            self.merge_and_sort_free(allocation["ordering"])
+        return allocation["members"]
+
+    def merge_and_sort_free(self, ordering):
+
+        # The core already ordered the pages; ResourceCalls exposes this native operation's execution graph.
+        return None
+
+    def allocate(self, dtype):
+        return self.indices(self.reserve(), dtype)
+
+    def indices(self, bindings, dtype):
 
         # SGLang reserves physical page zero; the core uses zero-based page identities.
         indices = [index + self.page_size for binding in bindings for index in binding["indices"]]
-        return torch.tensor(indices, dtype=torch.int64)
+        return torch.tensor(indices, dtype=dtype)
 
     def page_indices(self, pages):
         starts = (torch.tensor(pages, dtype=torch.int64) + 1) * self.page_size
         return (starts[:, None] + torch.arange(self.page_size, dtype=torch.int64)).flatten()
 
     def alloc(self, need_size):
-        return self.allocate()
+        return self.allocate(torch.int64)
 
     def alloc_extend(
         self, prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, extend_num_tokens, num_new_pages=None
     ):
-        return self.allocate()
+        from sglang.srt.mem_cache.allocator import alloc_extend_naive
+
+        # The declared NPU allocator returns int32 from its paged entry points, unlike alloc().
+        bindings = self.reserve()
+        result = self.indices(bindings, torch.int32)
+        pages = [page + 1 for binding in bindings for page in binding["new_pages"]]
+        if self._markov_allocation.extend_branch(len(pages)) == "extend_naive":
+
+            # Replay only index computation over core-owned pages; the helper never allocates or frees them.
+            free_pages = torch.tensor(pages, dtype=torch.int64)
+            alloc_extend_naive(prefix_lens, seq_lens, last_loc, free_pages, result, self.page_size, "cpu")
+        return result
 
     def alloc_decode(self, seq_lens, seq_lens_cpu, last_loc):
-        return self.allocate()
+        return self.allocate(torch.int32)
 
     def free(self, indices):
         if indices.numel() == 0:

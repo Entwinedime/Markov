@@ -1,4 +1,4 @@
-"""Calibrate device counter time against host RAW time outside the observation window."""
+"""Recover SDK counters for ordering and calibrate measured device time independently."""
 
 from __future__ import annotations
 
@@ -77,3 +77,28 @@ class AscendClock:
     def interval(self, record: dict) -> tuple[int, int]:
         begin = Decimal(str(record["ts"]))
         return self.timestamp(begin), self.timestamp(begin + Decimal(str(record["dur"])))
+
+
+class HostCounter:
+    def __init__(self, profile: Path) -> None:
+        start, = profile.glob("PROF_*/host/start_info")
+        host, = profile.glob("PROF_*/host/host_start.log")
+        device, = profile.glob("PROF_*/device_*")
+        info = device / f"info.json.{device.name.removeprefix('device_')}"
+        start = json.loads(start.read_text())
+        anchor = AscendClock.values(host)
+        info = json.loads(info.read_text())
+        self.frequency = Decimal(info["CPU"][0]["Frequency"]) * 1_000_000
+        self.anchor = anchor["cntvct"]
+        self.framework_raw = anchor["clock_monotonic_raw"]
+        self.cann_raw = self.framework_raw + round(Decimal(anchor["cntvct_diff"]) * 1_000_000_000 / self.frequency)
+        self.offset = Decimal(start["collectionTimeBegin"]) * 1000 - int(start["clockMonotonicRaw"])
+
+    def interval(self, record):
+
+        # Preserve the export's integer wall/RAW offset; float epoch subtraction loses counter ticks.
+        framework = record.get("cat") in {"cpu_op", "enqueue", "dequeue"}
+        anchor = self.framework_raw if framework else self.cann_raw
+        begin = Decimal(str(record["ts"])) * 1000
+        end = begin + Decimal(str(record["dur"])) * 1000
+        return tuple(self.anchor + round((value - self.offset - anchor) * self.frequency / 1_000_000_000) for value in (begin, end))

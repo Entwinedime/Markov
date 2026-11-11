@@ -169,7 +169,14 @@ void CoarseGraph::validate() const {
         if ((scope == 0 && parent) || (scope != 0 && (!parent || *parent >= scope)))
             throw std::invalid_argument("graph scopes require one root and parents before children");
 
-        if (scopes[scope].communication) scopes[scope].communication->validate();
+        if (scopes[scope].communication) {
+            scopes[scope].communication->validate();
+            for (const auto & field : scopes[scope].communication->agreements) {
+                const auto & port = scopes[scope].port(field.port, field.direction);
+                if ((port.use != PortUse::Data && port.use != PortUse::Metadata) || !port.tensor)
+                    throw std::invalid_argument("communication payload agreement requires a tensor port");
+            }
+        }
         std::size_t rendezvous = 0;
         std::set<std::pair<Direction, std::string>> ports;
         for (const auto & port : scopes[scope].ports) {

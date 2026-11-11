@@ -40,9 +40,15 @@ struct KvReservation {
     std::vector<std::size_t> new_pages;
 };
 
+struct PageOrdering {
+    std::int64_t ready_pages;
+    std::int64_t released_pages;
+};
+
 struct KvAllocation {
     std::vector<KvReservation> members;
     std::int64_t allocated_pages = 0;
+    std::optional<PageOrdering> ordering;
 };
 
 // Shared resource ownership is independent of control policy and request progress.

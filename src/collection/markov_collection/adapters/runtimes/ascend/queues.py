@@ -25,10 +25,16 @@ class NativeQueues:
                 calls[native.thread, stream].append(native)
         self.calls = {key: ([call.begin for call in values], values) for key, values in calls.items()}
 
-    def window(self, api, stream: int) -> tuple[int, int]:
-        starts, calls = self.calls[api.thread, stream]
+    def inside(self, api, stream: int) -> list:
+        starts, calls = self.calls.get((api.thread, stream), ([], []))
         selected = calls[bisect_left(starts, api.begin):bisect_right(starts, api.end)]
-        if not selected or any(call.end > api.end for call in selected):
+        if any(call.end > api.end for call in selected):
+            raise ValueError("native queue submission crosses its enclosing API boundary")
+        return selected
+
+    def window(self, api, stream: int) -> tuple[int, int]:
+        selected = self.inside(api, stream)
+        if not selected:
             raise ValueError("SDK command group lacks contained native queue submissions")
 
         # A launch wrapper can include a later synchronization; its return is not the device submission boundary.
@@ -41,16 +47,22 @@ class ServiceExecution:
     thread: int
     begin: int
     end: int
-    stream: int | None = None
 
 
 class ServiceExecutions:
     def __init__(self, scopes: list[dict], queues: NativeQueues) -> None:
+        owners = {scope["id"]: scope for scope in scopes}
         self.executions = [
-            ServiceExecution(scope["id"], call["thread"], call["begin_raw_ns"], call["end_raw_ns"])
+            ServiceExecution(scope["id"], call["thread"], call["begin_counter"], call["end_counter"])
             for scope in scopes for call in scope["service"]["executions"]
         ]
+        for call in self.executions:
+            interval = owners[call.scope]["host_interval"]
+            if not interval["begin_counter"] <= call.begin <= call.end <= interval["end_counter"]:
+                raise ValueError("transport execution escapes its synchronous service boundary")
         self.submissions = {}
+        queue_owners = {}
+        submitted = set()
         for stream, native in queues.submissions:
             row = native.record
             if row["service"] < 0:
@@ -63,13 +75,16 @@ class ServiceExecutions:
             if len(matches) != 1:
                 raise ValueError("native queue submission lacks one explicit service execution")
             (index, call), = matches
-            if call.stream is not None and call.stream != stream:
-                raise ValueError("one service execution uses multiple queues; separate completion boundaries are required")
-            call.stream = stream
+
+            # Shared queues must remain ordered by the caller thread retained in the coarse graph.
+            owner = owners[call.scope]["thread"]
+            if queue_owners.setdefault(stream, owner) != owner:
+                raise ValueError("transport queue crosses service callers; its ordering requires an explicit interface")
+            submitted.add(index)
             self.submissions.setdefault(stream, []).append((native, index))
 
-        self.streams = {call.stream for call in self.executions}
-        if None in self.streams:
+        self.streams = set(self.submissions)
+        if len(submitted) != len(self.executions):
             raise ValueError("transport execution has no native queue submission evidence")
         if any(stream in self.streams and native.record["service"] < 0 for stream, native in queues.submissions):
             raise ValueError("a transport queue also carries work outside its declared services")
@@ -88,4 +103,4 @@ class ServiceExecutions:
             if len(payload) != len(submissions):
                 raise ValueError(f"private queue {stream} submission/task coverage differs: {len(submissions)}/{len(payload)}")
             for task, (_, execution) in zip(payload, submissions, strict=True):
-                task.service = execution
+                task.service = self.executions[execution].scope

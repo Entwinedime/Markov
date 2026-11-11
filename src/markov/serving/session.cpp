@@ -105,6 +105,7 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ControlBoundaryTi
         {          "actions",                  actions },
         { "completed_events",              event_count },
         {   "work_intervals",               work_count },
+        { "communication_payloads", communication.payload_coverage() },
         {         "requests", control_.request_count() },
         {       "free_pages",    control_.free_pages() },
         {          "outputs",       std::move(outputs) }

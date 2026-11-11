@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import time
+import traceback
 from multiprocessing.connection import wait
 from pathlib import Path
 
@@ -38,9 +39,14 @@ class NativeServingSession:
     def execute(instance, barrier, clock, bootstrap, connection):
 
         # Each Engine owns descendants; cancellation must also stop that instance's native workers.
-        os.setsid()
         try:
-            connection.send(instance.run(barrier, clock, bootstrap))
+            os.setsid()
+            connection.send((True, instance.run(barrier, clock, bootstrap)))
+        except BaseException:
+
+            # Keep the traceback available before EOF lets the owner cancel this process group.
+            connection.send((False, traceback.format_exc()))
+            raise
         finally:
             connection.close()
 
@@ -73,7 +79,14 @@ class NativeServingSession:
 
             while pending:
                 for connection in wait(pending):
-                    results[pending[connection]] = connection.recv()
+                    index = pending[connection]
+                    try:
+                        success, result = connection.recv()
+                    except EOFError as error:
+                        raise RuntimeError(f"native capture instance {index} exited without reporting a result") from error
+                    if not success:
+                        raise RuntimeError(f"native capture instance {index} failed:\n{result}")
+                    results[index] = result
                     del pending[connection]
                     connection.close()
             for process in processes:

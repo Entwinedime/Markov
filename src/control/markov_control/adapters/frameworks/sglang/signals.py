@@ -30,11 +30,13 @@ class PipelineSignals:
 
     def record(self, original, event, stream=None):
         result = original(event, stream)
+        if not self.scheduler.calls.enabled:
+            return result
         work = self.scheduler.pipeline_messages.signal_work(stream)
         identity = self.publish(event, work["context"])
         if not self.enclosing:
             work["signals"] = {"completion": identity}
-            self.scheduler.action("signal_record", {}, work)
+            self.scheduler.action("signal_record", {}, work, condition={"stream": work["context"]["record_stream"]})
         return result
 
     def publish(self, event, context):
@@ -53,11 +55,14 @@ class PipelineSignals:
         signal = event._markov_signal
         work = self.scheduler.pipeline_messages.wait_work(signal.context, device=device, stream=stream)
         work["signals"] = {"completion": signal.identity}
-        self.scheduler.action("signal_wait", {}, work, condition={"device_wait": device})
+        condition = {"device_wait": device}
+        if device:
+            condition["stream"] = work["context"]["wait_stream"]
+        self.scheduler.action("signal_wait", {}, work, condition=condition)
 
     def wait_stream(self, original, stream, other):
         result = original(stream, other)
-        if not self.enclosing:
+        if self.scheduler.calls.enabled and not self.enclosing:
             streams = PipelineABI.streams(self.scheduler, stream, other)
             work = self.scheduler.pipeline_messages.work()
             work["context"]["streams"] = streams
@@ -66,7 +71,7 @@ class PipelineSignals:
 
     def query(self, original, event):
         signal = getattr(event, "_markov_signal", None)
-        if signal is None:
+        if not self.scheduler.calls.enabled or signal is None:
             return original(event)
         work = self.scheduler.pipeline_messages.work()
         work["context"]["producer"] = signal.context
@@ -76,9 +81,13 @@ class PipelineSignals:
             return result
 
     def synchronize(self, original, event):
+        if not self.scheduler.calls.enabled or not hasattr(event, "_markov_signal"):
+            return original(event)
         self.wait(event, device=False)
 
     def wait_event(self, original, stream, event):
+        if not self.scheduler.calls.enabled or not hasattr(event, "_markov_signal"):
+            return original(stream, event)
         self.wait(event, device=True, stream=stream)
 
     def install(self):

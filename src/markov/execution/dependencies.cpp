@@ -41,7 +41,7 @@ bool GraphDependencies::Contents::covers(std::int64_t begin, std::int64_t end) c
 void GraphDependencies::Contents::commit(const std::set<Access> & accesses, std::span<const std::size_t> events) {
     const auto previous_ranges = initialized.size();
     for (const auto & access : accesses) {
-        active.push_back({ access.begin, access.end, access.write, events[access.start], events[access.finish] });
+        active.push_back({ access.begin, access.end, access.write, events[access.start], events[access.finish], access.publication });
         if (access.write) initialized.emplace_back(access.begin, access.end);
     }
     if (initialized.size() == previous_ranges) return;
@@ -79,7 +79,12 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
     std::map<Contents *, std::set<Access>> accesses;
     std::map<std::size_t, std::vector<std::pair<Contents *, Access>>> uninitialized;
     std::map<std::tuple<std::string, std::string, std::int64_t, std::int64_t>, std::vector<KvPageRange>> bindings;
+    std::map<std::tuple<std::string, std::string, std::string>, std::size_t> state_bindings;
     std::set<std::tuple<std::size_t, std::size_t, Relation>> dependencies;
+
+    // A successful read precedes subsequent work; it does not retroactively block the already returned query.
+    const auto entered = graph.scopes.front().port("call.enter", Direction::Input).event;
+    for (const auto event : observations_) dependencies.emplace(event, entered, Relation::Observation);
     for (const auto & port : graph.scopes.front().ports) {
         if (port.use != PortUse::Signal) continue;
         std::optional<std::size_t> producer;
@@ -104,8 +109,10 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
             auto & contents = tensors_[tensor.storage];
             const auto resource = graph.events[port.event].resource;
             if (port.direction == Direction::Input) {
-                const auto [start, finish] = interval(graph, scope, resource);
-                accesses[&contents].insert({ 0, 1, false, start, finish });
+
+                // The declared input boundary locates consumption, including a host read completed by return.
+                const auto finish = interval(graph, scope, resource).second;
+                accesses[&contents].insert({ 0, 1, false, port.event, finish });
                 if (!tensor.writer) {
                     const auto producer = values_.find(tensor.storage);
                     if (producer == values_.end() || producer->second.first != tensor.version)
@@ -124,9 +131,13 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
                 const auto slot = owner.resources_.slot(access.value.field, owner.requests_.at(request));
                 auto & contents = owner.slots_[{ slot, access.value.field }];
                 const bool write = access.value.access == StateAccess::Write;
-                const Access region{ 0, 1, write, access.start, access.finish };
+                Access region{ 0, 1, write, access.start, access.finish };
+                if (!access.value.publication.empty()) region.publication = { owner.requests_.at(request), access.value.publication };
                 accesses[&contents].insert(region);
                 if (!write && !contents.covers(0, 1)) uninitialized[access.start].emplace_back(&contents, region);
+
+                // Record the address actually used by execution once, without replaying field allocation for diagnostics.
+                if (observer_) state_bindings.try_emplace({ access.value.pool, access.value.field, request }, slot);
             }
         }
         for (const auto & access : node.kv_accesses) {
@@ -193,6 +204,9 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
         contents->prune(timeline);
         for (const auto & access : current) {
             for (const auto & previous : contents->active) {
+
+                // Equal publications carry the same value; readers and physical reuse still join every pending write.
+                if (access.write && previous.write && access.publication && access.publication == previous.publication) continue;
                 if ((access.write || previous.write) && access.begin < previous.end && previous.begin < access.end)
                     dependencies.emplace(previous.finish, access.start, Relation::State);
             }
@@ -201,15 +215,20 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
     std::vector<ExecutionInput> inputs;
     for (const auto & [source, target, relation] : dependencies) inputs.push_back({ source, target, relation });
     const auto events = timeline.insert(graph, durations, inputs, boundaries);
+    observations_.clear();
     for (const auto & [key, ranges] : bindings) {
         const auto & [pool, request, begin, end] = key;
         const auto & owner = *pools.at(pool);
-        observer_->bound(events.at(graph.scopes.front().port("call.enter", Direction::Input).event),
+        observer_->bound(events.at(entered),
                          pool,
                          request,
                          owner.pool_.residence(owner.requests_.at(request)).slot,
                          begin,
                          ranges);
+    }
+    for (const auto & [key, slot] : state_bindings) {
+        const auto & [pool, field, request] = key;
+        observer_->state_bound(events.at(entered), pool, field, request, slot);
     }
     for (auto & [contents, current] : accesses) contents->commit(current, events);
     for (const auto & port : graph.scopes.front().ports) {
@@ -225,6 +244,8 @@ std::optional<std::size_t> GraphDependencies::signal(const std::string & name) c
     return found == signals_.end() ? std::nullopt : std::optional(found->second);
 }
 
+void GraphDependencies::observe_completion(std::size_t event) { observations_.insert(event); }
+
 std::set<std::size_t> GraphDependencies::retain(const std::set<std::string> & bindings, const Timeline & timeline) {
     std::erase_if(values_, [&](const auto & value) { return !bindings.contains(value.first); });
     std::erase_if(signals_, [&](const auto & signal) { return !bindings.contains(signal.first); });
@@ -237,7 +258,7 @@ std::set<std::size_t> GraphDependencies::retain(const std::set<std::string> & bi
     for (auto & [_, contents] : slots_) contents.prune(timeline);
 
     // Active accesses finish in the future and the timeline keeps them; published values may already be complete.
-    std::set<std::size_t> retained;
+    std::set<std::size_t> retained = observations_;
     for (const auto & [_, value] : values_) retained.insert(value.second);
     for (const auto & [_, event] : signals_) retained.insert(event);
     return retained;

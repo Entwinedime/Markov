@@ -22,6 +22,7 @@ public:
                          std::int64_t time_ns) = 0;
     virtual void bound(std::size_t invocation, std::string_view pool, std::string_view request, std::optional<std::size_t> slot, std::int64_t begin,
                        std::span<const KvPageRange> ranges) = 0;
+    virtual void state_bound(std::size_t invocation, std::string_view pool, std::string_view field, std::string_view request, std::size_t slot) = 0;
 };
 
 } // namespace markov

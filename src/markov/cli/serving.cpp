@@ -161,6 +161,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
         sources.push_back({
             { "id", id },
             { "model_config", implementation.at("model") },
+            { "allocator", implementation.at("allocator") },
             { "expert_layout", implementation.value("expert_layout", nlohmann::json()) },
             { "dtype", implementation.at("dtype") },
             { "tp", tp },

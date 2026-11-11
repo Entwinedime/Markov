@@ -107,7 +107,7 @@ class PrefixCache(RadixCache):
             self.peer.call("bind_prefix", request=int(req.rid), node=req.last_node, tokens=len(req.prefix_indices))
 
     def evictable_size(self):
-        return 0 if self.disable else self.peer.call("capacity")["evictable_tokens"]
+        return 0 if self.disable else self.peer.call("capacity", resource="evictable_tokens")
 
     def protected_size(self):
-        return 0 if self.disable else self.peer.call("capacity")["protected_tokens"]
+        return 0 if self.disable else self.peer.call("capacity", resource="protected_tokens")

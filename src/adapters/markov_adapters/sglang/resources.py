@@ -36,6 +36,12 @@ class ResourceCalls:
                 release_calls=len(owner.free_group),
                 release_tokens=sum(int(indices.numel()) for indices in owner.free_group),
             )
+        elif operation == "pages.sort":
+
+            # Native calls expose array lengths; the control view receives the core's actual ordering result.
+            ordering = args[0] if args else {"ready_pages": len(owner.free_pages), "released_pages": len(owner.release_pages)}
+            parameters.update(ordering)
+            guards = [["lt", 0, "released_pages"] if ordering["released_pages"] else ["eq", "released_pages", 0]]
         with self.calls.call(operation, original, parameters=parameters, work=work, guards=tuple(guards)):
             return original(*args, **kwargs)
 
@@ -68,7 +74,7 @@ class ResourceCalls:
         # Select the actual objects through their shared ABI, rather than enumerating concrete cache classes.
         for owner, methods in (
             (cache, {"cache_finished_req": "cache.finished", "cache_unfinished_req": "cache.unfinished"}),
-            (allocator, {"free": "pages.free", "free_group_end": "pages.flush"}),
+            (allocator, {"free": "pages.free", "free_group_end": "pages.flush", "merge_and_sort_free": "pages.sort"}),
             (slots, {"free": "slots.free"}),
         ):
             for name, operation in methods.items():

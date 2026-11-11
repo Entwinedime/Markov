@@ -156,7 +156,9 @@ int main(int argc, char ** argv) {
             std::vector<markov::TemplateLibrary> libraries;
             for (const auto & path : read_json(argv[2])) libraries.push_back(markov::TemplateLibrary::read(read_json(path.get<std::string>())));
             if (libraries.empty()) throw std::invalid_argument("template linking requires a source library set");
-            markov::TemplateLibrary::link_local_implementations(libraries);
+            std::vector<markov::TemplateLibrary *> sources;
+            for (auto & library : libraries) sources.push_back(&library);
+            markov::TemplateLibrary::link_local_implementations(sources);
             const std::filesystem::path directory(argv[3]);
             if (!std::filesystem::create_directory(directory)) throw std::invalid_argument("template output directory already exists");
             try {
@@ -183,16 +185,20 @@ int main(int argc, char ** argv) {
             destination = argv[4];
             const auto task = read_json(argv[3]);
             std::map<std::size_t, markov::TemplateLibrary> libraries;
-            for (const auto & instance : task.at("instances")) {
-                for (const auto & participant : instance.at("participants")) {
-                    const auto index = participant.at("template").get<std::size_t>();
-                    if (!libraries.contains(index))
-                        libraries.emplace(index, markov::TemplateLibrary::read(read_json(std::filesystem::path(argv[2]) / (std::to_string(index) + ".json"))));
-                }
+            for (const auto & source : task.at("template_sources")) {
+                const auto index = source.get<std::size_t>();
+                libraries.emplace(index, markov::TemplateLibrary::read(read_json(std::filesystem::path(argv[2]) / (std::to_string(index) + ".json"))));
             }
+            const auto imports = markov::sglang::NativeTemplates::share_batch_transforms(libraries);
+
+            // Auxiliary productions supply closed local bodies as well as complete batch actions.
+            std::vector<markov::TemplateLibrary *> sources;
+            for (auto & [_, library] : libraries) sources.push_back(&library);
+            markov::TemplateLibrary::link_local_implementations(sources);
             std::unique_ptr<markov::ExecutionTrace> trace;
             if (argc == 7) trace = std::make_unique<markov::ExecutionTrace>(argv[6]);
             output = markov::serve(libraries, task, trace.get(), trace.get(), trace.get());
+            output["template_imports"] = imports;
             if (trace) trace->finish();
         }
         else if (command == "execute" && (argc == 5 || (argc == 7 && std::string_view(argv[5]) == "--trace"))) {

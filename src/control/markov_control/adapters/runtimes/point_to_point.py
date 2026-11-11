@@ -4,32 +4,20 @@ from dataclasses import dataclass, field
 
 import torch.distributed as distributed
 
+from markov_adapters.pytorch import CpuTransfer
 from markov_control.adapters.runtimes.metadata import MetadataWork
 
 
-class CpuPointToPoint:
+class CpuPointToPoint(CpuTransfer):
     def __init__(self, peer, world) -> None:
+        super().__init__(world)
         self.peer = peer
-        self.world = world
 
     def install(self) -> None:
         for name in ("send", "recv", "isend", "irecv"):
             operation = getattr(self, name)
             setattr(distributed, name, operation)
             setattr(distributed.distributed_c10d, name, operation)
-
-    def describe(self, tensor, group, tag, endpoint, group_endpoint, receiving):
-        group = distributed.group.WORLD if group is None else group
-        if group_endpoint is not None:
-            endpoint = distributed.get_global_rank(group, group_endpoint)
-        if endpoint is None:
-            raise ValueError("Native metadata receive requires an explicit sender")
-        local = distributed.get_rank()
-        source, target = (endpoint, local) if receiving else (local, endpoint)
-        return {
-            "group": group.group_name, "source": self.world[source], "target": self.world[target],
-            "tag": tag, "receiving": receiving, "dtype": str(tensor.dtype), "shape": list(tensor.shape),
-        }
 
     def post(self, tensor, group, tag, endpoint, group_endpoint, receiving):
         if tensor.device.type != "cpu":
@@ -66,9 +54,11 @@ class MetadataTransfer:
 
 
 class PointToPointCalls:
-    def __init__(self) -> None:
+    def __init__(self, observe=False) -> None:
         self.positions = {}
         self.pending = {}
+        self.observe = observe
+        self.observations = []
 
     def post(self, channel, rank, message) -> None:
         source, target = message["source"], message["target"]
@@ -86,6 +76,11 @@ class PointToPointCalls:
         transfer.posted.add(rank)
         if not receiving:
             transfer.values = message["values"]
+        if self.observe:
+            self.observations.append({
+                "phase": "post", "key": key, "rank": rank,
+                "descriptor": {name: value for name, value in message.items() if name != "values"},
+            })
 
         # Posting is asynchronous. Completion requires the matching receive, even if a sender waits later.
         channel.send(key)
@@ -105,6 +100,8 @@ class PointToPointCalls:
         for rank, channel in transfer.waiting.items():
             channel.send(transfer.values if rank == key[2] else None)
             transfer.consumed.add(rank)
+            if self.observe:
+                self.observations.append({"phase": "consumed", "key": key, "rank": rank})
         transfer.waiting.clear()
 
         # Keep completed payload until both native Work handles have consumed their result.
@@ -113,3 +110,7 @@ class PointToPointCalls:
 
     def blocked(self):
         return {channel for transfer in self.pending.values() for channel in transfer.waiting.values()}
+
+    def take_observations(self):
+        result, self.observations = self.observations, []
+        return result

@@ -24,7 +24,10 @@ class PipelineMessages:
 
     def wait_work(self, producer, *, device, stream=None):
         work = self.work()
-        work["context"].update(producer=producer, device_wait=device)
+
+        # Waiting consumes the recorded producer; the current scheduler state locates this occurrence.
+        work["observation_context"] = work["context"]
+        work["context"] = {"producer": producer, "device_wait": device}
         if device:
             work["context"]["wait_stream"] = PipelineABI.stream_role(self.calls.scheduler, stream)
         return work
@@ -79,6 +82,12 @@ class PipelineMessages:
 
 
 class PipelineABI:
+    @staticmethod
+    def pending_model_sends(scheduler):
+
+        # Empty request forwarding continues while idle; proxy/output sends still retain model work.
+        return scheduler.ps.pp_size > 1 and bool(scheduler.send_proxy_work or scheduler.send_output_work)
+
     @staticmethod
     def control_context(calls):
         scheduler = calls.scheduler

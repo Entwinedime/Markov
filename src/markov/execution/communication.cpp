@@ -25,19 +25,26 @@ void CommunicationLinks::insert(const CoarseGraph & graph, std::span<const std::
     for (const auto * scope : scopes) {
         const auto & group = *scope->communication;
         const auto & port = *std::ranges::find_if(scope->ports, [](const auto & value) { return value.rendezvous.has_value(); });
-        std::optional<TensorLayout> payload;
+        std::map<std::tuple<Direction, std::string, bool>, TensorLayout> payload;
         if (group.operation == "transfer") {
             if (group.members.size() != 2 || group.required != group.members) throw std::invalid_argument("transfer requires one sender and one receiver");
             const auto direction = group.rank == group.members.front() ? Direction::Input : Direction::Output;
             for (const auto & field : scope->ports) {
                 if (field.use != PortUse::Data && field.use != PortUse::Metadata) continue;
-                if (payload || field.direction != direction) throw std::invalid_argument("transfer requires one payload with the endpoint's direction");
+                if (!payload.empty() || field.direction != direction) throw std::invalid_argument("transfer requires one payload with the endpoint's direction");
 
                 // State-backed transfers expose payload geometry; KV accesses own their contents and hazards.
                 if (!field.tensor) throw std::invalid_argument("transfer payload has no layout");
-                payload = TensorLayout{ field.tensor->dtype, field.tensor->shape };
+                payload.emplace(std::tuple{ Direction::Input, std::string("payload"), true }, TensorLayout{ field.tensor->dtype, field.tensor->shape });
             }
-            if (!payload) throw std::invalid_argument("transfer has no payload");
+            if (payload.empty()) throw std::invalid_argument("transfer has no payload");
+        }
+        for (const auto & agreement : group.agreements) {
+            const auto & tensor = *scope->port(agreement.port, agreement.direction).tensor;
+
+            // Variable-size protocols can agree on dtype without requiring equal per-rank row counts.
+            payload.emplace(std::tuple{ agreement.direction, agreement.port, agreement.shape },
+                            TensorLayout{ tensor.dtype, agreement.shape ? tensor.shape : std::vector<std::int64_t>{} });
         }
 
         // The channel's native protocol orders calls; source observation or batch indices never identify target work.
@@ -46,6 +53,12 @@ void CommunicationLinks::insert(const CoarseGraph & graph, std::span<const std::
         auto & exchange = position->second;
         if (!inserted && (exchange.operation != group.operation || exchange.members != group.members || exchange.payload != payload))
             throw std::invalid_argument("communication participants disagree on channel " + group.channel);
+        if (payload.empty()) ++unknown_endpoints_;
+        else ++payload_endpoints_;
+        for (const auto & [field, _] : payload) {
+            if (std::get<2>(field)) ++shape_fields_;
+            else ++dtype_fields_;
+        }
         exchange.endpoints.emplace(group.rank, Endpoint{ events[*port.rendezvous], events[port.event], group.required });
         for (auto & [rank, endpoint] : exchange.endpoints) {
             if (endpoint.connected || !std::ranges::all_of(endpoint.required, [&](const auto peer) { return exchange.endpoints.contains(peer); })) continue;
@@ -61,6 +74,11 @@ void CommunicationLinks::insert(const CoarseGraph & graph, std::span<const std::
 }
 
 bool CommunicationLinks::empty() const { return pending_.empty(); }
+
+nlohmann::json CommunicationLinks::payload_coverage() const {
+    return { { "checked_endpoints", payload_endpoints_ }, { "undeclared_endpoints", unknown_endpoints_ },
+             { "shape_fields", shape_fields_ }, { "dtype_only_fields", dtype_fields_ } };
+}
 
 std::set<std::size_t> CommunicationLinks::retained_events() const {
     std::set<std::size_t> retained;

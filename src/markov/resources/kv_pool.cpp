@@ -60,6 +60,7 @@ KvAllocation KvPool::allocate(std::span<const KvDemand> demands) {
 
     // Deferred pages join the ordered prefix only when that prefix cannot satisfy the demand.
     if (reuse == PageReuse::DeferredSorted && allocation.allocated_pages > ordered_pages_) {
+        allocation.ordering = PageOrdering{ ordered_pages_, static_cast<std::int64_t>(free_pages_.size()) - ordered_pages_ };
         std::ranges::sort(free_pages_);
         ordered_pages_ = static_cast<std::int64_t>(free_pages_.size());
     }

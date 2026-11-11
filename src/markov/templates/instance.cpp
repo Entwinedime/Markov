@@ -138,7 +138,8 @@ private:
                  access.field,
                  access.access,
                  access.members,
-                 invocation_.work.at(access.members).get<std::vector<std::string>>() },
+                 invocation_.work.at(access.members).get<std::vector<std::string>>(),
+                 access.publication },
                 event(scope, access.start),
                 event(scope, access.finish)
             });

@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
-import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
-import torch
 import torch_npu
 
 from markov_collection.adapters.runtimes.ascend.clock import AscendClock
@@ -22,6 +21,10 @@ class AscendMarkers:
         self.lock = threading.Lock()
         self.recording = ContextVar("observer_point", default=False)
         self.clock_samples = []
+        self.intervals = []
+        self.host_sample = ctypes.CDLL(None).markov_sample_host
+        self.host_sample.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+        self.host_sample.restype = None
         self.native_service = ctypes.CDLL(None).markov_set_service_scope
         self.native_service.argtypes = [ctypes.c_int64]
         self.native_service.restype = ctypes.c_int64
@@ -29,20 +32,33 @@ class AscendMarkers:
     def calibrate(self) -> None:
         self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
 
-    @staticmethod
-    def scope(name: str) -> Any:
-        return torch.profiler.record_function(name)
+    def timestamp(self, record, side):
+        sample = (ctypes.c_uint64 * 2)()
+        self.host_sample(sample)
+        record[f"{side}_counter"], record[f"{side}_raw_ns"] = sample
 
-    @staticmethod
+    def host_observation(self):
+        return {"process": os.getpid(), "intervals": self.intervals}
+
     @contextmanager
-    def service_scope(interval):
+    def scope(self, name: str):
+        if len(self.clock_samples) != 1:
+            yield
+            return
+        record = {"name": name, "thread": threading.get_native_id()}
+        self.intervals.append(record)
+        with self.service_scope(record):
+            yield
 
-        # Native transport threads do not inherit Torch's thread-local profiler callbacks.
-        interval["begin_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    @contextmanager
+    def service_scope(self, interval):
+
+        # Ordering uses the same CPU counter as SDK enqueue/API records; measurements stay in RAW time.
+        self.timestamp(interval, "begin")
         try:
             yield
         finally:
-            interval["end_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+            self.timestamp(interval, "end")
 
     @contextmanager
     def service_execution(self, scope: int, execution: dict):

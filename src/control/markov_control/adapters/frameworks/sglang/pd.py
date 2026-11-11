@@ -32,12 +32,15 @@ class NativePdBackend:
                 self.reservations[value["room"]][source] = value
             elif kind == "reservation_visible":
                 self.manager.update_status(value["room"], KVPoll.WaitingForInput)
+                self.senders[value["room"]].completions[KVPoll.WaitingForInput] = packet["completion"]
             elif kind == "transfer":
                 self.receivers[value["room"]].pending[source] = value
             elif kind == "sender_visible":
                 self.manager.update_status(value["room"], KVPoll.Success)
+                self.senders[value["room"]].completions[KVPoll.Success] = packet["completion"]
             elif kind == "receiver_visible":
                 self.receivers[value["room"]].visible = True
+                self.receivers[value["room"]].completions[KVPoll.Success] = packet["completion"]
             elif kind == "consumed":
                 publication = self.published[value["publication"]]
                 publication["pending"].remove(source)
@@ -63,10 +66,9 @@ class NativePdBackend:
     def waiting(self):
         transports = (*self.senders.values(), *self.receivers.values())
 
-        # Native group agreement, not one rank's local readiness, determines whether an idle loop can progress.
+        # Local readiness may still await PP consensus; only native queues can turn it into runnable work.
         return bool(transports) and all(
-            transport.poll_state in (KVPoll.Bootstrapping, KVPoll.Transferring, KVPoll.Success)
-            or (transport.poll_state == KVPoll.WaitingForInput and transport.aux_index is not None)
+            transport.poll_state in (KVPoll.Bootstrapping, KVPoll.WaitingForInput, KVPoll.Transferring, KVPoll.Success)
             for transport in transports
         )
 
@@ -164,6 +166,11 @@ class NativeKvPolling:
 
         with calls.read("transport", self.poll, calls.request_work(self._markov_request)) as query:
             self.poll_state = self._poll()
+
+            # Record only the state actually read, not unrelated deliveries collected in the same inbox drain.
+            completion = self.completions.get(self.poll_state)
+            if completion is not None:
+                self.backend.scheduler.peer.call("observed_completion", event=completion)
             query["result"] = self.poll_state
         return self.poll_state
 
@@ -174,6 +181,7 @@ class NativeKvSender(NativeKvPolling, CommonKVSender):
         self.backend = mgr.backend
         self.signals = set()
         self.poll_state = None
+        self.completions = {}
         self.backend.senders[bootstrap_room] = self
 
     def _poll(self):
@@ -209,19 +217,14 @@ class NativeKvSender(NativeKvPolling, CommonKVSender):
         identity = backend.sequence
         backend.sequence += 1
         signals, packets, pools = {}, [], {}
+        if len(kv_indices) or last:
+            signals["transfer.complete"] = f"{scheduler.group}/pd/{identity}"
         metadata = self.kv_mgr.rows.read(self.aux_index) if last else None
         for target, peer in backend.topology.peers.items():
             destination = backend.reservations[self.bootstrap_room][target]
             if len(destination["pages"][index_slice]) != len(kv_indices):
                 raise ValueError("native PD sender chunk exceeds its receiver's page reservation")
             pools[peer["binding"]] = peer["pool"]
-            names = ["kv"] if len(kv_indices) else []
-            if last:
-                names.append("metadata")
-            for name in names:
-                port = f"completion/{peer['binding']}/{name}"
-                signal = f"{scheduler.group}/pd/{identity}/{target}/{name}"
-                signals[port] = signal
             if last:
                 packets.append({"target": target, "value": {
                     "kind": "transfer", "room": self.bootstrap_room, "publication": identity, "metadata": metadata,
@@ -273,6 +276,7 @@ class NativeKvReceiver(NativeKvPolling, BaseKVReceiver):
         self.bootstrap_room = bootstrap_room
         self.conclude_state = None
         self.poll_state = None
+        self.completions = {}
         self.visible = False
         self.pending = {}
         self.finished = set()

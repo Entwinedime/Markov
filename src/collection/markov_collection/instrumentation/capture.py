@@ -40,16 +40,27 @@ class CapturedCall:
         finally:
             self.capture.current.reset(self.parent)
 
-    def port(self, name: str, direction: str, tensor: dict[str, Any] | None, *, use: str) -> None:
+    def port(
+        self, name: str, direction: str, tensor: dict[str, Any] | None, *, use: str, at_return: bool = False,
+    ) -> None:
         if direction not in {"input", "output"} or use not in {"host", "device", "metadata", "state"}:
             raise ValueError("a boundary port needs a direction and an explicit use")
-        self.record["ports"].append({"name": name, "direction": direction, "tensor": tensor, "use": use})
+        port = {"name": name, "direction": direction, "tensor": tensor, "use": use}
+        if at_return:
+            if direction != "input" or use != "host" or tensor is None:
+                raise ValueError("a completed read requires a host tensor input")
+            port["at_return"] = True
+        self.record["ports"].append(port)
 
     def output(self, name: str, tensor: dict[str, Any], *, use: str, preceding: list[int]) -> None:
         writer = tensor["writer"]
-        if writer in preceding:
+        if writer in preceding and not any(
+            port["direction"] == "input" and port["use"] in {"host", "device"} and port["tensor"] is not None
+            and (port["tensor"]["storage"], port["tensor"]["version"]) == (tensor["storage"], tensor["version"])
+            for port in self.record["ports"]
+        ):
 
-            # A private return value may be created before an intervening child call; retain its actual producer.
+            # Deferred values need their actual producer; an explicit continuation input already supplies it.
             if tensor["allocation"] != writer:
                 raise ValueError("a deferred mutation needs an explicit input/output boundary at its writer")
             self.capture.scopes[writer]["ports"].append({

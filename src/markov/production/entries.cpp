@@ -150,6 +150,9 @@ private:
             graph_.edges.push_back({ event_ids_.at(edge.source), event_ids_.at(edge.target), edge.kind });
             return;
         }
+
+        // A completed fact was read in the source; target control establishes its own observations, not a wait input.
+        if (edge.kind == Relation::Observation) return;
         const auto resource = source_.events[edge.target].resource;
         if (edge.kind == Relation::Order && source_.events[edge.source].resource == resource && source_.resources[resource].serial) return;
         if (edge.kind == Relation::Data && declared_data(edge)) return;

@@ -50,7 +50,7 @@ class NativeServingInstance:
         submissions.content.check_vocabulary(engine.tokenizer_manager.model_config.vocab_size)
         print(f"markov: native {phase} begin", flush=True)
         try:
-            engine.loop.run_until_complete(submissions.run(engine, clock, barrier))
+            engine.loop.run_until_complete(submissions.run(engine, clock, barrier, self.output, self.roles))
         finally:
 
             # Delivery records explain actual ingress delay; declared arrival_ns is never rewritten.
@@ -154,12 +154,19 @@ class NativeServingInstance:
                 barrier.wait()
             finally:
                 engine.stop_profile()
-                NativeProfiles.wait(self.output, selected)
+                NativeProfiles.wait(self.output, selected, self.roles if self.resource_trace else ())
             captured_ns = time.monotonic_ns()
         finally:
-            engine.shutdown()
+            try:
+                engine.shutdown()
+            finally:
+
+                # Engine stops its workers but leaves the Prefill bootstrap thread to its owner.
+                if engine.tokenizer_manager.bootstrap_server is not None:
+                    engine.tokenizer_manager.bootstrap_server.close()
         return {
             "id": self.instance.identity, "mode": mode, "rank_offset": self.rank_offset, "observed_roles": selected,
+            "native_participants": self.roles,
             "initialization_ns": initialized_ns - started_ns,
             "warmup_ns": warmed_ns - initialized_ns,
             "capture_ns": captured_ns - warmed_ns,

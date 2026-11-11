@@ -39,7 +39,10 @@ class CallFrame:
     values: dict = field(default_factory=dict)
     observations: list[int] = field(default_factory=list)
     tensor_inputs: dict = field(default_factory=dict)
+    metadata_inputs: dict = field(default_factory=dict)
+    tensor_allocations: dict = field(default_factory=dict)
     tensor_outputs: dict = field(default_factory=dict)
+    condition: dict = field(default_factory=dict)
 
     @property
     def first(self):
@@ -59,6 +62,8 @@ class CallFrame:
     def child(self, work):
 
         # Preserve the caller's logical position, not a run-local call counter or resource binding.
+        if "observation_context" in self.work:
+            work.setdefault("observation_context", self.work["observation_context"])
         work["callers"] = [*self.work.get("callers", ()), {
             "owner": self.operation, "context": self.work.get("context", {}),
             "entry": self.entry, "entry_context": self.entry_context,
@@ -68,28 +73,6 @@ class CallFrame:
 class CallSegments:
     def __init__(self) -> None:
         self.current = ContextVar("native_call_segments", default=None)
-        self.serving = False
-
-    def input(self, original, scheduler, requests):
-        from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
-
-        # Profiling and cache-reset commands must not restart a drained serving interval.
-        if any(isinstance(request, (TokenizedGenerateReqInput, BatchTokenizedGenerateReqInput)) for request in requests):
-            self.serving = True
-        return original(scheduler, requests)
-
-    def idle(self, original, scheduler):
-
-        # A native idle boundary ends logical work, not the lifetime of submitted transfers or profiling.
-        if scheduler.is_fully_idle():
-            self.serving = False
-        return original(scheduler)
-
-    def install_lifecycle(self):
-        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-        for name, hook in (("process_input_requests", self.input), ("on_idle", self.idle)):
-            HookRegistry.register(f"sglang.srt.managers.scheduler.Scheduler.{name}", hook, HookType.AROUND)
 
     def enclosing(self, frame):
         return nullcontext()
@@ -162,11 +145,16 @@ class CallSegments:
             work["context"]["pipeline"] = PipelineABI.control_context(self)
         return work
 
-    def resume(self, frame, entry="call.enter", context=None):
+    def resume(self, frame, entry="call.enter", context=None, tensor_inputs=None):
         frame.entry = entry
         frame.entry_context = {} if context is None else context
         frame.exit = ""
         frame.exit_context = {}
+        if entry != "call.enter" and tensor_inputs is not None:
+
+            # A resource-only child leaves borrowed inputs live; explicit returns replace the continuation contract.
+            frame.tensor_inputs = dict(tensor_inputs)
+        frame.tensor_outputs = {}
         frame.segment = self.fragment(frame)
         frame.segment.__enter__()
 
@@ -196,7 +184,10 @@ class CallSegments:
             self.resume(parent, operation, context)
 
     @contextmanager
-    def call(self, operation, original, *, parameters=None, work=None, inputs=None, guards=(), host_only=False, tensor_inputs=None):
+    def call(
+        self, operation, original, *, parameters=None, work=None, inputs=None, guards=(),
+        host_only=False, tensor_inputs=None, tensor_outputs=None, metadata_inputs=None, allocations=None, condition=None,
+    ):
         parent = self.current.get()
         work = dict(parent.work if work is None else work)
         context = work.get("context", {})
@@ -208,6 +199,9 @@ class CallSegments:
             dict(parent.parameters if parameters is None else parameters),
             work, inputs, guards, host_only,
             tensor_inputs={} if tensor_inputs is None else tensor_inputs,
+            metadata_inputs={} if metadata_inputs is None else metadata_inputs,
+            tensor_allocations={} if allocations is None else allocations,
+            condition={} if condition is None else condition,
         )
         previous = self.current.set(frame)
         try:
@@ -225,4 +219,4 @@ class CallSegments:
 
         # Resume only after a successful child return; a failing call cannot publish another successful segment.
         if parent is not None:
-            self.resume(parent, operation, context)
+            self.resume(parent, operation, context, tensor_outputs)

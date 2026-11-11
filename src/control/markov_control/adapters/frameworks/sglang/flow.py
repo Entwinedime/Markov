@@ -6,6 +6,7 @@ from markov_adapters.sglang.calls import CallSegments
 from markov_adapters.sglang.disaggregated_calls import DisaggregatedCalls
 from markov_adapters.sglang.groups import ParallelGroups
 from markov_adapters.sglang.metadata_collectives import MetadataCollectives
+from markov_adapters.sglang.pipeline import PipelineABI
 from markov_adapters.sglang.resources import ResourceCalls
 from markov_adapters.sglang.selection import BatchSelection
 
@@ -36,10 +37,11 @@ class FlowExecution(CallSegments):
     def __init__(self, scheduler) -> None:
         super().__init__()
         self.scheduler = scheduler
+        self.started = False
+        self.pending_inputs = {str(index) for index in range(len(scheduler.request_input.requests))}
         self.request_state = scheduler.request_state
         self.groups = ParallelGroups()
         self.selection = BatchSelection(self)
-        self.install_lifecycle()
         self.selection.install()
         ResourceCalls(self).bind(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, scheduler.req_to_token_pool)
         scheduler.output_streamer.send_to_detokenizer = PublishedRequests(
@@ -50,7 +52,17 @@ class FlowExecution(CallSegments):
 
     @property
     def enabled(self):
-        return self.serving
+        return self.started
+
+    def input(self, request):
+        self.pending_inputs.remove(request.rid)
+        self.started = True
+
+    def drained(self):
+
+        # Close at the same local idle boundary as capture, never between future arrivals or inside a call.
+        if not self.pending_inputs and self.current.get() is None:
+            self.started = False
 
     def request_id(self, native_id):
         return self.scheduler.request_input.requests[int(native_id)]["id"]
@@ -133,14 +145,15 @@ class FlowExecution(CallSegments):
         # Submission facts belong to this segment, not to the caller context inherited by later children.
         work = {**frame.work, "continuation": frame.continuation}
         self.scheduler.bind_state(work, accesses)
-        condition = {"owner": frame.operation}
+        condition = {**frame.condition, "owner": frame.operation}
         if not frame.host_only:
             condition.update(entry=frame.entry, exit=frame.exit)
         outputs = frame.outputs if frame.terminal else ()
-        tensors = {name: tensor for name, (tensor, _) in frame.tensor_outputs.items()} if frame.terminal else {}
-        inputs = {name: tensor for name, (tensor, _) in frame.tensor_inputs.items()} if frame.first else {}
+        tensors = {name: tensor for name, (tensor, _) in frame.tensor_outputs.items()}
+        inputs = {name: tensor for name, (tensor, _) in {**frame.tensor_inputs, **frame.metadata_inputs}.items()}
         returned = self.scheduler.action(
             "segment", frame.parameters, work, outputs, condition=condition, tensor_inputs=inputs, tensor_outputs=tensors,
+            allocations=frame.tensor_allocations,
         )
         if self.request_state.observe:
             frame.observations.append(returned["observation"])
@@ -151,6 +164,8 @@ class FlowExecution(CallSegments):
 
     def process(self, original, batch, result):
         parameters, work = self.scheduler.description(batch)
+        if self.scheduler.ps.pp_size > 1:
+            work["observation_context"] = {"pipeline": PipelineABI.control_context(self)}
         with self.call("result", original, parameters=parameters, work=work) as frame:
             original(batch, result)
 

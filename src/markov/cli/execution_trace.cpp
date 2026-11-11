@@ -72,13 +72,20 @@ void ExecutionTrace::applied(std::string_view group, const nlohmann::json & oper
         {         "result",                 result },
         { "returned_pages", changes.returned_pages },
         { "returned_slots", changes.returned_slots },
-        { "returned_fields", changes.returned_fields }
+        { "returned_fields", changes.returned_fields },
+        { "capacity_increased", changes.capacity_increased }
     } << '\n';
 }
 
 void ExecutionTrace::observed_values(std::string_view group, std::size_t boundary, const nlohmann::json & values, std::int64_t time_ns) {
     stream_ << nlohmann::json{
         { "kind", "action_values" }, { "group", group }, { "boundary", boundary }, { "values", values }, { "time_ns", time_ns }
+    } << '\n';
+}
+
+void ExecutionTrace::native_protocol(std::string_view group, const nlohmann::json & record, std::int64_t time_ns) {
+    stream_ << nlohmann::json{
+        { "kind", "native_protocol" }, { "group", group }, { "record", record }, { "time_ns", time_ns }
     } << '\n';
 }
 
@@ -115,10 +122,16 @@ void ExecutionTrace::notification_ready(const nlohmann::json & identity, std::si
     } << '\n';
 }
 
-void ExecutionTrace::input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, std::int64_t time_ns) {
+void ExecutionTrace::input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) {
     stream_ << nlohmann::json{
-        { "kind", "input_read" }, { "identity", identity }, { "time_ns", time_ns },
+        { "kind", "input_read" }, { "identity", identity }, { "time_ns", time_ns }, { "in_flow", in_flow },
         { "request_indices", std::vector<std::size_t>(requests.begin(), requests.end()) }
+    } << '\n';
+}
+
+void ExecutionTrace::state_bound(std::size_t invocation, std::string_view pool, std::string_view field, std::string_view request, std::size_t slot) {
+    stream_ << nlohmann::json{
+        { "kind", "state_binding" }, { "invocation", invocation }, { "pool", pool }, { "field", field }, { "request", request }, { "slot", slot }
     } << '\n';
 }
 

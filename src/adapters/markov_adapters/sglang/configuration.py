@@ -42,6 +42,14 @@ class NativeConfiguration:
             if type(self.ep) is not int or not 0 < self.ep < 1 << 63:
                 raise ValueError("native EP size must be a positive signed 64-bit integer")
 
+    @staticmethod
+    def batch_capacity(configuration: dict) -> int:
+        slots = configuration["max_running_requests"]
+
+        # Scheduler initializes the default per PP stage; admission also checks the shared request pool.
+        microbatch = configuration.get("microbatch_requests", max(slots // configuration.get("pp", 1), 1))
+        return min(slots, microbatch)
+
     def routes(self, workload: dict):
         if "ep" not in self.values:
             return None

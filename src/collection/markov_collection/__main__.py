@@ -13,7 +13,7 @@ def main() -> None:
     capture = commands.add_parser("capture", help="run one normalized native observation job")
     capture.add_argument("--input", type=Path, required=True)
     capture.add_argument("--output", type=Path, required=True)
-    capture.add_argument("--resource-trace", action="store_true", help="observe native resources and input reads for independent comparison")
+    capture.add_argument("--resource-trace", action="store_true", help="observe resources, input reads and CPU protocol for independent comparison")
     interpret = commands.add_parser("interpret", help="interpret an SDK-exported worker recording")
     interpret.add_argument("--trace", type=Path, required=True)
     interpret.add_argument("--evidence", action="store_true", help="retain measured boundary clocks for source auditing")
@@ -35,9 +35,10 @@ def main() -> None:
         from markov_collection.adapters.frameworks.sglang.kv_facts import NativeKvFacts
         from markov_collection.adapters.runtimes.ascend.observation import AscendObservation
 
-        recording = NativeKvFacts(arguments.input, arguments.rank).document()
+        native = NativeKvFacts(arguments.input, arguments.rank)
+        recording = native.document()
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)
-        write_json(arguments.output, observation.document(arguments.evidence), replace=False)
+        write_json(arguments.output, native.groups.project(observation.document(arguments.evidence)), replace=False)
 
 
 if __name__ == "__main__":

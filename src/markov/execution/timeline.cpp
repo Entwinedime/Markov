@@ -65,7 +65,9 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     std::map<std::size_t, std::int64_t> times;
     for (const auto & boundary : boundaries) {
         if (boundary.event >= graph.events.size() || boundary.time_ns < now_ns_)
-            throw std::invalid_argument("boundary time refers outside this invocation or before its submission");
+            throw std::invalid_argument("boundary time refers outside this invocation or before its submission: event="
+                                        + std::to_string(boundary.event) + " time_ns=" + std::to_string(boundary.time_ns)
+                                        + " submitted_ns=" + std::to_string(now_ns_));
         if (!times.emplace(boundary.event, boundary.time_ns).second) throw std::invalid_argument("duplicate invocation boundary time");
     }
 

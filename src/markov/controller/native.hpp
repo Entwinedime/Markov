@@ -65,7 +65,7 @@ private:
     nlohmann::json receive_call();
     void reply(std::size_t call, const nlohmann::json & result);
     void reach_idle(const std::string & group, std::size_t call, bool waiting);
-    void release_idle(const std::string & instance);
+    bool release_idle(const std::string & instance);
     std::optional<std::size_t> completion_event(const std::string & signal) const;
     void resolve_notifications();
 
@@ -84,9 +84,9 @@ private:
         std::optional<std::size_t> call = std::nullopt;
         nlohmann::json identity = nullptr;
         std::optional<std::int64_t> return_ns = std::nullopt;
-        bool action_progress = false;
         bool waiting = false;
-        bool woken = true;
+        bool woken = false;
+        bool in_flow = false;
     };
 
     nlohmann::json resource_call(const std::string & group, const nlohmann::json & message);

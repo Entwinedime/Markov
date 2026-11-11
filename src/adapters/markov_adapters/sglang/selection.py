@@ -2,6 +2,7 @@
 
 from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.calls import ActionCall
+from markov_adapters.sglang.allocation_loop import AllocationIndices
 
 
 class BatchPreparation(ActionCall):
@@ -21,13 +22,6 @@ class BatchPreparation(ActionCall):
             calls.work(batch, members, phase=mode),
         )
         self.batch = batch
-        if mode == "decode":
-
-            # Keep the inputs before native code increments lengths in place.
-            self.inputs = {
-                name: item for name, item in BatchTensors.boundaries(batch).items()
-                if name in {"request_slots", "sequence_lengths"}
-            }
 
     def complete(self):
         self.outputs = BatchTensors.boundaries(self.batch)
@@ -87,6 +81,29 @@ class BatchTransform(ActionCall):
         return "unchanged" if after == before else "empty" if after == 0 else "subset"
 
 
+class BatchAllocation(ActionCall):
+    def __init__(self, calls, batch, decode) -> None:
+        parent = calls.current.get()
+        super().__init__("allocation", dict(parent.parameters), dict(parent.work))
+        allocator = batch.token_to_kv_pool_allocator
+        self.condition = {
+            "allocation": allocator._markov_allocation.branch(self.work["members"], allocator.page_size, decode),
+        }
+        self.inputs = {"sequence_lengths": (batch.seq_lens, ["members"])}
+        if decode:
+            self.inputs["request_slots"] = batch.req_pool_indices, ["members"]
+
+        # Extend creates lengths here; Decode borrows tensors that allocation reads first.
+        if not decode:
+            parent.tensor_outputs.update(self.inputs)
+
+    def complete(self, result, decode):
+        self.outputs.update(self.inputs)
+        self.outputs["cache_locations"] = (result if decode else result[0]), ["input_tokens"]
+        if not decode:
+            self.outputs["request_slots"] = result[1], ["members"]
+
+
 class BatchSelection:
     def __init__(self, calls) -> None:
         self.calls = calls
@@ -111,9 +128,26 @@ class BatchSelection:
             tensor_inputs=boundary.inputs,
         ) as frame:
 
-            # Native eviction may interrupt preparation; each resource call owns its device work and waits.
+            # Allocation and resource calls own their work; preparation resumes with their published tensors.
             result = original(batch)
             boundary.complete()
+            frame.tensor_outputs = boundary.outputs
+        return result
+
+    def allocate(self, original, batch, token_per_req=None):
+        decode = token_per_req is not None
+        arguments = (batch, token_per_req) if decode else (batch,)
+        if not self.calls.enabled or self.calls.current.get() is None:
+            return original(*arguments)
+        boundary = BatchAllocation(self.calls, batch, decode)
+        with self.calls.call(
+            boundary.operation, original, parameters=boundary.parameters, work=boundary.work,
+            tensor_inputs=boundary.inputs, tensor_outputs=boundary.outputs, condition=boundary.condition,
+        ) as frame:
+
+            # Eviction remains an independent resource action inside the allocation lifecycle.
+            result = original(*arguments)
+            boundary.complete(result, decode)
             frame.tensor_outputs = boundary.outputs
         return result
 
@@ -185,6 +219,7 @@ class BatchSelection:
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+        AllocationIndices(self.calls).install()
         HookRegistry.register(
             "sglang.srt.managers.scheduler_components.dp_attn.MLPSyncBatchInfo.all_gather",
             self.gather, HookType.AROUND,
@@ -195,6 +230,8 @@ class BatchSelection:
             ("filter_batch", self.filter), ("merge_batch", self.merge), ("mix_with_running", self.mix),
         ):
             HookRegistry.register(owner + method, hook, HookType.AROUND)
+        for method in ("alloc_for_extend", "alloc_for_decode"):
+            HookRegistry.register("sglang.srt.mem_cache.common." + method, self.allocate, HookType.AROUND)
         HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run", self.select, HookType.AROUND)
         HookRegistry.register(
             "sglang.srt.managers.scheduler_components.dp_attn.SchedulerDPAttnAdapter.prepare_mlp_sync_batch",

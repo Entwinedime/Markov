@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::array<std::string_view, 3> resource_names{ "thread", "stream", "service" };
 constexpr std::array<std::string_view, 6> work_names{ "host", "device", "transfer", "communication", "wait", "boundary" };
-constexpr std::array<std::string_view, 7> relation_names{ "order", "submission", "data", "signal", "control", "state", "communication" };
+constexpr std::array<std::string_view, 8> relation_names{ "order", "submission", "data", "signal", "control", "state", "communication", "observation" };
 constexpr std::array<std::string_view, 2> direction_names{ "input", "output" };
 constexpr std::array<std::string_view, 4> port_use_names{ "control", "data", "metadata", "signal" };
 
@@ -169,12 +169,17 @@ CommunicationGroup CommunicationGroup::read(const nlohmann::json & source) {
                                source.at("required").get<std::vector<std::int64_t>>(),
                                source.at("rank").get<std::int64_t>(),
                                static_cast<std::size_t>(ordinal) };
+    if (source.contains("agreements")) {
+        for (const auto & field : source.at("agreements").get_ref<const nlohmann::json::array_t &>())
+            result.agreements.push_back({ field.at("port").get<std::string>(), direction_kind(field.at("direction").get<std::string>()),
+                                          field.at("shape").get<bool>() });
+    }
     result.validate();
     return result;
 }
 
 nlohmann::json CommunicationGroup::document() const {
-    return {
+    nlohmann::json result{
         {   "channel",   channel },
         { "operation", operation },
         {   "members",   members },
@@ -182,6 +187,12 @@ nlohmann::json CommunicationGroup::document() const {
         {      "rank",      rank },
         {     "order",     order }
     };
+    if (!agreements.empty()) {
+        result["agreements"] = nlohmann::json::array();
+        for (const auto & field : agreements)
+            result["agreements"].push_back({ { "port", field.port }, { "direction", direction_name(field.direction) }, { "shape", field.shape } });
+    }
+    return result;
 }
 
 void CommunicationGroup::validate() const {
@@ -190,6 +201,11 @@ void CommunicationGroup::validate() const {
     if (channel.empty() || operation.empty() || participants.empty() || participants.size() != members.size() || *participants.begin() < 0
         || !participants.contains(rank) || dependencies.size() != required.size() || !std::ranges::includes(participants, dependencies))
         throw std::invalid_argument("invalid communication participant contract");
+    std::set<std::pair<Direction, std::string>> fields;
+    for (const auto & field : agreements) {
+        if (field.port.empty() || !fields.emplace(field.direction, field.port).second)
+            throw std::invalid_argument("communication payload agreement requires distinct named ports");
+    }
 }
 
 } // namespace markov

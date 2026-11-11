@@ -1,4 +1,4 @@
-"""Observe native resource mutations without replaying allocation or cache policy."""
+"""Observe actual resource reads and mutations without replaying their policy."""
 
 import threading
 import time
@@ -20,6 +20,7 @@ class NativeResourceHistory:
     def __init__(self, observation) -> None:
         self.observation = observation
         self.events = []
+        self.reads = []
         self.bindings = []
         self.initial = None
         self.final = None
@@ -44,12 +45,9 @@ class NativeResourceHistory:
         return None if value is None else value.id
 
     def available(self):
-        return {
-            "slots": self.slots.available_size(),
-            "pages": self.allocator.available_size() // self.page_size,
-            "evictable_tokens": self.cache.evictable_size(),
-            "protected_tokens": self.cache.protected_size(),
-        }
+
+        # Diagnostic snapshots call the original readers, never the hooks for real control observations.
+        return {name: int(original()) // unit for name, (original, unit) in self.capacity_readers.items()}
 
     def begin(self):
         self.initial = {
@@ -63,6 +61,9 @@ class NativeResourceHistory:
 
     def bind_field(self, field, allocator):
         self.fields[field] = allocator
+        original = allocator.available_size
+        operation = {"kind": "state_slots", "field": field, "operation": "available"}
+        allocator.available_size = update_wrapper(partial(self.read_capacity, operation, 1, original), original)
         for name, operation in (("alloc", "allocate"), ("free", "release")):
             original = getattr(allocator, name)
             setattr(allocator, name, update_wrapper(partial(self.state_operation, field, operation, original), original))
@@ -112,7 +113,7 @@ class NativeResourceHistory:
         return ranges
 
     @contextmanager
-    def event(self, operation):
+    def event(self, operation, *, query=False):
         capture = self.observation.capture
         scope = capture.current.get()
 
@@ -123,10 +124,19 @@ class NativeResourceHistory:
             "scope": scope, "thread": threading.get_native_id(),
             "operation": operation, "begin_raw_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
         }
-        self.events.append(record)
+        (self.reads if query else self.events).append(record)
         yield record
         record["end_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
-        record["available"] = self.available()
+        if not query:
+            record["available"] = self.available()
+
+    def read_capacity(self, operation, unit, original, *args, **kwargs):
+        if not self.enabled:
+            return original(*args, **kwargs)
+        with self.event(operation, query=True) as record:
+            result = original(*args, **kwargs)
+        record["result"] = int(result) // unit
+        return result
 
     def allocate_slots(self, original, reqs):
         if not self.enabled:
@@ -205,6 +215,18 @@ class NativeResourceHistory:
     def bind(self, cache, allocator, slots):
         self.cache, self.allocator, self.slots = cache, allocator, slots
         self.page_size = allocator.page_size
+        self.capacity_readers = {}
+        for owner, method, resource, unit in (
+            (slots, "available_size", "slots", 1),
+            (allocator, "available_size", "pages", self.page_size),
+            (cache, "evictable_size", "evictable_tokens", 1),
+            (cache, "protected_size", "protected_tokens", 1),
+        ):
+            original = getattr(owner, method)
+            self.capacity_readers[resource] = original, unit
+            operation = {"kind": "capacity", "resource": resource}
+            setattr(owner, method, update_wrapper(partial(self.read_capacity, operation, unit, original), original))
+
         for owner, methods in (
             (slots, {"alloc": self.allocate_slots, "free": self.release_slot}),
             (allocator, {"alloc": self.allocate_pages, "alloc_extend": self.allocate_pages,
@@ -243,4 +265,5 @@ class NativeResourceHistory:
             "initial": self.initial, "final": self.final, "events": self.events, "bindings": self.bindings,
             "state_events": self.state_events,
             "state_free": self.state_free,
+            "reads": self.reads,
         }

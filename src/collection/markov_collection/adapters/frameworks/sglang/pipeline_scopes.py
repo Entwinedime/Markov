@@ -25,7 +25,7 @@ class PipelineScopes:
                 for name, tensor in PipelineABI.proxy_tensors(pp_proxy_tensors).items():
 
                     # Launch forwards handles before its stream wait; the model body owns the actual device read.
-                    call.port(f"proxy.{name}", "input", owner.tensors.observe(tensor, ["model_tokens", *tensor.shape[1:]]), use="metadata")
+                    call.port(f"proxy.{name}", "input", owner.tensors.observe(tensor, owner.modules.proxy_shape(tensor)), use="metadata")
             result, event = original(scheduler, mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue)
             self.signals.publish(call, event, "completion")
             owner.result_port(call, result, "output")

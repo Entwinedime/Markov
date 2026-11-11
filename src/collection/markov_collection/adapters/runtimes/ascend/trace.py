@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import json
 import struct
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from markov_collection.adapters.runtimes.ascend.clock import AscendClock
+from markov_collection.adapters.runtimes.ascend.clock import AscendClock, HostCounter
 from markov_collection.adapters.runtimes.ascend.queues import NativeQueues, ServiceExecutions
-
-
-def nanoseconds(microseconds: Any) -> int:
-    return int(Decimal(str(microseconds)) * 1000)
 
 
 @dataclass
@@ -27,9 +23,9 @@ class Interval:
     record: dict[str, Any]
 
     @classmethod
-    def read(cls, record: dict[str, Any], offset_ns: int) -> Interval:
-        begin = nanoseconds(record["ts"]) - offset_ns
-        return cls(begin, begin + nanoseconds(record["dur"]), int(record["tid"]), record)
+    def read(cls, record: dict[str, Any], counter: HostCounter) -> Interval:
+        begin, end = counter.interval(record)
+        return cls(begin, end, int(record["tid"]), record)
 
     def contains(self, other: Interval) -> bool:
         return self.thread == other.thread and self.begin <= other.begin and other.end <= self.end
@@ -99,25 +95,11 @@ class DeviceTask:
 
 
 @dataclass
-class StreamWait:
-    api: Interval
-    stream: int
-    scope: int
-    begin: int = 0
-    end: int = 0
-
-
-@dataclass
 class DevicePoint:
     host: Interval
     api: Interval
     task: DeviceTask
     stream: int
-
-    @property
-    def order(self) -> int:
-        return self.task.end
-
 
 class AscendTrace:
     host_waits = frozenset({
@@ -126,17 +108,23 @@ class AscendTrace:
     })
     stream_waits = frozenset({"aclrtStreamWaitEvent", "aclrtStreamWaitEventWithTimeout"})
 
-    def __init__(self, profile: Path, runtime: Path, native_points: set[int], services: list[dict], trace: Path, clock_samples: list[dict]) -> None:
+    def __init__(self, profile: Path, runtime: Path, raw: dict, trace: Path) -> None:
+        native_points = {index for index, point in enumerate(raw["points"]) if point["side"] == "signal"}
+        services = [scope for scope in raw["scopes"] if "service" in scope]
+        host_observation = raw["host_observation"]
 
-        # Native service/API intervals use RAW; device time needs an independent counter calibration.
-        start, = profile.glob("PROF_*/host/start_info")
+        # Host counters and stream ordinals establish order; measured RAW time is separate evidence.
+        counter = HostCounter(profile)
         device, = profile.glob("PROF_*/device_*")
-        host_offset = self.clock_offset(start)
-        self.clock = AscendClock(device, clock_samples)
+        self.clock = AscendClock(device, raw["device_clock"])
         rows = json.loads(trace.read_text(), parse_float=Decimal)
         flips = self.task_flips(profile)
-        intervals = [self.device_interval(row) if "Task Type" in row.get("args", {}) else Interval.read(row, host_offset)
-                     for row in rows if row.get("ph") == "X"]
+        intervals = [self.device_interval(row) if "Task Type" in row.get("args", {}) else Interval.read(row, counter)
+                     for row in rows if row.get("ph") == "X"
+                     and (row.get("cat") in {"enqueue", "dequeue"} or "connection_id" in row.get("args", {}))]
+        self.host_times = {}
+        native_intervals = [self.native_interval(row) for row in host_observation["intervals"]]
+        self.process = host_observation["process"]
         self.scopes = {}
         self.points = {}
         windows = []
@@ -144,10 +132,9 @@ class AscendTrace:
         enqueues, dequeues = [], []
         self.apis: dict[int, Interval] = {}
         self.tasks: dict[int, list[DeviceTask]] = defaultdict(list)
-        self.payload = []
-        processes = set()
+        self.device_tasks = []
         streams = defaultdict(list)
-        for interval in intervals:
+        for interval in [*native_intervals, *intervals]:
             row = interval.record
             name = row["name"]
             if name == "markov.window":
@@ -157,7 +144,6 @@ class AscendTrace:
                 if identity in self.scopes:
                     raise ValueError(f"duplicate semantic scope marker: {identity}")
                 self.scopes[identity] = interval
-                processes.add(row["pid"])
             elif name.startswith("markov.point/"):
                 identity = int(name.split("/")[1])
                 if identity in self.points:
@@ -193,8 +179,7 @@ class AscendTrace:
             for order, interval in enumerate(tasks):
                 task = DeviceTask(2 * order, 2 * order + 1, interval.record)
                 self.tasks[task.record["args"]["connection_id"]].append(task)
-                self.payload.append(task)
-        self.process, = processes
+                self.device_tasks.append(task)
         if len(windows) != 1:
             raise ValueError("native recording requires one closed observation window")
         self.window, = windows
@@ -203,10 +188,7 @@ class AscendTrace:
             if identity in self.scopes:
                 raise ValueError(f"service has two competing host observations: {identity}")
             interval = scope["host_interval"]
-            self.scopes[identity] = Interval(
-                interval["begin_raw_ns"], interval["end_raw_ns"],
-                scope["thread"], {"name": f"markov.scope/{identity}"},
-            )
+            self.scopes[identity] = self.native_interval({**interval, "thread": scope["thread"], "name": f"markov.scope/{identity}"})
         self.scope_ranges = ThreadIntervals(list(self.scopes.values()))
         self.excluded_ranges = ThreadIntervals(self.excluded)
         self.enqueue_ranges = ThreadIntervals(enqueues)
@@ -220,14 +202,14 @@ class AscendTrace:
             row = json.loads(line)
             if row["result"] != 0:
                 raise RuntimeError(f"native runtime call failed: {row['api']} ({row['result']})")
-            self.runtime.append(Interval(row["begin_raw_ns"], row["end_raw_ns"], row["thread"], row))
-        queues = NativeQueues(self.runtime)
-        self.services = ServiceExecutions(services, queues)
+            self.runtime.append(self.native_interval(row))
+        self.queues = NativeQueues(self.runtime)
+        self.services = ServiceExecutions(services, self.queues)
         for native in self.runtime:
             row = native.record
             if row["api"].startswith("aclrt") and row["stream_status"] == 0 and row["stream"] in self.services.streams:
                 raise ValueError("a private transport queue has external runtime operations; explicit ports are required")
-        self.services.assign(self.payload)
+        self.services.assign(self.device_tasks)
 
         self.runtime_ranges = ThreadIntervals(self.runtime)
         self.synchronizations = []
@@ -242,43 +224,17 @@ class AscendTrace:
 
                 # Resolve the generation while the handle is live; a later record can reuse the same handle.
                 self.synchronizations.append((native, records.get(row.get("event"))))
-        self.order_stream_commands()
         self.device_points = {identity: self.device_point(identity) for identity in self.points}
-        observed = {point.api.record["args"]["connection_id"] for identity, point in self.device_points.items() if identity not in native_points}
+        self.observer_connections = {
+            point.api.record["args"]["connection_id"] for identity, point in self.device_points.items() if identity not in native_points
+        }
 
-        # A native fence waits for submitted business work, not the observer's synthetic stream markers.
-        submitted: dict[int, list[tuple[int, DeviceTask | StreamWait]]] = defaultdict(list)
-        submitting = []
-        groups = {}
-        for command in self.commands:
-            if isinstance(command, StreamWait):
-                submitted[command.stream].append((command.api.end, command))
-                submitting.append(Interval(command.api.begin, command.api.end, command.stream, {}))
-                continue
-            connection = command.record["args"]["connection_id"]
-            if command.service is None and connection in self.apis and connection not in observed and not self.auxiliary(command) and not self.outside_window(command):
-                key = command.stream, connection
-                if key not in groups or command.end > groups[key].end:
-                    groups[key] = command
-
-        # SDK correlations may group several device tasks; driver submissions bound when the whole group is accepted.
-        for (stream, connection), command in groups.items():
-            begin, end = queues.window(self.apis[connection], stream)
-            submitting.append(Interval(begin, end, stream, {}))
-            submitted[stream].append((end, command))
-        self.submitting = ThreadIntervals(submitting)
-        self.frontiers = {}
-        for stream, values in submitted.items():
-            values.sort(key=lambda value: value[0])
-            latest = []
-            for _, task in values:
-                latest.append(task if not latest or task.end > latest[-1].end else latest[-1])
-            self.frontiers[stream] = [time for time, _ in values], latest
-
-    @staticmethod
-    def clock_offset(path: Path) -> int:
-        clock = json.loads(path.read_text())
-        return nanoseconds(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
+    def native_interval(self, record: dict) -> Interval:
+        thread = record["thread"]
+        for side in ("begin", "end"):
+            for resource in (f"thread/{thread}", f"service/{thread}"):
+                self.host_times[resource, record[f"{side}_counter"]] = record[f"{side}_raw_ns"]
+        return Interval(record["begin_counter"], record["end_counter"], thread, record)
 
     def device_interval(self, record: dict) -> Interval:
         begin, end = self.clock.interval(record)
@@ -304,79 +260,6 @@ class AscendTrace:
             if flip != 65535:
                 flips.add((stream, task, batches[stream]))
         return flips
-
-    def order_stream_commands(self) -> None:
-        self.waits: dict[int, StreamWait] = {}
-        waits: dict[int, list[StreamWait]] = defaultdict(list)
-        for native, _ in self.synchronizations:
-            if native.record["api"] not in self.stream_waits:
-                continue
-            api = self.native_api(native)
-            origin = self.origin(api)
-            owner = self.owner(origin)
-            if owner is None or self.excluded_ranges.enclosing(origin) is not None:
-                continue
-            if native.record["stream_status"] != 0:
-                raise ValueError("stream wait has no observed native stream identity")
-            wait = StreamWait(api, native.record["stream"], owner)
-            self.waits[api.record["args"]["connection_id"]] = wait
-            waits[wait.stream].append(wait)
-
-        streams: dict[int, list[DeviceTask]] = defaultdict(list)
-        for task in self.payload:
-            if task.record["args"]["connection_id"] not in self.waits:
-                streams[task.stream].append(task)
-        self.commands: list[DeviceTask | StreamWait] = []
-        for stream in sorted(streams.keys() | waits.keys()):
-            tasks = sorted(streams[stream], key=lambda task: task.begin)
-            positions = [task.begin for task in tasks]
-            gaps: dict[int, list[StreamWait]] = defaultdict(list)
-            for wait in waits[stream]:
-                observed = self.tasks[wait.api.record["args"]["connection_id"]]
-                if observed:
-                    task, = observed
-                    if task.stream != stream or task.record["args"]["Task Type"] != "EVENT_WAIT":
-                        raise ValueError("stream wait differs from its SDK device task")
-                    position = bisect_left(positions, task.begin)
-                else:
-
-                    # Submission order bounds the missing command; unknown or concurrent commands cannot be guessed past.
-                    lower, upper = 0, len(tasks)
-                    for index, task in enumerate(tasks):
-                        api = self.apis.get(task.record["args"]["connection_id"])
-                        if api is None:
-                            continue
-                        if api.end <= wait.api.begin:
-                            lower = max(lower, index + 1)
-                        elif api.begin >= wait.api.end:
-                            upper = min(upper, index)
-                    if lower != upper:
-                        raise ValueError(f"stream {stream} wait in scope {wait.scope} has no unique command position: {lower}..{upper}")
-                    position = lower
-                gaps[position].append(wait)
-
-            ordered = []
-            for position in range(len(tasks) + 1):
-                local = gaps[position]
-                physical = [self.tasks[wait.api.record["args"]["connection_id"]] for wait in local]
-                if all(physical):
-                    local.sort(key=lambda wait: self.tasks[wait.api.record["args"]["connection_id"]][0].begin)
-                else:
-                    local.sort(key=lambda wait: wait.api.begin)
-                    if any(left.api.end > right.api.begin for left, right in zip(local, local[1:])):
-                        raise ValueError(f"concurrent stream waits have no established order on stream {stream}")
-                ordered.extend(local)
-                if position < len(tasks):
-                    ordered.append(tasks[position])
-
-            # The API defines a wait even when hardware elides its task; both use the same logical entry/exit coordinates.
-            for index, command in enumerate(ordered):
-                command.begin, command.end = 2 * index, 2 * index + 1
-                if isinstance(command, StreamWait):
-                    for task in self.tasks[command.api.record["args"]["connection_id"]]:
-                        task.begin, task.end = command.begin, command.end
-            self.commands.extend(ordered)
-        self.payload = [command for command in self.commands if isinstance(command, DeviceTask)]
 
     @staticmethod
     def queue_index(intervals: list[Interval]) -> dict[int, Interval]:
@@ -404,43 +287,6 @@ class AscendTrace:
                 for access in scope[field]:
                     yield access["start"]
                     yield access["finish"]
-
-    def measurements(self, observation: dict) -> dict:
-        spans, resources = observation["spans"], observation["resources"]
-        positions = [set() for _ in resources]
-        for span in spans:
-            positions[span["resource"]].update((span["begin"], span["end"]))
-        for anchor in self.anchors(observation):
-            positions[spans[anchor["span"]]["resource"]].add(anchor["order"])
-
-        clocks = {}
-        for command in self.commands:
-            if isinstance(command, DeviceTask):
-                interval = self.device_interval(command.record)
-            else:
-                physical = self.tasks[command.api.record["args"]["connection_id"]]
-                interval = self.device_interval(physical[0].record) if physical else None
-
-            # An elided device wait has a proved order, but no measured device timestamp.
-            clocks[command.stream, command.begin] = interval.begin if interval else None
-            clocks[command.stream, command.end] = interval.end if interval else None
-
-        coordinates = []
-        for resource, orders in enumerate(positions):
-            descriptor = resources[resource]
-            stream = int(descriptor["identity"].split("/")[1]) if descriptor["kind"] == "stream" else None
-            for order in sorted(orders):
-
-                # Host/service coordinates are RAW timestamps; stream coordinates are strictly ordinal.
-                measured = clocks[stream, order] if stream is not None else order
-                if stream is not None and measured is not None and not self.clock.begin_ns <= measured <= self.clock.end_ns:
-                    raise ValueError("observed device boundary lies outside the clock calibration window")
-                coordinates.append({"resource": resource, "order": order, "time_ns": measured})
-        return {
-            "clock": "monotonic_raw_ns",
-            "window_ns": [self.window.begin, self.window.end],
-            "coordinates": coordinates,
-        }
 
     def origin(self, api: Interval) -> Interval:
         dequeue = self.dequeue_ranges.enclosing(api)
@@ -475,14 +321,15 @@ class AscendTrace:
 
     def runtime_call(self, api: Interval) -> Interval | None:
 
-        # SDK clock conversion has finite precision: require one overlapping call of the same API and thread.
-        calls = [native for native in self.runtime_ranges.overlapping(api) if native.record["api"] == api.record["args"]["id"]]
+        # Both recordings now use the same counter; the interposer encloses the actual SDK API.
+        calls = [native for native in self.runtime_ranges.overlapping(api)
+                 if native.contains(api) and native.record["api"] == api.record["args"]["id"]]
         if len(calls) > 1:
             raise ValueError(f"ambiguous native API instance: {api.record['args']['id']}")
         return calls[0] if calls else None
 
     def native_api(self, native: Interval) -> Interval:
-        calls = [api for api in self.api_ranges.overlapping(native) if api.record["args"]["id"] == native.record["api"]]
+        calls = [api for api in self.api_ranges.inside(native) if api.record["args"]["id"] == native.record["api"]]
         if len(calls) != 1:
             raise ValueError(f"native call does not identify one profiler API: {native.record['api']}")
         return calls[0]
@@ -497,20 +344,3 @@ class AscendTrace:
             return False
         origin = self.origin(api)
         return origin.end <= self.window.begin or self.window.end <= origin.begin
-
-    def submitted(self, before: int, stream: int | None) -> list[DeviceTask | StreamWait]:
-        result = []
-        if stream is not None and stream not in self.frontiers:
-
-            # An observed stream may contain only markers; the preceding warmup was drained.
-            return result
-        selected = self.frontiers if stream is None else {stream: self.frontiers[stream]}
-        for stream, (starts, latest) in selected.items():
-
-            # Without per-SQE correspondence, an overlapping dispatch cannot identify the fence's exact frontier.
-            if any(window.begin < before < window.end for window in self.submitting.overlapping(Interval(before, before, stream, {}))):
-                raise ValueError(f"stream {stream} fence overlaps a native command-group submission")
-            index = bisect_right(starts, before) - 1
-            if index >= 0:
-                result.append(latest[index])
-        return result

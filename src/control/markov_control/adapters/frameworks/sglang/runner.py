@@ -16,10 +16,11 @@ class UnexecutedModel(torch.nn.Module):
 
 
 class MetadataRunner(ModelRunner):
-    def __init__(self, *args, peer, rendezvous: str, kv_layout, **kwargs):
+    def __init__(self, *args, peer, rendezvous: str, kv_layout, allocator: str, **kwargs):
         self.peer = peer
         self.rendezvous = rendezvous
         self.kv_layout = kv_layout
+        self.allocator_implementation = allocator
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -75,7 +76,7 @@ class MetadataRunner(ModelRunner):
                        page_reuse=reuse, fields=["output_token"])
         self.req_to_token_pool = RequestSlots(self.peer, self.max_running_requests, context, extra)
         self.token_to_kv_pool_allocator = PageAllocator(
-            self.peer, self.max_total_num_tokens, self.server_args.page_size, self.kv_layout
+            self.peer, self.max_total_num_tokens, self.server_args.page_size, self.kv_layout, self.allocator_implementation
         )
         self.token_to_kv_pool = self.token_to_kv_pool_allocator.storage
 

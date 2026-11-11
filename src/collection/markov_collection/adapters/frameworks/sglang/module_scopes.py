@@ -38,6 +38,7 @@ class ModelScopes:
     def __init__(self, observation: Any, model: Any) -> None:
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.moe.topk import TopK
         from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.layers.utils.common import PPMissingLayer
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
@@ -46,10 +47,14 @@ class ModelScopes:
         self.model = model
         modules = dict(model.named_modules())
         self.experts = {name: module for name, module in modules.items() if isinstance(module, FusedMoE)}
-        self.expert_layers = [
-            {"layer": module.layer_id, "experts": module._num_global_routed, "top_k": module.top_k}
-            for module in self.experts.values()
-        ]
+        self.expert_layers = []
+        for path, module in self.experts.items():
+
+            # The enclosing MoE block pairs its routing module with the expert executor; executor top_k is optional.
+            router, = [child for child in modules[path.rpartition(".")[0]].children() if isinstance(child, TopK)]
+            self.expert_layers.append({
+                "layer": module.layer_id, "experts": module._num_global_routed, "top_k": router.topk_config.top_k,
+            })
         selected: dict[str, str] = {"": "model_body"}
         containers = [name for name, module in modules.items() if isinstance(module, torch.nn.ModuleList)]
         outer = [name for name in containers if not any(name.startswith(parent + ".") for parent in containers if parent != name)]
@@ -90,6 +95,10 @@ class ModelScopes:
             # Native capability checks inspect forward's signature after instrumentation is installed.
             module.forward = update_wrapper(partial(self.invoke, path, original), original)
 
+        # A pipeline input enters the first local decoder with that decoder's native token partition.
+        first_layer = next(spec for spec in self.bindings.values() if spec["role"] == "layer")
+        self.proxy_rows = first_layer["rows"]["input"]
+
     def logits(self, original: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
         owner = self.observation
@@ -103,20 +112,31 @@ class ModelScopes:
                 owner.tensors.declare_shape(result, ["model_members", result.shape[1]])
         return result
 
-    @classmethod
-    def shape(cls, spec, name: str, tensor: torch.Tensor, *, output: bool) -> list[Any] | None:
-        if not output and name.split(".", 2)[1] not in cls.token_arguments:
-            return None
+    def shape(self, spec, name: str, tensor: torch.Tensor, *, output: bool) -> list[Any] | None:
+        if not output and name.split(".", 2)[1] not in self.token_arguments:
+            return self.observation.tensors.declared_shape(tensor)
+        if output and spec["role"] == "model_body":
+
+            # The model wrapper forwards layer/logits results; it cannot replace their producer geometry.
+            declared = self.observation.tensors.declared_shape(tensor)
+            if declared is not None:
+                return declared
+
         shape: list[Any] = list(tensor.shape)
         if not shape:
             return shape
 
         # The decoder ABI is flat-token based; logits select one row per request, independently of token count.
         axis = "model_members" if output and ".next_token_" in name else "model_tokens"
+        if not output and name.startswith("argument.pp_proxy_tensors."):
+            axis = self.proxy_rows
         if spec["role"] == "layer" and (output or name.split(".", 2)[1] in {"hidden_states", "residual", "post_residual_addition"}):
             axis = spec["rows"]["output" if output else "input"]
         shape[0] = axis
         return shape
+
+    def proxy_shape(self, tensor):
+        return [self.proxy_rows, *tensor.shape[1:]]
 
     def invoke(self, path: str, original: Any, *args: Any, **kwargs: Any) -> Any:
         owner = self.observation

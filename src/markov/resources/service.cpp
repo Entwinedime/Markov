@@ -55,18 +55,20 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
         if (operation == "release") {
             slots.release(slot);
             changes_.returned_fields.emplace_back(field, slot);
+            changes_.capacity_increased = true;
             return nullptr;
         }
         throw std::invalid_argument("unknown state slot operation: " + operation);
     }
     if (kind == "free_slots") return pool_.free_slots();
-    if (kind == "capacity")
-        return {
-            {            "slots",           pool_.free_slots().size() },
-            {            "pages",           pool_.free_pages().size() },
-            { "evictable_tokens", pool_.prefixes().evictable_tokens() },
-            { "protected_tokens", pool_.prefixes().protected_tokens() }
-        };
+    if (kind == "capacity") {
+        const auto resource = message.at("resource").get<std::string>();
+        if (resource == "slots") return pool_.free_slots().size();
+        if (resource == "pages") return pool_.free_pages().size();
+        if (resource == "evictable_tokens") return pool_.prefixes().evictable_tokens();
+        if (resource == "protected_tokens") return pool_.prefixes().protected_tokens();
+        throw std::invalid_argument("unknown capacity resource: " + resource);
+    }
 
     if (kind == "prefix") {
         auto & index = pool_.prefixes();
@@ -83,13 +85,21 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
             for (const auto page : pages) {
                 if (page >= pool_.capacity().pages) throw std::invalid_argument("cached page lies outside its pool");
             }
+            const auto before = index.evictable_tokens();
             const auto inserted = index.insert(message.at("tokens").get<std::vector<std::int64_t>>(), pages);
+            changes_.capacity_increased |= index.evictable_tokens() > before;
             return {
                 {            "node",            inserted.node },
                 { "existing_tokens", inserted.existing_tokens }
             };
         }
-        if (operation == "lock") return index.lock(message.at("node").get<std::size_t>(), message.at("acquire").get<bool>());
+        if (operation == "lock") {
+
+            // Unlocking cached pages can unblock admission without returning them to the free list.
+            const auto delta = index.lock(message.at("node").get<std::size_t>(), message.at("acquire").get<bool>());
+            changes_.capacity_increased |= delta > 0;
+            return delta;
+        }
         if (operation == "evict") return index.evict(message.at("tokens").get<std::int64_t>());
         throw std::invalid_argument("unknown prefix operation: " + operation);
     }
@@ -120,9 +130,16 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
         for (const auto & member : allocation.members)
             bindings.push_back({
                 { "slot", member.slot },
+                { "new_pages", member.new_pages },
                 { "indices", pool_.indices(member.request, member.context_tokens, member.context_tokens + member.new_tokens) }
             });
-        return bindings;
+        if (kind == "slots") return bindings;
+
+        // Ordering changes the index computation's execution, not the ownership of a second page pool.
+        nlohmann::json ordering;
+        if (allocation.ordering)
+            ordering = { { "ready_pages", allocation.ordering->ready_pages }, { "released_pages", allocation.ordering->released_pages } };
+        return { { "members", std::move(bindings) }, { "ordering", std::move(ordering) } };
     }
     if (kind == "bind_prefix") {
         const auto id = request(message.at("request"), delivered);
@@ -134,6 +151,7 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
         const auto slot = pool_.residence(id).slot.value();
         pool_.release(id);
         changes_.returned_slots.push_back(slot);
+        changes_.capacity_increased = true;
         return nullptr;
     }
     if (kind == "release_pages") {
@@ -143,6 +161,7 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
         }
         pool_.return_pages(pages);
         changes_.returned_pages.insert(changes_.returned_pages.end(), pages.begin(), pages.end());
+        changes_.capacity_increased |= !pages.empty();
         return nullptr;
     }
     throw std::invalid_argument("unknown resource operation: " + kind);

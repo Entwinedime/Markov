@@ -66,7 +66,7 @@ class NativeExpertRoutes:
         from sglang.srt.server_args import get_global_server_args
 
         result = args[1] if len(args) > 1 else kwargs["topk_output"]
-        if result.topk_ids.shape[1] != experts.top_k:
+        if result.topk_ids.shape[1] != self.conditions.layers[experts.layer_id]["top_k"]:
             raise ValueError("native expert input does not match the supplied route top-k")
 
         # DeepEP partitions padded tokens; a local expert group retains the entire token vector.

@@ -17,12 +17,7 @@ from markov_control.peer import ControlPeer
 
 
 class NativeStopped(Exception):
-    """The core ended serving at a native request boundary."""
-
-
-@dataclass
-class StopInput:
-    pass
+    """The core ended drained serving at a suspended native control boundary."""
 
 
 class WorkerPeer(ControlPeer):
@@ -31,13 +26,13 @@ class WorkerPeer(ControlPeer):
 
     def exchange(self, operation, message=None):
         self.connection.send((operation, message))
-        return self.connection.recv()
+        result = self.connection.recv()
+        if isinstance(result, NativeStopped):
+            raise result
+        return result
 
     def send(self, message) -> None:
         self.exchange("send", message)
-
-    def receive(self, *, waiting, context):
-        return self.exchange("receive", {"waiting": waiting, "context": context})
 
     def call(self, kind: str, **parameters):
         return self.exchange("call", {"kind": kind, **parameters})
@@ -86,7 +81,7 @@ class NativeWorkers:
             for child in children:
                 child.close()
             try:
-                NativeCalls(peer, connections, context, groups).run()
+                NativeCalls(peer, connections, context, groups, observe=configuration["observe"]).run()
             finally:
                 for process in context.processes:
                     if process.is_alive():
@@ -107,6 +102,7 @@ class NativeWorkers:
 
         from markov_control.adapters.frameworks.sglang.scheduler import NativeScheduler
         from markov_adapters.sglang.metadata_collectives import MetadataCollectives
+        from markov_adapters.sglang.metadata_transfers import MetadataTransfers
         from sglang.srt.distributed import parallel_state
         from sglang.srt.plugins.hook_registry import HookRegistry
 
@@ -124,6 +120,7 @@ class NativeWorkers:
                 PipelineTransfers(scheduler, world, [worker["rank"] for worker in source["workers"]]).install()
             else:
                 CpuPointToPoint(peer, world).install()
+            MetadataTransfers(scheduler.calls).install()
 
             # Apply once after every serving adapter registers; early application silently skips later hooks.
             HookRegistry.apply_hooks()
@@ -150,13 +147,13 @@ class WorkerCall:
 class NativeCalls:
     """Keep worker calls suspended independently until their core response arrives."""
 
-    def __init__(self, peer, connections, context, groups) -> None:
+    def __init__(self, peer, connections, context, groups, *, observe=False) -> None:
         self.peer = peer
         self.connections = connections
         self.context = context
         self.membership = {rank: group for group in groups for rank in group["members"]}
         self.collectives = CollectiveCalls()
-        self.transfers = PointToPointCalls()
+        self.transfers = PointToPointCalls(observe)
         self.messages = {rank: [] for rank in range(len(connections))}
         self.closing = False
         self.stopped = set()
@@ -167,9 +164,19 @@ class NativeCalls:
         self.polled = False
         self.initialized = False
         self.next_rank = 0
+        if observe:
+            self.ready.append(WorkerCall("observe", {
+                "kind": "protocol", "group": self.membership[0]["id"],
+                "record": {"phase": "scope", "backend": "gloo", "operations": ["send", "recv", "isend", "irecv"],
+                           "participants": [{"rank": rank, "group": group["id"]} for rank, group in self.membership.items()]},
+            }, ()))
 
     def receive_worker(self, channel, rank, operation, message) -> None:
         group = self.membership[rank]
+
+        if self.closing and (operation != "send" or message.get("kind") != "stopped"):
+            raise ValueError("Native worker requested work after drained shutdown")
+
         if operation == "messages":
             deliveries = tuple({"source": rank, **delivery} for delivery in message["deliveries"])
             if message["completion"] is not None:
@@ -191,19 +198,15 @@ class NativeCalls:
             return
         if operation == "metadata_post":
             self.transfers.post(channel, rank, message)
+            self.observe_transfers()
             return
         if operation == "metadata_wait":
             self.transfers.wait(channel, rank, message)
-            return
-        if operation == "receive":
-            if not group["ingress"]:
-                raise ValueError("Only the native input rank receives core arrivals")
-            if self.closing:
-                channel.send({"kind": "stop"})
-            else:
-                self.ready.append(WorkerCall(operation, {"kind": "input", "group": group["id"], **message}, (channel,)))
+            self.observe_transfers()
             return
         message = {**message, "group": group["id"]}
+        if message["kind"] == "input" and not group["ingress"]:
+            raise ValueError("Only the native input rank receives core arrivals")
 
         if message["kind"] != "ready":
             self.ready.append(WorkerCall(operation, message, (channel,)))
@@ -225,11 +228,17 @@ class NativeCalls:
             for participant in members:
                 del self.pending[participant]
 
-    def deliver(self, deliveries):
+    def observe_transfers(self):
+        for record in self.transfers.take_observations():
+            self.ready.append(WorkerCall("observe", {
+                "kind": "protocol", "group": self.membership[record["rank"]]["id"], "record": record,
+            }, ()))
+
+    def deliver(self, deliveries, completion=None):
         if not deliveries:
             return
         for packet in deliveries:
-            self.messages[packet["target"]].append({"source": packet["source"], "value": packet["value"]})
+            self.messages[packet["target"]].append({"source": packet["source"], "value": packet["value"], "completion": completion})
 
         # Publish the wakeup after queuing metadata; a receiver must never miss that change while parking.
         source = self.membership[deliveries[0]["source"]]["id"]
@@ -243,20 +252,29 @@ class NativeCalls:
                 raise ValueError("Core issued an overlapping native poll")
             self.polled = True
         elif message.get("kind") == "shutdown":
-            self.closing = True
-
-            # Serving is drained; release only native ingress waits before stopping workers.
-            for identity, call in list(self.awaiting.items()):
-                if call.operation == "receive":
-                    call.participants[0].send({"kind": "stop"})
-                    del self.awaiting[identity]
+            self.shutdown()
         else:
             call = self.awaiting.pop(message["reply"])
             if call.operation == "delivery":
-                self.deliver(call.deliveries)
+                self.deliver(call.deliveries, message["result"]["event"])
             else:
                 for channel in call.participants:
                     channel.send(message["result"])
+
+    def shutdown(self):
+        if self.ready or self.pending or not self.quiescent() or any(
+            call.message["kind"] not in {"input", "idle"} for call in self.awaiting.values()
+        ):
+            raise ValueError("Native shutdown requires suspended participants and no unfinished serving calls")
+        self.closing = True
+
+        # The core drained serving and its execution graph; cancel private CPU waits without injecting PP messages.
+        self.awaiting.clear()
+        self.collectives.pending.clear()
+        self.transfers.pending.clear()
+        for channel in self.connections:
+            if channel not in self.stopped:
+                channel.send(NativeStopped())
 
     def quiescent(self) -> bool:
         blocked = self.stopped | set(self.pending) | self.collectives.blocked() | self.transfers.blocked()
@@ -276,7 +294,8 @@ class NativeCalls:
 
                 # Read-only replies and observations must not consume a native scheduling turn.
                 call = next((item for item in self.ready if item.message["kind"] in {
-                    "capacity", "free_slots", "describe", "completed", "completion_notice", "wake", "query_result", "action_values",
+                    "capacity", "free_slots", "describe", "completed", "completion_notice", "observed_completion",
+                    "wake", "query_result", "action_values", "protocol",
                 } or (item.message["kind"] == "state_slots" and item.message["operation"] == "available")), None)
                 if call is None:
                     if not self.quiescent():
@@ -291,9 +310,6 @@ class NativeCalls:
                     )
                     self.next_rank = (self.connections.index(call.participants[0]) + 1) % len(self.connections)
                 self.ready.remove(call)
-            if self.closing and call.operation == "receive":
-                call.participants[0].send({"kind": "stop"})
-                return
             identity = self.sequence
             self.sequence += 1
             self.peer.send({"kind": "call", "id": identity, "message": call.message})

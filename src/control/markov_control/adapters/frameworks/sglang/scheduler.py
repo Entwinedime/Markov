@@ -13,15 +13,13 @@ from markov_control.adapters.frameworks.sglang.batches import BatchNames
 from markov_control.adapters.frameworks.sglang.prefix_cache import PrefixCache
 from markov_control.adapters.frameworks.sglang.requests import NativeRequestReceiver, RequestInput
 from markov_control.adapters.frameworks.sglang.flow import FlowExecution
-from markov_control.adapters.frameworks.sglang.resources import AllocationCalls
+from markov_control.adapters.frameworks.sglang.resources import AllocationDemand
 from markov_control.adapters.frameworks.sglang.runner import MetadataRunner
 from markov_control.adapters.frameworks.sglang.signals import PipelineSignals
-from markov_control.adapters.frameworks.sglang.workers import NativeStopped
 from markov_control.adapters.runtimes.tensors import TensorValues
 from markov_workload.expert_routes import ExpertRoutes
 from sglang.srt.entrypoints.engine import _compute_parallelism_ranks
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers import schedule_batch
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -38,7 +36,6 @@ class NativeScheduler(Scheduler):
         worker = source["workers"][rank]
         self.graph_rank = worker["rank"]
         self.group = worker["group"]
-        self.waiting_for_change = False
         self.launching = False
         self.pd = None
         if source["mode"] != "null":
@@ -51,7 +48,8 @@ class NativeScheduler(Scheduler):
         self.batch_names = BatchNames()
         self.request_state = RequestStateCalls(observe=settings["observe"])
         model_runner.ModelRunner = partial(
-            MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri(), kv_layout=worker["kv_layout"],
+            MetadataRunner, peer=peer, rendezvous=Path(model_path, "group").as_uri(),
+            kv_layout=worker["kv_layout"], allocator=source["allocator"],
         )
         cache = source["cache"]
         register_radix_cache_backend("markov", partial(PrefixCache.build, expected=cache))
@@ -132,13 +130,19 @@ class NativeScheduler(Scheduler):
         self.model_worker.forward_batch_generation = self.model_result
         self.request_state.install()
         self.calls = FlowExecution(self)
-        AllocationCalls(schedule_batch)
+        AllocationDemand()
         if self.pd is not None:
             self.pd.install_calls()
 
         if source["pp"] > 1:
             self.pipeline_messages = PipelineMessages(self.calls)
             self.signals.install()
+
+    def handle_generate_request(self, request):
+
+        # Native initialization binds this method into its dispatcher before call instrumentation is installed.
+        self.calls.input(request)
+        return super().handle_generate_request(request)
 
     def description(self, batch):
         if batch is None:
@@ -175,6 +179,7 @@ class NativeScheduler(Scheduler):
         return parameters, work
 
     def run_batch(self, batch, *args, **kwargs):
+        self.request_receiver.model_ran = True
         if self.launching:
             return super().run_batch(batch, *args, **kwargs)
         parameters, work = self.model_work(batch)
@@ -185,6 +190,7 @@ class NativeScheduler(Scheduler):
         return result
 
     def _pp_launch_batch(self, mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue):
+        self.request_receiver.model_ran = True
         parameters, work = self.model_work(self.cur_batch)
 
         # The native launch owns run_batch and its recorded completion; submit the parent graph once.
@@ -195,6 +201,7 @@ class NativeScheduler(Scheduler):
         finally:
             self.launching = False
         work["signals"] = {"completion": event._markov_signal.identity}
+        work["observation_context"] = {"pipeline": event._markov_signal.context["pipeline"]}
         self.bind_state(work, accesses)
         inputs = {} if pp_proxy_tensors is None else {f"proxy.{name}": tensor for name, tensor in PipelineABI.proxy_tensors(pp_proxy_tensors).items()}
         if result.pp_hidden_states_proxy_tensors is None:
@@ -206,6 +213,7 @@ class NativeScheduler(Scheduler):
 
     def _pp_prep_batch_result(self, batch, mb_metadata, pp_outputs):
         parameters, work = self.description(batch)
+        work["observation_context"] = {"pipeline": PipelineABI.control_context(self.calls)}
         received = pp_outputs["next_token_ids"]
         tokens = self.next_tokens(batch)
 
@@ -226,6 +234,7 @@ class NativeScheduler(Scheduler):
         with self.signals.producing():
             outputs, result, event = super()._pp_make_skip_output_result(batch, mb_metadata)
         work["signals"] = {"completion": event._markov_signal.identity}
+        work["observation_context"] = {"pipeline": event._markov_signal.context["pipeline"]}
         self.action("output_skip", parameters, work, tensor_outputs={"next_token_ids": result.next_token_ids})
         return outputs, result, event
 
@@ -271,10 +280,9 @@ class NativeScheduler(Scheduler):
         self.calls.process(super().process_batch_result, batch, result)
 
     def on_idle(self):
-        self.waiting_for_change = self.pd is not None and self.pd.waiting()
-        idle = self.is_fully_idle()
+        idle = self.is_fully_idle() and not PipelineABI.pending_model_sends(self)
         if idle:
-            self.drain_transfers()
+            self.calls.drained()
         super().on_idle()
         if not idle:
             return
@@ -285,18 +293,3 @@ class NativeScheduler(Scheduler):
             self.peer.call("idle", waiting=True)
         else:
             self.peer.send(message)
-
-    def drain_transfers(self):
-        if self.ps.pp_size > 1:
-
-            # Native logical idle can still own asynchronous sends from the preceding microbatch round.
-            for work in (self.send_req_work, self.send_proxy_work, self.send_output_work):
-                self._pp_commit_comm_work(work)
-
-    def stop(self, requests):
-        self.drain_transfers()
-        if self.ps.pp_size > 1 and not self.pp_group.is_last_rank:
-
-            # Forward shutdown through the same native request path before leaving downstream receivers behind.
-            self._pp_send_pyobj_to_next_stage(requests, async_send=False)
-        raise NativeStopped()

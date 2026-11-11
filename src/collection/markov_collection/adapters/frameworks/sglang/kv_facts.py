@@ -5,6 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from markov_adapters.sglang.kv_layout import KvBufferAddresses, MhaKvLayout
+from markov_collection.adapters.frameworks.sglang.transfer_groups import TransferGroups
 
 
 class NativeKvFacts:
@@ -12,6 +13,7 @@ class NativeKvFacts:
         self.directory = directory
         self.recording = json.loads((directory / f"rank-{rank}.json").read_text())
         self.registrations = {}
+        self.groups = TransferGroups(self.recording)
 
     def registration(self, recording):
         observed = recording["registration"]
@@ -31,6 +33,8 @@ class NativeKvFacts:
             raise ValueError("native metadata send differs from its enqueued request")
         if not source["row_bytes"] or source["row_bytes"] != target["row_bytes"]:
             raise ValueError("native metadata endpoints have different row layouts")
+        if parent["parameters"]["last_chunk"] != 1:
+            raise ValueError("native first-token metadata must belong to the final chunk")
 
         # Native send_aux transfers one complete registered row from every buffer, including the room gate.
         rows = []
@@ -54,6 +58,9 @@ class NativeKvFacts:
                 "space": "slot", "pool": pool, "field": "metadata", "access": mode,
                 "members": key, "requests": [member["id"]], "interval": "service",
             })
+
+        # Native senders independently publish the same request's first token; the receiver joins their completions.
+        accesses[-1]["publication"] = "first-token"
         return accesses
 
     @staticmethod
@@ -162,9 +169,10 @@ class NativeKvFacts:
             if expected != self.recording["environment"]["kv_peers"][binding]:
                 raise ValueError("native transfer registration differs from the planned peer interface")
             scope["state_accesses"] = self.accesses(scope)
-            parent = self.recording["scopes"][scope["submitted_by"]]
+        for parent, members in self.groups.members.items():
+            parent = self.recording["scopes"][parent]
             parent["ports"].append({
-                "name": f"completion/{binding}/{transfer['kind']}", "direction": "output", "use": "signal",
-                "boundary": {"scope": scope["id"], "interval": "service", "side": "end"},
+                "name": "transfer.complete", "direction": "output", "use": "signal",
+                "boundary": {"scope": members[-1], "interval": "service", "side": "end"},
             })
         return self.recording

@@ -1,9 +1,9 @@
 """Translate simulated arrivals at the native tokenizer receive boundary."""
 
 from array import array
+import sys
 
 import zmq
-from markov_control.adapters.frameworks.sglang.workers import StopInput
 from markov_control.peer import ControlPeer
 from markov_workload import WorkloadContent
 from markov_workload.routing import RoutedContent
@@ -21,6 +21,7 @@ class RequestInput:
         self.arrivals = None
         self.waiting = False
         self.context = None
+        self.in_flow = False
         self.requests = workload["requests"]
         self.content = WorkloadContent(self.requests, workload["prefixes"])
         self.content.check_vocabulary(vocab_size)
@@ -38,13 +39,10 @@ class RequestInput:
 
     def recv_pyobj(self, flags):
         if self.arrivals is None:
-            advance = self.peer.receive(waiting=self.waiting, context=self.context)
-            if advance["kind"] == "stop":
-                self.arrivals = iter([StopInput()])
-            elif advance["kind"] == "advance":
-                self.arrivals = iter(advance["arrivals"])
-            else:
+            advance = self.peer.call("input", waiting=self.waiting, context=self.context, in_flow=self.in_flow)
+            if advance["kind"] != "advance":
                 raise ValueError("Native control expected an advance boundary")
+            self.arrivals = iter(advance["arrivals"])
 
         request = next(self.arrivals, None)
 
@@ -52,9 +50,6 @@ class RequestInput:
         if request is None:
             self.arrivals = None
             raise zmq.Again()
-
-        if isinstance(request, StopInput):
-            return request
 
         identity = request
         request = self.requests[identity]
@@ -87,17 +82,25 @@ class NativeRequestReceiver:
     def __init__(self, receiver, scheduler) -> None:
         self.receiver = receiver
         self.scheduler = scheduler
+        self.round_started = False
+        self.model_ran = False
 
     def recv_requests(self):
         scheduler = self.scheduler
 
-        # Finish native post-idle cleanup before parking at the next receive boundary.
-        scheduler.request_input.waiting = (
-            scheduler.waiting_for_change and scheduler.pd.waiting() and scheduler.is_fully_idle(for_health_check=True)
-        )
-        scheduler.waiting_for_change = False
+        # The native loop owns this cursor. A PP round includes every slot, not each individual receive.
+        first_slot = scheduler.ps.pp_size == 1 or sys._getframe(1).f_locals["mb_id"] == 0
+        scheduler.request_input.waiting = False
+        if first_slot:
+
+            # Pending transfers can bypass on_idle; completed rounds must still have a safe external wait.
+            scheduler.request_input.waiting = (
+                self.round_started and not self.model_ran
+                and not scheduler.waiting_queue and scheduler.chunked_req is None
+                and scheduler.pd is not None and scheduler.pd.waiting()
+            )
+            self.round_started = True
+            self.model_ran = False
         scheduler.request_input.context = scheduler.calls.scheduler_work()["context"]
-        requests = self.receiver.recv_requests()
-        if any(isinstance(request, StopInput) for request in requests):
-            self.scheduler.stop(requests)
-        return requests
+        scheduler.request_input.in_flow = scheduler.calls.started
+        return self.receiver.recv_requests()
