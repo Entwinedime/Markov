@@ -1,4 +1,4 @@
-"""Recover SDK counters for ordering and calibrate measured device time independently."""
+"""Recover SDK host coordinates and RAW time, and calibrate measured device time."""
 
 from __future__ import annotations
 
@@ -93,6 +93,11 @@ class HostCounter:
         self.framework_raw = anchor["clock_monotonic_raw"]
         self.cann_raw = self.framework_raw + round(Decimal(anchor["cntvct_diff"]) * 1_000_000_000 / self.frequency)
         self.offset = Decimal(start["collectionTimeBegin"]) * 1000 - int(start["clockMonotonicRaw"])
+
+    def timestamp(self, counter: int) -> int:
+
+        # The profiler records this counter/RAW anchor; recover time on its actual counter grid.
+        return self.framework_raw + round(Decimal(counter - self.anchor) * 1_000_000_000 / self.frequency)
 
     def interval(self, record):
 

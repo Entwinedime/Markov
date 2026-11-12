@@ -113,7 +113,7 @@ class AscendTrace:
         services = [scope for scope in raw["scopes"] if "service" in scope]
         host_observation = raw["host_observation"]
 
-        # Host counters and stream ordinals establish order; measured RAW time is separate evidence.
+        # Host counters and stream ordinals establish order; both native and SDK times reach the common RAW clock.
         counter = HostCounter(profile)
         device, = profile.glob("PROF_*/device_*")
         self.clock = AscendClock(device, raw["device_clock"])
@@ -122,7 +122,13 @@ class AscendTrace:
         intervals = [self.device_interval(row) if "Task Type" in row.get("args", {}) else Interval.read(row, counter)
                      for row in rows if row.get("ph") == "X"
                      and (row.get("cat") in {"enqueue", "dequeue"} or "connection_id" in row.get("args", {}))]
-        self.host_times = {}
+        self.host_times = {
+            (f"thread/{interval.thread}", position): counter.timestamp(position)
+            for interval in intervals if "Task Type" not in interval.record.get("args", {})
+            for position in (interval.begin, interval.end)
+        }
+
+        # Direct RAW observations take precedence when both recordings name the same counter coordinate.
         native_intervals = [self.native_interval(row) for row in host_observation["intervals"]]
         self.process = host_observation["process"]
         self.scopes = {}

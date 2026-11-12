@@ -247,8 +247,8 @@ class StreamCommands:
             stream = int(descriptor["identity"].split("/")[1]) if descriptor["kind"] == "stream" else None
             for order in sorted(orders):
 
-                # SDK-only host endpoints establish order, not independently measured RAW time.
-                measured = clocks[stream, order] if stream is not None else trace.host_times.get((descriptor["identity"], order))
+                # Every retained host cut names an observed native or SDK endpoint; missing handoff is an error.
+                measured = clocks[stream, order] if stream is not None else trace.host_times[descriptor["identity"], order]
                 if stream is not None and measured is not None and not trace.clock.begin_ns <= measured <= trace.clock.end_ns:
                     raise ValueError("observed device boundary lies outside the clock calibration window")
                 coordinates.append({"resource": resource, "order": order, "time_ns": measured})
