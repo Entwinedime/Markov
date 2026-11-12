@@ -20,10 +20,13 @@ class NativeCase:
 
     def __init__(self, capture, manifest):
         self.capture, self.manifest = capture, manifest
-        self.groups = {rank: f"{instance['id']}/{rank}" for instance in manifest["instances"] for rank in instance["observed_roles"]}
-        self.ranks = {rank: instance["id"] for instance in manifest["instances"] for rank in instance["observed_roles"]}
-        if len(self.groups) != sum(len(instance["observed_roles"]) for instance in manifest["instances"]):
-            raise ValueError("native case repeats an observed worker")
+        self.groups = {rank: f"{instance['id']}/{rank}" for instance in manifest["instances"] for rank in instance["native_participants"]}
+        self.ranks = {rank: instance["id"] for instance in manifest["instances"] for rank in instance["native_participants"]}
+        self.observed_roles = {rank for instance in manifest["instances"] for rank in instance["observed_roles"]}
+        if (len(self.groups) != sum(len(instance["native_participants"]) for instance in manifest["instances"])
+                or len(self.observed_roles) != sum(len(instance["observed_roles"]) for instance in manifest["instances"])
+                or self.observed_roles - self.groups.keys()):
+            raise ValueError("native case has repeated participants or invalid observed workers")
 
         self.sources, self.dependencies, self.clocks = {}, {}, {}
         self.connections = Connections()
@@ -34,8 +37,8 @@ class NativeCase:
         self.observed_actions = 0
 
     def observe(self, rank, graph, raw):
-        if rank in self.sources:
-            raise ValueError("native worker was already observed")
+        if rank not in self.observed_roles or rank in self.sources:
+            raise ValueError("native worker observation is unexpected or repeated")
         if raw["environment"]["implementation"]["framework_revision"] != self.manifest["framework_revision"]:
             raise ValueError("native worker and capture disagree on their upstream framework revision")
         source = GraphContents(graph)
@@ -72,7 +75,7 @@ class NativeCase:
         return source
 
     def finish(self):
-        if self.sources.keys() != self.groups.keys():
+        if self.sources.keys() != self.observed_roles:
             raise ValueError("native case omits observed workers")
         if not self.observed_actions:
             raise ValueError("native case contains no observed actions")
@@ -85,6 +88,9 @@ class NativeCase:
                 raise ValueError("native session identifies more than one registered pool")
             registrations[session] = registration
         registered_ranks = {session: value["parallel"]["rank"] for session, value in registrations.items()}
+
+        # Registration covers initialized peers too; missing graphs never remove real PD endpoints.
+        self.protocol.register(registrations, self.groups)
         self.histories = {}
         for rank, group in self.groups.items():
             path = self.capture / "resources" / f"rank-{rank}.json"

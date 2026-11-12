@@ -130,10 +130,15 @@ class ActionScopes:
     def __init__(self, graph):
         self.graph = graph
         self.children, self.work = defaultdict(list), defaultdict(list)
+        self.events = defaultdict(list)
         for index, scope in enumerate(graph["scopes"]):
             self.children[scope["parent"]].append(index)
         for piece in graph["work"]:
             self.work[piece["scope"]].append(piece)
+
+        # Repeated action cuts share one event-ownership index over this immutable graph.
+        for index, event in enumerate(graph["events"]):
+            self.events[event["scope"]].append(index)
         self.placements = {}
 
     @staticmethod

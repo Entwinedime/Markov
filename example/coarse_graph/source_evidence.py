@@ -247,11 +247,13 @@ class ProductionEvidence:
                 SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
                 contents = native_case.observe(rank, graph, native)
                 native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
+                measurements = native_evidence.inspect_measurements()
                 boundaries = native_evidence.inspect_boundaries(graph)
                 effects = native_evidence.inspect()
                 signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank])
                 report = SourceEvidence(facts, graph, native["device_clock"], self.details).inspect()
                 report["native_effects"] = effects
+                report["native_measurements"] = measurements
                 report["native_boundaries"] = boundaries
                 report["native_signals"] = signals
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
@@ -289,8 +291,11 @@ class ProductionEvidence:
                 lines.extend(["", f"rank {report['rank']} 无法完成检查：{report['error']}", ""])
             elif "native_boundaries" in report:
                 boundaries, signals = report["native_boundaries"], report["native_signals"]
+                measurements = report["native_measurements"]
                 lines.extend([
-                    "", f"rank {report['rank']}：核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
+                    "", f"rank {report['rank']}：从原始记录核对主机时间点 {measurements['checked_host_measurements']} 个；"
+                    f"没有SDK设备任务的原生动作所派生的端点 {measurements['unmeasured_device_endpoints']} 个仍无设备时间，未用主机调用时间替代。"
+                    f"核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
                     f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
                     f"SDK 完成导出 {signals.get('exported_completions', 0)} 处、实际等待 {signals.get('signal_waits', 0)} 处、"
                     f"返回 true 的完成读取 {signals.get('true_completion_reads', 0)} 处。"

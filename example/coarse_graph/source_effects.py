@@ -24,16 +24,24 @@ class NativeEffectEvidence:
         self.task_records = {}
         self.enqueues = {}
         self.dequeue_ids = {}
+        self.host_measurements = {}
         dequeues = []
         for row in rows:
             if row.get("ph") != "X":
                 continue
             args = row.get("args", {})
+            if "Task Type" not in args and (row.get("cat") in {"enqueue", "dequeue"} or "connection_id" in args):
+                interval = Interval.read(row, counter)
+
+                # Reconstruct expected times from raw SDK coordinates, never from interpreted measurements.
+                for position in (interval.begin, interval.end):
+                    self.host_measurements[f"thread/{interval.thread}", position] = (
+                        counter.framework_raw + round(Decimal(position - counter.anchor) * 1_000_000_000 / counter.frequency)
+                    )
             if "Task Type" in args:
                 self.tasks[args["connection_id"]].append(args)
                 self.task_records[int(args["Physic Stream Id"]), self.task_key(args)] = row
             elif row.get("cat") in {"enqueue", "dequeue"}:
-                interval = Interval.read(row, counter)
                 if row["cat"] == "enqueue":
                     self.enqueues[args["correlation_id"]] = interval
                 else:
@@ -41,7 +49,7 @@ class NativeEffectEvidence:
                     self.dequeue_ids[args["correlation_id"]] = interval
             elif "Thread Id" in args and "connection_id" in args:
                 self.require(args["connection_id"] not in self.apis, "raw SDK repeats an API connection")
-                self.apis[args["connection_id"]] = Interval.read(row, counter)
+                self.apis[args["connection_id"]] = interval
         self.api_ranges = ThreadIntervals(list(self.apis.values()))
         self.dequeues = ThreadIntervals(dequeues)
         self.enqueue_ranges = ThreadIntervals(list(self.enqueues.values()))
@@ -93,6 +101,14 @@ class NativeEffectEvidence:
                 submissions[queues[key]].append(self.interval(row))
         self.submissions = {stream: ThreadIntervals(calls) for stream, calls in submissions.items()}
 
+        # Actual RAW samples override SDK reconstruction at their own coordinates, including service threads.
+        services = [{**scope["host_interval"], "thread": scope["thread"]}
+                    for scope in native["scopes"] if "service" in scope]
+        for row in [*native["host_observation"]["intervals"], *services, *self.runtime]:
+            for side in ("begin", "end"):
+                for resource in (f"thread/{row['thread']}", f"service/{row['thread']}"):
+                    self.host_measurements[resource, row[f"{side}_counter"]] = row[f"{side}_raw_ns"]
+
     @staticmethod
     def require(condition, message):
         if not condition:
@@ -117,10 +133,34 @@ class NativeEffectEvidence:
     def task_key(self, task):
         return tuple(task[name] for name in self.task_fields)
 
+    def inspect_measurements(self):
+        checked = 0
+        unmeasured = set()
+        for point in self.facts["measurements"]["coordinates"]:
+            resource = self.facts["resources"][point["resource"]]
+            if resource["kind"] == "stream":
+                if point["time_ns"] is None:
+                    unmeasured.add((point["resource"], point["order"]))
+                continue
+            key = resource["identity"], point["order"]
+            self.require(key in self.host_measurements, f"host boundary has no original time source: {key}")
+            self.require(point["time_ns"] == self.host_measurements[key], f"host measurement is missing or changes its original time: {key}")
+            checked += 1
+
+        # inspect() independently checks these native commands against raw API and SDK task records.
+        native_only = {(effect["resource"], command[side])
+                       for effect in self.facts["native_effects"] for command in effect["commands"]
+                       if command["sdk"] is None for side in ("begin", "end")}
+        self.require(unmeasured <= native_only, "device boundary loses a recorded timestamp or lacks an observed native command")
+        return {"checked_host_measurements": checked, "unmeasured_device_endpoints": len(unmeasured)}
+
     def inspect_boundaries(self, graph):
         spans = Counter((span["scope"], span["resource"], span["begin"], span["end"], span["kind"]) for span in self.facts["spans"])
         resources = {(resource["kind"], resource["identity"]): index for index, resource in enumerate(graph["resources"])}
         self.require(len(resources) == len(graph["resources"]), "coarse graph repeats a native resource")
+
+        # SDK ownership is fixed for this recording, so CPU regions share one device-owner set.
+        device_owners = {self.owner(api) for connection, api in self.apis.items() if self.tasks.get(connection)}
         counts = Counter()
         for index, scope in enumerate(graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
@@ -146,9 +186,7 @@ class NativeEffectEvidence:
             if scope["role"] == "segment" and len(origins) > 1:
 
                 # A CPU-only region cannot conceal real SDK work, even if its semantic declarations were incomplete.
-                for api in self.apis.values():
-                    if self.owner(api) in origins:
-                        self.require(not self.tasks.get(api.record["args"]["connection_id"]), "closed CPU region hides native device work")
+                self.require(device_owners.isdisjoint(origins), "closed CPU region hides native device work")
                 counts["closed_cpu_regions"] += 1
             if "service" in raw:
                 service = resources["service", f"service/{thread}"]

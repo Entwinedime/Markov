@@ -20,8 +20,9 @@ class ClockConstraints:
         self.region = [(Fraction(x), Fraction(y)) for x, y in (
             (lower[0], lower[1]), (upper[0], lower[1]), (upper[0], upper[1]), (lower[0], upper[1]),
         )]
-        self.points = [self.point(measured["time_ns"], graph["resources"][event["resource"]]["kind"] == "stream")
-                       for event, measured in zip(graph["events"], graph["evidence"]["events"], strict=True)]
+        self.device = [graph["resources"][event["resource"]]["kind"] == "stream" for event in graph["events"]]
+        self.points = [self.point(measured["time_ns"], device)
+                       for measured, device in zip(graph["evidence"]["events"], self.device, strict=True)]
         self.measured = 0
         self.unknown = 0
         self.conflict = None
@@ -49,9 +50,14 @@ class ClockConstraints:
         if self.conflict is not None:
             return
 
-        a, b, limit = begin[0] - end[0], begin[1] - end[1], end[2] - begin[2]
-        if a == b == 0 and limit >= 0:
+        # One positive affine clock preserves order; only cross-clock pairs constrain its calibration.
+        if self.device[source] == self.device[target]:
+            if begin[2] > end[2]:
+                self.region.clear()
+                self.conflict = {"kind": kind, "index": index, "source": source, "target": target}
             return
+
+        a, b, limit = begin[0] - end[0], begin[1] - end[1], end[2] - begin[2]
         distances = [a * x + b * y - limit for x, y in self.region]
         if all(value <= 0 for value in distances):
             return

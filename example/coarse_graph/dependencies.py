@@ -118,13 +118,6 @@ class CausalGraph:
                 raise ValueError("execution repeats an event identity")
             self.next[event] = {}
 
-    def induced(self, events):
-        result = CausalGraph()
-        result.next = {source: {target: relations for target, relations in self.next[source].items() if target in events}
-                       for source in self.next if source in events}
-        result.prepare()
-        return result
-
     def connect(self, source, target, relation):
         if source not in self.next or target not in self.next:
             raise ValueError("dependency refers to an undeclared event")

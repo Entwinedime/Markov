@@ -13,6 +13,15 @@ class PdStateEvidence:
         self.admission_members = {}
         self.addresses, self.publications = {}, {}
 
+    def register(self, registrations, groups):
+        for session, recording in registrations.items():
+            group = groups[recording["parallel"]["rank"]]
+            if self.sessions.setdefault(session, group) != group:
+                raise ValueError("PD session disagrees with its initialized worker")
+            endpoint = tuple(recording["registration"]["control_endpoint"])
+            if self.addresses.setdefault(endpoint, group) != group:
+                raise ValueError("PD control endpoint disagrees with its initialized worker")
+
     def observe(self, raw, group):
         if raw["kv_session"] is not None:
             session = raw["kv_session"]
