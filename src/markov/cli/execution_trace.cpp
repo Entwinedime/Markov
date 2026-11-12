@@ -91,6 +91,14 @@ void ExecutionTrace::applied(std::string_view group, const nlohmann::json & oper
     } << '\n';
 }
 
+void ExecutionTrace::condition_used(std::string_view group, std::size_t step, std::string_view operation,
+                                   const nlohmann::json & identity, const nlohmann::json & source) {
+    stream_ << nlohmann::json{
+        { "kind", "condition_used" }, { "group", group }, { "step", step }, { "operation", operation },
+        { "identity", identity }, { "source", source }
+    } << '\n';
+}
+
 void ExecutionTrace::observed_values(std::string_view group, std::size_t boundary, const nlohmann::json & values, std::int64_t time_ns) {
     stream_ << nlohmann::json{
         { "kind", "action_values" }, { "group", group }, { "boundary", boundary }, { "values", values }, { "time_ns", time_ns }

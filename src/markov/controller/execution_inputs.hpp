@@ -13,6 +13,8 @@
 
 namespace markov {
 
+class ControlObserver;
+
 struct InputPosition {
     std::string group;
     std::size_t step;
@@ -26,7 +28,7 @@ struct InvocationInput {
 // Positions retain an already checked causal prefix; operation and work must still match at every step.
 class ExecutionInputs {
 public:
-    explicit ExecutionInputs(const nlohmann::json & source);
+    ExecutionInputs(const nlohmann::json & source, ControlObserver * observer);
     void bind(std::span<const std::string> participants) const;
     static nlohmann::json work_identity(const nlohmann::json & work);
     static nlohmann::json action_identity(const ServingAction & action);
@@ -53,6 +55,7 @@ private:
     static ServiceDuration service(const nlohmann::json & record);
 
     std::map<std::string, Actor> actors_;
+    ControlObserver * observer_;
     std::map<nlohmann::json, Condition> notifications_;
     std::map<nlohmann::json, Condition> transfers_;
     std::size_t graph_count_ = 0;

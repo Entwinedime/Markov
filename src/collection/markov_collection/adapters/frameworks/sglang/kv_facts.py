@@ -5,7 +5,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from markov_adapters.sglang.kv_layout import KvBufferAddresses, MhaKvLayout
-from markov_collection.adapters.frameworks.sglang.transfer_groups import TransferGroups
 
 
 class NativeKvFacts:
@@ -13,7 +12,6 @@ class NativeKvFacts:
         self.directory = directory
         self.recording = json.loads((directory / f"rank-{rank}.json").read_text())
         self.registrations = {}
-        self.groups = TransferGroups(self.recording)
 
     def registration(self, recording):
         observed = recording["registration"]
@@ -139,7 +137,7 @@ class NativeKvFacts:
                 result.append(value)
         return result
 
-    def document(self):
+    def document(self, transfer_groups):
         transfers = [scope for scope in self.recording["scopes"] if "native_transfer" in scope]
         if not transfers:
             return self.recording
@@ -169,7 +167,7 @@ class NativeKvFacts:
             if expected != self.recording["environment"]["kv_peers"][binding]:
                 raise ValueError("native transfer registration differs from the planned peer interface")
             scope["state_accesses"] = self.accesses(scope)
-        for parent, members in self.groups.members.items():
+        for parent, members in transfer_groups.items():
             parent = self.recording["scopes"][parent]
             parent["ports"].append({
                 "name": "transfer.complete", "direction": "output", "use": "signal",

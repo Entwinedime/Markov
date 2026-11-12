@@ -134,7 +134,7 @@ class IngressEvidence:
             if members:
                 self.actual[instance].append(observed)
 
-    def compare_reads(self, instance):
+    def compare_reads(self, instance, pairs):
         reads = [row for row in self.actual_reads[instance] if row["in_flow"]]
         outside = len(self.actual_reads[instance]) - len(reads)
         if self.input_attempts[instance]["status"] == "unobserved":
@@ -144,6 +144,11 @@ class IngressEvidence:
 
         # Capture retains the first source pull and active-flow reads; keep later driver polls in the trace only.
         actual = self.groups(reads)
+        if pairs is not None:
+
+            # Only a separately verified complete consumption prefix can identify otherwise repeatable reads.
+            native = {str(index): [row] for index, row in enumerate(self.native_reads[instance])}
+            actual = {str(source): [self.actual_reads[instance][index]] for index, source in pairs.items()}
         matched, ambiguous, unmatched_native, unmatched_predicted, differences = 0, 0, 0, 0, []
         for key in sorted(native.keys() | actual.keys()):
             left, right = native.get(key, []), actual.get(key, [])
@@ -157,13 +162,14 @@ class IngressEvidence:
             elif len(left) != 1 or len(right) != 1:
                 ambiguous += 1
                 reason = "logical read identity repeats"
-            elif not left[0]["requests"]:
+            elif pairs is None and not left[0]["requests"]:
                 ambiguous += 1
                 reason = "read returns no workload requests and may repeat"
-            elif not ActionIdentity.request_progress(left[0]["identity"]["context"]):
+            elif pairs is None and not ActionIdentity.request_progress(left[0]["identity"]["context"]):
                 ambiguous += 1
                 reason = "entering context has no request work anchor for an exact read time"
-            elif left[0]["time_ns"] == right[0]["time_ns"] and left[0]["requests"] == right[0]["requests"]:
+            elif (left[0]["identity"] == right[0]["identity"] and left[0]["time_ns"] == right[0]["time_ns"]
+                  and left[0]["requests"] == right[0]["requests"]):
                 matched += 1
             else:
                 differences.append({"identity": left[0]["identity"], "native": left[0], "predicted": right[0]})
@@ -184,7 +190,7 @@ class IngressEvidence:
                 "ambiguous": ambiguous, "unmatched_native": unmatched_native, "unmatched_predicted": unmatched_predicted,
                 "unknown_native_context": unknown, "differences": differences}
 
-    def compare(self):
+    def compare(self, read_pairs=None):
         results = {}
         for instance in sorted(self.sources.keys() | self.actual.keys()):
             native, actual = self.expected.get(instance), self.actual[instance]
@@ -202,7 +208,8 @@ class IngressEvidence:
                                             "predicted_ns": right["time_ns"], "delta_ns": right["time_ns"] - left["time_ns"]})
             results[instance] = {"status": "matched" if cohorts and not differences else "different", "cohorts_match": cohorts,
                                  "native_rounds": len(native), "predicted_rounds": len(actual), "time_differences": differences,
-                                 "native_input_attempts": self.input_attempts[instance], "input_reads": self.compare_reads(instance)}
+                                 "native_input_attempts": self.input_attempts[instance],
+                                 "input_reads": self.compare_reads(instance, None if read_pairs is None else read_pairs[instance])}
             if not cohorts:
                 results[instance].update(native_cohorts=[row["requests"] for row in native],
                                          predicted_cohorts=[row["requests"] for row in actual])

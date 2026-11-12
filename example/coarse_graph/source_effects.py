@@ -143,6 +143,13 @@ class NativeEffectEvidence:
                 self.check_boundary(graph, ports[name]["event"], host, record, side, index)
                 counts["host_boundaries"] += 1
             counts["host_intervals"] += 1
+            if scope["role"] == "segment" and len(origins) > 1:
+
+                # A CPU-only region cannot conceal real SDK work, even if its semantic declarations were incomplete.
+                for api in self.apis.values():
+                    if self.owner(api) in origins:
+                        self.require(not self.tasks.get(api.record["args"]["connection_id"]), "closed CPU region hides native device work")
+                counts["closed_cpu_regions"] += 1
             if "service" in raw:
                 service = resources["service", f"service/{thread}"]
                 self.require(not graph["resources"][service]["serial"], "synchronous service is charged as a serial caller resource")

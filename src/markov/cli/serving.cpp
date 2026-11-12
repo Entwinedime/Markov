@@ -65,7 +65,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     const auto timing = task.value("execution_inputs", nlohmann::json());
     if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
     std::optional<ExecutionInputs> inputs;
-    if (!timing.is_null()) inputs.emplace(timing);
+    if (!timing.is_null()) inputs.emplace(timing, control_observer);
     const auto ingress = timing.is_null() ? nlohmann::json() : timing.at("ingress");
     if (!ingress.is_null() && !ingress.is_object()) throw std::invalid_argument("ingress must be an instance mapping");
     std::vector<Resource> resources;

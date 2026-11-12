@@ -28,6 +28,12 @@ class BatchPreparation(ActionCall):
 
 
 class BatchTransform(ActionCall):
+    @staticmethod
+    def private(operation, members):
+
+        # Native filter_batch returns before accessing tensors when its input batch is empty.
+        return operation == "filter" and members == 0
+
     def __init__(self, calls, operation, batch, other=None) -> None:
         super().__init__(
             "batch_transform",
@@ -152,7 +158,9 @@ class BatchSelection:
         return result
 
     def transform(self, operation, original, batch, arguments, keywords, other=None):
-        if not self.calls.enabled or self.calls.current.get() is None:
+        parent = self.calls.current.get()
+        if (not self.calls.enabled or parent is None
+                or parent.host_only and BatchTransform.private(operation, len(batch.reqs))):
             return original(batch, *arguments, **keywords)
         boundary = BatchTransform(self.calls, operation, batch, other)
         with self.calls.separate(boundary.operation, boundary.work), self.calls.boundary(original, boundary):

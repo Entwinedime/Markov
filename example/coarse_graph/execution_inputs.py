@@ -1,4 +1,4 @@
-"""Prepare checked actor input streams from a closed native case, without reading predictions or templates."""
+"""Prepare native execution conditions and independently check their actual consumption."""
 
 import argparse
 import json
@@ -62,7 +62,7 @@ class NativeInputs:
                 raise ValueError("native action lacks its measured entry or complete logical identity")
             self.steps[group].append((begin, {"operation": "action", "identity": {
                 name: identity[name] for name in ("action", "parameters", "work")
-            }, "service_ns": None, "ports": ports}, None))
+            }, "source": {"scope": index}, "service_ns": None, "ports": ports}, None))
 
     def input_reads(self, instance, rank, raw, aliases, requests, origin):
         if not raw["request_ingress"]:
@@ -74,9 +74,9 @@ class NativeInputs:
         if IngressEvidence.attempts(raw)["status"] != "observed":
             raise ValueError("native input reads lack their complete entering contexts")
         reads = IngressEvidence.reads(name, raw, aliases, origin)
-        for interval, read in zip(raw["request_input_attempts"], reads, strict=True):
+        for number, (interval, read) in enumerate(zip(raw["request_input_attempts"], reads, strict=True)):
             self.steps[group].append((interval["begin_raw_ns"], {
-                "operation": "input", "identity": read["identity"],
+                "operation": "input", "identity": read["identity"], "source": {"input": number},
                 "window": {"begin_ns": read["time_ns"], "end_ns": read["time_ns"]},
             }, None))
 
@@ -102,7 +102,7 @@ class NativeInputs:
                 self.steps[group].append((begin, {
                     "operation": "cpu", "identity": {
                         "operation": execution["operation"], "work": ActionIdentity.work_identity(work),
-                    }, "service_ns": None, "ports": [
+                    }, "source": {"post": list(key), "phase": "post" if position is not None else "wait"}, "service_ns": None, "ports": [
                         self.port("call.enter", "input", self.window(begin, begin, origin)),
                         self.port("call.return", "output", self.window(end, end, origin)),
                     ],
@@ -185,6 +185,116 @@ class NativeInputs:
         report["scope"] = "Checked actor operations and measured or explicit bounded time conditions. Device windows preserve a common feasible calibration envelope; separate windows do not prove one joint clock realization. No batches, query results, allocations or graph bodies are supplied. Broad observation windows retain uncertainty; no cost accuracy or unique native trajectory qualification."
         (self.output / "execution-inputs-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         return 0 if report["status"] == "extracted" else 1
+
+
+class ConsumedInputs:
+    """Prove consumed prefixes from native observations, independently of the supplied condition file."""
+
+    def __init__(self, case, ingress):
+        self.capture, self.groups, self.ingress = case.capture, case.groups, ingress
+        self.sources = dict(case.sources)
+        self.expected = None
+        self.positions = Counter()
+        self.pending, self.reads = {}, {}
+        self.input_pairs = defaultdict(dict)
+        self.counts = Counter()
+
+    def prepare(self):
+        ordered = defaultdict(list)
+        for rank, (source, raw, identities) in self.sources.items():
+            group = self.groups[rank]
+
+            # Original CPU entries establish order; graph scope references retain their independently checked raw origins.
+            host = {int(row["name"].split("/")[1]): row["begin_raw_ns"]
+                    for row in raw["host_observation"]["intervals"] if row["name"].startswith("markov.scope/")}
+            for index, identity in identities.items():
+                origins = source.graph["scopes"][index]["bindings"]["source_scopes"]
+                begin = min(raw["scopes"][origin]["host_interval"]["begin_raw_ns"] if "service" in raw["scopes"][origin] else host[origin]
+                            for origin in origins)
+                ordered[group].append((begin, {"operation": "action", "identity": {key: identity[key] for key in ("action", "parameters", "work")},
+                                              "source": {"scope": index}}))
+
+            protocol = json.loads((self.capture / f"protocol/rank-{rank}.json").read_text())
+            for post in protocol["posts"]:
+                for phase, interval in (("post", post["interval"]), ("wait", post["consumed"])):
+                    if interval is None or not interval["execution"]["in_flow"] or (phase == "wait" and post["operation"] not in {"isend", "irecv"}):
+                        continue
+                    execution = interval["execution"]
+                    work = execution["work"]
+                    work = {**work, "context": {**work["context"], "cpu_transfer": CpuTransfer.identity(work["context"]["cpu_transfer"])}}
+                    ordered[group].append((interval["begin_raw_ns"], {
+                        "operation": "cpu", "identity": {"operation": execution["operation"], "work": ActionIdentity.work_identity(work)},
+                        "source": {"post": post["key"], "phase": phase},
+                    }))
+
+            if raw["request_ingress"]:
+                instance = group.rsplit("/", 1)[0]
+                for index, (interval, read) in enumerate(zip(raw["request_input_attempts"], self.ingress.native_reads[instance], strict=True)):
+                    ordered[group].append((interval["begin_raw_ns"], {
+                        "operation": "input", "identity": read["identity"], "source": {"input": index},
+                    }))
+
+        self.expected = {}
+        for group, records in ordered.items():
+            records.sort(key=lambda item: item[0])
+            if any(left[0] >= right[0] for left, right in zip(records, records[1:])):
+                raise ValueError("native condition witnesses need strictly ordered measured CPU entries")
+            self.expected[group] = [record for _, record in records]
+        self.sources.clear()
+
+    def observe(self, row):
+        if row["kind"] == "condition_used":
+            if self.expected is None:
+                self.prepare()
+            group = row["group"]
+            position = self.positions[group]
+            record = {key: row[key] for key in ("operation", "identity", "source")}
+            if (type(row["step"]) is not int or row["step"] != position or position >= len(self.expected[group])
+                    or record != self.expected[group][position] or group in self.pending):
+                raise ValueError(f"consumed execution condition differs from its native causal prefix: {group} at {position}")
+            self.positions[group] += 1
+            self.counts[record["operation"]] += 1
+            if record["operation"] == "input":
+                instance = record["identity"]["instance"]
+                if instance in self.reads:
+                    raise ValueError("input condition was consumed before the preceding read returned")
+                self.reads[instance] = record["source"]["input"], record["identity"]
+            else:
+                self.pending[group] = record
+        elif row["kind"] == "input_read" and self.expected is not None:
+            instance = row["identity"]["instance"]
+            if instance in self.reads:
+                source, identity = self.reads.pop(instance)
+            elif not row["in_flow"]:
+                return
+            else:
+                raise ValueError("active input read has no consumed condition")
+            if identity != row["identity"]:
+                raise ValueError("input result belongs to a different consumed condition")
+            self.input_pairs[instance][len(self.ingress.actual_reads[instance])] = source
+
+    def graph(self, group, root):
+        if self.expected is None:
+            return None
+        record = self.pending.pop(group)
+        if root["role"] == "cpu_service":
+            execution = root["bindings"]["cpu_protocol"]["execution"]
+            operation = "cpu"
+            identity = {"operation": execution["operation"], "work": ActionIdentity.work_identity(root["work"])}
+        else:
+            operation = "action"
+            identity = {key: value for key, value in ActionIdentity.record(root, group).items() if key != "group"}
+        if record["operation"] != operation or record["identity"] != identity:
+            raise ValueError("instantiated graph differs from its consumed execution condition")
+        return record["source"]["scope"] if operation == "action" else None
+
+    def finish(self):
+        if self.expected is None:
+            return {"status": "not_used", "scope": "No consumed-condition witness; ordinary logical pairing only."}
+        remaining = sum(len(records) - self.positions[group] for group, records in self.expected.items())
+        return {"status": "complete" if not remaining and not self.pending and not self.reads else "partial",
+                "checked": dict(self.counts), "unconsumed": remaining, "unbound_graphs": len(self.pending), "unreturned_reads": len(self.reads),
+                "scope": "Every consumed operation, full work identity and native reference checked in strict observed CPU order. Action references bind actual instantiated graphs. No cost accuracy or independent target generalization claim."}
 
 
 def main():

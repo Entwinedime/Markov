@@ -6,11 +6,12 @@
 #include <utility>
 #include <vector>
 
+#include "markov/controller/observer.hpp"
 #include "markov/graph/graph.hpp"
 
 namespace markov {
 
-ExecutionInputs::ExecutionInputs(const nlohmann::json & source) {
+ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver * observer) : observer_(observer) {
     if (!source.at("actors").is_object()) throw std::invalid_argument("execution inputs require an actor mapping");
     for (const auto & [field, _] : source.items()) {
         if (field != "actors" && field != "notifications" && field != "transfers" && field != "ingress")
@@ -21,8 +22,9 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source) {
         if (group.empty() || !steps.is_array()) throw std::invalid_argument("execution inputs require named actors and ordered operation arrays");
         for (const auto & step : steps) {
             const auto operation = step.at("operation").get<std::string>();
-            if ((operation != "action" && operation != "cpu" && operation != "input") || !step.at("identity").is_object())
-                throw std::invalid_argument("execution input requires an operation and logical identity");
+            if ((operation != "action" && operation != "cpu" && operation != "input") || !step.at("identity").is_object()
+                || !step.at("source").is_object() || step.at("source").empty())
+                throw std::invalid_argument("execution input requires an operation, logical identity and source reference");
         }
         std::optional<TimeWindow> unmeasured;
         if (record.contains("unmeasured_completion_window")) unmeasured = window(record.at("unmeasured_completion_window"));
@@ -110,6 +112,7 @@ const nlohmann::json & ExecutionInputs::take(const std::string & group, const st
         throw std::invalid_argument("first execution input divergence: " + nlohmann::json{
             { "group", group }, { "step", actor.next }, { "expected", expected }, { "actual", actual }
         }.dump());
+    if (observer_) observer_->condition_used(group, actor.next, operation, identity, expected.at("source"));
     ++actor.next;
     return expected;
 }

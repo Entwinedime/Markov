@@ -304,7 +304,9 @@ class ActionOrderComparison:
             if native.events.keys() != estimate.events.keys():
                 self.findings.append(("ordering_evidence", identity, {"reason": "action boundary sets differ"}))
                 return
-            key = ActionIdentity.logical_key(identity)
+
+            # Occurrence pairs are already established; repeated work still needs distinct order labels.
+            key = ActionIdentity.logical_key(identity), native.events["root/input:call.enter"]
             identities[key] = identity
             for name, event in native.events.items():
                 labels[event, estimate.events[name]].append((key, name))
