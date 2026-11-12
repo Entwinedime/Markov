@@ -1,4 +1,4 @@
-"""Check fixed-source local expansion without running a simulated controller."""
+"""Check explicit source/target products without running a simulated controller."""
 
 import argparse
 import json
@@ -13,8 +13,6 @@ from matrix import MatrixRun
 class LocalMatrixRun(MatrixRun):
     def __init__(self, root, matrix):
         super().__init__(root, matrix)
-        catalog = json.loads((self.root / self.matrix['source_catalog']).read_text())
-        self.sources = {domain['id']: domain for domain in catalog['domains']}
         self.local_binary = self.root / self.matrix['local_binary']
         self.local_batch = self.matrix['local_batch']
 
@@ -49,14 +47,11 @@ class LocalMatrixRun(MatrixRun):
     def compare_case(self, case, paths, libraries):
         identity = case['id']
         row = {'id': identity}
-        truth, status = self.produce_truth(case)
+        truth, status = self.read_truth(case)
         if truth is None:
             return row | {'status': 'target-' + status}
         native, production = truth
-        truth_output = self.root / 'results' / self.name / identity
-        row['target_evidence'] = self.observe(f'{identity}/truth-evidence', production, native, truth_output / 'truth-evidence')
-        if not self.mapping_verified(row['target_evidence']):
-            return row | {'status': 'target-mapping-unverified'}
+        row['target_evidence'] = case['source_evidence']
 
         primary = case['source_domain']
         order = [primary, *(job for job in libraries if job != primary)]

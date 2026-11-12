@@ -2,7 +2,8 @@
 
 Invoke from the repository root inside the control image, with
 PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload.
-Capture and compare may run separately; terminal failures are retained without retries.
+Capture and compare run separately; comparison consumes source_catalog and explicit target observation/production/source_evidence.
+Terminal failures are retained without retries or implicit target production.
 """
 
 import argparse
@@ -16,7 +17,7 @@ from markov_workflow.capture import CaptureProcess
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
 
-from run import SourceProductions, WorkflowCommands
+from run import WorkflowCommands
 
 
 class MatrixRun:
@@ -143,33 +144,24 @@ class MatrixRun:
         return self.step(name, command, {'native_seconds': allowance, 'native_attempts': 1}, allowance,
                          capture_status=output / 'execution.json')
 
-    def produce_truth(self, case):
+    def read_truth(self, case):
         if 'native_prerequisite' in case:
             return None, 'native-prerequisite-unresolved'
-        capture = self.root / case['observation'] if 'observation' in case else self.root / 'targets' / self.name / case['id']
-        publication = capture / 'result.json'
-        if not publication.exists():
-            return None, 'capture-not-published'
-        native = CaptureProcess.published(capture, json.loads((self.root / case['capture_input']).read_text()))
-        output = self.root / 'work' / self.name / case['id']
-        command = self.commands.command(
-            'produce', '--product', 'graphs', '--capture', native, '--output', output, '--binary', self.binary,
-            '--source-image', self.images['source'], '--modeling-image', self.images['modeling'],
-            '--budget-seconds', self.budget['task_seconds'], '--keep-intermediates',
-        )
-        if self.process(f"{case['id']}/truth-production", command) != 0:
-            return None, 'production-error'
-        return (native, output), 'published'
+        native = CaptureProcess.published(self.root / case['observation'],
+                                          json.loads((self.root / case['capture_input']).read_text()))
+        production = (self.root / case['production']).resolve(strict=True)
+        state = json.loads((production / 'production.json').read_text())
+        publication = json.loads((production / 'result.json').read_text())
+        evidence = json.loads((self.root / case['source_evidence']).read_text())
 
-    def observe(self, name, production, capture, output):
-        self.evaluate(name, 'source_evidence.py', '--production', production, '--capture', capture, '--output', output)
-        report = output / 'source-evidence.json'
-        if not report.exists():
-            return {'status': 'evaluation-error', 'report': str(report.relative_to(self.root))}
-        document = json.loads(report.read_text())
-        return {'native_case_status': document['native_case']['status'],
-                'ranks': [{'rank': row['rank'], 'mapping': row['mapping'], 'timing': row['timing']['status']}
-                          for row in document['ranks']], 'report': str(report.relative_to(self.root))}
+        # A qualified target is a read-only input, independent of the current predictor executable.
+        if (state['running'] is not None or state['inputs']['capture_path'] != str(native)
+                or publication['qualification'] != 'observed_coarse_graphs'
+                or Path(evidence['production']).resolve() != production or Path(evidence['capture']).resolve() != native
+                or sorted(publication['observed_roles']) != sorted(row['rank'] for row in evidence['ranks'])):
+            raise ValueError(f"target publication/evidence ownership differs: {case['id']}")
+        view = {'native_case_status': evidence['native_case']['status'], 'ranks': evidence['ranks']}
+        return ((native, production), 'published') if self.mapping_verified(view) else (None, 'mapping-unverified')
 
     @staticmethod
     def mapping_verified(report):
@@ -202,65 +194,51 @@ class MatrixRun:
         write_json(self.root / 'results' / self.name / name / 'capture.json', rows, indent=2)
 
     def compare_domain(self, domain):
-        name = domain['id']
-        collection = self.collection(domain)
-        publication = collection / 'result.json'
-        productions, evidence = {}, {}
-        if publication.exists():
-            collected = SourceProductions(collection, self.root / domain['plan'])
-            productions = collected.paths
-            for identity, production in productions.items():
-                source = collected.captures[identity]
-                native = source / json.loads((source / 'result.json').read_text())['source']
-                evidence[str(identity)] = self.observe(f'{name}/source-{identity}-evidence', production, native,
-                                                     self.root / 'results' / self.name / name / f'source-{identity}')
-        source_mapping_verified = bool(evidence) and all(self.mapping_verified(report) for report in evidence.values())
+        source = self.sources[domain['id']]
         rows = []
         for case in domain['targets']:
             identity = case['id']
             output = self.root / 'results' / self.name / identity
             row = {'id': identity}
-            truth, status = self.produce_truth(case)
+            if source['status'] != 'source_scope_checked':
+                rows.append(row | {'status': 'source-prerequisite-unqualified'})
+                continue
+            truth, status = self.read_truth(case)
             if truth is None:
-                row['status'] = 'target-' + status
-                rows.append(row)
+                rows.append(row | {'status': 'target-' + status})
                 continue
             native, production = truth
+            row['target_evidence'] = case['source_evidence']
 
-            # Target graphs supply evaluation and timing only; the complete source publication owns every candidate.
-            row['target_evidence'] = self.observe(f'{identity}/truth-evidence', production, native, output / 'truth-evidence')
-            if not self.mapping_verified(row['target_evidence']):
-                row['status'] = 'target-mapping-unverified'
-                rows.append(row)
-                continue
-            self.evaluate(f'{identity}/timing', 'execution_inputs.py', '--capture', native, '--graphs', production / 'work', '--output', output / 'timing')
+            # Only independently extracted time conditions enter prediction; target bodies and edges stay in evaluation.
+            self.evaluate(f'{identity}/timing', 'execution_inputs.py', '--capture', native, '--graphs', production / 'work',
+                          '--output', output / 'timing')
             timing_report = output / 'timing/execution-inputs-report.json'
             row['timing'] = json.loads(timing_report.read_text())['status'] if timing_report.exists() else 'evaluation-error'
             timing = output / 'timing/execution-inputs.json'
-            if not productions or not timing.exists():
-                row['status'] = 'source-unavailable' if not productions else 'timing-unavailable'
-                rows.append(row)
-                continue
-
-            # Unknown SDK timing remains partial; an unverified source mapping cannot qualify a prediction.
-            if not source_mapping_verified:
-                row['status'] = 'source-mapping-unverified'
-                rows.append(row)
+            if not timing.exists():
+                rows.append(row | {'status': 'timing-unavailable'})
                 continue
 
             primary = case['source_domain']
+            productions = {job['id']: job['production'] for job in source['jobs']}
+            arguments = ['--production', productions[primary]]
+            arguments.extend(value for job, path in productions.items() if job != primary for value in ('--local-production', path))
             prediction = output / 'prediction'
             command = self.commands.command(
-                'predict', *collected.arguments(primary), '--input', self.root / case['prediction_input'], '--output', prediction,
+                'predict', *arguments, '--input', self.root / case['prediction_input'], '--output', prediction,
                 '--binary', self.binary, '--modeling-image', self.images['modeling'], '--control-image', self.images['control'],
                 '--timeout', self.budget['task_seconds'], '--execution-trace', '--execution-inputs', timing,
             )
-            if self.process(f'{identity}/predict', command) != 0:
-                row['status'] = 'prediction-error'
-                rows.append(row)
+            row['prediction_exit'] = self.process(f'{identity}/predict', command)
+            execution = prediction / 'execution.jsonl'
+            if not execution.exists():
+                rows.append(row | {'status': 'prediction-no-trace'})
                 continue
+
+            # A stopped run still has a checked prefix; compare it without inventing an unexecuted tail.
             self.evaluate(f'{identity}/compare', 'compare_actions.py', '--capture', native, '--graphs', production / 'work',
-                          '--execution', prediction / 'execution.jsonl', '--output', output / 'comparison')
+                          '--execution', execution, '--output', output / 'comparison')
             report = output / 'comparison/actions.json'
             if report.exists():
                 document = json.loads(report.read_text())
@@ -269,18 +247,15 @@ class MatrixRun:
             else:
                 row['status'] = 'comparison-error'
             rows.append(row)
-
-        source_status = 'published' if productions else 'not-published'
-        if not productions and 'native_prerequisite' in domain:
-            source_status = 'native-prerequisite-unresolved'
-        write_json(self.root / 'results' / self.name / name / 'comparison.json', {
-            'source_status': source_status,
-            'source_evidence': evidence, 'targets': rows,
-        }, indent=2)
+        write_json(self.root / 'results' / self.name / domain['id'] / 'comparison.json',
+                   {'source_status': source['status'], 'targets': rows}, indent=2)
 
     def run(self, phase, domain_name):
         if self.matrix['status'] != 'frozen':
             raise ValueError('matrix is not frozen; no execution started')
+        if phase == 'compare':
+            catalog = json.loads((self.root / self.matrix['source_catalog']).read_text())
+            self.sources = {domain['id']: domain for domain in catalog['domains']}
         domains = self.matrix['domains']
         if domain_name is not None:
             domains = [next(domain for domain in domains if domain['id'] == domain_name)]
