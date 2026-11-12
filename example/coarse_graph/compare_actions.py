@@ -28,17 +28,6 @@ class ActionComparison:
         self.capture, self.graphs, self.execution, self.output, self.details = capture, graphs, execution, output, details
         self.counts, self.findings = Counter(), []
 
-    @classmethod
-    def differences(cls, native, predicted, path=""):
-        if isinstance(native, dict) and isinstance(predicted, dict):
-            for key in sorted(native.keys() | predicted.keys()):
-                if key in native and key in predicted:
-                    yield from cls.differences(native[key], predicted[key], f"{path}/{key}")
-                else:
-                    yield {"field": f"{path}/{key}", "native": native.get(key), "predicted": predicted.get(key)}
-        elif native != predicted:
-            yield {"field": path, "native": native, "predicted": predicted}
-
     def finding(self, category, identity, detail):
         self.counts[category] += 1
         if self.details or self.counts[category] == 1:
@@ -57,16 +46,9 @@ class ActionComparison:
 
     def compare_contents(self, identity, actual, predicted):
         different = False
-        for path in sorted(actual.keys() | predicted.keys()):
-            if path not in actual or path not in predicted:
-                self.finding("scope_tree", identity, {"scope": path, "native": path in actual, "predicted": path in predicted})
-                different = True
-                continue
-            for field in actual[path]:
-                if actual[path][field] != predicted[path][field]:
-                    changes = list(self.differences(actual[path][field], predicted[path][field]))
-                    self.finding(field, identity, {"scope": path, "changes": changes if self.details else changes[:3]})
-                    different = True
+        for category, detail in GraphContents.differences(actual, predicted, self.details):
+            self.finding(category, identity, detail)
+            different = True
         return not different
 
     def publish(self, report):

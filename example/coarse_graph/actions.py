@@ -139,6 +139,15 @@ class ActionScopes:
             return type(expression).__name__, expression
         operation, *arguments = expression
         values = tuple(ActionScopes.expression_key(value) for value in arguments)
+        if operation in {"add", "mul"}:
+            identity = 0 if operation == "add" else 1
+            values = tuple(value for value in values if value != ("int", identity))
+            if not values:
+                return "int", identity
+        if operation == "floor_div" and values[1] == ("int", 1):
+            return values[0]
+        if len(values) == 1 and operation in {"add", "mul", "min", "max", "and", "or"}:
+            return values[0]
 
         # Only binary commutation preserves the DSL's checked arithmetic without changing overflow order.
         return operation, frozenset(values) if len(values) == 2 and operation in {"add", "mul", "eq"} else values
@@ -249,7 +258,13 @@ class ActionScopes:
             for access, projected in zip(native, scope[field], strict=True):
                 expected = {key: value for key, value in access.items() if key != "interval"}
                 actual = {key: value for key, value in projected.items() if key not in {"start", "finish"}}
-                if self.expression_key(expected) != self.expression_key(actual):
+                if space == "kv":
+
+                    # Only range rules are expressions; request lists and regions retain literal order and multiplicity.
+                    for value in (expected, actual):
+                        if "rule" in value:
+                            value["rule"] = self.expression_key(value["rule"])
+                if expected != actual:
                     raise ValueError(f"graph scope {index} changes its declared {space} access contents")
                 interval = access["interval"]
                 if interval == "service":

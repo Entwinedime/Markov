@@ -36,6 +36,8 @@ class NativeCase:
     def observe(self, rank, graph, raw):
         if rank in self.sources:
             raise ValueError("native worker was already observed")
+        if raw["environment"]["implementation"]["framework_revision"] != self.manifest["framework_revision"]:
+            raise ValueError("native worker and capture disagree on their upstream framework revision")
         source = GraphContents(graph)
         source.validate_source(raw, rank)
         dependencies = CausalGraph.observed(graph)

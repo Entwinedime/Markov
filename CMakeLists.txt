@@ -50,6 +50,10 @@ target_link_libraries(markov_sglang PUBLIC markov_core)
 
 add_executable(markov src/markov/cli/main.cpp src/markov/cli/serving.cpp src/markov/cli/execution_trace.cpp)
 target_link_libraries(markov PRIVATE markov_sglang)
-foreach(target markov_core markov_sglang markov)
+
+# The example expands given native actions without running control or execution.
+add_executable(markov_local_graphs example/coarse_graph/local_graphs.cpp)
+target_link_libraries(markov_local_graphs PRIVATE markov_sglang)
+foreach(target markov_core markov_sglang markov markov_local_graphs)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endforeach()

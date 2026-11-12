@@ -11,6 +11,28 @@ class GraphContents(ActionScopes):
         super().__init__(graph)
         self.pools = {}
 
+    @classmethod
+    def value_differences(cls, native, predicted, path=""):
+        if isinstance(native, dict) and isinstance(predicted, dict):
+            for key in sorted(native.keys() | predicted.keys()):
+                if key in native and key in predicted:
+                    yield from cls.value_differences(native[key], predicted[key], f"{path}/{key}")
+                else:
+                    yield {"field": f"{path}/{key}", "native": native.get(key), "predicted": predicted.get(key)}
+        elif native != predicted:
+            yield {"field": path, "native": native, "predicted": predicted}
+
+    @classmethod
+    def differences(cls, native, predicted, details=False):
+        for path in sorted(native.keys() | predicted.keys()):
+            if path not in native or path not in predicted:
+                yield "scope_tree", {"scope": path, "native": path in native, "predicted": path in predicted}
+                continue
+            for field in native[path]:
+                if native[path][field] != predicted[path][field]:
+                    changes = list(cls.value_differences(native[path][field], predicted[path][field]))
+                    yield field, {"scope": path, "changes": changes if details else changes[:3]}
+
     def control_key(self, root, identity):
         scope = self.graph["scopes"][root]
         return json.dumps({"control": {
