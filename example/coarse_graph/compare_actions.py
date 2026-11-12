@@ -24,6 +24,7 @@ class ActionComparison:
         "ambiguous_native_identity", "ambiguous_predicted_identity",
         "unpaired_native_context", "unpaired_predicted_context",
         "incomplete_execution", "unfinished_events",
+        "native_tail_unexecuted",
     })
 
     def __init__(self, capture, graphs, execution, output, details):
@@ -280,14 +281,14 @@ class ActionComparison:
                 pending.append((key, rank, identity, source, index, target_key, ActionBoundaries(target, 0, events),
                                 content_match, snapshot if key in varied else None, conditioned_scope))
         condition_scope = condition_inputs.finish()
-        conditioned = condition_scope["status"] == "complete"
+        checked_prefix = condition_scope["verified_prefix"]
         for key, (_, _, identity) in expected.items():
             if not predicted_counts[key]:
-                self.finding("unmatched_native", identity, {})
+                self.finding("unmatched_native" if ended else "native_tail_unexecuted", identity, {})
         for key, indices in full_occurrences.items():
             if not full_predicted_counts[key] and any(predicted_counts[value] for value in native_classes[key]):
                 self.finding("unpaired_native_context", json.loads(key), {"observed_calls": len(indices)})
-            if len(indices) > 1 and not conditioned:
+            if len(indices) > 1 and not checked_prefix:
                 self.finding("ambiguous_native_identity", json.loads(key), {
                     "observed_calls": len(indices), "predicted_calls": full_predicted_counts[key],
                     "reason": "complete logical context repeats; structure is checked independently",
@@ -295,7 +296,7 @@ class ActionComparison:
         for key, count in full_predicted_counts.items():
             if not full_occurrences[key] and predicted_classes[key] & expected.keys():
                 self.finding("unpaired_predicted_context", json.loads(key), {"predicted_calls": count})
-            if count > 1 and len(full_occurrences[key]) <= 1 and not conditioned:
+            if count > 1 and len(full_occurrences[key]) <= 1 and not checked_prefix:
                 self.finding("ambiguous_predicted_identity", json.loads(key), {"predicted_calls": count})
         if not ended:
             self.finding("incomplete_execution", {}, {})
@@ -312,8 +313,8 @@ class ActionComparison:
             full_key = ActionIdentity.logical_key(identity)
             indices = [index for index in full_occurrences[full_key] if native_scope_keys[rank, index] == key]
             unique = len(indices) == len(full_occurrences[full_key]) == full_predicted_counts[full_key] == 1
-            paired_index = conditioned_scope if conditioned else None
-            if not conditioned and unique and ActionIdentity.occurrence_anchored(identity):
+            paired_index = conditioned_scope
+            if paired_index is None and unique and ActionIdentity.occurrence_anchored(identity):
                 paired_index = indices[0]
             paired = paired_index is not None
             if unique and not paired:
@@ -352,7 +353,7 @@ class ActionComparison:
         predicted_links = {((event_ranks[source], source), (event_ranks[target], target), relation)
                            for source, target, relation in cross_rank_edges}
         actual_graph = native_case.graph
-        predicted_graph = cpu_protocol.prediction(predicted_dependencies, predicted_links)
+        predicted_graph = cpu_protocol.prediction(predicted_dependencies, predicted_links, complete=ended)
         connections.check_predicted_readiness(predicted_graph, event_ranks)
         connections.compare_values(predicted_graph, pairs)
         cpu_scope = cpu_protocol.report()
@@ -397,7 +398,7 @@ class ActionComparison:
         for category, identity, detail in (*connections.findings, *bindings.findings, *bindings.lifetimes.findings,
                                           *ordering.findings, *cpu_protocol.findings, *stream_synchronization.findings):
             self.finding(category, identity, detail)
-        for category, identity, detail in effects.compare():
+        for category, identity, detail in effects.compare(complete=ended):
             self.finding(category, identity, detail)
 
         for category, identity, detail in (*state_values.compare(protocol_source), *action_results.compare(pairs)):
@@ -405,7 +406,7 @@ class ActionComparison:
         for category, identity, detail in (*native_polling.findings, *protocol.polling.findings):
             self.finding(category, identity, detail)
 
-        input_delivery = ingress.compare(condition_inputs.input_pairs if conditioned else None)
+        input_delivery = ingress.compare(condition_inputs.input_pairs if checked_prefix else None, complete=ended)
         for category, identity, detail in ingress.findings:
             self.finding(category, identity, detail)
         for instance, result in input_delivery.items():
@@ -415,7 +416,7 @@ class ActionComparison:
             if result.get("input_reads", {}).get("status") == "different":
                 self.finding("input_read", {"instance": instance}, result["input_reads"])
 
-        recorded_queries = queries.finish()
+        recorded_queries = queries.finish(complete=ended)
         checked_cross_rank, unverified_cross_rank = Counter(), Counter()
         communication = set()
         if cpu_scope["complete"]:
@@ -432,6 +433,9 @@ class ActionComparison:
         for key, (result, identity) in native_reads.items():
             if key not in pairs:
                 query_counts["unpaired_native"] += 1
+                continue
+            if pairs[key] not in queries.results:
+                query_counts["unreturned_predicted"] += 1
                 continue
             actual = queries.results[pairs[key]]
             query_counts["compared"] += 1
@@ -463,12 +467,12 @@ class ActionComparison:
                                   or not connections.counts["communication_evidence_complete"]
                                   or connections.counts["data_inputs_unpaired"] or connections.counts["signal_inputs_unpaired"])
         bindings_incomplete = bindings.counts["request_bindings_unpaired"] or bindings.counts["predicted_request_bindings_unpaired"]
-        queries_incomplete = query_counts["unpaired_native"] or query_counts["unpaired_predicted"]
+        queries_incomplete = query_counts["unpaired_native"] or query_counts["unpaired_predicted"] or query_counts["unreturned_predicted"]
         unpaired_calls = {"native": observed_actions - compared, "predicted": sum(predicted_counts.values()) - compared}
         incomplete = (payload_incomplete or any(unpaired_calls.values()) or input_incomplete or metadata_incomplete or admission_incomplete
                       or connections_incomplete or batch_sync_incomplete or bindings_incomplete or queries_incomplete
                       or bool(effects.counts["state_slots"]["unobserved_native"]) or bool(unverified_cross_rank)
-                      or not cpu_scope["complete"] or not ordering.qualified)
+                      or not cpu_scope["complete"] or not ordering.qualified or condition_scope["status"] == "partial")
         report = {
             **self.outcome(incomplete),
             "native_case": native_evidence,
@@ -499,7 +503,7 @@ class ActionComparison:
             "state_values": state_values.counts,
             "action_results": dict(action_results.counts),
             "query_results_recorded": recorded_queries,
-            "execution_times": execution_times.finish(),
+            "execution_times": execution_times.finish(complete=ended),
             "condition_inputs": condition_scope,
             "completion_reads_checked": queries.completion_reads,
             "completion_notifications_checked": queries.notifications,
@@ -526,7 +530,7 @@ class ActionComparison:
             ) if missing] + ["exact PD notification arrival times", "unnamed internal event topology",
                             "intra-call resource effect timing and tensor hazards; native in-flight resource reuse outside observed cases", "request-slot bindings during native transport",
                             "PD unused padding and unsupported multimodal/logprob/speculative values; controller output values outside recorded progress and publication fields"],
-            "scope": "Every invocation retains its run-local identity; cross-run occurrence pairs require either unique full logical work anchors or a complete consumed-condition prefix independently reconstructed from native CPU observations, protocol posts and input reads. Every actual consumed identity and source reference binds its instantiated graph; positions alone never establish correspondence. Without this witness, repeatable reads and unanchored control calls remain unpaired even if observed once. Logical matches retain ancestor contexts and exclude time-only observation placement. Structural classes omit ancestor state for common-content checks. Native ABIs whose every observed declaration is independently verified host-only also share CPU contents across queue snapshots and continuation cuts; their predicted body never selects a class, and logical/time identities remain unchanged. Classes never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. Every nonempty predicted external data input is separately checked against its own published storage/version export and the shared all-rank causal graph. Every explicit signal wait is checked against its actual generation and recorded direct signal edge; completion queries do not acquire a wait. These run-local checks do not require native occurrence pairs. Signal cross-run matched counts concern producer identity. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A qualified full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. All causal comparisons use the same per-run all-rank graphs, including unnamed intermediates, dynamic prediction edges and verified model/CPU communication. A path may cross ranks and return. Missing protocol coverage withholds causal qualification rather than proving a negative from an isolated rank. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
+            "scope": "Every invocation retains its run-local identity; cross-run occurrence pairs require either unique full logical work anchors or a checked consumed native prefix independently reconstructed from native CPU observations, protocol posts and input reads. Every actual consumed identity and source reference binds its instantiated graph; positions alone never establish correspondence. Without this witness, repeatable reads and unanchored control calls remain unpaired even if observed once. Logical matches retain ancestor contexts and exclude time-only observation placement. Structural classes omit ancestor state for common-content checks. Native ABIs whose every observed declaration is independently verified host-only also share CPU contents across queue snapshots and continuation cuts; their predicted body never selects a class, and logical/time identities remain unchanged. Classes never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. Every nonempty predicted external data input is separately checked against its own published storage/version export and the shared all-rank causal graph. Every explicit signal wait is checked against its actual generation and recorded direct signal edge; completion queries do not acquire a wait. These run-local checks do not require native occurrence pairs. Signal cross-run matched counts concern producer identity. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A qualified full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. All causal comparisons use the same per-run all-rank graphs, including unnamed intermediates, dynamic prediction edges and verified model/CPU communication. A path may cross ranks and return. Missing protocol coverage withholds causal qualification rather than proving a negative from an isolated rank. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
         }
         return self.publish(report)
 

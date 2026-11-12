@@ -290,9 +290,10 @@ class ConsumedInputs:
 
     def finish(self):
         if self.expected is None:
-            return {"status": "not_used", "scope": "No consumed-condition witness; ordinary logical pairing only."}
+            return {"status": "not_used", "verified_prefix": False,
+                    "scope": "No consumed-condition witness; ordinary logical pairing only."}
         remaining = sum(len(records) - self.positions[group] for group, records in self.expected.items())
-        return {"status": "complete" if not remaining and not self.pending and not self.reads else "partial",
+        return {"status": "complete" if not remaining and not self.pending and not self.reads else "partial", "verified_prefix": True,
                 "checked": dict(self.counts), "unconsumed": remaining, "unbound_graphs": len(self.pending), "unreturned_reads": len(self.reads),
                 "scope": "Every consumed operation, full work identity and native reference checked in strict observed CPU order. Action references bind actual instantiated graphs. No cost accuracy or independent target generalization claim."}
 

@@ -70,6 +70,28 @@ class FieldEffects:
             histories[field, tuple(operations)] += 1
         return histories, failures
 
+    def prefix_of(self, source):
+        if not self.capacities.items() <= source.capacities.items():
+            return False
+        histories, failures = self.row_histories()
+        available, source_failures = source.row_histories()
+        if not failures <= source_failures:
+            return False
+
+        # Match specific row histories first; a shorter prefix must not consume their only compatible native row.
+        for (field, history), count in sorted(histories.items(), key=lambda item: len(item[0][1]), reverse=True):
+            for key, capacity in available.items():
+                if key[0] != field or key[1][:len(history)] != history:
+                    continue
+                used = min(count, capacity)
+                count -= used
+                available[key] -= used
+                if not count:
+                    break
+            if count:
+                return False
+        return True
+
 
 class ResourceEffects:
     def __init__(self, page_size):
@@ -294,13 +316,14 @@ class ResourceEffectComparison:
         return {name: {"count": len(value), "first": value[:4]} if isinstance(value, list) else value
                 for name, value in operation.items()}
 
-    def compare(self):
+    def compare(self, *, complete):
         matched, totals = 0, Counter()
         for group, source in self.native.items():
             target = self.predicted[group]
             for operation in source.operations:
                 totals[operation["kind"]] += 1
-            if source.operations == target.operations:
+            expected = source.operations if complete else source.operations[:len(target.operations)]
+            if expected == target.operations:
                 matched += 1
             else:
                 different = next((index for index, pair in enumerate(zip(source.operations, target.operations)) if pair[0] != pair[1]),
@@ -316,7 +339,13 @@ class ResourceEffectComparison:
             target = self.predicted[group]
             if target.fields.capacities and not source.fields.capacities:
                 state_unobserved.append(group)
-            elif source.fields.capacities == target.fields.capacities and source.fields.row_histories() == target.fields.row_histories():
+                continue
+            if complete:
+                matches = source.fields.capacities == target.fields.capacities and source.fields.row_histories() == target.fields.row_histories()
+            else:
+                matches = target.fields.prefix_of(source.fields)
+
+            if matches:
                 state_matched += 1
             else:
                 yield "state_slot_effects", {"group": group}, {
@@ -324,6 +353,7 @@ class ResourceEffectComparison:
                     "native_operations": len(source.fields.operations), "predicted_operations": len(target.fields.operations),
                 }
         self.counts = {"groups": len(self.native), "groups_matched": matched, "operations": dict(totals),
+                       "comparison_scope": "complete_history" if complete else "observed_prefix",
                        "reads": {
                            **{origin: [{"group": group, "kind": kind, "resource": resource, **value}
                                        for (group, kind, resource), value in sorted(reads.items())]

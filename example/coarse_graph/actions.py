@@ -120,10 +120,10 @@ class QueryResults:
             self.counts[query["kind"]] += 1
             return query
 
-    def finish(self):
-        if self.pending or self.notices:
+    def finish(self, *, complete):
+        if complete and (self.pending or self.notices):
             raise ValueError("execution has unfinished query or notification observations")
-        return dict(self.counts)
+        return {**self.counts, "pending_queries": len(self.pending), "pending_notifications": len(self.notices)}
 
 
 class ActionScopes:

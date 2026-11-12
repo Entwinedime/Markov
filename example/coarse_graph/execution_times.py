@@ -55,8 +55,8 @@ class ExecutionTimes:
                         raise ValueError("completion condition waived a supplied service duration")
                     self.counts["checked_work"] += 1
 
-    def finish(self):
-        if self.starts or self.expected or self.bounds:
+    def finish(self, *, complete):
+        if complete and (self.starts or self.expected or self.bounds):
             raise ValueError("execution has unfinished work or completion conditions")
         return {
             **self.counts, "unfinished_work": sum(self.expected.values()), "unfinished_windows": len(self.bounds),

@@ -146,7 +146,7 @@ class IngressEvidence:
         actual = self.groups(reads)
         if pairs is not None:
 
-            # Only a separately verified complete consumption prefix can identify otherwise repeatable reads.
+            # A separately checked consumed prefix can identify otherwise repeatable reads.
             native = {str(index): [row] for index, row in enumerate(self.native_reads[instance])}
             actual = {str(source): [self.actual_reads[instance][index]] for index, source in pairs.items()}
         matched, ambiguous, unmatched_native, unmatched_predicted, differences = 0, 0, 0, 0, []
@@ -190,7 +190,7 @@ class IngressEvidence:
                 "ambiguous": ambiguous, "unmatched_native": unmatched_native, "unmatched_predicted": unmatched_predicted,
                 "unknown_native_context": unknown, "differences": differences}
 
-    def compare(self, read_pairs=None):
+    def compare(self, read_pairs=None, *, complete):
         results = {}
         for instance in sorted(self.sources.keys() | self.actual.keys()):
             native, actual = self.expected.get(instance), self.actual[instance]
@@ -198,15 +198,19 @@ class IngressEvidence:
                 results[instance] = {"status": "missing_native_evidence"}
                 continue
 
+            # A stopped run has not reached later delivery rounds; compare only its observed prefix.
+            expected = native if complete else native[:len(actual)]
+
             # Time is paired only after request identities and receive cohorts agree, never by round number alone.
-            cohorts = [row["requests"] for row in native] == [row["requests"] for row in actual]
+            cohorts = [row["requests"] for row in expected] == [row["requests"] for row in actual]
             differences = []
             if cohorts:
-                for left, right in zip(native, actual, strict=True):
+                for left, right in zip(expected, actual, strict=True):
                     if left["time_ns"] != right["time_ns"]:
                         differences.append({"requests": left["requests"], "native_ns": left["time_ns"],
                                             "predicted_ns": right["time_ns"], "delta_ns": right["time_ns"] - left["time_ns"]})
             results[instance] = {"status": "matched" if cohorts and not differences else "different", "cohorts_match": cohorts,
+                                 "comparison_scope": "complete_history" if complete else "observed_prefix",
                                  "native_rounds": len(native), "predicted_rounds": len(actual), "time_differences": differences,
                                  "native_input_attempts": self.input_attempts[instance],
                                  "input_reads": self.compare_reads(instance, None if read_pairs is None else read_pairs[instance])}

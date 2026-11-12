@@ -374,12 +374,18 @@ class CpuProtocolEvidence:
         graph.prepare()
         return graph
 
-    def prediction(self, predicted, predicted_edges):
+    def prediction(self, predicted, predicted_edges, *, complete):
         if not self.predicted_scope:
             self.missing("missing_predicted_protocol_scope")
         if (self.services or self.service_gates or self.service_returns.keys() != self.finished_services
                 or any(not wire["ready"] for wire in self.wires.values())):
-            raise ValueError("CPU protocol has an unobserved service or unfinished wire")
+            if complete:
+                raise ValueError("CPU protocol has an unobserved service or unfinished wire")
+
+            # A stopped prefix can still have live work; it cannot qualify the missing protocol paths.
+            self.missing("unfinished_predicted_protocol", services=len(self.services), gates=len(self.service_gates),
+                         returns=len(self.service_returns.keys() - self.finished_services),
+                         wires=sum(not wire["ready"] for wire in self.wires.values()))
         self.connect_messages("predicted")
 
         # Keep each run's observed paths available; protocol completeness gates cross-run negative conclusions.
