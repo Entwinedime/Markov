@@ -14,6 +14,10 @@ class ExecutionTimes:
 
     def observe(self, record):
         kind = record["kind"]
+        if kind in {"activation", "completion"}:
+            if record["time_ns"] < self.now_ns:
+                raise ValueError("execution clock moved backwards")
+            self.now_ns = record["time_ns"]
         if kind == "graph":
             for work, service in zip(record["graph"]["work"], record["work_ns"], strict=True):
                 if service is not None and (type(service) is not int or service < 0):
@@ -30,9 +34,6 @@ class ExecutionTimes:
             self.bounds[event] = begin, end
         elif kind == "completion":
             event, time_ns = record["event"], record["time_ns"]
-            if time_ns < self.now_ns:
-                raise ValueError("execution clock moved backwards")
-            self.now_ns = time_ns
             bound = self.bounds.pop(event, None)
             if bound is not None:
                 if not bound[0] <= time_ns <= bound[1]:

@@ -8,6 +8,7 @@ from pathlib import Path
 from actions import ActionIdentity, QueryResults
 from contents import GraphContents
 from execution_times import ExecutionTimes
+from stream_queues import StreamSynchronization
 from native_case import NativeCase
 from ingress import IngressEvidence
 from dependencies import ActionBoundaries, ActionOrderComparison, CausalGraph
@@ -17,7 +18,7 @@ from state_values import ActionResults, StateValueComparison
 
 class ActionComparison:
     evidence_categories = NativeCase.evidence_categories | frozenset({
-        "state_binding_evidence", "ordering_evidence", "input_read_evidence",
+        "state_binding_evidence", "ordering_evidence", "input_read_evidence", "stream_evidence",
         "missing_predicted_identity",
         "ambiguous_native_identity", "ambiguous_predicted_identity",
         "unpaired_native_context", "unpaired_predicted_context",
@@ -58,6 +59,7 @@ class ActionComparison:
         checks, state, counts = report["action_checks"], report["state_lifetimes"], report["counts"]
         connections = report["connections"]
         reads = report["resource_effects"]["reads"]
+        streams = report["stream_synchronization"]
         order = report["action_order"]
         outside_flow = sum(value["input_reads"]["outside_flow"] for value in report["request_ingress"].values() if "input_reads" in value)
         rows = [
@@ -77,7 +79,11 @@ class ActionComparison:
             f"{connections['predicted_signal_inputs_checked']} 个完成等待 | 数据就绪保护 "
             f"{connections['predicted_data_inputs_ready']} 项、完成等待保护 {connections['predicted_signal_inputs_ready']} 项；"
             "不依赖跨运行调用配对，查询不当作等待 |",
-            f"| 运行内物理状态 | {state.get('kv_regions_checked', 0)} 个 KV 逻辑区间、"
+            f"| 动态stream等待 | {streams.get('waits_checked', 0)} / {streams.get('declared_waits', 0)} 次等待 | "
+            f"{streams['matched_dependencies']} / {streams['required_dependencies']} 条前沿依赖对应，"
+            f"额外依赖 {streams['extra_dependencies']}，缺失激活事实 {streams['activations_missing']}；按实际接收时刻取队列快照 |",
+            f"| 运行内物理状态 | {state.get('tensor_ports_checked', 0)} 个非空可见张量端口、"
+            f"{state.get('kv_regions_checked', 0)} 个 KV 逻辑区间、"
             f"{state.get('field_bindings_checked', 0)} 条字段绑定 | 未完整绑定的 KV 区间 "
             f"{state.get('kv_regions_unbound', 0)}、字段访问 {state.get('field_bindings_missing', 0)}；"
             f"{state.get('pending_conflicts_ordered', 0)} / {state.get('pending_conflicts', 0)} 个在途冲突有保护路径 |",
@@ -166,12 +172,14 @@ class ActionComparison:
         cross_rank_edges = set()
         queries = QueryResults()
         execution_times = ExecutionTimes()
+        stream_synchronization = StreamSynchronization()
         protocol_readiness = native_case.readiness
         protocol = PdPredictionEvidence(protocol_source, protocol_readiness, ingress.origin_ns)
         with self.execution.open() as stream:
             for line in stream:
                 row = json.loads(line)
                 execution_times.observe(row)
+                stream_synchronization.observe(row)
                 cpu_protocol.observe(row)
                 cpu_service = row["kind"] == "graph" and row["graph"]["scopes"][0]["role"] == "cpu_service"
                 if not cpu_service:
@@ -376,8 +384,9 @@ class ActionComparison:
             })
         bindings.compare(pairs)
         bindings.lifetimes.compare(predicted_graph, event_ranks)
+        stream_scope = stream_synchronization.finish()
         for category, identity, detail in (*connections.findings, *bindings.findings, *bindings.lifetimes.findings,
-                                          *ordering.findings, *cpu_protocol.findings):
+                                          *ordering.findings, *cpu_protocol.findings, *stream_synchronization.findings):
             self.finding(category, identity, detail)
         for category, identity, detail in effects.compare():
             self.finding(category, identity, detail)
@@ -470,6 +479,7 @@ class ActionComparison:
                                     "scope": "Sets of all-rank causal positions relative to uniquely paired call entries/returns in the same joined graphs. Counts, payloads, effects, cross-rank rounds and timing are not paired; no source occurrence is selected by matching its position."},
             "physical_bindings": bindings.counts,
             "state_lifetimes": bindings.lifetimes.report(),
+            "stream_synchronization": stream_scope,
             "resource_effects": effects.counts,
             "state_values": state_values.counts,
             "action_results": dict(action_results.counts),
@@ -494,7 +504,7 @@ class ActionComparison:
             "cross_rank_dependencies": {"protocol_checked_edges": dict(checked_cross_rank), "unverified_edges": dict(unverified_cross_rank)},
             "not_checked": ["unpaired query outcomes and exact PD notification arrival times", "unpaired external input reads", "unnamed internal event topology",
                             "cross-rank causality outside verified communication and notification protocols",
-                            "intra-call resource effect timing, tensor lifetimes and native in-flight resource reuse outside observed cases", "request-slot bindings during native transport",
+                            "intra-call resource effect timing and tensor hazards; native in-flight resource reuse outside observed cases", "request-slot bindings during native transport",
                             "per-occurrence pairing, placement and timing of calls whose full logical context repeats", "PD unused padding and unsupported multimodal/logprob/speculative values; controller output values outside recorded progress and publication fields"],
             "scope": "Every invocation retains its run-local identity; cross-run occurrence pairs require one-to-one full logical matches and request work anchors. Repeatable reads and unanchored control calls remain unpaired even if observed once. Logical matches retain ancestor contexts and exclude time-only observation placement. Structural classes omit ancestor state for common-content checks. Native ABIs whose every observed declaration is independently verified host-only also share CPU contents across queue snapshots and continuation cuts; their predicted body never selects a class, and logical/time identities remain unchanged. Classes never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. Every nonempty predicted external data input is separately checked against its own published storage/version export and the shared all-rank causal graph. Every explicit signal wait is checked against its actual generation and recorded direct signal edge; completion queries do not acquire a wait. These run-local checks do not require native occurrence pairs. Signal cross-run matched counts concern producer identity. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A qualified full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. All causal comparisons use the same per-run all-rank graphs, including unnamed intermediates, dynamic prediction edges and verified model/CPU communication. A path may cross ranks and return. Missing protocol coverage withholds causal qualification rather than proving a negative from an isolated rank. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
         }

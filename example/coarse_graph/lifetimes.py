@@ -1,4 +1,4 @@
-"""Check pending state hazards from actual bindings, without replaying allocation."""
+"""Check pending tensor and state hazards from actual bindings, without replaying allocation."""
 
 from __future__ import annotations
 
@@ -42,7 +42,30 @@ class StateLifetimes:
         self.close_bindings()
         self.entered = entered
         self.identities[entered] = identity
-        for scope in graph["scopes"]:
+        exposed = {port["tensor"]["storage"] for port in graph["scopes"][0]["ports"]
+                   if port["use"] == "data" and port["direction"] == "output"}
+        for index, scope in enumerate(graph["scopes"]):
+            for port in scope["ports"]:
+                if port["use"] != "data":
+                    continue
+                tensor = port["tensor"]
+                if 0 in tensor["shape"] or (tensor["allocation"] is not None and tensor["storage"] not in exposed):
+                    continue
+                resource = graph["events"][port["event"]]["resource"]
+                intervals = []
+                if port["direction"] == "input":
+                    _, finish = self.tensor_interval(graph, index, resource)
+                    intervals.append((False, port["event"], finish))
+                if tensor["writer"] is not None:
+                    start, finish = self.tensor_interval(graph, tensor["writer"], resource)
+                    intervals.append((True, start, finish))
+
+                # Versions identify producers; all epochs still share the same physical allocation for overwrite safety.
+                for write, start, finish in intervals:
+                    self.bind((identity["group"], "tensor", tensor["storage"], 0), MemoryAccess(
+                        (0, 1), (0, 1), write, events[start], events[finish], entered,
+                    ), {"group": identity["group"], "storage": tensor["storage"]})
+                self.counts["tensor_ports_checked"] += 1
             for access in scope["slot_accesses"]:
                 for request in access["requests"]:
                     publication = (request, access["publication"]) if access.get("publication") else None
@@ -58,6 +81,19 @@ class StateLifetimes:
                             events[access["start"]], events[access["finish"]])
                 for region in access["regions"]:
                     self.accesses[access["pool"], region["request"]].append((region["begin"], region["end"], interval))
+
+    @staticmethod
+    def tensor_interval(graph, scope, resource):
+        owner = graph["scopes"][scope]
+        if graph["resources"][resource]["kind"] == "stream" and owner.get("communication"):
+            completion, = [port for port in owner["ports"] if "rendezvous" in port]
+            return completion["rendezvous"], completion["event"]
+        prefix = "device" if graph["resources"][resource]["kind"] == "stream" else "call"
+        boundaries = {port["name"]: port["event"] for port in owner["ports"]}
+        start, finish = boundaries[prefix + ".enter"], boundaries[prefix + (".complete" if prefix == "device" else ".return")]
+        if any(graph["events"][event]["resource"] != resource for event in (start, finish)):
+            raise ValueError("tensor access has no lifetime on its declared resource")
+        return start, finish
 
     def close_bindings(self):
         self.counts["field_bindings_missing"] += len(self.fields)
@@ -172,5 +208,5 @@ class StateLifetimes:
     def report(self):
         return {
             **self.counts,
-            "scope": "Prediction-only cross-invocation KV and request-field safety. Every declared nonempty KV region and field access needs an actual physical binding, independently of cross-run pairing. Completed accesses retire before later submissions; logical release preserves pending hazards. Equal publications may write concurrently; readers join pending writers. Excludes tensor lifetimes, initialization/values, native intra-call release timing and unexercised reuse. Bindings do not prove cross-run row correspondence.",
+            "scope": "Prediction-only cross-invocation tensor, KV and request-field safety. Nonempty boundary-visible tensor epochs share their allocation; every nonempty KV region and field access needs an actual physical binding, independently of cross-run pairing. Completed accesses retire before later submissions; logical release preserves pending hazards. Equal publications may write concurrently; readers join pending writers. Excludes intra-invocation hazards, initialization/values, native intra-call release timing and unexercised reuse. Bindings do not prove cross-run row correspondence.",
         }

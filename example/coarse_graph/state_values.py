@@ -11,6 +11,7 @@ class StateValueComparison:
         self.native = defaultdict(list)
         self.predicted = defaultdict(list)
         self.returns = {}
+        self.continuations = {}
         self.findings = []
         self.counts = {}
 
@@ -34,16 +35,53 @@ class StateValueComparison:
             destination[group, request, operation].append({"room": value["room"], "values": payload})
 
     def source(self, raw, group):
-        seen = set()
+        values = {}
         for record in raw.get("action_values", ()):
             if "state" not in record["values"]:
                 continue
             scope = record["scope"]
-            if type(scope) is not int or not 0 < scope < len(raw["scopes"]) or scope in seen:
+            if type(scope) is not int or not 0 < scope < len(raw["scopes"]) or scope in values:
                 raise ValueError("state value observation has no unique native scope")
-            seen.add(scope)
-            declared = self.declared([raw["scopes"][scope].get("state_accesses", ())], "local")
-            self.add(self.native, group, record["values"]["state"], declared)
+            values[scope] = record["values"]["state"]
+
+        declarations = {raw["scopes"][index]["parent"]: set()
+                        for index in values if raw["scopes"][index]["role"] == "segment"}
+        if any(raw["scopes"][parent]["role"] != "invocation" for parent in declarations):
+            raise ValueError("state segment has no native invocation envelope")
+        for index, scope in enumerate(raw["scopes"]):
+            parent = scope["parent"]
+            if index not in values and (scope["role"] != "segment" or parent not in declarations):
+                continue
+            declared = self.declared([scope.get("state_accesses", ())], "local")
+            if scope["role"] == "segment" and parent in declarations:
+
+                # A native read can precede a clock cut; its later value still belongs to this actual invocation.
+                declarations[parent].update(declared)
+                declared = declarations[parent]
+            if index in values:
+                self.add(self.native, group, values[index], declared)
+
+    def invocation_fields(self, group, root, declared):
+        work = root["work"]
+        position = work.get("continuation")
+        if position is None:
+            return declared
+        callers = work.get("callers", [])
+
+        # Depth locates a live frame; its full work and continuation must still match across cuts.
+        key = group, len(callers)
+        identity = position["owner"], work.get("members", []), work["context"], callers
+        if position["entry"] == "call.enter":
+            if key in self.continuations:
+                raise ValueError("state invocation starts before its preceding call returns")
+        else:
+            previous, previous_exit, previous_context, fields = self.continuations.pop(key)
+            if previous != identity or (previous_exit, previous_context) != (position["entry"], position["entry_context"]):
+                raise ValueError("state segments do not continue the same native invocation")
+            declared = declared | fields
+        if position["exit"] != "call.return":
+            self.continuations[key] = identity, position["exit"], position["exit_context"], declared
+        return declared
 
     def observe(self, row):
         if row["kind"] == "graph":
@@ -51,6 +89,7 @@ class StateValueComparison:
             root = graph["scopes"][0]
             group = self.groups[graph["resources"][0]["rank"]]
             declared = self.declared((scope["slot_accesses"] for scope in graph["scopes"]), group)
+            declared = self.invocation_fields(group, root, declared)
             if not any(field == "metadata" for field, _, _ in declared):
                 return
             boundary = next(port["event"] for port in root["ports"] if port["name"] == "call.return")

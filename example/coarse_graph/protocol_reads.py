@@ -530,10 +530,18 @@ class PdPredictionEvidence:
                 if record["result"] < self.last_states.get(key, 1):
                     raise ValueError(f"PD endpoint {key} regresses from its preceding poll")
                 self.last_states[key] = record["result"]
+                notice = None
                 if key in self.targets and record["result"] >= 2:
                     ready = self.notifications.get((*key, "kv_ready"))
                     if ready is None or ready["time_ns"] > record["time_ns"]:
                         raise ValueError(f"PD sender readiness at {key} precedes its complete reservation cohort")
+                    notice = ready
+                if record["result"] == 4:
+                    notice = self.notifications.get((*key, "kv_success"))
+
+                # Native and predicted query returns both include the state actually consumed, including cached states.
+                if notice is not None and (notice["event"], record["boundary"]) not in queries.observation_edges:
+                    raise ValueError(f"PD read at {key} lacks its actual visibility cause at return")
                 self.polls += 1
             if record["kind"] == "completion_read":
                 producers = self.signals[record["signal"]]

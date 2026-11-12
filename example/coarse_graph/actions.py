@@ -19,6 +19,7 @@ class QueryResults:
         self.notifications = 0
         self.notices = {}
         self.notice_inputs = defaultdict(set)
+        self.observation_edges = set()
 
     @staticmethod
     def clock(record, time_ns=None, epoch_ns=None):
@@ -64,6 +65,8 @@ class QueryResults:
             self.signal_completions[event] = None
         elif kind == "edge" and record["target"] in self.notices:
             self.notice_inputs[record["target"]].add(record["source"])
+        elif kind == "edge" and record["relation"] == "observation":
+            self.observation_edges.add((record["source"], record["target"]))
         elif kind == "completion":
             event = record["event"]
             if event in self.pending:
@@ -84,7 +87,7 @@ class QueryResults:
             completed_ns = self.signal_completions[event]
 
             # Recorded order distinguishes a read from a completion at the same simulated time.
-            if (query["returned_ns"] is None or record["time_ns"] < query["returned_ns"]
+            if (query["returned_ns"] is None or record["time_ns"] != query["returned_ns"]
                     or record["group"] != query["group"] or record["event"] != event
                     or type(record["result"]) is not bool or record["result"] != (completed_ns is not None)
                     or (completed_ns is not None and completed_ns > record["time_ns"])):
@@ -92,6 +95,8 @@ class QueryResults:
             query["reads"] += 1
             query["last_read"] = record
             self.completion_reads += 1
+            if ((event, record["boundary"]) in self.observation_edges) != record["result"]:
+                raise ValueError("completion read lacks its actual observation edge or turns an unsuccessful read into a wait")
             return query
         elif kind == "state_query":
             query = self.pending.pop(record["boundary"])
@@ -101,7 +106,7 @@ class QueryResults:
             last_read = query["last_read"]
             if (type(record["result"]) is not expected_type
                     or record["group"] != query["group"] or query["returned_ns"] is None
-                    or record["time_ns"] < query["returned_ns"] or record["completion_reads"] != query["reads"]
+                    or record["time_ns"] != query["returned_ns"] or record["completion_reads"] != query["reads"]
                     or (last_read is not None and record["time_ns"] < last_read["time_ns"])
                     or (query["kind"] == "event" and (query["reads"] != 1 or record["result"] != last_read["result"]))):
                 raise ValueError("query result disagrees with its worker, result type, boundary or actual reads")
