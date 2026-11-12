@@ -161,14 +161,24 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     return identities;
 }
 
-void Timeline::connect(std::size_t source, std::size_t target, std::int64_t delay_ns, Relation relation) {
+void Timeline::connect(std::size_t source, std::size_t target, std::int64_t delay_ns, Relation relation, std::optional<std::size_t> activation) {
     auto & consumer = events_.at(target);
     if (const auto completed = events_.at(source).completed_ns) consumer.ready_ns = std::max(consumer.ready_ns, after(*completed, delay_ns));
     else {
         ++consumer.pending;
         events_.at(source).next.push_back({ target, delay_ns });
     }
-    if (observer_) observer_->connected(source, target, relation, delay_ns);
+    if (observer_) observer_->connected(source, target, relation, delay_ns, activation);
+}
+
+void Timeline::observe(std::size_t source, std::size_t boundary) {
+    const auto producer = events_.at(source).completed_ns;
+    const auto returned = events_.at(boundary).completed_ns;
+    if (!producer || !returned || *producer > *returned || *returned != now_ns_ || source == boundary)
+        throw std::invalid_argument("read observation requires an already completed producer at the current return boundary");
+
+    // Successful reads establish knowledge after execution; they never wait for a pending producer.
+    if (observer_) observer_->connected(source, boundary, Relation::Observation, 0, {});
 }
 
 std::size_t Timeline::defer() {
@@ -234,6 +244,9 @@ std::optional<EventCompletion> Timeline::advance(std::optional<std::int64_t> unt
         now_ns_ = time_ns;
         if (!event.activated) {
             event.activated = true;
+
+            // Queue acceptance and a wait's snapshot happen before completion, which may itself wait for the stream.
+            if (observer_ && (!event.enqueues.empty() || !event.waits.empty())) observer_->activated(identity, time_ns);
             for (const auto command_id : event.enqueues) {
                 auto & command = commands_.at(command_id);
                 if (--command.pending == 0) {
@@ -245,8 +258,8 @@ std::optional<EventCompletion> Timeline::advance(std::optional<std::int64_t> unt
 
             // Waiting includes queued work and the completed frontier, but never a later enqueue.
             for (const auto & wait : event.waits) {
-                if (const auto completed = completed_commands_[wait.resource]) connect(*completed, wait.finish, 0, Relation::Signal);
-                for (const auto completion : queued_[wait.resource]) connect(completion, wait.finish, 0, Relation::Signal);
+                if (const auto completed = completed_commands_[wait.resource]) connect(*completed, wait.finish, 0, Relation::Signal, identity);
+                for (const auto completion : queued_[wait.resource]) connect(completion, wait.finish, 0, Relation::Signal, identity);
                 schedule(wait.finish);
             }
             event.waits.clear();

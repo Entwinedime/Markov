@@ -303,37 +303,37 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             reply(identity, nullptr);
             continue;
         }
-        if (kind == "query_result") {
-            const auto boundary = message.at("boundary").get<std::size_t>();
+        if (kind == "read_result") {
+            const auto boundary = read_boundary(name, message);
             const auto & result = message.at("result");
             const auto & clocks = message.at("clocks");
-            if (!control_observer_ || !timeline_.completed(boundary) || !clocks.is_array()
-                || (!result.is_boolean() && !result.is_number_integer()))
-                throw std::invalid_argument("query observation requires a completed read boundary and scalar result");
-            control_observer_->queried(name, boundary, result, clocks, now_ns);
+            if (!clocks.is_array() || (!result.is_boolean() && !result.is_number_integer()))
+                throw std::invalid_argument("native read requires its scalar result and clock records");
+            if (control_observer_) control_observer_->queried(name, boundary, result, clocks, now_ns);
+            pending_reads_.erase(name);
             reply(identity, nullptr);
             continue;
         }
         if (kind == "completed") {
+            const auto boundary = read_boundary(name, message);
             const auto signal = message.at("signal").get<std::string>();
             const auto producer = completion_event(signal);
             if (!producer) throw std::invalid_argument("native completion reference has no live producer: " + signal);
             const auto event = *producer;
             const bool completed = timeline_.completed(event);
-            if (!message.at("observation").is_null()) {
-                const auto boundary = message.at("observation").get<std::size_t>();
-                if (!control_observer_ || !timeline_.completed(boundary))
-                    throw std::invalid_argument("completion read observation requires a completed query boundary");
-                control_observer_->completion_read(name, boundary, signal, event, completed, now_ns);
+            if (completed) {
+                timeline_.observe(event, boundary);
+                participant.dependencies.observe_completion(event);
             }
-            if (completed) participant.dependencies.observe_completion(event);
             else observed_[event].insert(instances_.at(name));
+            if (control_observer_) control_observer_->completion_read(name, boundary, signal, event, completed, now_ns);
             reply(identity, completed);
             continue;
         }
         if (kind == "observed_completion") {
+            const auto boundary = read_boundary(name, message);
             const auto event = message.at("event").get<std::size_t>();
-            if (!timeline_.completed(event)) throw std::invalid_argument("control observed a pending completion");
+            timeline_.observe(event, boundary);
             participant.dependencies.observe_completion(event);
             reply(identity, nullptr);
             continue;
@@ -362,6 +362,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             continue;
         }
         if (kind == "action") {
+            if (pending_reads_.contains(name)) throw std::invalid_argument("native action precedes its read result: " + name);
 
             // A new serving action ends this participant's previously reported idle interval.
             idle_.erase(name);
@@ -398,6 +399,13 @@ nlohmann::json NativeController::resource_call(const std::string & group, const 
     if (changes.capacity_increased) input.woken = true;
     if (observer_) observer_->applied(group, message, result, changes, timeline_.now_ns());
     return result;
+}
+
+std::size_t NativeController::read_boundary(const std::string & group, const nlohmann::json & message) const {
+    const auto & read = pending_reads_.at(group);
+    if (message.at("boundary").get<std::size_t>() != read.boundary || timeline_.now_ns() != read.time_ns)
+        throw std::invalid_argument("nonblocking native read left its actual return boundary: " + group);
+    return read.boundary;
 }
 
 std::optional<std::size_t> NativeController::completion_event(const std::string & signal) const {
@@ -465,6 +473,7 @@ void NativeController::release_notifications(std::size_t request) {
 
 std::set<std::size_t> NativeController::retained_events() const {
     auto events = cpu_.retained_events();
+    for (const auto & [_, read] : pending_reads_) events.insert(read.boundary);
 
     // Retain notifications while their request is live, including later registrations by another participant.
     for (const auto & [event, _] : notices_) events.insert(event);
@@ -523,6 +532,10 @@ void NativeController::finish(const ServingAction & action, std::size_t returned
 
     // Identity is available at CPU return; actual data readiness remains in the execution graph.
     nlohmann::json returned{ { "completed_ns", completed_ns }, { "values", std::move(bindings) } };
+    if (action.name == "query") {
+        pending_reads_.emplace(action.task.group, PendingRead{ returned_event, completed_ns });
+        returned["read_boundary"] = returned_event;
+    }
     if (control_observer_) returned["observation"] = returned_event;
     reply(call, returned);
     running_calls_.erase(action.task);
@@ -540,7 +553,7 @@ std::optional<std::int64_t> NativeController::next_wakeup_ns(std::int64_t now_ns
     return next;
 }
 
-bool NativeController::done() const { return stopped_.size() == groups_.size() && running_calls_.empty(); }
+bool NativeController::done() const { return stopped_.size() == groups_.size() && running_calls_.empty() && pending_reads_.empty(); }
 std::size_t NativeController::free_pages() const {
     std::size_t pages = 0;
     for (const auto & [name, group] : groups_) pages += group.resources.free_pages();

@@ -37,7 +37,7 @@ class MetadataCollectives:
         tensor = values["input_tensor" if name == "all_gather_into_tensor" else "tensor"]
         group = distributed.group.WORLD if values["group"] is None else values["group"]
         if not calls.groups.is_cpu(group):
-            return original(*args, **kwargs)
+            return calls.device_collective(original, values)
 
         # Empty Gloo reductions and singleton groups do not impose a peer rendezvous.
         if distributed.get_world_size(group) == 1 or (name == "all_reduce" and tensor.numel() == 0):

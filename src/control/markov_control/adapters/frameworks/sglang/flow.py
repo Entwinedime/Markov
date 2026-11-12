@@ -111,6 +111,16 @@ class FlowExecution(CallSegments):
             values["output"] = outputs.flatten().tolist()
             self.scheduler.peer.call("action_values", boundary=returned["observation"], values={"collective": values})
 
+    def device_collective(self, original, arguments):
+        frame = self.current.get()
+        if frame.operation != "batch_sync_exchange":
+            return super().device_collective(original, arguments)
+
+        # This native method has one exchange and private tensor postprocessing; the whole declared graph owns both.
+        work = original(**{**arguments, "async_op": True})
+        self.suspend(frame, "call.return")
+        work.wait()
+
     def clock_sample(self, original, query):
         time_ns = self.scheduler.peer.call("clock") if query is None else query["time_ns"]
 
@@ -121,16 +131,14 @@ class FlowExecution(CallSegments):
     @contextmanager
     def read_boundary(self, kind, original, work, condition):
 
-        # Return after observed read work and local synchronization, without waiting for the queried producer.
+        # Native nonblocking reads complete at this virtual instant, independently of optional tracing.
         returned = self.scheduler.action("query", {}, work, condition=condition)
-        query = {"observation": returned.get("observation"), "time_ns": returned["completed_ns"]}
+        query = {"boundary": returned["read_boundary"], "time_ns": returned["completed_ns"]}
         yield query
 
-        # Detailed tracing joins this result to the actual return event, never to a polling ordinal.
-        if "observation" in returned:
-            self.scheduler.peer.call(
-                "query_result", boundary=returned["observation"], result=query["result"], clocks=query["clocks"],
-            )
+        self.scheduler.peer.call(
+            "read_result", boundary=query["boundary"], result=query["result"], clocks=query["clocks"],
+        )
 
     @contextmanager
     def boundary(self, original, boundary):

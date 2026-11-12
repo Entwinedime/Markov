@@ -71,6 +71,7 @@ private:
     void reach_idle(const std::string & group, std::size_t call, bool waiting);
     bool release_idle(const std::string & instance);
     std::optional<std::size_t> completion_event(const std::string & signal) const;
+    std::size_t read_boundary(const std::string & group, const nlohmann::json & message) const;
     void resolve_notifications();
     bool cpu_call(std::size_t call, const std::string & group, const nlohmann::json & message);
     bool release_cpu();
@@ -93,6 +94,11 @@ private:
         bool waiting = false;
         bool woken = false;
         bool in_flow = false;
+    };
+
+    struct PendingRead {
+        std::size_t boundary;
+        std::int64_t time_ns;
     };
 
     nlohmann::json resource_call(const std::string & group, const nlohmann::json & message);
@@ -121,6 +127,7 @@ private:
     std::map<std::size_t, CompletionNotice> notices_;
     std::set<std::size_t> pending_notices_;
     std::map<TaskIdentity, std::size_t> running_calls_;
+    std::map<std::string, PendingRead> pending_reads_;
     std::size_t next_action_ = 0;
     bool shutdown_ = false;
 };

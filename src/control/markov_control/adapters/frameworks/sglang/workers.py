@@ -317,7 +317,7 @@ class NativeCalls:
                 # Read-only replies and observations must not consume a native scheduling turn.
                 call = next((item for item in self.ready if item.message["kind"] in {
                     "capacity", "free_slots", "describe", "completed", "completion_notice", "observed_completion",
-                    "wake", "query_result", "action_values", "protocol", "clock",
+                    "wake", "read_result", "action_values", "protocol", "clock",
                 } or (item.message["kind"] == "state_slots" and item.message["operation"] == "available")), None)
                 if call is None:
                     if not self.quiescent():

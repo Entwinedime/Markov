@@ -23,6 +23,17 @@ std::pair<std::size_t, std::size_t> interval(const CoarseGraph & graph, std::siz
     return { start, finish };
 }
 
+void prune_returned(auto & contents, const Timeline & timeline) {
+    for (auto it = contents.begin(); it != contents.end();) {
+        auto & value = it->second;
+        value.prune(timeline);
+
+        // Logical return clears contents; the last physical access must also finish before its record can disappear.
+        if (value.initialized.empty() && value.active.empty()) it = contents.erase(it);
+        else ++it;
+    }
+}
+
 } // namespace
 
 GraphDependencies::GraphDependencies(KvPool & pool, ResourceService & resources, std::span<const Request> requests, ResourceObserver * observer)
@@ -82,7 +93,7 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
     std::map<std::tuple<std::string, std::string, std::string>, std::size_t> state_bindings;
     std::set<std::tuple<std::size_t, std::size_t, Relation>> dependencies;
 
-    // A successful read precedes subsequent work; it does not retroactively block the already returned query.
+    // Read observations also protect subsequent work after the nonblocking query has consumed its result.
     const auto entered = graph.scopes.front().port("call.enter", Direction::Input).event;
     for (const auto event : observations_) dependencies.emplace(event, entered, Relation::Observation);
     for (const auto & port : graph.scopes.front().ports) {
@@ -254,8 +265,8 @@ std::set<std::size_t> GraphDependencies::retain(const std::set<std::string> & bi
         if (!bindings.contains(it->first) && it->second.active.empty()) it = tensors_.erase(it);
         else ++it;
     }
-    for (auto & [_, contents] : pages_) contents.prune(timeline);
-    for (auto & [_, contents] : slots_) contents.prune(timeline);
+    prune_returned(pages_, timeline);
+    prune_returned(slots_, timeline);
 
     // Active accesses finish in the future and the timeline keeps them; published values may already be complete.
     std::set<std::size_t> retained = observations_;

@@ -4,6 +4,7 @@ from array import array
 import sys
 
 import zmq
+from markov_adapters.sglang.pipeline import PipelineABI
 from markov_control.peer import ControlPeer
 from markov_workload import WorkloadContent
 from markov_workload.routing import RoutedContent
@@ -84,6 +85,7 @@ class NativeRequestReceiver:
         self.scheduler = scheduler
         self.round_started = False
         self.model_ran = False
+        self.idle_reported = False
 
     def recv_requests(self):
         scheduler = self.scheduler
@@ -92,6 +94,15 @@ class NativeRequestReceiver:
         first_slot = scheduler.ps.pp_size == 1 or sys._getframe(1).f_locals["mb_id"] == 0
         scheduler.request_input.waiting = False
         if first_slot:
+
+            # Native on_idle can precede round-tail work; park only after that work reaches the next receive.
+            idle = self.idle_reported and scheduler.is_fully_idle() and not PipelineABI.pending_model_sends(scheduler)
+            self.idle_reported = False
+            if idle:
+                if scheduler.ps.pp_rank == 0 and scheduler.ps.tp_rank == 0:
+                    scheduler.peer.call("idle", waiting=True)
+                else:
+                    scheduler.peer.send({"kind": "idle", "waiting": False})
 
             # Pending transfers can bypass on_idle; completed rounds must still have a safe external wait.
             scheduler.request_input.waiting = (

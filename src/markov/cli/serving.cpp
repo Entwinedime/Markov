@@ -6,6 +6,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "markov/adapters/sglang/actions.hpp"
@@ -21,7 +22,14 @@ public:
     nlohmann::json receive() override {
         std::string line;
         if (!std::getline(std::cin, line)) throw std::runtime_error("native control endpoint closed");
-        return nlohmann::json::parse(line);
+
+        // Keep unexpected native output diagnosable without accepting it as a control message.
+        try {
+            return nlohmann::json::parse(line);
+        }
+        catch (const nlohmann::json::parse_error & error) {
+            throw std::runtime_error("native control sent an invalid JSON frame: " + line.substr(0, 160) + " (" + error.what() + ")");
+        }
     }
     void send(const nlohmann::json & message) override {
         std::cout << message << '\n' << std::flush;

@@ -187,7 +187,10 @@ class NativeScheduler(Scheduler):
         with self.request_state.members(batch), self.request_state.record() as accesses:
             result = super().run_batch(batch, *args, **kwargs)
         self.bind_state(work, accesses)
-        self.action("run_batch", parameters, work)
+
+        # The native tensor carries bookkeeping values; later reads must inherit this graph's produced storage.
+        outputs = {} if result.next_token_ids is None else {"next_token_ids": result.next_token_ids}
+        self.action("run_batch", parameters, work, tensor_outputs=outputs)
         return result
 
     def _pp_launch_batch(self, mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue):
@@ -285,12 +288,4 @@ class NativeScheduler(Scheduler):
         if idle:
             self.calls.drained()
         super().on_idle()
-        if not idle:
-            return
-        message = {"kind": "idle", "waiting": self.ps.pp_rank == 0 and self.ps.tp_rank == 0}
-
-        # Only ingress sleeps; its peers can still reach the native control boundary.
-        if message["waiting"]:
-            self.peer.call("idle", waiting=True)
-        else:
-            self.peer.send(message)
+        self.request_receiver.idle_reported = idle

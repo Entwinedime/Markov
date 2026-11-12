@@ -1,8 +1,13 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
+#include <span>
+#include <string_view>
 
 #include "markov/execution/observer.hpp"
 #include "markov/controller/observer.hpp"
@@ -14,7 +19,9 @@ class ExecutionTrace final : public ExecutionObserver, public ResourceObserver, 
 public:
     explicit ExecutionTrace(const std::filesystem::path & path);
     void inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const ServiceDuration> work_ns, std::int64_t time_ns) override;
-    void connected(std::size_t source, std::size_t target, Relation relation, std::int64_t delay_ns) override;
+    void connected(std::size_t source, std::size_t target, Relation relation, std::int64_t delay_ns,
+                   std::optional<std::size_t> activation) override;
+    void activated(std::size_t event, std::int64_t time_ns) override;
     void completed(std::size_t event, std::int64_t time_ns) override;
     void constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns) override;
     void initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) override;

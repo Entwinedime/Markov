@@ -179,9 +179,11 @@ class NativeKvPolling:
             self.poll_state = self._poll()
 
             # Record only the state actually read, not unrelated deliveries collected in the same inbox drain.
-            completion = self.completions.get(self.poll_state)
-            if completion is not None:
-                self.backend.scheduler.peer.call("observed_completion", event=completion)
+            visible = [state for state in self.completions if state <= self.poll_state]
+            if visible:
+                self.backend.scheduler.peer.call(
+                    "observed_completion", event=self.completions[max(visible)], boundary=query["boundary"],
+                )
             query["result"] = self.poll_state
         return self.poll_state
 

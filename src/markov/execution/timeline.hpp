@@ -38,6 +38,7 @@ public:
                                     std::span<const BoundaryTime> boundaries = {});
     std::optional<EventCompletion> advance(std::optional<std::int64_t> until_ns = {});
     bool completed(std::size_t event) const;
+    void observe(std::size_t source, std::size_t boundary);
     std::size_t defer();
     void resolve(std::size_t event, std::span<const std::size_t> sources, Relation relation = Relation::Communication,
                  std::optional<TimeWindow> window = {}, ServiceDuration service_ns = 0);
@@ -76,7 +77,8 @@ private:
         std::size_t pending;
     };
 
-    void connect(std::size_t source, std::size_t target, std::int64_t delay_ns, Relation relation);
+    void connect(std::size_t source, std::size_t target, std::int64_t delay_ns, Relation relation,
+                 std::optional<std::size_t> activation = {});
     void schedule(std::size_t event);
 
     std::vector<Resource> resources_;

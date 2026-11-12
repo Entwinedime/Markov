@@ -90,6 +90,9 @@ class CallSegments:
     def read_boundary(self, kind, original, work, condition):
         raise NotImplementedError
 
+    def device_collective(self, original, arguments):
+        return original(**arguments)
+
     @contextmanager
     def read(self, kind, original, work, *, read=None):
         work = dict(work)

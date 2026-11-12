@@ -76,7 +76,7 @@ class PipelineSignals:
         work = self.scheduler.pipeline_messages.work()
         work["context"]["producer"] = signal.context
         with self.scheduler.calls.read("event", original, work) as query:
-            result = self.scheduler.peer.call("completed", signal=signal.identity, observation=query["observation"])
+            result = self.scheduler.peer.call("completed", signal=signal.identity, boundary=query["boundary"])
             query["result"] = result
             return result
 

@@ -29,13 +29,22 @@ void ExecutionTrace::inserted(const CoarseGraph & graph, std::span<const std::si
     } << '\n';
 }
 
-void ExecutionTrace::connected(std::size_t source, std::size_t target, Relation relation, std::int64_t delay_ns) {
-    stream_ << nlohmann::json{
+void ExecutionTrace::connected(std::size_t source, std::size_t target, Relation relation, std::int64_t delay_ns,
+                               std::optional<std::size_t> activation) {
+    nlohmann::json record{
         {     "kind",                  "edge" },
         {   "source",                  source },
         {   "target",                  target },
         { "relation", relation_name(relation) },
         { "delay_ns",                delay_ns }
+    };
+    if (activation) record["activation"] = *activation;
+    stream_ << record << '\n';
+}
+
+void ExecutionTrace::activated(std::size_t event, std::int64_t time_ns) {
+    stream_ << nlohmann::json{
+        { "kind", "activation" }, { "event", event }, { "time_ns", time_ns }
     } << '\n';
 }
 
