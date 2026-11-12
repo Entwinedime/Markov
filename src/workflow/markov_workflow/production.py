@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from markov_collection.artifacts import write_json
 from markov_collection.adapters.runtimes.ascend.export import AscendExport
+from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
 
@@ -34,8 +35,10 @@ class CaptureProduction:
             raise ValueError("published capture must contain unique nonnegative integer workers")
         images = {}
         for role, image in (("source", arguments.source_image), ("modeling", arguments.modeling_image)):
-            images[role] = subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
-        self.inputs = {"capture_path": str(self.capture), "capture": capture, "images": images,
+            images[role] = json.loads(subprocess.check_output(["docker", "image", "inspect", image], text=True))[0]
+        if SourceDomain.image_revision(images["source"]) != capture["framework_revision"]:
+            raise ValueError("source postprocessing image differs from the captured upstream SGLang revision")
+        self.inputs = {"capture_path": str(self.capture), "capture": capture, "images": {role: image["Id"] for role, image in images.items()},
                        "product": arguments.product, "keep_intermediates": arguments.keep_intermediates}
 
     def publish_state(self) -> None:

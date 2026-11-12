@@ -2,6 +2,8 @@
 
 from functools import partial, update_wrapper
 
+from markov_collection.adapters.frameworks.sglang.module_layout import ModuleStructure
+
 
 class ExpertScopes:
     def __init__(self, observation, modules) -> None:
@@ -13,6 +15,7 @@ class ExpertScopes:
 
         self.observation = observation
         self.sites = []
+        self.implementations = {}
         geometry = observation.routing.geometry
         if geometry.size > 1 and os.environ.get("DEEP_USE_ALLTOALL_MODE") != "1":
             raise ValueError("expert geometry requires the Ascend DeepEP normal AllToAll layout")
@@ -28,6 +31,11 @@ class ExpertScopes:
                 if not isinstance(inner, DeepEPDispatcher):
                     raise ValueError("native expert exchange differs from the declared DeepEP layout")
             self.sites.append(path)
+
+            # Equal initialized modules may share local bodies; their concrete layer/weight bindings remain on each call.
+            self.implementations[path] = {
+                "layout": geometry.layout, "module": ModuleStructure.read(module, {module.layer_id: 0}, {}),
+            }
             original = module.forward
             module.forward = update_wrapper(partial(self.forward, path, module, original), original)
             original = module.run_moe_core
@@ -44,7 +52,10 @@ class ExpertScopes:
         with owner.capture.call(
             "experts", path, f"{type(module).__module__}.{type(module).__qualname__}",
             parameters=parameters, arguments=relations, constants=enclosing["constants"], device=True,
-            bindings={"weights": [name for name, _ in module.named_parameters(recurse=False)]},
+            bindings={
+                "weights": [name for name, _ in module.named_parameters(recurse=False)],
+                "local_implementation": self.implementations[path],
+            },
         ) as call:
             self.port(call, "hidden_states", "input", hidden_states, "expert_input_tokens")
             self.port(call, "topk_ids", "input", topk_output.topk_ids, "expert_input_tokens")

@@ -3,6 +3,11 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG SGLANG_REVISION
+RUN [[ "$SGLANG_REVISION" =~ ^[0-9a-f]{40}$ ]]
+ENV MARKOV_SGLANG_REVISION=${SGLANG_REVISION}
+LABEL org.markov.sglang.revision=${SGLANG_REVISION}
+
 COPY src/collection/native/frameworks/sglang/ascend/install.sh /opt/markov/install-sglang.sh
 COPY third_party/sglang /opt/markov/sglang
 

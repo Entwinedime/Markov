@@ -115,7 +115,8 @@ public:
 
     void validate(std::size_t scope, std::string_view action, const nlohmann::json & condition) const {
         const bool control_transform = action == "batch_transform" && condition.at("transformation").at("effect") == "control";
-        if (control_transform) validate_host(scope);
+        const bool result_continuation = action == "segment" && condition.at("owner") == "result";
+        if (control_transform || result_continuation) validate_host(scope);
     }
 
 private:
@@ -162,10 +163,7 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
         const auto & communication = observation.scopes[scope].communication;
         if (info.role == "expert_compute" || (communication && (communication->operation == "dispatch" || communication->operation == "combine"))) {
             const auto & owner = observation.scopes.at(*observed.parent).info;
-            info.bindings["local_implementation"] = {
-                { "layout", graph.environment.at("implementation").at("expert_layout") },
-                { "owner", owner.site }, { "implementation", owner.implementation }
-            };
+            info.bindings["local_implementation"] = owner.bindings.at("local_implementation");
         }
 
         // Native selection can run between PD caller segments while remaining an independently submitted action.
@@ -203,7 +201,7 @@ TemplateLibrary NativeTemplates::compile(const CoarseGraph & observation) {
     library.local_domain = nlohmann::json::object();
     for (const auto field : { "framework", "device", "torch", "torch_npu" }) library.local_domain[field] = graph.environment.at(field);
     const auto & implementation = graph.environment.at("implementation");
-    for (const auto field : { "model", "dtype", "load_format" }) library.local_domain[field] = implementation.at(field);
+    for (const auto field : { "model", "dtype", "load_format", "framework_revision" }) library.local_domain[field] = implementation.at(field);
     library.local_domain["expert_layout"] = implementation.value("expert_layout", nlohmann::json());
     library.local_domain["expert_layers"] = graph.environment.value("expert_layers", nlohmann::json::array());
     for (const auto field : { "logical_tp", "logical_pp", "logical_ep" }) library.local_domain[field] = graph.environment.at("parallel").at(field);
@@ -218,6 +216,18 @@ nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::jso
     };
     if (action == "segment") {
         const auto & owner = facts.at("owner").get_ref<const std::string &>();
+
+        // Result reads, resource calls and publication are separate actions; the residual has only CPU work.
+        if (owner == "result") {
+            facts.erase("entry");
+            facts.erase("exit");
+        }
+
+        // Both native Decode paths have the same coarse tensor ABI; logical members retain the actual page demand.
+        if (owner == "allocation") {
+            auto & allocation = facts.at("allocation");
+            if (allocation == "decode_tail" || allocation == "decode_pages") allocation = "decode_paged";
+        }
 
         // These resource ABIs consume request/pool inputs, not the caller batch's forward mode.
         if (std::ranges::find(resource_calls, owner) != resource_calls.end()) facts.erase("phase");
@@ -235,6 +245,8 @@ nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::jso
 
 nlohmann::json NativeTemplates::domain(const nlohmann::json & environment) {
     if (environment.at("framework") != "sglang") throw std::invalid_argument("target framework has no SGLang implementation domain");
+    if (environment.at("implementation").at("framework_revision").get_ref<const std::string &>().empty())
+        throw std::invalid_argument("SGLang implementation domain requires its upstream revision");
     auto result = environment;
 
     // Placement and initial state are target bindings; implementation and worker layout still require matching evidence.

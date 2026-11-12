@@ -35,6 +35,7 @@ public:
     nlohmann::json document() const;
 
 private:
+    static Expression make_operation(Kind kind, std::vector<Expression> arguments);
     std::variant<std::int64_t, std::string, Operation> value_;
 };
 

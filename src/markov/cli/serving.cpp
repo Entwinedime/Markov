@@ -91,6 +91,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                               description.at("expert_routes") });
         auto & instance = instances.back();
         nlohmann::json implementation;
+        nlohmann::json runtime;
         std::vector<std::size_t> ranks;
         auto workers = nlohmann::json::array();
         std::int64_t tp = 0, pp = 0, ep = 0;
@@ -102,13 +103,14 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
             const auto & parallel = environment.at("parallel");
             if (ranks.empty()) {
                 implementation = environment.at("implementation");
+                runtime = { { "framework_revision", implementation.at("framework_revision") }, { "torch", environment.at("torch") } };
                 tp = parallel.at("logical_tp").get<std::int64_t>();
                 pp = parallel.at("logical_pp").get<std::int64_t>();
                 ep = parallel.at("logical_ep").get<std::int64_t>();
                 if (tp <= 0 || pp <= 0 || ep <= 0 || ep > tp || tp % ep != 0) throw std::invalid_argument("invalid native parallel topology");
             }
             if (environment.at("implementation") != implementation || parallel.at("logical_tp") != tp || parallel.at("logical_pp") != pp
-                || parallel.at("logical_ep") != ep || implementation.at("page_size") != capacity.page_size)
+                || parallel.at("logical_ep") != ep || implementation.at("page_size") != capacity.page_size || environment.at("torch") != runtime.at("torch"))
                 throw std::invalid_argument("native participants disagree on their instance implementation");
             const auto local = static_cast<std::int64_t>(ranks.size());
             if (parallel.at("tp_rank") != local % tp || parallel.at("pp_rank") != local / tp)
@@ -164,6 +166,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
             throw std::invalid_argument("native instance scheduling mechanisms differ from the observed implementation");
         sources.push_back({
             { "id", id },
+            { "runtime", std::move(runtime) },
             { "model_config", implementation.at("model") },
             { "allocator", implementation.at("allocator") },
             { "expert_layout", implementation.value("expert_layout", nlohmann::json()) },

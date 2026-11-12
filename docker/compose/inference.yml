@@ -47,6 +47,7 @@ services:
       args:
         <<: *build-proxy
         BASE_IMAGE: ${MARKOV_IMAGE_PREFIX:-markov-next}-sglang-env:ubuntu22.04
+        SGLANG_REVISION: ${SGLANG_REVISION:-}
     image: ${MARKOV_IMAGE_PREFIX:-markov-next}-sglang:ubuntu22.04
     pull_policy: never
     environment:

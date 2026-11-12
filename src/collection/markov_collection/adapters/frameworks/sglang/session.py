@@ -9,7 +9,7 @@ import traceback
 from multiprocessing.connection import wait
 from pathlib import Path
 
-from markov_adapters.sglang.configuration import CaptureInput
+from markov_adapters.sglang.configuration import CaptureInput, NativeConfiguration
 from markov_collection.adapters.frameworks.sglang.instance import NativeServingInstance
 from markov_collection.artifacts import write_json
 
@@ -26,6 +26,7 @@ class ArrivalClock:
 
 class NativeServingSession:
     def __init__(self, source, output: Path, resource_trace: bool = False) -> None:
+        self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
         serving = CaptureInput(source)
         self.output = output.resolve()
         self.instances = []
@@ -93,7 +94,9 @@ class NativeServingSession:
                 process.join()
                 if process.exitcode != 0:
                     raise RuntimeError(f"native capture worker exited with {process.exitcode}")
-            write_json(self.output / "capture.json", {"instances": [results[index] for index in range(len(results))]}, indent=2, replace=False)
+            write_json(self.output / "capture.json", {
+                "framework_revision": self.framework_revision, "instances": [results[index] for index in range(len(results))],
+            }, indent=2, replace=False)
         finally:
             for connection in pending:
                 connection.close()

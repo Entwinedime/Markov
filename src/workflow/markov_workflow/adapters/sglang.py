@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from markov_adapters.sglang.configuration import InstanceConfiguration, ServingInput
+from markov_adapters.sglang.configuration import InstanceConfiguration, NativeConfiguration, ServingInput
 
 
 class SourceDomain:
     """Match a complete native job before selecting its representative worker libraries."""
+
+    @staticmethod
+    def image_revision(image: dict) -> str:
+        labels = image["Config"]["Labels"] or {}
+        return NativeConfiguration.upstream_revision(labels.get("org.markov.sglang.revision"))
+
+    @staticmethod
+    def require_control(image: dict, libraries: list[dict]) -> None:
+        revision = SourceDomain.image_revision(image)
+        if any(library["domain"]["implementation"]["framework_revision"] != revision for library in libraries):
+            raise ValueError("control image and primary source use different upstream SGLang revisions")
 
     @staticmethod
     def requested(serving: ServingInput) -> dict:

@@ -11,6 +11,7 @@ from uuid import uuid4
 from markov_adapters.sglang.configuration import CaptureInput
 from markov_collection.artifacts import write_json
 from markov_workflow.adapters.ascend import AscendDeployment
+from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
 
@@ -55,11 +56,9 @@ class CaptureProcess:
         self.timeout_ns = int(arguments.timeout * 1_000_000_000)
         if min(self.limit_ns, self.timeout_ns) < 1:
             raise ValueError("native allowances must be at least one nanosecond")
-        image = subprocess.check_output([
-            "docker", "image", "inspect", arguments.source_image, "--format", "{{.Id}}",
-        ], text=True).strip()
+        image = json.loads(subprocess.check_output(["docker", "image", "inspect", arguments.source_image], text=True))[0]
         self.inputs = {
-            "job": job, "deployment": deployment, "image": image,
+            "job": job, "deployment": deployment, "image": image["Id"], "framework_revision": SourceDomain.image_revision(image),
             "model_path": str(self.model), "model_destination": destination,
             "resource_trace": arguments.resource_trace,
         }

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_adapters.sglang.batches import BatchTensors
+from markov_adapters.sglang.configuration import NativeConfiguration
 from markov_adapters.sglang.pipeline import PipelineABI
 from markov_adapters.sglang.state_calls import RequestStateCalls
 
@@ -27,6 +28,7 @@ class SGLangObservation:
         from markov_collection.adapters.runtimes.pytorch.boundaries import TensorBoundaries
 
         self.description = description
+        self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
         self.directory = Path(description["output"])
         self.window = ObservationWindow(self.directory, description)
         self.capture = SemanticCapture(AscendMarkers())
@@ -111,6 +113,7 @@ class SGLangObservation:
 
         self.groups = ParallelGroups()
         self.implementation = {
+            "framework_revision": self.framework_revision,
             "model": runner.model_config.hf_config.to_dict(), "dtype": str(runner.model_config.dtype),
             "attention_backend": runner.server_args.attention_backend,
             "page_size": runner.server_args.page_size,

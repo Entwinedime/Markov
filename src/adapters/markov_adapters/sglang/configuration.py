@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
 class NativeConfiguration:
+    @staticmethod
+    def upstream_revision(value: str | None) -> str:
+        if not isinstance(value, str) or re.fullmatch("[0-9a-f]{40}", value) is None:
+            raise ValueError("SGLang image requires its actual upstream Git revision metadata")
+        return value
+
     def __init__(self, source: dict) -> None:
         allowed = {
             "id", "tp", "pp", "ep", "attention_backend", "page_size", "max_running_requests", "max_total_tokens",

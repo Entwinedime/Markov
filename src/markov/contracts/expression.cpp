@@ -80,12 +80,33 @@ Expression Expression::read(const nlohmann::json & value) {
             || ((kind == Kind::FloorDivide || kind == Kind::Modulo || kind == Kind::Equal || kind == Kind::Less || kind == Kind::LessEqual) && count != 2))
             throw std::invalid_argument("invalid expression arity");
 
-        Operation operation{ kind, {} };
-        for (std::size_t index = 1; index < value.size(); ++index) operation.arguments.push_back(read(value.at(index)));
-
-        result.value_ = std::move(operation);
+        std::vector<Expression> arguments;
+        for (std::size_t index = 1; index < value.size(); ++index) arguments.push_back(read(value.at(index)));
+        return make_operation(kind, std::move(arguments));
     }
 
+    return result;
+}
+
+Expression Expression::make_operation(Kind kind, std::vector<Expression> arguments) {
+    if (kind == Kind::Add || kind == Kind::Multiply) {
+        const std::int64_t identity = kind == Kind::Add ? 0 : 1;
+
+        // Remove only neutral operands; reassociation or absorbing zero could hide checked overflow or invalid division.
+        std::erase_if(arguments, [&](const auto & argument) {
+            const auto * constant = std::get_if<std::int64_t>(&argument.value_);
+            return constant && *constant == identity;
+        });
+        if (arguments.empty()) return read(identity);
+    }
+    if (kind == Kind::FloorDivide) {
+        const auto * divisor = std::get_if<std::int64_t>(&arguments[1].value_);
+        if (divisor && *divisor == 1) return std::move(arguments.front());
+    }
+    if (arguments.size() == 1) return std::move(arguments.front());
+
+    Expression result;
+    result.value_ = Operation{ kind, std::move(arguments) };
     return result;
 }
 
@@ -190,11 +211,12 @@ Expression Expression::substitute(const std::map<std::string, Expression> & expr
         return found == expressions.end() ? *this : found->second;
     }
 
-    auto result = *this;
-    if (auto * operation = std::get_if<Operation>(&result.value_)) {
-        for (auto & argument : operation->arguments) argument = argument.substitute(expressions);
+    if (const auto * operation = std::get_if<Operation>(&value_)) {
+        std::vector<Expression> arguments;
+        for (const auto & argument : operation->arguments) arguments.push_back(argument.substitute(expressions));
+        return make_operation(operation->kind, std::move(arguments));
     }
-    return result;
+    return *this;
 }
 
 bool Expression::parameterized() const {

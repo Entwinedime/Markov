@@ -1,7 +1,10 @@
-"""Read native layer communication choices for shape rules and representative roles."""
+"""Read initialized native module structure and layer communication choices."""
+
+from __future__ import annotations
 
 from functools import partial
 from inspect import signature
+from typing import Any
 
 
 class LayerCommunication:
@@ -57,3 +60,74 @@ class LayerCommunication:
             )},
             "functions": functions,
         }
+
+
+class ModuleStructure:
+    @classmethod
+    def read(cls, module: Any, layers: dict[int, int], storages: dict[int, int]) -> Any:
+        import torch
+        from sglang.srt.layers.utils.common import PPMissingLayer
+
+        if isinstance(module, PPMissingLayer):
+            return None
+        fields = {}
+        identities = {
+            "rank",
+            "tp_rank",
+            "pp_rank",
+            "ep_rank",
+            "moe_ep_rank",
+            "moe_tp_rank",
+            "attn_tp_rank",
+            "gpu_id",
+            "device_id",
+            "device_index",
+            "local_rank",
+            "prefix",
+            "layer_name",
+        }
+        for name, value in sorted(vars(module).items()):
+            field = name.lstrip("_")
+            if field in identities:
+                continue
+            if type(value) is int and field in {"layer_id", "layer_idx", "start_layer", "end_layer"} and value in layers:
+
+                # A local layer reference is distinct from an unrelated literal with the same numeric value.
+                fields[name] = ("local_layer", layers[value])
+                continue
+            if isinstance(value, torch.device):
+                value = value.type
+            elif isinstance(value, torch.dtype):
+                value = str(value)
+            if isinstance(value, (str, int, float, bool, type(None))):
+                fields[name] = value
+            elif field in {"quant_method", "dispatcher"}:
+                fields[name] = f"{type(value).__module__}.{type(value).__qualname__}"
+
+        communicator = LayerCommunication.read(module)
+        if communicator is not None:
+            fields["layer_communicator"] = communicator.document()
+
+        tensors = []
+        for name, value in (*module.named_parameters(recurse=False), *module.named_buffers(recurse=False)):
+            storage = value.untyped_storage()._cdata
+            alias = storages.setdefault(storage, len(storages))
+            tensors.append(
+                (
+                    name,
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.storage_offset(),
+                    str(value.dtype),
+                    value.device.type,
+                    alias,
+                )
+            )
+        children = []
+        for name, child in module.named_children():
+            key = cls.read(child, layers, storages)
+            if key is not None:
+                children.append((str(len(children)) if isinstance(module, torch.nn.ModuleList) else name, key))
+
+        # Placement is bound per worker; native implementation, local geometry and flags remain significant.
+        return f"{type(module).__module__}.{type(module).__qualname__}", fields, tensors, children

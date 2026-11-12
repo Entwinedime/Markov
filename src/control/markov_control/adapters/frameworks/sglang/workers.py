@@ -1,6 +1,7 @@
 """Keep native worker returns independent and expose their control waits to the broker."""
 
 import json
+import os
 from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -9,7 +10,9 @@ from multiprocessing.connection import wait
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import torch
 import torch.multiprocessing as multiprocessing
+from markov_adapters.sglang.configuration import NativeConfiguration
 from markov_control.adapters.runtimes.collectives import CollectiveCalls, CpuCollectives
 from markov_control.adapters.runtimes.cpu import CpuDeclarations
 from markov_control.adapters.runtimes.point_to_point import CpuPointToPoint, PointToPointCalls
@@ -44,6 +47,13 @@ class NativeWorkers:
         source, configuration = peer.receive(), peer.receive()
         if source["kind"] != "source" or configuration["kind"] != "configure":
             raise ValueError("Native control requires template metadata and core configuration first")
+        runtime = {
+            "framework_revision": NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION")),
+            "torch": str(torch.__version__),
+        }
+        for instance in source["instances"]:
+            if instance["runtime"] != runtime:
+                raise ValueError(f"native control runtime {runtime} differs from source {instance['runtime']}")
 
         with TemporaryDirectory(prefix="markov-control-") as directory, ExitStack() as resources:
             configurations = {item["id"]: item for item in configuration["instances"]}

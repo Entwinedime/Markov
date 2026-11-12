@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from uuid import uuid4
 
-from markov_workflow.adapters.sglang import SGLangTask
+from markov_workflow.adapters.sglang import SGLangTask, SourceDomain
 from markov_workflow.containers import OwnedContainers
 
 
@@ -40,8 +40,12 @@ class ServingProcess:
         binary = args.binary.resolve(strict=True)
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("Prediction timeout must be positive")
-        images = {role: subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
-                  for role, image in (("modeling", args.modeling_image), ("control", args.control_image))}
+        descriptions = {
+            role: json.loads(subprocess.check_output(["docker", "image", "inspect", image], text=True))[0]
+            for role, image in (("modeling", args.modeling_image), ("control", args.control_image))
+        }
+        SourceDomain.require_control(descriptions["control"], productions[0])
+        images = {role: image["Id"] for role, image in descriptions.items()}
         output = args.output.resolve()
         output.mkdir(parents=True)
         task = output / ".task.json"
