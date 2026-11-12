@@ -177,12 +177,12 @@ class MatrixRun:
         return (report.get('native_case_status') in {'consistent', 'incomplete'} and bool(ranks)
                 and all(row['mapping'] == 'consistent' for row in ranks))
 
-    def capture_domain(self, domain):
+    def capture_domain(self, domain, include_sources):
         name = domain['id']
-        if 'native_prerequisite' in domain:
-            rows = [{'id': name, 'status': 'native-prerequisite-unresolved'}]
-        else:
-            rows = [{'id': name, 'exit_code': self.acquire(domain)}]
+        rows = []
+        if include_sources:
+            rows = ([{'id': name, 'status': 'native-prerequisite-unresolved'}] if 'native_prerequisite' in domain
+                    else [{'id': name, 'exit_code': self.acquire(domain)}])
 
         # Source eligibility never decides whether an independent target can be observed.
         for case in domain['targets']:
@@ -288,8 +288,8 @@ class MatrixRun:
         with (self.steps / f'.{phase}.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             for domain in domains:
-                if phase == 'capture':
-                    self.capture_domain(domain)
+                if phase in {'capture', 'targets'}:
+                    self.capture_domain(domain, phase == 'capture')
                 else:
                     self.compare_domain(domain)
 
@@ -298,7 +298,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True, help='existing window data root')
     parser.add_argument('--matrix', type=Path, required=True, help='frozen matrix beside environment.json and markov')
-    parser.add_argument('--phase', choices=['capture', 'compare'], required=True)
+    parser.add_argument('--phase', choices=['capture', 'targets', 'compare'], required=True)
     parser.add_argument('--domain', help='one named domain; omit to process the complete matrix')
     arguments = parser.parse_args()
     MatrixRun(arguments.root, arguments.matrix).run(arguments.phase, arguments.domain)
