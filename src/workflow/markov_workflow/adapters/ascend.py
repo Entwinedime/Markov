@@ -23,7 +23,7 @@ class AscendDeployment:
             self.environment["ASCEND_MF_TRANSFER_PROTOCOL"] = source.get("transfer_protocol", "sdma")
 
     def options(self) -> list[str]:
-        arguments = ["--privileged", "--ipc", "host", "--network", "host"]
+        arguments = ["--runtime", "ascend", "--privileged", "--ipc", "host", "--network", "host"]
         for path in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
             source = Path(path).resolve(strict=True)
             arguments.extend(["--mount", f"type=bind,src={source},dst={path},readonly"])

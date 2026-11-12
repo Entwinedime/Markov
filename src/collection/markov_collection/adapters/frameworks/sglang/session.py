@@ -24,6 +24,18 @@ class ArrivalClock:
         self.origin.value = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
 
 
+class NativeRendezvous:
+    def __init__(self) -> None:
+        from torch.distributed import TCPStore
+
+        # Keep the bound server alive until every Engine worker has exited; no free-port handoff.
+        self.store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+        self.environment = {
+            "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(self.store.port),
+            "TORCHELASTIC_USE_AGENT_STORE": "True", "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE": "env://",
+        }
+
+
 class NativeServingSession:
     def __init__(self, source, output: Path, resource_trace: bool = False) -> None:
         self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
@@ -37,12 +49,12 @@ class NativeServingSession:
             offset += len(instance.roles)
 
     @staticmethod
-    def execute(instance, barrier, clock, bootstrap, connection):
+    def execute(instance, barrier, clock, bootstrap, rendezvous, connection):
 
         # Each Engine owns descendants; cancellation must also stop that instance's native workers.
         try:
             os.setsid()
-            connection.send((True, instance.run(barrier, clock, bootstrap)))
+            connection.send((True, instance.run(barrier, clock, bootstrap, rendezvous)))
         except BaseException:
 
             # Keep the traceback available before EOF lets the owner cancel this process group.
@@ -55,19 +67,24 @@ class NativeServingSession:
         self.output.mkdir(parents=True)
         (self.output / "instances").mkdir()
         (self.output / "runtime").mkdir()
-        bootstrap = None
-        if len(self.instances) > 1:
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                bootstrap = {"host": "127.0.0.1", "port": reservation.getsockname()[1]}
         context = multiprocessing.get_context("spawn")
         clock = ArrivalClock(context)
         barrier = context.Barrier(len(self.instances), action=clock)
-        processes, pending, results = [], {}, {}
+        processes, pending, results, rendezvous = [], {}, {}, []
         try:
+            for _ in self.instances:
+                rendezvous.append(NativeRendezvous())
+
+            # Select the native HTTP bootstrap only after all store ports are already occupied.
+            bootstrap = None
+            if len(self.instances) > 1:
+                with socket.socket() as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    bootstrap = {"host": "127.0.0.1", "port": reservation.getsockname()[1]}
+
             for index, instance in enumerate(self.instances):
                 reader, writer = context.Pipe(duplex=False)
-                process = context.Process(target=self.execute, args=(instance, barrier, clock, bootstrap, writer))
+                process = context.Process(target=self.execute, args=(instance, barrier, clock, bootstrap, rendezvous[index].environment, writer))
                 try:
                     process.start()
                 except BaseException:
@@ -108,3 +125,4 @@ class NativeServingSession:
                         if process.is_alive():
                             process.kill()
                 process.join()
+            rendezvous.clear()

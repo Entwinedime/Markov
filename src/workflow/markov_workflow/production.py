@@ -109,7 +109,8 @@ class CaptureProduction:
 
                 # The cumulative reservation also bounds the container after coordinator interruption.
                 command = [
-                    "docker", "run", "--rm", "--init", "--network", "none", "--name", container,
+                    "docker", "run", "--rm", "--init", "--runtime", "runc" if image == "modeling" else "ascend",
+                    "--network", "none", "--name", container,
                     "--entrypoint", "/usr/bin/timeout", "-e", "LD_PRELOAD=",
                     "--mount", f"type=bind,src={self.capture},dst=/source,readonly",
                     "--mount", f"type=bind,src={self.output},dst=/production",

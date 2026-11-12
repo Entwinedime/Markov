@@ -67,7 +67,7 @@ class NativeServingInstance:
             raise RuntimeError(f"native cache reset failed: {result.message}")
         ObservationWindow.wait(self.output, self.roles, phase, "complete")
 
-    def run(self, barrier, clock, bootstrap) -> dict:
+    def run(self, barrier, clock, bootstrap, rendezvous) -> dict:
         self.directory.mkdir()
         description = self.directory / "session.json"
         warmup = self.warmup_requests(self.configuration["page_size"])
@@ -78,6 +78,7 @@ class NativeServingInstance:
         capture.prepare("capture", bootstrap, 1 + len(warmup["requests"]))
         session = {
             "output": str(self.output), "instance_directory": str(self.directory), "mode": mode,
+            "rendezvous": {"host": rendezvous["MASTER_ADDR"], "port": int(rendezvous["MASTER_PORT"])},
             "rank_offset": self.rank_offset, "native_participants": self.roles,
             "pp_size": self.pp, "ep_size": self.ep,
             "observe_all_workers": self.observe_all_workers,
@@ -90,6 +91,7 @@ class NativeServingInstance:
             "serving_input": {"configuration": self.configuration, **self.workload},
         }
         write_json(description, session)
+        os.environ.update(rendezvous)
         os.environ["MARKOV_GRAPH_SESSION"] = str(description)
         os.environ["MARKOV_NATIVE_RUNTIME_DIR"] = str(self.output / "runtime")
         os.environ["SGLANG_PLUGINS"] = "markov"
@@ -104,6 +106,7 @@ class NativeServingInstance:
         options = {
             "model_path": model["path"], "dtype": model["dtype"], "device": "npu",
             "tp_size": self.tp, "pp_size": self.pp, "base_gpu_id": self.rank_offset,
+            "nccl_port": int(rendezvous["MASTER_PORT"]),
             "attention_backend": configuration["attention_backend"],
             "page_size": configuration["page_size"],
             "max_running_requests": configuration["max_running_requests"],

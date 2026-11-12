@@ -27,7 +27,7 @@ class WorkflowCommands:
             (Path("/var/run/docker.sock"), Path("/var/run/docker.sock"), False),
             (Path(shutil.which("docker")).resolve(strict=True), Path("/usr/bin/docker"), True),
         ])
-        command = ["docker", "run", "--rm", "--init", "-i", "--network", "none"]
+        command = ["docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none"]
         for source, destination, readonly in mounts:
             command.extend(["--mount", f"type=bind,src={source},dst={destination}" + (",readonly" if readonly else "")])
         command.extend([

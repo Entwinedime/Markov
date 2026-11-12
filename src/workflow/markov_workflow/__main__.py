@@ -58,7 +58,7 @@ class ServingProcess:
         # Container-local deadlines survive a killed coordinator; logs retain the resolved image and exact command.
         commands = [
             [
-                "docker", "run", "--rm", "--init", "-i", "--network", "none", "--name", names[0],
+                "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--name", names[0],
                 "--entrypoint", "/usr/bin/timeout",
                 "--mount", f"type=bind,src={binary},dst=/app/markov,readonly",
                 *[item for index, path in enumerate(templates) for item in ("--mount", f"type=bind,src={path},dst=/inputs/templates/{index}.json,readonly")],
@@ -69,7 +69,7 @@ class ServingProcess:
                 *(["--trace", "/output/execution.partial.jsonl"] if args.execution_trace else []),
             ],
             [
-                "docker", "run", "--rm", "--init", "-i", "--network", "none", "--shm-size", "512m", "--name", names[1],
+                "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--shm-size", "512m", "--name", names[1],
                 "--entrypoint", "/usr/bin/timeout", images["control"], "--signal=KILL", f"{args.timeout}s",
                 "python3", "-m", "markov_control", "--kernel-python", "/opt/markov/sglang/sgl-kernel/python",
             ],

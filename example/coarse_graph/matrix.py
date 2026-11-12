@@ -104,7 +104,7 @@ class MatrixRun:
 
     def evaluate(self, name, script, *arguments):
         command = [
-            'docker', 'run', '--rm', '--network', 'none',
+            'docker', 'run', '--rm', '--runtime', 'runc', '--network', 'none',
             '--mount', f'type=bind,src={self.repository},dst={self.repository}',
             '--env', f'PYTHONPATH={self.repository}/src/collection:{self.repository}/src/adapters',
             '--workdir', str(self.repository), '--entrypoint', 'timeout', self.images['modeling'],
