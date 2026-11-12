@@ -1,9 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "markov/adapters/sglang/workers.hpp"
 #include "markov/controller/action_graphs.hpp"

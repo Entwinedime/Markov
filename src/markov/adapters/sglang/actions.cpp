@@ -120,17 +120,7 @@ std::map<std::string, TensorLayout> NativeActionGraphs::outputs(std::string_view
 CoarseGraph NativeActionGraphs::build(const ServingAction & action) {
     if (action.task.group != group_) throw std::invalid_argument("action sent to another participant's graph provider");
     auto entry = select(action.name, action.condition, action.parameters);
-    worker_.bind(entry.frame, instance_);
-    if (action.work.contains("transfer") || (entry.frame.communication && entry.frame.communication->operation == "transfer")) {
-        auto & communication = entry.frame.communication;
-        if (!communication || communication->operation != "transfer") throw std::invalid_argument("native transfer requires a transfer template");
-        const auto & transfer = action.work.at("transfer");
-
-        // Bind the native route before instantiation validates endpoint/resource ownership.
-        communication->channel = transfer.at("channel").get<std::string>();
-        communication->members = transfer.at("members").get<std::vector<std::int64_t>>();
-        communication->required = communication->members;
-    }
+    worker_.bind(entry.frame, instance_, action.work);
     const auto live = action.work.at("live_batches").get<std::set<std::size_t>>();
     std::erase_if(batches_, [&](const auto & batch) { return !live.contains(batch.first); });
     GraphInvocation call{ action.name,  entry.condition, action.parameters,

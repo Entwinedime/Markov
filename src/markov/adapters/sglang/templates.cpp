@@ -214,6 +214,9 @@ nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::jso
     constexpr std::array<std::string_view, 6> resource_calls{
         "cache.finished", "cache.unfinished", "pages.free", "pages.flush", "pages.sort", "slots.free"
     };
+
+    // Scalar reads use their declared read contract; serving phase remains in the caller's work identity.
+    if (action == "query" && facts.contains("read")) facts.erase("phase");
     if (action == "segment") {
         const auto & owner = facts.at("owner").get_ref<const std::string &>();
 

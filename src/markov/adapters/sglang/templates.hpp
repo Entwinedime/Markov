@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "markov/graph/graph.hpp"
 #include "markov/production/templates.hpp"
 #include "markov/templates/library.hpp"

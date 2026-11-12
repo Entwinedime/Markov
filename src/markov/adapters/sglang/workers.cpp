@@ -51,7 +51,21 @@ void WorkerBindings::bind_pool(const std::string & name, const nlohmann::json & 
     for (auto layer = source_begin; layer < source_end; ++layer) layers.emplace(layer, target_begin + (layer - source_begin));
 }
 
-void WorkerBindings::bind(TemplateFrame & frame, const std::string & instance) const {
+void WorkerBindings::bind(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const {
+    bind_worker(frame, instance);
+    if (work.contains("transfer") || (frame.communication && frame.communication->operation == "transfer")) {
+        auto & communication = frame.communication;
+        if (!communication || communication->operation != "transfer") throw std::invalid_argument("native transfer requires a transfer template");
+        const auto & transfer = work.at("transfer");
+
+        // Bind the native route before instantiation validates endpoint/resource ownership.
+        communication->channel = transfer.at("channel").get<std::string>();
+        communication->members = transfer.at("members").get<std::vector<std::int64_t>>();
+        communication->required = communication->members;
+    }
+}
+
+void WorkerBindings::bind_worker(TemplateFrame & frame, const std::string & instance) const {
     if (const auto site = sites_.find(frame.site); site != sites_.end()) frame.site = site->second;
     const auto & accesses = library_.definitions[frame.definition].kv_accesses;
 
@@ -79,7 +93,7 @@ void WorkerBindings::bind(TemplateFrame & frame, const std::string & instance) c
             communication.channel = instance + "/" + target.at("channel").get<std::string>();
         }
     }
-    for (auto & child : frame.children) bind(child, instance);
+    for (auto & child : frame.children) bind_worker(child, instance);
 }
 
 } // namespace markov::sglang

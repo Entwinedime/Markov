@@ -305,7 +305,14 @@ predict 可选 --execution-trace，以同一次模拟增量写出 execution.json
 
 ## 给定真实动作的局部构图
 
-CMake同时构建独立示例 `markov_local_graphs <source-library.json> <observed-target.json> <local-graphs.jsonl>`。来源模板须预先冻结；目标是带真实动作声明的粗图。示例由框架adapter描述真实动作，构图对象只接收动作条件、参数和逻辑work，再调用正式模板选择、worker绑定与实例化；不编译目标模板，不向构图器交接目标工作/端口/边。给定条件的正确性本身属于前提，不能用本检查反证。外部存储、池与信号采用符号绑定，不处理实际分配史或跨图执行。
+CMake同时构建独立示例 `markov_local_graphs`，分开导出调用输入和构图：
+
+```sh
+markov_local_graphs actions <observed-target.json> <action-inputs.json>
+markov_local_graphs expand <source-libraries.json> <action-inputs.json> <local-graphs.jsonl>
+```
+
+来源模板须预先冻结。source-libraries.json是库路径数组，首项为当前worker的代表库，其余为正式装配所需的其他来源；入口复用正式batch变换和局部实现连接。actions由框架adapter描述真实动作，只导出环境、动作条件、参数和逻辑work，包含原生传输调用已声明的路由。expand仅取得这些输入与来源库，再调用正式模板选择、共享调用绑定和实例化；生成容器不挂载目标图、输出shape、内部依赖或模型文件，也不编译目标模板。给定条件的正确性本身属于前提，不能用本检查反证。外部存储、池与信号采用符号绑定，不处理实际分配史或跨图执行。
 
 每个目标worker由正式装配的SGLangTask.participants选择代表库，不能按同名rank文件假定一对一；C++构图入口再核对角色和目标域。输出以C++23禁止覆盖方式创建，写入关闭成功后才返回。每个给定动作输出一条 `local_graph`，构图失败保留该动作error并继续收齐；末尾 `local_summary` 核对attempted/built，缺末尾记录不能当作完整结果。图文件是验证明细，不作为模拟执行流或人类汇报。
 

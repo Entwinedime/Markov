@@ -14,9 +14,10 @@ namespace markov::sglang {
 class WorkerBindings {
 public:
     WorkerBindings(const TemplateLibrary & library, const nlohmann::json & environment);
-    void bind(TemplateFrame & frame, const std::string & instance) const;
+    void bind(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const;
 
 private:
+    void bind_worker(TemplateFrame & frame, const std::string & instance) const;
     void bind_pool(const std::string & name, const nlohmann::json & source, const nlohmann::json & target);
 
     const TemplateLibrary & library_;
