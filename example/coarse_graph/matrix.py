@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit

@@ -8,7 +8,7 @@ import subprocess
 import time
 from uuid import uuid4
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 from markov_collection.adapters.runtimes.ascend.export import AscendExport
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers

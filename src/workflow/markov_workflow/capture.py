@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from markov_adapters.sglang.configuration import CaptureInput
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.ascend import AscendDeployment
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers

@@ -16,7 +16,7 @@ from markov_adapters.sglang.configuration import NativeConfiguration
 from markov_adapters.sglang.pipeline import PipelineABI
 from markov_adapters.sglang.state_calls import RequestStateCalls
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 from markov_collection.instrumentation.capture import SemanticCapture
 
 

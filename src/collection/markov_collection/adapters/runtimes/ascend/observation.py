@@ -9,6 +9,7 @@ from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.commands import NativeStreamCall, StreamCommand, StreamCommands
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, DeviceTask, Interval, ThreadIntervals
+from markov_collection.instrumentation.observation import ObservationReferences
 
 
 class AscendObservation:
@@ -591,7 +592,7 @@ class AscendObservation:
             raise ValueError(f"declared event waits have no native synchronization evidence: {self.signal_inputs}")
 
     def normalize_device_spans(self, result: dict) -> None:
-        anchors = list(self.trace.anchors(result))
+        anchors = list(ObservationReferences(result))
         references = Counter(anchor["span"] for anchor in anchors)
         device = set(self.device.values())
         points = defaultdict(set)
@@ -648,7 +649,7 @@ class AscendObservation:
 
         # Publication ends interpretation: remap every surviving reference, including shared anchor objects, once.
         positions = {old: new for new, old in enumerate(index for index in range(len(self.spans)) if index not in discarded)}
-        anchors = {id(anchor): anchor for anchor in self.trace.anchors(result)}
+        anchors = {id(anchor): anchor for anchor in ObservationReferences(result)}
         for anchor in anchors.values():
             anchor["span"] = positions[anchor["span"]]
         result["spans"] = [span for index, span in enumerate(self.spans) if index not in discarded]

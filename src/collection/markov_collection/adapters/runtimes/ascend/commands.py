@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, DeviceTask, Interval, ThreadIntervals
+from markov_collection.instrumentation.observation import ObservationReferences
 
 
 @dataclass
@@ -254,7 +255,7 @@ class StreamCommands:
         positions = [set() for _ in resources]
         for span in spans:
             positions[span["resource"]].update((span["begin"], span["end"]))
-        for anchor in trace.anchors(observation):
+        for anchor in ObservationReferences(observation):
             positions[spans[anchor["span"]]["resource"]].add(anchor["order"])
 
         clocks = {}

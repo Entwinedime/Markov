@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 
 from matrix import MatrixRun
 

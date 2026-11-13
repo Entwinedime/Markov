@@ -1,4 +1,4 @@
-"""One atomic JSON publication boundary for collector-owned documents."""
+"""Shared atomic JSON publication for task and observation artifacts."""
 
 import json
 import os

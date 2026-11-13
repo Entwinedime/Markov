@@ -281,23 +281,6 @@ class AscendTrace:
             result[correlation] = interval
         return result
 
-    @staticmethod
-    def anchors(observation: dict):
-        for edge in observation["dependencies"]:
-            yield edge["source"]
-            yield edge["target"]
-        for scope in observation["scopes"]:
-            for port in scope["ports"]:
-                yield port["at"]
-                if "wait" in port:
-                    yield port["wait"]["begin"]
-                if "rendezvous" in port:
-                    yield port["rendezvous"]
-            for field in ("kv_accesses", "slot_accesses"):
-                for access in scope[field]:
-                    yield access["start"]
-                    yield access["finish"]
-
     def origin(self, api: Interval) -> Interval:
         dequeue = self.dequeue_ranges.enclosing(api)
         if dequeue is None:

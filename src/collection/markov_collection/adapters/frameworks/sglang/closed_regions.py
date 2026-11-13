@@ -3,7 +3,7 @@
 from collections import defaultdict
 
 from markov_adapters.sglang.selection import BatchTransform
-from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
+from markov_collection.instrumentation.observation import ObservationReferences
 
 
 class ClosedRegions:
@@ -64,7 +64,7 @@ class ClosedRegions:
         if any(edge[side]["span"] in owned for edge in facts["dependencies"] for side in ("source", "target")):
             raise ValueError("private CPU region has an externally used dependency")
         for index, scope in enumerate(scopes):
-            if index not in members and any(anchor["span"] in owned for anchor in AscendTrace.anchors({"scopes": [scope], "dependencies": []})):
+            if index not in members and any(anchor["span"] in owned for anchor in ObservationReferences({"scopes": [scope], "dependencies": []})):
                 raise ValueError("private CPU region exposes an intermediate boundary")
 
         for position, member in enumerate(members):
@@ -123,7 +123,7 @@ class ClosedRegions:
         for span in spans:
             span["scope"] = mapped[span["scope"]]
         span_ids = {old: new for new, old in enumerate(i for i in range(len(spans)) if i not in removed_spans)}
-        for anchor in {id(value): value for value in AscendTrace.anchors(facts)}.values():
+        for anchor in {id(value): value for value in ObservationReferences(facts)}.values():
             anchor["span"] = span_ids[anchor["span"]]
         facts["spans"] = [span for index, span in enumerate(spans) if index not in removed_spans]
 

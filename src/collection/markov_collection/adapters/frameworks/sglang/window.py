@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 
 
 class ObservationWindow:

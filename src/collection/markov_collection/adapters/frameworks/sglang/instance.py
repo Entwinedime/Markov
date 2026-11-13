@@ -12,7 +12,7 @@ from markov_adapters.sglang.configuration import CaptureInput, InstanceConfigura
 from markov_collection.adapters.frameworks.sglang.profiles import NativeProfiles
 from markov_collection.adapters.frameworks.sglang.submissions import EngineSubmissions
 from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 
 
 class NativeServingInstance:

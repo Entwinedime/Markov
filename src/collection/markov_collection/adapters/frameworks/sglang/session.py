@@ -11,7 +11,7 @@ from pathlib import Path
 
 from markov_adapters.sglang.configuration import CaptureInput, NativeConfiguration
 from markov_collection.adapters.frameworks.sglang.instance import NativeServingInstance
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 
 
 class ArrivalClock:

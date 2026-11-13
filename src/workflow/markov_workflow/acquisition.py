@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from markov_adapters.sglang.configuration import CaptureInput
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.ascend import AscendDeployment
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.adapters.sglang_local_sources import LocalSources

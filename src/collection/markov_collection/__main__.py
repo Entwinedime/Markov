@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from markov_collection.artifacts import write_json
+from markov_adapters.artifacts import write_json
 
 
 def main() -> None:
