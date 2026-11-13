@@ -67,7 +67,8 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 
 ## 已验证范围与限制
 
-当前实际输入为 Qwen3-32B/BF16/TP2、Ascend 910B3、SGLang eager/FIA，串行固定输出。
+当前实际输入包括 Qwen3-32B 与 Qwen3-8B，各用自己的 base 和独立成本；部署为 BF16/TP2、Ascend 910B3、SGLang eager/FIA，串行固定输出。
+8B 的同 TP 开发对照仍有写回/限时预取条件超过 10%；跨 TP 尚未实现。紧主机池下，原生分配可能失败，现行主机缓冲回收近似尚不能可靠预测这种情况。
 预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
 需要在准备结束后清空后台工作时，workload 设置 drain_before_formal=true；SGLang 以轻量状态等待 HiCache 空闲，预测保留同一控制语义。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
