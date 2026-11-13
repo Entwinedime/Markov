@@ -27,7 +27,7 @@ add_library(markov_core
     src/markov/execution/dependencies.cpp
     src/markov/execution/communication.cpp
     src/markov/serving/session.cpp
-    src/markov/controller/execution_inputs.cpp
+    src/markov/serving/execution_inputs.cpp
     src/markov/production/projection.cpp
     src/markov/production/templates.cpp
     src/markov/production/entries.cpp
@@ -45,10 +45,11 @@ add_library(markov_sglang
     src/markov/adapters/sglang/templates.cpp
     src/markov/adapters/sglang/workers.cpp
     src/markov/adapters/sglang/actions.cpp
+    src/markov/adapters/sglang/serving.cpp
 )
 target_link_libraries(markov_sglang PUBLIC markov_core)
 
-add_executable(markov src/markov/cli/main.cpp src/markov/cli/serving.cpp src/markov/cli/execution_trace.cpp)
+add_executable(markov src/markov/cli/main.cpp src/markov/cli/execution_trace.cpp)
 target_link_libraries(markov PRIVATE markov_sglang)
 
 # The example expands given native actions without running control or execution.

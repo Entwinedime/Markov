@@ -4,8 +4,8 @@
 #include <map>
 #include <string>
 
-#include "markov/controller/action_graphs.hpp"
-#include "markov/controller/control.hpp"
+#include "markov/serving/action_graphs.hpp"
+#include "markov/serving/control.hpp"
 #include "markov/execution/dependencies.hpp"
 
 namespace markov {

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -16,9 +17,10 @@
 #include <nlohmann/json.hpp>
 #include <unistd.h>
 
+#include "markov/adapters/sglang/serving.hpp"
 #include "markov/adapters/sglang/templates.hpp"
 #include "markov/cli/execution_trace.hpp"
-#include "markov/cli/serving.hpp"
+#include "markov/controller/control_peer.hpp"
 #include "markov/execution/timeline.hpp"
 #include "markov/execution/timing.hpp"
 #include "markov/graph/observation.hpp"
@@ -29,6 +31,27 @@
 #include "markov/templates/selection.hpp"
 
 namespace {
+
+class StreamPeer final : public markov::ControlPeer {
+public:
+    nlohmann::json receive() override {
+        std::string line;
+        if (!std::getline(std::cin, line)) throw std::runtime_error("native control endpoint closed");
+
+        // Keep unexpected native output diagnosable without accepting it as a control message.
+        try {
+            return nlohmann::json::parse(line);
+        }
+        catch (const nlohmann::json::parse_error & error) {
+            throw std::runtime_error("native control sent an invalid JSON frame: " + line.substr(0, 160) + " (" + error.what() + ")");
+        }
+    }
+
+    void send(const nlohmann::json & message) override {
+        std::cout << message << '\n' << std::flush;
+        if (!std::cout) throw std::runtime_error("native control endpoint cannot receive");
+    }
+};
 
 nlohmann::json read_json(const std::filesystem::path & path) {
     std::ifstream stream(path);
@@ -213,7 +236,8 @@ int main(int argc, char ** argv) {
             markov::TemplateLibrary::link_local_implementations(sources);
             std::unique_ptr<markov::ExecutionTrace> trace;
             if (argc == 7) trace = std::make_unique<markov::ExecutionTrace>(argv[6]);
-            output = markov::serve(libraries, task, trace.get(), trace.get(), trace.get());
+            StreamPeer peer;
+            output = markov::sglang::serve(libraries, task, peer, trace.get(), trace.get(), trace.get());
             output["template_imports"] = imports;
             if (trace) trace->finish();
         }

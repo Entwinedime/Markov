@@ -1,41 +1,31 @@
-#include "markov/cli/serving.hpp"
+#include "markov/adapters/sglang/serving.hpp"
 
 #include <algorithm>
-#include <iostream>
+#include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "markov/adapters/sglang/actions.hpp"
+#include "markov/contracts/serving.hpp"
+#include "markov/controller/control_peer.hpp"
 #include "markov/controller/native.hpp"
+#include "markov/execution/dependencies.hpp"
+#include "markov/execution/timeline.hpp"
+#include "markov/resources/kv_pool.hpp"
+#include "markov/resources/service.hpp"
+#include "markov/serving/execution_inputs.hpp"
 #include "markov/serving/session.hpp"
-#include "markov/controller/execution_inputs.hpp"
 
-namespace markov {
+namespace markov::sglang {
 namespace {
-
-class StreamPeer final : public ControlPeer {
-public:
-    nlohmann::json receive() override {
-        std::string line;
-        if (!std::getline(std::cin, line)) throw std::runtime_error("native control endpoint closed");
-
-        // Keep unexpected native output diagnosable without accepting it as a control message.
-        try {
-            return nlohmann::json::parse(line);
-        }
-        catch (const nlohmann::json::parse_error & error) {
-            throw std::runtime_error("native control sent an invalid JSON frame: " + line.substr(0, 160) + " (" + error.what() + ")");
-        }
-    }
-    void send(const nlohmann::json & message) override {
-        std::cout << message << '\n' << std::flush;
-        if (!std::cout) throw std::runtime_error("native control endpoint cannot receive");
-    }
-};
 
 struct Participant {
     Participant(const TemplateLibrary & library, const nlohmann::json & environment, std::vector<Resource> execution_resources, const std::string & group,
@@ -47,13 +37,13 @@ struct Participant {
 
     KvPool pool;
     ResourceService resources;
-    sglang::NativeActionGraphs graphs;
+    NativeActionGraphs graphs;
     GraphDependencies dependencies;
 };
 
 } // namespace
 
-nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, ExecutionObserver * execution_observer,
+nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, ControlPeer & peer, ExecutionObserver * execution_observer,
                      ResourceObserver * resource_observer, ControlObserver * control_observer) {
     const auto & workload = task.at("workload");
     auto requests = Request::read(workload.at("requests"));
@@ -190,7 +180,6 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
         });
     }
     if (instances.empty()) throw std::invalid_argument("serving requires a native instance");
-    StreamPeer peer;
     peer.send({
         {      "kind",           "source" },
         { "instances", std::move(sources) }
@@ -204,4 +193,4 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     return result;
 }
 
-} // namespace markov
+} // namespace markov::sglang

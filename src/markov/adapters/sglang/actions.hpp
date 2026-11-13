@@ -10,7 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/adapters/sglang/workers.hpp"
-#include "markov/controller/action_graphs.hpp"
+#include "markov/serving/action_graphs.hpp"
 #include "markov/templates/library.hpp"
 #include "markov/templates/selection.hpp"
 

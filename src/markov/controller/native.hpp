@@ -12,13 +12,13 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/contracts/serving.hpp"
-#include "markov/controller/action_graphs.hpp"
-#include "markov/controller/control.hpp"
+#include "markov/serving/action_graphs.hpp"
+#include "markov/serving/control.hpp"
 #include "markov/controller/control_peer.hpp"
 #include "markov/controller/cpu_messages.hpp"
 #include "markov/controller/delivery.hpp"
-#include "markov/controller/execution_inputs.hpp"
-#include "markov/controller/observer.hpp"
+#include "markov/serving/execution_inputs.hpp"
+#include "markov/serving/observer.hpp"
 #include "markov/execution/dependencies.hpp"
 #include "markov/resources/kv_pool.hpp"
 #include "markov/resources/observer.hpp"

@@ -1,4 +1,4 @@
-#include "markov/controller/execution_inputs.hpp"
+#include "markov/serving/execution_inputs.hpp"
 
 #include <algorithm>
 #include <set>
@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include "markov/controller/observer.hpp"
+#include "markov/serving/observer.hpp"
 #include "markov/graph/graph.hpp"
 
 namespace markov {

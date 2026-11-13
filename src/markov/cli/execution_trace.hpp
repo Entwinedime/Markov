@@ -10,7 +10,7 @@
 #include <string_view>
 
 #include "markov/execution/observer.hpp"
-#include "markov/controller/observer.hpp"
+#include "markov/serving/observer.hpp"
 #include "markov/resources/observer.hpp"
 
 namespace markov {

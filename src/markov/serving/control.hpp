@@ -13,7 +13,7 @@
 
 namespace markov {
 
-// Control owns request progress and coordinates shared resources; workflow delivers execution feedback.
+// Control owns request progress and coordinates shared resources; the serving loop delivers execution feedback.
 class ServingControl {
 public:
     virtual ~ServingControl() = default;

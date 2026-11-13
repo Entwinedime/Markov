@@ -12,8 +12,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "markov/controller/observer.hpp"
-#include "markov/controller/execution_inputs.hpp"
+#include "markov/serving/observer.hpp"
+#include "markov/serving/execution_inputs.hpp"
 #include "markov/execution/timeline.hpp"
 
 namespace markov {
