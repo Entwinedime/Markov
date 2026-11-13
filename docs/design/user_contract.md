@@ -10,14 +10,14 @@ scripts/markov.sh predict --request /path/to/request.json
 
 沿用下方共同请求：base.manifest 复用采集，或 base.configuration 加 execution.capture 先采 base；
 performance.database 指向已维护的性能库，或用 performance.models 显式选择离线模型；两者都有时 models 优先。
-数据库只在准备阶段读取现行选择，并导出小型只读模型；预测容器不打开数据库，不自动训练未选中的原始记录。
+数据库只在准备阶段按目标部署读取现行选择，分别导出小型只读模型；混合 TP 目标使用同一数据库。显式 models 文件用于单一目标部署，不能混装多个 TP。报告的 models 按 TP 列出实际选择，各 cell 给出有效 deployment。预测容器不打开数据库，不自动训练未选中的原始记录。
 可选 performance.sampling_budget 声明整组共享补采的六项累计预算，需要同时提供 database 和 execution.capture。
 没有现行模型时可从空库开始；只有实际成本查询发现缺口才补采，维护后重新执行目标，绝不填零遍历分支。
 execution.kernel_cache_initial_state 必须为 empty 或 prepared。
 empty/prepared 是声明的初始条件，不是自动检测结果。输入准备另按原生工作规格记录新准备数量；
 首次 phase 仍覆盖未细分的初次准备，不能保证还原全部编译器或驱动缓存状态。
 
-当前要求相同部署、串行输入、ignore_eos=true、与 base 一致的输出数量和 formal_begin_index。
+当前要求同平台、框架、runtime、模型与 dtype；SGLang/Qwen3 BF16 可声明同机 TP=1↔2 目标。输入保持串行、ignore_eos=true，以及与 base 一致的输出数量和 formal_begin_index；实际资格以工作流记录为准。
 文本 prompt 需与采集原文相同，由 manifest 声明的配置取得实际 token，再核对源语义；预测不加载 tokenizer。
 采集配置没有保留实际编码时不能猜 token，已有 input_ids 仍直接核对源前缀。目标配置覆盖 base 对应字段，name 仅用于结果标识。
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
@@ -146,7 +146,7 @@ configuration 的准备动作是采集或复用，预览不判断该任务是否
 manifest 检查只读取 manifest 和文件元数据；输出 inputs_accessible 不代表通道内容、源 DAG 或正常性能已通过。
 
 请求路径以声明它的文件目录为起点。base 二选一：manifest 复用真实来源，configuration 声明需要采集的配置。
-每个 target 只有 name 和 configuration；name 用于定位结果，不作为结构或成本特征。
+每个 target 提供 name、configuration，可选 deployment 覆盖源部署的 tensor_parallel；其余部署字段须保持相同。省略时继承源部署。name 只定位结果，不作为结构或成本特征。
 deployment 包含 platform、framework、runtime、model、dtype、tensor_parallel；工作配置由相应适配器解释。
 performance.models 和 performance.database 均可省略作输入预览；实际预测需要其中之一。
 execution 必须给 output，memory_limit_gib 可显式声明。
