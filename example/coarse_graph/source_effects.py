@@ -227,7 +227,10 @@ class NativeEffectEvidence:
                 counts["service_intervals"] += 1
             if "native_transfer" in raw:
 
-                # PD address-derived accesses need their pool/transfer proof, beyond the original literal declarations.
+                # Each payload keeps its own readiness interval; merging KV and later metadata invents early reads.
+                for access in scope["kv_accesses"] + scope["slot_accesses"]:
+                    self.check_boundary(graph, access["start"], service, begin, "begin", index)
+                    self.check_boundary(graph, access["finish"], service, end, "end", index)
                 counts["derived_state_accesses"] += len(scope["kv_accesses"]) + len(scope["slot_accesses"])
             else:
                 counts["declared_state_accesses"] += sum(len(self.native["scopes"][origin].get("state_accesses", ())) for origin in origins)

@@ -102,7 +102,7 @@ class NativeCase:
         for rank, (source, raw, identities) in self.sources.items():
             group = self.groups[rank]
             source.observed_pools(raw, registered_ranks, self.groups)
-            payload.inspect(source, raw, group)
+            payload.inspect(source, raw, group, self.dependencies[rank])
             self.connections.native(source, raw, rank, self.ranks[rank], self.dependencies[rank], identities)
             if group in self.histories:
                 self.bindings.observed(source, raw, group, identities)

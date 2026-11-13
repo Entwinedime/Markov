@@ -2,6 +2,8 @@
 
 from collections import defaultdict
 
+from dependencies import CausalGraph
+
 
 class PdStateEvidence:
     """Check native state visibility and transport prerequisites independently of polling counts."""
@@ -606,13 +608,19 @@ class PdPredictionEvidence:
         if not effects:
             return
         sender = groups[root["work"]["rank"]]
+        dependencies = CausalGraph.observed(graph)
         exported = set()
         for port in root["ports"]:
-            if port["use"] != "signal" or port["direction"] != "output" or port["event"] not in effects:
+            if port["use"] != "signal" or port["direction"] != "output":
+                continue
+
+            # One chunk completion may join distinct KV and metadata services; every payload must reach it.
+            covered = {finish for finish in effects if dependencies.reaches(finish, port["event"])}
+            if not covered:
                 continue
             event = record["event_ids"][port["event"]]
             producers = set()
-            for target, request, kind in effects[port["event"]]:
+            for target, request, kind in set().union(*(effects[finish] for finish in covered)):
                 key = sender, request
                 if target not in self.targets[key]:
                     raise ValueError(f"PD transfer {key} writes to an unobserved destination {target}")
@@ -624,7 +632,7 @@ class PdPredictionEvidence:
                     transfer["metadata"].add(target)
                 producers.add(key)
             self.signals[port["signal"]] = producers
-            exported.add(port["event"])
+            exported.update(covered)
         if exported != effects.keys():
             raise ValueError("PD transfer effects lack exported completion evidence")
 

@@ -59,8 +59,7 @@ class PrefixCache(RadixCache):
     def key_tokens(self, key):
         if key.extra_key is not None:
             raise ValueError("request cache namespaces are outside the declared workload content contract")
-        length = len(key) // self.page_size * self.page_size
-        return list(key.token_ids[:length])
+        return list(key.page_aligned(self.page_size).raw_token_ids())
 
     def match_prefix(self, params):
         if self.disable:

@@ -179,7 +179,7 @@ class NativeResourceHistory:
     def match(self, original, params):
         if not self.enabled:
             return original(params)
-        operation = {"kind": "prefix", "operation": "match", "tokens": list(params.key.token_ids)}
+        operation = {"kind": "prefix", "operation": "match", "key_tokens": list(params.key.raw_token_ids())}
         with self.event(operation) as record:
             result = original(params)
         record["result"] = {"node": self.node(result.last_device_node), "indices": self.indices(result.device_indices, self.page_size)}
@@ -189,7 +189,7 @@ class NativeResourceHistory:
         if not self.enabled:
             return original(params)
         operation = {
-            "kind": "prefix", "operation": "insert", "tokens": list(params.key.token_ids),
+            "kind": "prefix", "operation": "insert", "key_tokens": list(params.key.raw_token_ids()),
             "indices": self.indices(params.value, self.page_size),
         }
         with self.event(operation) as record:

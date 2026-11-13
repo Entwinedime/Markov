@@ -137,7 +137,34 @@ class NativeKvFacts:
                 result.append(value)
         return result
 
-    def document(self, transfer_groups):
+    def connect_metadata(self, facts):
+        raw = self.recording["scopes"]
+        transfers = [scope for scope in raw if scope.get("native_transfer", {}).get("kind") == "metadata"]
+        if not transfers:
+            return
+
+        writers = defaultdict(list)
+        for index, scope in enumerate(facts["scopes"]):
+            for access in scope["slot_accesses"]:
+                if (access["pool"], access["field"], access["access"]) == ("local", "metadata", "write"):
+                    for request in access["requests"]:
+                        writers[request].append((index, access["finish"]))
+
+        for transfer in transfers:
+            reader, = [access for access in facts["scopes"][transfer["id"]]["slot_accesses"]
+                       if access["pool"] == "local" and access["access"] == "read"]
+            request, = reader["requests"]
+            (writer, completed), = writers[request]
+            caller = transfer["submitted_by"]
+            while caller is not None and caller != raw[writer]["parent"]:
+                caller = raw[caller]["parent"]
+            if caller is None:
+                raise ValueError("native first-token row was not produced by its enqueue invocation")
+
+            # This registered row consumes the invocation's data; the edge declares dataflow, not a runtime fence.
+            facts["dependencies"].append({"source": completed, "target": reader["start"], "kind": "state"})
+
+    def document(self):
         transfers = [scope for scope in self.recording["scopes"] if "native_transfer" in scope]
         if not transfers:
             return self.recording
@@ -167,10 +194,19 @@ class NativeKvFacts:
             if expected != self.recording["environment"]["kv_peers"][binding]:
                 raise ValueError("native transfer registration differs from the planned peer interface")
             scope["state_accesses"] = self.accesses(scope)
-        for parent, members in transfer_groups.items():
-            parent = self.recording["scopes"][parent]
-            parent["ports"].append({
+
+        # KV and metadata have different inputs; retain each service and expose only the chunk's final completion.
+        chunks = defaultdict(list)
+        for scope in transfers:
+            chunks[scope["submitted_by"]].append(scope)
+        for parent, services in chunks.items():
+            services.sort(key=lambda scope: scope["host_interval"]["begin_counter"])
+            if (any(scope["parent"] != parent or scope["thread"] != services[0]["thread"] for scope in services)
+                    or any(a["host_interval"]["end_counter"] > b["host_interval"]["begin_counter"]
+                           for a, b in zip(services, services[1:]))):
+                raise ValueError("native chunk services lack one serial synchronous caller")
+            self.recording["scopes"][parent]["ports"].append({
                 "name": "transfer.complete", "direction": "output", "use": "signal",
-                "boundary": {"scope": members[-1], "interval": "service", "side": "end"},
+                "boundary": {"scope": services[-1]["id"], "interval": "service", "side": "end"},
             })
         return self.recording

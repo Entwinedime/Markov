@@ -37,12 +37,14 @@ def main() -> None:
         from markov_collection.adapters.runtimes.ascend.observation import AscendObservation
 
         native = NativeKvFacts(arguments.input, arguments.rank)
-        regions = ClosedRegions(native.recording)
-        recording = native.document(regions.transfers)
+        regions = ClosedRegions()
+        recording = native.document()
 
         # Framework closure rules stay separate from runtime interpretation and the common graph projection.
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)
-        write_json(arguments.output, regions.normalize(observation.document(arguments.evidence)), replace=False)
+        facts = observation.document(arguments.evidence)
+        native.connect_metadata(facts)
+        write_json(arguments.output, regions.normalize(facts), replace=False)
 
 
 if __name__ == "__main__":

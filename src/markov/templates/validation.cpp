@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
+
+#include "markov/templates/selection.hpp"
 
 namespace markov {
 namespace {
@@ -208,6 +212,16 @@ void TemplateLibrary::validate() const {
         std::map<std::string, std::string> buffers;
         frame(*this, entry.frame, entry.frame, buffers);
         for (const auto & observed : entry.observations) observed_frame(*this, entry.frame, observed.parameters);
+    }
+
+    // A published library must select one implementation for its own observations, before any serving run needs it.
+    const TemplateSelection selection(*this);
+    std::set<std::tuple<std::string, nlohmann::json, Parameters>> checked;
+    for (const auto & entry : entries) {
+        for (const auto & observed : entry.observations) {
+            if (checked.emplace(entry.action, entry.condition, observed.parameters).second)
+                selection.select(entry.action, entry.condition, observed.parameters);
+        }
     }
 }
 

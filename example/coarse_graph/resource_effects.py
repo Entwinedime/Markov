@@ -183,7 +183,7 @@ class ResourceEffects:
                 action = observed["operation"]
                 operation["operation"] = action
                 if action in {"match", "insert"}:
-                    tokens = observed["tokens"]
+                    tokens = observed["key_tokens"]
                     length = len(tokens) // self.page_size * self.page_size
                     operation.update(tokens=tokens[:length], node=record["result"]["node"])
                     if action == "match":

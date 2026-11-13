@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "markov/graph/state.hpp"
+
 namespace markov {
 
 class EntryExtraction::Cut {
@@ -55,7 +57,13 @@ public:
             for (const auto event : contents.events) event_ids_.try_emplace(event, 0);
             work_ids_.insert(work_ids_.end(), contents.work.begin(), contents.work.end());
             for (const auto & access : source.scopes[scope].kv_accesses) retain(access.start, access.finish);
-            for (const auto & access : source.scopes[scope].slot_accesses) retain(access.start, access.finish);
+            for (const auto & access : source.scopes[scope].slot_accesses) {
+                retain(access.start, access.finish);
+                if (access.value.access == StateAccess::Read) {
+                    for (const auto & request : access.value.requests)
+                        slot_inputs_[access.start].emplace(access.value.pool, access.value.field, request);
+                }
+            }
             for (const auto & port : source.scopes[scope].ports) {
                 event_ids_.try_emplace(port.event, 0);
                 if (port.direction == Direction::Input) {
@@ -157,6 +165,7 @@ private:
         if (edge.kind == Relation::Order && source_.events[edge.source].resource == resource && source_.resources[resource].serial) return;
         if (edge.kind == Relation::Data && declared_data(edge)) return;
         if (edge.kind == Relation::Signal && declared_signal(edge)) return;
+        if (edge.kind == Relation::State && declared_state(edge)) return;
         throw std::invalid_argument("action " + graph_.scopes[0].info.site + " lacks a declared input for " + std::string(relation_name(edge.kind))
                                     + " dependency " + std::to_string(edge.source) + " -> " + std::to_string(edge.target));
     }
@@ -175,6 +184,15 @@ private:
         return std::ranges::any_of(consumer->second, [&](const auto & signal) { return producer->second.contains(signal); });
     }
 
+    bool declared_state(const GraphEdge & edge) const {
+        const auto producer = extraction_.slot_outputs_.find(edge.source);
+        const auto consumer = slot_inputs_.find(edge.target);
+        if (producer == extraction_.slot_outputs_.end() || consumer == slot_inputs_.end()) return false;
+
+        // The target resource owner restores field dataflow; a cut keeps the exact pool/field/request input.
+        return std::ranges::any_of(consumer->second, [&](const auto & value) { return producer->second.contains(value); });
+    }
+
     const EntryExtraction & extraction_;
     const CoarseGraph & source_;
     CoarseGraph graph_;
@@ -184,6 +202,7 @@ private:
     std::set<std::pair<std::size_t, std::size_t>> waits_;
     std::map<std::size_t, std::set<std::pair<std::string, std::int64_t>>> inputs_;
     std::map<std::size_t, std::set<std::string>> signal_inputs_;
+    std::map<std::size_t, std::set<SlotContent>> slot_inputs_;
 };
 
 EntryExtraction::EntryExtraction(const CoarseGraph & source)
@@ -198,6 +217,11 @@ EntryExtraction::EntryExtraction(const CoarseGraph & source)
             if (port.direction != Direction::Output) continue;
             if (port.use == PortUse::Signal) signal_outputs_[port.event].insert(port.signal);
             if (port.use == PortUse::Data) outputs_[port.event].emplace(port.tensor->storage, port.tensor->version);
+        }
+        for (const auto & access : scope.slot_accesses) {
+            if (access.value.access != StateAccess::Write) continue;
+            for (const auto & request : access.value.requests)
+                slot_outputs_[access.finish].emplace(access.value.pool, access.value.field, request);
         }
     }
 

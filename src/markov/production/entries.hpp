@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@ public:
     CoarseGraph extract(std::size_t scope) const;
 
 private:
+    using SlotContent = std::tuple<std::string, std::string, std::string>;
     class Cut;
     struct ScopeContents {
         std::vector<std::size_t> children;
@@ -31,6 +33,7 @@ private:
     std::vector<std::size_t> event_order_;
     std::map<std::size_t, std::set<std::pair<std::string, std::int64_t>>> outputs_;
     std::map<std::size_t, std::set<std::string>> signal_outputs_;
+    std::map<std::size_t, std::set<SlotContent>> slot_outputs_;
 };
 
 } // namespace markov

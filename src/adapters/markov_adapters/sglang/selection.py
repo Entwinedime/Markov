@@ -2,7 +2,7 @@
 
 from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.calls import ActionCall
-from markov_adapters.sglang.allocation_loop import AllocationIndices
+from markov_adapters.sglang.allocation import AllocationIndices, AllocationPrefixes
 
 
 class BatchPreparation(ActionCall):
@@ -228,6 +228,7 @@ class BatchSelection:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         AllocationIndices(self.calls).install()
+        AllocationPrefixes(self.calls).install()
         HookRegistry.register(
             "sglang.srt.managers.scheduler_components.dp_attn.MLPSyncBatchInfo.all_gather",
             self.gather, HookType.AROUND,

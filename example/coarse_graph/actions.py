@@ -193,12 +193,9 @@ class ActionScopes:
         if self.source_ids.keys() != set(range(len(raw["scopes"]))):
             raise ValueError("coarse scopes omit native observations")
 
-        # Ordinary declarations remain exact; a closed transfer region is checked from all its native members.
+        # Ordinary declarations remain exact; only private CPU continuations may share an owner.
         for index, scope in enumerate(self.graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
-            if scope["implementation"] == "sglang.pd.transfer_group":
-                self.validate_transfer_group(index, origins, raw)
-                continue
             if len(origins) > 1 and scope["role"] == "segment":
                 self.validate_control_region(index, origins, raw)
                 continue
@@ -403,47 +400,6 @@ class ActionScopes:
             owner = self.graph["scopes"][owner]["parent"]
         return record
 
-    def validate_transfer_group(self, index, origins, raw):
-        group = self.graph["scopes"][index]
-        calls = sorted((raw["scopes"][origin] for origin in origins), key=lambda call: call["host_interval"]["begin_counter"])
-        parent = calls[0]["submitted_by"]
-        expected = {call["id"] for call in raw["scopes"] if call.get("submitted_by") == parent and "native_transfer" in call}
-        if set(origins) != expected or any(
-            not call["complete"] or call["parent"] != parent or call["thread"] != calls[0]["thread"]
-            or any(call[field] != group[field] for field in ("parameters", "constants"))
-            or self.declaration_expressions(call) != self.declaration_expressions(group)
-            or call["ports"] or call.get("communication") for call in calls
-        ):
-            raise ValueError("coarse transfer group differs from its complete native service cohort")
-        work = {}
-        for call in calls:
-            for key, value in call["work"].items():
-                if key in work and work[key] != value:
-                    raise ValueError("native services disagree on request context")
-                work[key] = value
-        if group["work"] != work:
-            raise ValueError("coarse transfer group changes its logical work")
-        begin, end = calls[0]["host_interval"]["begin_raw_ns"], calls[-1]["host_interval"]["end_raw_ns"]
-        if (group["role"] != "kv_transfer" or group["site"] != "transfer_group"
-                or group["parent"] != self.source_ids[parent] or self.children[index]
-                or any(a["host_interval"]["end_counter"] > b["host_interval"]["begin_counter"] for a, b in zip(calls, calls[1:]))):
-            raise ValueError("coarse transfer group loses native caller structure or serial order")
-        if any(call["id"] not in origins and call["thread"] == calls[0]["thread"]
-               and call["host_interval"]["begin_raw_ns"] < end and begin < call["host_interval"]["end_raw_ns"]
-               for call in raw["scopes"][1:]):
-            raise ValueError("coarse transfer group hides another native invocation")
-        ports = {port["name"]: port for port in group["ports"]}
-        if ports.keys() != {"call.enter", "call.return", "service.complete"}:
-            raise ValueError("closed transfer group has extra or missing public boundaries")
-        for name, time in (("call.enter", begin), ("call.return", end), ("service.complete", end)):
-            if self.graph["evidence"]["events"][ports[name]["event"]]["time_ns"] != time:
-                raise ValueError("coarse transfer group changes its native outer interval")
-        work, = self.work[index]
-        if work["kind"] != "transfer" or self.graph["resources"][work["resource"]]["kind"] != "service":
-            raise ValueError("coarse transfer group duplicates CPU cost or loses transport work")
-        if any(access["start"] != work["start"] or access["finish"] != work["finish"]
-               for field in ("kv_accesses", "slot_accesses") for access in group[field]):
-            raise ValueError("coarse transfer payload escapes its closed service interval")
 
 class ActionIdentity:
     @classmethod

@@ -119,7 +119,14 @@ class PdPayloadEvidence:
         self.counts["metadata_transfers"] += 1
         return {(source, "read", "metadata", member["id"], None), (target, "write", "metadata", member["id"], "first-token")}
 
-    def inspect(self, contents, raw, group):
+    def inspect(self, contents, raw, group, dependencies):
+        writers = defaultdict(list)
+        for original in raw["scopes"]:
+            for access in original.get("state_accesses", []):
+                if (access["pool"], access.get("field"), access["access"]) == ("local", "metadata", "write"):
+                    for request in access["requests"]:
+                        writers[request].append(original["id"])
+
         for index, scope in enumerate(contents.graph["scopes"]):
             calls = [raw["scopes"][origin] for origin in scope["bindings"]["source_scopes"] if "native_transfer" in raw["scopes"][origin]]
             if not calls:
@@ -133,6 +140,18 @@ class PdPayloadEvidence:
                 source, target = raw["kv_session"], transfer["session"]
                 if transfer["kind"] == "metadata":
                     slots.update(self.metadata(transfer, parent, source, target))
+                    origin, = writers[member["id"]]
+                    producer = contents.graph["scopes"][contents.source_ids[origin]]
+                    written, = [access["finish"] for access in producer["slot_accesses"]
+                                if (access["pool"], access["field"], access["access"]) == ("local", "metadata", "write")
+                                and member["id"] in access["requests"]]
+                    consumed, = [access["start"] for access in scope["slot_accesses"]
+                                 if access["pool"] == "local" and access["access"] == "read"]
+
+                    # The original field write and registered copy row establish content origin, independently of prediction.
+                    if not dependencies.reaches(written, consumed):
+                        raise ValueError("native metadata copy loses its observed first-token producer")
+                    self.counts["metadata_producers_checked"] += 1
                 elif transfer["kind"] == "kv":
                     if transfer["source_pages"] != parent["native_kv_chunk"]["source_pages"]:
                         raise ValueError("native KV bytes differ from their enqueued source pages")

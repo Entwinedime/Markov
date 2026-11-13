@@ -70,8 +70,8 @@ public:
         families_[found->second].push_back(&frame);
 
         const auto contract = library_.local_contract(frame, position);
-        if (!contract.is_null()) {
-            for (const auto * implementation : implementations_.at(contract)) {
+        if (const auto available = implementations_.find(contract); available != implementations_.end()) {
+            for (const auto * implementation : available->second) {
 
                 // Rebind only the observed body and its guard; the recipient retains all caller and rank identities.
                 auto replacement = frame;
