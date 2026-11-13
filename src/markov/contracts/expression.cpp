@@ -231,28 +231,4 @@ bool Expression::parameterized() const {
     return false;
 }
 
-ParameterRelations ParameterRelations::read(const nlohmann::json & source) {
-    ParameterRelations result;
-    std::set<std::string> outputs;
-
-    for (const auto & record : source) {
-        auto name = record.at("name").get<std::string>();
-        if (!outputs.insert(name).second) throw std::invalid_argument("duplicate derived parameter: " + name);
-
-        result.expressions_.emplace_back(std::move(name), Expression::read(record.at("expression")));
-    }
-
-    return result;
-}
-
-void ParameterRelations::derive(Parameters & parameters) const {
-
-    // Outputs belong to this scope; observed or inherited outputs cannot supply missing inputs.
-    for (const auto & [name, _] : expressions_) parameters.erase(name);
-
-    for (const auto & [name, expression] : expressions_) parameters.emplace(name, expression.evaluate(parameters));
-}
-
-const std::vector<std::pair<std::string, Expression>> & ParameterRelations::expressions() const { return expressions_; }
-
 } // namespace markov

@@ -4,7 +4,6 @@
 #include <map>
 #include <set>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -37,17 +36,6 @@ public:
 private:
     static Expression make_operation(Kind kind, std::vector<Expression> arguments);
     std::variant<std::int64_t, std::string, Operation> value_;
-};
-
-// Derived names belong to the current call scope, not to its observed defaults.
-class ParameterRelations {
-public:
-    static ParameterRelations read(const nlohmann::json & source);
-    void derive(Parameters & parameters) const;
-    const std::vector<std::pair<std::string, Expression>> & expressions() const;
-
-private:
-    std::vector<std::pair<std::string, Expression>> expressions_;
 };
 
 } // namespace markov

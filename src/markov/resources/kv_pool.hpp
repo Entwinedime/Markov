@@ -8,12 +8,19 @@
 #include <vector>
 
 #include "markov/contracts/serving.hpp"
-#include "markov/resources/kv_state.hpp"
 #include "markov/resources/prefix_index.hpp"
 
 namespace markov {
 
 enum class PageReuse { Prepend, DeferredSorted };
+
+struct KvResidence {
+    std::optional<std::size_t> slot;
+
+    // Allocation reserves addresses; execution dependencies determine when their contents are ready.
+    std::int64_t allocated_tokens = 0;
+    std::vector<std::size_t> pages;
+};
 
 struct KvDemand {
     std::size_t request;
