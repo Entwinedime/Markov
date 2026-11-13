@@ -324,19 +324,19 @@ markov_local_graphs expand <source-libraries.json> <action-inputs.json> <local-g
 
 公开 `markov_workflow predict` 可附加 `--execution-inputs <execution-inputs.json>`。文件由 `actors`、`ingress`、`notifications`、`transfers` 组成；同一份输入只规定时间和可见性条件，不提供组批、查询返回值、资源分配或图体。未提供时使用任务显式给定的工作耗时；提供后，流程内缺记录、操作/工作不符或结束时未消费完均失败，不退回给定耗时。
 
-`actors` 按参与者保存有序 `steps` 及可选 `unmeasured_completion_window`。每步包含 `operation`、`identity`、`source`：action核对动作、参数和完整工作；cpu核对原生操作和工作；input核对实例、读取上下文及既有交付。工作去除物理slot，保留token范围、调用祖先、继续位置和实际放置。source只供追溯：观察图scope、原始post及post/wait阶段、原始输入读取引用；不参与决策。核心游标保存已核对前缀，明细输出condition_used；首处分歧或未消费完仍失败。
+`actors` 按参与者保存有序 `steps`。每步包含 `operation`、`identity`、`source`：action核对动作、参数和完整工作；cpu核对原生操作和工作；input核对实例、读取上下文及既有交付。工作去除物理slot，保留token范围、调用祖先、继续位置和实际放置。source只供追溯：观察图scope、原始post及post/wait阶段、原始输入读取引用；不参与决策。核心游标保存已核对前缀，明细输出condition_used；首处分歧或未消费完仍失败。
 
-图操作的 `ports` 用根作用域的具名端口、方向及 `window: {begin_ns, end_ns}` 表示完成条件，必须包含实际call.enter和call.return。别名窗口取交集，不能消除图依赖。`service_ns` 是该调用各工作共同采用的显式给定服务，null表示都未知；原生提取保持null，不把含等待的API墙钟当成本。共享执行时间类型仍支持逐节点已知/未知服务。
+图操作的 `boundaries` 以 `at` 和 `window: {begin_ns, end_ns}` 表示完成条件。具名端口的at为 `{port, direction}`，必须包含实际call.enter和call.return；资源收尾先用 `{resource: {port, direction}}` 定位已有具名端口的资源，再用 `{resource: {kind, role}}` 补齐未被业务端口命名的唯一职责资源。已命名资源不再参与职责候选，生成的resource.enter/exit只承接接口，不充当业务命名。条件绑定本次图已声明的资源出口，不传入原生线程/stream编号或节点序号；剩余职责存在歧义时缺少测量对应资格，不能任选。独立提取保留各串行资源在该动作中的实际收尾，CPU返回不替代后台提交尾部。别名窗口取交集，不能消除图依赖。`service_ns` 是该调用各工作共同采用的显式给定服务，null表示都未知；原生提取保持null，不把含等待的API墙钟当成本。共享执行时间类型仍支持逐节点已知/未知服务。
 
-未知内部工作优先保留自身完成条件，再沿实际DAG从受约束后继推导上界；异步尾部可能不通向原语义端口。参与者可明确提供 `unmeasured_completion_window: {begin_ns, end_ns}`，由已同步排空的原生观测证明未测完成被该区间包含，整份窗口只保存一次；未知内部完成取该窗口与已有因果上界的交集。没有具名/因果依据且未显式提供观测窗口仍拒绝，不从其他stream借时刻或填零，不按原生资源编号绑定合成前沿。该条件不增加等待边或屏障，也不提供内部精确时间；执行器选择最早因果可行时刻，不能据此宣称成本覆盖或唯一真实轨迹。
+未知内部工作保留自身完成条件，或沿实际DAG从受约束后继推导上界。没有因果完成依据的异步尾部需要补足真实完成接口或提供服务耗时，不能由整轮观测窗口兜底，不从其他stream借时刻、填零或按原生资源编号硬配。内部因果上界不是服务成本，也不提供内部精确时间。
 
 `transfers` 引用已核对CPU post的 `{group, step}` 位置并给出service_ns及可选window；位置必须指向真实post，核心还核对两端角色和几何，不使用原生通道计数跨运行匹配。未知传输服务必须有完成区间。未消费的异步尾部不提前生成完成事件；真实Work消费才需要完成条件。`notifications` 按逻辑生产者身份提供window，条件只消费一次，仍须满足实际生产者的信号依赖。
 
 `ingress` 按实例保存实际接收轮次 `{time_ns, requests}`，覆盖全部请求且不早于workload声明到达；原生代码仍决定如何组批。流程内input操作提供实际返回window，进入过晚直接失败；范围外空读取可以按原生停驻/排空取消，不能伪造成实测读取。输入结果继续由当前可用请求产生，条件不指定查询结果。明细保留全部input_read及in_flow；独立对照从实际session及原始接收还原真值，不以输入文件自证。
 
-独立提取使用 `python3 example/coarse_graph/execution_inputs.py --capture <closed-native-case> --graphs <projected-graphs> --output <new-directory>`。全部实际参与者必须有原始记录和带evidence的粗图，工具复用共同原生检查，只读真实事实，不读模板或预测。输出execution-inputs-report.json；可交接时另写execution-inputs.json。CPU入口/返回保留直接RAW测量；设备端口使用同一仿射校准可行区域的区间包络，不把名义中点当精确RAW时间。共同校准须满足跨未测节点的已测因果关系；没有可行校准则拒绝。区间分别交接不证明模拟时刻来自同一个联合校准实现，仍保留partial。
+在CPU control环境运行 `python3 example/coarse_graph/execution_inputs.py --capture <closed-native-case> --graphs <projected-graphs> --output <new-directory>`。全部实际参与者必须有原始记录和带evidence的粗图，只读真实事实，不读模板或预测。复用已有SymPy精确有理数求解器，从原始查询区间和全rank必要因果选择一套共同可行的仿射时钟；同物理设备的多个记录保持同一映射。CPU入口/返回保持直接RAW时间，设备具名端口按所选映射向上取整到纳秒，交给既有核心完成接口。输出execution-inputs-report.json记录所选实现和原始校准不确定性；全部必要事实齐全才发布execution-inputs.json。所选实现不是唯一精确测量，也不代表成本预测。
 
-没有实测时间的端口只给采集结束前已同步排空的观测窗口，计为partial；宽区间不保证查询或控制轨迹唯一，不能宣称真实时间已对齐。原始矛盾或缺少必要事实只发布unverified报告，不能从预测补造。受控结果只报告checked_causal_execution_inputs，不附带未使用的given_work_ns；work_intervals由执行器统计全部已插入图的工作，包含模型动作和CPU消息服务，协议就绪事件另计。
+没有实测时间的端口或工作完成保留partial报告，不发布可消费条件，也不改用整轮观测窗口。原始矛盾或缺少必要事实发布unverified报告，不能从预测补造。CPU消息wire及状态通知自身的有界测量另行保留，不伪称设备完成或最早可见。受控结果只报告checked_causal_execution_inputs，不附带未使用的given_work_ns；work_intervals由执行器统计全部已插入图的工作，包含模型动作和CPU消息服务，协议就绪事件另计。
 
 批次变换的上下文保留左右请求进度及结果成员，实际工作和父片段快照分别维护；不能将后来结果回写前置片段。PP模型/结果的实际流水线位置保留在observation_context，结构复用不能授予绝对时间复用。旁路只用于固定案例的结构验证；结果标记checked_causal_execution_inputs，不作为性能层建设或精度验收。
 
@@ -356,7 +356,9 @@ MLP 组批协调在共享 adapter 中以完整 `MLPSyncBatchInfo.all_gather` 调
 
 持久字段复用相同的可选动作观察通道：`values.state` 保存逻辑请求、字段、读写及实际值，不进入模板。PD 记录原生 set_buf 的首 token/缓存计数输入，以及 commit 已读出并写回请求的结果；失败提交显式记录空值，不额外读取设备张量。目标观察在对应动作返回后提交，独立评价核对本地字段访问、参与者和实际发送组，再按逻辑请求比较两侧值；room 编号仅在每次运行内部对应。不检查未使用 padding、范围外的多模态/logprob/speculative 字段，也不把缺少源端数值的目标自洽当作独立通过。
 
-共享调用层先结束读取前的 CPU 片段，再执行 query CPU 工作，在其返回边界读取当前状态，然后恢复原生代码。读取不额外连接“被查询生产者必须完成”的等待边。原生 API 自身的工作与同步仍保留，例如 Ascend 标量读取会同步本地 stream；因此 query 可以包含多段 CPU 工作和原生等待，不能统一验证为单段纯 host。metadata 准入检查与提交之后的实际 metadata 内容读取分开。采集测量实际 API 读取区间，控制将读取线性化在 query 返回边界；这是粗粒度执行约定，不声称还原 API 内部采样时刻。结果不参与模板分类，模板只按读取种类共享结构，逻辑请求或信号生产者随实例绑定。 资源容量和独立字段槽位使用相同切口，描述保留资源名、字段及量纲；物理资源实现内部检查不作为控制器query，观察器快照直接调用原始reader。详细原始getter记录声明control归属，独立原生检查核对业务getter与query的描述、值及包含区间；缺少本合同的旧观察不能补写资格。
+共享调用层先结束读取前的 CPU 片段，再执行 query CPU 工作，在实际读取的call.return边界取得当前状态；caller.return另外声明外层调用方继续运行的边界。结果及内部时钟在读取返回的同一模拟时刻取得，随后等调用方边界完成才恢复原生决定。采集保留实际读取区间和不重复计费的外层包络，不以观察器包装结束代替读取时刻。读取不额外连接“被查询生产者必须完成”的等待边。原生 API 自身的工作与同步仍保留，例如 Ascend 标量读取会同步本地 stream；因此 query 可以包含多段 CPU 工作和原生等待，不能统一验证为单段纯 host。metadata 准入检查与提交之后的实际 metadata 内容读取分开。这是粗粒度线性化约定，不声称还原 API 内部每次采样时刻。结果不参与模板分类，模板只按读取种类共享结构，逻辑请求或信号生产者随实例绑定。
+
+资源容量和独立字段槽位使用相同切口，描述保留资源名、字段及量纲；物理资源实现内部检查不作为控制器query，观察器快照直接调用原始reader。详细原始getter记录声明control归属，独立原生检查核对业务getter与query的描述、值及包含区间；缺少本合同的旧观察不能补写资格。
 
 策略时钟沿声明的原生消费者与模块绑定；进程time对象、任务预算及诊断时钟不改变。核心configure和resources明细携带clock_epoch_ns，time/monotonic/perf_counter使用同一正原点，保留原生0为未设置的约定。独立时钟读作为query，返回整数纳秒并保留API/consumer；poll内部时钟保存在该query的clocks数组，使用同一已完成切口，不再嵌套展开。源端保持原始时钟及读值，目标按核心切口加原点验证；不同原点的绝对值不参与普通查询结果的跨运行比较。PD策略复用原生poll、超时和失败方法，adapter维护传输交接，不复制状态机。
 
@@ -364,7 +366,7 @@ Event 返回 true 只说明完成不晚于查询返回，false 只说明完成�
 
 共同原生检查核对实际测得边界沿完整rank内DAG的因果次序；未测量节点不截断路径。发生倒置时停止，而非平移时间或只挑选相容调用。跨rank次序继续由模型通信、CPU协议及PD事实单独核对，局部时间相容不替代这些证明。
 
-独立动作比较在 modeling 容器内使用 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。 两者同时核对原始 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
+独立动作比较在CPU control容器内使用 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。实际完成时间通过已核对的具名端口对应原始测量；独立核对CPU边界及全部已消费设备端点是否具有一套共同仿射解释，不读取生成条件中的时钟映射自证。向上取整的开闭区间按精确有理数约束验证，不增加经验容差。 两者同时核对原始 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
 
 矩阵示例将采集、图生产与比较分别执行。比较使用显式source_catalog；每个目标声明observation、production、source_evidence，分别指向捕获所有者、已发布真实图和独立来源报告。读取时核对原始任务、发布与报告的归属；真实图保留原生产身份，预测程序另行固定。比较阶段只消费这些已有产物；按prediction_exit选择成功时的execution.jsonl或失败时保留的execution.partial.jsonl，并记录execution_trace。任务成功与前缀结构资格分别报告，预测失败时仍检查实际留下的执行明细。
 
