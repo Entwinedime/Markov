@@ -75,7 +75,9 @@ class NativeResourceHistory:
         if operation == "release":
             record["slot"], = args
         self.state_events.append(record)
+        record["begin_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         result = original(*args)
+        record["end_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         if operation == "allocate":
             record["slot"] = result
         return result

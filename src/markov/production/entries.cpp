@@ -212,25 +212,46 @@ EntryExtraction::EntryExtraction(const CoarseGraph & source)
       event_order_(source.events.size()) {
 
     // Every cut shares one immutable source order and boundary index; only local bindings are rebuilt.
+    std::vector<bool> retained(source.events.size());
     for (const auto & scope : source.scopes) {
         for (const auto & port : scope.ports) {
+            retained[port.event] = true;
+            if (port.wait) retained[port.wait->begin] = true;
+            if (port.rendezvous) retained[*port.rendezvous] = true;
             if (port.direction != Direction::Output) continue;
             if (port.use == PortUse::Signal) signal_outputs_[port.event].insert(port.signal);
             if (port.use == PortUse::Data) outputs_[port.event].emplace(port.tensor->storage, port.tensor->version);
         }
         for (const auto & access : scope.slot_accesses) {
+            retained[access.start] = retained[access.finish] = true;
             if (access.value.access != StateAccess::Write) continue;
             for (const auto & request : access.value.requests)
                 slot_outputs_[access.finish].emplace(access.value.pool, access.value.field, request);
         }
+        for (const auto & access : scope.kv_accesses) retained[access.start] = retained[access.finish] = true;
     }
 
     for (std::size_t scope = 0; scope < source.scopes.size(); ++scope) {
         if (const auto parent = source.scopes[scope].info.parent) scopes_[*parent].children.push_back(scope);
     }
-    for (std::size_t event = 0; event < source.events.size(); ++event) scopes_[source.events[event].scope].events.push_back(event);
-    for (std::size_t work = 0; work < source.work.size(); ++work) scopes_[source.work[work].scope].work.push_back(work);
-    for (std::size_t edge = 0; edge < source.edges.size(); ++edge) incoming_[source.edges[edge].target].push_back(edge);
+    for (std::size_t work = 0; work < source.work.size(); ++work) {
+        const auto & piece = source.work[work];
+        scopes_[piece.scope].work.push_back(work);
+        retained[piece.start] = retained[piece.finish] = true;
+    }
+    for (std::size_t identity = 0; identity < source.edges.size(); ++identity) {
+        const auto & edge = source.edges[identity];
+        incoming_[edge.target].push_back(identity);
+        const auto resource = source.events[edge.source].resource;
+        if (edge.kind != Relation::Order || source.events[edge.target].resource != resource || !source.resources[resource].serial)
+            retained[edge.source] = retained[edge.target] = true;
+    }
+
+    // Unnamed empty serial markers add no work or dependency; each cut reconstructs order between retained boundaries.
+    for (std::size_t event = 0; event < source.events.size(); ++event) {
+        const auto & boundary = source.events[event];
+        if (retained[event] || !source.resources[boundary.resource].serial) scopes_[boundary.scope].events.push_back(event);
+    }
 
     std::vector<std::set<std::size_t>> next(source_.events.size());
     for (const auto & work : source_.work) next[work.start].insert(work.finish);

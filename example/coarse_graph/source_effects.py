@@ -14,6 +14,7 @@ class NativeEffectEvidence:
 
     def __init__(self, capture, rank, native, facts, sdk):
         self.native, self.facts = native, facts
+        self.logical_coordinates = set()
         profile, = (capture / "native" / f"rank-{rank}").glob("*_ascend_pt")
         counter = HostCounter(profile)
         device, = profile.glob("PROF_*/device_*")
@@ -172,7 +173,8 @@ class NativeEffectEvidence:
                        for effect in self.facts["native_effects"] for command in effect["commands"]
                        if command["sdk"] is None for side in ("begin", "end")}
         self.require(unmeasured <= native_only, "device boundary loses a recorded timestamp or lacks an observed native command")
-        return {"checked_host_measurements": checked, "unmeasured_device_endpoints": len(unmeasured)}
+        return {"checked_host_measurements": checked, "unmeasured_device_endpoints": len(unmeasured - self.logical_coordinates),
+                "logical_wait_boundaries": len(unmeasured & self.logical_coordinates)}
 
     def inspect_boundaries(self, graph):
         spans = Counter((span["scope"], span["resource"], span["begin"], span["end"], span["kind"]) for span in self.facts["spans"])
@@ -481,6 +483,13 @@ class NativeEffectEvidence:
             expected_tasks = Counter(self.task_key(task) for task in tasks) if tasks else Counter({None: 1})
             self.require(Counter(self.task_key(command["sdk"]) if command["sdk"] is not None else None
                                  for command in effect["commands"]) == expected_tasks, "native effect duplicates, omits or invents device work")
+
+            if not copy and not tasks:
+                self.require(all(submission.record["tasks"] == 0 for submission in self.submissions_inside(interval, stream)),
+                             "unmatched stream wait has actual driver submissions")
+                self.logical_coordinates.update((effect["resource"], command[side])
+                                                for command in effect["commands"] for side in ("begin", "end"))
+                counts["elided_stream_waits"] += 1
 
             for command in effect["commands"]:
                 begin, end = command["begin"], command["end"]

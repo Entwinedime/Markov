@@ -35,7 +35,9 @@ class NativeInputs:
     def port(name, direction, window):
         return {"at": {"port": name, "direction": direction}, "window": window}
 
-    def actions(self, group, rank, source, identities, clock, realization, origin):
+    def actions(self, case, rank, realization, origin):
+        group, clock = case.groups[rank], case.clocks[rank]
+        source, _, identities = case.sources[rank]
         graph, evidence = source.graph, source.graph["evidence"]
         if evidence["clock"] != "monotonic_raw_ns":
             raise ValueError("native input conditions require the common RAW clock")
@@ -43,7 +45,7 @@ class NativeInputs:
         for index, identity in identities.items():
             scope = graph["scopes"][index]
             boundaries = []
-            for boundary in source.completion_boundaries(index):
+            for boundary in case.completion_boundaries(rank, index):
                 measured = clock.window(boundary["event"])
                 if measured is None:
                     self.counts["unmeasured_boundaries"] += 1
@@ -125,7 +127,7 @@ class NativeInputs:
     def run(self):
         self.output.mkdir(parents=True)
         manifest = self.read(self.capture / "capture.json")
-        evidence = NativeCase(self.capture, manifest)
+        evidence = NativeCase(self.capture, manifest, self.graphs)
         report = {"capture": str(self.capture.resolve()), "graphs": str(self.graphs.resolve()), "status": "unverified"}
         try:
             for number, instance in enumerate(manifest["instances"]):
@@ -154,9 +156,10 @@ class NativeInputs:
             if native_report["status"] == "differences":
                 raise ValueError("native source has confirmed contradictions")
             realization = ClockRealization(evidence.clocks, evidence.graph).solve()
-            for rank, (source, _, identities) in evidence.sources.items():
+            self.counts["derived_logical_boundaries"] = sum(map(len, evidence.logical.values()))
+            for rank in evidence.sources:
                 group = evidence.groups[rank]
-                self.actions(group, rank, source, identities, evidence.clocks[rank], realization, self.origins[group])
+                self.actions(evidence, rank, realization, self.origins[group])
             actors = {}
             for group in self.origins:
                 ordered = sorted(self.steps[group], key=lambda step: step[0])
@@ -183,7 +186,7 @@ class NativeInputs:
                 (self.output / "execution-inputs.json").write_text(json.dumps(document) + "\n")
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
             report["error"] = str(error)
-        report["scope"] = "Checked actor operations and one jointly feasible device-clock realization, rounded upward to integer nanoseconds. Original calibration ranges remain uncertain; a chosen realization is not a unique measurement. Unmeasured boundaries prevent publication; CPU wire and notification intervals remain explicit bounds. No batches, query results, allocations, graph bodies or cost accuracy are supplied."
+        report["scope"] = "Checked actor operations and one jointly feasible device-clock realization, rounded upward to integer nanoseconds. Original calibration ranges remain uncertain; a chosen realization is not a unique measurement. Unmeasured physical boundaries prevent publication; independently verified waits without SDK tasks or driver submissions remain causal gates without fake timestamps. CPU wire and notification intervals remain explicit bounds. No batches, query results, allocations, graph bodies or cost accuracy are supplied."
         (self.output / "execution-inputs-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         return 0 if report["status"] == "extracted" else 1
 
@@ -194,6 +197,7 @@ class ConsumedInputs:
     def __init__(self, case, ingress):
         self.capture, self.groups, self.ingress = case.capture, case.groups, ingress
         self.sources = dict(case.sources)
+        self.logical = case.logical
         self.clocks, self.native_graph = case.clocks, case.graph
         self.ranks = {group: rank for rank, group in case.groups.items()}
         self.origin_ns = ingress.origin_ns
@@ -216,7 +220,8 @@ class ConsumedInputs:
                     for row in raw["host_observation"]["intervals"] if row["name"].startswith("markov.scope/")}
             host.update({query["scope"]: query["begin_raw_ns"] for query in raw["state_queries"]})
             for index, identity in identities.items():
-                self.ports[group, index] = source.completion_boundaries(index)
+                self.ports[group, index] = [boundary for boundary in source.completion_boundaries(index)
+                                            if boundary["event"] not in self.logical[rank]]
                 origins = source.graph["scopes"][index]["bindings"]["source_scopes"]
                 begin = min(raw["scopes"][origin]["host_interval"]["begin_raw_ns"] if "service" in raw["scopes"][origin] else host[origin]
                             for origin in origins)

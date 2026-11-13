@@ -258,12 +258,21 @@ class ResourceEffects:
 class ResourceEffectComparison:
     def __init__(self):
         self.native, self.predicted = {}, {}
+        self.initial = {}
         self.requests = []
         self.counts = {}
         self.reads = {"native": {}, "predicted": {}}
 
     def observed(self, history, graph, group, raw):
-        source = ResourceEffects(history["initial"]["page_size"])
+        initial = history["initial"]
+        available = initial["available"]
+        if (sorted(initial["free_pages"]) != list(range(initial["page_capacity"])) or initial["released_pages"]
+                or available["pages"] != initial["page_capacity"] or available["evictable_tokens"] or available["protected_tokens"]
+                or sorted(initial["free_slots"]) != list(range(available["slots"]))
+                or any(sorted(pool["free"]) != list(range(pool["capacity"])) for pool in initial["state_slots"].values())):
+            raise ValueError("native observation does not start with empty logical KV and free slot pools")
+        self.initial[group] = initial
+        source = ResourceEffects(initial["page_size"])
         scopes = {origin: scope for scope in graph["scopes"] for origin in scope["bindings"]["source_scopes"]}
         source.native(history, scopes, graph["environment"]["implementation"]["cache"]["disabled"])
         self.native[group] = source
@@ -304,6 +313,9 @@ class ResourceEffectComparison:
             return
         operation, group = row["operation"], row["group"]
         kind = operation["kind"]
+        if kind == "declare_resources" and group in self.initial:
+            if operation["slots"] != len(self.initial[group]["free_slots"]):
+                raise ValueError("predicted request pool differs from the observed empty native pool")
         if kind == "capacity":
             self.capacity_read("predicted", group, operation, row["result"])
         elif kind == "state_slots" and operation["operation"] == "available":
@@ -353,6 +365,7 @@ class ResourceEffectComparison:
                     "native_operations": len(source.fields.operations), "predicted_operations": len(target.fields.operations),
                 }
         self.counts = {"groups": len(self.native), "groups_matched": matched, "operations": dict(totals),
+                       "empty_initial_states_checked": len(self.initial),
                        "comparison_scope": "complete_history" if complete else "observed_prefix",
                        "reads": {
                            **{origin: [{"group": group, "kind": kind, "resource": resource, **value}

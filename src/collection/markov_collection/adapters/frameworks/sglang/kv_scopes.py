@@ -157,7 +157,7 @@ class NativeKvScopes:
                 item._markov_submission = call["id"]
                 call["native_kv_chunk"] = {
                     "room": item.room, "source_pages": item.prefill_kv_indices.tolist(),
-                    "metadata_index": item.prefill_aux_index,
+                    "metadata_index": item.prefill_aux_index, "request_slot": int(request.req_pool_idx) - 1,
                 }
                 return original(queue, item)
 

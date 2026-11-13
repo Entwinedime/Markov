@@ -13,13 +13,14 @@ from pd_payload import PdPayloadEvidence
 from protocol_reads import PdStateEvidence
 from resource_effects import ResourceEffectComparison
 from source_clock import ClockConstraints
+from source_effects import NativeEffectEvidence
 
 
 class NativeCase:
     evidence_categories = frozenset({"native_evidence", "binding_evidence", "cpu_protocol_evidence", "missing_native_identity"})
 
-    def __init__(self, capture, manifest):
-        self.capture, self.manifest = capture, manifest
+    def __init__(self, capture, manifest, graphs):
+        self.capture, self.manifest, self.graphs = capture, manifest, graphs
         self.groups = {rank: f"{instance['id']}/{rank}" for instance in manifest["instances"] for rank in instance["native_participants"]}
         self.ranks = {rank: instance["id"] for instance in manifest["instances"] for rank in instance["native_participants"]}
         self.observed_roles = {rank for instance in manifest["instances"] for rank in instance["observed_roles"]}
@@ -29,6 +30,7 @@ class NativeCase:
             raise ValueError("native case has repeated participants or invalid observed workers")
 
         self.sources, self.dependencies, self.clocks = {}, {}, {}
+        self.runtime, self.runtime_counts, self.logical = {}, {}, {}
         self.connections = Connections()
         self.cpu = CpuProtocolEvidence(capture, manifest["instances"])
         self.protocol = PdStateEvidence()
@@ -43,6 +45,25 @@ class NativeCase:
             raise ValueError("native worker and capture disagree on their upstream framework revision")
         source = GraphContents(graph)
         source.validate_source(raw, rank)
+        self.logical[rank] = set()
+        if any(point["time_ns"] is None for point in graph["evidence"]["events"]):
+            facts = json.loads((self.graphs / f"{rank}-facts.json").read_text())
+            runtime = NativeEffectEvidence(self.capture, rank, raw, facts, self.graphs / f"{rank}-sdk/trace.json")
+            self.runtime_counts[rank] = runtime.inspect(graph)
+            self.runtime[rank] = runtime
+            self.logical[rank] = {event for event, point in enumerate(graph["evidence"]["events"])
+                                  if point["time_ns"] is None and (graph["events"][event]["resource"], point["order"]) in runtime.logical_coordinates}
+
+            # Elided waits gate order, not work or published data; those boundaries still require actual measurements.
+            data = {event for work in graph["work"] for event in (work["start"], work["finish"])}
+            for scope in graph["scopes"]:
+                data.update(port["event"] for port in scope["ports"] if port["use"] == "data"
+                            or port["use"] == "signal" and port["direction"] == "output")
+                data.update(port["rendezvous"] for port in scope["ports"] if "rendezvous" in port)
+                for access in scope["kv_accesses"] + scope["slot_accesses"]:
+                    data.update((access["start"], access["finish"]))
+            if data & self.logical[rank]:
+                raise ValueError("unmeasured stream wait also owns work, data or state")
         dependencies = CausalGraph.observed(graph)
         clock = ClockConstraints(graph, raw["device_clock"])
         anchors = [event for event, point in enumerate(clock.points) if point is not None]
@@ -74,6 +95,10 @@ class NativeCase:
         self.sources[rank] = source, raw, identities
         return source
 
+    def completion_boundaries(self, rank, scope):
+        return [boundary for boundary in self.sources[rank][0].completion_boundaries(scope)
+                if boundary["event"] not in self.logical[rank]]
+
     def finish(self):
         if self.sources.keys() != self.observed_roles:
             raise ValueError("native case omits observed workers")
@@ -98,7 +123,7 @@ class NativeCase:
                 self.histories[group] = json.loads(path.read_text())
         self.bindings = BindingComparison(self.histories, {session: self.groups[rank] for session, rank in registered_ranks.items()})
         self.effects = ResourceEffectComparison()
-        payload = PdPayloadEvidence(registrations, self.protocol.sessions)
+        payload = PdPayloadEvidence(registrations, self.protocol.sessions, self.bindings.pools)
         for rank, (source, raw, identities) in self.sources.items():
             group = self.groups[rank]
             source.observed_pools(raw, registered_ranks, self.groups)
@@ -111,6 +136,10 @@ class NativeCase:
                 self.bindings.findings.append(("binding_evidence", {"group": group}, {"reason": "native resource history is absent"}))
         self.findings.extend(payload.findings)
         self.payload_counts = dict(payload.counts)
+
+        # Only source qualification needs SDK dictionaries; downstream consumers retain compact gate identities.
+        self.runtime.clear()
+        self.runtime_counts.clear()
 
         # These run-local rounds and links are also the source for later prediction comparison.
         self.connections.native_communication(self.dependencies)
@@ -148,7 +177,8 @@ class NativeCase:
             "physical_bindings": {"observed_request_bindings": len(self.bindings.native),
                                   "unconsumed_snapshots": self.bindings.unconsumed_snapshots},
             "all_rank_events": None if self.graph is None else len(self.graph.next),
+            "logical_wait_boundaries": sum(map(len, self.logical.values())),
             "pd_payload": self.payload_counts,
             "resource_reads": sum(value["count"] for value in self.effects.reads["native"].values()),
-            "scope": "Original worker declarations, resource getter checkpoints, pool bindings, PD byte footprints/metadata, model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
+            "scope": "Original worker declarations, empty logical resource pools, getter checkpoints, pool bindings, PD byte footprints/metadata, enqueue slot ownership and retained page/row intervals, model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
         }

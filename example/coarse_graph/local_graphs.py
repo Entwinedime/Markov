@@ -115,7 +115,7 @@ class LocalComparison:
                   "expanded": str(self.expanded.resolve())}
         try:
             manifest = self.read(self.capture / "capture.json")
-            case = NativeCase(self.capture, manifest)
+            case = NativeCase(self.capture, manifest, self.graphs)
             for rank in sorted(case.observed_roles):
                 case.observe(rank, self.read(self.graphs / f"{rank}-graph.json"), self.read(self.capture / f"rank-{rank}.json"))
             case.finish()

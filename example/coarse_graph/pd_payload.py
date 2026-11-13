@@ -6,8 +6,9 @@ from markov_adapters.sglang.kv_layout import KvBufferAddresses, MhaKvLayout
 
 
 class PdPayloadEvidence:
-    def __init__(self, registrations, sessions):
+    def __init__(self, registrations, sessions, pools):
         self.registrations = registrations
+        self.groups, self.pools = sessions, pools
         self.sessions = {group: session for session, group in sessions.items()}
         self.buffers = {}
         for session, recording in registrations.items():
@@ -17,6 +18,46 @@ class PdPayloadEvidence:
                 native["pointers"], native["lengths"], native["page_bytes"],
             )
         self.findings, self.counts = [], Counter()
+
+    def ownership(self, contents, parent, call, source, target):
+        graph = contents.graph
+        scope = graph["scopes"][contents.source_ids[parent["id"]]]
+        entered, = [port["event"] for port in scope["ports"] if port["name"] == "call.enter"]
+        begin = graph["evidence"]["events"][entered]["time_ns"]
+        end = call["host_interval"]["end_raw_ns"]
+        if graph["evidence"]["clock"] != "monotonic_raw_ns" or begin is None or end < begin:
+            raise ValueError("native PD ownership has no common ordered host interval")
+        member, = parent["work"]["members"]
+        request, chunk = member["id"], parent["native_kv_chunk"]
+        transfer = call["native_transfer"]
+
+        # A table slot is required at enqueue only. Copies subsequently retain pages and metadata rows independently.
+        checks = [(source, "request", chunk.get("request_slot"), (begin, begin))]
+        if transfer["kind"] == "metadata":
+            checks.extend((session, "metadata", transfer[f"{side}_index"], (begin, end))
+                          for session, side in ((source, "source"), (target, "target")))
+        for session, field, slot, window in checks:
+            pool = self.pools.get(self.groups[session])
+            if pool is None or slot is None or not pool.owns(field, slot, request, window):
+                self.findings.append(("binding_evidence", {"group": self.groups[session], "scope": parent["id"]}, {
+                    "request": request, "field": field, "slot": slot,
+                    "reason": "no measured ownership interval covers the enqueue or retained native transfer",
+                }))
+            else:
+                self.counts[f"{field}_ownership_checked"] += 1
+
+        if transfer["kind"] != "kv":
+            return
+        for session, side in ((source, "source"), (target, "target")):
+            pool = self.pools.get(self.groups[session])
+            ranges = [] if pool is None else [[page - 1, 0, pool.page_size] for page in transfer[f"{side}_pages"]]
+            binding = {"slot": None, "begin": 0, "ranges": ranges}
+            if pool is None or pool.resolve(binding, (begin, end), graph["evidence"]["clock"]) is None:
+                self.findings.append(("binding_evidence", {"group": self.groups[session], "scope": parent["id"]}, {
+                    "request": request, "reason": "a native transfer page has no release-free enqueue-to-copy interval",
+                }))
+            else:
+                self.counts["queued_page_intervals_checked"] += len(binding["ranges"])
 
     @staticmethod
     def coverage(rectangles):
@@ -138,6 +179,7 @@ class PdPayloadEvidence:
                 parent = raw["scopes"][call["submitted_by"]]
                 member, = parent["work"]["members"]
                 source, target = raw["kv_session"], transfer["session"]
+                self.ownership(contents, parent, call, source, target)
                 if transfer["kind"] == "metadata":
                     slots.update(self.metadata(transfer, parent, source, target))
                     origin, = writers[member["id"]]

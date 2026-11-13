@@ -9,12 +9,11 @@ from pathlib import Path
 
 from actions import ActionScopes
 from native_case import NativeCase
-from source_clock import ClockConstraints
 from source_effects import NativeEffectEvidence
 
 
 class SourceEvidence:
-    def __init__(self, facts, graph, clock_samples, details=False):
+    def __init__(self, facts, graph, clock, logical, details=False):
         self.facts, self.graph = facts, graph
         self.evidence = graph["evidence"]
         self.details = details
@@ -22,7 +21,7 @@ class SourceEvidence:
         self.findings = []
         self.maximum_inversion_ns = 0
         self.coverage = {}
-        self.clock_samples = clock_samples
+        self.clock, self.logical = clock, logical
 
     @staticmethod
     def require(condition, message):
@@ -197,6 +196,11 @@ class SourceEvidence:
         return orders
 
     def timing(self, kind, index, source, target):
+        missing = {event for event in (source, target) if self.evidence["events"][event]["time_ns"] is None}
+        if missing and missing <= self.logical:
+            self.counts["logical_condition_relations"] += 1
+            return
+        self.clock.constrain(kind, index, source, target)
         begin, end = (self.evidence["events"][event]["time_ns"] for event in (source, target))
         issue = "unknown_time" if begin is None or end is None else "time_inversion" if begin > end else None
         if issue is None:
@@ -213,15 +217,14 @@ class SourceEvidence:
 
     def inspect(self):
         self.validate_mapping()
-        clock = ClockConstraints(self.graph, self.clock_samples)
+
+        # The case clock already constrains measured paths through independently verified logical gates.
         for index, edge in enumerate(self.graph["edges"]):
             self.timing(edge["kind"], index, edge["source"], edge["target"])
-            clock.constrain(edge["kind"], index, edge["source"], edge["target"])
         for index, work in enumerate(self.graph["work"]):
             self.timing("work/" + work["kind"], index, work["start"], work["finish"])
-            clock.constrain("work/" + work["kind"], index, work["start"], work["finish"])
         return {
-            "mapping": "consistent", "timing": clock.report(),
+            "mapping": "consistent", "timing": self.clock.report(),
             "events": len(self.graph["events"]), "work": len(self.graph["work"]),
             "coverage": self.coverage,
             "counts": dict(self.counts), "maximum_inversion_ns": self.maximum_inversion_ns, "findings": self.findings,
@@ -237,7 +240,7 @@ class ProductionEvidence:
         capture = json.loads((self.capture / "capture.json").read_text())
         ranks = [rank for instance in capture["instances"] for rank in instance["observed_roles"]]
         SourceEvidence.require(publication["observed_roles"] == ranks, "production omits or changes the captured worker set")
-        native_case = NativeCase(self.capture, capture)
+        native_case = NativeCase(self.capture, capture, self.production / "work")
         reports = []
         for rank in publication["observed_roles"]:
             try:
@@ -246,14 +249,18 @@ class ProductionEvidence:
                 native = json.loads((self.capture / f"rank-{rank}.json").read_text())
                 SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
                 contents = native_case.observe(rank, graph, native)
-                native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
+                native_evidence = native_case.runtime.get(rank)
+                if native_evidence is None:
+                    native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
+                effects = native_case.runtime_counts.get(rank)
+                if effects is None:
+                    effects = native_evidence.inspect(graph)
                 measurements = native_evidence.inspect_measurements()
                 boundaries = native_evidence.inspect_boundaries(graph)
                 services = native_evidence.inspect_services()
                 submissions = native_evidence.inspect_submissions()
-                effects = native_evidence.inspect(graph)
                 signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank])
-                report = SourceEvidence(facts, graph, native["device_clock"], self.details).inspect()
+                report = SourceEvidence(facts, graph, native_case.clocks[rank], native_case.logical[rank], self.details).inspect()
                 report["native_effects"] = effects
                 report["native_measurements"] = measurements
                 report["native_boundaries"] = boundaries
@@ -299,7 +306,8 @@ class ProductionEvidence:
                 services = report["native_services"]
                 lines.extend([
                     "", f"rank {report['rank']}：从原始记录核对主机时间点 {measurements['checked_host_measurements']} 个；"
-                    f"未测stream边界 {measurements['unmeasured_device_endpoints']} 个；同步传输保留driver主机时间，设备返回fence保留真实SDK时间。"
+                    f"缺少测量的stream边界 {measurements['unmeasured_device_endpoints']} 个，"
+                    f"无实际下发的逻辑等待边界 {measurements['logical_wait_boundaries']} 个；同步传输保留driver主机时间，设备返回fence保留真实SDK时间。"
                     f"核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
                     f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
                     f"闭合服务 {services['synchronous_services']} 个、私有队列 {services['private_queues']} 条、原始下发任务 {services['submitted_tasks']} 项；"
@@ -324,8 +332,8 @@ class ProductionEvidence:
             for finding in case_report["findings"]:
                 lines.extend(["", f"{finding['category']}：{finding.get('reason', finding['kind'])}"])
         lines.extend([
-            "", "名义倒置按原始中点时间统计；校准约束则核对同一rank全部已测关系能否共同满足两端实测查询区间，不能逐边选择不同的时钟。相容只证明现有仿射时钟假设下没有测量矛盾，不证明精确偏移、插桩完整或SDK关联正确。原始时间和图不修改，也不输出拟合后的时间。unknown_time仍是缺少测量。",
-            "", "只有各rank映射、原生整组检查一致，且全部时间已测并存在共同校准才返回 0；其余返回 1。整组检查不需要预测结果；参与者、CPU协议或绑定证据不足不会被弱图替代。默认 JSON 每类仅列前三个名义时间问题，--details 输出全部位置。", "",
+            "", "名义倒置按原始中点时间统计；校准约束使用同一rank全部实测关系及穿过逻辑等待的传递路径，不能逐边选择不同的时钟。逻辑等待须由原始API、无SDK任务及无driver下发共同证明，不拥有工作、数据或状态，不提供假设备时间；实体工作及对外完成仍需实测。相容不证明精确偏移、插桩完整或SDK关联正确，原始时间和图保持不变。unknown_time仍是缺少必要测量。",
+            "", "只有各rank映射、原生整组检查一致，必要测量完整、纯逻辑条件有独立依据且存在共同校准才返回 0；其余返回 1。整组检查不需要预测结果；参与者、CPU协议或绑定证据不足不会被弱图替代。默认 JSON 每类仅列前三个名义时间问题，--details 输出全部位置。", "",
         ])
         (self.output / "source-evidence.md").write_text("\n".join(lines))
         return 0 if reports and case_report["status"] == "consistent" and all(report["mapping"] == "consistent" and report["timing"]["status"] == "compatible"

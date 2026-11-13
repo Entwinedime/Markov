@@ -100,6 +100,10 @@ class StreamCommands:
                     position = bisect_left(positions, task.begin)
                 else:
 
+                    # A missing SDK task is a logical wait only when the native API submitted no physical queue work.
+                    if any(submission.record["tasks"] != 0 for submission in trace.queues.inside(call.native, stream)):
+                        raise ValueError("unmatched stream wait has native queue submissions")
+
                     # Submission order bounds the missing command; concurrent commands cannot be guessed past.
                     lower, upper = 0, len(tasks)
                     for index, task in enumerate(tasks):

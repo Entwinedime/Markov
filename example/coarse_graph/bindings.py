@@ -13,6 +13,7 @@ class NativePoolHistory:
         self.page_size = history["initial"]["page_size"]
         self.capacity = history["initial"]["page_capacity"]
         self.pages, self.slots = defaultdict(list), defaultdict(list)
+        self.ownership = defaultdict(list)
         for record in history["events"]:
             operation = record["operation"]
             window = record["end_raw_ns"], record["begin_raw_ns"]
@@ -23,8 +24,31 @@ class NativePoolHistory:
                     self.pages[page].append(window)
             elif operation["kind"] == "release_request":
                 self.slots[operation["slot"]].append(window)
+                self.ownership["request", operation["slot"]][-1][2] = record["begin_raw_ns"]
+            elif operation["kind"] == "slots" and record["result"] is not None:
+                for request, slot in zip(operation["requests"], record["result"], strict=True):
+                    self.ownership["request", slot].append([request, record["end_raw_ns"], float("inf")])
         for windows in (*self.pages.values(), *self.slots.values()):
             windows.sort()
+
+        for record in history["state_events"]:
+            slot, operation = record["slot"], record["operation"]
+            if slot is None:
+                continue
+            claims = self.ownership[record["field"], slot]
+            if operation == "allocate":
+                claims.append([None, record.get("end_raw_ns"), float("inf")])
+            elif operation == "bind":
+                claims[-1][0] = record["request"]
+            elif operation == "release":
+                claims[-1][2] = record.get("begin_raw_ns")
+
+    def owns(self, field, slot, request, window):
+        begin, end = window
+
+        # API return and release entry bound certain ownership; an overlapping or unmeasured mutation proves less.
+        return sum(owner == request and first is not None and last is not None and first <= begin <= end <= last
+                   for owner, first, last in self.ownership[field, slot]) == 1
 
     def ranges(self, binding, epoch):
         result, begin = [], binding["begin"]
@@ -104,7 +128,7 @@ class BindingComparison:
                 if member["context_tokens"] % size or len(pages) != (count + size - 1) // size:
                     raise ValueError("native transfer pages do not describe its aligned request chunk")
 
-                # SGLang reserves page zero. Transport records pages directly, but no request-slot snapshot.
+                # Transport owns frozen pages; it no longer consumes the request's table slot.
                 ranges = [[page - 1, 0, min(size, count - position * size)] for position, page in enumerate(pages)]
                 yield {"scope": index, "request": member["id"], "slot": None,
                        "begin": member["context_tokens"], "ranges": ranges}, pool, window
@@ -256,4 +280,4 @@ class BindingComparison:
                        "snapshots_without_kv_access": self.unconsumed_snapshots,
                        "page_only_bindings": sum(value[1] is None for value in self.native.values()),
                        "predicted_regions": sum(map(len, self.predicted.values())), "page_intervals": intervals,
-                       "scope": "Observed request extents, page offsets and page/slot alias identities across recorded release epochs; transport observations compare pages only, not request slots, allocator or in-flight lifetime correctness."}
+                       "scope": "Observed request extents, page offsets and page/slot alias identities across recorded release epochs. Transport consumes frozen pages, not table slots; native enqueue ownership and retained pages/metadata are checked separately. This comparison does not prove allocator or in-flight lifetime correctness."}
