@@ -28,9 +28,8 @@ struct GraphTiming {
     std::vector<ServiceDuration> work_ns;
     std::vector<BoundaryTime> boundaries;
 
-    // Unknown work needs a causal or explicitly observed completion bound; neither supplies its service cost.
-    static GraphTiming conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries,
-                                   std::optional<TimeWindow> unmeasured_completion_window = std::nullopt);
+    // Unknown work needs its own condition or a bound from an actual causal successor; neither supplies its service cost.
+    static GraphTiming conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries);
 };
 
 struct EventTiming {

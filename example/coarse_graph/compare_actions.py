@@ -243,13 +243,13 @@ class ActionComparison:
                     raise ValueError("execution has invalid invocation event identities")
                 event_ranks.update(dict.fromkeys(events, rank))
                 predicted_dependencies[rank].add_events(events)
-                conditioned_scope = condition_inputs.graph(groups[rank], root)
+                target = GraphContents(graph)
+                conditioned_scope = condition_inputs.graph(groups[rank], row, target)
                 if cpu_service:
 
                     # Runtime protocol intervals are independently checked before joining action causality.
                     continue
                 group = ActionIdentity.group(graph, ranks[rank])
-                target = GraphContents(graph)
                 try:
                     identity = ActionIdentity.record(root, group)
                 except ValueError as error:

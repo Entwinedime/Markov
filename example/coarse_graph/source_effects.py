@@ -122,7 +122,9 @@ class NativeEffectEvidence:
         # Actual RAW samples override SDK reconstruction at their own coordinates, including service threads.
         services = [{**scope["host_interval"], "thread": scope["thread"]}
                     for scope in native["scopes"] if "service" in scope]
-        for row in [*native["host_observation"]["intervals"], *services, *self.runtime]:
+        self.queries = {query["scope"]: {**query, "thread": native["scopes"][query["scope"]]["thread"]}
+                        for query in native["state_queries"]}
+        for row in [*native["host_observation"]["intervals"], *services, *self.runtime, *self.queries.values()]:
             for side in ("begin", "end"):
                 for resource in (f"thread/{row['thread']}", f"service/{row['thread']}"):
                     self.host_measurements[resource, row[f"{side}_counter"]] = row[f"{side}_raw_ns"]
@@ -195,6 +197,16 @@ class NativeEffectEvidence:
             if "communication" in raw and "device_entry" not in raw:
                 kind = "communication"
             host = resources["thread", f"thread/{thread}"]
+            if origins[0] in self.queries:
+                self.require(len(origins) == 1 and spans[index, host, begin["begin_counter"], end["end_counter"], "boundary"] == 1,
+                             f"query {index} loses its uncharged caller envelope")
+                read = self.queries[origins[0]]
+                self.require(begin["begin_counter"] <= read["begin_counter"] <= read["end_counter"] <= end["end_counter"],
+                             f"query {index} escapes its original caller interval")
+                self.check_boundary(graph, ports["caller.return"]["event"], host, end, "end", index)
+                counts["caller_boundaries"] += 1
+                begin = end = read
+                kind = "host"
             self.require(spans[index, host, begin["begin_counter"], end["end_counter"], kind] == 1,
                          f"scope {index} omits, duplicates or changes its native host interval")
             for name, side, record in (("call.enter", "begin", begin), ("call.return", "end", end)):

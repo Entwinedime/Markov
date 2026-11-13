@@ -26,6 +26,7 @@ class AscendObservation:
         self.spans = []
         self.dependencies = []
         self.host = {}
+        self.callers = {}
         self.device = {}
         self.services = {}
         self.payload = []
@@ -100,6 +101,7 @@ class AscendObservation:
         return ThreadIntervals(intervals)
 
     def host_spans(self) -> None:
+        queries = {query["scope"]: query for query in self.raw["state_queries"]}
 
         # Coordinates express ordering, not service time; observer calls must not fragment business CPU work.
         for scope, interval in self.trace.scopes.items():
@@ -115,6 +117,15 @@ class AscendObservation:
                 if interval.begin < interval.end:
                     self.resources[resource]["payload"].append([interval.begin, interval.end])
             self.host[scope] = self.span(scope, resource, interval.begin, interval.end, kind)
+            if scope in queries:
+                read = self.trace.native_interval({**queries[scope], "thread": interval.thread})
+                if not interval.contains(read):
+                    raise ValueError(f"query {scope} escapes its observed caller interval")
+
+                # The actual read returns before observer bookkeeping; retain its caller envelope without charging it.
+                self.callers[scope] = self.host[scope]
+                self.spans[self.host[scope]]["kind"] = "boundary"
+                self.host[scope] = self.span(scope, resource, read.begin, read.end, "host")
         self.host_index = self.span_index("thread")
         pending = None
         for dequeue in sorted(self.trace.dequeue.values(), key=lambda value: (value.thread, value.begin)):
@@ -322,6 +333,11 @@ class AscendObservation:
                 ports.append({
                     "name": name, "direction": direction, "use": "control", "relation": "control",
                     "at": self.endpoint(host, side),
+                })
+            if scope in self.callers:
+                ports.append({
+                    "name": "caller.return", "direction": "output", "use": "control", "relation": "control",
+                    "at": self.endpoint(self.callers[scope], "end"),
                 })
             if scope in self.services:
                 ports.append({

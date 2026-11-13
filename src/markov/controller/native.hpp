@@ -13,11 +13,11 @@
 
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/action_graphs.hpp"
-#include "markov/controller/execution_inputs.hpp"
 #include "markov/controller/control.hpp"
 #include "markov/controller/control_peer.hpp"
 #include "markov/controller/cpu_messages.hpp"
 #include "markov/controller/delivery.hpp"
+#include "markov/controller/execution_inputs.hpp"
 #include "markov/controller/observer.hpp"
 #include "markov/execution/dependencies.hpp"
 #include "markov/resources/kv_pool.hpp"
@@ -54,7 +54,7 @@ public:
                      ControlObserver * control_observer = nullptr);
 
     std::optional<ServingAction> plan(std::int64_t now_ns) override;
-    void finish(const ServingAction & action, std::size_t returned_event, std::int64_t completed_ns,
+    void finish(const ServingAction & action, std::size_t returned_event, std::size_t caller_returned_event, std::int64_t completed_ns,
                 const std::map<std::string, StorageBinding> & values) override;
     bool notify(std::size_t event) override;
     std::set<std::size_t> retained_events() const override;
@@ -75,6 +75,7 @@ private:
     void resolve_notifications();
     bool cpu_call(std::size_t call, const std::string & group, const nlohmann::json & message);
     bool release_cpu();
+    bool release_reads();
 
     struct CompletionNotice {
         nlohmann::json identity;
@@ -99,6 +100,8 @@ private:
     struct PendingRead {
         std::size_t boundary;
         std::int64_t time_ns;
+        std::size_t caller_returned;
+        std::optional<std::size_t> reply;
     };
 
     nlohmann::json resource_call(const std::string & group, const nlohmann::json & message);

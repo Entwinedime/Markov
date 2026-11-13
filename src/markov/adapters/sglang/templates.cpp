@@ -114,6 +114,7 @@ public:
     }
 
     void validate(std::size_t scope, std::string_view action, const nlohmann::json & condition) const {
+        if (action == "query") graph_.scopes[scope].port("caller.return", Direction::Output);
         const bool control_transform = action == "batch_transform" && condition.at("transformation").at("effect") == "control";
         const bool result_continuation = action == "segment" && condition.at("owner") == "result";
         if (control_transform || result_continuation) validate_host(scope);

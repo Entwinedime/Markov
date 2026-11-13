@@ -205,7 +205,7 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
         }
         const auto call = receive_call();
         if (call.at("kind") == "waiting") {
-            if (shutdown_ || !timeline_.done() || !running_calls_.empty()
+            if (shutdown_ || !timeline_.done() || !running_calls_.empty() || !pending_reads_.empty()
                 || std::ranges::any_of(inputs_, [](const auto & entry) { return entry.second.return_ns.has_value(); })
                 || !std::ranges::all_of(completed_, [&](const auto & entry) { return entry.second.size() == requests_.size(); }))
                 return std::nullopt;
@@ -310,8 +310,8 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
             if (!clocks.is_array() || (!result.is_boolean() && !result.is_number_integer()))
                 throw std::invalid_argument("native read requires its scalar result and clock records");
             if (control_observer_) control_observer_->queried(name, boundary, result, clocks, now_ns);
-            pending_reads_.erase(name);
-            reply(identity, nullptr);
+            pending_reads_.at(name).reply = identity;
+            release_reads();
             continue;
         }
         if (kind == "completed") {
@@ -473,7 +473,10 @@ void NativeController::release_notifications(std::size_t request) {
 
 std::set<std::size_t> NativeController::retained_events() const {
     auto events = cpu_.retained_events();
-    for (const auto & [_, read] : pending_reads_) events.insert(read.boundary);
+    for (const auto & [_, read] : pending_reads_) {
+        events.insert(read.boundary);
+        events.insert(read.caller_returned);
+    }
 
     // Retain notifications while their request is live, including later registrations by another participant.
     for (const auto & [event, _] : notices_) events.insert(event);
@@ -483,6 +486,7 @@ std::set<std::size_t> NativeController::retained_events() const {
 bool NativeController::notify(std::size_t event) {
     cpu_.notify(event);
     bool released = release_cpu();
+    released = release_reads() || released;
 
     const auto notification = notices_.find(event);
     if (notification != notices_.end()) {
@@ -501,7 +505,23 @@ bool NativeController::notify(std::size_t event) {
     return true;
 }
 
-void NativeController::finish(const ServingAction & action, std::size_t returned_event, std::int64_t completed_ns,
+bool NativeController::release_reads() {
+    bool released = false;
+    for (auto read = pending_reads_.begin(); read != pending_reads_.end();) {
+        if (!read->second.reply || !timeline_.completed(read->second.caller_returned)) {
+            ++read;
+            continue;
+        }
+
+        // Sampling and caller continuation are distinct; post-read work must finish before native decisions continue.
+        reply(*read->second.reply, nullptr);
+        read = pending_reads_.erase(read);
+        released = true;
+    }
+    return released;
+}
+
+void NativeController::finish(const ServingAction & action, std::size_t returned_event, std::size_t caller_returned_event, std::int64_t completed_ns,
                               const std::map<std::string, StorageBinding> & values) {
     const auto call = running_calls_.at(action.task);
     auto & completed = completed_.at(action.task.group);
@@ -533,7 +553,7 @@ void NativeController::finish(const ServingAction & action, std::size_t returned
     // Identity is available at CPU return; actual data readiness remains in the execution graph.
     nlohmann::json returned{ { "completed_ns", completed_ns }, { "values", std::move(bindings) } };
     if (action.name == "query") {
-        pending_reads_.emplace(action.task.group, PendingRead{ returned_event, completed_ns });
+        pending_reads_.emplace(action.task.group, PendingRead{ returned_event, completed_ns, caller_returned_event, {} });
         returned["read_boundary"] = returned_event;
     }
     if (control_observer_) returned["observation"] = returned_event;

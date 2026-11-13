@@ -11,8 +11,7 @@
 
 namespace markov {
 
-GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries,
-                                     std::optional<TimeWindow> unmeasured_completion_window) {
+GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries) {
     if (work_ns.size() != graph.work.size()) throw std::invalid_argument("graph timing requires one service declaration per work interval");
     GraphTiming result{ std::move(work_ns), std::move(boundaries) };
     if (std::ranges::all_of(result.work_ns, [](const auto & value) { return value.has_value(); })) return result;
@@ -53,15 +52,13 @@ GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<Serv
         const auto & work = graph.work[index];
         if (result.work_ns[index]) continue;
         if (bounded.contains(work.finish)) continue;
-        if (!upper[work.finish] && !unmeasured_completion_window)
-            throw std::invalid_argument("unknown work has no causal or declared observation bound at " + graph.scopes[work.scope].info.site);
+        if (!upper[work.finish])
+            throw std::invalid_argument("unknown work has no explicit or causal completion bound at " + graph.scopes[work.scope].info.site);
 
-        // A synchronized observation can enclose private async tails without prescribing an internal event time.
-        auto window = unmeasured_completion_window ? *unmeasured_completion_window : TimeWindow{ 0, *upper[work.finish] };
-        if (upper[work.finish]) window.end_ns = std::min(window.end_ns, *upper[work.finish]);
-        if (window.begin_ns < 0 || window.begin_ns > window.end_ns)
-            throw std::invalid_argument("unmeasured completion window conflicts with causal bounds at " + graph.scopes[work.scope].info.site);
-        result.boundaries.push_back({ work.finish, window });
+        result.boundaries.push_back({
+            work.finish,
+            { 0, *upper[work.finish] }
+        });
         bounded.insert(work.finish);
     }
     return result;

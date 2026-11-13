@@ -103,6 +103,72 @@ class GraphContents(ActionScopes):
                 pending.append(scope)
         return paths
 
+    def completion_boundaries(self, root):
+        graph = self.graph
+        scopes = [root]
+        for scope in scopes:
+            scopes.extend(self.children[scope])
+        retained = {event for scope in scopes for event in self.events[scope]}
+        for scope in scopes:
+            for work in self.work[scope]:
+                retained.update((work["start"], work["finish"]))
+            for port in graph["scopes"][scope]["ports"]:
+                retained.add(port["event"])
+                if "wait" in port:
+                    retained.add(port["wait"]["begin"])
+                if "rendezvous" in port:
+                    retained.add(port["rendezvous"])
+            for access in graph["scopes"][scope]["kv_accesses"] + graph["scopes"][scope]["slot_accesses"]:
+                retained.update((access["start"], access["finish"]))
+
+        ports = graph["scopes"][root]["ports"]
+        named_resources = {graph["events"][port["event"]]["resource"] for port in ports}
+        result = [{"at": {"port": port["name"], "direction": port["direction"]}, "event": port["event"]} for port in ports]
+        tails = {}
+        for event in retained:
+            resource = graph["events"][event]["resource"]
+            if not graph["resources"][resource]["serial"]:
+                continue
+            previous = tails.get(resource)
+            if previous is None or graph["evidence"]["events"][event]["order"] > graph["evidence"]["events"][previous]["order"]:
+                tails[resource] = event
+        for resource, event in sorted(tails.items()):
+            names = sorted((port["name"], port["direction"]) for port in ports
+                           if graph["events"][port["event"]]["resource"] == resource)
+            if names:
+                name, direction = names[0]
+                identity = {"port": name, "direction": direction}
+            else:
+                identity = {key: graph["resources"][resource][key] for key in ("kind", "role")}
+                if sum(all(graph["resources"][peer][key] == value for key, value in identity.items())
+                       for peer in tails.keys() - named_resources) != 1:
+                    raise ValueError(f"scope {root} ({graph['scopes'][root]['site']}) resource tail {identity} "
+                                     "has no unique named interface or resource role")
+
+            # A semantic resource identity selects a tail; native thread/stream IDs never cross the run boundary.
+            result.append({"at": {"resource": identity}, "event": event})
+        return result
+
+    def boundary_event(self, root, selector):
+        ports = self.graph["scopes"][root]["ports"]
+        identity = selector.get("resource", selector)
+        if "port" in identity:
+            port, = [port for port in ports if (port["name"], port["direction"]) == (identity["port"], identity["direction"])]
+            if "resource" not in selector:
+                return port["event"]
+            resource = self.graph["events"][port["event"]]["resource"]
+            candidates = [port for port in ports if port["name"].startswith("resource.exit/")
+                          and self.graph["events"][port["event"]]["resource"] == resource]
+        else:
+            named_resources = {self.graph["events"][port["event"]]["resource"] for port in ports
+                               if not port["name"].startswith(("resource.enter/", "resource.exit/"))}
+            candidates = [port for port in ports if port["name"].startswith("resource.exit/")
+                          and self.graph["events"][port["event"]]["resource"] not in named_resources
+                          and all(self.graph["resources"][self.graph["events"][port["event"]]["resource"]][key] == value
+                                  for key, value in identity.items())]
+        boundary, = candidates
+        return boundary["event"]
+
     def snapshot(self, root, group):
         graph, paths = self.graph, self.paths(root)
 

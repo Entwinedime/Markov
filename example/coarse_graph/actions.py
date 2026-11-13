@@ -11,6 +11,7 @@ class QueryResults:
 
     def __init__(self):
         self.groups, self.pending = {}, {}
+        self.caller_returns = {}
         self.clock_epoch_ns = None
         self.signals, self.signal_completions = {}, {}
         self.results = {}
@@ -42,6 +43,11 @@ class QueryResults:
         elif kind == "graph":
             graph = record["graph"]
             scope = graph["scopes"][0]
+            ports = {port["name"]: port["event"] for port in scope["ports"]}
+            rank = graph["resources"][graph["events"][ports["call.return"]]["resource"]]["rank"]
+            group = self.groups[rank]
+            if group in self.caller_returns.values() or any(query["group"] == group for query in self.pending.values()):
+                raise ValueError("native action was submitted before its preceding read and caller continuation completed")
             for port in scope["ports"]:
                 if port["use"] == "signal" and port["direction"] == "output":
                     event = record["event_ids"][port["event"]]
@@ -49,11 +55,10 @@ class QueryResults:
                     self.signal_completions[event] = None
             if scope["role"] != "query":
                 return
-            event = next(port["event"] for port in scope["ports"] if port["name"] == "call.return")
-            entered = next(port["event"] for port in scope["ports"] if port["name"] == "call.enter")
-            rank = graph["resources"][graph["events"][event]["resource"]]["rank"]
+            event, entered = ports["call.return"], ports["call.enter"]
+            self.caller_returns[record["event_ids"][ports["caller.return"]]] = group
             self.pending[record["event_ids"][event]] = {
-                "kind": scope["work"]["context"]["query"], "group": self.groups[rank],
+                "kind": scope["work"]["context"]["query"], "group": group,
                 "returned_ns": None, "entered": record["event_ids"][entered], "reads": 0, "last_read": None,
                 "work": scope["work"],
             }
@@ -69,6 +74,7 @@ class QueryResults:
             self.observation_edges.add((record["source"], record["target"]))
         elif kind == "completion":
             event = record["event"]
+            self.caller_returns.pop(event, None)
             if event in self.pending:
                 self.pending[event]["returned_ns"] = record["time_ns"]
             if event in self.signal_completions:
@@ -121,9 +127,10 @@ class QueryResults:
             return query
 
     def finish(self, *, complete):
-        if complete and (self.pending or self.notices):
+        if complete and (self.pending or self.notices or self.caller_returns):
             raise ValueError("execution has unfinished query or notification observations")
-        return {**self.counts, "pending_queries": len(self.pending), "pending_notifications": len(self.notices)}
+        return {**self.counts, "pending_queries": len(self.pending), "pending_callers": len(self.caller_returns),
+                "pending_notifications": len(self.notices)}
 
 
 class ActionScopes:

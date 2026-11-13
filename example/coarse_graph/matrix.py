@@ -108,7 +108,7 @@ class MatrixRun:
             'docker', 'run', '--rm', '--runtime', 'runc', '--network', 'none',
             '--mount', f'type=bind,src={self.repository},dst={self.repository}',
             '--env', f'PYTHONPATH={self.repository}/src/collection:{self.repository}/src/adapters',
-            '--workdir', str(self.repository), '--entrypoint', 'timeout', self.images['modeling'],
+            '--workdir', str(self.repository), '--entrypoint', 'timeout', self.images['control'],
             '--signal=KILL', str(self.budget['task_seconds']), 'python3',
             str(self.repository / 'example/coarse_graph' / script), *map(str, arguments),
         ]

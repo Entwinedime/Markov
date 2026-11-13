@@ -19,16 +19,15 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
     }
     for (const auto & [group, record] : source.at("actors").items()) {
         const auto & steps = record.at("steps");
-        if (group.empty() || !steps.is_array()) throw std::invalid_argument("execution inputs require named actors and ordered operation arrays");
+        if (group.empty() || !steps.is_array() || record.size() != 1)
+            throw std::invalid_argument("execution inputs require named actors containing only ordered operation arrays");
         for (const auto & step : steps) {
             const auto operation = step.at("operation").get<std::string>();
             if ((operation != "action" && operation != "cpu" && operation != "input") || !step.at("identity").is_object()
                 || !step.at("source").is_object() || step.at("source").empty())
                 throw std::invalid_argument("execution input requires an operation, logical identity and source reference");
         }
-        std::optional<TimeWindow> unmeasured;
-        if (record.contains("unmeasured_completion_window")) unmeasured = window(record.at("unmeasured_completion_window"));
-        actors_.emplace(group, Actor{ steps, unmeasured });
+        actors_.emplace(group, Actor{ steps });
     }
     if (actors_.empty()) throw std::invalid_argument("execution inputs require participants");
     for (const auto & record : source.at("notifications")) {
@@ -117,18 +116,51 @@ const nlohmann::json & ExecutionInputs::take(const std::string & group, const st
     return expected;
 }
 
-InvocationInput ExecutionInputs::graph(const std::string & group, const std::string & operation, const nlohmann::json & identity,
-                                       const CoarseGraph & graph) {
+std::size_t ExecutionInputs::boundary(const CoarseGraph & graph, const nlohmann::json & selector) {
+    const auto & root = graph.scopes.front();
+    const auto & identity = selector.contains("resource") ? selector.at("resource") : selector;
+    if (identity.size() != 2 || (selector.contains("resource") && selector.size() != 1))
+        throw std::invalid_argument("execution boundary requires a named port or a semantic resource interface");
+    std::optional<std::size_t> resource;
+    if (identity.contains("port")) {
+        const auto & port = root.port(identity.at("port").get<std::string>(), direction_kind(identity.at("direction").get<std::string>()));
+        if (!selector.contains("resource")) return port.event;
+        resource = graph.events[port.event].resource;
+    }
+
+    // Resource tails are the invocation's declared interface, never a native stream/thread number.
+    std::optional<std::size_t> result;
+    for (const auto & port : root.ports) {
+        if (!port.name.starts_with("resource.exit/")) continue;
+        const auto index = graph.events[port.event].resource;
+        if (!resource && std::ranges::any_of(root.ports, [&](const auto & named) {
+                return !named.name.starts_with("resource.enter/") && !named.name.starts_with("resource.exit/") && graph.events[named.event].resource == index;
+            }))
+            continue;
+        const auto & descriptor = graph.resources[index];
+        const bool matches =
+            resource ? *resource == index
+                     : descriptor.kind == resource_kind(identity.at("kind").get<std::string>()) && descriptor.role == identity.at("role").get<std::string>();
+        if (!matches) continue;
+        if (result) throw std::invalid_argument("execution resource tail has an ambiguous semantic interface");
+        result = port.event;
+    }
+    if (!result) throw std::invalid_argument("execution resource tail has no matching invocation interface");
+    return *result;
+}
+
+InvocationInput ExecutionInputs::graph(const std::string & group, const std::string & operation, const nlohmann::json & identity, const CoarseGraph & graph) {
     const auto & record = take(group, operation, identity);
     std::map<std::size_t, TimeWindow> times;
     std::set<std::pair<std::string, Direction>> names;
-    for (const auto & condition : record.at("ports")) {
-        const auto name = condition.at("port").get<std::string>();
-        const auto direction = direction_kind(condition.at("direction").get<std::string>());
-        if (!names.emplace(name, direction).second) throw std::invalid_argument("execution input repeats a named boundary");
-        const auto & port = graph.scopes.front().port(name, direction);
+    std::set<nlohmann::json> selectors;
+    for (const auto & condition : record.at("boundaries")) {
+        const auto & selector = condition.at("at");
+        if (!selectors.insert(selector).second) throw std::invalid_argument("execution input repeats a boundary selector");
+        if (selector.contains("port")) names.emplace(selector.at("port").get<std::string>(), direction_kind(selector.at("direction").get<std::string>()));
+        const auto event = boundary(graph, selector);
         const auto value = window(condition.at("window"));
-        const auto [found, inserted] = times.emplace(port.event, value);
+        const auto [found, inserted] = times.emplace(event, value);
         if (!inserted) {
             found->second.begin_ns = std::max(found->second.begin_ns, value.begin_ns);
             found->second.end_ns = std::min(found->second.end_ns, value.end_ns);
@@ -140,9 +172,10 @@ InvocationInput ExecutionInputs::graph(const std::string & group, const std::str
     std::vector<BoundaryTime> boundaries;
     for (const auto & [event, value] : times) boundaries.push_back({ event, value });
     ++graph_count_;
-    return { GraphTiming::conditioned(graph, std::vector<ServiceDuration>(graph.work.size(), service(record)), std::move(boundaries),
-                                      actors_.at(group).unmeasured_completion_window),
-             { group, actors_.at(group).next - 1 } };
+    return {
+        GraphTiming::conditioned(graph, std::vector<ServiceDuration>(graph.work.size(), service(record)), std::move(boundaries)),
+        { group, actors_.at(group).next - 1 }
+    };
 }
 
 std::optional<TimeWindow> ExecutionInputs::input(const std::string & group, const nlohmann::json & identity, bool in_flow) {

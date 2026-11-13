@@ -7,6 +7,7 @@ from math import ceil, floor
 class ClockConstraints:
     def __init__(self, graph, samples):
         first, last = samples
+        self.device_id, self.first_counter = first["device"], first["counter"]
         self.origin, finish = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
         self.duration = finish - self.origin
         self.counts = last["counter"] - first["counter"]
@@ -39,6 +40,10 @@ class ClockConstraints:
         if lower != upper or not 0 <= lower <= self.counts:
             raise ValueError("device timestamp does not identify one counter inside the calibration window")
         position = Fraction(lower, self.counts)
+        return 1 - position, position, self.origin + position * self.duration
+
+    def at_counter(self, counter):
+        position = Fraction(counter - self.first_counter, self.counts)
         return 1 - position, position, self.origin + position * self.duration
 
     def constrain(self, kind, index, source, target):
@@ -92,4 +97,129 @@ class ClockConstraints:
             "status": "inconsistent" if self.conflict else "incomplete" if self.unknown else "compatible",
             "measured_constraints": self.measured, "unknown_constraints": self.unknown,
             "common_calibration_feasible": self.conflict is None, "first_conflict": self.conflict,
+        }
+
+
+class ClockRealization:
+    """Choose or verify one affine clock realization for an entire observed case."""
+
+    def __init__(self, clocks, graph):
+        if graph is None or any(clock.conflict for clock in clocks.values()):
+            raise ValueError("joint clock realization requires the complete measured native causal graph")
+        self.clocks = clocks
+        self.vertices = {rank: tuple(dict.fromkeys(clock.region)) for rank, clock in clocks.items()}
+        self.columns, position = {}, 0
+        for rank, vertices in self.vertices.items():
+            self.columns[rank] = slice(position, position + len(vertices))
+            position += len(vertices)
+        self.size = position + 1
+        self.constraints, self.equalities = {}, []
+        self.measured, self.conditioned = 0, 0
+        self.solution = None
+
+        # Convex weights preserve each local causal calibration; the final variable certifies strict rounding cells.
+        for rank in clocks:
+            row = [Fraction(0)] * self.size
+            row[self.columns[rank]] = [Fraction(1)] * len(self.vertices[rank])
+            self.equalities.append((row, Fraction(1)))
+        row = [Fraction(0)] * self.size
+        row[-1] = Fraction(1)
+        self.restrict(row, 1)
+
+        # Separate processes on one physical device still share one affine counter/RAW relation.
+        devices = {}
+        for rank, clock in clocks.items():
+            reference = devices.setdefault(clock.device_id, rank)
+            if reference == rank:
+                continue
+            other = clocks[reference]
+            for counter in (other.first_counter, other.first_counter + other.counts):
+                row, limit = self.difference((rank, clock.at_counter(counter)), (reference, other.at_counter(counter)))
+                self.equalities.append((row, limit))
+
+        anchors = [(rank, event) for rank, clock in clocks.items()
+                   for event, point in enumerate(clock.points) if point is not None]
+        causal = graph.projected(anchors)
+        for source, targets in causal.next.items():
+            rank, event = anchors[source]
+            for target in targets:
+                peer, endpoint = anchors[target]
+                row, limit = self.difference((rank, clocks[rank].points[event]), (peer, clocks[peer].points[endpoint]))
+                self.measured += 1
+
+                # Local polygons already imply most paths; retain only additional cross-clock restrictions.
+                if sum(max(row[columns]) for columns in self.columns.values()) > limit:
+                    self.restrict(row, limit)
+
+    def coefficients(self, rank, point):
+        a, b, constant = point
+        row = [Fraction(0)] * self.size
+        row[self.columns[rank]] = [a * x + b * y for x, y in self.vertices[rank]]
+        return row, constant
+
+    def difference(self, source, target):
+        left, begin = self.coefficients(*source)
+        right, end = self.coefficients(*target)
+        return [a - b for a, b in zip(left, right, strict=True)], end - begin
+
+    def restrict(self, row, limit):
+        key = tuple(row)
+        self.constraints[key] = min(self.constraints.get(key, limit), limit)
+
+    def condition(self, rank, event, raw_ns):
+        point = self.clocks[rank].points[event]
+        if point is None:
+            raise ValueError("consumed completion has no original measurement")
+        self.conditioned += 1
+        if not self.clocks[rank].device[event]:
+            if raw_ns != point[2]:
+                raise ValueError("consumed CPU boundary changes its original RAW measurement")
+            return
+
+        # ceil(device_time) == raw_ns means raw_ns - 1 < device_time <= raw_ns, not a fitted tolerance.
+        row, constant = self.coefficients(rank, point)
+        self.restrict(row, raw_ns - constant)
+        lower = [-value for value in row]
+        lower[-1] = Fraction(1)
+        self.restrict(lower, constant - raw_ns + 1)
+
+    def solve(self):
+        from sympy.solvers.simplex import InfeasibleLPError, linprog
+
+        rows, limits = zip(*self.constraints.items(), strict=True)
+        equations, values = zip(*self.equalities, strict=True)
+        try:
+
+            # SymPy is already present in the CPU control environment; solve measured constraints exactly, without fitting.
+            _, solution = linprog([0] * (self.size - 1) + [-1], rows, limits, equations, values)
+        except InfeasibleLPError as error:
+            raise ValueError("native clocks and consumed completions have no joint affine realization") from error
+        weights = [Fraction(value) for value in solution]
+        if (weights[-1] <= 0 or any(value < 0 for value in weights)
+                or any(sum(a * b for a, b in zip(row, weights, strict=True)) > limit for row, limit in self.constraints.items())
+                or any(sum(a * b for a, b in zip(row, weights, strict=True)) != value for row, value in self.equalities)):
+            raise ValueError("clock solver did not certify the exact measured constraints and rounding cells")
+        self.solution = {
+            rank: tuple(sum(weight * vertex[axis] for weight, vertex in zip(weights[self.columns[rank]], vertices, strict=True))
+                        for axis in (0, 1))
+            for rank, vertices in self.vertices.items()
+        }
+        return self
+
+    def timestamp(self, rank, event):
+        point = self.clocks[rank].points[event]
+        if point is None:
+            return None
+        a, b, constant = point
+        x, y = self.solution[rank]
+        return ceil(a * x + b * y + constant)
+
+    def report(self):
+        return {
+            "status": "jointly_realized", "device_clocks": len({clock.device_id for clock in self.clocks.values()}),
+            "causal_constraints": self.measured, "consumed_measurements": self.conditioned,
+            "clock_maps": [{"rank": rank, "device": self.clocks[rank].device_id,
+                            "endpoint_corrections_ns": [str(value) for value in corrections]}
+                           for rank, corrections in self.solution.items()],
+            "scope": "One feasible affine counter/RAW realization, rounded upward to integer nanoseconds. Original calibration uncertainty remains; this is not a unique measured trajectory.",
         }

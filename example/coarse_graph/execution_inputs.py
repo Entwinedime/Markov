@@ -10,6 +10,7 @@ from markov_adapters.pytorch import CpuTransfer
 from actions import ActionIdentity
 from ingress import IngressEvidence
 from native_case import NativeCase
+from source_clock import ClockRealization
 
 
 class NativeInputs:
@@ -17,7 +18,7 @@ class NativeInputs:
         self.capture, self.graphs, self.output = capture, graphs, output
         self.steps = defaultdict(list)
         self.cpu_posts = defaultdict(dict)
-        self.origins, self.ingress, self.windows = {}, {}, {}
+        self.origins, self.ingress = {}, {}
         self.counts = Counter()
 
     @staticmethod
@@ -32,37 +33,33 @@ class NativeInputs:
 
     @staticmethod
     def port(name, direction, window):
-        return {"port": name, "direction": direction, "window": window}
+        return {"at": {"port": name, "direction": direction}, "window": window}
 
-    def actions(self, group, source, identities, clock, origin):
+    def actions(self, group, rank, source, identities, clock, realization, origin):
         graph, evidence = source.graph, source.graph["evidence"]
         if evidence["clock"] != "monotonic_raw_ns":
             raise ValueError("native input conditions require the common RAW clock")
-        horizon = self.window(*evidence["window_ns"], origin)
-        self.windows[group] = horizon
         self.counts["unmeasured_work_finishes"] += sum(evidence["events"][work["finish"]]["time_ns"] is None for work in graph["work"])
         for index, identity in identities.items():
             scope = graph["scopes"][index]
-            ports = []
-            for port in scope["ports"]:
-                measured = clock.window(port["event"])
+            boundaries = []
+            for boundary in source.completion_boundaries(index):
+                measured = clock.window(boundary["event"])
                 if measured is None:
-
-                    # Acquisition synchronizes device tails before closing this measured observation window.
-                    condition = horizon
-                    self.counts["ports_bounded_by_observation_window"] += 1
-                else:
-                    condition = self.window(*measured, origin)
-                    self.counts["measured_ports"] += 1
-                    self.counts["calibrated_port_windows"] += measured[0] != measured[1]
-                ports.append(self.port(port["name"], port["direction"], condition))
+                    self.counts["unmeasured_boundaries"] += 1
+                    continue
+                selected = realization.timestamp(rank, boundary["event"])
+                condition = self.window(selected, selected, origin)
+                self.counts["measured_boundaries"] += 1
+                self.counts["calibrated_boundary_ranges"] += measured[0] != measured[1]
+                boundaries.append({"at": boundary["at"], "window": condition})
             entered = next(port["event"] for port in scope["ports"] if port["name"] == "call.enter")
             begin = evidence["events"][entered]["time_ns"]
             if begin is None or "work" not in identity:
                 raise ValueError("native action lacks its measured entry or complete logical identity")
             self.steps[group].append((begin, {"operation": "action", "identity": {
                 name: identity[name] for name in ("action", "parameters", "work")
-            }, "source": {"scope": index}, "service_ns": None, "ports": ports}, None))
+            }, "source": {"scope": index}, "service_ns": None, "boundaries": boundaries}, None))
 
     def input_reads(self, instance, rank, raw, aliases, requests, origin):
         if not raw["request_ingress"]:
@@ -102,7 +99,7 @@ class NativeInputs:
                 self.steps[group].append((begin, {
                     "operation": "cpu", "identity": {
                         "operation": execution["operation"], "work": ActionIdentity.work_identity(work),
-                    }, "source": {"post": list(key), "phase": "post" if position is not None else "wait"}, "service_ns": None, "ports": [
+                    }, "source": {"post": list(key), "phase": "post" if position is not None else "wait"}, "service_ns": None, "boundaries": [
                         self.port("call.enter", "input", self.window(begin, begin, origin)),
                         self.port("call.return", "output", self.window(end, end, origin)),
                     ],
@@ -146,7 +143,6 @@ class NativeInputs:
                     raw = self.read(self.capture / f"rank-{rank}.json")
                     graph = self.read(self.graphs / f"{rank}-graph.json")
                     source = evidence.observe(rank, graph, raw)
-                    self.actions(group, source, evidence.sources[rank][2], evidence.clocks[rank], origin)
                     self.input_reads(instance, rank, raw, aliases, requests, origin)
                     self.cpu(instance, rank, origin)
                 if instance["id"] not in self.ingress:
@@ -157,12 +153,16 @@ class NativeInputs:
             native_report = evidence.report(False)
             if native_report["status"] == "differences":
                 raise ValueError("native source has confirmed contradictions")
+            realization = ClockRealization(evidence.clocks, evidence.graph).solve()
+            for rank, (source, _, identities) in evidence.sources.items():
+                group = evidence.groups[rank]
+                self.actions(group, rank, source, identities, evidence.clocks[rank], realization, self.origins[group])
             actors = {}
             for group in self.origins:
                 ordered = sorted(self.steps[group], key=lambda step: step[0])
                 if len({begin for begin, _, _ in ordered}) != len(ordered):
                     raise ValueError(f"native {group} has unordered operation entries at the same RAW timestamp")
-                actors[group] = {"steps": [step for _, step, _ in ordered], "unmeasured_completion_window": self.windows[group]}
+                actors[group] = {"steps": [step for _, step, _ in ordered]}
                 for position, (_, _, post) in enumerate(ordered):
                     if post is not None:
                         key, rank = post
@@ -175,14 +175,15 @@ class NativeInputs:
                 if row[field] is not None and (name != "kv_ready" or row["remote_reservation"])
             ]
             document = {"actors": actors, "ingress": self.ingress, "notifications": notifications, "transfers": self.transfers()}
-            report.update(status="partial" if self.counts["ports_bounded_by_observation_window"] or self.counts["unmeasured_work_finishes"]
-                          or self.counts["calibrated_port_windows"]
+            report.update(status="partial" if self.counts["unmeasured_boundaries"] or self.counts["unmeasured_work_finishes"]
                           or native_report["status"] != "consistent" else "extracted",
-                          native_evidence=native_report, counts=dict(self.counts), steps={group: len(actor["steps"]) for group, actor in actors.items()})
-            (self.output / "execution-inputs.json").write_text(json.dumps(document) + "\n")
+                          native_evidence=native_report, clock_realization=realization.report(), counts=dict(self.counts),
+                          steps={group: len(actor["steps"]) for group, actor in actors.items()})
+            if report["status"] == "extracted":
+                (self.output / "execution-inputs.json").write_text(json.dumps(document) + "\n")
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
             report["error"] = str(error)
-        report["scope"] = "Checked actor operations and measured or explicit bounded time conditions. Device windows preserve a common feasible calibration envelope; separate windows do not prove one joint clock realization. No batches, query results, allocations or graph bodies are supplied. Broad observation windows retain uncertainty; no cost accuracy or unique native trajectory qualification."
+        report["scope"] = "Checked actor operations and one jointly feasible device-clock realization, rounded upward to integer nanoseconds. Original calibration ranges remain uncertain; a chosen realization is not a unique measurement. Unmeasured boundaries prevent publication; CPU wire and notification intervals remain explicit bounds. No batches, query results, allocations, graph bodies or cost accuracy are supplied."
         (self.output / "execution-inputs-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         return 0 if report["status"] == "extracted" else 1
 
@@ -193,6 +194,12 @@ class ConsumedInputs:
     def __init__(self, case, ingress):
         self.capture, self.groups, self.ingress = case.capture, case.groups, ingress
         self.sources = dict(case.sources)
+        self.clocks, self.native_graph = case.clocks, case.graph
+        self.ranks = {group: rank for rank, group in case.groups.items()}
+        self.origin_ns = ingress.origin_ns
+        self.ports, self.cpu_times = {}, {}
+        self.boundaries = defaultdict(set)
+        self.realization = None
         self.expected = None
         self.positions = Counter()
         self.pending, self.reads = {}, {}
@@ -207,7 +214,9 @@ class ConsumedInputs:
             # Original CPU entries establish order; graph scope references retain their independently checked raw origins.
             host = {int(row["name"].split("/")[1]): row["begin_raw_ns"]
                     for row in raw["host_observation"]["intervals"] if row["name"].startswith("markov.scope/")}
+            host.update({query["scope"]: query["begin_raw_ns"] for query in raw["state_queries"]})
             for index, identity in identities.items():
+                self.ports[group, index] = source.completion_boundaries(index)
                 origins = source.graph["scopes"][index]["bindings"]["source_scopes"]
                 begin = min(raw["scopes"][origin]["host_interval"]["begin_raw_ns"] if "service" in raw["scopes"][origin] else host[origin]
                             for origin in origins)
@@ -220,6 +229,7 @@ class ConsumedInputs:
                     if interval is None or not interval["execution"]["in_flow"] or (phase == "wait" and post["operation"] not in {"isend", "irecv"}):
                         continue
                     execution = interval["execution"]
+                    self.cpu_times[group, tuple(post["key"]), phase] = interval["begin_raw_ns"], interval["end_raw_ns"]
                     work = execution["work"]
                     work = {**work, "context": {**work["context"], "cpu_transfer": CpuTransfer.identity(work["context"]["cpu_transfer"])}}
                     ordered[group].append((interval["begin_raw_ns"], {
@@ -246,6 +256,7 @@ class ConsumedInputs:
         if row["kind"] == "condition_used":
             if self.expected is None:
                 self.prepare()
+                self.realization = ClockRealization(self.clocks, self.native_graph)
             group = row["group"]
             position = self.positions[group]
             record = {key: row[key] for key in ("operation", "identity", "source")}
@@ -273,9 +284,20 @@ class ConsumedInputs:
                 raise ValueError("input result belongs to a different consumed condition")
             self.input_pairs[instance][len(self.ingress.actual_reads[instance])] = source
 
-    def graph(self, group, root):
+        elif row["kind"] == "completion" and self.expected is not None:
+            raw_ns = row["time_ns"] + self.origin_ns
+            for rank, event in self.boundaries.pop(row["event"], ()):
+                if rank is None:
+                    if raw_ns != event:
+                        raise ValueError("CPU protocol completion changes its original RAW boundary")
+                else:
+                    self.realization.condition(rank, event, raw_ns)
+                self.counts["timed_boundaries"] += 1
+
+    def graph(self, group, row, contents):
         if self.expected is None:
             return None
+        root = row["graph"]["scopes"][0]
         record = self.pending.pop(group)
         if root["role"] == "cpu_service":
             execution = root["bindings"]["cpu_protocol"]["execution"]
@@ -286,6 +308,15 @@ class ConsumedInputs:
             identity = {key: value for key, value in ActionIdentity.record(root, group).items() if key != "group"}
         if record["operation"] != operation or record["identity"] != identity:
             raise ValueError("instantiated graph differs from its consumed execution condition")
+        ports = {(port["name"], port["direction"]): row["event_ids"][port["event"]] for port in root["ports"]}
+        if operation == "action":
+            for boundary in self.ports[group, record["source"]["scope"]]:
+                event = row["event_ids"][contents.boundary_event(0, boundary["at"])]
+                self.boundaries[event].add((self.ranks[group], boundary["event"]))
+        else:
+            begin, end = self.cpu_times[group, tuple(record["source"]["post"]), record["source"]["phase"]]
+            self.boundaries[ports["call.enter", "input"]].add((None, begin))
+            self.boundaries[ports["call.return", "output"]].add((None, end))
         return record["source"]["scope"] if operation == "action" else None
 
     def finish(self):
@@ -293,9 +324,10 @@ class ConsumedInputs:
             return {"status": "not_used", "verified_prefix": False,
                     "scope": "No consumed-condition witness; ordinary logical pairing only."}
         remaining = sum(len(records) - self.positions[group] for group, records in self.expected.items())
-        return {"status": "complete" if not remaining and not self.pending and not self.reads else "partial", "verified_prefix": True,
+        return {"status": "complete" if not remaining and not self.pending and not self.reads and not self.boundaries else "partial", "verified_prefix": True,
                 "checked": dict(self.counts), "unconsumed": remaining, "unbound_graphs": len(self.pending), "unreturned_reads": len(self.reads),
-                "scope": "Every consumed operation, full work identity and native reference checked in strict observed CPU order. Action references bind actual instantiated graphs. No cost accuracy or independent target generalization claim."}
+                "unfinished_measured_boundaries": len(self.boundaries), "clock_realization": self.realization.solve().report(),
+                "scope": "Consumed identities and native references checked in strict CPU order; actual named completions and CPU protocol boundaries checked against original measurements and one joint affine clock realization. No cost accuracy or independent target generalization claim."}
 
 
 def main():

@@ -1,8 +1,8 @@
 #include "markov/serving/session.hpp"
 
+#include "markov/controller/execution_inputs.hpp"
 #include "markov/execution/communication.hpp"
 #include "markov/execution/timing.hpp"
-#include "markov/controller/execution_inputs.hpp"
 
 #include <set>
 #include <stdexcept>
@@ -25,6 +25,7 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs *
     struct ReturnedAction {
         ServingAction action;
         std::map<std::string, StorageBinding> values;
+        std::size_t caller_returned;
     };
     std::map<std::size_t, ReturnedAction> pending;
     std::map<std::string, std::size_t> actions;
@@ -46,13 +47,17 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs *
             const auto events = participant.dependencies.insert(graph, timeline_, timing.work_ns, pools, timing.boundaries);
             communication.insert(graph, events, timeline_);
             const auto returned = events.at(graph.scopes.front().port("call.return", Direction::Output).event);
+            auto caller_returned = returned;
+            for (const auto & port : graph.scopes.front().ports) {
+                if (port.name == "caller.return" && port.direction == Direction::Output) caller_returned = events.at(port.event);
+            }
             ++actions[action->name];
             std::map<std::string, StorageBinding> values;
             for (const auto & port : graph.scopes.front().ports) {
                 if (port.use == PortUse::Data && port.direction == Direction::Output)
                     values.emplace(port.name, StorageBinding{ port.tensor->storage, port.tensor->version });
             }
-            pending.emplace(returned, ReturnedAction{ std::move(*action), std::move(values) });
+            pending.emplace(returned, ReturnedAction{ std::move(*action), std::move(values), caller_returned });
         }
 
         if (planning) {
@@ -92,7 +97,7 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs *
                 {          "time_ns",                                          completion->time_ns }
             });
         }
-        control_.finish(action, completion->event, completion->time_ns, returned->second.values);
+        control_.finish(action, completion->event, returned->second.caller_returned, completion->time_ns, returned->second.values);
         pending.erase(returned);
         plan = true;
     }

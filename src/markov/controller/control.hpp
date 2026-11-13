@@ -20,8 +20,8 @@ public:
 
     virtual std::optional<ServingAction> plan(std::int64_t now_ns) = 0;
 
-    // The native caller remains suspended until its action return boundary completes.
-    virtual void finish(const ServingAction & action, std::size_t returned_event, std::int64_t completed_ns,
+    // Reads expose a result at operation return, then resume their caller at its declared continuation.
+    virtual void finish(const ServingAction & action, std::size_t returned_event, std::size_t caller_returned_event, std::int64_t completed_ns,
                         const std::map<std::string, StorageBinding> & values) = 0;
 
     // An observed device boundary can wake polling even when no CPU action returns.

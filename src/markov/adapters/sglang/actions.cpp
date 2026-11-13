@@ -150,6 +150,7 @@ CoarseGraph NativeActionGraphs::build(const ServingAction & action) {
     bind_inputs(entry.frame, fields, explicit_inputs, call);
     bind_buffers(entry.frame, call);
     auto graph = library_.instantiate(entry, call);
+    if (action.name == "query") graph.scopes.front().port("caller.return", Direction::Output);
     for (const auto & port : graph.scopes.front().ports) {
         if (port.use != PortUse::Data || port.direction != Direction::Output) continue;
         const auto & tensor = *port.tensor;

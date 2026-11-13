@@ -42,7 +42,6 @@ public:
 private:
     struct Actor {
         nlohmann::json steps;
-        std::optional<TimeWindow> unmeasured_completion_window;
         std::size_t next = 0;
     };
     struct Condition {
@@ -53,6 +52,7 @@ private:
     const nlohmann::json & take(const std::string & group, const std::string & operation, const nlohmann::json & identity);
     static TimeWindow window(const nlohmann::json & record);
     static ServiceDuration service(const nlohmann::json & record);
+    static std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector);
 
     std::map<std::string, Actor> actors_;
     ControlObserver * observer_;
