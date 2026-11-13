@@ -70,14 +70,15 @@ void append_record(const char * directory, const char * record, int size, std::s
     }
 }
 
-class DriverQueueCall {
+class DriverCall {
 public:
-    explicit DriverQueueCall(const char * name, bool lifecycle = false)
+    explicit DriverCall(const char * name, bool lifecycle = false)
         : directory_(lifecycle || runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
           begin_(directory_ == nullptr ? HostTimestamp{} : host_timestamp()) {}
 
-    drvError_t finish(drvError_t result, std::uint32_t device, std::uint32_t system, std::uint32_t queue, std::uint32_t stream = 0) const {
+    drvError_t finish(drvError_t result, std::uint32_t device, std::uint32_t system, std::uint32_t queue,
+                      std::uint32_t stream = 0, std::uint32_t tasks = 0) const {
         if (directory_ == nullptr) return result;
 
         const auto end = host_timestamp();
@@ -86,7 +87,7 @@ public:
                                         sizeof(record),
                                         "{\"api\":\"%s\",\"thread\":%ld,\"begin_counter\":%llu,\"end_counter\":%llu,"
                                         "\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
-                                        "\"device\":%u,\"task_system\":%u,\"queue\":%u,\"stream\":%u,\"service\":%lld,\"result\":%d}\n",
+                                        "\"device\":%u,\"task_system\":%u,\"queue\":%u,\"stream\":%u,\"tasks\":%u,\"service\":%lld,\"result\":%d}\n",
                                         name_,
                                         syscall(SYS_gettid),
                                         static_cast<unsigned long long>(begin_.counter),
@@ -97,7 +98,33 @@ public:
                                         system,
                                         queue,
                                         stream,
+                                        tasks,
                                         static_cast<long long>(service_scope),
+                                        static_cast<int>(result));
+        append_record(directory_, record, size, sizeof(record));
+        return result;
+    }
+
+    drvError_t finish(drvError_t result, const void * source, const void * destination, std::size_t bytes) const {
+        if (directory_ == nullptr) return result;
+
+        // Driver workers need no ACL context; observing a completed transfer must not create or query one.
+        const auto end = host_timestamp();
+        char record[512];
+        const auto size = std::snprintf(record,
+                                        sizeof(record),
+                                        "{\"api\":\"%s\",\"thread\":%ld,\"begin_counter\":%llu,\"end_counter\":%llu,"
+                                        "\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,\"source\":\"%llx\",\"destination\":\"%llx\","
+                                        "\"bytes\":%zu,\"result\":%d}\n",
+                                        name_,
+                                        syscall(SYS_gettid),
+                                        static_cast<unsigned long long>(begin_.counter),
+                                        static_cast<unsigned long long>(end.counter),
+                                        static_cast<long long>(begin_.raw_ns),
+                                        static_cast<long long>(end.raw_ns),
+                                        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(source)),
+                                        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(destination)),
+                                        bytes,
                                         static_cast<int>(result));
         append_record(directory_, record, size, sizeof(record));
         return result;
@@ -111,12 +138,15 @@ private:
 
 class RuntimeCall {
 public:
-    RuntimeCall(const char * name, aclrtStream stream = nullptr, bool has_stream = false, std::size_t bytes = 0, int direction = -1, aclrtEvent event = nullptr)
+    RuntimeCall(const char * name, aclrtStream stream = nullptr, bool has_stream = false, std::size_t bytes = 0, int direction = -1,
+                aclrtEvent event = nullptr, const void * source = nullptr, const void * destination = nullptr)
         : directory_(runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
           bytes_(bytes),
           direction_(direction),
-          event_(event) {
+          event_(event),
+          source_(source),
+          destination_(destination) {
         if (directory_ == nullptr) return;
 
         static const auto get_device = original<decltype(&aclrtGetDevice)>("aclrtGetDevice");
@@ -133,13 +163,21 @@ public:
 
         const auto end = host_timestamp();
 
-        char record[512];
+        // Exact buffer ranges distinguish a completed driver transfer from staging or unrelated runtime copies.
+        char buffers[128]{};
+        if (source_ != nullptr || destination_ != nullptr) {
+            std::snprintf(buffers, sizeof(buffers), ",\"source\":\"%llx\",\"destination\":\"%llx\"",
+                          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(source_)),
+                          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(destination_)));
+        }
+
+        char record[768];
         const auto size = std::snprintf(record,
                                         sizeof(record),
                                         "{\"api\":\"%s\",\"thread\":%ld,\"begin_counter\":%llu,\"end_counter\":%llu,"
                                         "\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld,"
                                         "\"device\":%d,\"device_status\":%d,\"stream\":%d,\"stream_status\":%d,"
-                                        "\"bytes\":%zu,\"direction\":%d,\"event\":\"%llx\",\"result\":%d}\n",
+                                        "\"bytes\":%zu,\"direction\":%d,\"event\":\"%llx\",\"result\":%d%s}\n",
                                         name_,
                                         syscall(SYS_gettid),
                                         static_cast<unsigned long long>(begin_.counter),
@@ -153,7 +191,8 @@ public:
                                         bytes_,
                                         direction_,
                                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(created == nullptr ? event_ : created)),
-                                        result);
+                                        result,
+                                        buffers);
         append_record(directory_, record, size, sizeof(record));
 
         return result;
@@ -165,6 +204,8 @@ private:
     std::size_t bytes_;
     int direction_;
     aclrtEvent event_;
+    const void * source_;
+    const void * destination_;
 
     std::int32_t device_ = -1;
     std::int32_t stream_ = -1;
@@ -194,7 +235,9 @@ extern "C" void * dlsym(void * handle, const char * name) noexcept {
         std::abort();
     }
     auto * native = resolve(handle, name);
-    if (native == nullptr || handle == RTLD_NEXT || (!std::string_view(name).starts_with("aclrt") && !std::string_view(name).starts_with("halSq")))
+    const auto observed = std::string_view(name).starts_with("aclrt") || std::string_view(name).starts_with("halSq")
+                          || std::string_view(name) == "drvMemcpy" || std::string_view(name) == "halMemcpy";
+    if (native == nullptr || handle == RTLD_NEXT || !observed)
         return native;
 
     auto * candidate = resolve(RTLD_DEFAULT, name);
@@ -211,15 +254,28 @@ extern "C" void * dlsym(void * handle, const char * name) noexcept {
 
 extern "C" aclError aclrtMemcpy(void * destination, std::size_t capacity, const void * source, std::size_t bytes, aclrtMemcpyKind direction) {
     static const auto call = original<decltype(&aclrtMemcpy)>("aclrtMemcpy");
-    const RuntimeCall observation("aclrtMemcpy", nullptr, false, bytes, static_cast<int>(direction));
+    const RuntimeCall observation("aclrtMemcpy", nullptr, false, bytes, static_cast<int>(direction), nullptr, source, destination);
     return observation.finish(call(destination, capacity, source, bytes, direction));
 }
 
 extern "C" aclError aclrtMemcpyAsync(void * destination, std::size_t capacity, const void * source, std::size_t bytes, aclrtMemcpyKind direction,
                                      aclrtStream stream) {
     static const auto call = original<decltype(&aclrtMemcpyAsync)>("aclrtMemcpyAsync");
-    const RuntimeCall observation("aclrtMemcpyAsync", stream, true, bytes, static_cast<int>(direction));
+    const RuntimeCall observation("aclrtMemcpyAsync", stream, true, bytes, static_cast<int>(direction), nullptr, source, destination);
     return observation.finish(call(destination, capacity, source, bytes, direction, stream));
+}
+
+extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t capacity, DVdeviceptr source, std::size_t bytes) {
+    static const auto call = driver_original<decltype(&drvMemcpy)>("drvMemcpy");
+    const DriverCall observation("drvMemcpy");
+    return observation.finish(call(destination, capacity, source, bytes),
+                              reinterpret_cast<const void *>(source), reinterpret_cast<const void *>(destination), bytes);
+}
+
+extern "C" drvError_t halMemcpy(void * destination, std::size_t capacity, void * source, std::size_t bytes, memcpy_info * info) {
+    static const auto call = driver_original<decltype(&halMemcpy)>("halMemcpy");
+    const DriverCall observation("halMemcpy");
+    return observation.finish(call(destination, capacity, source, bytes, info), source, destination, bytes);
 }
 
 extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
@@ -301,7 +357,7 @@ extern "C" drvError_t halSqCqAllocate(std::uint32_t device, halSqCqInputInfo * i
     static const auto call = driver_original<decltype(&halSqCqAllocate)>("halSqCqAllocate");
 
     // Queue identity is established during warmup; retain its lifecycle outside the observation window.
-    const DriverQueueCall observation("halSqCqAllocate", true);
+    const DriverCall observation("halSqCqAllocate", true);
     const auto result = call(device, input, output);
     if (input->type != DRV_NORMAL_TYPE || result != DRV_ERROR_NONE) return result;
 
@@ -311,7 +367,7 @@ extern "C" drvError_t halSqCqAllocate(std::uint32_t device, halSqCqInputInfo * i
 
 extern "C" drvError_t halSqCqFree(std::uint32_t device, halSqCqFreeInfo * input) {
     static const auto call = driver_original<decltype(&halSqCqFree)>("halSqCqFree");
-    const DriverQueueCall observation("halSqCqFree", true);
+    const DriverCall observation("halSqCqFree", true);
     const auto result = call(device, input);
     if (input->type != DRV_NORMAL_TYPE || result != DRV_ERROR_NONE) return result;
     return observation.finish(result, device, input->tsId, input->sqId);
@@ -319,8 +375,9 @@ extern "C" drvError_t halSqCqFree(std::uint32_t device, halSqCqFreeInfo * input)
 
 extern "C" drvError_t halSqTaskSend(std::uint32_t device, halTaskSendInfo * input) {
     static const auto call = driver_original<decltype(&halSqTaskSend)>("halSqTaskSend");
-    const DriverQueueCall observation("halSqTaskSend");
+    const DriverCall observation("halSqTaskSend");
+    const auto tasks = input->sqe_num;
     const auto result = call(device, input);
     if (input->type != DRV_NORMAL_TYPE) return result;
-    return observation.finish(result, device, input->tsId, input->sqId);
+    return observation.finish(result, device, input->tsId, input->sqId, 0, tasks);
 }

@@ -5,7 +5,7 @@ from decimal import Decimal
 import json
 
 from markov_collection.adapters.runtimes.ascend.clock import AscendClock, HostCounter
-from markov_collection.adapters.runtimes.ascend.trace import Interval, ThreadIntervals
+from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, Interval, ThreadIntervals
 
 
 class NativeEffectEvidence:
@@ -18,6 +18,7 @@ class NativeEffectEvidence:
         counter = HostCounter(profile)
         device, = profile.glob("PROF_*/device_*")
         self.clock = AscendClock(device, native["device_clock"])
+        flips = AscendTrace.task_flips(profile)
         rows = json.loads(sdk.read_text(), parse_float=Decimal)
         self.apis = {}
         self.tasks = defaultdict(list)
@@ -39,8 +40,14 @@ class NativeEffectEvidence:
                         counter.framework_raw + round(Decimal(position - counter.anchor) * 1_000_000_000 / counter.frequency)
                     )
             if "Task Type" in args:
+                if args["Task Type"] == "PLACE_HOLDER_SQE" and (
+                    int(args["Physic Stream Id"]), int(args["Task Id"]), int(args["Batch Id"])
+                ) in flips:
+                    continue
                 self.tasks[args["connection_id"]].append(args)
-                self.task_records[int(args["Physic Stream Id"]), self.task_key(args)] = row
+                key = int(args["Physic Stream Id"]), self.task_key(args)
+                self.require(key not in self.task_records, "raw SDK repeats a physical task identity")
+                self.task_records[key] = row
             elif row.get("cat") in {"enqueue", "dequeue"}:
                 if row["cat"] == "enqueue":
                     self.enqueues[args["correlation_id"]] = interval
@@ -85,9 +92,18 @@ class NativeEffectEvidence:
         self.scopes, self.excluded = ThreadIntervals(scopes), ThreadIntervals(excluded)
         process = native["host_observation"]["process"]
         self.runtime = [json.loads(line) for line in (capture / "runtime" / f"{process}.jsonl").read_text().splitlines()]
+        self.runtime_records = {(row["thread"], row["begin_counter"]): row for row in self.runtime}
+        self.require(len(self.runtime_records) == len(self.runtime), "raw runtime repeats an API interval identity")
+        self.source_scopes = {origin: index for index, scope in enumerate(facts["scopes"])
+                              for origin in scope["bindings"]["source_scopes"]}
+        self.closed_scopes = set()
+        for scope in native["scopes"]:
+            if "service" in scope or scope["parent"] in self.closed_scopes:
+                self.closed_scopes.add(scope["id"])
 
         # Resolve actual queue generations independently of the production command interpreter.
         queues, submissions = {}, defaultdict(list)
+        self.driver_submissions = []
         for row in sorted(self.runtime, key=lambda row: row["begin_counter"]):
             if not row["api"].startswith("halSq"):
                 continue
@@ -98,7 +114,9 @@ class NativeEffectEvidence:
             elif row["api"] == "halSqCqFree":
                 del queues[key]
             elif row["api"] == "halSqTaskSend":
-                submissions[queues[key]].append(self.interval(row))
+                stream = queues[key]
+                submissions[stream].append(self.interval(row))
+                self.driver_submissions.append((stream, row))
         self.submissions = {stream: ThreadIntervals(calls) for stream, calls in submissions.items()}
 
         # Actual RAW samples override SDK reconstruction at their own coordinates, including service threads.
@@ -201,6 +219,62 @@ class NativeEffectEvidence:
                 counts["derived_state_accesses"] += len(scope["kv_accesses"]) + len(scope["slot_accesses"])
             else:
                 counts["declared_state_accesses"] += sum(len(self.native["scopes"][origin].get("state_accesses", ())) for origin in origins)
+        return dict(counts)
+
+    def inspect_services(self):
+        services = {scope["id"]: scope for scope in self.native["scopes"] if "service" in scope}
+        expected = Counter()
+        observed = set()
+
+        # Reconstruct ownership from original submissions, without reading the producer's task assignments.
+        for stream, row in self.driver_submissions:
+            if row["service"] < 0:
+                continue
+            scope = services[row["service"]]
+            matches = [index for index, call in enumerate(scope["service"]["executions"])
+                       if call["thread"] == row["thread"] and call["begin_counter"] <= row["begin_counter"]
+                       and row["end_counter"] <= call["end_counter"]]
+            self.require(len(matches) == 1, "private submission has no unique declared synchronous execution")
+            self.require(type(row["tasks"]) is int and row["tasks"] >= 0, "private submission has no valid observed SQE count")
+            expected[stream] += row["tasks"]
+            observed.add((scope["id"], matches[0]))
+
+        declared = {(scope["id"], index) for scope in services.values() for index in range(len(scope["service"]["executions"]))}
+        self.require(observed == declared, "synchronous service executions lack raw queue evidence")
+        self.require(not any(stream in expected and row["service"] < 0 for stream, row in self.driver_submissions),
+                     "private queue has unowned work outside its closed services")
+        for stream, count in expected.items():
+            self.require(sum(key[0] == stream for key in self.task_records) == count,
+                         "private queue SDK coverage differs from its actual submitted SQE counts")
+
+        return {"synchronous_services": len(services), "executions": len(declared), "private_queues": len(expected),
+                "submitted_tasks": sum(expected.values())}
+
+    def inspect_submissions(self):
+        submitted = {(row["thread"], row["begin_counter"]): stream for stream, row in self.driver_submissions}
+        logical = set()
+        for effect in self.facts["native_effects"]:
+            row = self.runtime_records[effect["thread"], effect["begin_counter"]]
+            if row["api"] in self.waits:
+                for command in effect["commands"]:
+                    if command["sdk"] is None:
+                        logical.add((effect["resource"], command["end"], row["thread"], row["begin_counter"]))
+
+        counts = Counter()
+        for edge in self.facts["dependencies"]:
+            source, target = edge["source"], edge["target"]
+            resources = [self.facts["resources"][self.facts["spans"][point["span"]]["resource"]] for point in (source, target)]
+            if edge["kind"] != "submission" or (resources[0]["kind"], resources[1]["kind"]) != ("thread", "stream"):
+                continue
+            thread = int(resources[0]["identity"].split("/")[1])
+            stream = int(resources[1]["identity"].split("/")[1])
+            resource = self.facts["spans"][target["span"]]["resource"]
+            if (resource, target["order"], thread, source["order"]) in logical:
+                counts["logical_waits"] += 1
+                continue
+            self.require(submitted.get((thread, source["order"])) == stream,
+                         "device submission uses an API entry or a different queue instead of an actual driver boundary")
+            counts["driver_boundaries"] += 1
         return dict(counts)
 
     def check_boundary(self, graph, event, resource, record, side, scope):
@@ -324,7 +398,7 @@ class NativeEffectEvidence:
                          "native completion consumer has no path from its actual producer")
         return dict(counts)
 
-    def inspect(self):
+    def inspect(self, graph):
         effects = self.facts["native_effects"]
         recorded = {(effect["thread"], effect["begin_counter"]): effect for effect in effects}
         self.require(len(recorded) == len(effects), "native effects repeat an API instance")
@@ -333,6 +407,13 @@ class NativeEffectEvidence:
         for span in self.facts["spans"]:
             spans[span["resource"]].append(span)
         for row in self.runtime:
+            if row["api"] == "aclrtMemcpy" and row["bytes"] > 0:
+                interval = self.interval(row)
+                if self.window.contains(interval):
+                    owner = self.owner(self.native_api(interval))
+                    if owner is not None and owner not in self.closed_scopes:
+                        self.inspect_transfer(owner, row, spans, graph)
+                        counts["synchronous_copies"] += 1
             copy = row["api"] == "aclrtMemcpyAsync" and row["bytes"] > 0
             if not copy and row["api"] not in self.waits:
                 continue
@@ -341,7 +422,7 @@ class NativeEffectEvidence:
                 continue
             api = self.native_api(interval)
             owner = self.owner(api)
-            if owner is None:
+            if owner is None or owner in self.closed_scopes:
                 continue
             key = row["thread"], row["begin_counter"]
             expected.add(key)
@@ -351,7 +432,6 @@ class NativeEffectEvidence:
             self.require(row["result"] == 0 and row["stream_status"] == 0, "raw stream operation failed or has no stream identity")
             self.require((effect["source_scope"], effect["connection"]) == (owner, connection), "native effect changes its API or owner")
             resource = self.facts["resources"][effect["resource"]]
-            self.require((resource["kind"], resource["identity"]) == ("stream", f"stream/{stream}"), "native effect changes stream")
             tasks = self.tasks.get(connection, [])
             if copy and not tasks:
                 submitted = self.submissions_inside(interval, stream)
@@ -362,7 +442,26 @@ class NativeEffectEvidence:
                         candidates.append(group)
                 self.require(len(candidates) <= 1, "native copy has ambiguous enclosing device work")
                 tasks = candidates[0] if candidates else []
-                counts["enclosing_group_copies" if tasks else "native_only_copies"] += 1
+                counts["enclosing_group_copies" if tasks else "host_completed_copies"] += 1
+            witness = effect["completion"]
+            completed = None
+            if copy and not tasks:
+                self.require(witness is not None, "unmatched copy has no raw completion witness")
+                completed = self.runtime_records[witness["thread"], witness["begin_counter"]]
+                self.require(completed["api"] == witness["api"] and completed["api"] in {"drvMemcpy", "halMemcpy"}
+                             and completed["thread"] == row["thread"] and completed["result"] == 0
+                             and row["begin_counter"] <= completed["begin_counter"] <= completed["end_counter"] <= row["end_counter"]
+                             and all(completed[key] == row[key] for key in ("source", "destination", "bytes")),
+                             "copy completion does not witness a synchronous transfer of the actual buffers")
+            else:
+                self.require(witness is None, "queued work or stream wait claims an unrelated host-copy completion")
+            if completed is not None:
+                host = self.inspect_transfer(owner, completed, spans, graph)
+                self.require(effect["resource"] == host and not effect["commands"],
+                             "synchronous transfer invents a stream command or changes its actual caller")
+                counts["copies"] += 1
+                continue
+            self.require((resource["kind"], resource["identity"]) == ("stream", f"stream/{stream}"), "native effect changes stream")
             self.require(all(int(task["Physic Stream Id"]) == stream for task in tasks), "native effect's SDK tasks change stream")
             expected_tasks = Counter(self.task_key(task) for task in tasks) if tasks else Counter({None: 1})
             self.require(Counter(self.task_key(command["sdk"]) if command["sdk"] is not None else None
@@ -384,6 +483,33 @@ class NativeEffectEvidence:
         self.require(set(recorded) == expected, "effect evidence contains an unobserved or auxiliary operation")
         self.check_sdk_order(coordinates)
         return dict(counts)
+
+    def inspect_transfer(self, source_scope, completed, spans, graph):
+        scope = self.source_scopes[source_scope]
+        resources = self.facts["resources"]
+        host, = [index for index, resource in enumerate(resources)
+                 if (resource["kind"], resource["identity"]) == ("thread", f"thread/{completed['thread']}")]
+        begin, end = completed["begin_counter"], completed["end_counter"]
+        self.require(any(span["scope"] == scope and span["kind"] == "transfer"
+                         and (span["begin"], span["end"]) == (begin, end) for span in spans[host]),
+                     "synchronous copy loses its caller transfer interval")
+        self.require(any(first <= begin < end <= last for first, last in resources[host]["payload"]),
+                     "synchronous transfer is absent from its caller payload")
+        raw = self.native["scopes"][source_scope]
+        while "device_entry" not in raw and raw["parent"] is not None:
+            raw = self.native["scopes"][raw["parent"]]
+        if "device_entry" not in raw:
+            return host
+
+        owner = self.source_scopes[raw["id"]]
+        port, = [port for port in self.facts["scopes"][owner]["ports"] if port["name"] == "device.complete"]
+        published, = [port for port in graph["scopes"][owner]["ports"] if port["name"] == "device.complete"]
+        self.check_device_end(graph, published["event"], self.point_connection(raw["device_return"]), "EVENT_RECORD")
+        self.require(any(edge["kind"] == "signal" and edge["target"] == port["at"]
+                         and self.facts["spans"][edge["source"]["span"]]["resource"] == host and edge["source"]["order"] == end
+                         for edge in self.facts["dependencies"]),
+                     "synchronous transfer has no readiness edge to its actual enclosing return fence")
+        return host
 
     def check_sdk_order(self, coordinates):
         ordered = []

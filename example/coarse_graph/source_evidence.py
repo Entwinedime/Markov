@@ -249,12 +249,16 @@ class ProductionEvidence:
                 native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
                 measurements = native_evidence.inspect_measurements()
                 boundaries = native_evidence.inspect_boundaries(graph)
-                effects = native_evidence.inspect()
+                services = native_evidence.inspect_services()
+                submissions = native_evidence.inspect_submissions()
+                effects = native_evidence.inspect(graph)
                 signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank])
                 report = SourceEvidence(facts, graph, native["device_clock"], self.details).inspect()
                 report["native_effects"] = effects
                 report["native_measurements"] = measurements
                 report["native_boundaries"] = boundaries
+                report["native_services"] = services
+                report["native_submissions"] = submissions
                 report["native_signals"] = signals
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
 
@@ -275,13 +279,13 @@ class ProductionEvidence:
         (self.output / "source-evidence.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
         lines = [
             "# 来源证据检查", "", "本检查核对原始声明、解释结果与粗图的环境、调用层级与上下文、通信声明、规则保留、完整工作/顺序区间、边界及其语义归属、几何、依赖和状态访问，以及实测时间是否满足图中因果；工作区间不能遗漏或重复，等待和无载荷区间保留顺序而不计为工作。不证明原生插桩完整、规则对目标配置成立、模板泛化或目标预测正确。",
-            "", "原生作用检查直接读取同次运行的 SDK API、设备任务、runtime 及队列生命周期：核对非零异步拷贝和 stream 等待的完整交接；嵌套 API 只有在原始提交相同且归属一致时才共用设备工作。没有 SDK 任务的拷贝仍须保留工作，不因此获得测量时间。",
-            "", "| rank | 来源映射 | 原生拷贝 / 流等待 | 校准约束 | 名义时间倒置数 | 最大名义倒置/ns |", "| --- | --- | ---: | --- | ---: | ---: |",
+            "", "原生作用检查直接读取同次运行的SDK API、设备任务、runtime及队列生命周期。真实设备工作由SDK或相同实际提交组关联；缺SDK任务的拷贝必须有原缓冲区同步driver传输见证，费用在调用方，不生成stream命令。显式同步拷贝也核对调用方传输区间，完成关系连到真实的调用返回fence。",
+            "", "| rank | 来源映射 | 异步拷贝 / 同步拷贝 / 流等待 | 校准约束 | 名义时间倒置数 | 最大名义倒置/ns |", "| --- | --- | ---: | --- | ---: | ---: |",
         ]
         labels = {"consistent": "一致", "compatible": "校准范围内相容", "inconsistent": "不存在共同校准", "incomplete": "缺少测量", "unverified": "未能核对"}
         for report in reports:
             effects = report.get("native_effects")
-            native_counts = f"{effects.get('copies', 0)} / {effects.get('stream_waits', 0)}" if effects is not None else "—"
+            native_counts = f"{effects.get('copies', 0)} / {effects.get('synchronous_copies', 0)} / {effects.get('stream_waits', 0)}" if effects is not None else "—"
             lines.append(
                 f"| {report['rank']} | {labels[report['mapping']]} | {native_counts} | {labels[report['timing']['status']]} | "
                 f"{report.get('counts', {}).get('time_inversion', '—')} | {report.get('maximum_inversion_ns', '—')} |"
@@ -292,11 +296,13 @@ class ProductionEvidence:
             elif "native_boundaries" in report:
                 boundaries, signals = report["native_boundaries"], report["native_signals"]
                 measurements = report["native_measurements"]
+                services = report["native_services"]
                 lines.extend([
                     "", f"rank {report['rank']}：从原始记录核对主机时间点 {measurements['checked_host_measurements']} 个；"
-                    f"没有SDK设备任务的原生动作所派生的端点 {measurements['unmeasured_device_endpoints']} 个仍无设备时间，未用主机调用时间替代。"
+                    f"未测stream边界 {measurements['unmeasured_device_endpoints']} 个；同步传输保留driver主机时间，设备返回fence保留真实SDK时间。"
                     f"核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
                     f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
+                    f"闭合服务 {services['synchronous_services']} 个、私有队列 {services['private_queues']} 条、原始下发任务 {services['submitted_tasks']} 项；"
                     f"SDK 完成导出 {signals.get('exported_completions', 0)} 处、实际等待 {signals.get('signal_waits', 0)} 处、"
                     f"返回 true 的完成读取 {signals.get('true_completion_reads', 0)} 处。"
                     f"地址派生的 PD 状态访问 {boundaries.get('derived_state_accesses', 0)} 项需由池/传输证据另行核对。",

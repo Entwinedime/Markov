@@ -67,6 +67,8 @@ class ServiceExecutions:
             row = native.record
             if row["service"] < 0:
                 continue
+            if type(row["tasks"]) is not int or row["tasks"] < 0:
+                raise ValueError("private queue submission requires its observed nonnegative SQE count")
             matches = [
                 (index, call) for index, call in enumerate(self.executions)
                 if call.scope == row["service"] and call.thread == native.thread
@@ -98,9 +100,14 @@ class ServiceExecutions:
             if any(left[0].end > right[0].begin for left, right in zip(submissions, submissions[1:])):
                 raise ValueError("concurrent private-queue submissions have no established order")
 
-            # This transport submits one SQE per driver call; its registered queue supplies correspondence, not host/device clocks.
+            # Driver submission sizes define correspondence, independently of CPU/device clock calibration.
             payload = sorted(grouped[stream], key=lambda task: task.begin)
-            if len(payload) != len(submissions):
-                raise ValueError(f"private queue {stream} submission/task coverage differs: {len(submissions)}/{len(payload)}")
-            for task, (_, execution) in zip(payload, submissions, strict=True):
-                task.service = self.executions[execution].scope
+            expected = sum(native.record["tasks"] for native, _ in submissions)
+            if len(payload) != expected:
+                raise ValueError(f"private queue {stream} submission/task coverage differs: {expected}/{len(payload)}")
+            position = 0
+            for native, execution in submissions:
+                count = native.record["tasks"]
+                for task in payload[position:position + count]:
+                    task.service = self.executions[execution].scope
+                position += count

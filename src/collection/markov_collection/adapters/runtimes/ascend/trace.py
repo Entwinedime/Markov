@@ -111,6 +111,10 @@ class AscendTrace:
     def __init__(self, profile: Path, runtime: Path, raw: dict, trace: Path) -> None:
         native_points = {index for index, point in enumerate(raw["points"]) if point["side"] == "signal"}
         services = [scope for scope in raw["scopes"] if "service" in scope]
+        self.closed_scopes = set()
+        for scope in raw["scopes"]:
+            if "service" in scope or scope["parent"] in self.closed_scopes:
+                self.closed_scopes.add(scope["id"])
         host_observation = raw["host_observation"]
 
         # Host counters and stream ordinals establish order; both native and SDK times reach the common RAW clock.
@@ -156,7 +160,7 @@ class AscendTrace:
                     raise ValueError(f"duplicate device point marker: {identity}")
                 self.points[identity] = interval
 
-                # Exported native Event.record is business work; only inserted observer fences are auxiliary.
+                # Native Event.record exports a completion boundary; inserted observer fences have no business owner.
                 if identity not in native_points:
                     self.excluded.append(interval)
             elif name in {"markov.observer", "markov.auxiliary"}:

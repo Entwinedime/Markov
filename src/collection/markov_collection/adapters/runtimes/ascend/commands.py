@@ -14,8 +14,8 @@ class NativeStreamCall:
     api: Interval
     stream: int
     scope: int
-    kind: str
     native: Interval
+    completion: Interval | None = None
 
 
 @dataclass
@@ -38,7 +38,7 @@ class StreamCommands:
         self.native_calls: list[NativeStreamCall] = []
         self.effects: dict[int, list[StreamCommand]] = {}
         self.order_commands()
-        self.payload = [command for command in self.commands if isinstance(command.source, DeviceTask) or command.source.kind == "device"]
+        self.payload = [command for command in self.commands if isinstance(command.source, DeviceTask)]
         self.submission_frontiers()
 
     def task(self, task: DeviceTask) -> StreamCommand:
@@ -61,11 +61,11 @@ class StreamCommands:
 
             origin = trace.origin(api)
             owner = trace.owner(origin)
-            if owner is None or trace.excluded_ranges.enclosing(origin) is not None:
+            if owner is None or owner in trace.closed_scopes or trace.excluded_ranges.enclosing(origin) is not None:
                 continue
             if native.record["stream_status"] != 0:
                 raise ValueError("native stream operation has no observed stream identity")
-            call = NativeStreamCall(api, native.record["stream"], owner, "device" if copy else "wait", native)
+            call = NativeStreamCall(api, native.record["stream"], owner, native)
             self.native_calls.append(call)
             if copy:
                 tasks = trace.tasks.get(connection) or self.covering_group(call)
@@ -75,7 +75,11 @@ class StreamCommands:
                     covered[connection] = tasks
                     continue
 
-            # An unrepresented nonzero copy remains work even without a measured SDK task.
+                call.completion = self.copy_completion(call)
+                self.effects[connection] = []
+                continue
+
+            # Only actual queue operations receive stream coordinates; synchronous copies remain on their caller.
             calls[call.stream].append(call)
             connections.add(connection)
 
@@ -139,6 +143,18 @@ class StreamCommands:
         for connection, tasks in covered.items():
             self.effects[connection] = [self.task(task) for task in tasks]
 
+    def copy_completion(self, source: NativeStreamCall) -> Interval:
+        row = source.native.record
+        copies = [call for call in self.trace.runtime_ranges.inside(source.native)
+                  if call.record["api"] in {"drvMemcpy", "halMemcpy"}
+                  and all(call.record[key] == row[key] for key in ("source", "destination", "bytes"))]
+        if not copies:
+            raise ValueError(f"copy in scope {source.scope} "
+                             "has neither correlated device work nor an observed synchronous transfer of its buffers")
+
+        # Staging copies have different addresses. A successful synchronous copy of the full range proves visibility.
+        return max(copies, key=lambda call: call.end)
+
     def covering_group(self, call: NativeStreamCall) -> list[DeviceTask]:
         trace = self.trace
         submissions = trace.queues.inside(call.native, call.stream)
@@ -165,8 +181,10 @@ class StreamCommands:
         for command in self.commands:
             source = command.source
             if isinstance(source, NativeStreamCall):
-                submitted[command.stream].append((source.native.end, command))
-                submitting.append(Interval(source.native.begin, source.native.end, command.stream, {}))
+                physical = trace.tasks.get(source.api.record["args"]["connection_id"])
+                begin, end = trace.queues.window(source.api, command.stream) if physical else (source.native.begin, source.native.end)
+                submitted[command.stream].append((end, command))
+                submitting.append(Interval(begin, end, command.stream, {}))
                 continue
             connection = source.record["args"]["connection_id"]
             if source.service is None and connection in trace.apis and connection not in trace.observer_connections and not trace.auxiliary(source) and not trace.outside_window(source):
@@ -218,7 +236,11 @@ class StreamCommands:
                 })
             records.append({
                 "thread": call.native.thread, "begin_counter": call.native.begin, "connection": connection,
-                "source_scope": call.scope, "resource": resources["stream", call.stream], "commands": commands,
+                "source_scope": call.scope,
+                "resource": resources["thread", call.completion.thread] if call.completion else resources["stream", call.stream],
+                "commands": commands,
+                "completion": {key: call.completion.record[key] for key in ("api", "thread", "begin_counter")}
+                              if call.completion else None,
             })
         return records
 
@@ -237,7 +259,7 @@ class StreamCommands:
             physical = [source] if isinstance(source, DeviceTask) else trace.tasks.get(source.api.record["args"]["connection_id"], [])
             interval = trace.device_interval(physical[0].record) if physical else None
 
-            # Missing SDK timestamps remain unknown even when native semantics prove stream work.
+            # Only real SDK tasks provide device timestamps. Unmeasured waits remain pure boundaries.
             clocks[command.stream, command.begin] = interval.begin if interval else None
             clocks[command.stream, command.end] = interval.end if interval else None
 
