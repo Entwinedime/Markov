@@ -30,9 +30,8 @@ SGLang 的 semantic base 只生产必要 probe 和客户端观察，diagnostic �
 只有 profiler 就绪的来源可以进入详细源图与静态原成本诊断，不能把语义采集的完成当成完整原生观察资格。
 
 采集工作流按框架选择适配器，设备任务仍只有一个所有者；HTTP 客户端、文本编码、服务就绪和进程组回收共用，
-框架适配器只处理原生模型、观察、配置和产物发布。KTransformers 的 dense/Torch 入口使用真实原生线性算子，
-同步阶段及其数据适配留在框架目录，不反向改变 SGLang 执行或共用核心。
-该适配器按 workload 和目标分块规则产生工作，交给共同的串行程序、成本查询和事件执行器；没有第二套仿真时钟。
+框架适配器只处理原生模型、观察、配置和产物发布。KTransformers 的 DeepSeek-V4-Flash 部署由 SGLang 服务和 KT-Kernel 协作；
+其采集、工作变换和成本响应尚未建立，不使用旧 dense/Torch 的同步阶段规则。
 串行程序只负责封闭同步工作的依赖与请求端口，不识别框架、模型、attention 后端或 HiCache。
 分布式与非分布式导出共用 Ascend 时钟换算，非分布式调用者显式提供进程身份，不依靠猜测 rank 或内部版本判断。
 
@@ -261,7 +260,7 @@ docker/                    各框架与 modeling 环境
 
 C++ 以 `src` 为 include 根，使用 `markov/<职责>/<文件>.hpp`，不维护平行 include 树或转发头。
 依赖由外围 workflow 经 adapters 指向 core；Python 编排不实现缓存状态机或时序算法；C++ 核心不导入 Python 应用、数据库训练或 target evaluator。
-SGLang 与 KTransformers 共享图、成本接口和仿真；HiCache 规则只由 SGLang 适配器启用。
+HiCache 规则只由 SGLang 适配器启用；新 KTransformers 部署尚不支持共同图与成本预测。
 框架和 runtime 使用组合，不能让共享核心反向依赖某个第三方源码树。
 研究矩阵、留出划分及跨运行汇总放在 examples；正式流程只维护单任务和通用评价能力。
 原生观察所需的环境补丁与依赖声明归适配器维护，third_party 工作树保持上游内容。
@@ -269,6 +268,6 @@ SGLang 与 KTransformers 共享图、成本接口和仿真；HiCache 规则只�
 ## 先支持什么
 
 首轮恢复现有已验证部署的 SGLang HiCache、受控串行请求、Prefill/Decode、完整 HTTP 和原实验面板。
-KTransformers 恢复正式采集适配、manifest、普通 DAG 与仿真；不伪造 HiCache。
+KTransformers 首先恢复 DeepSeek-V4-Flash 运行；该部署的采集与仿真须另行建立，不伪造 HiCache。
 NodeScale 保留，默认关闭；源静态回放与现行规则下的显式静态 oracle-cost 诊断保留。
 跨模型、TP、平台、后端、并发组批及新的执行模式分别声明支持条件；结构可变换不自动证明成本可外推。

@@ -1,5 +1,4 @@
 #include "markov/adapters/source.hpp"
-#include "markov/adapters/ktransformers/observations.hpp"
 
 #include "markov/adapters/ascend/trace.hpp"
 #include "markov/adapters/probes.hpp"
@@ -75,7 +74,6 @@ PreparedSource prepare_source(trace_graph::source::ProfileManifest manifest, con
                                                        sglang::read_deterministic_sampling(manifest.configuration_path),
                                                        manifest.configuration_path,
                                                        detail == SourceDetail::Native);
-    else if (manifest.framework == "ktransformers") probes = std::make_unique<ktransformers::ProbeReader>(observations, manifest.configuration_path);
     else throw std::runtime_error("Framework probe interpretation is not implemented for " + manifest.framework);
     std::vector<std::size_t> counts;
     std::vector<std::size_t> skipped;

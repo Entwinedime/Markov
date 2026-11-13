@@ -1,43 +1,31 @@
-FROM quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11 AS dependencies
+FROM quay.io/ascend/sglang@sha256:5ed0acf504181fe092f9badbd8f77611b985ec65df0f93b66ab4b9616231f70b
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG BUILD_JOBS=2
 ENV DEBIAN_FRONTEND=noninteractive \
-    TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-    MAX_JOBS=${BUILD_JOBS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
-    USE_BALANCE_SERVE=1 \
-    KTRANSFORMERS_FORCE_BUILD=TRUE \
-    TASK_QUEUE_ENABLE=0
+    DSV4_WORKSPACE=/opt/dsv4 \
+    KTRANSFORMERS_REPO=/opt/dsv4/ktransformers \
+    SGLANG_REPO=/opt/dsv4/sglang \
+    DSV4_MODEL_ROOT=/models \
+    DSV4_SOC=ascend910b \
+    DSV4_JOBS=8
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build patch pkg-config \
-        libnuma-dev libhwloc-dev libtbb-dev libaio-dev libcurl4-openssl-dev libssl-dev \
+       build-essential cmake git libhwloc-dev libhwloc15 libnuma-dev patchelf pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Keep the SDK/PyTorch ABI pair together; the modeling image has neither.
-RUN python3 -m pip install --no-cache-dir "setuptools<80" wheel==0.45.1 \
-    && python3 -m pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu \
-    && python3 -m pip install --no-cache-dir \
-        torch-npu==2.6.0.post5 numpy==1.26.4 transformers==4.57.1 \
-        packaging ninja pybind11 fastapi uvicorn "langchain<0.4" blessed accelerate \
-        sentencepiece openai colorlog fire protobuf tiktoken blobfile pyzmq psutil \
-        pyyaml scipy decorator attrs sqlalchemy
+RUN git init "$KTRANSFORMERS_REPO" \
+    && git -C "$KTRANSFORMERS_REPO" remote add origin https://github.com/kvcache-ai/ktransformers.git \
+    && git -C "$KTRANSFORMERS_REPO" fetch --depth 1 origin ca198c50de70abb6827ba6f573bb6671e54436e2 \
+    && git -C "$KTRANSFORMERS_REPO" checkout --detach FETCH_HEAD \
+    && git -C "$KTRANSFORMERS_REPO" submodule update --init --depth 1 third_party/llama.cpp third_party/pybind11 \
+    && git init "$SGLANG_REPO" \
+    && git -C "$SGLANG_REPO" remote add origin https://github.com/Pan-Boyi/sglang.git \
+    && git -C "$SGLANG_REPO" fetch --depth 1 origin ff46d660d16cbf11ef393c80cc6b3ab7f6259780 \
+    && git -C "$SGLANG_REPO" checkout --detach FETCH_HEAD
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN bash "$KTRANSFORMERS_REPO/kt-kernel/tools/ascend_dsv4/setup.sh" deps \
+    && bash "$KTRANSFORMERS_REPO/kt-kernel/tools/ascend_dsv4/setup.sh" kt-kernel
 
-FROM dependencies AS runtime
-COPY third_party/ktransformers/archive /opt/ktransformers
-COPY python/markov/adapters/ktransformers/ascend/build.patch /tmp/ktransformers-build.patch
-WORKDIR /opt/ktransformers
-RUN patch -p1 < /tmp/ktransformers-build.patch \
-    && export TORCH_NPU_PATH="$(python3 -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("torch_npu").origin).parent)')" \
-    && python3 -m pip install --no-deps --no-build-isolation . \
-    && rm -f /tmp/ktransformers-build.patch
-
-ENV OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2
-WORKDIR /workspace/markov
+WORKDIR /opt/dsv4
 CMD ["bash"]

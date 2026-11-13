@@ -1,5 +1,4 @@
 #include "markov/adapters/prediction.hpp"
-#include "markov/adapters/ktransformers/prediction.hpp"
 #include "markov/trace_graph/planning/cache_program.hpp"
 
 #include <algorithm>
@@ -38,17 +37,6 @@ PreparedPrediction prepare_prediction(const std::filesystem::path & path) {
     const auto captured = Json::parse(config);
     if (captured.at("deployment") != raw.at("deployment")) throw std::runtime_error("Base capture belongs to a different deployment");
     const auto & base = captured.at("server").at("arguments");
-    if (manifest.framework == "ktransformers") {
-        auto source = prepare_source(manifest, std::nullopt, SourceDetail::Regions);
-        auto targets = ktransformers::prepare_targets(raw, captured, source.context);
-        return { std::move(source),
-                 std::move(selected),
-                 models_path,
-                 initial == "empty" ? trace_graph::planning::KernelCacheInitial::Empty : trace_graph::planning::KernelCacheInitial::Prepared,
-                 std::move(targets),
-                 std::move(scaling),
-                 raw.value("record_graph", false) };
-    }
     if (manifest.framework != "sglang") throw std::runtime_error("No prediction adapter for " + manifest.framework);
     if (base.value("disable_radix_cache", false))
         throw std::runtime_error("Regional prediction requires an active radix cache; cache-disabled scheduling is not restored");

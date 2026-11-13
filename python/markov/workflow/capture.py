@@ -40,6 +40,8 @@ class InferenceCapture:
         )
 
     def run(self, recapture: bool = False, reuse: bool = False) -> dict:
+        if self.request.deployment.framework != "sglang":
+            raise ValueError(f"Inference capture does not support framework {self.request.deployment.framework}")
         if self.request.base.manifest is not None:
             if not self.profiling:
                 raise ValueError("Normal measurement requires base.configuration; a trace is not a normal observation")
@@ -53,15 +55,7 @@ class InferenceCapture:
             raise ValueError("Inference capture currently supports the Ascend runtime")
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
             raise ValueError("Single-host capture needs one declared device per tensor-parallel rank")
-        if self.semantic and self.request.deployment.framework != "sglang":
-            raise ValueError("Semantic-only base capture currently supports SGLang")
-
-        if self.request.deployment.framework == "sglang":
-            from markov.adapters.sglang import capture as adapter
-        elif self.request.deployment.framework == "ktransformers":
-            from markov.adapters.ktransformers import capture as adapter
-        else:
-            raise ValueError("Inference capture does not support this framework")
+        from markov.adapters.sglang import capture as adapter
 
         workload = self.workload if self.workload is not None else Workload.load(self.request.workload)
         if self.calibration and self.request.base.configuration.get("hicache_transfer_bandwidth") is not None:
@@ -91,14 +85,11 @@ class InferenceCapture:
         model = Path(self.request.deployment.model)
         if not model.is_absolute() or not model.is_dir():
             raise ValueError("Inference capture needs deployment.model to name an absolute local model directory")
-        if self.request.deployment.framework == "sglang":
-            environment = adapter.capture_environment(
-                self.profiling and not self.semantic,
-                self.calibration or self.record_regions,
-                semantic=self.semantic,
-            )
-        else:
-            environment = adapter.capture_environment(self.profiling, self.calibration or self.record_regions)
+        environment = adapter.capture_environment(
+            self.profiling and not self.semantic,
+            self.calibration or self.record_regions,
+            semantic=self.semantic,
+        )
         payload = {
             "deployment": asdict(self.request.deployment),
             "server": server,

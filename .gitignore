@@ -43,3 +43,6 @@ output_graph.json
 
 # Local reference implementation; preserved in Git history
 /deprecated/
+
+# Retained local legacy checkout; the current image uses pinned upstream sources.
+/third_party/ktransformers/

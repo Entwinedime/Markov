@@ -11,6 +11,8 @@ from markov.artifacts.workload import Workload
 
 def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
     """Describe known inputs; dynamic work and model coverage remain unexamined."""
+    if request.deployment.framework != "sglang":
+        raise ValueError(f"Prediction does not support framework {request.deployment.framework}")
     workload = Workload.load(request.workload)
     if request.base.manifest is not None:
         request.base.manifest.stat()

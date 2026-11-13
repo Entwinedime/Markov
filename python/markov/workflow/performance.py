@@ -21,11 +21,9 @@ from markov.adapters.sglang import (
     scheduler_measurements,
 )
 from markov.adapters.ascend import tensor_device_measurements, tensor_measurements, tensor_queue_measurements
-from markov.adapters.ktransformers import measurements as ktransformers_measurements
 
 
 ADAPTERS = {
-    "ktransformers_phases": ktransformers_measurements,
     "sglang_cache_io": cache_measurements,
     "sglang_cache_controls": cache_control_measurements,
     "sglang_file_workers": file_measurements,

@@ -8,8 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前正式入口已运行限定范围的 SGLang 主机/文件回访，以及 KTransformers dense 的 self、分块 Prefill 和 SDPA。
-两框架的完整请求预测已接通；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
+当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 正在切换到 DeepSeek-V4-Flash 单 NPU 运行流程，其采集和预测尚不支持。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
 
 ## 怎样运行
 
@@ -87,12 +86,45 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 显式诊断运行 `scripts/markov.sh replay --request /path/to/replay.json`，可选源图，或打开 execution.record_graph 后保存的目标执行图。
 回放可替换明确节点成本、缩放已有工作；它固定已有路径，不重新选择时间分支，也不自动匹配 target 真实成本。
 独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
-SGLang target 采集加 `--record-regions`，KTransformers 默认记录同步阶段；评价器单独编译，不进入预测/训练流程。
+SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
-SGLang 与 KTransformers 共用采集任务、预算、manifest、源图回放与性能库，HiCache 只属于 SGLang。
-KTransformers 单 NPU dense/Torch 入口已接通真实来源、独立阶段/控制成本、共享准备及完整 HTTP 预测。
-分块规则生成额外阶段，沿用共同执行器；仅支持 empty 初始化，HTTP 外层残余及首次使用仍有近似。
-采集示例为 [ktransformers_capture.json](configs/ktransformers_capture.json)，修改模型、设备和预算后可直接 predict，或单独执行 capture、measure、calibrate。
+HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；运行复现和模型加载正在验证，不支持采集、成本建模或预测。
+
+### DeepSeek-V4-Flash 单 NPU 运行
+
+此部署使用 910B3 单卡、CANN 9 和 CPU 专家；按当前权重清单及单层转换大小估算，准备 W8A8、官方 checkpoint 与全部 GGUF 需要约 600 GB（560 GiB）空间，另留构建和临时文件余量。以下流程的完整模型运行仍在验证中。权重下载直接访问 ModelScope，不使用代理；连接失败时保留 `.part` 文件，可用同一命令续传。
+
+先将 `DSV4_HOST_MODELS` 改成有足够空间的绝对路径，获取固定版本的文件清单和权重：
+
+```bash
+DSV4_HOST_MODELS=/absolute/path/to/models
+mkdir -p "$DSV4_HOST_MODELS"
+curl -q --noproxy '*' -fsSL 'https://www.modelscope.cn/api/v1/models/sgl-npu/DeepSeek-V4-Flash-W8A8/repo/files?Revision=6f4a67e00656c0c8410fcf7ec670bb3f304a0125&Recursive=true' -o "$DSV4_HOST_MODELS/w8a8-files.json"
+python3 scripts/download_dsv4_weights.py sgl-npu/DeepSeek-V4-Flash-W8A8 6f4a67e00656c0c8410fcf7ec670bb3f304a0125 "$DSV4_HOST_MODELS/w8a8-files.json" "$DSV4_HOST_MODELS/DeepSeek-V4-Flash-W8A8"
+
+# 若已有经核验的 43 层 GGUF，可跳过原始 checkpoint 的下载和后面的 gguf 转换。
+curl -q --noproxy '*' -fsSL 'https://www.modelscope.cn/api/v1/models/deepseek-ai/DeepSeek-V4-Flash/repo/files?Revision=4e9bb2457e147f6ebfe2a46f3df047dc9869e224&Recursive=true' -o "$DSV4_HOST_MODELS/native-files.json"
+python3 scripts/download_dsv4_weights.py deepseek-ai/DeepSeek-V4-Flash 4e9bb2457e147f6ebfe2a46f3df047dc9869e224 "$DSV4_HOST_MODELS/native-files.json" "$DSV4_HOST_MODELS/DeepSeek-V4-Flash"
+```
+
+下载器按清单逐文件校验大小和 SHA-256。然后构建镜像、选择空闲物理设备并启动容器；容器内该设备为逻辑 0：
+
+```bash
+docker build -t markov-ktransformers:dsv4 -f docker/ktransformers/Dockerfile .
+docker run -d --name markov-dsv4 --runtime ascend --network host --ipc host \
+  --ulimit memlock=-1 --ulimit stack=67108864 -e ASCEND_VISIBLE_DEVICES=0 \
+  --env-file configs/ktransformers.env.example \
+  --mount type=bind,source=/usr/local/Ascend/driver,target=/usr/local/Ascend/driver,readonly \
+  --mount "type=bind,source=$DSV4_HOST_MODELS,target=/models" \
+  markov-ktransformers:dsv4 sleep infinity
+docker exec markov-dsv4 bash /opt/dsv4/ktransformers/kt-kernel/tools/ascend_dsv4/setup.sh gguf
+docker exec markov-dsv4 bash /opt/dsv4/ktransformers/kt-kernel/tools/ascend_dsv4/setup.sh check
+docker exec markov-dsv4 bash /opt/dsv4/ktransformers/kt-kernel/tools/ascend_dsv4/serve.sh
+timeout 3600 bash -c 'until curl -sf --max-time 5 --noproxy "*" http://127.0.0.1:18080/health >/dev/null; do sleep 30; done'
+docker exec markov-dsv4 bash /opt/dsv4/ktransformers/kt-kernel/tools/ascend_dsv4/verify.sh
+```
+
+`setup.sh check` 须先返回 `PREFLIGHT OK`，服务日志在模型目录的 `dsv4-logs/serve.log`。验证后可通过本机 `http://127.0.0.1:18080/v1/chat/completions` 调用，停止容器使用 `docker stop markov-dsv4`。已有可核验的 43 层 GGUF 时，可将其放在模型目录的 `cache/`，避免重复转换。
 
 ## 文档与目录
 

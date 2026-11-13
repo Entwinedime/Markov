@@ -1,6 +1,6 @@
 # 用户输入与正式流程
 
-本文定义用户输入、准备行为和结果合同。正式入口支持限定的串行 SGLang/Ascend 与 KTransformers dense/Torch 路径；规则或成本不足时明确保留缺口。
+本文定义用户输入、准备行为和结果合同。正式预测入口支持限定的串行 SGLang/Ascend 路径；规则或成本不足时明确保留缺口。
 
 ## 完整预测
 
@@ -117,8 +117,7 @@ recommended 与 worst_within_budget 分别为不超过 baseline 小时费用时�
 运行 evaluate --request 时提供 prediction、target（报告中的条件名）、manifest（真实 target profile）、output，
 可选 memory_limit_gib。示例为 [target_evaluation.json](../../configs/target_evaluation.json)。
 预测必须启用 execution.record_graph；评价器核对部署、完整编码 workload、正式窗口及目标设置，不能把其他条件的 trace 当作真值。
-SGLang 的 target 采集使用 capture --record-regions，同时记录通常的因果观察与实验区域计时；
-KTransformers 的同步阶段默认已有对应观察。该开关不改变普通采集默认值，也不创建可导入性能库的独立校准元数据。
+SGLang 的 target 采集使用 capture --record-regions，同时记录通常的因果观察与实验区域计时。该开关不改变普通采集默认值，也不创建可导入性能库的独立校准元数据。
 启用 file 存储时，SGLang 还记录原生文件批次的分段和完整 token 祖先关系，区分新键写入、已有键处理及实际页复制/发布。
 评价只替换工作、rank、顺序和数据内容都对应的成本；没有对应或分段采集失败时保留原预测并报告欠项。
 
@@ -128,26 +127,9 @@ evaluate 使用独立 markov_evaluate 可执行文件，只挂载明确选择的
 fully_replaced 只表示已有图中可替换的节点均已绑定真实数值，不表示图包含全部必要操作；
 status=completed 仅表示评价完成。正常精度仍须使用 measure；profiled HTTP 及客户端跨请求间隔单列，未知成本不删除或置零。
 
-## KTransformers 采集与独立数据
+## KTransformers 运行范围
 
-KTransformers 与 SGLang 使用相同的 capture、measure、calibrate、maintain 和 replay 入口及累计预算。
-当前 KTransformers 真实范围为单 NPU、dense safetensors、原生 KTransformersLinear/KLinearTorch、同步 eager 阶段，
-已验证 Llama-2-7B/float16 来源。没有 HiCache，每请求从空 KV 开始；MoE、量化、多卡及异步服务未取得资格。
-
-配置示例为 [ktransformers_capture.json](../../configs/ktransformers_capture.json)。base.configuration 声明 max_context_tokens，
-可选 cpu_threads、attention_backend（eager/sdpa）和 prefill_chunk_tokens；未声明 chunk 则整段 Prefill。
-模型位置、dtype 和 TP 属于 deployment；当前仅支持 float16/bfloat16、TP=1。成本覆盖按实际 backend、线程及工作点分别判断。
-采集明确生成原始 trace、轻量阶段观察和 HTTP 报告；正常测量关闭 profiler 与观察记录，独立校准只保留小型阶段计时。
-predict 使用带完整 generate 边界的 base，按同一固定 token workload 生成 target 的 Prefill/Decode；
-分块会产生新的合法阶段，不由 base 中出现过的模板决定。max_context_tokens 不足时返回 resource_infeasible。
-当前要求 kernel_cache_initial_state=empty；prepared 的预初始化流程未取得资格，不静默忽略该声明。
-执行成功不表示所有后端设置、完整结构或正常性能精度已验收。
-
-独立阶段数据可经 maintain 的 ktransformers_phases 适配器导入既有 SQLite，显式选择来源再发布模型。
-成本查询使用 inference.prefill/decode、synchronous_phase_interval 及相应实现，测点和域外缺口沿用共同模型合同。
-生成控制使用 inference.request_control、exclusive_request_interval，完整生成区间扣除各计算阶段后计量。
-普通预测也可只声明 performance.database 和 sampling_budget；缺口触发整组共享的轻量采样，再经共同维护入口发布模型。
-模型只来自独立校准，不读 base 的 profiler 时长或正常评价；改变工作域时不能借相似后端的响应填零。
+DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家。该部署的采集、独立成本、预测与回放尚不支持，旧 dense/Torch 产物不能作为新部署的来源或成本。
 
 ## 输入预览和采集检查
 
@@ -191,7 +173,7 @@ execution.capture 另声明推理镜像 image、独占设备数组 devices、容
 可选 cpu_set 使用 Docker 的 CPU 列表表达式，例如 "16-23"，固定进程 CPU 放置；cpus 仍约束累计 CPU 配额，不表示独占这些核。
 SGLang 可选 detail="semantic"，仅采集区域预测所需的 probe 与客户端记录，关闭 profiler 和 native hook，并省去无消费者的 dense 逐算子探针；detail="diagnostic" 为当前默认，保留完整诊断观察。
 两种模式均交付 profile_manifest.json；semantic 的 profiling_ready=false，如实表示没有详细源图或原成本回放资格，普通预测仍可读取。
-区域计时由 --record-regions 另行显式开启。KTransformers 当前只支持 diagnostic，正常实测和独立校准不受 detail 影响。
+区域计时由 --record-regions 另行显式开启，正常实测和独立校准不受 detail 影响。
 Ascend 采集显式使用已注册的 ascend Docker runtime，由它将所选宿主设备映射为容器内逻辑编号；不依赖 Docker 的默认 runtime。
 HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用固定端口；这一环境随实际调用保存。依据为 [CANN 端口环境说明](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/envvar/envref_07_0144.html)。
 镜像需已安装本项目及相容的框架、PyTorch/CANN 和模型依赖；下方构建命令在已有 SDK 环境中安装项目并构建原生观察库，需有 C++23 工具链、CMake 和 CANN 头文件。
@@ -204,7 +186,7 @@ HCCL 的 NPU 通信端口使用操作系统分配的 auto 模式，避免共用�
 
 workload 当前支持 serial 到达，每个请求提供 prompt 或非空 input_ids 二选一，以及 max_new_tokens；
 可选 ignore_eos、return_logprob 是布尔值。formal_begin_index 之前的请求用于准备，仍连续采集；其后为正式请求。
-workload 可设 drain_before_formal=true，在首个正式请求前等待 SGLang HiCache 和服务队列排空；默认 false，KTransformers 不支持。
+workload 可设 drain_before_formal=true，在首个正式请求前等待 SGLang HiCache 和服务队列排空；默认 false。
 这一控制沿用原生服务状态口径，查询返回的轻量 pending 计数和服务空闲状态，不读取缓存树或 tensor snapshot；受同一采集墙钟预算约束。
 屏障单列在客户端报告中，不计作请求或 tokens；预测必须使用与 base 相同的准备屏障，并按目标自身后台完成决定何时继续。
 文本先用本地 tokenizer 编码并核对预算，再启动模型。预览列出请求数与输出上限；文本未经编码时输入 token 总量为未知。
@@ -285,7 +267,7 @@ trace.ld_preload_trace_files 同样可以显式声明 jsonl，记录原生 API�
 
 | 输入 | 含义 |
 | --- | --- |
-| platform/framework | 实际硬件、资源环境与 SGLang/KTransformers；不是实验别名 |
+| platform/framework | 实际硬件、资源环境与框架；不是实验别名 |
 | model | 模型引用、dtype、TP 及影响实现的运行设置 |
 | base | 一份真实可启动的配置，或已有明确 manifest |
 | workload | 请求顺序、输入、输出 token 上限、到达方式与正式计时边界 |

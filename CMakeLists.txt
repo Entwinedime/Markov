@@ -69,9 +69,6 @@ target_link_libraries(markov_prediction PUBLIC markov_source markov_cost)
 target_compile_options(markov_prediction PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
-    src/markov/adapters/ktransformers/observations.cpp
-    src/markov/adapters/ktransformers/prediction.cpp
-    src/markov/adapters/ktransformers/work.cpp
     src/markov/adapters/probes.cpp
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp

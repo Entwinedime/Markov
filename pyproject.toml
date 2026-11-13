@@ -1,7 +1,7 @@
 [project]
 name = "ktransformers-sglang-trace-sim"
 version = "0.1.0"
-description = "Trace-driven profiling, DAG modeling, and what-if simulation for ktransformers and sglang."
+description = "Trace-driven profiling, DAG modeling, and what-if simulation for supported inference deployments."
 requires-python = ">=3.10"
 dependencies = []
 
