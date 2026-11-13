@@ -22,7 +22,7 @@ class SourceDomain:
     @staticmethod
     def requested(serving: ServingInput) -> dict:
         return {
-            "model": {**serving.model, "dtype": serving.model["dtype"].removeprefix("torch.")},
+            "model": serving.model,
             "instances": {
                 instance.mode: instance.configuration.structure() for instance in serving.instances
             },

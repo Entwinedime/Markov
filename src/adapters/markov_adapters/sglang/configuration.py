@@ -100,6 +100,9 @@ class ServingInput:
         self.model = source["model"]
         if self.model.keys() != {"path", "dtype"}:
             raise ValueError("serving model needs path and dtype")
+        if self.model["dtype"] not in ("float16", "bfloat16", "float32"):
+            raise ValueError("serving model dtype must be explicit float16, bfloat16 or float32")
+
         self.instances = []
         identities = set()
         for description in source["instances"]:
