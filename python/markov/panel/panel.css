@@ -1,0 +1,243 @@
+:root {
+    color-scheme: light;
+    font-family: system-ui, sans-serif;
+    color: #233044;
+    background: #f3f5f8;
+}
+* {
+    box-sizing: border-box;
+}
+body {
+    margin: 0;
+}
+header {
+    padding: 26px max(24px, calc((100% - 1180px) / 2));
+    background: #182b46;
+    color: white;
+}
+.brand {
+    font-size: 27px;
+    font-weight: 700;
+}
+.tag {
+    margin-left: 16px;
+    opacity: 0.8;
+}
+header p {
+    margin-bottom: 0;
+    opacity: 0.85;
+}
+main {
+    max-width: 1228px;
+    margin: 24px auto;
+    padding: 0 24px;
+}
+section {
+    border: 1px solid #dbe2eb;
+    border-radius: 10px;
+    background: white;
+    padding: 24px;
+    margin-bottom: 24px;
+}
+h1 {
+    font-size: 21px;
+    margin: 0 0 20px;
+}
+h2 {
+    font-size: 17px;
+    margin: 28px 0 14px;
+}
+label {
+    display: block;
+    font-size: 14px;
+    font-weight: 600;
+}
+input,
+select,
+textarea {
+    display: block;
+    width: 100%;
+    margin: 6px 0 14px;
+    padding: 9px;
+    font: inherit;
+    color: inherit;
+    background: white;
+    border: 1px solid #b5c0cf;
+    border-radius: 5px;
+}
+textarea {
+    font-family: ui-monospace, monospace;
+    font-size: 13px;
+    resize: vertical;
+}
+input:focus,
+textarea:focus,
+select:focus,
+button:focus-visible {
+    outline: 3px solid #86bbef;
+    outline-offset: 1px;
+}
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 20px;
+}
+.import {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+.import label {
+    flex: 1 1 400px;
+}
+button,
+.export {
+    border: 1px solid #2863a5;
+    background: #2863a5;
+    color: white;
+    font: inherit;
+    padding: 9px 16px;
+    border-radius: 5px;
+    cursor: pointer;
+    display: inline-block;
+    text-decoration: none;
+}
+button.secondary {
+    color: #2863a5;
+    background: white;
+}
+button:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
+.actions,
+.heading {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 18px;
+}
+.heading {
+    margin: 0;
+}
+.hint,
+.muted {
+    color: #647084;
+    font-size: 14px;
+    line-height: 1.65;
+}
+.check {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 400;
+}
+.check input {
+    width: auto;
+    margin: 0;
+}
+details {
+    margin: 12px 0;
+    border-top: 1px solid #e2e7ee;
+    padding-top: 12px;
+}
+summary {
+    cursor: pointer;
+    font-weight: 500;
+}
+.table-scroll {
+    overflow-x: auto;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0;
+    text-align: left;
+}
+th,
+td {
+    border-bottom: 1px solid #e0e6ef;
+    padding: 9px;
+    font-size: 14px;
+    vertical-align: top;
+}
+th {
+    color: #596a81;
+}
+td input,
+td select {
+    min-width: 90px;
+    margin: 0;
+}
+td button {
+    padding: 7px;
+    white-space: nowrap;
+}
+#message {
+    position: sticky;
+    top: 8px;
+    z-index: 2;
+    white-space: pre-wrap;
+}
+#message:not(:empty) {
+    padding: 13px 18px;
+    border: 1px solid #c6d7e7;
+    border-radius: 6px;
+    background: #eef5ff;
+    margin-bottom: 18px;
+}
+#message.error {
+    color: #9e2330;
+    background: #fff0f1;
+    border-color: #ebc1c6;
+}
+.task {
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 0;
+    border-top: 1px solid #e2e7ee;
+}
+#task-detail {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 2px solid #dce6f1;
+}
+pre {
+    overflow: auto;
+    max-height: 440px;
+    font-size: 12px;
+    background: #f4f6f9;
+    padding: 14px;
+    line-height: 1.55;
+}
+.notice {
+    padding: 14px;
+    background: #fff6df;
+    line-height: 1.7;
+}
+footer {
+    text-align: center;
+    padding: 8px 24px 28px;
+    font-size: 13px;
+    color: #68788b;
+}
+@media (max-width: 720px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
+    main {
+        padding: 0 12px;
+    }
+    section {
+        padding: 18px;
+    }
+    .task {
+        flex-wrap: wrap;
+    }
+}

@@ -16,6 +16,9 @@ from markov.workflow.planning import plan_prediction
 def main() -> int:
     parser = argparse.ArgumentParser(prog="markov", description="Plan trace-driven configuration prediction.")
     commands = parser.add_subparsers(dest="command", required=True)
+    panel = commands.add_parser("panel", help="Open the local prediction and search task panel.")
+    panel.add_argument("--directory", type=Path, default=Path("data/panel"))
+    panel.add_argument("--port", type=int, default=8765)
     preview = commands.add_parser("plan", help="Preview inputs and preparation without executing them.")
     preview.add_argument("--request", type=Path, required=True)
     prediction = commands.add_parser(
@@ -59,7 +62,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "search":
+        if args.command == "panel":
+            from markov.panel.server import serve
+
+            serve(args.directory, args.port)
+            return 0
+        elif args.command == "search":
             from markov.workflow.search import search
 
             result = search(args.request)

@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Markov · 性能预测</title>
+        <link rel="stylesheet" href="/panel.css" />
+        <script defer src="/panel.js"></script>
+    </head>
+    <body>
+        <header>
+            <div>
+                <span class="brand">Markov</span
+                ><span class="tag">本地性能预测</span>
+            </div>
+            <p>
+                选择一个来源，比较目标配置。采集和成本准备由同一条工作流完成。
+            </p>
+        </header>
+        <main>
+            <div id="message" role="status" aria-live="polite"></div>
+            <section aria-labelledby="create-title">
+                <h1 id="create-title">创建任务</h1>
+                <div class="import">
+                    <label
+                        >已有请求或搜索文件的本机路径<input
+                            id="import-path"
+                            placeholder="/absolute/path/request.json" /></label
+                    ><button id="import-request">导入预测请求</button
+                    ><button id="import-policy">导入搜索请求</button>
+                </div>
+                <div class="grid">
+                    <label
+                        >任务名称<input id="title" value="配置比较" required
+                    /></label>
+                    <label
+                        >任务类型<select id="action">
+                            <option value="predict">性能预测</option>
+                            <option value="search">有限配置搜索</option>
+                        </select></label
+                    >
+                    <label>模型目录<input id="model" required /></label
+                    ><label>平台<input id="platform" required /></label>
+                    <label>推理框架<input id="framework" required /></label
+                    ><label>运行后端<input id="runtime" required /></label>
+                    <label>数据类型<input id="dtype" required /></label
+                    ><label
+                        >Base TP<input id="tp" type="number" min="1" required
+                    /></label>
+                </div>
+                <h2>请求与来源</h2>
+                <label
+                    >Workload 本机路径<input id="workload-path" required
+                /></label>
+                <div class="grid">
+                    <label
+                        >或上传 workload JSON<input
+                            id="workload-file"
+                            type="file"
+                            accept=".json,application/json"
+                    /></label>
+                    <p id="workload-summary" class="muted">
+                        保留原始请求、准备边界和输出长度。
+                    </p>
+                </div>
+                <div class="grid">
+                    <label
+                        >保留请求数（含准备，留空不改）<input
+                            id="request-count"
+                            type="number"
+                            min="1" /></label
+                    ><label
+                        >每请求输出 token 上限（留空不改）<input
+                            id="output-tokens"
+                            type="number"
+                            min="1"
+                    /></label>
+                </div>
+                <p class="hint">
+                    已有 base 只适用于其原始 workload。修改请求后须采集对应
+                    base；不裁剪图或跳过执行路径。
+                </p>
+                <div class="grid">
+                    <label
+                        >Base 来源<select id="base-mode">
+                            <option value="configuration">
+                                按配置采集或复用
+                            </option>
+                            <option value="manifest">使用已采集来源</option>
+                        </select></label
+                    ><label
+                        >已有 manifest 路径<input
+                            id="manifest"
+                            placeholder="/path/profile_manifest.json"
+                    /></label>
+                </div>
+                <details>
+                    <summary>Base 配置</summary>
+                    <textarea
+                        id="base-config"
+                        rows="9"
+                        spellcheck="false"
+                        aria-label="Base 配置 JSON"
+                    ></textarea>
+                </details>
+                <h2>目标配置</h2>
+                <p class="hint">
+                    容量为每 rank 的 KV token 池，页大小单位为
+                    token；主存倍数相对于对应设备 KV 池。未改字段继承 base。
+                </p>
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>名称</th>
+                                <th>TP</th>
+                                <th>设备 token 池</th>
+                                <th>主存倍数</th>
+                                <th>页 tokens</th>
+                                <th>写策略</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="targets"></tbody>
+                    </table>
+                </div>
+                <button id="add-target" class="secondary">增加配置</button>
+                <details>
+                    <summary>其他目标字段 / 批量候选 JSON</summary>
+                    <textarea
+                        id="target-json"
+                        rows="9"
+                        spellcheck="false"
+                        aria-label="完整目标 JSON"
+                    ></textarea
+                    ><button id="apply-targets">应用候选 JSON</button>
+                </details>
+                <h2>运行与准备预算</h2>
+                <div class="grid">
+                    <label>结果目录<input id="output" required /></label
+                    ><label
+                        >预测内存上限（GiB）<input
+                            id="memory"
+                            type="number"
+                            min="1"
+                            required /></label
+                    ><label
+                        >性能数据库<input
+                            id="database"
+                            placeholder="/path/performance.sqlite" /></label
+                    ><label
+                        >显式成本包（可选，优先于数据库）<input
+                            id="models"
+                            placeholder="通常留空" /></label
+                    ><label
+                        >首次准备状态<select id="kernel-state">
+                            <option value="empty">空缓存</option>
+                            <option value="prepared">已准备</option>
+                        </select></label
+                    ><label class="check"
+                        ><input
+                            id="allow-sampling"
+                            type="checkbox"
+                        />允许在共享预算内补采缺失成本</label
+                    >
+                </div>
+                <details>
+                    <summary>采集环境与累计预算</summary>
+                    <p class="hint">
+                        设备采集严格串行，等待也计入墙钟预算。预算是累计上限，停止或恢复不会清零。
+                    </p>
+                    <label>推理镜像<input id="image" /></label
+                    ><label>设备编号（逗号分隔）<input id="devices" /></label
+                    ><label
+                        >采集设置（含 CPU、内存、detail 和 base 预算）<textarea
+                            id="capture-json"
+                            rows="12"
+                            spellcheck="false"
+                        ></textarea></label
+                    ><label
+                        >整组独立性能采集预算<textarea
+                            id="sampling-json"
+                            rows="8"
+                            spellcheck="false"
+                        ></textarea>
+                    </label>
+                </details>
+                <details id="search-section">
+                    <summary>搜索约束与七项资源价格</summary>
+                    <p class="hint">
+                        只扫描下方已经声明的有限候选。价格是自行声明的相对权重，不是市场报价；缺成本时结果不作为完整推荐。
+                    </p>
+                    <textarea
+                        id="policy"
+                        rows="20"
+                        spellcheck="false"
+                        aria-label="搜索策略 JSON"
+                    ></textarea>
+                </details>
+                <details>
+                    <summary>完整公共请求（可导入、编辑）</summary>
+                    <textarea
+                        id="request-json"
+                        rows="12"
+                        spellcheck="false"
+                    ></textarea
+                    ><button id="apply-request">应用请求 JSON</button>
+                </details>
+                <div class="actions">
+                    <button id="preview">预览准备</button
+                    ><button id="start">运行任务</button>
+                </div>
+                <div id="preview-result" hidden></div>
+            </section>
+            <section aria-labelledby="tasks-title">
+                <div class="heading">
+                    <h1 id="tasks-title">任务与结果</h1>
+                    <button id="refresh" class="secondary">刷新</button>
+                </div>
+                <p class="hint">
+                    关闭网页或重启面板不会停止任务。同一面板目录同时运行一个任务，已有
+                    CLI 任务仍受各自输出锁和设备锁约束。
+                </p>
+                <div id="task-list"></div>
+                <article id="task-detail" hidden></article>
+            </section>
+            <section aria-labelledby="assets-title">
+                <div class="heading">
+                    <h1 id="assets-title">已登记的数据</h1>
+                    <button id="assets" class="secondary">
+                        查看覆盖与来源
+                    </button>
+                </div>
+                <p class="hint">
+                    仅列出此面板任务使用的数据，不扫描整机，也不删除历史记录。已有响应不代表新
+                    workload 的全部工作都在覆盖范围内。
+                </p>
+                <div id="asset-list"></div>
+                <details>
+                    <summary>显式维护独立性能数据</summary>
+                    <label
+                        >维护请求的本机路径<input
+                            id="maintenance-path"
+                            placeholder="/path/maintenance.json"
+                    /></label>
+                    <p class="hint">
+                        沿用 maintain
+                        合同，明确声明采集来源、训练选择和数据库；不是根据
+                        target 实测自动拟合。
+                    </p>
+                    <button id="maintain">运行维护</button>
+                </details>
+            </section>
+        </main>
+        <footer>
+            完整 HTTP 包括 Prefill、Decode、CPU gap
+            和未归属成本。预测成功与精度已验证是两件事。
+        </footer>
+    </body>
+</html>
