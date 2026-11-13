@@ -9,3 +9,33 @@
 **验证：** 已静态阅读 README、工程约束、相关调用方与构建配置，并通过 GitHub 读取新教程及 Ascend DSV4 工具；规划参考 KT 提交 `ca198c50de70abb6827ba6f573bb6671e54436e2`。只读驱动文件显示 `25.3.rc1`，会话代理变量存在；CPU/RAM/磁盘仅作瞬时资源盘点，当前视图未见 davinci 设备节点。ModelScope 页面无法成功读取，未验证权重可下载或来源兼容。文档交付前核对事实、职责、引用及 Git 差异；业务源码、构建和数据均未修改，无需设备运行或数据清理。
 
 **结论与限制：** 形成可按阶段执行及暂停的窗口计划，复现本身尚未开始。驱动兼容性、可用设备、确切 W8A8 来源、镜像 digest 和权重直连路线均待执行时确认；不以文档检查冒充运行成功。
+
+## 2026-11-13 — 阶段 A 启动：设备与镜像核对
+
+**范围：** 起点 `ac80196fcb1a45ad650cd961129ac7490d481903`，执行环境、驱动和下载资格检查；阶段 B/C 的旧链路替换与验收范围保持不变。
+
+**改动：** 确认参考 SGLang 分支提交为 `ff46d660d16cbf11ef393c80cc6b3ab7f6259780`；选择教程镜像当前 ARM64 摘要 `sha256:5ed0acf504181fe092f9badbd8f77611b985ec65df0f93b66ab4b9616231f70b`，开始拉取以检查 CANN 9。没有变更业务代码或下载权重。
+
+**验证：** `npu-smi info` 显示 8 张 910B3，单卡 65536 MiB、健康正常且当时无 NPU 进程；驱动 `25.3.rc1`。Docker 已配置 Ascend runtime，系统为 aarch64、192 CPU、8 NUMA，工作区及 Docker 所在文件系统可用约 1.6 TiB。Docker daemon 未配置 HTTP/HTTPS 代理，Quay 直连测试返回注册表认证响应 HTTP 401。
+
+**结论与限制：** 设备现在可见，镜像拉取和 CANN 9 小张量运算尚未完成；驱动能否工作仍未知，不能进入权重大文件下载或替换阶段。
+
+## 2026-11-13 — 阶段 A：权重来源小文件直连
+
+**范围：** 只访问两个配置文件以寻找权重的非代理下载来源，不下载任何权重分片。
+
+**改动：** 使用 curl 的 `--noproxy '*'`、大小及时间限制，取得 ModelScope 的 `sgl-npu/DeepSeek-V4-Flash-W8A8` 和 `deepseek-ai/DeepSeek-V4-Flash` 的 `config.json`，分别暂存于 `/tmp/markov-dsv4-w8a8-config.json` 与 `/tmp/markov-dsv4-modelscope-config.json`。
+
+**验证：** 两份配置的模型类型、架构、43 层、hidden size 4096、64 注意力头、256 routed experts 和词表大小一致；W8A8 配置声明 `quant_method=compressed-tensors`，权重和激活各为 8 bit。Hugging Face 直接解析域名失败；两次 ModelScope 配置请求返回 HTTP 200。
+
+**结论与限制：** 这为直连来源提供候选，不证明 checkpoint revision、量化实现、文件完整性及实际分片下载兼容；权重文件尚未请求。
+
+## 2026-11-13 — 阶段 A：单卡驱动与分片路由验证
+
+**范围：** 在无模型权重、无网络的单卡容器中执行 CANN 9 最小运算；只访问权重索引和各一字节分片以确定来源和路由。
+
+**改动：** 拉取固定 ARM64 镜像 `sha256:5ed0acf504181fe092f9badbd8f77611b985ec65df0f93b66ab4b9616231f70b`；确认 ModelScope 的 W8A8 版本 `6f4a67e00656c0c8410fcf7ec670bb3f304a0125` 与官方 checkpoint 版本 `4e9bb2457e147f6ebfe2a46f3df047dc9869e224`，清单和索引只保留在 `/tmp/markov-dsv4-*`，未改业务代码或下载权重分片。
+
+**验证：** `docker run --runtime ascend --network none` 显式只选 NPU 0、限制 8 GiB 内存及 4 CPU；镜像 Python 3.11.15、torch 2.10.0+cpu、torch_npu 2.10.0，在驱动 25.3.rc1 上识别一张 NPU，16×16 的全 1 矩阵相乘并同步得到 16.0，退出码 0，容器已自动移除。W8A8 与原始权重清单各 46 个 safetensors 分片、分别 294623227960 和 159617149040 字节；两份索引共有 35020 个张量名，tokenizer 等文件 SHA-256 相同。关闭代理后的各一次 1 字节分片请求均经一次重定向返回 HTTP 206，均只接收 1 字节。
+
+**结论与限制：** 基础 CANN/NPU 路径可运行，不能证明 DSV4 自定义算子或完整模型兼容。W8A8 模型卡未注明量化来源版本；相同结构、词表和张量名支持其作为候选，最终权重对应关系与部署兼容性须用固定版本真实加载确认。当前文件系统可用约 1.67 TB，仍须为构建、转换及并行任务保留余量。
