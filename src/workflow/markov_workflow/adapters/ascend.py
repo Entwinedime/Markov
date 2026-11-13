@@ -19,8 +19,14 @@ class AscendDeployment:
         if "transfer_protocol" in source and "store_url" not in source:
             raise ValueError("transfer_protocol needs a store_url")
         if "store_url" in source:
+            protocol = source.get("transfer_protocol", "sdma")
+
+            # The native engine silently falls back to SDMA for an unknown protocol.
+            if protocol not in ("sdma", "device_rdma"):
+                raise ValueError("Ascend transfer_protocol must be sdma or device_rdma")
+
             self.environment["ASCEND_MF_STORE_URL"] = source["store_url"]
-            self.environment["ASCEND_MF_TRANSFER_PROTOCOL"] = source.get("transfer_protocol", "sdma")
+            self.environment["ASCEND_MF_TRANSFER_PROTOCOL"] = protocol
 
     def options(self) -> list[str]:
         arguments = ["--runtime", "ascend", "--privileged", "--ipc", "host", "--network", "host"]

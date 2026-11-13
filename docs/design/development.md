@@ -134,7 +134,7 @@ PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow c
 
 采集任务可包含 `submission_groups`：非空请求 ID 数组的数组，必须恰好覆盖所有请求一次；未提供时整个 workload 是一组。规划器自动生成此采集选项，探索输入和目标 workload 不增加字段。每组内部按 arrival_ns 调度；本组所有请求完成返回、所有worker到达原生空闲且所有实例到达屏障后，使用新的共同 RAW 起点提交下一组。只有一个 Engine、预热和 profiler 窗口，原生继续维护批次与资源，组间不 flush/reset。`request-delivery.json` 保留整个观察的 origin_ns，并为每次提交记录 group、组内 arrival_ns、相对全局原点的 scheduled_ns 和实际 submitted_ns；不能把串行探针误读为原来的并发 workload。
 
-deployment 的 physical_devices 是按升序排列的不重复非负物理卡号；取前若干张，数量由各实例 TP×PP 之和决定。Ascend runtime 只支持升序可见设备，容器中的逻辑设备 0、1……依次对应这些卡；adapter 在启动前核对，不静默重排角色映射。[官方环境变量说明](https://www.hiascend.com/doc_center/source/zh/canncommercial/850/maintenref/envvar/envref_07_0028.html)。代表 worker 复用减少观察和导出，不减少运行原生并行协议所需的卡。PD 还需声明可达的 store_url，可选 transfer_protocol 默认 sdma；部署信息不进入模型或 workload 合同。Ascend adapter 提供驱动挂载、设备可见性和传输环境，外围应用不修改原生通信实现。
+deployment 的 physical_devices 是按升序排列的不重复非负物理卡号；取前若干张，数量由各实例 TP×PP 之和决定。Ascend runtime 只支持升序可见设备，容器中的逻辑设备 0、1……依次对应这些卡；adapter 在启动前核对，不静默重排角色映射。[官方环境变量说明](https://www.hiascend.com/doc_center/source/zh/canncommercial/850/maintenref/envvar/envref_07_0028.html)。代表 worker 复用减少观察和导出，不减少运行原生并行协议所需的卡。PD 还需声明可达的 store_url，可选 transfer_protocol 只接受 sdma 或 device_rdma，默认 sdma；非法值在启动前拒绝，避免原生退回默认协议。部署信息不进入模型或 workload 合同。Ascend adapter 提供驱动挂载、设备可见性和传输环境，外围应用不修改原生通信实现。
 
 --resource-trace 可选，默认关闭；开启后，选定观察的 worker 额外发布 source/resources/rank-<rank>.json，记录原生槽位/页分配与释放、前缀匹配/插入/锁/淘汰接口的实际结果及当时容量。操作关联原生语义调用，包含本地单调时钟区间；页、token 位置和槽位减去 SGLang 的保留区后使用零起点，缓存节点号仍是本次原生树的局部身份。初始化保留空闲队列，窗口结束在 flush 前保存最终容量。
 
@@ -166,7 +166,7 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 rank 事实中的 `request_ingress` 记录首个 PP 阶段从外部取入、尚未广播的请求集合；`request_receive_rounds` 记录每个 worker 经广播或 PP 转发实际收到的请求集合；`request_receipts` 保留逐条 dispatch 入口。三者都用 `received_raw_ns`，角色由所属字段明确。请求成员保留原生 ID，经 session 声明映射到 workload ID；空轮次和采集范围外的管理请求不进入记录。这些是输入交付证据，不是执行批次，也不用于反推或强制组批。模板代表复用不允许复制代表的实测完成时间给其他 worker；需要逐参与者独立时间对照时使用已有 `observe_all_workers` 采集范围。
 
-Ascend PD 部署必须为两侧设置同一个 `ASCEND_MF_STORE_URL=tcp://<可达地址>:<空闲端口>`；完整原生 Engine 在 Prefill 端启动配置服务，不额外启动第二份服务。Compose 将该变量传入采集容器，`ASCEND_MF_TRANSFER_PROTOCOL` 默认 sdma，其他传输方式按实际硬件配置。使用 `--device` 限定设备时，`ASCEND_RT_VISIBLE_DEVICES` 使用容器中驱动枚举的编号，例如只挂载宿主卡 4/5 时为 0/1；不能直接沿用宿主编号。开始模型采集前核对设备可见性和传输部署条件，避免以完整模型启动排查环境。单独调用传输引擎的诊断不包含 Engine 生命周期，不能据此推断正式入口缺少配置服务。
+Ascend PD 部署必须为两侧设置同一个 `ASCEND_MF_STORE_URL=tcp://<可达地址>:<空闲端口>`；完整原生 Engine 在 Prefill 端启动配置服务，不额外启动第二份服务。Compose 将该变量传入采集容器，`ASCEND_MF_TRANSFER_PROTOCOL` 默认 sdma；device_rdma 还需真实硬件、网络和原生配置条件，参数合法不等于已取得跨机运行资格。使用 `--device` 限定设备时，`ASCEND_RT_VISIBLE_DEVICES` 使用容器中驱动枚举的编号，例如只挂载宿主卡 4/5 时为 0/1；不能直接沿用宿主编号。开始模型采集前核对设备可见性和传输部署条件，避免以完整模型启动排查环境。单独调用传输引擎的诊断不包含 Engine 生命周期，不能据此推断正式入口缺少配置服务。
 
 输出目录必须不存在，失败目录不自动恢复或覆盖。instances/<序号>/ 保存该 Engine 的 session、role-plan、request-delivery 和窗口关闭标记；rank-<全局rank>.json、native/rank-<全局rank>/、runtime/ 保存角色事实、原始 profiler 及原生 API/阶段记录。PD 的 kv-pools/<全局rank>.json 在统一预热排空及采集排空时发布每个真实端点的注册和布局，小型注册事实不要求该角色导出完整 trace。模型/本地池角色事实在初始化时交换，最终代表在全部实例预热排空后、profiler 启动前确定；该请求内不执行 world collective，以免阻塞 PP 请求转发。capture.json 只在所有实例正常收尾后发布，记录各实例角色及初始化/预热/采集时间；中途产生文件不等于任务完成。
 
