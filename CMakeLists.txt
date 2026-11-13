@@ -55,7 +55,6 @@ target_compile_options(markov_cost PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_prediction
     src/markov/trace_graph/planning/bandwidth.cpp
-    src/markov/trace_graph/planning/serial_program.cpp
     src/markov/trace_graph/planning/cache_program.cpp
     src/markov/trace_graph/planning/cache_controls.cpp
     src/markov/trace_graph/planning/storage.cpp
@@ -105,7 +104,6 @@ add_library(markov_reports
 target_link_libraries(markov_reports PUBLIC markov_adapters)
 
 add_executable(markov_core
-    src/markov/commands/serial_prediction.cpp
     src/markov/main.cpp
     src/markov/commands/source.cpp
     src/markov/commands/page_work.cpp

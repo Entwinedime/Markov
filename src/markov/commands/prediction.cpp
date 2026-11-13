@@ -1,6 +1,5 @@
 #include "markov/commands/prediction.hpp"
 #include "markov/commands/costs.hpp"
-#include "markov/commands/serial_prediction.hpp"
 #include "markov/commands/trajectory.hpp"
 #include "markov/trace_graph/planning/cache_program.hpp"
 #include "markov/trace_graph/simulation/program_execution.hpp"
@@ -17,7 +16,6 @@
 namespace markov::commands {
 
 nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
-    if (std::holds_alternative<std::vector<adapters::SerialPredictionTarget>>(input.targets)) return serial_prediction_report(input);
     using namespace trace_graph;
     using Json = nlohmann::json;
     using Clock = std::chrono::steady_clock;
@@ -52,8 +50,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     for (const auto & [tp, selected] : input.costs) queries.try_emplace(tp, selected.models, &source);
     auto cells = Json::array();
     const auto session_begin = Clock::now();
-    const auto target_count = std::get<std::vector<adapters::PredictionTarget>>(input.targets).size();
-    for (const auto & target : std::get<std::vector<adapters::PredictionTarget>>(input.targets)) {
+    const auto target_count = input.targets.size();
+    for (const auto & target : input.targets) {
         if (cells.size() % 32 == 0) {
             const auto predicted = std::ranges::count_if(cells, [](const Json & cell) { return cell.at("status") == "predicted"; });
             std::clog << "prediction " << cells.size() + 1 << '/' << target_count << ", predicted so far: " << predicted
