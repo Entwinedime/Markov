@@ -66,17 +66,23 @@ class DeviceTask:
         self.directory.mkdir(parents=True, exist_ok=True)
         write_json(self.state_path, self.state)
 
-    def completed_capture(self, command: DeviceCommand) -> Path | None:
+    def completed_capture(self, command: DeviceCommand, approved: set[Path] | None = None) -> Path | None:
         wanted = encoded(command.payload)
-        for attempt in self.state["attempts"]:
-            if attempt["status"] != "completed" or attempt["result_key"] != command.result_key:
+        artifacts = [
+            Path(attempt["output"]) / attempt["artifact"]
+            for attempt in self.state["attempts"]
+            if attempt["status"] == "completed" and attempt["result_key"] == command.result_key
+        ]
+        artifacts.extend(sorted(approved or ()))
+        for artifact in artifacts:
+            output = artifact.parents[len(Path(command.artifact).parts) - 1]
+            inputs = output / "capture_input.json"
+            if not inputs.is_file():
                 continue
 
-            output = Path(attempt["output"])
-            actual = read_json(output / "capture_input.json")
+            actual = read_json(inputs)
             actual.pop("budget", None)
             if encoded(actual) == wanted:
-                artifact = output / attempt["artifact"]
                 ports = read_json(artifact).get("measurement_ports", [])
                 if set(command.required_measurement_ports) <= set(ports):
                     return artifact

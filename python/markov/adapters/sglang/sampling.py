@@ -232,7 +232,10 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
                     maximum = max(needed, math.ceil(context["max_context_tokens"] / page))
                     io_cases.update((page, pages, count) for pages, count in ((1, 1), (maximum, 1), (maximum, maximum)))
                 else:
-                    io_cases.update((page, pages, 1) for pages in (1, max(2, needed)))
+                    # A later eviction can copy any prefix within this group's
+                    # context bound; cover its index clone in the same capture.
+                    maximum = max(2, needed, math.ceil(context["max_context_tokens"] / page))
+                    io_cases.update((page, pages, 1) for pages in (1, maximum))
                     if segments > 1:
                         io_cases.add((page, max(needed, segments), segments))
         elif operation in ("cache.prefetch.issue", "cache.prefetch.check", "cache.prefetch.accept"):

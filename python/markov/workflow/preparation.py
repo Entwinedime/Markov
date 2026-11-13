@@ -39,7 +39,13 @@ class PerformancePreparation:
         self.rounds.append(summary)
         for command in commands:
             begin = time.monotonic()
-            existing = self.task.completed_capture(command)
+            try:
+                selected = read_json(models)
+                training = self.approved_training(selected, command.measurement_adapter)
+                existing = self.task.completed_capture(command, training)
+            finally:
+                self.task.record_processing(time.monotonic() - begin)
+
             if existing is None:
                 try:
                     result = self.task.run(command)
@@ -57,8 +63,6 @@ class PerformancePreparation:
             capture_sec = time.monotonic() - begin
             begin = time.monotonic()
             try:
-                selected = read_json(models)
-                training = self.approved_training(selected, command.measurement_adapter)
                 keys = ("operation", "implementation", "timing_scope")
                 responses = {tuple(entry["work"][key] for key in keys) for entry in report["cost_requirements"]}
                 adapter = ADAPTERS[command.measurement_adapter]
