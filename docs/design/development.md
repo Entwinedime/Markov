@@ -31,6 +31,8 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohman
 
 正式 CMake target 必须对应实际交付代码，不为保留旧入口构建已经废弃的应用。删除 target 同步删除源文件、脚本、Python 导入、Docker COPY、示例和说明；新目标完整交付后再提供其公开运行命令。
 
+当前工作构建统一使用build/coarse-graph。容器内将源码挂载到/repo、该构建目录挂载到/build，使用cmake -S /repo -B /build -DCMAKE_BUILD_TYPE=Release配置，再执行cmake --build /build --parallel。历史产物中的程序快照只供其显式消费者使用，不把旧缓存或对象目录当作当前构建入口。
+
 程序只消费明确输入和本次发布的资产，不能搜索历史 data 自动补库。执行中的程序与重建分别持有稳定生命周期，工作进程退出前不释放其保护；新任务和恢复均由单一写者维护状态。
 
 真实来源、离线解释、模板发布和纯预测分别交接。CPU 后处理失败优先消费已经闭合的本次事实，不重新启动原生；原生阶段成功、事实完整、资产发布及整个会话正常退出分别判断。
