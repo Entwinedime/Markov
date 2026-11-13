@@ -80,7 +80,7 @@ bool CacheProgram::submit_region_copy(ProgramRuntime & runtime, std::size_t turn
         { { "elements", pages * page_tokens_ }, { "element_bytes", 8 },       { "tensor_rank", 1 } }
     };
     const auto begin = runtime.next_node();
-    const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
+    const auto resource = base_resource_count() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
     const auto returned = kind == CopyKind::Backup && !pending.evict_after ? std::optional(action(ActionKind::CopyReturned, turn)) : std::nullopt;
     PlannedMutation mutation{ 0, {}, {} };
     graph::NodeId call_return, copy_done;
@@ -158,7 +158,7 @@ bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer
             issue_ = calls.issue;
             return false;
         }
-        const auto resource = source_.observations().resources.size() + 2 * rank + 1;
+        const auto resource = base_resource_count() + 2 * rank + 1;
         for (auto & call : calls.calls)
             if (call.async_work)
                 call.async_completion = AsyncCompletion{
@@ -182,7 +182,7 @@ bool CacheProgram::eviction_backup(ProgramRuntime & runtime, TransferId transfer
     NativeFrontier frontier;
     for (std::size_t rank = 0; rank < plans.size(); ++rank) {
         const auto base = begin + mutation.operations.size();
-        const auto resource = source_.observations().resources.size() + 2 * rank + 1;
+        const auto resource = base_resource_count() + 2 * rank + 1;
         const auto ends = plans[rank].frontier(base);
         auto participant = plans[rank].mutation(0, base, { std::nullopt }, cause_, queues_.native);
         pending.caller_returns.push_back(base + participant.operations.size() - 1);
@@ -259,7 +259,7 @@ std::optional<ControlWork> CacheProgram::begin_result_control(std::size_t reques
     }
     const auto caller = source_.observations().work_observations[source_.frame_operations(frame).front()].resource;
     const auto rank = std::ranges::find(running.callers, caller) - running.callers.begin();
-    const auto resource = source_.observations().resources.size() + 2 * rank + 1;
+    const auto resource = base_resource_count() + 2 * rank + 1;
     ControlWork work;
     for (const auto transfer : at->second) {
         const auto & copy = copies_.at(transfer);

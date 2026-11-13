@@ -1,6 +1,6 @@
 """Turn shared operation-domain gaps into small independent SGLang measurements."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import math
 import json
 from pathlib import Path
@@ -200,7 +200,7 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             for name in requirement["targets"]:
                 page = int(cells[name]["configuration"]["page_size"])
                 failed_load_pages[page] = max(failed_load_pages.get(page, 0), int(work["features"]["pages"]))
-        elif operation.split(".", 1)[0] in ("prepare", "batch", "result", "result_send", "result_tail"):
+        elif operation.split(".", 1)[0] in ("prepare", "batch", "result", "result_send", "result_tail", "control"):
             for name in requirement["targets"]:
                 configuration = cells[name]["configuration"]
                 regions[(int(configuration["page_size"]), bool(configuration["enable_hierarchical_cache"]))] = (
@@ -276,7 +276,13 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
             max_total_tokens=capacity,
             max_prefill_tokens=math.ceil(context["max_context_tokens"] / page) * page,
         )
-        commands.append(capture_command(deployment, configuration, workload, "sglang_regions"))
+        command = capture_command(deployment, configuration, workload, "sglang_regions")
+        if any(item.get("work", {}).get("operation", "").startswith("control.") for item in requirements):
+            ports = ("region.control.before_prepare", "region.control.before_batch", "region.control.before_result")
+            if deployment.tensor_parallel > 1:
+                ports += ("region.control.broadcast",)
+            command = replace(command, required_measurement_ports=command.required_measurement_ports + ports)
+        commands.append(command)
     if scheduler_pages:
         page = min(scheduler_pages)
         # Two alternating prefixes exceed both small pools; later requests

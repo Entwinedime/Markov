@@ -38,6 +38,28 @@ class RegionProbe:
         self.previous_poll: IdlePoll | None = None
         self.idle_intervals: list[tuple[IdlePoll, int]] = []
         self.idle_sample_count = 0
+        self.controller_begin = None
+        self.frontier = None
+        self.broadcast = None
+
+    def receive_turn(self, original, receiver, *args, **kwargs):
+        self.broadcast = None
+        result = original(receiver, *args, **kwargs)
+        self.controller_begin = self.broadcast[1] if self.broadcast is not None else time.time_ns()
+        return result
+
+    def broadcast_requests(self, original, receiver, requests):
+        begin = time.time_ns()
+        result = original(receiver, requests)
+        end = time.time_ns()
+        if receiver.ps.tp_size > 1:
+            tokens = sum(len(item.input_ids) for item in result if hasattr(item, "input_ids"))
+            self.broadcast = (begin, end, {"requests": len(result), "input_tokens": tokens})
+        return result
+
+    def record_control(self, part, begin, end, fields):
+        if begin is not None:
+            self.writer.write("region.control." + part, begin, end, {**fields, "status": "returned"})
 
     def select_batch(self, original: Callable, scheduler: Any) -> Any:
         if self.idle_sample_count >= IDLE_SAMPLE_LIMIT and not self.idle_intervals:
@@ -105,6 +127,7 @@ class RegionProbe:
         }
 
     def prepare(self, original, batch):
+        control_end = time.time_ns()
         import torch
         from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
@@ -133,6 +156,11 @@ class RegionProbe:
         end.record()
         self.pending.append(("region.prepare_stream", start, end, begin, fields))
         self.preparations[id(batch)] = fields
+        self.record_control("before_prepare", self.controller_begin, control_end, fields)
+        if self.broadcast is not None:
+            first, last, features = self.broadcast
+            self.record_control("broadcast", first, last, {**fields, "features": {**features, "page_tokens": fields["features"]["page_tokens"]}})
+        self.frontier = time.time_ns()
         return result
 
     def allocate_extend(
@@ -173,6 +201,7 @@ class RegionProbe:
         return result
 
     def run_batch(self, original, scheduler, batch, *args, **kwargs):
+        control_end, frontier = time.time_ns(), self.frontier
         if not (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()):
             return original(scheduler, batch, *args, **kwargs)
 
@@ -186,10 +215,12 @@ class RegionProbe:
             end.record(stream)
             self.pending.append(("region.stream", start, end, begin, fields))
             self.results[id(result)] = fields
+            self.record_control("before_batch", frontier, control_end, fields)
             return result
         finally:
             self.running = None
             self.forward_event = None
+            self.frontier = time.time_ns()
 
     def forward(self, original: Callable, worker: Any, *args: Any, **kwargs: Any) -> Any:
         if self.running is None:
@@ -235,6 +266,7 @@ class RegionProbe:
             self.pending.append(("input_metadata", start, end, begin, fields))
 
     def process_result(self, original, scheduler, batch, result):
+        control_end, frontier = time.time_ns(), self.frontier
         fields = self.results.pop(id(result), None)
         if fields is None:
             return original(scheduler, batch, result)
@@ -262,6 +294,8 @@ class RegionProbe:
             else:
                 pending.append((name, start, end, begin, measured))
         self.pending = pending
+        self.record_control("before_result", frontier, control_end, fields)
+        self.frontier = time.time_ns()
         return value
 
     def send(self, original, socket, message, *args, **kwargs):
@@ -277,6 +311,8 @@ class RegionProbe:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
         bindings = {
+            "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver.recv_requests": self.receive_turn,
+            "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver._broadcast_reqs_across_ranks": self.broadcast_requests,
             "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator.alloc_extend": self.allocate_extend,
             "zmq.Socket.send_pyobj": self.send,
             "sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_extend": self.prepare,

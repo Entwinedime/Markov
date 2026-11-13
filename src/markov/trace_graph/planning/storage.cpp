@@ -123,9 +123,10 @@ PrefetchCheck Storage::check_prefetch(ProgramRuntime & runtime, std::size_t requ
     bool active = false, finish = found == prefetches_.end();
     if (found != prefetches_.end()) {
         const auto & operation = found->second;
-        if (operation.queried) trim_buffer(request, result.worker_done ? result.published_pages : operation.keys.size());
-        active = !(operation.queried && operation.keys.empty());
-        const auto complete = operation.queried
+        // Hash completion queues unused host slots for the controller. Keep
+        // their ownership until a scheduler turn instead of freeing in a worker.
+        active = true;
+        const auto complete = operation.queried && !operation.revoked
                               && (result.published_pages == operation.keys.size()
                                   || std::ranges::any_of(operation.workers, [](const ReadCursor & worker) { return worker.terminated; }));
         const auto budget = std::min<long double>(
@@ -245,6 +246,33 @@ void Storage::stop(ProgramRuntime & runtime, std::size_t request, std::optional<
     runtime.submit(std::move(mutation));
 }
 
+void Storage::drain_controls() {
+    // Worker completion and controller reclamation are different events.
+    for (const auto buffer : retired_buffers_) {
+        reserved_pages_ -= cache_.buffer_pages(buffer);
+        cache_.release(buffer);
+    }
+    retired_buffers_.clear();
+    for (auto at = prefetches_.begin(); at != prefetches_.end();) {
+        auto & operation = at->second;
+        if (operation.revoked) {
+            occupied_pages_ -= results_[at->first].requested_pages;
+            trim_buffer(at->first, 0);
+            cache_.release(operation.buffer);
+            cache_.unpin_host(operation.anchor);
+            at = prefetches_.erase(at);
+            continue;
+        }
+        if (operation.queued_release_pages) {
+            trim_buffer(at->first, cache_.buffer_pages(operation.buffer) - operation.queued_release_pages);
+            operation.queued_release_pages = 0;
+        }
+        ++at;
+    }
+    for (const auto node : acknowledged_writes_) cache_.unpin_host(node);
+    acknowledged_writes_.clear();
+}
+
 bool Storage::accept(std::size_t request, graph::Time now_ns) {
     auto & result = results_[request];
     auto & operation = prefetches_.at(request);
@@ -255,12 +283,12 @@ bool Storage::accept(std::size_t request, graph::Time now_ns) {
     result.inserted_pages = operation.prefix.size() - cache_.match(operation.prefix).pages;
     cache_.commit_host(operation.prefix, operation.buffer);
     reserved_pages_ -= result.inserted_pages;
-    const auto retained = operation.queried ? operation.keys.size() - result.accepted_pages : result.requested_pages;
-    trim_buffer(request, result.worker_done ? 0 : retained);
+    const auto duplicates = result.accepted_pages - result.inserted_pages;
+    if (duplicates) trim_buffer(request, cache_.buffer_pages(operation.buffer) - duplicates);
     occupied_pages_ -= result.requested_pages;
     cache_.unpin_host(operation.anchor);
     if (result.worker_done) {
-        cache_.release(operation.buffer);
+        retired_buffers_.push_back(operation.buffer);
         prefetches_.erase(request);
     }
     return true;
@@ -280,11 +308,10 @@ bool Storage::finish_read(ProgramRuntime & runtime, std::size_t request, std::si
         result.worker_done = true;
         result.worker_finished_ns = runtime.now_ns();
         if (result.ready) {
-            trim_buffer(request, 0);
-            cache_.release(operation.buffer);
+            retired_buffers_.push_back(operation.buffer);
             prefetches_.erase(request);
         }
-        else if (!operation.stopping) { trim_buffer(request, result.published_pages); }
+        else operation.queued_release_pages = cache_.buffer_pages(operation.buffer) - result.published_pages;
     }
     if (!worker.reads.empty()) start_read(runtime, worker.reads.front(), rank, cause);
     return done || terminated;
@@ -345,7 +372,7 @@ bool Storage::write_page(ProgramRuntime & runtime, std::size_t rank, graph::Node
     const auto done = operation.completed.size() == participants_;
     if (done) {
         completion_frontier_[1] = join(runtime, operation.completed);
-        cache_.unpin_host(operation.source);
+        acknowledged_writes_.push_back(operation.source);
         writes_.erase(cursor.operation);
     }
     worker.writes.pop_front();

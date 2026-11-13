@@ -306,7 +306,7 @@ def write_report(
         search = read_json(directory / "search/report.json")
         prediction = read_json(directory / "prediction/report.json")
         result["pricing"] = search["pricing"]
-        if prediction["models"] != str(models) or prediction["deployment"] != settings["deployment"]:
+        if prediction["models"] != {str(settings["deployment"]["tensor_parallel"]): str(models)} or prediction["deployment"] != settings["deployment"]:
             raise ValueError("Report inputs must identify the deployment and models used for prediction")
         if search["status"] != "completed" or {cell["name"] for cell in prediction["cells"]} != {
             target["name"] for target in targets

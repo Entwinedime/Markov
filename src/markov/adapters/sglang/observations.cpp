@@ -322,6 +322,9 @@ void ProbeReader::finish() {
             throw std::runtime_error("One source frame contains conflicting collective participants");
         frame.participant = collective.rank;
     }
+    // TP=1 has no collective, but its sole rank follows from the captured deployment.
+    for (auto & frame : output_.compute_frames)
+        if (!frame.participant && participants_ == 1) frame.participant = 0;
     std::map<Index, std::vector<std::pair<Index, const RequestBroadcast *>>> broadcast_groups;
     for (const auto & [identity, call] : request_broadcasts_) {
         const auto result = batch_results_.find(identity);
@@ -472,7 +475,12 @@ void ProbeReader::observe_result(const ProbeEvent & event) {
             ++output_.counts["result_without_compute_frame"];
             return;
         }
-        const auto & observed = output_.compute_frames[frame->second];
+        auto & observed = output_.compute_frames[frame->second];
+        if (args.contains("participant")) {
+            const auto rank = args.at("participant").get<std::size_t>();
+            if (observed.participant && observed.participant != rank) throw std::runtime_error("Batch and compute participant identities disagree");
+            observed.participant = rank;
+        }
         const auto requests = args.at("request_ids").get<std::vector<std::string>>();
         if (observed.requests.size() != requests.size()) throw std::runtime_error("Result batch and compute frame have different requests");
         for (Index id = 0; id < requests.size(); ++id)

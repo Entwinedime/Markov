@@ -118,11 +118,12 @@ class SearchPolicy:
         )
 
     def rank(self, prediction: dict) -> dict:
-        participants = prediction["deployment"]["tensor_parallel"]
         rows = []
         for cell in prediction["cells"]:
+            participants = cell.get("deployment", prediction["deployment"])["tensor_parallel"]
             row = {
                 "name": cell["name"],
+                "deployment": cell.get("deployment", prediction["deployment"]),
                 "status": cell["status"],
                 "prediction_status": cell["status"],
                 "predicted_sec": cell["formal_http_sec"],

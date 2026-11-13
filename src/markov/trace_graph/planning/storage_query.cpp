@@ -53,6 +53,7 @@ bool Storage::finish_query(ProgramRuntime & runtime, std::size_t request, graph:
     const auto readable = operation.query_hits * page_tokens_ >= config_.threshold_tokens;
     operation.keys.resize(readable ? operation.query_hits : 0);
     if (readable) {
+        operation.queued_release_pages = result.requested_pages - operation.query_hits;
         ++stats_.prefetches;
         operation.enqueue_cause = cause;
         for (std::size_t rank = 0; rank < participants_; ++rank) {
@@ -62,11 +63,11 @@ bool Storage::finish_query(ProgramRuntime & runtime, std::size_t request, graph:
         }
     }
     else {
+        operation.revoked = true;
         result.worker_done = true;
         result.worker_finished_ns = runtime.now_ns();
         if (result.ready) {
-            trim_buffer(request, 0);
-            cache_.release(operation.buffer);
+            retired_buffers_.push_back(operation.buffer);
             prefetches_.erase(request);
         }
     }

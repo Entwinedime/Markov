@@ -167,12 +167,28 @@ class DeviceTask:
         if self.retained_bytes() >= remaining["retained_mib"] * 1024**2:
             raise CaptureBudgetExceeded("The cumulative capture storage budget is exhausted")
 
+        self.directory.mkdir(parents=True, exist_ok=True)
         with (Path(tempfile.gettempdir()) / "markov-device-capture.lock").open("a") as lease:
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
             waiting = time.monotonic()
+            deadline = waiting + remaining["wall_sec"]
             try:
-                devices = self.runtime.wait_idle(waiting + remaining["wall_sec"])
+                self.state["waiting_for"] = "capture_slot"
+                write_json(self.state_path, self.state)
+                while True:
+                    try:
+                        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            raise CaptureBudgetExceeded("The cumulative budget was reached waiting for the device capture slot")
+                        time.sleep(min(2, left))
+
+                self.state["waiting_for"] = "idle_devices"
+                write_json(self.state_path, self.state)
+                devices = self.runtime.wait_idle(deadline)
             finally:
+                self.state.pop("waiting_for", None)
                 self.record_processing(time.monotonic() - waiting)
             remaining = self.remaining()
             if remaining["wall_sec"] <= 0:

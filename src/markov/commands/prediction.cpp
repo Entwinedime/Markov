@@ -10,6 +10,7 @@
 #include <iostream>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <sys/resource.h>
 #include <variant>
 
@@ -22,7 +23,7 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     using Clock = std::chrono::steady_clock;
     const auto & source = input.source.context;
     const auto & observations = source.observations();
-    const auto backend = adapters::sglang::cache_backend(source);
+    const auto source_backend = adapters::sglang::cache_backend(source);
     const planning::AttentionGeometry * attention = nullptr;
     for (const auto & description : observations.work_descriptions) {
         for (const auto & part : description.recipe) {
@@ -42,12 +43,13 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         { "max_context_tokens",context_tokens                               },
         {       "final_phases",        final_phases },
         {           "geometry",
-         { { "layers", backend.layers },
+         { { "layers", source_backend.layers },
          { "kv_heads", attention->kv_heads },
          { "key_dim", attention->query_key_dim },
          { "value_dim", attention->value_dim } }   }
     };
-    cost::Queries costs(input.costs.models, &source);
+    std::map<std::size_t, cost::Queries> queries;
+    for (const auto & [tp, selected] : input.costs) queries.try_emplace(tp, selected.models, &source);
     auto cells = Json::array();
     const auto session_begin = Clock::now();
     const auto target_count = std::get<std::vector<adapters::PredictionTarget>>(input.targets).size();
@@ -57,6 +59,11 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             std::clog << "prediction " << cells.size() + 1 << '/' << target_count << ", predicted so far: " << predicted
                       << ", elapsed after source preparation: " << std::chrono::duration<double>(Clock::now() - session_begin).count() << " sec" << std::endl;
         }
+        const auto & backend = target.backend;
+        const auto tp = backend.participants;
+        auto & costs = queries.at(tp);
+        auto target_sampling = sampling_context;
+        target_sampling["geometry"]["kv_heads"] = attention->kv_heads * source_backend.participants / tp;
         const Json capacity{
             { "device", target.cache.device_pages },
             {   "host",   target.cache.host_pages }
@@ -83,6 +90,9 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
         if (target.infeasible) {
             cells.push_back({
                 {                  "name",           target.name },
+                {            "deployment",     target.deployment },
+                {           "work_layout",    target.work_layout },
+                {      "sampling_context",       target_sampling },
                 {         "configuration",  target.configuration },
                 {  "cache_capacity_pages",              capacity },
                 {  "resource_reservation",           reservation },
@@ -114,7 +124,19 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                                        target.regions,
                                        target.cache.bandwidth);
         simulation::ProgramResult result;
-        if (!program.issue()) result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale, input.record_graph).run();
+        if (!program.issue()) {
+            try {
+                result = simulation::ProgramExecution(program, costs, program.resources(), input.node_scale, input.record_graph).run();
+            }
+            catch (const std::runtime_error & error) {
+                const auto completed =
+                    std::ranges::count_if(program.requests(), [](const planning::CacheRequestResult & request) { return request.completed; });
+                throw std::runtime_error("Target " + target.name + ": " + error.what() + "; HTTP completed " + std::to_string(completed) + "/"
+                                         + std::to_string(program.requests().size())
+                                         + ", storage workers idle=" + (program.storage() && !program.storage()->idle() ? "false" : "true")
+                                         + ", issue=" + program.issue().value_or("none"));
+            }
+        }
         const bool complete =
             !program.issue() && result.cost_gaps.empty() && std::ranges::all_of(program.requests(), [&](const planning::CacheRequestResult & request) {
                 return request.completed && request.response && result.execution.states[*request.response] == simulation::OperationState::Complete;
@@ -185,6 +207,9 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             });
         cells.push_back({
             {                  "name",                                                  target.name                                      },
+            {            "deployment",                                                                                  target.deployment },
+            {           "work_layout",                                                                                 target.work_layout },
+            {      "sampling_context",                                                                                    target_sampling },
             {         "configuration",                                                                               target.configuration },
             {  "cache_capacity_pages",                                                                                           capacity },
             {  "resource_reservation",                                                                                        reservation },
@@ -224,7 +249,9 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
                 { "peak_rank_stored_pages", stats.peak_rank_stored_pages },
                 {                   "idle",              storage->idle() },
                 {          "qualification",
-                 "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control reuses the source "
+                 "Independent rank-local file workers; page counts sum rank services. Enqueue/check are separate; pre-admission control transfers unchanged "
+                 "source responses or uses independent target-TP responses. Worker completion retains host ownership until a controller turn. Unidentified "
+                 "control retains a source "
                  "residual outside replaced controls. Issue/check/accept responses retain caller ownership; background query groups and idle turns are "
                  "separate. Concurrent file changes remain "
                  "approximate."                                         }
@@ -234,23 +261,29 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
     rusage usage{};
     const auto usage_status = getrusage(RUSAGE_SELF, &usage);
     std::set<std::string> assumptions, sources;
-    for (const auto id : costs.limited_models()) {
-        const auto & model = input.costs.models.model(id);
-        assumptions.insert(model.limitations.begin(), model.limitations.end());
-        sources.insert(model.sources.begin(), model.sources.end());
+    std::size_t selected_models = 0;
+    Json models = Json::object();
+    for (const auto & [tp, selected] : input.costs) {
+        selected_models += selected.models.size();
+        models[std::to_string(tp)] = input.models_paths.at(tp).string();
+        for (const auto id : queries.at(tp).limited_models()) {
+            const auto & model = selected.models.model(id);
+            assumptions.insert(model.limitations.begin(), model.limitations.end());
+            sources.insert(model.sources.begin(), model.sources.end());
+        }
     }
     return {
-        { "deployment", input.costs.deployment },
+        { "deployment", input.deployment },
         { "sampling_context", std::move(sampling_context) },
         { "status", std::ranges::all_of(cells, [](const Json & cell) { return cell.at("e2e_predicted").get<bool>(); }) ? "completed" : "incomplete" },
         { "manifest", input.source.manifest.path.string() },
-        { "models", input.models_path.string() },
+        { "models", models },
         { "source_prepare_sec", input.source.read_and_interpret_sec + input.source.build_sec },
         { "source_records_read", std::accumulate(input.source.input_record_counts.begin(), input.source.input_record_counts.end(), std::size_t{ 0 }) },
         { "unread_low_level_trace_files", input.source.skipped_files.size() },
         { "source_details_materialized", source.detailed_preparation_sec() != 0 },
         { "process_peak_rss_bytes", usage_status == 0 ? Json(usage.ru_maxrss * 1'024) : Json(nullptr) },
-        { "selected_models", input.costs.models.size() },
+        { "selected_models", selected_models },
         { "model_sources", sources },
         { "cost_assumptions", assumptions },
         { "cells", std::move(cells) },
@@ -260,7 +293,8 @@ nlohmann::json prediction_report(const adapters::PreparedPrediction & input) {
             "Independent batch responses estimate wait/spin from metadata host-minus-device intervals, not a strict bound. Host setup, event queueing, "
             "initialization, device tails and contention remain approximate.",
             "Input setup follows rank-local load returns when capacity is ready; GPU prefill retains a conservative whole-load data fence.",
-            "Observed unchanged empty CPU broadcasts transfer post-arrival responses; local work/communication overlap remains approximate. Unobserved "
+            "Same-TP unchanged CPU broadcasts transfer post-arrival responses; changed-TP frontend responses use independent observations. Local "
+            "work/communication overlap remains approximate. Unobserved "
             "control retains its source residual.",
             "CPU and opaque stream responses overlap. Each rank starts at its own ready input; scheduler control rendezvous precedes preparation. Stream "
             "intervals include host starvation and internal communication.",

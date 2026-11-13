@@ -1,10 +1,11 @@
 #pragma once
 
 #include "markov/adapters/source.hpp"
-#include "markov/trace_graph/planning/region_compute.hpp"
+#include "markov/trace_graph/planning/cache_program.hpp"
 #include "markov/trace_graph/planning/serial_program.hpp"
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <variant>
@@ -15,6 +16,9 @@ namespace markov::adapters {
 struct PredictionTarget {
     std::string name;
     nlohmann::json configuration;
+    nlohmann::json deployment;
+    nlohmann::json work_layout;
+    trace_graph::planning::CacheBackend backend;
     std::size_t page_tokens;
     trace_graph::planning::RegionBackend regions;
     sglang::CacheSettings cache;
@@ -30,8 +34,9 @@ struct SerialPredictionTarget {
 
 struct PreparedPrediction {
     PreparedSource source;
-    SelectedCosts costs;
-    std::filesystem::path models_path;
+    nlohmann::json deployment;
+    std::map<std::size_t, SelectedCosts> costs;
+    std::map<std::size_t, std::filesystem::path> models_paths;
     trace_graph::planning::KernelCacheInitial initial;
     std::variant<std::vector<PredictionTarget>, std::vector<SerialPredictionTarget>> targets;
     std::vector<trace_graph::cost::ScalingRule> node_scale;

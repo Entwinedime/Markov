@@ -1,5 +1,6 @@
 """Import small independent region captures; never read target scores or base traces."""
 
+from collections import defaultdict
 from dataclasses import asdict
 from collections.abc import Iterator
 from decimal import Decimal
@@ -38,6 +39,26 @@ def context(captured: dict, deployment: dict) -> dict:
 def recipes(captured: dict) -> dict:
     result = {}
     for phase in captured["phases"]:
+        for part in ("before_prepare", "before_batch", "before_result", "broadcast"):
+            if "region.control." + part not in captured.get("measurement_ports", []):
+                continue
+            group = part in ("before_prepare", "broadcast")
+            features = (
+                ["requests", "input_tokens"] if part == "broadcast"
+                else ["query_tokens", "context_tokens"] if part == "before_prepare" and phase == "prefill"
+                else None
+            )
+            scope = "controller_group_response" if group else "caller_blocking_interval"
+            result[(f"control.{part}.{phase}", IMPLEMENTATION, scope)] = {
+                "feature": features,
+                "curve": "page_tokens",
+                "nonnegative": True,
+                "coverage_features": [] if part == "broadcast" else ["query_tokens", "context_tokens", "batch_size"],
+                "limitations": [
+                    "Independent initialized serial frontend response; exclusive CPU service and contention are not identified.",
+                    "Group timing starts after the last observed entry. Probe work outside the selected ports remains uncertain.",
+                ],
+            }
         for operation, scope in (
             ("prepare", "thread_cpu"),
             ("prepare", "caller_blocking_interval"),
@@ -120,6 +141,8 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
         if event["name"] == "region.stream" and "stream_interval_ns" in event["args"].get("input_metadata", {})
     }
     for position, event, warmup in records:
+        if event["name"].startswith("region.control."):
+            continue
         if event["name"] in (
             "region.scheduler_idle",
             "region.load_failed",
@@ -198,3 +221,46 @@ def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
                     cost,
                     warmup,
                 )
+
+    yield from control_measurements(records, captured)
+
+
+def control_measurements(records: list, captured: dict) -> Iterator[Measurement]:
+    groups = defaultdict(list)
+    for position, event, warmup in records:
+        if not event["name"].startswith("region.control."):
+            continue
+
+        fields = event["args"]
+        part = event["name"].removeprefix("region.control.")
+        phase = fields["phase"]
+        features = dict(fields["features"])
+        if part != "broadcast":
+            features = {key: features[key] for key in ("query_tokens", "context_tokens", "page_tokens", "batch_size")}
+        grouped = part in ("before_prepare", "broadcast")
+        scope = "controller_group_response" if grouped else "caller_blocking_interval"
+        sample_warmup = warmup or bool(fields["features"].get("first_phase", False))
+        if grouped:
+            identity = part, phase, tuple(fields["request_ids"]), fields["iteration"]
+            groups[identity].append((position, event, sample_warmup, features))
+            continue
+
+        duration = int(Decimal(event["dur"]) * 1000)
+        if duration < 0:
+            raise ValueError("Frontend response duration must be nonnegative")
+        yield Measurement(position, scope, f"control.{part}.{phase}", IMPLEMENTATION, scope, features, duration, sample_warmup)
+
+    for (part, phase, _, _), rows in groups.items():
+        ranks = {row[1]["args"]["participant"] for row in rows}
+        if ranks != set(range(captured["deployment"]["tensor_parallel"])) or len(ranks) != len(rows):
+            raise ValueError("Frontend group response needs one observation per TP participant")
+        if any(row[3] != rows[0][3] for row in rows):
+            raise ValueError("Frontend participants disagree on the group work")
+
+        begin = max(int(Decimal(row[1]["ts"]) * 1000) for row in rows)
+        end = max(int((Decimal(row[1]["ts"]) + Decimal(row[1]["dur"])) * 1000) for row in rows)
+        if end < begin:
+            raise ValueError("Frontend group response has no common arrival interval")
+        scope = "controller_group_response"
+        yield Measurement(rows[0][0], scope, f"control.{part}.{phase}", IMPLEMENTATION, scope,
+                          rows[0][3], end - begin, all(row[2] for row in rows))

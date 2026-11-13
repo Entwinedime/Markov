@@ -2,6 +2,7 @@
 
 #include "markov/adapters/probes.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -44,6 +45,7 @@ private:
     void finish_prefetch_responses();
     std::optional<std::filesystem::path> configuration_;
     std::string result_implementation_;
+    std::optional<std::size_t> participants_;
     std::optional<bool> deterministic_sampling_;
     bool full_compute_;
     const AttentionDescriptor & attention_descriptor(const ProbeEvent & event, trace_graph::planning::Phase phase);

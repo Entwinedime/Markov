@@ -36,6 +36,7 @@ public:
     void enqueue_write(ProgramRuntime & runtime, RadixId source, std::vector<PrefixId> pages, graph::NodeId cause);
     bool on_event(ProgramRuntime & runtime, const simulation::Event & event);
     bool idle() const { return prefetches_.empty() && writes_.empty(); }
+    void drain_controls();
     const std::array<std::optional<graph::NodeId>, 4> & completion_frontier() const { return completion_frontier_; }
     const std::vector<PrefetchResult> & results() const { return results_; }
     const StorageStats & stats() const { return stats_; }
@@ -72,7 +73,8 @@ private:
         std::optional<graph::NodeId> enqueue_cause;
         std::optional<graph::NodeId> publication_cause, query_cause;
         std::size_t query_hits = 0;
-        bool stopping = false, queried = false;
+        std::size_t queued_release_pages = 0;
+        bool stopping = false, queried = false, revoked = false;
     };
     struct Write {
         RadixId source;
@@ -132,6 +134,8 @@ private:
     std::map<std::size_t, Prefetch> prefetches_;
     std::deque<std::size_t> queries_;
     std::map<std::size_t, Write> writes_;
+    std::vector<BufferId> retired_buffers_;
+    std::vector<RadixId> acknowledged_writes_;
 
     // Read, write, acceptance and query workers can finish apart.
     std::array<std::optional<graph::NodeId>, 4> completion_frontier_;

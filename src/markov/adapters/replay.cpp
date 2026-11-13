@@ -14,7 +14,7 @@ PredictedTrajectory read_trajectory(const std::filesystem::path & prediction, co
         if (cell.at("name") != target) continue;
         if (!cell.at("e2e_predicted").get<bool>() || !cell.contains("execution_graph"))
             throw std::runtime_error("Evaluation or replay needs a completed prediction recorded with execution.record_graph");
-        return { prediction, cell, document.at("deployment"), document.at("manifest").get<std::string>() };
+        return { prediction, cell, cell.value("deployment", document.at("deployment")), document.at("manifest").get<std::string>() };
     }
     throw std::runtime_error("Target is absent from the selected prediction");
 }

@@ -10,9 +10,10 @@ namespace markov::trace_graph::planning {
 void RegionCompute::identify(ProgramRuntime & runtime, PlannedMutation & mutation, const Frame & frame, std::string_view port) const {
     if (!runtime.records_graph()) return;
 
-    const auto participant = source_.observations().compute_frames[frame.description.source_frame].participant;
+    const auto participant = frame.rank;
     for (auto & operation : mutation.operations) operation.position = OperationPosition{ request_, frame.group, participant, port };
-    if (std::holds_alternative<SourceRegionGap>(mutation.operations.front().cost))
+    const auto * work = std::get_if<std::reference_wrapper<const Work>>(&mutation.operations.front().cost);
+    if (std::holds_alternative<SourceRegionGap>(mutation.operations.front().cost) || (work && work->get().kind.operation.starts_with("control.")))
         mutation.operations.front().position->port = port == "prepare" ? "before_prepare" : port == "batch" ? "before_batch" : "before_result";
 }
 
@@ -55,7 +56,7 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
             issue_ = "semantic_frame_boundaries_unavailable";
             return;
         }
-        callers.insert(result->run.resource);
+        callers.insert(frame.caller);
     }
     std::map<std::size_t, std::size_t> previous;
     std::map<std::pair<Phase, double>, std::size_t> groups;
@@ -63,15 +64,15 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
         const auto id = frames_.size();
         const auto & result = *source.frame_result(description.source_frame);
         const auto phase = source.observations().compute_frames[description.source_frame].phase;
-        const auto rank = std::distance(callers.begin(), callers.find(result.run.resource));
+        const auto rank = description.rank;
         auto [group, inserted] = groups.try_emplace({ phase, description.input.context_tokens }, groups_.size());
         if (inserted) groups_.push_back({});
         groups_[group->second].push_back(id);
-        const auto prior = previous.find(result.run.resource);
+        const auto prior = previous.find(description.caller);
         std::optional<std::size_t> before = prior == previous.end() ? std::nullopt : std::optional(prior->second);
         Frame frame{};
         frame.description = description;
-        frame.caller = result.run.resource;
+        frame.caller = description.caller;
         frame.rank = rank;
         frame.group = group->second;
         frame.phase = phase;
@@ -83,10 +84,10 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
         frame.overlap = result.overlap;
         frame.has_result = result.processed.has_value();
         frame.publishes = phase == Phase::Prefill && result.processed && !result.processed->finished_after.front();
-        frame.sends = !result.final_sends.empty();
+        frame.sends = !result.final_sends.empty() && (backend_.transfer_source_control || rank == 0);
         if (before) frames_[*before].next = id;
         else roots_.push_back(id);
-        previous[result.run.resource] = id;
+        previous[description.caller] = id;
         frames_.push_back(std::move(frame));
         stats_.frames.emplace_back();
         stats_.frames.back().source_frame = description.source_frame;
@@ -96,6 +97,7 @@ RegionCompute::RegionCompute(const source::SourceContext & source, std::vector<R
             issue_ = "semantic_frame_participants_incomplete";
             return;
         }
+        if (!backend_.transfer_source_control) continue;
         std::optional<bool> rendezvous;
         for (const auto id : group) {
             const auto & frame = frames_[id];
@@ -121,15 +123,25 @@ void RegionCompute::start(ProgramRuntime & runtime, std::optional<graph::NodeId>
 
 void RegionCompute::begin_control(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
     auto & frame = frames_[id];
+    if (frame.rank == 0) controls_.controller_turn();
     const auto & regions = source_.regions().frame(frame.description.source_frame);
+    if (!backend_.transfer_source_control) {
+        frame.control_started = cause;
+        if (!frame.previous) {
+            const auto node = runtime.next_node();
+            runtime.submit(
+                { owner_, { { frame.caller, Boundary{}, action(ActionKind::ControlReady, id) } }, { { cause, node, graph::EdgeKind::ResourceOrder } } });
+            return;
+        }
+        enter_control(runtime, id, cause);
+        return;
+    }
     if (frame.previous && regions.control) {
         const auto node = runtime.next_node();
         PlannedMutation mutation{ owner_,
                                   { { frame.caller, SourceRegionGap{ regions.control->before }, action(ActionKind::ControlEntered, id) } },
                                   { { cause, node, graph::EdgeKind::ResourceOrder } } };
-        if (runtime.records_graph())
-            mutation.operations.front().position =
-                OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "before_control" };
+        if (runtime.records_graph()) mutation.operations.front().position = OperationPosition{ request_, frame.group, frame.rank, "before_control" };
         runtime.submit(std::move(mutation));
         return;
     }
@@ -145,9 +157,7 @@ void RegionCompute::begin_control(ProgramRuntime & runtime, std::size_t id, grap
         const auto gap = *source_.regions().frame(frame.description.source_frame).before_preparation;
         mutation.operations.front().cost = SourceRegionGap{ gap };
     }
-    if (runtime.records_graph())
-        mutation.operations.front().position =
-            OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "before_prepare" };
+    if (runtime.records_graph()) mutation.operations.front().position = OperationPosition{ request_, frame.group, frame.rank, "before_prepare" };
     if (!runtime.submit(std::move(mutation))) return;
     if (frame.previous) ++stats_.source_cpu_gaps;
     for (const auto peer : groups_[frame.group]) prepare(runtime, peer);
@@ -160,6 +170,43 @@ void RegionCompute::enter_control(ProgramRuntime & runtime, std::size_t id, grap
     for (const auto peer : groups_[frame.group]) {
         if (!frames_[peer].control_started) return;
         arrivals.push_back(*frames_[peer].control_started);
+    }
+
+    if (!backend_.transfer_source_control) {
+        if (frame.control_response_started) return;
+        for (const auto peer : groups_[frame.group]) frames_[peer].control_response_started = true;
+        const auto phase = frame.phase == Phase::Prefill ? "prefill" : "decode";
+        const Features features{
+            {   "query_tokens",   frame.description.input.query_tokens },
+            { "context_tokens", frame.description.input.context_tokens },
+            {    "page_tokens",    frame.description.input.page_tokens },
+            {     "batch_size",     frame.description.input.batch_size }
+        };
+        const Work broadcast{
+            { std::string("control.broadcast.") + phase, backend_.implementation,                            "controller_group_response" },
+            {                         { "requests", 0 },   { "input_tokens", 0 }, { "page_tokens", frame.description.input.page_tokens } }
+        };
+        const Work control{
+            { std::string("control.before_prepare.") + phase, backend_.implementation, "controller_group_response" },
+            features
+        };
+        const auto begin = runtime.next_node();
+        PlannedMutation mutation{ owner_, {}, {} };
+        if (backend_.participants > 1) {
+            mutation.operations.push_back({ frame.caller, std::cref(broadcast), std::nullopt, true });
+            mutation.operations.push_back({ frame.caller, std::cref(control), std::nullopt, true });
+            mutation.dependencies.push_back({ begin, begin + 1, graph::EdgeKind::DataDependency });
+        }
+        else mutation.operations.push_back({ frame.caller, std::cref(control), std::nullopt, true });
+        for (const auto arrival : arrivals) mutation.dependencies.push_back({ arrival, begin, graph::EdgeKind::Synchronization });
+        const auto ready = begin + mutation.operations.size() - 1;
+        for (const auto peer : groups_[frame.group]) {
+            const auto node = begin + mutation.operations.size();
+            mutation.operations.push_back({ frames_[peer].caller, Boundary{}, action(ActionKind::ControlReady, peer) });
+            mutation.dependencies.push_back({ ready, node, graph::EdgeKind::DataDependency });
+        }
+        runtime.submit(std::move(mutation));
+        return;
     }
 
     // Only the unchanged response after all callers entered is transferred.
@@ -178,7 +225,7 @@ void RegionCompute::enter_control(ProgramRuntime & runtime, std::size_t id, grap
         };
         for (const auto arrival : arrivals) mutation.dependencies.push_back({ arrival, node, graph::EdgeKind::DataDependency });
         if (runtime.records_graph()) {
-            const auto participant = source_.observations().compute_frames[target.description.source_frame].participant;
+            const auto participant = target.rank;
             mutation.operations[0].position = OperationPosition{ request_, target.group, participant, "control_response" };
             mutation.operations[1].position = OperationPosition{ request_, target.group, participant, "after_control" };
         }
@@ -272,14 +319,21 @@ void RegionCompute::prepare(ProgramRuntime & runtime, std::size_t id) {
 void RegionCompute::run_frame(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
     auto & frame = frames_[id];
     const auto gap = source_.regions().frame(frame.description.source_frame).before_run;
-    if (!gap) {
+    if (!gap && backend_.transfer_source_control) {
         issue_ = "semantic_forward_gap_unavailable";
         return;
     }
+    const Work control{
+        { std::string("control.before_batch.") + (frame.phase == Phase::Prefill ? "prefill" : "decode"), backend_.implementation, "caller_blocking_interval" },
+        { { "query_tokens", frame.description.input.query_tokens },
+         { "context_tokens", frame.description.input.context_tokens },
+         { "page_tokens", frame.description.input.page_tokens },
+         { "batch_size", frame.description.input.batch_size } }
+    };
     const auto begin = runtime.next_node();
     PlannedMutation mutation{
         owner_,
-        { { frame.caller, SourceRegionGap{ *gap } },
+        { { frame.caller, Boundary{} },
           { frame.caller, Boundary{}, action(ActionKind::Entered, id) },
           { frame.caller, std::cref(frame.batch_cpu) },
           { frame.caller, std::cref(frame.batch_return), std::nullopt, true },
@@ -291,6 +345,8 @@ void RegionCompute::run_frame(ProgramRuntime & runtime, std::size_t id, graph::N
           { begin + 2, begin + 4, graph::EdgeKind::DataDependency },
           { begin + 3, begin + 4, graph::EdgeKind::DataDependency } }
     };
+    if (backend_.transfer_source_control) mutation.operations.front().cost = SourceRegionGap{ *gap };
+    else mutation.operations.front().cost = std::cref(control);
     if (backend_.host_reads_stream_inputs) {
         // Host scalar reads block this caller on its local stream, not peers.
         mutation.dependencies.push_back({ *frame.input_ready, begin + 1, graph::EdgeKind::Synchronization });
@@ -319,9 +375,7 @@ void RegionCompute::launch_frame(ProgramRuntime & runtime, std::size_t id, graph
     };
     if (frame.previous) mutation.dependencies.push_back({ *stats_.frames[*frame.previous].completed, node, graph::EdgeKind::DataDependency });
     if (frame.data_ready) mutation.dependencies.push_back({ *frame.data_ready, node, graph::EdgeKind::DataDependency });
-    if (runtime.records_graph())
-        mutation.operations.front().position =
-            OperationPosition{ request_, frame.group, source_.observations().compute_frames[frame.description.source_frame].participant, "batch" };
+    if (runtime.records_graph()) mutation.operations.front().position = OperationPosition{ request_, frame.group, frame.rank, "batch" };
     if (runtime.submit(std::move(mutation))) {
         stats_.frames[id].completed = node;
         ++stats_.compute_calls;
@@ -351,12 +405,21 @@ void RegionCompute::advance(ProgramRuntime & runtime, std::size_t id) {
 void RegionCompute::process_result(ProgramRuntime & runtime, std::size_t id, graph::NodeId cause) {
     auto & frame = frames_[id];
     const auto gap = source_.regions().frame(frame.description.source_frame).before_result;
-    if (!gap) {
+    if (!gap && backend_.transfer_source_control) {
         issue_ = "semantic_result_gap_unavailable";
         return;
     }
     const auto begin = runtime.next_node();
-    PlannedMutation mutation{ owner_, { { frame.caller, SourceRegionGap{ *gap } } }, { { cause, begin, graph::EdgeKind::ResourceOrder } } };
+    const Work control{
+        { std::string("control.before_result.") + (frame.phase == Phase::Prefill ? "prefill" : "decode"), backend_.implementation, "caller_blocking_interval" },
+        { { "query_tokens", frame.description.input.query_tokens },
+         { "context_tokens", frame.description.input.context_tokens },
+         { "page_tokens", frame.description.input.page_tokens },
+         { "batch_size", frame.description.input.batch_size } }
+    };
+    PlannedMutation mutation{ owner_, { { frame.caller, Boundary{} } }, { { cause, begin, graph::EdgeKind::ResourceOrder } } };
+    if (backend_.transfer_source_control) mutation.operations.front().cost = SourceRegionGap{ *gap };
+    else mutation.operations.front().cost = std::cref(control);
     identify(runtime, mutation, frame, "result");
     if (!runtime.submit(std::move(mutation))) return;
     frame.result_control = begin;

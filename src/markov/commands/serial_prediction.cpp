@@ -21,7 +21,8 @@ nlohmann::json serial_prediction_report(const adapters::PreparedPrediction & inp
     using Clock = std::chrono::steady_clock;
     const auto & source = input.source.context;
     const auto & observed = source.observations();
-    cost::Queries costs(input.costs.models, &source);
+    const auto & selected = input.costs.begin()->second;
+    cost::Queries costs(selected.models, &source);
     auto cells = Json::array();
     double maximum_input = 0, maximum_output = 0;
     for (const auto & target : std::get<std::vector<adapters::SerialPredictionTarget>>(input.targets)) {
@@ -100,26 +101,36 @@ nlohmann::json serial_prediction_report(const adapters::PreparedPrediction & inp
     }
     std::set<std::string> sources, assumptions;
     for (const auto id : costs.limited_models()) {
-        const auto & model = input.costs.models.model(id);
+        const auto & model = selected.models.model(id);
         sources.insert(model.sources.begin(), model.sources.end());
         assumptions.insert(model.limitations.begin(), model.limitations.end());
     }
+    const Json sampling_context{
+        { "max_input_tokens",  maximum_input },
+        {   "max_new_tokens", maximum_output }
+    };
+    for (auto & cell : cells) {
+        cell["deployment"] = input.deployment;
+        cell["sampling_context"] = sampling_context;
+    }
+    Json models = Json::object();
+    for (const auto & [tp, path] : input.models_paths) models[std::to_string(tp)] = path.string();
     rusage usage{};
     const auto usage_status = getrusage(RUSAGE_SELF, &usage);
     return {
-        { "deployment", input.costs.deployment },
+        { "deployment", input.deployment },
         { "status", std::ranges::all_of(cells, [](const Json & cell) { return cell.at("e2e_predicted").get<bool>(); }) ? "completed" : "incomplete" },
         { "manifest", input.source.manifest.path.string() },
-        { "models", input.models_path.string() },
+        { "models", models },
         { "source_prepare_sec", input.source.read_and_interpret_sec + input.source.build_sec },
         { "source_records_read", std::accumulate(input.source.input_record_counts.begin(), input.source.input_record_counts.end(), std::size_t{ 0 }) },
         { "unread_low_level_trace_files", input.source.skipped_files.size() },
         { "source_details_materialized", source.detailed_preparation_sec() != 0 },
         { "process_peak_rss_bytes", usage_status == 0 ? Json(usage.ru_maxrss * 1'024) : Json(nullptr) },
-        { "selected_models", input.costs.models.size() },
+        { "selected_models", selected.models.size() },
         { "model_sources", sources },
         { "cost_assumptions", assumptions },
-        { "sampling_context", { { "max_input_tokens", maximum_input }, { "max_new_tokens", maximum_output } } },
+        { "sampling_context", sampling_context },
         { "cells", std::move(cells) },
         { "limitations",
          { "Closed synchronous requests on the declared single-device deployment, fresh KV per request; no serving overlap or offload model.",

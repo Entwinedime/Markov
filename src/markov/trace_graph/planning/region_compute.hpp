@@ -23,11 +23,14 @@ struct RegionBackend {
     bool host_reads_stream_inputs;
     WorkKind load_consumer;
     std::size_t event_waits_per_layer;
+    std::size_t participants;
+    bool transfer_source_control;
 };
 
 struct RegionFrame {
     source::Index source_frame;
     FrameInput input;
+    std::size_t rank, caller;
     std::optional<Work> load_consumer = std::nullopt;
 };
 

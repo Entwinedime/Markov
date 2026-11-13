@@ -34,21 +34,41 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
     }
     for (std::size_t request = 0; request < requests_.size(); ++request) {
         std::set<std::size_t> callers;
+        std::map<std::size_t, std::size_t> ranked_callers;
         for (const auto frame : source.request_frames(source.observations().requests[request].identity)) {
             const auto operations = source.frame_operations(frame);
             if (!operations.empty()) callers.insert(source.observations().work_observations[operations.front()].resource);
+            if (regions_) {
+                const auto * result = source.frame_result(frame);
+                const auto rank = source.observations().compute_frames[frame].participant;
+                if (result && rank) ranked_callers.emplace(*rank, result->run.resource);
+            }
             if (regions_ && source.observations().compute_frames[frame].phase == Phase::Prefill) {
                 const auto * result = source.frame_result(frame);
                 const auto gap = source.regions().frame(frame).before_preparation;
                 if (result && gap) running_[request].admission_gaps.try_emplace(result->run.resource, *gap);
             }
         }
+        if (regions_ && !regions_->transfer_source_control) {
+            callers.clear();
+            running_[request].admission_gaps.clear();
+            for (std::size_t rank = 0; rank < backend_.participants; ++rank) callers.insert(source.observations().resources.size() + rank);
+        }
         if (callers.size() != backend_.participants) {
             issue_ = "request_caller_resources_unavailable";
             return;
         }
-        running_[request].callers.assign(callers.begin(), callers.end());
-        if (regions_ && running_[request].admission_gaps.size() != callers.size()) {
+        if (regions_ && regions_->transfer_source_control) {
+            for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
+                if (!ranked_callers.contains(rank)) {
+                    issue_ = "request_participant_identity_unavailable";
+                    return;
+                }
+                running_[request].callers.push_back(ranked_callers.at(rank));
+            }
+        }
+        else running_[request].callers.assign(callers.begin(), callers.end());
+        if (regions_ && regions_->transfer_source_control && running_[request].admission_gaps.size() != callers.size()) {
             issue_ = "request_admission_regions_unavailable";
             return;
         }
@@ -59,7 +79,7 @@ CacheProgram::CacheProgram(const source::SourceContext & source, std::size_t pag
                          page_tokens_,
                          backend_.bytes_per_token,
                          backend_.participants,
-                         source.observations().resources.size() + 2 * backend_.participants,
+                         base_resource_count() + 2 * backend_.participants,
                          requests_.size(),
                          *storage,
                          backend_.storage,
@@ -110,7 +130,7 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
                                  kind == CopyKind::Backup ? cache_.tree().nodes()[node].pages : std::vector<PrefixId>{} });
     PlannedMutation mutation{ 0, {}, {} };
     for (std::size_t rank = 0; rank < backend_.participants; ++rank) {
-        const auto resource = source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
+        const auto resource = base_resource_count() + 2 * rank + (kind == CopyKind::Load ? 0 : 1);
         mutation.operations.push_back({ resource, std::cref(work) });
         const auto previous = queues_.native.find(resource);
         if (previous != queues_.native.end()) mutation.dependencies.push_back({ previous->second, begin + rank, graph::EdgeKind::ResourceOrder });
@@ -120,7 +140,7 @@ bool CacheProgram::copy(ProgramRuntime & runtime, TransferId transfer, RadixId n
     const auto submitted = submit(runtime, std::move(mutation));
     if (submitted) {
         for (std::size_t rank = 0; rank < backend_.participants; ++rank)
-            queues_.native[source_.observations().resources.size() + 2 * rank + (kind == CopyKind::Load ? 0 : 1)] = begin + rank;
+            queues_.native[base_resource_count() + 2 * rank + (kind == CopyKind::Load ? 0 : 1)] = begin + rank;
         kind == CopyKind::Load ? ++loads_ : ++backups_;
         copy_frontier_[kind == CopyKind::Load ? 0 : 1] = begin + backend_.participants;
     }
@@ -191,6 +211,7 @@ void CacheProgram::finish_compute(ProgramRuntime & runtime, std::size_t request)
     requests_[request].work_completed = cause_;
     compute_stats_.add(running.compute->stats());
     running.compute.reset();
+    if (request_ == requests_.size() && std::ranges::none_of(running_, [](const RunningRequest & current) { return bool(current.compute); })) controller_turn();
 }
 
 void CacheProgram::start(ProgramRuntime & runtime) { advance(runtime); }
@@ -261,6 +282,7 @@ void CacheProgram::advance(ProgramRuntime & runtime) {
     if (issue_ || (eviction_ && !eviction_->completed) || request_ == requests_.size()) return;
     waiting_ = true;
     if (request_stage_ == RequestStage::BeforeStart) {
+        if (std::ranges::none_of(running_, [](const RunningRequest & request) { return bool(request.compute); })) controller_turn();
         const auto & barriers = source_.observations().workload_barriers;
         const auto drain = std::ranges::any_of(barriers, [&](const source::WorkloadBarrier & barrier) { return barrier.before_request == request_; });
         const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
@@ -382,7 +404,8 @@ void CacheProgram::admit(ProgramRuntime & runtime, RadixId prefix, const Pending
         const bool pending_compute = std::ranges::any_of(running_, [](const RunningRequest & request) {
             return request.compute || request.final_publication || request.prefix_publication;
         });
-        if (room == RoomStatus::Unavailable && copies_.empty() && !pending_compute && (!storage_ || storage_->idle())) issue_ = "device_capacity_unavailable";
+        // File workers cannot grant an extra synchronous allocator retry.
+        if (room == RoomStatus::Unavailable && copies_.empty() && !pending_compute) issue_ = "device_capacity_unavailable";
         wait_for_progress(runtime);
         return;
     }
@@ -418,9 +441,35 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
     request_stage_ = RequestStage::Querying;
     requests_[request_].query_index_copies += copies.size();
     if (regions_) {
+        if (!regions_->transfer_source_control && backend_.participants > 1 && !running.broadcast_done) {
+            const auto prompt_tokens = observed.token_paths.length(observed.request_tokens.at(request.identity).prompt.value().path);
+            const Work broadcast{
+                { "control.broadcast.prefill",                               regions_->implementation,                          "controller_group_response" },
+                {           { "requests", 1 }, { "input_tokens", static_cast<double>(prompt_tokens) }, { "page_tokens", static_cast<double>(page_tokens_) } }
+            };
+            PlannedMutation mutation{ 0, { { running.callers.front(), std::cref(broadcast), action(ActionKind::BroadcastDone, request_), true } }, {} };
+            if (runtime.records_graph()) mutation.operations.front().position = OperationPosition{ request_, 0, 0, "broadcast" };
+            submit(runtime, std::move(mutation));
+            request_stage_ = RequestStage::Broadcasting;
+            return;
+        }
         const auto issued = storage_ ? storage_->begin_prefetch(runtime, request_, lookup, matched, running.callers, cause_) : std::nullopt;
         const auto begin = runtime.next_node();
+        const auto prompt_tokens = source_.observations().token_paths.length(source_.observations().request_tokens.at(request.identity).prompt.value().path);
+        const Work control_work{
+            { "control.before_prepare.prefill", regions_->implementation, "controller_group_response" },
+            { { "query_tokens", static_cast<double>(prompt_tokens) },
+             { "context_tokens", static_cast<double>(prompt_tokens) },
+             { "page_tokens", static_cast<double>(page_tokens_) },
+             { "batch_size", 1 } }
+        };
         PlannedMutation mutation{ 0, {}, {} };
+        std::optional<graph::NodeId> group_control;
+        if (!regions_->transfer_source_control && !running.frontend_control_complete) {
+            group_control = begin;
+            mutation.operations.push_back({ running.callers.front(), std::cref(control_work), std::nullopt, true });
+            if (issued) mutation.dependencies.push_back({ *issued, begin, graph::EdgeKind::DataDependency });
+        }
         for (const auto caller : running.callers) {
             const auto node = begin + mutation.operations.size();
             PlannedOperation control{ caller, Boundary{}, action(ActionKind::QuerySubmitted, request_) };
@@ -436,7 +485,8 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
                 }
             }
             mutation.operations.push_back(std::move(control));
-            if (issued) mutation.dependencies.push_back({ *issued, node, graph::EdgeKind::DataDependency });
+            if (group_control) mutation.dependencies.push_back({ *group_control, node, graph::EdgeKind::DataDependency });
+            else if (issued) mutation.dependencies.push_back({ *issued, node, graph::EdgeKind::DataDependency });
             mutation.operations.push_back({ caller, Boundary{}, action(ActionKind::QueryDone, request_) });
             mutation.dependencies.push_back({ node, node + 1, graph::EdgeKind::DataDependency });
         }
@@ -447,6 +497,7 @@ void CacheProgram::query(ProgramRuntime & runtime, std::span<const PrefixId> loo
             pending_queries_ += running.callers.size();
             compute_stats_.source_cpu_gaps += running.admission_gaps.size();
             running.admission_gaps.clear();
+            running.frontend_control_complete = true;
         }
         return;
     }
@@ -528,7 +579,16 @@ void CacheProgram::compute(ProgramRuntime & runtime, const PendingCopy * load) {
             std::optional<Work> consumer;
             if (load || requests_[request_].loaded_pages > 0)
                 consumer = Work{ regions_->load_consumer, { { "events", backend_.layers * regions_->event_waits_per_layer } } };
-            region_frames.push_back({ frame_id, variables, std::move(consumer) });
+            if (regions_->transfer_source_control) {
+                const auto rank = frame.participant.value();
+                region_frames.push_back({ frame_id, variables, rank, running_[request_].callers.at(rank), std::move(consumer) });
+            }
+            else if (frame.participant == std::optional<std::size_t>(0)) {
+                // Fixed serial requests have one logical phase sequence. The
+                // target deployment creates its ranks; source rank count is evidence only.
+                for (std::size_t rank = 0; rank < backend_.participants; ++rank)
+                    region_frames.push_back({ frame_id, variables, rank, running_[request_].callers.at(rank), consumer });
+            }
         }
         else plans.push_back({ frame_id, variables, project_compute(source_, frame_id, variables) });
     }
@@ -626,17 +686,23 @@ void CacheProgram::publish_result(ProgramRuntime & runtime, std::size_t request)
 }
 
 bool CacheProgram::complete() const {
+    if (issue_) return true;
     const bool pending_insertion = std::ranges::any_of(running_, [](const RunningRequest & request) {
         return request.final_publication || (request.prefix_insertion && !request.prefix_insertion->completed)
                || (request.final_insertion && !request.final_insertion->completed);
     });
-    if (pending_queries_ || pending_insertion || (!issue_ && request_ != requests_.size()) || !copies_.empty() || (storage_ && !storage_->idle())) return false;
-    return issue_ || std::ranges::all_of(running_, [](const RunningRequest & request) { return !request.compute; });
+    if (pending_queries_ || pending_insertion || request_ != requests_.size() || !copies_.empty() || (storage_ && !storage_->idle())) return false;
+    return std::ranges::all_of(running_, [](const RunningRequest & request) { return !request.compute; });
 }
 
 void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & event) {
     if (event.owner == Storage::owner) {
         const auto changed = storage_->on_event(runtime, event);
+        const bool frontend_idle = std::ranges::none_of(running_, [](const RunningRequest & request) { return bool(request.compute); });
+        if (frontend_idle
+            && (request_ == requests_.size() || request_stage_ == RequestStage::BeforeStart || request_stage_ == RequestStage::ClientPacing
+                || request_stage_ == RequestStage::Ingress))
+            controller_turn();
         if (request_stage_ == RequestStage::PrefetchIssuing && storage_->results()[request_].issue_finished_ns) request_stage_ = RequestStage::Active;
         if (request_stage_ == RequestStage::PrefetchFinalizing && request_ < requests_.size()) {
             if (!storage_->results()[request_].ready) return;
@@ -736,6 +802,11 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
             submit(runtime, std::move(mutation));
         }
     }
+    else if (event.action.kind == std::to_underlying(ActionKind::BroadcastDone)) {
+        running_[event.action.subject].broadcast_done = true;
+        request_stage_ = RequestStage::Active;
+        advance(runtime);
+    }
     else if (event.action.kind == std::to_underlying(ActionKind::QueryDone)) { --pending_queries_; }
     else if (event.action.kind == std::to_underlying(ActionKind::QuerySubmitted)) {
         auto & running = running_[event.action.subject];
@@ -763,6 +834,7 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
         }
     }
     else if (event.action.kind == std::to_underlying(ActionKind::Admitted)) {
+        controller_turn();
         auto & received = requests_[event.action.subject].received;
         if (!received) received = event.identity;
         request_stage_ = RequestStage::Active;
@@ -770,6 +842,8 @@ void CacheProgram::on_event(ProgramRuntime & runtime, const simulation::Event & 
     }
     else if (event.action.kind == std::to_underlying(ActionKind::ResponseDone)) {
         requests_[request_++].completed = true;
+        if (request_ == requests_.size() && std::ranges::none_of(running_, [](const RunningRequest & current) { return bool(current.compute); }))
+            controller_turn();
         if (request_ < requests_.size()) {
             const auto pacing = runtime.next_node();
             PlannedMutation mutation{

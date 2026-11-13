@@ -36,13 +36,17 @@ def _predict(request: PredictionRequest) -> dict:
     output = request.execution.output / "prediction"
     process = ModelingProcess(output, request.execution.memory_limit_gib or 4)
     process.check_available()
-    models = select_models(
-        request.deployment,
-        request.models,
-        request.database,
-        request.execution.output / "performance",
-        request.sampling_budget is not None,
-    )
+    deployments = {target.deployment.tensor_parallel: target.deployment for target in request.targets}
+    if request.models is not None and len(deployments) > 1:
+        raise ValueError("Mixed target deployments require performance.database for independent model selection")
+    models = {
+        tp: select_models(
+            deployment, request.models, request.database,
+            request.execution.output / "performance" / f"tp{tp}",
+            request.sampling_budget is not None,
+        )
+        for tp, deployment in deployments.items()
+    }
     performance_sec = time.monotonic() - begin
     workload = Workload.load(request.workload)
     capture_begin = time.monotonic()
@@ -56,7 +60,7 @@ def _predict(request: PredictionRequest) -> dict:
     prepared = request.execution.output / "prediction_input.json"
     inputs = {
         "manifest": str(manifest),
-        "models": str(models),
+        "models": {str(tp): str(path) for tp, path in models.items()},
         "deployment": asdict(request.deployment),
         "workload": asdict(workload),
         "targets": [asdict(target) for target in request.targets],
@@ -67,15 +71,16 @@ def _predict(request: PredictionRequest) -> dict:
     seen = set()
     preparation = None
     while True:
-        inputs["models"] = str(models)
+        inputs["models"] = {str(tp): str(path) for tp, path in models.items()}
         write_json(prepared, inputs)
-        result = process.run("predict", prepared, (manifest.parent, models))
+        result = process.run("predict", prepared, (manifest.parent, *models.values()))
         if result["status"] == "failed":
             return result
         requirements = {}
         for cell in result["cells"]:
             for gap in cell["cost_gaps"]:
-                entry = requirements.setdefault(encoded(gap), {**gap, "targets": []})
+                deployment = cell["deployment"]
+                entry = requirements.setdefault(encoded([deployment, gap]), {**gap, "deployment": deployment, "targets": []})
                 entry["targets"].append(cell["name"])
         result["cost_requirements"] = list(requirements.values())
         if not requirements or request.sampling_budget is None:

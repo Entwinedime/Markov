@@ -51,7 +51,7 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
             else None,
         },
         "capture": asdict(request.execution.capture) if request.execution.capture is not None else None,
-        "targets": [item.name for item in request.targets],
+        "targets": [asdict(item) for item in request.targets],
         "models": str(request.models) if request.models is not None else None,
         "database": str(request.database) if request.database is not None else None,
         "sampling_budget": request.sampling_budget,

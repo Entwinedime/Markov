@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from markov.artifacts.capture import DeviceCommand
@@ -22,6 +22,8 @@ class InferenceCapture:
     ) -> None:
         self.request = request
         self.settings = request.execution.capture
+        if self.settings is not None:
+            self.settings = replace(self.settings, devices=self.settings.devices[: request.deployment.tensor_parallel])
         self.semantic = profiling and self.settings is not None and self.settings.detail == "semantic"
         self.profiling = profiling
         self.calibration = calibration
@@ -54,7 +56,7 @@ class InferenceCapture:
         if self.request.deployment.runtime != "ascend":
             raise ValueError("Inference capture currently supports the Ascend runtime")
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
-            raise ValueError("Single-host capture needs one declared device per tensor-parallel rank")
+            raise ValueError("Single-host capture needs at least one declared device per tensor-parallel rank")
         from markov.adapters.sglang import capture as adapter
 
         workload = self.workload if self.workload is not None else Workload.load(self.request.workload)

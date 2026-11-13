@@ -129,8 +129,10 @@ PreparedEvaluation prepare(const std::filesystem::path & input) {
     const auto target_manifest = source::inspect_manifest(request.at("manifest").get<std::string>());
     const auto base = read(source_manifest.configuration_path.value());
     const auto target = read(target_manifest.configuration_path.value());
-    if (prediction.deployment != target.at("deployment") || prediction.deployment != base.at("deployment")
-        || source_manifest.framework != target_manifest.framework || base.at("workload") != target.at("workload"))
+    auto base_deployment = base.at("deployment");
+    base_deployment["tensor_parallel"] = prediction.deployment.at("tensor_parallel");
+    if (prediction.deployment != target.at("deployment") || prediction.deployment != base_deployment || source_manifest.framework != target_manifest.framework
+        || base.at("workload") != target.at("workload"))
         throw std::runtime_error("Target evaluation requires the predicted deployment and the base's exact encoded workload");
     for (const auto & [name, value] : prediction.cell.at("configuration").items())
         if (target.at("server").at("arguments").at(name) != value) throw std::runtime_error("Target profile does not use predicted setting: " + name);

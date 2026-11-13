@@ -182,6 +182,7 @@ class Capture(SerialHttpClient):
             self.directory / "config.json",
             {
                 "deployment": self.plan["deployment"],
+                "model_configuration": read_json(Path(self.plan["server"]["model_path"]) / "config.json"),
                 "workload": self.plan["workload"],
                 "server": {
                     "command": command,

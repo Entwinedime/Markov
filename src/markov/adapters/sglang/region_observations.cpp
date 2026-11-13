@@ -12,7 +12,15 @@ ProbeReader::ProbeReader(trace_graph::source::Observations & output, std::option
     : adapters::ProbeReader(output),
       configuration_(configuration),
       deterministic_sampling_(deterministic_sampling),
-      full_compute_(full_compute) {}
+      full_compute_(full_compute) {
+    if (configuration_) {
+        std::ifstream stream(*configuration_);
+        const auto captured = nlohmann::json::parse(stream);
+        participants_ = captured.at("deployment").at("tensor_parallel").get<std::size_t>();
+        result_implementation_ = std::string("sglang.ascend.eager:")
+                                 + (captured.at("server").at("arguments").value("enable_hierarchical_cache", false) ? "HiRadixCache" : "RadixCache");
+    }
+}
 
 void ProbeReader::observe_response(const ProbeEvent & event) {
     using namespace trace_graph;
@@ -20,6 +28,26 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
 
     const auto & fields = event.args;
     if (fields.at("status") != "returned") throw std::runtime_error("Cannot evaluate a failed regional observation");
+    if (event.name.starts_with("region.control.")) {
+        const auto part = event.name.substr(std::string("region.control.").size());
+        // Collective controller responses need grouped arrivals, not one rank's duration.
+        if (part != "before_batch" && part != "before_result") return;
+        planning::Features variables;
+        for (const auto * key : { "query_tokens", "context_tokens", "page_tokens", "batch_size" }) variables[key] = fields.at("features").at(key).get<double>();
+        output_.cost_observations.push_back({
+            output_.name(fields.at("request_ids").at(0).get<std::string>()),
+            fields.at("iteration").get<std::size_t>(),
+            fields.at("participant").get<std::size_t>(),
+            part == "before_batch" ? "before_batch" : "before_result",
+            { { "control." + part + "." + fields.at("phase").get<std::string>(), fields.at("implementation").get<std::string>(), "caller_blocking_interval" },
+                                                                   std::move(variables) },
+            event.end_ns - event.begin_ns,
+            { output_.resource(source::ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread), event.begin_ns, event.end_ns, event.record },
+            std::nullopt,
+            true
+        });
+        return;
+    }
     const auto requests = fields.at("request_ids").get<std::vector<std::string>>();
     if (requests.size() != 1) throw std::runtime_error("Regional cost evaluation currently supports serial single-request frames");
 
@@ -28,11 +56,6 @@ void ProbeReader::observe_response(const ProbeEvent & event) {
     const bool stream = operation == "stream" || operation == "prepare_stream";
     if (stream) operation = operation == "stream" ? "batch" : "prepare";
     const auto scope = stream ? "current_stream_interval" : "thread_cpu";
-    if (operation == "result" && result_implementation_.empty()) {
-        std::ifstream stream(*configuration_);
-        const auto settings = nlohmann::json::parse(stream).at("server").at("arguments");
-        result_implementation_ = std::string("sglang.ascend.eager:") + (settings.value("enable_hierarchical_cache", false) ? "HiRadixCache" : "RadixCache");
-    }
     const auto implementation = operation == "result" ? result_implementation_ : fields.at("implementation").get<std::string>();
     const auto phase = fields.at("phase").get<std::string>();
     const auto request = output_.name(requests.front());

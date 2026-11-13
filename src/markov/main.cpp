@@ -90,9 +90,8 @@ int main(int argc, char ** argv) {
         }
         else if (command == "predict") {
             const auto request = markov::adapters::prepare_prediction(argv[2]);
-            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(),
-                                                       request.models_path,
-                                                       request.source.manifest.path };
+            std::vector<std::filesystem::path> inputs{ std::filesystem::absolute(argv[2]).lexically_normal(), request.source.manifest.path };
+            for (const auto & [tp, models] : request.models_paths) inputs.push_back(models);
             for (const auto & file : request.source.manifest.files) inputs.push_back(file.path);
             if (request.source.manifest.configuration_path) inputs.push_back(*request.source.manifest.configuration_path);
             markov::commands::prepare_output(output, inputs);

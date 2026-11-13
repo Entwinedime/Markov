@@ -51,6 +51,8 @@ class RequestProbe:
         return result
 
     def run_batch(self, original: Callable, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+        from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+
         self.batch_sequence += 1
         identity = self.batch_sequence
         phase = "other"
@@ -60,6 +62,7 @@ class RequestProbe:
             phase = "prefill"
         fields = {
             "batch_id": identity,
+            "participant": get_tensor_model_parallel_rank(),
             "request_ids": [request.rid for request in batch.reqs],
             "phase": phase,
             "overlap": scheduler.enable_overlap,

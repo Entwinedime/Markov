@@ -22,6 +22,7 @@ struct ControlWork {
 class RequestControls {
 public:
     virtual ~RequestControls() = default;
+    virtual void controller_turn() {}
     virtual FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) = 0;
     // No value means the control awaits a state event; an empty vector is a completed no-op.
     virtual std::optional<ControlWork> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) = 0;

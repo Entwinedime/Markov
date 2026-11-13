@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
@@ -96,14 +96,18 @@ class BaseInput:
 class Target:
     name: str
     configuration: dict[str, Any]
+    deployment: Deployment
 
     @classmethod
-    def parse(cls, raw: dict[str, Any]) -> Target:
-        reject_unknown(raw, {"name", "configuration"}, "target")
+    def parse(cls, raw: dict[str, Any], source: Deployment) -> Target:
+        reject_unknown(raw, {"name", "configuration", "deployment"}, "target")
         if not isinstance(raw["configuration"], dict):
             raise ValueError("target.configuration must be a JSON object")
 
-        return cls(required_text(raw["name"], "target.name"), raw["configuration"])
+        deployment = Deployment.parse({**asdict(source), **raw.get("deployment", {})})
+        if any(getattr(deployment, name) != getattr(source, name) for name in asdict(source) if name != "tensor_parallel"):
+            raise ValueError("Targets currently change tensor_parallel within the same model, dtype, framework and platform")
+        return cls(required_text(raw["name"], "target.name"), raw["configuration"], deployment)
 
 
 @dataclass(frozen=True)
@@ -181,7 +185,8 @@ class PredictionRequest:
         raw = read_json(path)
         reject_unknown(raw, {"deployment", "base", "workload", "targets", "performance", "execution"}, "request")
         directory = path.resolve().parent
-        targets = tuple(Target.parse(item) for item in raw["targets"])
+        deployment = Deployment.parse(raw["deployment"])
+        targets = tuple(Target.parse(item, deployment) for item in raw["targets"])
         if not targets:
             raise ValueError("targets must contain at least one configuration")
         if len({item.name for item in targets}) != len(targets):
@@ -197,7 +202,7 @@ class PredictionRequest:
         if sampling_budget is not None and database is None:
             raise ValueError("Shared sampling requires performance.database")
         return cls(
-            Deployment.parse(raw["deployment"]),
+            deployment,
             BaseInput.parse(raw["base"], directory),
             resolve_path(directory, raw["workload"]),
             targets,

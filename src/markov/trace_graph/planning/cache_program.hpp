@@ -105,7 +105,8 @@ private:
         ClientReady,
         PollGranted,
         PollReturned,
-        LoadFailed
+        LoadFailed,
+        BroadcastDone
     };
     enum class RequestStage {
         BeforeStart,
@@ -115,6 +116,7 @@ private:
         Admitting,
         Active,
         Querying,
+        Broadcasting,
         PrefetchIssuing,
         PrefetchPolling,
         PrefetchFinalizing,
@@ -160,7 +162,7 @@ private:
         std::vector<graph::NodeId> poll_returns;
         graph::Time poll_started_ns = 0;
         std::map<std::size_t, std::size_t> admission_gaps;
-        bool queried = false, load_failed = false;
+        bool queried = false, load_failed = false, broadcast_done = false, frontend_control_complete = false;
         std::optional<Insertion> prefix_insertion, final_insertion;
         std::optional<std::vector<Work>> prefix_match;
         std::map<ResultControl, std::vector<TransferId>> backups;
@@ -178,6 +180,9 @@ private:
         std::optional<graph::NodeId> completed;
     };
     std::size_t release_group(std::size_t request, std::size_t frame, ResultControl group);
+    void controller_turn() override {
+        if (storage_) storage_->drain_controls();
+    }
     FrameInput begin_frame(std::size_t request, std::size_t frame, FrameInput input) override;
     std::optional<ControlWork> begin_result_control(std::size_t request, std::size_t frame, ResultControlPoint control) override;
     std::vector<Work> result_control_work(std::size_t request, std::size_t frame, ResultControlPoint control);
@@ -205,9 +210,10 @@ private:
     bool region_copy(ProgramRuntime & runtime, TransferId transfer, RadixId node, CopyKind kind, std::size_t pages, bool evict_after, std::size_t request);
     bool submit_region_copy(ProgramRuntime & runtime, std::size_t turn, graph::NodeId cause);
     bool submit(ProgramRuntime & runtime, PlannedMutation mutation);
-    std::size_t compute_resource_begin(bool storage) const {
-        return source_.observations().resources.size() + (storage ? 4 : 2) * backend_.participants + storage;
+    std::size_t base_resource_count() const {
+        return source_.observations().resources.size() + (regions_ && !regions_->transfer_source_control ? backend_.participants : 0);
     }
+    std::size_t compute_resource_begin(bool storage) const { return base_resource_count() + (storage ? 4 : 2) * backend_.participants + storage; }
     std::size_t compute_resource_begin() const { return compute_resource_begin(storage_.has_value()); }
 
     const source::SourceContext & source_;
