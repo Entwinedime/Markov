@@ -182,9 +182,11 @@ class PredictionRequest:
 
     @classmethod
     def load(cls, path: Path) -> PredictionRequest:
-        raw = read_json(path)
+        return cls.parse(read_json(path), path.resolve().parent)
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any], directory: Path) -> PredictionRequest:
         reject_unknown(raw, {"deployment", "base", "workload", "targets", "performance", "execution"}, "request")
-        directory = path.resolve().parent
         deployment = Deployment.parse(raw["deployment"])
         targets = tuple(Target.parse(item, deployment) for item in raw["targets"])
         if not targets:
@@ -211,3 +213,24 @@ class PredictionRequest:
             sampling_budget,
             Execution.parse(raw["execution"], directory),
         )
+
+    def document(self) -> dict[str, Any]:
+        """Export the public request with resolved paths, not private prepared input."""
+        execution = asdict(self.execution)
+        execution = {key: value for key, value in execution.items() if value is not None}
+        execution["output"] = str(self.execution.output)
+        if "capture" in execution:
+            execution["capture"] = {key: value for key, value in execution["capture"].items() if value is not None}
+            execution["capture"]["devices"] = list(self.execution.capture.devices)
+        return {
+            "deployment": asdict(self.deployment),
+            "base": {"manifest": str(self.base.manifest)} if self.base.manifest else {"configuration": self.base.configuration},
+            "workload": str(self.workload),
+            "targets": [asdict(target) for target in self.targets],
+            "performance": {
+                **({"models": str(self.models)} if self.models else {}),
+                **({"database": str(self.database)} if self.database else {}),
+                **({"sampling_budget": self.sampling_budget} if self.sampling_budget else {}),
+            },
+            "execution": execution,
+        }

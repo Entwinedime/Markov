@@ -207,19 +207,16 @@ class SearchPolicy:
             if within_budget
             else None
         )
-        pareto = [
-            row["name"]
-            for row in ranked
-            if not any(
-                other["predicted_sec"] <= row["predicted_sec"]
-                and other["hourly_cost_units"] <= row["hourly_cost_units"]
-                and (
-                    other["predicted_sec"] < row["predicted_sec"]
-                    or other["hourly_cost_units"] < row["hourly_cost_units"]
-                )
-                for other in ranked
-            )
-        ]
+        frontier = set()
+        best_cost, best_time = math.inf, None
+        for row in sorted(ranked, key=lambda row: (row["predicted_sec"], row["hourly_cost_units"])):
+            time, cost = row["predicted_sec"], row["hourly_cost_units"]
+            if cost < best_cost:
+                best_cost, best_time = cost, time
+                frontier.add(row["name"])
+            elif cost == best_cost and time == best_time:
+                frontier.add(row["name"])
+        pareto = [row["name"] for row in ranked if row["name"] in frontier]
         unresolved = [
             row for row in rows if row["status"] not in {"ranked", "resource_envelope_exceeded", "resource_infeasible"}
         ]

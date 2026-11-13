@@ -119,7 +119,7 @@ class PerformancePreparation:
         # Keep prior anchors for required kinds. Other responses stay selected,
         # even when these same captures contain a different measurement scope.
         sources = {Path(path) for model in selected["models"] for path in model["sources"]}
-        store = PerformanceData(self.request.database)
+        store = PerformanceData(self.request.database, readonly=True)
         try:
             selected = set()
             for source in sources:

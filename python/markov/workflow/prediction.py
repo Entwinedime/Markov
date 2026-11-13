@@ -31,6 +31,8 @@ def predict(request: PredictionRequest) -> dict:
 
 def _predict(request: PredictionRequest) -> dict:
     begin = time.monotonic()
+    state = request.execution.output / "workflow_state.json"
+    write_json(state, {"phase": "selecting_costs", "targets": len(request.targets)})
     if request.execution.kernel_cache_initial_state is None:
         raise ValueError("Prediction requires execution.kernel_cache_initial_state: empty or prepared")
     output = request.execution.output / "prediction"
@@ -50,6 +52,7 @@ def _predict(request: PredictionRequest) -> dict:
     performance_sec = time.monotonic() - begin
     workload = Workload.load(request.workload)
     capture_begin = time.monotonic()
+    write_json(state, {"phase": "preparing_base", "targets": len(request.targets)})
     base = InferenceCapture(request, workload=workload).run(reuse=True)
     capture_sec = time.monotonic() - capture_begin
     if base["status"] not in ("completed", "reused"):
@@ -71,6 +74,7 @@ def _predict(request: PredictionRequest) -> dict:
     seen = set()
     preparation = None
     while True:
+        write_json(state, {"phase": "predicting", "targets": len(request.targets), "sampling_rounds": len(seen)})
         inputs["models"] = {str(tp): str(path) for tp, path in models.items()}
         write_json(prepared, inputs)
         result = process.run("predict", prepared, (manifest.parent, *models.values()))
@@ -95,6 +99,7 @@ def _predict(request: PredictionRequest) -> dict:
         performance_begin = time.monotonic()
         if preparation is None:
             preparation = PerformancePreparation(request)
+        write_json(state, {"phase": "preparing_costs", "targets": len(request.targets), "requirements": list(requirements.values())})
         next_models = preparation.prepare(result, models)
         performance_sec += time.monotonic() - performance_begin
         if next_models is None:
@@ -110,5 +115,10 @@ def _predict(request: PredictionRequest) -> dict:
     }
     result["workflow_sec"] = time.monotonic() - begin
     write_json(process.report, result)
+    write_json(state, {
+        "phase": result["status"], "targets": len(request.targets),
+        "completed_targets": sum(cell["status"] == "predicted" for cell in result["cells"]),
+        "cost_requirements": result["cost_requirements"],
+    })
     result["report"] = str(process.report)
     return result

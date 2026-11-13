@@ -7,6 +7,8 @@ from typing import Any
 
 from markov.artifacts.request import PredictionRequest
 from markov.artifacts.workload import Workload
+from markov.artifacts.performance import PerformanceData
+from markov.workflow.capture import InferenceCapture
 
 
 def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
@@ -21,8 +23,20 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
     if request.database is not None and request.models is None and request.sampling_budget is None:
         request.database.stat()
 
+    base_preview = InferenceCapture(request, workload=workload).preview(workload)
+    costs = []
+    if request.models is None and request.database is not None and request.database.is_file():
+        store = PerformanceData(request.database, readonly=True)
+        try:
+            deployments = {target.deployment.tensor_parallel: target.deployment for target in request.targets}
+            for deployment in deployments.values():
+                selected = store.selected_models(asdict(deployment))
+                costs.append({"deployment": asdict(deployment), "response_count": len(selected["models"]) if selected else 0})
+        finally:
+            store.close()
+
     preparation = []
-    if request.base.manifest is None:
+    if base_preview["status"] not in ("declared", "matching_capture"):
         preparation.append("capture_or_reuse_base")
     if request.models is None:
         preparation.append(
@@ -38,8 +52,9 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         "deployment": asdict(request.deployment),
         "base": {
             "manifest": str(request.base.manifest) if request.base.manifest is not None else None,
-            "requires_preparation": request.base.manifest is None,
+            "requires_preparation": base_preview["status"] not in ("declared", "matching_capture"),
             "detail": request.execution.capture.detail if request.execution.capture is not None else None,
+            "reuse": base_preview,
         },
         "workload": str(request.workload),
         "workload_size": {
@@ -55,10 +70,9 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
         "models": str(request.models) if request.models is not None else None,
         "database": str(request.database) if request.database is not None else None,
         "sampling_budget": request.sampling_budget,
+        "maintained_selections": costs,
         "preparation": preparation,
         "not_evaluated": [
-            "base_reuse",
-            "maintained_model_availability",
             "source_semantics",
             "target_work",
             "cost_coverage",

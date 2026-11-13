@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import sqlite3
+
+from markov.artifacts.request import Deployment, read_json, reject_unknown, resolve_path
+
+
+def maintenance_document(path: Path) -> dict:
+    raw = read_json(path)
+    reject_unknown(raw, {"database", "deployment", "imports", "training", "models", "output", "responses"}, "performance maintenance")
+    raw["deployment"] = asdict(Deployment.parse(raw["deployment"]))
+    directory = path.resolve().parent
+    for key in ("database", "models", "output"):
+        if key in raw:
+            raw[key] = str(resolve_path(directory, raw[key]))
+    raw["training"] = [str(resolve_path(directory, value)) for value in raw.get("training", [])]
+    imports = []
+    for item in raw.get("imports", []):
+        reject_unknown(item, {"adapter", "capture"}, "measurement import")
+        imports.append({**item, "capture": str(resolve_path(directory, item["capture"]))})
+    raw["imports"] = imports
+    return raw
 
 
 @dataclass(frozen=True)
@@ -34,9 +53,12 @@ def encoded(value):
 
 
 class PerformanceData:
-    def __init__(self, path: Path):
-        self.connection = sqlite3.connect(path)
+    def __init__(self, path: Path, readonly: bool = False):
+        self.connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) if readonly else sqlite3.connect(path)
         self.connection.execute("PRAGMA foreign_keys = ON")
+        if readonly:
+            return
+
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS captures (
@@ -72,6 +94,16 @@ class PerformanceData:
 
     def close(self):
         self.connection.close()
+
+    def catalog(self) -> dict:
+        return {
+            "captures": self.connection.execute("SELECT count(*) FROM captures").fetchone()[0],
+            "measurements": self.connection.execute("SELECT count(*) FROM measurements").fetchone()[0],
+            "deployments": [
+                {"deployment": json.loads(deployment), "responses": json.loads(responses)}
+                for deployment, responses in self.connection.execute("SELECT deployment, responses FROM models")
+            ],
+        }
 
     def selected_models(self, deployment: dict) -> dict | None:
         row = self.connection.execute(

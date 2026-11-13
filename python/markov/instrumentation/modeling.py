@@ -20,6 +20,11 @@ class ModelingProcess:
         self.executable_name = executable_name
 
     def check_available(self) -> None:
+        memory = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+        available = int(memory["MemAvailable"].split()[0]) * 1024
+        total = int(memory["MemTotal"].split()[0]) * 1024
+        if available - self.memory_limit_gib * 1024**3 < total * 0.2:
+            raise ValueError("Insufficient host memory to preserve 20% headroom; wait or reduce the prediction memory limit")
         current = container_state(self.cid)
         if current is not None and current["Running"]:
             raise ValueError("This modeling output still has a running container")

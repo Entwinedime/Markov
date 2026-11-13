@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import fcntl
 from pathlib import Path
 
 from markov.artifacts.capture import DeviceCommand
@@ -42,6 +43,14 @@ class InferenceCapture:
         )
 
     def run(self, recapture: bool = False, reuse: bool = False) -> dict:
+        if self.request.base.manifest is not None:
+            return self._run(recapture, reuse)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with (self.directory / "capture.lock").open("a") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return self._run(recapture, reuse)
+
+    def _run(self, recapture: bool, reuse: bool) -> dict:
         if self.request.deployment.framework != "sglang":
             raise ValueError(f"Inference capture does not support framework {self.request.deployment.framework}")
         if self.request.base.manifest is not None:
@@ -71,17 +80,7 @@ class InferenceCapture:
         if existing is not None and not recapture:
             if not reuse:
                 raise ValueError(f"This task already completed at {existing}; request --recapture to repeat")
-            captured = read_json(Path(existing).parent / "capture_input.json")
-            if (
-                captured["deployment"] != asdict(self.request.deployment)
-                or captured["server"] != server
-                or Workload.parse(captured["workload"]) != workload
-                or captured.get("semantic", False) != self.semantic
-            ):
-                raise ValueError(
-                    "This output belongs to different capture inputs; use a new output or explicit recapture"
-                )
-            Path(existing).stat()
+            self.check_reuse(Path(existing), workload, server)
             return {"status": "reused", self.result_key: existing, "capture_state": str(task.state_path)}
 
         model = Path(self.request.deployment.model)
@@ -119,3 +118,29 @@ class InferenceCapture:
             "workload_report.json",
         )
         return task.run(command)
+
+    def check_reuse(self, artifact: Path, workload: Workload, server: dict) -> None:
+        captured = read_json(artifact.parent / "capture_input.json")
+        if (
+            captured["deployment"] != asdict(self.request.deployment)
+            or captured["server"] != server
+            or Workload.parse(captured["workload"]) != workload
+            or captured.get("semantic", False) != self.semantic
+        ):
+            raise ValueError("This output belongs to different capture inputs; use a new output or explicit recapture")
+        artifact.stat()
+
+    def preview(self, workload: Workload) -> dict:
+        if self.request.base.manifest is not None:
+            return {"status": "declared", "manifest": str(self.request.base.manifest)}
+        state = self.directory / "capture_state.json"
+        if not state.exists():
+            return {"status": "capture_required"}
+        ledger = read_json(state)
+        existing = ledger.get(self.result_key)
+        if existing:
+            from markov.adapters.sglang.capture import server_arguments
+
+            self.check_reuse(Path(existing), workload, server_arguments(self.request.deployment, self.request.base.configuration))
+            return {"status": "matching_capture", "manifest": existing}
+        return {"status": "unfinished", "capture_state": str(state), "waiting_for": ledger.get("waiting_for")}

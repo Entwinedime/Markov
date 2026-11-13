@@ -238,6 +238,9 @@ class DeviceTask:
                             process.wait(timeout=2)
                         except subprocess.TimeoutExpired:
                             pass
+                except KeyboardInterrupt:
+                    attempt["stopped_by_user"] = True
+                    raise
                 finally:
                     if process is not None and process.poll() is None:
                         self.remove_container(output)

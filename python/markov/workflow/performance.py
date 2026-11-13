@@ -9,8 +9,8 @@ import math
 from pathlib import Path
 from statistics import median
 
-from markov.artifacts.performance import PerformanceData, encoded
-from markov.artifacts.request import Deployment, read_json, reject_unknown, required_text, resolve_path
+from markov.artifacts.performance import PerformanceData, encoded, maintenance_document
+from markov.artifacts.request import Deployment, read_json, reject_unknown, required_text
 from markov.artifacts.writing import write_json
 from markov.adapters.sglang import (
     cache_control_measurements,
@@ -52,7 +52,7 @@ def select_models(
         database.parent.mkdir(parents=True, exist_ok=True)
     else:
         database.stat()
-    store = PerformanceData(database)
+    store = PerformanceData(database, readonly=database.exists())
     try:
         selected = store.selected_models(asdict(deployment))
     finally:
@@ -265,16 +265,10 @@ def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, so
 
 
 def maintain_performance(path: Path) -> dict:
-    raw = read_json(path)
-    reject_unknown(
-        raw,
-        {"database", "deployment", "imports", "training", "models", "output", "responses"},
-        "performance maintenance",
-    )
-    directory = path.resolve().parent
-    database = resolve_path(directory, raw["database"])
-    deployment = asdict(Deployment.parse(raw["deployment"]))
-    training = [resolve_path(directory, item) for item in raw.get("training", [])]
+    raw = maintenance_document(path)
+    database = Path(raw["database"])
+    deployment = raw["deployment"]
+    training = [Path(item) for item in raw["training"]]
     responses = None
     if "responses" in raw:
         if not isinstance(raw["responses"], list) or not raw["responses"]:
@@ -290,8 +284,8 @@ def maintain_performance(path: Path) -> dict:
         raise ValueError("Model export requires an explicit training capture selection")
     if not training and not raw.get("imports"):
         raise ValueError("Performance maintenance needs imports or an explicit training selection")
-    output = resolve_path(directory, raw["output"]) if training else None
-    imports = [resolve_path(directory, item["capture"]) for item in raw.get("imports", [])]
+    output = Path(raw["output"]) if training else None
+    imports = [Path(item["capture"]) for item in raw["imports"]]
     if output is not None and (
         output in (database, path.resolve())
         or any(output.is_relative_to(source.parent) for source in training + imports)
@@ -302,7 +296,7 @@ def maintain_performance(path: Path) -> dict:
     imported = []
     try:
         selected = (
-            read_json(resolve_path(directory, raw["models"]))
+            read_json(Path(raw["models"]))
             if "models" in raw
             else store.selected_models(deployment) or {"deployment": deployment, "models": []}
         )
@@ -310,9 +304,8 @@ def maintain_performance(path: Path) -> dict:
             raise ValueError("Selected models belong to a different deployment")
 
         for item in raw.get("imports", []):
-            reject_unknown(item, {"adapter", "capture"}, "measurement import")
             adapter = ADAPTERS[item["adapter"]]
-            source = resolve_path(directory, item["capture"])
+            source = Path(item["capture"])
             metadata = adapter.metadata(source)
             imported.append(
                 store.import_capture(
