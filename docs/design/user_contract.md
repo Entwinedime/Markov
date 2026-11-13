@@ -131,6 +131,24 @@ status=completed 仅表示评价完成。正常精度仍须使用 measure；prof
 
 DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家。该部署的采集、独立成本、预测与回放尚不支持，旧 dense/Torch 产物不能作为新部署的来源或成本。
 
+## 本地用户面板
+
+```bash
+scripts/markov.sh panel --directory data/panel --port 8765
+```
+
+浏览器打开 http://127.0.0.1:8765。表单编辑 deployment、来源、workload、targets、输出和预算；原生配置与高级字段可展开编辑。
+也可导入本机预测或搜索请求，路径仍以原文件为起点，面板保存解析后的公共请求。workload 可用本机路径或上传 JSON；上传界面可控制请求数和输出上限，必须保留有效的正式边界。修改 workload 后不能继续使用不匹配的 base。
+面板默认新采 semantic，导入请求保留原 detail；这不会授予完整细图回放资格。普通预测可以直接复用性能库，只有缺少的独立工作才按整组预算采集。
+
+同一面板目录同时运行一个任务，设备互斥仍由原 DeviceTask 管理。页面刷新和服务重启只重新读取原 worker 身份；停止与继续只作用于本任务，历史预算不清零。停止未完成、成本缺项、资源声明缺项和不支持分别保留状态，不填零或冒充推荐。
+已完成任务可复用输入；新结果用不同 output 保留原报告，沿用原 output 则复用对应采集并更新该目录的预测报告。应用不读取 target 正常真值。
+
+结果展示完整正式 HTTP、目标配置比较及已声明资源的排序/费用。没有声明带宽配额时，耗时预测仍可完成，资源排序报告不完整；价格属于用户声明的相对权重。
+CSV 用于表格阅读，JSON 下载保留完整正式报告，页面只读取展示摘要。数据页只列已登记来源、数据库响应和训练来源；显式维护沿用 maintain 合同，不扫描或删除整机资产。
+
+服务仅监听 127.0.0.1，限制 Host、Origin 和写请求令牌；不提供任意 shell 或远程多用户服务。HTTP 上传上限为 16 MiB，更大 workload 直接填写本机路径。服务端只有 Python 标准库，浏览器资源无需构建。
+
 ## 输入预览和采集检查
 
 ```bash
@@ -141,7 +159,7 @@ scripts/run.sh modeling -- build/modeling/Release/markov_core inspect-manifest /
 ```
 
 plan 读取请求、核对 workload/manifest/模型包的声明路径并列出已知准备动作，不构图、启动设备或创建结果目录。
-configuration 的准备动作是采集或复用，预览不判断该任务是否可以复用，也不将数据库路径存在等同于模型已维护。
+configuration 预览沿采集入口的同一匹配规则检查已有 capture_input 和账本，并区分匹配、待采和未完成；运行时仍要取得输出锁并恢复实际容器。已有数据库按目标部署只读列出现行响应数，响应存在不等于目标工作已获完整成本覆盖。
 输出 not_evaluated 列出尚未分析的源语义、目标工作和成本覆盖，不能据此认定模型可用。
 manifest 检查只读取 manifest 和文件元数据；输出 inputs_accessible 不代表通道内容、源 DAG 或正常性能已通过。
 

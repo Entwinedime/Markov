@@ -19,6 +19,10 @@ base profile → 原始 DAG 与源依据 → 目标工作、依赖和条件程�
 
 ### 当前正式预测如何落地
 
+浏览器面板只编辑公共输入、读取任务和展示结果。本地服务登记任务并持有 worker 的进程身份；worker 直接调用既有 predict、search、maintain，不实现另一套采集或建模流程。
+服务与 worker 生命周期分开，服务重启不重新派发任务；停止只通知对应 worker，由原 workflow 回收其容器并保留预算。任务记录不代替设备采集账本。
+正式报告保留完整机器数据，面板另存小型展示摘要；明细下载直接读取原报告，不让页面反复载入逐请求和执行图。
+
 Python predict 负责准备/复用 base、导出现行模型、归并整组成本缺口并接收结果；ModelingProcess 只拥有隔离建模容器生命周期。
 PerformancePreparation 用已有合格独立来源及有界采样维护模型；配方由框架适配器根据工作与来源上下文生成，不读目标真值。
 DeviceTask 统一拥有设备互斥、累计用量、实际容器恢复和终态发布，base、正常测量与共享采样分别持有自己的任务预算。
@@ -32,7 +36,6 @@ SGLang 的 semantic base 只生产必要 probe 和客户端观察，diagnostic �
 采集工作流按框架选择适配器，设备任务仍只有一个所有者；HTTP 客户端、文本编码、服务就绪和进程组回收共用，
 框架适配器只处理原生模型、观察、配置和产物发布。KTransformers 的 DeepSeek-V4-Flash 部署由 SGLang 服务和 KT-Kernel 协作；
 其采集、工作变换和成本响应尚未建立，不使用旧 dense/Torch 的同步阶段规则。
-串行程序只负责封闭同步工作的依赖与请求端口，不识别框架、模型、attention 后端或 HiCache。
 分布式与非分布式导出共用 Ascend 时钟换算，非分布式调用者显式提供进程身份，不依靠猜测 rank 或内部版本判断。
 
 CacheProgram 拥有唯一的目标缓存、准入、发布和请求生命周期。它组合 RequestComputation 接口：
@@ -244,7 +247,8 @@ NodeScale 在共同成本绑定后修改本次操作的响应，不修改共享�
 
 ```text
 python/markov/              Python 正式包
-  workflow/                 准备、性能维护、预测、评价与搜索的单任务流程
+  panel/                    本机浏览器界面与 HTTP 输入/展示
+  workflow/                 准备、性能维护、预测、评价、搜索与本地任务句柄
   instrumentation/          通用 probe、观察与原生进程生命周期
   artifacts/                manifest、workload、测量与结果合同
   adapters/                 框架、runtime、模型及部署差异
