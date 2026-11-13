@@ -231,10 +231,11 @@ class MatrixRun:
                 '--timeout', self.budget['task_seconds'], '--execution-trace', '--execution-inputs', timing,
             )
             row['prediction_exit'] = self.process(f'{identity}/predict', command)
-            execution = prediction / 'execution.jsonl'
+            execution = prediction / ('execution.jsonl' if row['prediction_exit'] == 0 else 'execution.partial.jsonl')
             if not execution.exists():
                 rows.append(row | {'status': 'prediction-no-trace'})
                 continue
+            row['execution_trace'] = str(execution.relative_to(self.root))
 
             # A stopped run still has a checked prefix; compare it without inventing an unexecuted tail.
             self.evaluate(f'{identity}/compare', 'compare_actions.py', '--capture', native, '--graphs', production / 'work',

@@ -366,7 +366,7 @@ Event 返回 true 只说明完成不晚于查询返回，false 只说明完成�
 
 独立动作比较在 modeling 容器内使用 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。 两者同时核对原始 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
 
-矩阵示例将采集、图生产与比较分别执行。比较使用显式source_catalog；每个目标声明observation、production、source_evidence，分别指向捕获所有者、已发布真实图和独立来源报告。读取时核对原始任务、发布与报告的归属；真实图保留原生产身份，预测程序另行固定。比较阶段只消费这些已有产物，预测失败时继续检查实际留下的执行明细。
+矩阵示例将采集、图生产与比较分别执行。比较使用显式source_catalog；每个目标声明observation、production、source_evidence，分别指向捕获所有者、已发布真实图和独立来源报告。读取时核对原始任务、发布与报告的归属；真实图保留原生产身份，预测程序另行固定。比较阶段只消费这些已有产物；按prediction_exit选择成功时的execution.jsonl或失败时保留的execution.partial.jsonl，并记录execution_trace。任务成功与前缀结构资格分别报告，预测失败时仍检查实际留下的执行明细。
 
 依赖比较先核实每次运行自身的模型通信、CPU协议及PD前提，再将其全部rank图按真实端点连接。真实PD关系来自预留发送入口、实际服务返回和读取到的状态，不猜通知时刻；预测采用执行器实际输出的跨rank通信、信号和状态边。关系类别保留，CPU终止消息检查也使用同一完整图。内部具名边界可达关系、粗工作位置、跨动作顺序和重复调用位置统一使用这两份全rank图；路径可以离开动作树、经过其他rank后返回。不以孤立rank图中没有路径认定全局缺边，也不重复生成本地、仅模型通信及CPU通信多套判定。协议覆盖不足时保留内容和运行内检查，因果比较明确报告证据不足，不选择较弱图宣称对应。
 
