@@ -177,3 +177,21 @@
 **验证：** 隔离版本的 modeling Docker Release 核心完整构建退出码 0；SGLang 示例 plan 返回 `planned`，KT plan/capture 均明确报告不支持；Ruff、Python 编译、活动源码旧 KT 引用搜索和 `git diff --check` 通过。固定镜像、权重清单、GGUF 校验与上游单卡预检见本日志前述条目；权重和运行日志留在忽略的数据区。
 
 **结论与限制：** 阶段 B 关联实现和检查已完成，当前记录提交推送后才进入阶段 C。完整权重设备加载、专用算子执行和 HTTP 生成尚未验证；另一窗口正在进行独立任务，设备操作前重新检查并持串行锁。
+
+## 2026-11-14 — 阶段 C：完整模型首次启动准备
+
+**范围：** 阶段 B 代码 `e7e5a3a`、记录 `7bce502` 均已推送并核对远端。新模型首次完整加载及短请求将使用物理 NPU 0，设备操作持共享锁；不执行准确性或吞吐量测试。
+
+**资源与预算：** 启动前观察无 NPU 设备进程、18080 未监听、可用内存约 455 GiB、模型盘可用约 976 GiB；宿主及 Docker memory cgroup 未设有效上限。服务容器限内存 384 GiB、CPU 0–15 和 24–191（避让另一窗口的 16–23），8 个 NUMA 线程池共 64 CPU 专家线程，绑定 loopback，禁继承代理。计划全窗口最多 3 次完整启动含复启，单次启动等待最多 60 分钟，启动与功能验证累计最多 4 小时。启动结果以进程和 `data/kt_dsv4_20261113/serve-attempt-1.log` 为准。
+
+**首次运行证据：** `markov-dsv4-serving-1` 持设备锁加载 46/46 W8A8 分片和 43 层 GGUF，完成 KV 池和 decode NPU graph，服务就绪；`/health`、`/health_generate` 均 HTTP 200，`/generate` HTTP 200、16 个 completion tokens、文本非空，`/v1/chat/completions` HTTP 200、3 个 completion tokens、文本非空。上游 `verify.sh` 退出 0、`ALL CHECKS PASSED`。响应及日志位于 `data/kt_dsv4_20261113/` 的 `generate-response.json`、`chat-response.json`、`serve-attempt-1.log`、`verify-attempt-1.log`。容器日志有 NUMA 绑定权限提示但未阻止本次生成；未进行准确性和吞吐验证。同配置复启尚待完成。
+
+**停止与设备交接：** `docker stop --time 60 markov-dsv4-serving-1` 返回 0，首次服务进程退出码 0，容器、相关宿主 PID、18080 监听及 NPU 进程均已消失。应用在退出期间记录 asyncio `CancelledError`，其发生于停止后，不属于前述请求失败。另一窗口随后取得设备锁并启动自己的容器；本窗口等待其释放，再以相同配置执行第 2 次启动。
+
+**复启准备：** 另一窗口批次退出并释放设备锁后，重查 NPU 无进程、18080 空闲、可用内存约 457 GiB、磁盘可用约 975 GiB；使用首次相同设备、镜像、资源与环境配置启动第 2 次，日志 `data/kt_dsv4_20261113/serve-attempt-2.log`。
+
+**同配置复启与最终服务状态：** 第二次启动使用与首次相同的镜像、设备、线程与资源参数；完整模型加载及 NPU graph 完成，服务报告就绪。`/v1/chat/completions` HTTP 200，响应非空、completion tokens 为 3，保存于 `data/kt_dsv4_20261113/restart-chat-response.json`；完整日志为 `serve-attempt-2.log`。`docker stop --time 60 markov-dsv4-serving-2` 返回 0，服务进程退出 0，容器和端口已释放；NPU 进程检查无本窗口残留。停止时同样出现 asyncio `CancelledError`，属于退出期间记录，不是请求异常。本次两次启动、一次复启均在计划预算内；不报告准确率或吞吐量。
+
+**交付核对：** 复查两个运行日志的启动和 NPU graph 记录、三份非空响应及上游检查，确认异常栈均出现在两次主动停止期间；活动 Python/C++ 和 CMake 无旧 KT 链路引用，旧本地检出已忽略且保留。README 和工作流改为当前运行资格，并记录本机实际启动资源；本窗口日志和权重均在忽略数据区，未纳入提交。关联代码在阶段 B 的隔离构建和入口检查已通过，本阶段为运行验收和文档变更，不再重复无关构建；`git diff --check` 通过。其他窗口未提交的代码保留。
+
+**结论与限制：** 单 910B3、当前驱动和固定镜像上，首次加载、非空 HTTP 生成、上游检查及同配置复启均已完成；最终服务已停止。只获得运行资格，不宣称准确性、吞吐、长上下文、并发或新的 KT 建模能力。NUMA 绑定权限提示未阻止短请求生成；不同机器的资源和兼容性需重新核验。

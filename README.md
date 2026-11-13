@@ -8,7 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 正在切换到 DeepSeek-V4-Flash 单 NPU 运行流程，其采集和预测尚不支持。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
+当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 单 NPU 流程已完成非空生成和同配置复启，其采集和预测尚不支持。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
 
 ## 怎样运行
 
@@ -88,11 +88,11 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
 SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
-HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；运行复现和模型加载正在验证，不支持采集、成本建模或预测。
+HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；模型加载、非空生成和同配置复启均已通过；不支持采集、成本建模或预测。
 
 ### DeepSeek-V4-Flash 单 NPU 运行
 
-此部署使用 910B3 单卡、CANN 9 和 CPU 专家；按当前权重清单及单层转换大小估算，准备 W8A8、官方 checkpoint 与全部 GGUF 需要约 600 GB（560 GiB）空间，另留构建和临时文件余量。以下流程的完整模型运行仍在验证中。权重下载直接访问 ModelScope，不使用代理；连接失败时保留 `.part` 文件，可用同一命令续传。
+此部署使用 910B3 单卡、CANN 9 和 CPU 专家；按当前权重清单及单层转换大小估算，准备 W8A8、官方 checkpoint 与全部 GGUF 需要约 600 GB（560 GiB）空间，另留构建和临时文件余量。本机 910B3、驱动 25.3.rc1 上模型加载、非空生成和同配置复启已通过。权重下载直接访问 ModelScope，不使用代理；连接失败时保留 `.part` 文件，可用同一命令续传。
 
 先将 `DSV4_HOST_MODELS` 改成有足够空间的绝对路径，获取固定版本的文件清单和权重：
 
@@ -107,13 +107,15 @@ curl -q --noproxy '*' -fsSL 'https://www.modelscope.cn/api/v1/models/deepseek-ai
 python3 scripts/download_dsv4_weights.py deepseek-ai/DeepSeek-V4-Flash 4e9bb2457e147f6ebfe2a46f3df047dc9869e224 "$DSV4_HOST_MODELS/native-files.json" "$DSV4_HOST_MODELS/DeepSeek-V4-Flash"
 ```
 
-下载器按清单逐文件校验大小和 SHA-256。然后构建镜像、选择空闲物理设备并启动容器；容器内该设备为逻辑 0：
+下载器按清单逐文件校验大小和 SHA-256。以下启动参数对应本次 192 核、8 NUMA、约 501 GiB 内存的机器；其他机器须按可用资源调整 CPU 集、内存和专家线程数。选择空闲物理设备并保证设备任务串行，容器内该设备为逻辑 0：
 
 ```bash
 docker build -t markov-ktransformers:dsv4 -f docker/ktransformers/Dockerfile .
 docker run -d --name markov-dsv4 --runtime ascend --network host --ipc host \
+  --cpuset-cpus 0-15,24-191 --memory 384g --memory-swap 384g \
   --ulimit memlock=-1 --ulimit stack=67108864 -e ASCEND_VISIBLE_DEVICES=0 \
-  --env-file configs/ktransformers.env.example \
+  --env-file configs/ktransformers.env.example -e DSV4_HOST=127.0.0.1 \
+  -e DSV4_CPUINFER=64 -e DSV4_THREADPOOL_COUNT=8 \
   --mount type=bind,source=/usr/local/Ascend/driver,target=/usr/local/Ascend/driver,readonly \
   --mount "type=bind,source=$DSV4_HOST_MODELS,target=/models" \
   markov-ktransformers:dsv4 sleep infinity
