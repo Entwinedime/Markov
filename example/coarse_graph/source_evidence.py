@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 from heapq import heappop, heappush
 from pathlib import Path
 
+from markov_adapters.sglang.pipeline import PipelineABI
+
 from actions import ActionScopes
 from native_case import NativeCase
 from source_effects import NativeEffectEvidence
@@ -256,12 +258,19 @@ class ProductionEvidence:
                 if effects is None:
                     effects = native_evidence.inspect(graph)
                 measurements = native_evidence.inspect_measurements()
-                boundaries = native_evidence.inspect_boundaries(graph)
-                services = native_evidence.inspect_services()
+                measurements["checked_device_measurements"] = effects["device_measurements"]
+                device_intervals = native_evidence.device_intervals()
+                boundaries = native_evidence.inspect_boundaries(graph, device_intervals)
+                services, private_streams = native_evidence.inspect_services()
+                payload = native_evidence.inspect_payload(graph, private_streams, device_intervals)
                 submissions = native_evidence.inspect_submissions()
-                signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank])
+                generations = native_evidence.event_generations()
+                signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank], generations)
+                stream_roles = native_evidence.inspect_stream_roles(*PipelineABI.stream_declarations(native), generations[1])
                 report = SourceEvidence(facts, graph, native_case.clocks[rank], native_case.logical[rank], self.details).inspect()
                 report["native_effects"] = effects
+                report["native_stream_roles"] = stream_roles
+                report["native_payload"] = payload
                 report["native_measurements"] = measurements
                 report["native_boundaries"] = boundaries
                 report["native_services"] = services
@@ -304,10 +313,14 @@ class ProductionEvidence:
                 boundaries, signals = report["native_boundaries"], report["native_signals"]
                 measurements = report["native_measurements"]
                 services = report["native_services"]
+                streams, payload = report["native_stream_roles"], report["native_payload"]
                 lines.extend([
                     "", f"rank {report['rank']}：从原始记录核对主机时间点 {measurements['checked_host_measurements']} 个；"
                     f"缺少测量的stream边界 {measurements['unmeasured_device_endpoints']} 个，"
                     f"无实际下发的逻辑等待边界 {measurements['logical_wait_boundaries']} 个；同步传输保留driver主机时间，设备返回fence保留真实SDK时间。"
+                    f"另逐项核对{measurements['checked_device_measurements']}个设备测量端点，"
+                    f"{streams['named_streams']}条具名逻辑流；保留SDK负载{payload.get('retained_payload_tasks', 0)}项，"
+                    f"封闭服务队列内负载{payload.get('opaque_service_tasks', 0)}项。"
                     f"核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
                     f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
                     f"闭合服务 {services['synchronous_services']} 个、私有队列 {services['private_queues']} 条、原始下发任务 {services['submitted_tasks']} 项；"

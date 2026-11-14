@@ -180,6 +180,19 @@ class ActionScopes:
         return {"arguments": cls.expression_key(scope.get("arguments", {})),
                 "guards": cls.expression_list_key(scope.get("guards", []))}
 
+    @staticmethod
+    def tensor_publications(raw):
+        ends = {int(row["name"].split("/")[1]): row["end_counter"]
+                for row in raw["host_observation"]["intervals"] if row["name"].startswith("markov.scope/")}
+        ends.update({scope["id"]: scope["host_interval"]["end_counter"] for scope in raw["scopes"] if "service" in scope})
+        outputs = [(ends[scope["id"]], scope["id"], port) for scope in raw["scopes"] for port in scope["ports"]
+                   if port["direction"] == "output" and port["use"] in {"host", "device"} and port.get("tensor") is not None]
+        published = {}
+        for _, scope, port in sorted(outputs, key=lambda row: (row[0], row[1])):
+            tensor = port["tensor"]
+            published.setdefault((tensor["storage"], tensor["version"]), (scope, port["name"]))
+        return published
+
     def validate_source(self, raw, rank):
         if raw["environment"]["parallel"]["rank"] != rank or self.graph["environment"] != raw["environment"]:
             raise ValueError("graph and recording belong to different worker environments")
@@ -195,6 +208,7 @@ class ActionScopes:
                 self.source_ids[origin] = index
         if self.source_ids.keys() != set(range(len(raw["scopes"]))):
             raise ValueError("coarse scopes omit native observations")
+        publications = self.tensor_publications(raw)
 
         # Ordinary declarations remain exact; only private CPU continuations may share an owner.
         for index, scope in enumerate(self.graph["scopes"]):
@@ -217,11 +231,38 @@ class ActionScopes:
 
             # Check native tensor facts before either interpretation or projection can become the comparison's truth.
             ports = {(port["name"], port["direction"]): port for port in scope["ports"]}
+            native_tensors = {(port["name"], port["direction"]) for port in observed["ports"] if port.get("tensor") is not None}
+            graph_tensors = {key for key, port in ports.items() if port.get("tensor") is not None}
+            if len(ports) != len(scope["ports"]) or native_tensors != graph_tensors:
+                raise ValueError(f"graph scope {index} omits, duplicates or invents native tensor ports")
             for port in observed["ports"]:
                 tensor = port.get("tensor")
                 if tensor is None:
                     continue
                 boundary = ports[port["name"], port["direction"]]
+                use = {"host": "data", "device": "data", "metadata": "metadata", "state": "metadata"}[port["use"]]
+                relation = "data" if use == "data" else "control"
+                interval = "device" if port["use"] in {"device", "state"} else "call"
+                side = "return" if interval == "call" else "complete"
+                if port["direction"] == "input" and not port.get("at_return", False):
+                    side = "enter"
+                endpoint = f"{interval}.{side}"
+                if observed.get("asynchronous", False) and port["use"] == "device" and port["direction"] == "output":
+                    endpoint = "communication.complete"
+                direction = "input" if side == "enter" else "output"
+                ready = ports[endpoint, direction]["event"]
+                if port["direction"] == "output" and use == "data":
+                    producer, name = publications[tensor["storage"], tensor["version"]]
+                    ancestor = producer
+                    while ancestor is not None and ancestor != observed["id"]:
+                        ancestor = raw["scopes"][ancestor]["parent"]
+                    if producer != observed["id"] and ancestor is not None:
+
+                        # Re-exporting a descendant's published version keeps that child's readiness, not the parent's return.
+                        outputs = self.graph["scopes"][self.source_ids[producer]]["ports"]
+                        ready, = [value["event"] for value in outputs if value["name"] == name and value["direction"] == "output"]
+                if boundary["use"] != use or boundary["relation"] != relation or boundary["event"] != ready:
+                    raise ValueError(f"graph scope {index} changes native tensor use or readiness: {port['name']}/{port['direction']}")
                 projected = boundary["tensor"]
                 if (projected is None
                         or any(tensor[field] != projected[field] for field in ("dtype", "shape", "value", "storage", "version", "buffer"))

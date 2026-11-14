@@ -475,6 +475,8 @@ class ActionComparison:
                       or not cpu_scope["complete"] or not ordering.qualified or condition_scope["status"] == "partial")
         report = {
             **self.outcome(incomplete),
+            "inputs": {"capture": str(self.capture.resolve()), "graphs": str(self.graphs.resolve()),
+                       "execution": str(self.execution.resolve())},
             "native_case": native_evidence,
             "native_actions_checked": observed_actions, "predicted_actions_checked": sum(predicted_counts.values()),
             "actions_compared": compared,
