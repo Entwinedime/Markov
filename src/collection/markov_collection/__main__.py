@@ -32,6 +32,7 @@ def main() -> None:
 
         AscendExport.run(arguments.input, arguments.rank, arguments.output)
     else:
+        from markov_adapters.sglang.pipeline import PipelineABI
         from markov_adapters.sglang.resources import ResourceInputs
         from markov_collection.adapters.frameworks.sglang.closed_regions import ClosedRegions
         from markov_collection.adapters.frameworks.sglang.kv_facts import NativeKvFacts
@@ -44,6 +45,7 @@ def main() -> None:
 
         # Framework closure rules stay separate from runtime interpretation and the common graph projection.
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)
+        observation.name_streams(*PipelineABI.stream_declarations(recording))
         facts = observation.document(arguments.evidence)
         native.connect_metadata(facts)
         write_json(arguments.output, regions.normalize(facts), replace=False)

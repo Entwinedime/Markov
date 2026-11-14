@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.commands import NativeStreamCall, StreamCommand, StreamCommands
-from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, DeviceTask, Interval, ThreadIntervals
+from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, Interval, ThreadIntervals
 from markov_collection.instrumentation.observation import ObservationReferences
 
 
@@ -24,6 +24,7 @@ class AscendObservation:
         self.control_threads = {interval.thread for scope, interval in self.trace.scopes.items() if "service" not in raw["scopes"][scope]}
         self.resources = []
         self.resource_ids = {}
+        self.stream_names = {}
         self.spans = []
         self.dependencies = []
         self.host = {}
@@ -55,11 +56,42 @@ class AscendObservation:
         if set(self.trace.scopes) != set(range(1, len(self.scopes))):
             raise ValueError("native scope metadata and recorded CPU markers differ")
 
+    def name_streams(self, points: dict[int, str], waits: dict[int, dict[str, str]]) -> None:
+        if not points and not waits:
+            return
+        trace = self.trace
+        declarations = [(trace.device_points[point].stream, role) for point, role in points.items()]
+        observed = set()
+        for native, recorded in trace.synchronizations:
+            if native.record["api"] not in trace.stream_waits:
+                continue
+            owner = trace.owner(trace.origin(trace.native_api(native)))
+            if owner not in waits:
+                continue
+            if recorded is None:
+                raise ValueError("named stream wait has no native event generation")
+            task, = trace.tasks[trace.native_api(recorded).record["args"]["connection_id"]]
+            if (task.record["args"]["Task Type"] != "EVENT_RECORD" or recorded.record["stream_status"] != 0
+                    or recorded.record["stream"] != task.stream or native.record["stream_status"] != 0):
+                raise ValueError("named stream wait changes its recorded producer stream")
+            declarations.extend(((task.stream, waits[owner]["source"]), (native.record["stream"], waits[owner]["target"])))
+            observed.add(owner)
+        if observed != waits.keys():
+            raise ValueError("logical stream wait has no observed native wait")
+
+        # The framework's canonical names must identify the same lanes throughout this worker's observation.
+        named = {}
+        for stream, role in declarations:
+            if self.stream_names.setdefault(stream, role) != role or named.setdefault(role, stream) != stream:
+                raise ValueError("native logical streams have conflicting resource bindings")
+
     def resource(self, kind: str, identity: int | str, role: str, *, serial: bool = True) -> int:
         key = kind, identity
         if key not in self.resource_ids:
             if kind == "thread":
                 role = "control" if identity in self.control_threads else "submission"
+            elif kind == "stream":
+                role = self.stream_names.get(identity, role)
             self.resource_ids[key] = len(self.resources)
             self.resources.append({
                 "kind": kind, "rank": self.rank, "role": role, "identity": f"{kind}/{identity}",

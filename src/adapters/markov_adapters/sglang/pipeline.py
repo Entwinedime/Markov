@@ -82,6 +82,39 @@ class PipelineMessages:
 
 
 class PipelineABI:
+    stream_roles = ("schedule", "forward", "copy")
+
+    @staticmethod
+    def stream_declarations(recording):
+        declarations, waits = [], {}
+        for scope in recording["scopes"]:
+            context = scope["work"].get("context", {})
+            if scope["role"] == "signal_record":
+                port, = (port for port in scope["ports"] if port["use"] == "signal" and port["direction"] == "output")
+                declarations.append((port["point"], context["record_stream"]))
+            elif scope["role"] == "signal_wait":
+                port, = (port for port in scope["ports"] if port["use"] == "signal" and port["direction"] == "input")
+                declarations.append((port["point"], context["producer"]["record_stream"]))
+                if context["device_wait"]:
+                    declarations.append((scope["device_entry"], context["wait_stream"]))
+            elif scope["role"] == "stream_wait":
+                waits[scope["id"]] = context["streams"]
+                declarations.append((scope["device_entry"], context["streams"]["target"]))
+
+        for query in recording["state_queries"]:
+            if query["kind"] == "event":
+                context = recording["scopes"][query["scope"]]["work"]["context"]
+                declarations.append((query["point"], context["producer"]["record_stream"]))
+
+        # Declarations name native streams; runtime evidence supplies their actual identities.
+        points = {}
+        for point, role in declarations:
+            if role not in PipelineABI.stream_roles or points.setdefault(point, role) != role:
+                raise ValueError("native event has an invalid or conflicting logical stream role")
+        if any(role not in PipelineABI.stream_roles for streams in waits.values() for role in streams.values()):
+            raise ValueError("native stream wait has an unknown logical stream role")
+        return points, waits
+
     @staticmethod
     def pending_model_sends(scheduler):
 
@@ -124,4 +157,4 @@ class PipelineABI:
     @staticmethod
     def stream_role(scheduler, stream):
         stream = scheduler.device_module.current_stream() if stream is None else stream
-        return next(role for role in ("schedule", "forward", "copy") if stream == getattr(scheduler, f"{role}_stream"))
+        return next(role for role in PipelineABI.stream_roles if stream == getattr(scheduler, f"{role}_stream"))
