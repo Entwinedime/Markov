@@ -5,7 +5,6 @@ import sys
 
 import zmq
 from markov_adapters.sglang.pipeline import PipelineABI
-from markov_control.peer import ControlPeer
 from markov_workload import WorkloadContent
 from markov_workload.routing import RoutedContent
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
@@ -14,7 +13,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 class RequestInput:
     def __init__(
-        self, peer: ControlPeer, vocab_size: int, workload: dict, routes, mode: str, expert_layers: set[int]
+        self, peer, vocab_size: int, workload: dict, routes, mode: str, expert_layers: set[int]
     ) -> None:
         self.peer = peer
         self.vocab_size = vocab_size

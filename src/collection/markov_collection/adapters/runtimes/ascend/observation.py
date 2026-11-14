@@ -156,7 +156,9 @@ class AscendObservation:
         for native in self.trace.runtime:
             if native.record["api"] != "aclrtMemcpy" or native.record["bytes"] == 0:
                 continue
-            if not self.trace.window.contains(native):
+
+            # The observation window covers every worker thread, not only its opening caller.
+            if native.begin < self.trace.window.begin or self.trace.window.end < native.end:
                 continue
             origin = self.trace.origin(self.trace.native_api(native))
             owner = self.trace.owner(origin)

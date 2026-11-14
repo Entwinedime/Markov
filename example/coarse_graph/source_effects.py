@@ -426,7 +426,7 @@ class NativeEffectEvidence:
         for row in self.runtime:
             if row["api"] == "aclrtMemcpy" and row["bytes"] > 0:
                 interval = self.interval(row)
-                if self.window.contains(interval):
+                if self.window.begin <= interval.begin and interval.end <= self.window.end:
                     owner = self.owner(self.native_api(interval))
                     if owner is not None and owner not in self.closed_scopes:
                         self.inspect_transfer(owner, row, spans, graph)

@@ -5,7 +5,6 @@ from contextlib import contextmanager
 import torch
 from markov_adapters.sglang.allocation import AllocationABI
 from markov_adapters.sglang.kv_layout import MhaKvLayout
-from markov_control.peer import ControlPeer
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 
@@ -58,7 +57,7 @@ class AllocationDemand:
 
 
 class RequestSlots:
-    def __init__(self, peer: ControlPeer, size: int, context: int, extra: int) -> None:
+    def __init__(self, peer, size: int, context: int, extra: int) -> None:
         self.peer = peer
         self.prefix_bindings = {}
         self.size = size
@@ -151,7 +150,7 @@ class PageAllocator:
     free_group_begin = BaseTokenToKVPoolAllocator.free_group_begin
     free_group_end = BaseTokenToKVPoolAllocator.free_group_end
 
-    def __init__(self, peer: ControlPeer, size: int, page_size: int, layout, implementation: str) -> None:
+    def __init__(self, peer, size: int, page_size: int, layout, implementation: str) -> None:
         self.peer = peer
         self._markov_allocation = AllocationABI(implementation)
         self.size = size

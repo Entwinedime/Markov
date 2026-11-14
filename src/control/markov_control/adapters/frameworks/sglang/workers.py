@@ -23,7 +23,7 @@ class NativeStopped(Exception):
     """The core ended drained serving at a suspended native control boundary."""
 
 
-class WorkerPeer(ControlPeer):
+class WorkerPeer:
     def __init__(self, connection) -> None:
         self.connection = connection
 
@@ -169,7 +169,7 @@ class NativeCalls:
         self.messages = {rank: [] for rank in range(len(connections))}
         self.closing = False
         self.stopped = set()
-        self.pending = {}
+        self.startup = set()
         self.ready = deque()
         self.awaiting = {}
         self.sequence = 0
@@ -232,20 +232,12 @@ class NativeCalls:
             return
 
         # Only startup waits for the world; native CPU collectives own all later rank agreement.
-        members = tuple(self.connections)
-        message = {"kind": "ready"}
-        self.pending[channel] = (operation, message)
-        if all(participant in self.pending for participant in members):
-            for participant in members:
-                other_operation, other = self.pending[participant]
-                if (other_operation, other) != (operation, message):
-                    fields = sorted(key for key in other.keys() | message.keys() if other.get(key) != message.get(key))
-                    raise ValueError(
-                        f"Native initialization disagrees on {other['kind']} / {message['kind']}: {fields}"
-                    )
-            self.ready.append(WorkerCall(operation, message, members))
-            for participant in members:
-                del self.pending[participant]
+        if operation != "send":
+            raise ValueError("Native startup readiness must be a notification")
+        self.startup.add(channel)
+        if len(self.startup) == len(self.connections):
+            self.ready.append(WorkerCall("send", {"kind": "ready"}, tuple(self.connections)))
+            self.startup.clear()
 
     def deliver(self, deliveries, completion=None):
         if not deliveries:
@@ -282,7 +274,7 @@ class NativeCalls:
                     channel.send(message["result"])
 
     def shutdown(self):
-        if self.ready or self.pending or not self.quiescent() or any(
+        if self.ready or self.startup or not self.quiescent() or any(
             call.message["kind"] not in {"input", "idle"}
             and not (call.message["kind"] == "cpu_wait" and not call.message["execution"]["in_flow"])
             for call in self.awaiting.values()
@@ -299,7 +291,7 @@ class NativeCalls:
                 channel.send(NativeStopped())
 
     def quiescent(self) -> bool:
-        blocked = self.stopped | set(self.pending) | self.collectives.blocked()
+        blocked = self.stopped | self.startup | self.collectives.blocked()
         calls = [*self.ready, *self.awaiting.values()]
         for call in calls:
             blocked.update(call.participants)
@@ -370,7 +362,7 @@ class NativeCalls:
                     try:
                         self.receive_core()
                     except EOFError:
-                        if self.awaiting or self.pending or self.ready or self.collectives.pending or self.transfers.pending:
+                        if self.awaiting or self.startup or self.ready or self.collectives.pending or self.transfers.pending:
                             raise
                         core_open = False
                         self.polled = False
@@ -385,5 +377,5 @@ class NativeCalls:
                     self.receive_worker(channel, channels[channel], *request)
             self.dispatch()
 
-        if self.awaiting or self.pending or self.ready or self.collectives.pending or self.transfers.pending:
+        if self.awaiting or self.startup or self.ready or self.collectives.pending or self.transfers.pending:
             raise RuntimeError("Native workers exited with unfinished calls or metadata transport")
