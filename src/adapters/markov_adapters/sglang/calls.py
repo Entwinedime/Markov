@@ -230,6 +230,8 @@ class CallSegments:
         if parent is not None:
             parent.child(work)
             self.suspend(parent, operation, context)
+
+        # Continuations inherit their owner's inputs; independent resource APIs supply their own explicit inputs.
         frame = CallFrame(
             operation, original,
             dict(parent.parameters if parameters is None else parameters),

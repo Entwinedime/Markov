@@ -32,6 +32,7 @@ def main() -> None:
 
         AscendExport.run(arguments.input, arguments.rank, arguments.output)
     else:
+        from markov_adapters.sglang.resources import ResourceInputs
         from markov_collection.adapters.frameworks.sglang.closed_regions import ClosedRegions
         from markov_collection.adapters.frameworks.sglang.kv_facts import NativeKvFacts
         from markov_collection.adapters.runtimes.ascend.observation import AscendObservation
@@ -39,6 +40,7 @@ def main() -> None:
         native = NativeKvFacts(arguments.input, arguments.rank)
         regions = ClosedRegions()
         recording = native.document()
+        recording["scopes"] = ResourceInputs.scopes(recording["scopes"])
 
         # Framework closure rules stay separate from runtime interpretation and the common graph projection.
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)

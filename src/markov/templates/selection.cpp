@@ -18,9 +18,11 @@ struct FrameChoice {
     std::optional<TemplateFrame> frame;
     std::optional<std::string> ambiguity;
     std::optional<std::string> rejected_guard;
+    std::optional<std::string> rejected_parameters;
 
     void merge(FrameChoice candidate, std::string_view site) {
         if (!rejected_guard) rejected_guard = std::move(candidate.rejected_guard);
+        if (!rejected_parameters) rejected_parameters = std::move(candidate.rejected_parameters);
         if (candidate.ambiguity) {
             frame.reset();
             ambiguity = std::move(candidate.ambiguity);
@@ -136,16 +138,35 @@ public:
           membership_(membership) {}
 
     FrameChoice resolve(std::span<const TemplateFrame * const> candidates, const Parameters & arguments) const {
+        FrameChoice result;
         Parameters parameters = candidates.front()->constants;
         for (const auto & [name, value] : arguments) {
             const auto [previous, inserted] = parameters.emplace(name, value);
-            if (!inserted && previous->second != value) return {};
+            if (!inserted && previous->second != value) {
+                result.rejected_parameters = nlohmann::json{
+                    { "site", candidates.front()->site }, { "fixed", name }, { "expected", previous->second }, { "actual", value }
+                }.dump();
+                return result;
+            }
         }
 
         // Family construction fixes the interface and constants; only guards and child choices vary at runtime.
         const auto & expected = library_.definitions[candidates.front()->definition].parameters;
-        if (expected.size() != parameters.size() || !std::ranges::all_of(expected, [&](const auto & name) { return parameters.contains(name); }))
-            return {};
+        if (expected.size() != parameters.size() || !std::ranges::all_of(expected, [&](const auto & name) { return parameters.contains(name); })) {
+            std::vector<std::string> missing, unexpected;
+            for (const auto & name : expected) {
+                if (!parameters.contains(name)) missing.push_back(name);
+            }
+            for (const auto & [name, value] : parameters) {
+                if (!expected.contains(name)) unexpected.push_back(name);
+            }
+
+            // Report the contract failure separately from guards on other, incompatible candidates.
+            result.rejected_parameters = nlohmann::json{
+                { "site", candidates.front()->site }, { "missing", missing }, { "unexpected", unexpected }
+            }.dump();
+            return result;
+        }
 
         const TemplateFrame * rejected = nullptr;
         std::map<std::pair<std::size_t, std::vector<std::size_t>>, const TemplateFrame *> implementations;
@@ -159,7 +180,6 @@ public:
             implementations.try_emplace(std::pair{ candidate->definition, std::move(children) }, candidate);
         }
 
-        FrameChoice result;
         if (implementations.empty() && rejected) {
             Parameters relevant;
             for (const auto & name : rejected->guard.variables()) relevant.emplace(name, parameters.at(name));
@@ -187,6 +207,7 @@ public:
                               {},
                               source.kv_layers,
                               source.communication },
+                {},
                 {},
                 {}
             };
@@ -233,8 +254,9 @@ TemplateEntry TemplateSelection::select(std::string_view action, const nlohmann:
                                     + " condition=" + condition.dump() + " parameters=" + nlohmann::json(parameters).dump());
     if (!chosen.frame)
         throw std::invalid_argument("template action has no matching local conditions: " + std::string(action) + " condition=" + condition.dump()
-                                    + (chosen.rejected_guard ? " rejected_local_candidate=" + *chosen.rejected_guard
-                                                             : " parameters=" + nlohmann::json(parameters).dump()));
+                                    + " parameters=" + nlohmann::json(parameters).dump()
+                                    + (chosen.rejected_parameters ? " rejected_parameter_contract=" + *chosen.rejected_parameters : "")
+                                    + (chosen.rejected_guard ? " rejected_local_candidate=" + *chosen.rejected_guard : ""));
 
     // A composed target is not an observed whole call; source observations remain on the stored candidates.
     return { std::string(action), condition, std::move(*chosen.frame), {} };

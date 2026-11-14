@@ -7,6 +7,45 @@ from functools import partial, update_wrapper
 from markov_adapters.sglang.calls import ActionCall
 
 
+class ResourceInputs:
+    """Scalar inputs owned by the resource ABI; request context travels separately in work."""
+
+    declarations = {
+        "cache.finished": (),
+        "cache.unfinished": (),
+        "slots.free": (),
+        "pages.free": ("page_size", "release_tokens", "release_grouped"),
+        "pages.flush": ("page_size", "release_calls", "release_tokens"),
+        "pages.sort": ("page_size", "ready_pages", "released_pages"),
+    }
+
+    @classmethod
+    def bind(cls, operation, values):
+        return {name: values[name] for name in cls.declarations[operation]}
+
+    @classmethod
+    def scopes(cls, scopes):
+
+        # Native records retain the enclosing observation; only formal inputs cross a resource call boundary.
+        owners = {}
+        for scope in scopes:
+            operation = scope["bindings"].get("segment", {}).get("owner")
+            if operation in cls.declarations:
+                owners[scope["id"]] = operation
+                owners[scope["parent"]] = operation
+
+        result = []
+        for scope in scopes:
+            operation = owners.get(scope["id"])
+            if operation is not None:
+                parameters = cls.bind(operation, scope["parameters"])
+                scope = {**scope, "parameters": parameters,
+                         "constants": {name: value for name, value in scope["constants"].items() if name in parameters},
+                         "arguments": {name: value for name, value in scope["arguments"].items() if name in parameters}}
+            result.append(scope)
+        return result
+
+
 class ResourceCalls:
     def __init__(self, calls) -> None:
         self.calls = calls
@@ -48,7 +87,9 @@ class ResourceCalls:
         parent = self.calls.current.get()
         if parent is None:
             return original(*args, **kwargs)
-        parameters = dict(parent.parameters)
+        parameters = {}
+        if "page_size" in ResourceInputs.declarations[operation]:
+            parameters["page_size"] = owner.page_size
         work = dict(parent.work)
         guards = []
         if operation in {"cache.finished", "cache.unfinished"}:
@@ -75,7 +116,7 @@ class ResourceCalls:
             ordering = args[0] if args else {"ready_pages": len(owner.free_pages), "released_pages": len(owner.release_pages)}
             parameters.update(ordering)
             guards = [["lt", 0, "released_pages"] if ordering["released_pages"] else ["eq", "released_pages", 0]]
-        with self.calls.call(operation, original, parameters=parameters, work=work, guards=tuple(guards)):
+        with self.calls.call(operation, original, parameters=ResourceInputs.bind(operation, parameters), work=work, guards=tuple(guards)):
             return original(*args, **kwargs)
 
     def match(self, owner, original, params):
