@@ -124,6 +124,20 @@ class NativeEffectEvidence:
                 for resource in (f"thread/{row['thread']}", f"service/{row['thread']}"):
                     self.host_measurements[resource, row[f"{side}_counter"]] = row[f"{side}_raw_ns"]
 
+        # These immutable source intervals serve every API check; copies must not rescan the whole recording.
+        self.spans = Counter((span["scope"], span["resource"], span["begin"], span["end"], span["kind"])
+                             for span in facts["spans"])
+        self.span_ranges = ThreadIntervals([Interval(begin, end, resource, {}) for _, resource, begin, end, _ in self.spans])
+        self.wait_intervals = {(resource, begin, end) for _, resource, begin, end, kind in self.spans if kind == "wait"}
+        self.payload_ranges = ThreadIntervals([
+            Interval(begin, end, index, {})
+            for index, resource in enumerate(facts["resources"]) for begin, end in resource["payload"]
+        ])
+        self.transfer_signals = {
+            (tuple(sorted(edge["target"].items())), facts["spans"][edge["source"]["span"]]["resource"], edge["source"]["order"])
+            for edge in facts["dependencies"] if edge["kind"] == "signal"
+        }
+
     @staticmethod
     def require(condition, message):
         if not condition:
@@ -189,7 +203,7 @@ class NativeEffectEvidence:
         return intervals
 
     def inspect_boundaries(self, graph, device_intervals):
-        spans = Counter((span["scope"], span["resource"], span["begin"], span["end"], span["kind"]) for span in self.facts["spans"])
+        spans = self.spans
         resources = {(resource["kind"], resource["identity"]): index for index, resource in enumerate(graph["resources"])}
         self.require(len(resources) == len(graph["resources"]), "coarse graph repeats a native resource")
 
@@ -527,16 +541,13 @@ class NativeEffectEvidence:
         recorded = {(effect["thread"], effect["begin_counter"]): effect for effect in effects}
         self.require(len(recorded) == len(effects), "native effects repeat an API instance")
         expected, coordinates, counts = set(), {}, Counter()
-        spans = defaultdict(list)
-        for span in self.facts["spans"]:
-            spans[span["resource"]].append(span)
         for row in self.runtime:
             if row["api"] == "aclrtMemcpy" and row["bytes"] > 0:
                 interval = self.interval(row)
                 if self.window.begin <= interval.begin and interval.end <= self.window.end:
                     owner = self.owner(self.native_api(interval))
                     if owner is not None and owner not in self.closed_scopes:
-                        self.inspect_transfer(owner, row, spans, graph)
+                        self.inspect_transfer(owner, row, graph)
                         counts["synchronous_copies"] += 1
             copy = row["api"] == "aclrtMemcpyAsync" and row["bytes"] > 0
             if not copy and row["api"] not in self.waits:
@@ -580,7 +591,7 @@ class NativeEffectEvidence:
             else:
                 self.require(witness is None, "queued work or stream wait claims an unrelated host-copy completion")
             if completed is not None:
-                host = self.inspect_transfer(owner, completed, spans, graph)
+                host = self.inspect_transfer(owner, completed, graph)
                 self.require(effect["resource"] == host and not effect["commands"],
                              "synchronous transfer invents a stream command or changes its actual caller")
                 counts["copies"] += 1
@@ -603,13 +614,13 @@ class NativeEffectEvidence:
 
             for command in effect["commands"]:
                 begin, end = command["begin"], command["end"]
-                self.require(begin < end and any(span["begin"] <= begin < end <= span["end"] for span in spans[effect["resource"]]),
+                interval = Interval(begin, end, effect["resource"], {})
+                self.require(begin < end and self.span_ranges.enclosing(interval) is not None,
                              "native effect has no retained stream span")
                 if copy:
-                    self.require(any(first <= begin < end <= last for first, last in resource["payload"]), "native copy is absent from work payload")
+                    self.require(self.payload_ranges.enclosing(interval) is not None, "native copy is absent from work payload")
                 else:
-                    self.require(any(span["kind"] == "wait" and span["begin"] == begin and span["end"] == end
-                                     for span in spans[effect["resource"]]), "native stream wait is absent")
+                    self.require((effect["resource"], begin, end) in self.wait_intervals, "native stream wait is absent")
                 if command["sdk"] is not None:
                     identity = instances[self.sdk.key(command["sdk"])].popleft()
                     self.require(coordinates.setdefault(identity, (begin, end)) == (begin, end), "nested API views duplicate a device task")
@@ -618,16 +629,15 @@ class NativeEffectEvidence:
         counts["device_measurements"] = self.sdk.inspect_coordinates(self.facts, self.apis, coordinates)
         return dict(counts)
 
-    def inspect_transfer(self, source_scope, completed, spans, graph):
+    def inspect_transfer(self, source_scope, completed, graph):
         scope = self.source_scopes[source_scope]
         resources = self.facts["resources"]
         host, = [index for index, resource in enumerate(resources)
                  if (resource["kind"], resource["identity"]) == ("thread", f"thread/{completed['thread']}")]
         begin, end = completed["begin_counter"], completed["end_counter"]
-        self.require(any(span["scope"] == scope and span["kind"] == "transfer"
-                         and (span["begin"], span["end"]) == (begin, end) for span in spans[host]),
+        self.require(self.spans[scope, host, begin, end, "transfer"] > 0,
                      "synchronous copy loses its caller transfer interval")
-        self.require(any(first <= begin < end <= last for first, last in resources[host]["payload"]),
+        self.require(begin < end and self.payload_ranges.enclosing(Interval(begin, end, host, {})) is not None,
                      "synchronous transfer is absent from its caller payload")
         raw = self.native["scopes"][source_scope]
         while "device_entry" not in raw and raw["parent"] is not None:
@@ -639,8 +649,6 @@ class NativeEffectEvidence:
         port, = [port for port in self.facts["scopes"][owner]["ports"] if port["name"] == "device.complete"]
         published, = [port for port in graph["scopes"][owner]["ports"] if port["name"] == "device.complete"]
         self.check_device_end(graph, published["event"], self.point_connection(raw["device_return"]))
-        self.require(any(edge["kind"] == "signal" and edge["target"] == port["at"]
-                         and self.facts["spans"][edge["source"]["span"]]["resource"] == host and edge["source"]["order"] == end
-                         for edge in self.facts["dependencies"]),
+        self.require((tuple(sorted(port["at"].items())), host, end) in self.transfer_signals,
                      "synchronous transfer has no readiness edge to its actual enclosing return fence")
         return host
