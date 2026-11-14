@@ -112,21 +112,39 @@ class PdPayloadEvidence:
             for session, mode, address, pages in ((source, "read", first, transfer["source_pages"]),
                                                    (target, "write", last, transfer["target_pages"])):
                 buffers = self.buffers[session]
-                size = buffers.page_size
-                for region in buffers.regions(address, length):
-                    covered = 0
-                    for index, page in enumerate(pages):
-                        begin = max(region["token_begin"], page * size)
-                        end = min(region["token_end"], (page + 1) * size)
-                        covered += max(0, end - begin)
+                layout, size = buffers.layout, buffers.page_size
+                candidates = [index for index, (start, count) in enumerate(zip(buffers.starts, buffers.lengths, strict=True))
+                              if start <= address and address + length <= start + count]
+                if length <= 0 or len(candidates) != 1:
+                    raise ValueError("native PD bytes do not lie in one registered buffer")
 
-                        # A copied tail page includes padding; only valid request tokens define the state footprint.
-                        end = min(end, page * size + max(0, min(size, member["new_tokens"] - index * size)))
-                        if begin < end:
-                            interval = region["slice"]
-                            footprints[session, mode, region["layer"], member["id"]].append((begin, end, interval["begin"], interval["end"]))
-                    if covered != region["token_end"] - region["token_begin"]:
-                        raise ValueError("native PD bytes escape the chunk's actual physical pages")
+                buffer, = candidates
+                layers = layout.end_layer - layout.start_layer
+                width = layout.key_token_bytes if buffer < layers else layout.value_token_bytes
+                component = 0 if buffer < layers else layout.key_token_bytes
+                layer = layout.start_layer + buffer % layers
+                offset, covered = address - buffers.starts[buffer], 0
+                output = footprints[session, mode, layer, member["id"]]
+                for index, page in enumerate(pages):
+                    begin, end = max(offset, page * size * width), min(offset + length, (page + 1) * size * width)
+                    covered += max(0, end - begin)
+
+                    # Check raw byte intersections independently of the producer's address-to-region decoder.
+                    valid_tokens = max(0, min(size, member["new_tokens"] - index * size))
+                    end = min(end, (page * size + valid_tokens) * width)
+                    if begin >= end:
+                        continue
+
+                    head, tail = begin // width, (end - 1) // width
+                    if head == tail:
+                        output.append((head, head + 1, component + begin % width, component + (end - 1) % width + 1))
+                    else:
+                        output.append((head, head + 1, component + begin % width, component + width))
+                        if head + 1 < tail:
+                            output.append((head + 1, tail, component, component + width))
+                        output.append((tail, tail + 1, component, component + (end - 1) % width + 1))
+                if covered != length:
+                    raise ValueError("native PD bytes escape the chunk's actual physical pages")
             self.counts["recorded_kv_bytes"] += length
 
     def metadata(self, transfer, parent, source, target):

@@ -370,7 +370,13 @@ Event 返回 true 只说明完成不晚于查询返回，false 只说明完成�
 
 独立动作比较在CPU control容器内使用 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。实际完成时间通过已核对的具名端口对应原始测量；独立核对CPU边界及全部已消费设备端点是否具有一套共同仿射解释，不读取生成条件中的时钟映射自证。向上取整的开闭区间按精确有理数约束验证，不增加经验容差。 两者同时核对原始 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
 
-矩阵示例将采集、图生产与比较分别执行。比较使用显式source_catalog；每个目标声明observation、production、source_evidence，分别指向捕获所有者、已发布真实图和独立来源报告。读取时核对原始任务、发布与报告的归属；真实图保留原生产身份，预测程序另行固定。比较阶段只消费这些已有产物；按prediction_exit选择成功时的execution.jsonl或失败时保留的execution.partial.jsonl，并记录execution_trace。任务成功与前缀结构资格分别报告，预测失败时仍检查实际留下的执行明细。
+矩阵示例维护sources、targets、compare三个明确阶段：sources调用正式规划/采集/模板生产并独立检查来源；targets取得每个目标的原生记录、真实粗图及来源检查；compare从目标证据提取必要时间条件，再用来源模板预测和独立比较。矩阵声明具名domain的exploration/deployment及各目标的capture_input、prediction_input和configuration；environment.json固定镜像和全调查共享的validation_budget，同目录markov固定实际程序。不手工编制source_catalog或把目标图装入来源。
+
+来源失败不阻止独立目标取证。代表worker的局部来源映射和共同校准须成立，整组原生资格另行记录；目标整组或时间资格不足时，不发布完整闭环通过。三阶段分别在results/<矩阵名>维护精简sources.json、targets.json、comparisons.json，详细报告留在具名对象目录。预测成功检查execution.jsonl，失败仍可检查execution.partial.jsonl；保留任务成功、前缀资格和完整结构结论各自的边界。
+
+调用形式为`python3 example/coarse_graph/matrix.py --root <运行根> --matrix <固定矩阵.json> --phase sources|targets|compare`。全调查共用预算锁和原生设备占用锁，CPU比较独立；已结束步骤不自动重试。普通失败与产物错误分别记录，执行状态不明时保留额度及进程身份并停止，检查真实进程后再恢复。工具代码不实现采集恢复、分配或模板规则，继续使用正式任务的唯一所有者。
+
+输入准备使用`python3 example/coarse_graph/prepare_matrix.py --root <运行根> --specification <覆盖声明.json> --stage <阶段> --seed <冻结交付提交> --phase sources|targets`。覆盖声明保留配置、请求取值范围、固定来源探针及抽样方法；同域固定库先发布来源并取得终态，再生成目标请求，跨域任务则先生成用户输入，再交给来源规划。已发布文件只允许相同内容接续，不重新抽样替换。EP路由属于实验输入构造，仍经正式请求/路由合同检查，不在示例实现原生组批或图变换。
 
 依赖比较先核实每次运行自身的模型通信、CPU协议及PD前提，再将其全部rank图按真实端点连接。真实PD关系来自预留发送入口、实际服务返回和读取到的状态，不猜通知时刻；预测采用执行器实际输出的跨rank通信、信号和状态边。关系类别保留，CPU终止消息检查也使用同一完整图。内部具名边界可达关系、粗工作位置、跨动作顺序和重复调用位置统一使用这两份全rank图；路径可以离开动作树、经过其他rank后返回。不以孤立rank图中没有路径认定全局缺边，也不重复生成本地、仅模型通信及CPU通信多套判定。协议覆盖不足时保留内容和运行内检查，因果比较明确报告证据不足，不选择较弱图宣称对应。
 
