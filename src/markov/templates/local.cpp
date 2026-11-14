@@ -88,54 +88,10 @@ nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, cons
         if (port.use == PortUse::Signal) return nullptr;
     }
 
-    const auto event = [&](const TemplateReference & reference) { return reference.event + (reference.imported ? 0 : body.imports.size()); };
-    const auto resource = [&](const TemplateReference & reference) {
-        return reference.imported ? body.imports.at(reference.event) : body.events.at(reference.event);
-    };
-    std::vector<std::size_t> boundaries, slots;
-    for (std::size_t imported = 0; imported < body.imports.size(); ++imported) {
-        boundaries.push_back(imported);
-        slots.push_back(body.imports[imported]);
-    }
-    for (const auto & exported : body.exports) {
-        boundaries.push_back(event(exported));
-        slots.push_back(resource(exported));
-    }
-    for (const auto & port : body.ports) {
-        boundaries.push_back(event(port.event));
-        slots.push_back(resource(port.event));
-        if (port.rendezvous) {
-            boundaries.push_back(event(*port.rendezvous));
-            slots.push_back(resource(*port.rendezvous));
-        }
-        if (port.wait) {
+    const auto interface = call_interface(frame);
 
-            // A replacement must wait on the same stream frontier at the same position in its caller-visible order.
-            boundaries.push_back(event(port.wait->begin));
-            slots.push_back(resource(port.wait->begin));
-        }
-    }
-
-    // Every resource slot must have a caller-visible identity; private extra resources cannot be guessed on replacement.
-    if (std::set<std::size_t>(slots.begin(), slots.end()).size() != body.resources.size()) return nullptr;
-    std::vector<std::vector<std::size_t>> successors(body.imports.size() + body.events.size());
-    for (const auto & edge : body.edges) successors[event(edge.source)].push_back(event(edge.target));
-    for (const auto & work : body.work) successors[event(work.start)].push_back(event(work.finish));
-    auto causality = nlohmann::json::array();
-    for (std::size_t origin = 0; origin < boundaries.size(); ++origin) {
-        std::vector<bool> reached(successors.size());
-        auto pending = successors[boundaries[origin]];
-        while (!pending.empty()) {
-            const auto current = pending.back();
-            pending.pop_back();
-            if (reached[current]) continue;
-            reached[current] = true;
-            pending.insert(pending.end(), successors[current].begin(), successors[current].end());
-        }
-        for (std::size_t target = 0; target < boundaries.size(); ++target) {
-            if (reached[boundaries[target]]) causality.push_back({ origin, target });
-        }
-    }
+    // A replacement cannot invent bindings for resources hidden from its caller.
+    if (interface.resources.size() != body.resources.size()) return nullptr;
 
     std::map<std::string, std::size_t> values, storage;
     auto tensors = nlohmann::json::array();
@@ -162,7 +118,7 @@ nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, cons
                           { "required", std::move(required) } };
         if (!group.agreements.empty()) communication["agreements"] = group.document().at("agreements");
     }
-    return { { "interface", call_interface(frame).document() }, { "slots", slots }, { "causality", std::move(causality) },
+    return { { "interface", interface.document() },
              { "bindings", frame.bindings }, { "constants", frame.constants }, { "tensors", std::move(tensors) },
              { "communication", std::move(communication) } };
 }

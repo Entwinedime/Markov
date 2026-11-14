@@ -133,9 +133,10 @@ private:
         std::optional<std::size_t> candidate;
         for (const auto & [external, internal] : { std::pair{ edge.source, edge.target }, std::pair{ edge.target, edge.source } }) {
             for (const auto scope : boundaries[external]) {
-                if (scope == owner || !source_.contains(owner, scope) || !source_.contains(scope, source_.events[internal].scope)) continue;
+                if (scope == owner || !source_.contains(owner, scope)) continue;
+                if (!source_.contains(scope, source_.events[internal].scope) && !boundaries[internal].contains(scope)) continue;
 
-                // A shared endpoint can belong to a parent while the child's declared operation owns its dependency.
+                // Shared endpoints may live in the parent while the child declaring both owns their relation.
                 if (!candidate || source_.contains(*candidate, scope)) candidate = scope;
                 else if (!source_.contains(scope, *candidate)) return owner;
             }
@@ -204,6 +205,8 @@ private:
         TemplateDefinition definition;
         definition.role = observed.info.role;
         definition.implementation = observed.info.implementation;
+
+        // The adapter declares call inputs; observation context in work never adds template parameters.
         for (const auto & [name, value] : observed.info.parameters) definition.parameters.insert(name);
         for (const auto & [name, value] : observed.info.constants) definition.fixed.insert(name);
 

@@ -91,6 +91,12 @@ public:
         for (const auto event : ordered_events) {
             const auto & observed = source_.events[event];
             const auto owner = scope_ids_.contains(observed.scope) ? scope_ids_.at(observed.scope) : 0;
+
+            // Named boundaries, work and typed dependencies define each layer; private empty markers do not.
+            if (!extraction_.retained_[event] && source_.resources[observed.resource].serial) {
+                event_ids_.erase(event);
+                continue;
+            }
             event_ids_.at(event) = graph_.events.size();
             resources[observed.resource].push_back(graph_.events.size());
             graph_.events.push_back({ owner, observed.resource });
@@ -210,27 +216,27 @@ private:
 EntryExtraction::EntryExtraction(const CoarseGraph & source)
     : source_(source),
       scopes_(source.scopes.size()),
+      retained_(source.events.size()),
       incoming_(source.events.size()),
       event_order_(source.events.size()) {
 
     // Every cut shares one immutable source order and boundary index; only local bindings are rebuilt.
-    std::vector<bool> retained(source.events.size());
     for (const auto & scope : source.scopes) {
         for (const auto & port : scope.ports) {
-            retained[port.event] = true;
-            if (port.wait) retained[port.wait->begin] = true;
-            if (port.rendezvous) retained[*port.rendezvous] = true;
+            retained_[port.event] = true;
+            if (port.wait) retained_[port.wait->begin] = true;
+            if (port.rendezvous) retained_[*port.rendezvous] = true;
             if (port.direction != Direction::Output) continue;
             if (port.use == PortUse::Signal) signal_outputs_[port.event].insert(port.signal);
             if (port.use == PortUse::Data) outputs_[port.event].emplace(port.tensor->storage, port.tensor->version);
         }
         for (const auto & access : scope.slot_accesses) {
-            retained[access.start] = retained[access.finish] = true;
+            retained_[access.start] = retained_[access.finish] = true;
             if (access.value.access != StateAccess::Write) continue;
             for (const auto & request : access.value.requests)
                 slot_outputs_[access.finish].emplace(access.value.pool, access.value.field, request);
         }
-        for (const auto & access : scope.kv_accesses) retained[access.start] = retained[access.finish] = true;
+        for (const auto & access : scope.kv_accesses) retained_[access.start] = retained_[access.finish] = true;
     }
 
     for (std::size_t scope = 0; scope < source.scopes.size(); ++scope) {
@@ -239,21 +245,18 @@ EntryExtraction::EntryExtraction(const CoarseGraph & source)
     for (std::size_t work = 0; work < source.work.size(); ++work) {
         const auto & piece = source.work[work];
         scopes_[piece.scope].work.push_back(work);
-        retained[piece.start] = retained[piece.finish] = true;
+        retained_[piece.start] = retained_[piece.finish] = true;
     }
     for (std::size_t identity = 0; identity < source.edges.size(); ++identity) {
         const auto & edge = source.edges[identity];
         incoming_[edge.target].push_back(identity);
         const auto resource = source.events[edge.source].resource;
         if (edge.kind != Relation::Order || source.events[edge.target].resource != resource || !source.resources[resource].serial)
-            retained[edge.source] = retained[edge.target] = true;
+            retained_[edge.source] = retained_[edge.target] = true;
     }
 
-    // Unnamed empty serial markers add no work or dependency; each cut reconstructs order between retained boundaries.
-    for (std::size_t event = 0; event < source.events.size(); ++event) {
-        const auto & boundary = source.events[event];
-        if (retained[event] || !source.resources[boundary.resource].serial) scopes_[boundary.scope].events.push_back(event);
-    }
+    // Keep ownership intact until a specific action has been detached from its surrounding calls.
+    for (std::size_t event = 0; event < source.events.size(); ++event) scopes_[source.events[event].scope].events.push_back(event);
 
     std::vector<std::set<std::size_t>> next(source_.events.size());
     for (const auto & work : source_.work) next[work.start].insert(work.finish);

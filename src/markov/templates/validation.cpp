@@ -137,6 +137,11 @@ void TemplateLibrary::validate() const {
             for (const auto slot : callee.boundaries) callee.resources.at(slot);
             for (const auto endpoint : callee.imports) callee.boundaries.at(endpoint);
             for (const auto endpoint : callee.exports) callee.boundaries.at(endpoint);
+            for (const auto & [source, target] : callee.causality) {
+                callee.boundaries.at(source);
+                callee.boundaries.at(target);
+                if (source == target) throw std::invalid_argument("child interface has cyclic boundary causality");
+            }
             if (child.imports.size() != callee.imports.size() || child.arguments.size() != callee.parameters.size() - callee.fixed.size())
                 throw std::invalid_argument("template call arguments or imports are incomplete");
             for (const auto & [name, expression] : child.arguments) {

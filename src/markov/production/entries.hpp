@@ -29,6 +29,7 @@ private:
     };
     const CoarseGraph & source_;
     std::vector<ScopeContents> scopes_;
+    std::vector<bool> retained_;
     std::vector<std::vector<std::size_t>> incoming_;
     std::vector<std::size_t> event_order_;
     std::map<std::size_t, std::set<std::pair<std::string, std::int64_t>>> outputs_;

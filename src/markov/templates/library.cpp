@@ -77,10 +77,12 @@ TemplateInterface TemplateInterface::read(const nlohmann::json & source) {
                               indices(source.at("imports")),
                               indices(source.at("exports")),
                               indices(source.at("boundaries")),
-                              source.at("ports") };
+                              source.at("ports"),
+                              {} };
     for (const auto & resource : source.at("resources").get_ref<const nlohmann::json::array_t &>())
         result.resources.push_back(
             { resource_kind(resource.at("kind").get<std::string>()), resource.at("role").get<std::string>(), resource.at("serial").get<bool>() });
+    for (const auto & relation : source.at("causality")) result.causality.emplace_back(index(relation.at(0)), index(relation.at(1)));
     return result;
 }
 
@@ -94,6 +96,7 @@ nlohmann::json TemplateInterface::document() const {
         {        "exports",                 exports },
         {     "boundaries",              boundaries },
         {          "ports",                   ports },
+        {      "causality",               causality },
         {      "resources", nlohmann::json::array() }
     };
     for (const auto & resource : resources)

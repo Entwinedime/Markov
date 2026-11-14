@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -80,6 +81,9 @@ struct TemplateInterface {
     std::vector<std::size_t> exports;
     std::vector<std::size_t> boundaries;
     nlohmann::json ports;
+
+    // Caller-visible reachability is invariant across implementations sharing this interface.
+    std::vector<std::pair<std::size_t, std::size_t>> causality;
 
     static TemplateInterface read(const nlohmann::json & source);
     nlohmann::json document() const;
