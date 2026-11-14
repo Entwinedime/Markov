@@ -176,16 +176,13 @@ struct GraphInvocation {
     std::map<std::string, std::string> pools{};
 };
 
-struct TemplateObservation {
-    std::size_t scope;
-    Parameters parameters;
-};
-
 struct TemplateEntry {
     std::string action;
     nlohmann::json condition;
     TemplateFrame frame;
-    std::vector<TemplateObservation> observations;
+
+    // Distinct source parameter points qualify selection; source graphs retain individual call provenance.
+    std::set<Parameters> observations;
 };
 
 // A local implementation carries no caller tensor identities, communication ranks or physical resources.

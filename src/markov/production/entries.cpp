@@ -152,6 +152,10 @@ private:
 
     void connect(const GraphEdge & edge) {
 
+        // The cut rebuilds serial order once; retaining source copies only duplicates that same resource chain.
+        const auto resource = source_.events[edge.target].resource;
+        if (edge.kind == Relation::Order && source_.events[edge.source].resource == resource && source_.resources[resource].serial) return;
+
         // A wait resolves the target's submitted stream frontier, never the source run's last task.
         if (edge.kind == Relation::Signal && waits_.contains({ edge.target, source_.events[edge.source].resource })) return;
         if (event_ids_.contains(edge.source)) {
@@ -161,8 +165,6 @@ private:
 
         // A completed fact was read in the source; target control establishes its own observations, not a wait input.
         if (edge.kind == Relation::Observation) return;
-        const auto resource = source_.events[edge.target].resource;
-        if (edge.kind == Relation::Order && source_.events[edge.source].resource == resource && source_.resources[resource].serial) return;
         if (edge.kind == Relation::Data && declared_data(edge)) return;
         if (edge.kind == Relation::Signal && declared_signal(edge)) return;
         if (edge.kind == Relation::State && declared_state(edge)) return;

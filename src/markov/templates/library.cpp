@@ -316,7 +316,7 @@ TemplateLibrary TemplateLibrary::read(const nlohmann::json & source) {
     for (const auto & entry : source.at("entries").get_ref<const nlohmann::json::array_t &>()) {
         TemplateEntry value{ entry.at("action").get<std::string>(), entry.at("condition"), TemplateFrame::read(entry.at("frame")), {} };
         for (const auto & observation : entry.at("observations").get_ref<const nlohmann::json::array_t &>())
-            value.observations.push_back({ index(observation.at("scope")), read_parameters(observation.at("parameters")) });
+            value.observations.insert(read_parameters(observation));
         result.entries.push_back(std::move(value));
     }
     for (const auto & local : source.at("implementations"))
@@ -339,17 +339,11 @@ nlohmann::json TemplateLibrary::document() const {
     for (const auto & local : implementations)
         result["implementations"].push_back({ { "contract", local.contract }, { "definition", local.definition }, { "guard", local.guard.document() } });
     for (const auto & entry : entries) {
-        auto observations = nlohmann::json::array();
-        for (const auto & observed : entry.observations)
-            observations.push_back({
-                {      "scope",      observed.scope },
-                { "parameters", observed.parameters }
-            });
         result["entries"].push_back({
             {       "action",            entry.action },
             {    "condition",         entry.condition },
             {        "frame",  entry.frame.document() },
-            { "observations", std::move(observations) }
+            { "observations",      entry.observations }
         });
     }
     return result;

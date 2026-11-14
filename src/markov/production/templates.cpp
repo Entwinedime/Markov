@@ -124,7 +124,7 @@ public:
 
         // Compile children first to derive their call interfaces before sharing the caller's structure.
         for (std::size_t scope = scopes_.size(); scope-- > 0;) compile_scope(scope);
-        return { entry.action, entry.condition, std::move(scopes_[0].frame), { { entry.scope, source_.scopes[0].info.parameters } } };
+        return { entry.action, entry.condition, std::move(scopes_[0].frame), { source_.scopes[0].info.parameters } };
     }
 
 private:
@@ -345,7 +345,7 @@ TemplateLibrary TemplateCompiler::compile(const CoarseGraph & source, std::span<
         auto key = std::tuple{ entry.action, entry.condition, entry.frame.document() };
         const auto [found, inserted] = shared_entries.try_emplace(std::move(key), library.entries.size());
         if (inserted) library.entries.push_back(std::move(entry));
-        else library.entries[found->second].observations.push_back(std::move(entry.observations.front()));
+        else library.entries[found->second].observations.merge(entry.observations);
     }
     library.validate();
     return library;

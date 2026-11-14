@@ -147,8 +147,8 @@ class LocalSources:
                         if entry["action"] == "batch_transform" and entry["observations"]}
 
             # PP launch owns the run_batch child and exposes the same observed model geometry.
-            members = {observation["parameters"]["model_members"] for entry in library["entries"]
-                       if entry["action"] in {"run_batch", "launch"} for observation in entry["observations"]}
+            members = {parameters["model_members"] for entry in library["entries"]
+                       if entry["action"] in {"run_batch", "launch"} for parameters in entry["observations"]}
             if 1 in members:
                 observed.add("single_model_batch")
             if any(count > 1 for count in members):
