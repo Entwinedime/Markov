@@ -2,56 +2,55 @@
 
 更新：2026-11-15。
 
-goal运行中。A0及A1已完成各自审定范围内的代码、文档与数据检查，A2的普通Serving审定范围已完成；阶段分层交付以Git记录为准，不把独立验证或整个goal标为完成。当前分支refactor/modeling-redesign，当前A2基线b1c8f52（A1起点acc8c68），新运行根data/20261114T161057Z_execution-structure-development。
+goal运行中。A0–A2已分层提交推送，A3审查完成、待分层交付；尚未开始A4或独立验证。当前分支refactor/modeling-redesign，阶段起点8d02571。运行根data/20261114T161057Z_execution-structure-development；下面的results、inputs、sources及work均相对此根。
 
 ## 阶段与资格
 
-第一阶段先工程开发、多场景回归及收口，第二阶段再独立调查与交付。原D/I及42/30安排已替换，旧输入和调查结果保留。
-
 | 阶段 | 当前资格 |
 | --- | --- |
-| A0 基线、遗留归因和额度 | 已完成，交付acc8c68 |
-| A1 完整闭环及基础合同 | F01–F18已在审定开发域取得对应依据，代码/文档/数据检查完成，作为本阶段交付 |
-| A2 状态、shape、资源及结构变换 | 普通Serving审定范围完成；9例完整开发对照32276动作，三项局部几何及单请求output2给定耗时控制通过；PD动态责任保留在A4 |
-| A3 多实现族、原生资格及自动来源 | 待执行，旧事实不自动取得当前合同资格；检查路由变化造成的零/非零结构机会 |
-| A4 多rank、PP/EP/PD及连接反馈 | 待执行；局部模板见证不代替完整多rank验证 |
+| A0 基线、遗留归因和额度 | 完成，acc8c68 |
+| A1 完整闭环及基础合同 | F01–F18审定开发范围完成，b1c8f52 |
+| A2 状态与结构变换 | 普通Serving范围完成，8d02571；9完整目标32276动作，PD动态责任在A4 |
+| A3 多实现族和自动来源 | F29–F36审定范围完成；15完整目标10094动作，分层提交推送待确认 |
+| A4 多rank、PP/EP/PD及连接反馈 | 待执行，承接PD延迟归还/排序及在途再用 |
 | A5 调度、缓存及持续运行 | 待执行 |
-| A6 工程收口、整合回归及冻结 | 待前述责任闭合，不提前进入性能层 |
-| B1 / B2 / B3 / B4 | 固定库16 / 新域12 / 模型留出8 / 组合12，共48个独立完整目标，均未启动 |
-| B5 根因处置、有限复核及交付 | 未开始，关键共同问题不靠冻结延后 |
+| A6 工程收口、整合回归及冻结 | 待前述责任闭合 |
+| B1–B4 独立验证 | 固定库16、新域12、模型留出8、组合12，共48个完整目标；未启动 |
+| B5 处置、有限复核和交付 | 未开始；性能层不属本goal |
 
-[场景表](verification_matrix.md)维护56项行为/合同责任及48个独立目标。责任数不是采集数；具体任务在阶段启动时按已有事实和有限必要证据确定。Meta-Llama-3.1-8B-Instruct、GLM-4-9B-Chat仍是模型留出候选，需在冻结前核实原生支持及历史介入，不把读过元数据称为运行资格。
+[场景表](verification_matrix.md)维护56项行为/合同责任，责任数不是采集数。Meta-Llama-3.1-8B-Instruct、GLM-4-9B-Chat仍是留出候选，须在冻结前核实原生支持和历史介入。
 
-## 当前代码和镜像
+## A3当前实现与证据
 
-A1修复SDK弱编号被当成全局任务身份的评价；由原生事件/等待声明绑定schedule/forward/copy资源；直接核对原始载荷、设备测量、张量集合/用途和实际就绪。父图转出子图已就绪值时，保留子图的发布边界；不以父返回替代。共同核心没有新增字段、PP特例或物理编号选择。
+来源规划预先选择有限互补作业，完整预测从正式集合选一份主来源，按声明导入局部实现；不跨采集拼物理流，不由目标失败自动补采。容量互补、路由及padding分组采用共同机会选择；专家数规划时取得并由真实模块核对，纯预测不访问模型目录。缓存输入机会复用ABI guard；默认示例实际两个作业，额度说明同步。
 
-A1阶段业务Python净增67行、示例净增265行；A2当前业务净增0行、示例净增8行，当前src171文件/21672行、example27文件/7993行，共29665行。代码检查覆盖采集声明、参数/形状、端口/版本、解释/投影、切图/归一化/替换、时间消费及失败发布。相关八文件Ruff F检查、126文件Python3.10 AST及空白检查通过；没有C++改动或重复构建。
+缓存启用时，采集/原生控制/解释显式交接页大小、缓存长度及进入时保护长度，避免空/正拷贝歧义。原始事实不改写，30次调用用原生insert/free独立核对。普通Serving与PD共用已有有限merge/subset来源；一次四请求MoE辅助运行后，旧单/多请求目标172/568动作对应，主来源不变、C++不加特例。
 
-当前程序build/resource-parameters/markov，SHA256为94a439a70e8aa7d6cc66a18ed8738d362d8ad853cec58f71b7cc9419e209b986。最终source/control为6bd8db15dbe1/0fa73ad76ff4，modeling仍e066a5196c3b；项目包与源码一致，原生SGLang 4e155ecc31af及SDK桥/基础层未改。任务保留当时实际image ID，不凭标签回退。
+- results/a3-sources/final-opportunity-checks.json：四组规划、10项选择、共享前缀guard及无模型目录的纯选择；规划不是原生覆盖。
+- sources/a3-models：八个旧模型/页域按相同原生输入正式重建，14代表库各38–49定义；所有本地层均有实际scope，Qwen8/32分别36/64层，Mistral32层，Mixtral32层/8experts/top2。
+- results/a3-models/comparisons.json及results/a3-api-regression/comparisons.json：八模型/页目标共8046动作对应。原矩阵五例直接通过，三例因example漏传环境的工具错误定向复核通过；原结论保留。
+- results/a3-cache-regression/comparisons.json：FP16短/非均匀及旧prefix/压力四例1204动作对应；来源三份均发布，无重复采集。
+- results/a3-moe-local-regression/comparisons.json：两例740动作对应，包含曾缺merge的多请求到达案例。
+- inputs/a3-mixtral-short：沿用旧EP1库，一次新真实短目标完整104动作对应；results/a3-mixtral-short/comparisons.json保留终态。
 
-## 恢复工作所需证据
+以上为开发回归，原始旧独立调查不改判。来源检查只有代表rank时，全组通信部分状态不冒充全rank证明；目标对照使用各自实际全rank事实。Mixtral历史EP>1的14次失败发生在原生swiglu_quant的UB编译容量，不patch框架；其EP1成功是另一项事实。七次历史PP watchdog由A4继续分析。
 
-A2入口results/a2-state/summary.md；acceptance.json按F19–F28记录实际依据、关联代码审查及边界。七例历史成员/容量与两个分开运行的新预算/压力目标全部对应，32276动作、6507页表快照、231在途冲突均有保护路径；单槽到配置128、KV4096到262144由已发布小池来源变换。配置128的实际最大批次70；归还时在途KV页0，普通non-overlap路径按同stream结果物化先于释放封闭，PD异步责任仍由A4取得动态依据。
+## 程序、镜像和代码
 
-仅示例查询净增8行：按原始区间/载荷/ready边一次索引，不改工作、时间或判据。6252查询及作用/边界计数等价、删载荷均拒绝，两个最终公开来源核对及126文件Python3.10 AST、Ruff F、空白检查通过；业务/C++、程序和镜像未变，不重复构建。单请求output2是given-work完整控制，三项几何是局部检查，不冒充新的真实对照。
+C++本阶段未改。程序build/resource-parameters/markov，SHA256为94a439a70e8aa7d6cc66a18ed8738d362d8ad853cec58f71b7cc9419e209b986。source/control当前ID为ffb5e580539e/13dc6a85682f，modeling为e066a5196c3b；实际完整ID及包校验在work/a3-sources/cache-package-verification.json。17层原生基础相同，官方SGLang 4e155ecc31af未改；旧任务保留当时实际ID。构建首次代理网络失败保留，host构建网络成功，不改变无设备预测的隔离。
 
-最后容量预测因外层批次3500秒额度结束仍在正式容器中续行；按原ID等待至退出0、发布完整结果后首次对照通过，原超时记录保留，未重跑预测/采集。阶段代码/文档/数据检查完成，分层提交及远端事实以Git和results/a2-stage-delivery.json为准；不在未推送时开始A3。
+当前src171文件/21830行，example27文件/7997行，共29827行，相比A2业务净增158、示例净增4。Ruff F、126文件Python3.10 AST、消费者及空白检查通过，阶段静态审查和依据索引在results/a3-sources/acceptance.json；不反复构建未改的C++。
 
-当前运行根：
+## 既有阶段恢复入口及边界
 
-- results/a1-values/summary.md是A1收口入口，列F01–F18的依据及范围。TP1/TP2/PP3既有完整预测由最终评价器重评，233/104/1070动作对应；只重评，没有再采集或仿真。PP3源与对照同次，仍是开发见证。
-- sources/a1-zero-receiver是正式规划的唯一新增来源：Qwen30MoE、TP2/EP2、真实及padding路由集中到同侧。一次原生、一个Engine、三个请求/两组；rank1保留1152零extent端口，两rank定义56/55、入口39/37，506动作局部内容及内部依赖对应。5120动态前沿未冒充局部资格，没有完整EP控制或新目标结论。
-- assets/a1-minimal-input复用已有Qwen8的prompt=1原始来源与SDK，按当前合同重建并核对，130调用唯一选择及展开，无新增原生。
-- results/a1-streams/summary.md保留SDK/原始工作/时间及多stream审查；四项工作/时间/角色/依赖反例均拒绝，六worker分项核对68006项载荷及57410个设备测量端点。历史Mistral尾部仅SDK/接口分项资格，旧资源ABI未自动合格。
-- results/a1-contracts/summary.md保留当前TP1 prefix来源及分开真实目标，完整233动作对应；来源含目标请求描述，是开发见证。此前两次新原生用于不可无损恢复的旧有效key元数据，没有旧字段兼容。
+A1：results/a1-values/summary.md及results/a1-contracts/summary.md；基础参数/层次、SDK发生实例、多stream、原始载荷/张量用途及父子发布关系已分别核对。TP1/TP2/PP3的233/104/1070动作完整开发见证不代替其他配置资格；零接收和最小输入分别只是所列局部/完整范围。
 
-此前运行根data/20261114T084338.925689Z_interactive-structure-validation：Qwen8当前源为assets/s7-qwen8-00-resource-inputs，两rank45/44定义；results/s7-length-parameter-regression/summary.md为六例开发回归2866动作对应。最初六例调查仍为3通过/3失败，不改判；release_calls越层污染经共同资源ABI修正，源码和目标/来源分开。
+A2：results/a2-state/summary.md、acceptance.json及results/a2-stage-delivery.json。九例32276动作、6507页表快照、231在途冲突均有保护路径；最大并发配置128、实测最大批70，KV4096到262144由小池规则变换。普通路径归还时在途页0，PD异步归还和排序仍在A4；单请求output2给定耗时和三项局部几何不冒充新真实目标。
 
-## 限制与费用
+历史根data/20261113T111324.301829Z_execution-structure-reliability及data/20261114T084338.925689Z_interactive-structure-validation保留原调查、六例长度回归及原始SDK；只按明确消费者复用，不自动找最新资产。旧调查3通过/3失败及跨域失败不改写，修正后结果归开发。
 
-当前结果授予基础合同和列出的有限普通Serving容量/压力开发资格；不证明任意容量/压力、更多模型与dtype/backend、新拓扑/PD组合、全部chunk/mixed/prefix或持续运行。校准不确定性和粗化范围保留；未知分支不能任选、填默认值或挪给性能层。局部给定动作、完整原生控制和独立目标三类资格继续分开。
+## 费用与交付
 
-原历史调查根data/20261113T111324.301829Z_execution-structure-reliability保留旧24项固定调查及跨域结果。21次原生失败（14次UB编译、7次PP watchdog）、旧资源ABI不足、部分缺序等按A3/A4归因处理，不因基础合同通过而关闭；71份成功事实仅为复用候选，逐消费者审定。冻结前关键支持域问题必须处置。
+A1原生3次/447.668秒，处理1171.010秒；A2原生3次/434.210秒，处理4252.682秒及120秒未测区间预留。A3原生5次/671.606秒，处理5156.231秒及60秒未测区间预留；阶段上限5次/4500原生秒、16000处理秒、128GiB。总窗口103次/19129.779秒，总上限240次、原生及处理各172800秒；新增任务终态随后由真实owner合计，旧事实引用不重复收费。
 
-A1累计原生3次/447.668秒、已记录处理1171.010秒；A2新增3次/434.210秒、已记录处理4252.682秒及120秒未测交接区间额度；本阶段上限3次/1200秒、处理6000秒；全窗口原生98次/18458.173秒，剩余142次/154341.827秒，总上限240次、原生及处理各172800秒。原始SDK按明确来源引用，不复制旧目录或清零历史费用。额度和实际入口保存在inputs/budget.json及work各批记录中；用户.gitignore、.gitmodules、reference暂存及.clang-format保持原样。
+当前不授予任意模型、配置、容量/压力或复杂调度组合支持；测量校准范围和粗化可见性保留。未知guard不能任选或填默认值，缺口不挪给性能层。A3审查、数据/文档整理及分层提交推送后才进入A4；用户.gitignore、.gitmodules、reference暂存及.clang-format保持原样。

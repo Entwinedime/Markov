@@ -48,20 +48,20 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohman
 ```bash
 python3 example/coarse_graph/run.py \
   --deployment /path/to/deployment.json \
-  --native-budget-seconds 900 --postprocessing-budget-seconds 600 \
-  --attempt-limit 1 --storage-bytes 32212254720
+  --native-budget-seconds 1800 --postprocessing-budget-seconds 1200 \
+  --attempt-limit 2 --storage-bytes 32212254720
 ```
 
-这组额度用于默认单来源域示例，都是上限，不是实际开销承诺。增加来源域时需相应明确累计额度；不会自动放宽、重试或补采。`--timeout` 默认 900 秒，分别限制每次原生尝试和每个目标预测。程序默认 `build/coarse-graph/markov`，可用 `--binary` 指定其他 modeling 构建路径。
+默认输入预先规划一个完整worker来源和一个批次merge/subset局部来源，共两个原生任务。这组额度都是上限，不是实际开销承诺；改变输入时先检查计划并明确累计额度，不会自动放宽、重试或补采。`--timeout` 默认 900 秒，分别限制每次原生尝试和每个目标预测。程序默认 `build/coarse-graph/markov`，可用 `--binary` 指定其他 modeling 构建路径。
 
 每次调用创建 `data/<UTC运行时间>_coarse-graph/`，不扫描或引用历史目录：
 
 | 位置 | 内容 |
 | --- | --- |
 | inputs/ | 解析为绝对模型路径的探索输入、部署、三个镜像 ID 及本次程序快照 |
-| plan/ | 初始来源域及代表输入、简短规划说明 |
-| collection/sources/ | 各来源域的原生任务及不可替代的原始观察 |
-| collection/assets/ | 各来源域的模板生产目录，包含发布模板、生产记录及必要日志 |
+| plan/ | 预先确定的有限来源作业、代表输入及简短规划说明 |
+| collection/sources/ | 各来源作业的原生任务及不可替代的原始观察 |
+| collection/assets/ | 各来源作业的模板生产目录，包含发布模板、生产记录及必要日志 |
 | targets/<序号>/ | 该目标的 input.json 和 prediction/；使用数字目录，不把用户 ID 当作路径 |
 | logs/ | 每步的命令参数与外围日志，失败时定位对应子任务 |
 | summary.md、result.json | 人类摘要与精简目标索引；只有全部目标成功才发布 result.json |
@@ -70,17 +70,19 @@ python3 example/coarse_graph/run.py \
 
 预测默认每工作给定 1 ns，可用 `--given-work-ns` 修改。结果只表示给定耗时条件下的动态展开，不是性能预测、独立结构验收或泛化覆盖证明。输入规划也不保证所有目标分支已被观察。第一处失败即停止，保留已完成任务及摘要；子任务恢复使用 logs 中记录的正式命令及原目录，不重新执行一键脚本制造新采集。此示例不增加另一套恢复状态机。
 
-## 配置集合的来源域规划
+## 配置集合的有限来源规划
 
-在 modeling 环境运行 `PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 -m markov_workflow plan-sources --input <集合输入.json> --output <新目录>`。这一入口划分来源域，并为每域选择一个代表配置及有限 workload 组合，生成初始采集输入；不启动原生。
+在 modeling 环境运行 `PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 -m markov_workflow plan-sources --input <集合输入.json> --output <新目录>`。这一入口划分实现域，在每域预先选择有限互补配置及workload组合，生成完整采集作业；不启动原生。
 
 输入严格包含 framework（当前为 sglang）、model、configurations 和 workloads。configurations 是非空数组，每项为唯一 id 和完整 instances；instances 与单任务采集/预测的表示一致，PD 两端同属一项配置。workloads 是非空请求集合数组，每项具有唯一 id，并沿用 requests、prefixes、ep_routes 的共同合同。
 
-规划复用预测装配的 SourceDomain 规则，将容量和 chunk 长度变化保留在同域，按模型、拓扑、页布局及机制区分来源需求。SGLang 适配层识别声明输入的流程机会（prefill/decode、后续到达、分块、多请求、共享前缀等）。多请求进一步区分同时到达的多Decode和不同Decode长度；按角色计算请求持有页数：Prefill只计prompt，普通serving和Decode还计输出增长；同一结果用于容量筛选和累计需求。单请求均可容纳但未扣共享前缀的总需求超池时，为缓存淘汰或PD延迟回收页再使用保留输入机会；PD不要求启用缓存，不推演准入或断言实际淘汰/排序。在每个配置与相同 EP 补齐条件组内选择提供新条件的 workload，删除已被其他选中输入覆盖的整组冗余 workload；每次选择必须增加条件，次数由有限条件集合约束。再按未包含条件、逻辑 token 总量、各组到达等待之和及 KV 容量选择初始方案；逻辑成本不是性能估计，也不声称求得全局最小集合。
+规划复用预测装配的 SourceDomain 规则，将容量和 chunk 长度变化保留在同域，按模型、拓扑、页布局及机制区分来源需求。SGLang 适配层识别声明输入的流程机会（prefill/decode、后续到达、分块、多请求、共享前缀等）。多请求进一步区分同时到达的多Decode和不同Decode长度；按角色计算请求持有页数：Prefill只计prompt，普通serving和Decode还计输出增长；同一结果用于容量筛选和累计需求。单请求均可容纳但未扣共享前缀的总需求超池时，为缓存淘汰或PD延迟回收页再使用保留输入机会；PD不要求启用缓存，不推演准入或断言实际淘汰/排序。在每个配置与相同 EP 补齐条件组内选择提供新条件的 workload，删除已被其他选中输入覆盖的整组冗余 workload；每次选择必须增加条件，次数由有限条件集合约束。再从完整配方中逐次选择覆盖更多尚未分配目标输入的作业，以逻辑token、到达等待和KV容量作成本排序，删除整项冗余作业。互斥输入机会允许多个来源；作业数受声明输入与兼容padding分组约束，不由失败重试增长。逻辑成本不是性能估计，也不声称求得全局最小集合。
 
-选中的 workload 组成同一个 Engine 内的有限提交序列，请求/前缀 ID 编码为 `[workload ID, 原 ID]`，父前缀及路由引用同步重绑定；独立 workload 不因此意外共享内容。组内到达偏移和完整前缀树保留，只消费配置实际启用的 EP 拓扑；相同补齐条件允许记录顺序不同，不推断不同区间写法等价。不同 padding 条件分别选候选，不覆盖或混合；若无法涵盖声明条件则报告缺口。前缀树与长度关系复用共同内容解析。
+选中的 workload 组成同一个 Engine 内的有限提交序列，请求/前缀 ID 编码为 `[workload ID, 原 ID]`，父前缀及路由引用同步重绑定；独立 workload 不因此意外共享内容。组内到达偏移和完整前缀树保留，只消费配置实际启用的 EP 拓扑；相同补齐条件允许记录顺序不同，不推断不同区间写法等价。不同padding条件分别选候选，不覆盖或混合。EP大于1时，从模型配置读取num_experts或num_local_experts并保存唯一专家数；按原生均分规则区分各层Prefill/Decode的联合接收角色机会，不按专家ID或模型名为核心增加分支。实际零/非零体仍须原生见证，padding及实际组批可能改变最终接收量。前缀树与长度关系复用共同内容解析。
 
-输出 input.json、plan.md、每域的 sources/<域号>.json，最后发布引用这些输入的 plan.json。sources 输入可直接交给 capture；目标集合仍保留原配置/workload 两个维度。报告列出选中 workload、逻辑成本和未包含条件；共享前缀不等于实际命中，不同输出长度不等于实际发生 subset，未选中 workload 的 EP 路由变化也未获得覆盖资格。
+启用缓存时，来源筛选复用缓存调用ABI的guard：按请求最终提交长度区分空/非空整页key，按未完成Prefill区分尾页及新增索引是否为空。共享前缀的连续探针保留已保护整页的机会；中间chunk的实际端点仍由原生调度决定。这些是有限输入机会，不代替原生分支覆盖或模板选择。
+
+输出input.json、plan.md、各作业的sources/<任务号>.json，最后发布引用这些输入的plan.json；sources数组保存作业，实现域不是作业编号。sources 输入可直接交给 capture；目标集合仍保留原配置/workload 两个维度。报告列出选中workload、逻辑成本和对应目标范围；共享前缀不等于实际命中，不同输出长度不等于实际发生subset，输入机会相同也不保证全部实际guard或路由分支可用。
 
 分页 Prefill 的原生实现分支也参与输入选择：同到达组中可容纳的请求，按原生有效批容量、页容量及 prefill/chunk 预算计算冷输入新页数上界；未显式配置微批时采用max(max_running_requests//pp,1)，再受总槽位限制，再使用共享分配器 ABI 区分逐请求路径的触发机会。ignore-EOS 路径可在加入完整请求后才耗尽 prefill 预算，不能把该预算直接当作硬截断长度。同一调用的重复写入单独保留机会：至少两个槽位和同到达成员、最小两项页数能入池，且首项之后仍有 prefill/chunk 预算；跨组的多请求不能替代。PD Decode 的预分配和 page_size=1 不套用分页 Extend 分支。同一冷输入计算同时保留多成员Prefill机会，不能仅凭workload中有多个请求就认定能够合批。两个上界都不是组批预测；准入余量、前缀命中及实际到达仍可能使原生执行走另一条路径，实际模板覆盖必须观察确认。
 
@@ -94,6 +96,8 @@ python3 example/coarse_graph/run.py \
 
 普通TP来源在声明多成员Prefill或并发Decode输入机会时，同样要求实际单/多成员模型观察；仅有多个单成员批次不能代替。该需求与PD共用覆盖定义及发布检查。
 
+普通Serving的多请求、多槽位且存在持续Decode的实施域，同样预先规划merge/subset局部见证；初始请求恰好一批、来源全部同时到达，不能证明新到达与已有Decode合并的张量路径。局部数组操作与完整worker来源分开，复用同一有限配方和发布检查，不等目标报缺失再临时指定供体。
+
 PD 的局部操作来源按参与者的普通实施域规划。多请求、多槽位的Decode端需要merge/subset；TP大于1且允许多成员批次的参与者需要单/多成员模型调用机会，有效批容量使用同一原生默认值和显式微批上限。先合并两端及不同目标的需求，相同模型、TP/PP/EP、backend、页布局和缓存/调度机制的局部需求合并处理。已有普通来源只有在初始计划已声明覆盖全部所需动作时才复用；否则首次规划增加一个有限辅助来源，不改已有普通来源或目标配置。完整任务来源与局部辅助来源允许具有相同实施域，职责不同，不因此互相替代。PD两端完整协议仍来自同一个PD来源。
 
 新辅助来源采用有限配方：每个PP槽位两对无共享前缀请求，需要批次周转时每对输出1/2 token，只有模型几何需求时均输出1 token；需要单/多成员覆盖时另设一个独立单请求提交组。Prefill预算依据原生分页准入容纳一对prompt，缓存开启时给预算相等判断留1 token余量，微批容量为3。实际组批仍由原生完成。保持KV容量，只截取已有EP路由，不延长原请求或推造padding。
@@ -102,9 +106,9 @@ PD 的局部操作来源按参与者的普通实施域规划。多请求、多�
 
 ## 有限来源集合的采集与生产
 
-`acquire-sources` 消费 `plan-sources` 的目录，顺序复用单任务 capture 和 produce。运行前核对全部任务的域、模型路径、部署设备数和编译程序，固定输入、部署及镜像 ID；首次采集前将程序保存到集合 inputs/markov，各域只使用该副本。恢复时先按内容核对传入程序，不能混用中途重新编译的实现；单个候选仍有未包含输入条件时停止，不在执行途中生成补采请求。
+`acquire-sources` 消费 `plan-sources` 的目录，顺序复用单任务 capture 和 produce。运行前核对全部任务的域、模型路径、部署设备数和编译程序，固定输入、部署及镜像 ID；首次采集前将程序保存到集合 inputs/markov，各域只使用该副本。恢复时先按内容核对传入程序，不能混用中途重新编译的实现；互补作业在采集前固定，不在执行途中生成补采请求。
 
-已有正式采集可通过可选的 `--observations <引用.json>` 显式交接，JSON对象将计划域号字符串映射到已发布采集任务的绝对路径。运行前核对完整原生输入、成功终态及任务内的发布路径；被引用任务只读，保留原镜像和尝试记录，不把它标成当前镜像采集。未引用的域正常采集，已引用域只进行当前规则下的生产和实际覆盖核对；缺事实、域不符或生产失败均停止，不自动改为补采。镜像变化不构成自动兼容，原始观察是否足够及原生实施域资格仍须有明确依据。
+已有正式采集可通过可选的 `--observations <引用.json>` 显式交接，JSON对象将计划来源任务号字符串映射到已发布采集任务的绝对路径。运行前核对完整原生输入、成功终态及任务内的发布路径；被引用任务只读，保留原镜像和尝试记录，不把它标成当前镜像采集。未引用的域正常采集，已引用域只进行当前规则下的生产和实际覆盖核对；缺事实、域不符或生产失败均停止，不自动改为补采。镜像变化不构成自动兼容，原始观察是否足够及原生实施域资格仍须有明确依据。
 
 集合的原生时间和尝试额度只统计本集合拥有的采集，包括其失败尝试；引用的历史费用由原任务保留。所有域在本集合内产生的后处理继续计费。原生额度耗尽仍可生产已引用的观察，后处理额度独立约束；这不为未采集的域增加原生额度。
 
@@ -116,9 +120,11 @@ PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow a
   --postprocessing-budget-seconds <后处理累计秒数> --storage-bytes <集合逻辑字节上限>
 ```
 
-根目录 input.json 固定输入，inputs/markov 保存集合程序，status.json 提供额度和失败摘要；sources/<域号> 保存本次采集任务，assets/<域号> 保存模板生产目录。只有全部域生产成功且域匹配，才发布 result.json 的 productions 及对应 captures 列表；captures明确指向实际任务所有者，包括显式引用的外部任务。目标配置按计划中的域分配选择一项作为predict --production，其余显式交给--local-production提供局部实现；不从同域产物中猜完整任务来源。该结果表示初始来源编译完成，不表示目标覆盖或独立验证通过。集合内源trace、SDK临时导出和模板计入集合存储；外部引用的唯一原始事实由原所有者额度维护，外围矩阵另监测整个运行根，不能因引用而忽略总体保留量。默认沿用produce的中间件清理规则，完整明细需显式--keep-intermediates或--resource-trace。
+根目录 input.json 固定输入，inputs/markov 保存集合程序，status.json 提供额度和失败摘要；sources/<任务号> 保存本次采集任务，assets/<任务号> 保存模板生产目录。只有全部作业生产成功且域匹配，才发布 result.json 的 productions 及对应 captures 列表；captures明确指向实际任务所有者，包括显式引用的外部任务。predict --production消费整个发布集合，按目标实现域和已声明输入机会选择一个完整来源，并交接该来源声明的局部实现。相同实现域允许预先选定多个互补作业，完整worker资源仍来自一次原生任务，不合并跨采集物理流；输入机会不是支持判据。该结果表示初始来源编译完成，不表示目标覆盖或独立验证通过。集合内源trace、SDK临时导出和模板计入集合存储；外部引用的唯一原始事实由原所有者额度维护，外围矩阵另监测整个运行根，不能因引用而忽略总体保留量。默认沿用produce的中间件清理规则，完整明细需显式--keep-intermediates或--resource-trace。
 
 集合持有独占锁，并直接从各子任务的原生尝试和生产记录汇总用量，不维护第二套计费账本。每次调用每个域最多新增一次原生尝试；第一处失败即停止，恢复时重新执行同一命令，可显式增加额度，不能换输入、程序或镜像。已有成功采集及完成的生产步骤复用，失败和中断预留仍计费；后处理失败不重启已成功的原生任务。不要绕过集合入口并发运行其子目录任务。
+
+验证矩阵的目标项也可通过observation字段显式引用已发布的原生任务；入口先核对完整采集输入，再重新生产当前规则下的目标图和评价，不新增原生尝试，也不把引用记成新采集。字段属于example验证编排，不扩充workload或核心输入。
 
 显式观察引用也保留原任务的历史费用及尝试数；它们不是本次新增采集。跨集合汇总须按实际任务所有者区分复用和新增，不将历史费用或同一观察重复计为新的原生运行。引用原生事实与复用旧模板是两件事：新解释/模板规则使用新生产目录及当前程序，不修改旧生产状态。
 
@@ -233,13 +239,13 @@ SDK的任务编号及关联字段不是全局发生实例，编号复用不能�
 
 ```bash
 PYTHONPATH=src/workflow:src/adapters python3 -m markov_workflow predict \
-  --production <已发布的生产目录> --input <prediction.json> \
+  --production <已发布的来源集合目录> --input <prediction.json> \
   --binary <modeling构建的markov> --output <新的输出目录> --timeout 180
 ```
 
---production 指定一份负责完整任务的来源；可重复的 --local-production 提供额外局部实现。入口只读取显式目录的已发布索引，模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
+--production 指定一份已由acquire-sources完整发布的来源集合。入口读取集合固定计划及生产索引，根据目标实施域和输入机会自动选完整来源及它的局部供体；未知输入仍由实际模板合同核对，不把规划机会标签变成额外支持门槛。模型专家数来自规划发布的元数据，纯预测不重新打开模型目录。模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
 
-PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；一键示例沿来源计划的目标域映射选择主来源。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
+PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；正式预测入口负责来源选择，示例不维护第二套装配规则。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
 
 外围入口管理 modeling/control 两个容器，无网络、不挂载设备或模型权重。--modeling-image 和 --control-image 接受稳定标签或 ID，启动前统一解析为实际 ID；core.log/control.log 首行记录对应容器的完整命令。只给 modeling 挂载程序、模板、生成的内部任务和输出目录。输出目录必须不存在；仅两端成功退出且本次容器清理完成后发布 result.json，保留日志，删除临时内部任务和未发布结果。协调器与两个容器各自持有期限，容器使用 --init 回收子进程；超时或失败只清理本次专属容器，并回收 Docker 客户端。协调器被强杀时不保证临时任务文件被删除，但子容器仍受自身期限限制，临时文件不能视为已发布结果，不自动重跑。
 
@@ -279,7 +285,7 @@ predict 可选 --execution-trace，以同一次模拟增量写出 execution.json
 
 原生边界记录的host张量输入可通过`CapturedCall.port(..., at_return=True)`声明阻塞读取在调用返回前完成；普通输入不设置该字段。该声明仅允许host input，解释器将其接到同一调用的CPU返回，投影后的共同图只保留普通data端口及实际事件。SGLang的共享HostReads在结果入口登记具名输入对象，只在该对象实际调用`Tensor.tolist`时产生独立`host_read`动作；采集保留真实等待，控制在使用返回值前完成同一动作。普通结果片段不声明已完成物化，也不按片段位置推断是否纯CPU；其他tolist不被接管，未发生的读取没有动作。未知别名或其他物化API须由相应adapter明确声明，不能猜测读取位置。模型／PP输出仍按实际生产资源发布，独立来源检查核对返回别名及读取所属调用。改变这项声明需要新的原生观察，不能把旧端口改写后作为实测事实发布。
 
-`markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>]` 是应用内部的核心入口，标准输入输出保留给控制协议。内部任务包含 settings/control、参与者环境及模板索引，template_sources列出所有显式提供的来源库，模板目录按索引放置0.json、1.json等库；用户通过外围入口生成，不手工维护这些重复事实。核心仍核对资产域、参与者和资源绑定。 唯一的--production负责完整原生任务；--local-production仅供适配器明确授权的局部动作复用，不拼接PD两侧。结果template_imports记录导入候选的source/source_entry和recipient/entry，库索引先主来源、后各局部来源，按各发布清单顺序展开；这不是实际执行次数。
+`markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>]` 是应用内部的核心入口，标准输入输出保留给控制协议。内部任务包含 settings/control、参与者环境及模板索引，template_sources列出所有显式提供的来源库，模板目录按索引放置0.json、1.json等库；用户通过外围入口生成，不手工维护这些重复事实。核心仍核对资产域、参与者和资源绑定。 来源集合选择的主作业负责完整原生任务；计划明确授权的供体只提供局部动作复用，不拼接PD两侧。结果template_imports记录导入候选的source/source_entry和recipient/entry，库索引先主来源、后各局部来源，按各发布清单顺序展开；这不是实际执行次数。
 
 单图实例化的 signals 按端口名绑定目标信号，pools 明确提供池绑定；动态 serving 由原生句柄维护信号代次，并将 local 绑定到当前参与者、远端绑定到相应资源所有者。独立 execute 的 initial_inputs=ready 仍是显式假设，不能作为跨动作等待正确性证据。现存旧来源缺少新机制字段时保持历史用途，不补造运行资格。
 
