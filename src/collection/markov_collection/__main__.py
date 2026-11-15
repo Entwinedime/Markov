@@ -41,7 +41,7 @@ def main() -> None:
         native = NativeKvFacts(arguments.input, arguments.rank)
         regions = ClosedRegions()
         recording = native.document()
-        recording["scopes"] = ResourceInputs.scopes(recording["scopes"])
+        recording["scopes"] = ResourceInputs.scopes(recording["scopes"], recording["environment"])
 
         # Framework closure rules stay separate from runtime interpretation and the common graph projection.
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)

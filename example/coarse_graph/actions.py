@@ -196,7 +196,7 @@ class ActionScopes:
     def validate_source(self, raw, rank):
         if raw["environment"]["parallel"]["rank"] != rank or self.graph["environment"] != raw["environment"]:
             raise ValueError("graph and recording belong to different worker environments")
-        raw = {**raw, "scopes": ResourceInputs.scopes(raw["scopes"])}
+        raw = {**raw, "scopes": ResourceInputs.scopes(raw["scopes"], raw["environment"])}
         self.source_ids = {}
         for index, scope in enumerate(self.graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
