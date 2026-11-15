@@ -26,19 +26,17 @@ class SourceAcquisition:
         plan_root = arguments.plan.resolve(strict=True)
         plan = json.loads((plan_root / "plan.json").read_text())
         deployment = json.loads(arguments.deployment.read_text())
-        self.jobs, self.domains = {}, {}
-        for domain in plan["domains"]:
-            identity = domain["id"]
+        self.jobs, self.descriptions = {}, {}
+        for description in plan["sources"]:
+            identity = description["id"]
             if type(identity) is not int or identity < 0 or identity in self.jobs:
-                raise ValueError("source plan needs distinct nonnegative domain IDs")
-            if domain["source"]["unrepresented_conditions"]:
-                raise ValueError(f"domain {identity} has unresolved input conditions: {domain['source']['unrepresented_conditions']}")
-            path = (plan_root / domain["source"]["input"]).resolve(strict=True)
+                raise ValueError("source plan needs distinct nonnegative source job IDs")
+            path = (plan_root / description["source"]["input"]).resolve(strict=True)
             if not path.is_relative_to(plan_root):
                 raise ValueError("planned capture input lies outside its plan directory")
             job = json.loads(path.read_text())
             serving = CaptureInput(job)
-            if SourceDomain.requested(serving) != domain["structure"]:
+            if SourceDomain.requested(serving) != description["structure"]:
                 raise ValueError("planned capture input differs from its source domain")
             workers = sum(instance.configuration.tp * instance.configuration.pp for instance in serving.instances)
             placement = AscendDeployment(deployment, workers, len(serving.instances) > 1)
@@ -46,13 +44,13 @@ class SourceAcquisition:
             if self.output == model or model in self.output.parents:
                 raise ValueError("source collection must not write inside a model directory")
             self.jobs[identity] = job
-            self.domains[identity] = {"structure": domain["structure"], "required_local_coverage": domain["required_local_coverage"]}
+            self.descriptions[identity] = {"structure": description["structure"], "required_local_coverage": description["required_local_coverage"]}
         if not self.jobs:
             raise ValueError("source acquisition needs a nonempty plan")
 
         observations = json.loads(arguments.observations.read_text()) if arguments.observations is not None else {}
         if not isinstance(observations, dict) or observations.keys() - {str(identity) for identity in self.jobs}:
-            raise ValueError("observation references name an unplanned source domain")
+            raise ValueError("observation references name an unplanned source job")
         self.observations = {int(key): Path(path).resolve(strict=True) for key, path in observations.items()}
         for identity, directory in self.observations.items():
             if self.output == directory or directory in self.output.parents:
@@ -122,7 +120,7 @@ class SourceAcquisition:
             executable.chmod(0o500)
             write_json(path, self.inputs, indent=2, replace=False)
 
-        # Every domain uses this task's program, even if the external build changes during native capture.
+        # Every source job uses this task's program, even if the external build changes during native capture.
         self.binary = executable
 
     def acquire(self, identity):
@@ -156,9 +154,15 @@ class SourceAcquisition:
         ), self.limit).run()
         publication = json.loads((assets / "result.json").read_text())
         libraries = [json.loads((assets / path).read_text()) for path in publication["templates"]]
-        if SourceDomain.observed(libraries) != self.domains[identity]["structure"]:
-            raise ValueError(f"domain {identity} compiled a different native implementation")
-        LocalSources.check(libraries, self.domains[identity]["required_local_coverage"])
+        if SourceDomain.observed(libraries) != self.descriptions[identity]["structure"]:
+            raise ValueError(f"source {identity} compiled a different native implementation")
+
+        # Input opportunities use metadata; initialized native expert modules must confirm that partition.
+        expert_count = self.inputs["plan"]["expert_count"]
+        if expert_count is not None and any(layer["experts"] != expert_count
+                                            for library in libraries for layer in library["domain"]["expert_layers"]):
+            raise ValueError(f"source {identity} initialized a different expert count from its plan")
+        LocalSources.check(libraries, self.descriptions[identity]["required_local_coverage"])
 
     def run(self):
         self.output.mkdir(parents=True, exist_ok=True)

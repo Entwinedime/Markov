@@ -4,6 +4,7 @@ import json
 
 from markov_adapters.sglang.allocation import AllocationABI
 from markov_adapters.sglang.configuration import NativeConfiguration, ServingInput
+from markov_adapters.sglang.resources import CacheInputs
 from markov_workload import WorkloadContent
 from markov_workflow.adapters.sglang_probes import LifecycleProbes
 
@@ -11,8 +12,9 @@ from markov_workflow.adapters.sglang_probes import LifecycleProbes
 class RepresentativeSources:
     """Combine compatible input witnesses without claiming native branch coverage."""
 
-    def __init__(self, workloads: dict[str, dict]) -> None:
+    def __init__(self, workloads: dict[str, dict], expert_count: int | None) -> None:
         self.workloads = workloads
+        self.expert_count = expert_count
 
     @staticmethod
     def prefill_page_bounds(config, requests, resident_pages):
@@ -43,8 +45,7 @@ class RepresentativeSources:
                 repeated = max(repeated, cohort_bound)
         return bound, repeated
 
-    @staticmethod
-    def conditions(instances, workload: dict) -> set[str]:
+    def conditions(self, instances, workload: dict) -> set[str]:
         requests = workload["requests"]
         content = WorkloadContent(requests, workload["prefixes"])
         decode_cohorts = {}
@@ -63,6 +64,9 @@ class RepresentativeSources:
         for instance in instances:
             config = instance.configuration.values
             prefix = instance.mode + "/"
+            conditions.update(prefix + condition for condition in self.route_conditions(instance, workload))
+            if config["prefix_cache"]:
+                conditions.update(prefix + condition for condition in self.cache_conditions(instance.mode, config, content))
             if NativeConfiguration.batch_capacity(config) > 1 and len(requests) > 1:
                 conditions.add(prefix + "multiple_requests")
                 if len({request["output_tokens"] for request in requests}) > 1:
@@ -97,6 +101,50 @@ class RepresentativeSources:
                 conditions.add(prefix + "partial_page")
             if config["prefix_cache"] and LifecycleProbes.shared_prefix_requests(content, page_size):
                 conditions.add(prefix + "shared_prefix")
+        return conditions
+
+    @staticmethod
+    def cache_conditions(mode, configuration, content):
+        page = configuration["page_size"]
+        shared = {request["id"] for request in LifecycleProbes.shared_prefix_requests(content, page)}
+        conditions = set()
+        for request in content.requests.values():
+            prompt, output = request["prompt_tokens"], request["output_tokens"]
+            calls = [("cache.finished", prompt + (0 if mode == "prefill" else output - 1))]
+            if mode == "null" and output > 1:
+                calls.append(("cache.unfinished", prompt))
+            for operation, tokens in calls:
+                protected = {0}
+
+                # Consecutive prefix probes can retain every full page while executing the final partial page.
+                if operation == "cache.unfinished" and request["id"] in shared and tokens % page:
+                    protected.add(tokens // page * page)
+                for retained in protected:
+                    guards = CacheInputs.guards(operation, {"page_size": page, "cache_tokens": tokens, "protected_tokens": retained})
+                    conditions.add(operation + "/" + json.dumps(guards, separators=(",", ":")))
+        return conditions
+
+    def route_conditions(self, instance, workload):
+        size = instance.configuration.ep
+        if size == 1:
+            return set()
+        experts = self.expert_count
+        if type(experts) is not int or experts <= 0 or experts % size:
+            raise ValueError("expert source planning requires an even native expert partition")
+        width = experts // size
+        route = instance.configuration.routes(workload)
+        conditions = {"padding/" + json.dumps(sorted(json.dumps(entry, sort_keys=True) for entry in route.get("padding", [])))}
+        requests = {request["id"]: request for request in workload["requests"]}
+        for assignment in route["assignments"]:
+            prompt = requests[assignment["request"]]["prompt_tokens"]
+            begin, end = assignment["tokens"]
+            phases = (["prefill"] if begin < prompt else []) + (["decode"] if end > prompt else [])
+            receivers = {expert // width for expert in assignment["experts"]}
+            for phase in phases:
+                for layer in range(*assignment["layers"]):
+
+                    # Preserve phase and joint receiver opportunities without claiming actual native batch coverage.
+                    conditions.add(f"expert/{phase}/{layer}/receivers/" + ",".join(str(rank) for rank in sorted(receivers)))
         return conditions
 
     @staticmethod
@@ -161,7 +209,7 @@ class RepresentativeSources:
             workload["ep_routes"] = routes
         return workload, groups
 
-    def select(self, candidates: list[tuple[str, str, ServingInput]]) -> tuple[dict, dict, list[list[str]]]:
+    def select(self, candidates: list[tuple[str, str, ServingInput]]) -> list[tuple[dict, dict, list[list[str]], set[tuple[str, str]]]]:
         groups, instances = {}, {}
         for configuration, name, serving in candidates:
             instances[configuration] = serving.instances
@@ -169,7 +217,8 @@ class RepresentativeSources:
                 "name": name, "conditions": self.conditions(serving.instances, self.workloads[name]),
                 "cost": self.cost(serving.workload, serving.instances),
             })
-        required = set().union(*(item["conditions"] for group in groups.values() for item in group))
+        targets = {(configuration, name): self.conditions(serving.instances, self.workloads[name])
+                   for configuration, name, serving in candidates}
         choices = []
         for (configuration, padding), remaining in groups.items():
             selected, covered = [], set()
@@ -223,12 +272,28 @@ class RepresentativeSources:
                             "input_cost": cost, "input_conditions": sorted(covered),
                             "original_tokens": sum(item["cost"]["prompt_tokens"] + item["cost"]["decode_tokens"] for item in selected),
                             "submission_group_count": len(submissions),
-                            "unrepresented_conditions": sorted(required - covered),
+                            "targets": {target for target, required in targets.items() if required <= covered},
                             "workload": workload, "submission_groups": submissions})
-        choice = min(choices, key=lambda item: (
-            len(item["unrepresented_conditions"]), item["input_cost"]["prompt_tokens"] + item["input_cost"]["decode_tokens"],
-            item["input_cost"]["arrival_wait_ns"], item["input_cost"]["worker_kv_tokens"],
-            item["input_cost"]["requests"], item["configuration"], item["workloads"],
-        ))
-        workload, submissions = choice.pop("workload"), choice.pop("submission_groups")
-        return choice, workload, submissions
+        selected, remaining = [], set(targets)
+        while remaining:
+
+            # Each recipe covers whole declared target inputs; incompatible conditions need another planned source.
+            choice = min((item for item in choices if item["targets"] & remaining), key=lambda item: (
+                -len(item["targets"] & remaining), item["input_cost"]["prompt_tokens"] + item["input_cost"]["decode_tokens"],
+                item["input_cost"]["arrival_wait_ns"], item["input_cost"]["worker_kv_tokens"],
+                item["input_cost"]["requests"], item["configuration"], item["workloads"],
+            ))
+            remaining.difference_update(choice["targets"])
+            selected.append(choice)
+            choices.remove(choice)
+
+        # Remove whole redundant jobs before publishing; no source is added in response to target results.
+        for choice in reversed(selected.copy()):
+            others = [item for item in selected if item is not choice]
+            if set(targets) <= set().union(*(item["targets"] for item in others)):
+                selected.remove(choice)
+        result = []
+        for choice in selected:
+            workload, submissions, covered = choice.pop("workload"), choice.pop("submission_groups"), choice.pop("targets")
+            result.append((choice, workload, submissions, covered))
+        return result

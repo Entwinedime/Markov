@@ -44,18 +44,13 @@ class SourceProductions:
     def __init__(self, directory, plan):
         self.plan = json.loads((plan / "plan.json").read_text())
         publication = json.loads((directory / "result.json").read_text())
-        if not len(self.plan["domains"]) == len(publication["productions"]) == len(publication["captures"]):
-            raise ValueError("source publication does not match the planned domains")
+        if not len(self.plan["sources"]) == len(publication["productions"]) == len(publication["captures"]):
+            raise ValueError("source publication does not match the planned source jobs")
 
-        self.paths = {domain["id"]: directory / name
-                      for domain, name in zip(self.plan["domains"], publication["productions"])}
-        self.captures = {domain["id"]: directory / name
-                         for domain, name in zip(self.plan["domains"], publication["captures"])}
-
-    def arguments(self, primary):
-        result = ["--production", self.paths[primary]]
-        result.extend(value for identity, path in self.paths.items() if identity != primary for value in ("--local-production", path))
-        return result
+        self.paths = {job["id"]: directory / name
+                      for job, name in zip(self.plan["sources"], publication["productions"])}
+        self.captures = {job["id"]: directory / name
+                         for job, name in zip(self.plan["sources"], publication["captures"])}
 
 
 class ExplorationRun:
@@ -141,15 +136,13 @@ class ExplorationRun:
                 "--attempt-limit", args.attempt_limit, "--storage-bytes", args.storage_bytes,
                 *(["--keep-intermediates", "--resource-trace"] if args.details else []),
             )
-            collected = SourceProductions(self.output / "collection", self.output / "plan")
             for index, (configuration, workload, target) in enumerate(self.targets()):
-                primary = collected.plan["targets"]["configurations"][configuration]
                 directory = self.output / "targets" / str(index)
                 directory.mkdir()
                 task = directory / "input.json"
                 task.write_text(json.dumps(target, indent=2) + "\n")
                 self.execute(
-                    f"predict-{index}", "predict", *collected.arguments(primary), "--input", task, "--output", directory / "prediction",
+                    f"predict-{index}", "predict", "--production", self.output / "collection", "--input", task, "--output", directory / "prediction",
                     "--binary", binary, "--modeling-image", self.images["modeling"],
                     "--control-image", self.images["control"], "--timeout", args.timeout,
                     *(["--execution-trace"] if args.details else []),

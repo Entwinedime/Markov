@@ -19,36 +19,32 @@ class PlanningProcess:
         write_json(output / "input.json", source, indent=2, replace=False)
         (output / "sources").mkdir()
         lines = [
-            "# 代表来源域规划", "",
-            f"{plan['targets']['count']} 个目标组合分为 {len(plan['domains'])} 个来源域。",
+            "# 有限来源任务规划", "",
+            f"{plan['targets']['count']} 个目标组合预先规划 {len(plan['sources'])} 个来源任务。",
             f"包含预先规划的局部动作来源，共 {plan['native_jobs']} 个原生任务；本命令只规划，不启动采集。",
-            "选择互补 workload，构造较短请求，按需加入独立生命周期及顺序前缀复用；同一 Engine 逐组执行，实际命中和组批以原生记录为准。",
-            "", "| 来源域 | 代表配置 / workload | 请求数 / 提交组 | prompt / decode token | 原选中 token | 原生 worker |", "| --- | --- | ---: | ---: | ---: | ---: |",
+            "同一实现域可由互补配置或不兼容padding的有限任务供证；每次预测仍使用一份完整worker模板，不拼接未经证明的物理流。",
+            "每任务组合互补workload、缩短请求并加入必要生命周期；一个Engine逐组执行，命中和组批以原生记录为准。",
+            "", "| 来源任务 | 代表配置 / workload | 请求数 / 提交组 | prompt / decode token | 原选中 token | 原生 worker |", "| --- | --- | ---: | ---: | ---: | ---: |",
         ]
-        for domain in plan["domains"]:
-            selected = domain["source"]
+        for job in plan["sources"]:
+            selected = job["source"]
             cost = selected["input_cost"]
-            write_json(output / selected["input"], planner.capture_inputs[domain["id"]], indent=2, replace=False)
-            lines.append(f"| {domain['id']} | {selected['configuration']} / {', '.join(selected['workloads'])} | {cost['requests']} / {selected['submission_group_count']} | "
-                         f"{cost['prompt_tokens']} / {cost['decode_tokens']} | {selected['original_tokens']} | {domain['native_workers']} |")
-        for domain in plan["domains"]:
-            required = domain["required_local_coverage"]
+            write_json(output / selected["input"], planner.capture_inputs[job["id"]], indent=2, replace=False)
+            lines.append(f"| {job['id']} | {selected['configuration']} / {', '.join(selected['workloads'])} | {cost['requests']} / {selected['submission_group_count']} | "
+                         f"{cost['prompt_tokens']} / {cost['decode_tokens']} | {selected['original_tokens']} | {job['native_workers']} |")
+        for job in plan["sources"]:
+            required = job["required_local_coverage"]
             if not required:
                 continue
-            consumers = ["本域目标"] if domain["configurations"] else []
-            if "local_consumers" in domain:
-                consumers.extend(f"PD {item['domain']}/{item['mode']}" for item in domain["local_consumers"])
-            lines.append(f"\n域 {domain['id']} 为 {', '.join(consumers)} 提供局部操作来源；"
+            consumers = ["本域目标"] if job["configurations"] else []
+            if "local_consumers" in job:
+                consumers.extend(f"完整来源 {item['source']}/{item['mode']}" for item in job["local_consumers"])
+            lines.append(f"\n来源 {job['id']} 为 {', '.join(consumers)} 提供局部操作来源；"
                          f"发布前必须实际观察到 {', '.join(required)}。")
-        missing = [domain for domain in plan["domains"] if domain["source"]["unrepresented_conditions"]]
-        if missing:
-            lines.extend(["", "选定配置与兼容补齐条件下未包含的输入条件："])
-            for domain in missing:
-                lines.append(f"- 域 {domain['id']}：{', '.join(domain['source']['unrepresented_conditions'])}")
         lines.extend([
             "", "这是采集前的有限计划；实际批次、命中、分支和局部覆盖以原生观察为准。",
             "原生继续负责组批和生命周期；代表观察减少profiling与导出，不减少协议参与卡数。",
-            "sources 中的输入供采集使用，完整选择依据、目标映射和未覆盖条件保留在plan.json。",
+            "sources 中的输入供采集使用，完整选择依据和目标范围保留在plan.json。",
             "采集发现覆盖不足时保留缺口，不在运行中补采或借目标补库。", "",
         ])
         (output / "plan.md").write_text("\n".join(lines))

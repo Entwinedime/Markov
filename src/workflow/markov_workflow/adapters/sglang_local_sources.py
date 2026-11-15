@@ -1,4 +1,4 @@
-"""Declare local coverage and share ordinary-serving witnesses across PD participants."""
+"""Declare finite model and batch-operation witnesses for ordinary and PD consumers."""
 
 from markov_adapters.sglang.configuration import NativeConfiguration, ServingInput
 from markov_workflow.adapters.sglang import SourceDomain
@@ -12,11 +12,11 @@ class LocalSources:
         self.workloads = workloads
         self.configurations = configurations
 
-    def extend(self, domains, captures):
+    def extend(self, jobs, captures):
         needed = []
         multiple = [workload for workload in self.workloads.values() if len(workload["requests"]) > 1]
         outputs = max((request["output_tokens"] for workload in multiple for request in workload["requests"]), default=1)
-        for target in list(domains):
+        for target in list(jobs):
             for mode, implementation in target["structure"]["instances"].items():
                 configurations = [instance["configuration"] for name in target["configurations"]
                                   for instance in self.configurations[name]["instances"] if instance["mode"] == mode]
@@ -28,11 +28,11 @@ class LocalSources:
 
                 if mode == "null":
                     target["required_local_coverage"] = sorted(required)
-                    continue
+                    required = set()
                 if not required and outputs == 1:
                     continue
 
-                # Collect both roles before choosing a recipe; equal implementation domains need one ordinary job.
+                # Collect every consumer before choosing a recipe; equal implementation domains share one ordinary job.
                 structure = {"model": target["structure"]["model"], "instances": {"null": implementation}}
                 need = next((item for item in needed if item["structure"] == structure), None)
                 if need is None:
@@ -40,7 +40,7 @@ class LocalSources:
                     need = {"structure": structure, "instance": instance, "required": set(), "consumers": []}
                     needed.append(need)
                 need["required"].update(required)
-                need["consumers"].append({"domain": target["id"], "mode": mode})
+                need["consumers"].append({"source": target["id"], "mode": mode})
 
         if outputs > 1:
             shared = {}
@@ -50,7 +50,7 @@ class LocalSources:
                 shared.setdefault(key, []).append(need)
             for group in shared.values():
 
-                # Both PD roles need batch arrays; one existing model witness can supply them across shard layouts.
+                # Native continuous batching needs merge/subset; one model witness can supply arrays across shard layouts.
                 donor = min(group, key=lambda item: (
                     not item["required"],
                     item["structure"]["instances"]["null"]["tp"] * item["structure"]["instances"]["null"]["pp"],
@@ -63,17 +63,17 @@ class LocalSources:
                 continue
 
             # Matching topology alone cannot provide batch operations that the selected workload never planned to observe.
-            donor = next((domain for domain in domains if domain["structure"] == need["structure"]
-                          and need["required"] <= set(domain["required_local_coverage"])), None)
+            donor = next((job for job in jobs if job["structure"] == need["structure"]
+                          and need["required"] <= set(job["required_local_coverage"])), None)
             if donor is None:
-                capture, selected = self.probe(need["instance"], need["required"], len(domains))
+                capture, selected = self.probe(need["instance"], need["required"], len(jobs))
                 serving = ServingInput(capture)
-                donor = {"id": len(domains), "structure": SourceDomain.requested(serving), "configurations": [],
+                donor = {"id": len(jobs), "structure": SourceDomain.requested(serving), "configurations": [],
                          "native_workers": serving.instances[0].configuration.tp * serving.instances[0].configuration.pp,
                          "source": selected, "required_local_coverage": []}
-                domains.append(donor)
+                jobs.append(donor)
                 captures[donor["id"]] = capture
-            donor["local_consumers"] = need["consumers"]
+            donor.setdefault("local_consumers", []).extend(need["consumers"])
             donor["required_local_coverage"] = sorted(set(donor["required_local_coverage"]) | need["required"])
 
     def probe(self, instance, required, identity):
@@ -134,7 +134,7 @@ class LocalSources:
         selected = {"configuration": f"local-source-{identity}", "workloads": [name], "input": f"sources/{identity}.json",
                     "input_cost": cost, "input_conditions": sorted(required),
                     "original_tokens": sum(item["prompt_tokens"] + item["output_tokens"] - 1 for item in original["requests"]),
-                    "submission_group_count": len(groups), "unrepresented_conditions": []}
+                    "submission_group_count": len(groups)}
         return {"model": self.model, "instances": instances, "workload": workload,
                 "observe_all_workers": False, "submission_groups": groups}, selected
 

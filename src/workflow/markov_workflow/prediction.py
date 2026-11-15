@@ -9,6 +9,7 @@ from contextlib import ExitStack
 from uuid import uuid4
 
 from markov_workflow.adapters.sglang import SGLangTask, SourceDomain
+from markov_workflow.adapters.sglang_planning import SourcePlanning
 from markov_workflow.containers import OwnedContainers
 
 
@@ -18,10 +19,22 @@ class PredictionProcess:
 
     def run(self) -> None:
         args = self.arguments
+        source = json.loads(args.input.read_text())
+        collection = args.production.resolve(strict=True)
+        plan = json.loads((collection / "input.json").read_text())["plan"]
+        publication = json.loads((collection / "result.json").read_text())
+        jobs = plan["sources"]
+        if len(publication["productions"]) != len(jobs):
+            raise ValueError("source collection omits a planned production")
+        primary = SourcePlanning.primary(plan, source)
+        local_sources = [job["id"] for job in jobs
+                         if any(consumer["source"] == primary for consumer in job.get("local_consumers", []))]
+        selected = [primary, *local_sources]
+        paths = {job["id"]: collection / path for job, path in zip(jobs, publication["productions"], strict=True)}
         templates = []
         productions = []
-        for directory in [args.production, *args.local_production]:
-            directory = directory.resolve(strict=True)
+        for identity in selected:
+            directory = paths[identity].resolve(strict=True)
             publication = json.loads((directory / "result.json").read_text())
             libraries = []
             for name in publication["templates"]:
@@ -31,7 +44,6 @@ class PredictionProcess:
                 templates.append(path)
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
-        source = json.loads(args.input.read_text())
         document = SGLangTask(productions[0], productions[1:]).document(source)
         if args.execution_inputs is not None:
             document["execution_inputs"] = json.loads(args.execution_inputs.read_text())
@@ -119,5 +131,3 @@ class PredictionProcess:
                     if process.poll() is None:
                         process.kill()
                     process.wait()
-
-
