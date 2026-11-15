@@ -195,7 +195,7 @@ class PdStateEvidence:
         windows = {key: self.state_windows(key, records) for key, records in self.states.items()}
         updates = {key: values[4] for key, values in windows.items() if 4 in values}
 
-        publications, published = [], set()
+        publications, published, unobserved_peers = [], set(), []
         required_publications = {
             (self.sessions[session], request, sender)
             for (sender, request), service in self.services.items() for session in service["metadata"]
@@ -203,8 +203,12 @@ class PdStateEvidence:
         for (publisher, request, peer), publication in self.publications.items():
             recipient = self.addresses[tuple(publication["target"])]
             edge = publisher, request, recipient
-            if edge not in required_publications or edge in published:
+            if edge in published or (edge not in required_publications and recipient in self.peer_counts):
                 raise ValueError(f"PD reservation does not match one actual native transfer peer: {edge}")
+
+            # Registered peers can lack a selected source profile; their transfers remain unverified, not mismatched.
+            if recipient not in self.peer_counts:
+                unobserved_peers.append({"publisher": publisher, "request": request, "recipient": recipient})
             published.add(edge)
             ready = windows.get((recipient, request), {}).get(2)
 
@@ -259,6 +263,7 @@ class PdStateEvidence:
         return {
             "status": "observed_bounds_consistent" if endpoints else "not_applicable", "endpoints": endpoints,
             "reservations": publications,
+            "unobserved_transfer_peers": unobserved_peers,
             "missing_publications": [{"publisher": publisher, "request": request, "recipient": recipient}
                                      for publisher, request, recipient in sorted(required_publications - published)],
             "completion_updates_checked": sum(row["completion_update"] is not None for row in endpoints),

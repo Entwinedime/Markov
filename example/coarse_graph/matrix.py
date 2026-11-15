@@ -213,7 +213,9 @@ class MatrixRun:
         if not path.exists():
             return result | {"status": "source-evaluation-error"}
         report = json.loads(path.read_text())
-        return result | {"status": "mapped" if self.mapped(report) else "target-evidence-unqualified",
+
+        # Representative sources may omit peers; a complete target requires the public check's full qualification.
+        return result | {"status": "mapped" if result["evidence_exit"] == 0 else "target-evidence-unqualified",
                          "native_group_status": report["native_case"]["status"], "source_evidence": str(path)}
 
     def compare(self, domain, case, source, target):

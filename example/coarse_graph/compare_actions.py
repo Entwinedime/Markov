@@ -446,7 +446,10 @@ class ActionComparison:
                 query_counts["matched"] += 1
         query_counts["unpaired_predicted"] = len(queries.results.keys() - set(pairs.values()))
 
-        for missing in ("missing_publications", "missing_reservation_updates", "missing_completion_updates", "missing_success_reads"):
+        for missing in (
+            "missing_publications", "missing_reservation_updates", "missing_completion_updates", "missing_success_reads",
+            "unobserved_transfer_peers",
+        ):
             if protocol_readiness[missing]:
                 self.finding("native_evidence", {}, {missing: protocol_readiness[missing]})
         repeated = [key for key in expected if len(occurrences[key]) > 1 or predicted_counts[key] > 1]
@@ -529,6 +532,7 @@ class ActionComparison:
                 (queries_incomplete, "unpaired query outcomes"), (input_incomplete, "unpaired external input reads"),
                 (bool(unverified_cross_rank), "cross-rank causality outside verified communication and notification protocols"),
                 (any(unpaired_calls.values()), "per-occurrence correspondence of calls without an independently checked witness"),
+                (bool(condition_inputs.counts["bound_invocations"]), "autonomous prediction of explicitly supplied native invocation bindings"),
             ) if missing] + ["exact PD notification arrival times", "unnamed internal event topology",
                             "private intra-call resource mutations and tensor hazards; native in-flight resource reuse outside observed cases",
                             "PD unused padding and unsupported multimodal/logprob/speculative values; controller output values outside recorded progress and publication fields"],

@@ -219,6 +219,23 @@ class ActionScopes:
             if len(origins) != 1:
                 raise ValueError("ordinary coarse scope combines distinct native declarations")
             observed = raw["scopes"][origins[0]]
+            if "required_peers" in observed["bindings"]:
+                group, counts = observed["communication"], observed["expert_exchange"]
+                sent, received = counts["send"], counts["receive"]
+                if (len(sent) != len(group["members"]) or len(received) != len(sent)
+                        or any(type(value) is not int or value < 0 for value in sent + received)):
+                    raise ValueError("native expert exchange has invalid peer-wise row counts")
+
+                required = [rank for rank, send, receive in zip(group["members"], sent, received, strict=True)
+                            if rank == group["rank"] or send or receive]
+                tensors = {port["direction"]: port["tensor"] for port in observed["ports"] if port["name"] == "hidden_states"}
+                parent = raw["scopes"][observed["parent"]]
+                topk, = [port["tensor"]["shape"][1] for port in parent["ports"] if port["name"] == "topk_ids"]
+
+                if (group["operation"] != "combine" or group["required"] != required
+                        or sum(sent) != tensors["input"]["shape"][0] or sum(received) != tensors["output"]["shape"][0] * topk):
+                    raise ValueError("native expert exchange prerequisites disagree with its observed traffic")
+
             bindings = dict(observed["bindings"])
             bindings.update({name: observed[name] for name in ("effects", "publication") if name in observed})
             bindings["source_scopes"] = origins

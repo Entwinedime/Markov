@@ -108,7 +108,9 @@ class PdPayloadEvidence:
                     raise ValueError("one native PD chunk maps a logical page to competing physical pages")
 
     def raw_kv(self, transfer, member, source, target, footprints):
+        misrouted = Counter()
         for first, last, length in transfer["blocks"]:
+            endpoints = []
             for session, mode, address, pages in ((source, "read", first, transfer["source_pages"]),
                                                    (target, "write", last, transfer["target_pages"])):
                 buffers = self.buffers[session]
@@ -123,6 +125,7 @@ class PdPayloadEvidence:
                 width = layout.key_token_bytes if buffer < layers else layout.value_token_bytes
                 component = 0 if buffer < layers else layout.key_token_bytes
                 layer = layout.start_layer + buffer % layers
+                endpoints.append((layer, "key" if buffer < layers else "value"))
                 offset, covered = address - buffers.starts[buffer], 0
                 output = footprints[session, mode, layer, member["id"]]
                 for index, page in enumerate(pages):
@@ -145,7 +148,12 @@ class PdPayloadEvidence:
                         output.append((tail, tail + 1, component, component + (end - 1) % width + 1))
                 if covered != length:
                     raise ValueError("native PD bytes escape the chunk's actual physical pages")
+
+            # TP changes head slices, while a model layer's K/V identity must survive the copy.
+            if endpoints[0] != endpoints[1]:
+                misrouted[tuple(endpoints)] += 1
             self.counts["recorded_kv_bytes"] += length
+        return misrouted
 
     def metadata(self, transfer, parent, source, target):
         member, = parent["work"]["members"]
@@ -216,7 +224,14 @@ class PdPayloadEvidence:
                     if transfer["source_pages"] != parent["native_kv_chunk"]["source_pages"]:
                         raise ValueError("native KV bytes differ from their enqueued source pages")
                     self.page_map(transfer, member, source, target, maps)
-                    self.raw_kv(transfer, member, source, target, native)
+                    misrouted = self.raw_kv(transfer, member, source, target, native)
+                    if misrouted:
+                        self.findings.append(("native_pd_payload", {"group": group, "scope": index}, {
+                            "reason": "native KV copy changes the model layer or K/V component",
+                            "request": member["id"], "misrouted_blocks": sum(misrouted.values()),
+                            "routes": [{"source": first, "target": last, "blocks": count}
+                                       for (first, last), count in sorted(misrouted.items())],
+                        }))
                     self.counts["kv_transfers"] += 1
                 else:
                     raise ValueError("native PD transfer has an unknown payload kind")

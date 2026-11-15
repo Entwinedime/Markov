@@ -32,12 +32,16 @@ public:
 
     markov::CoarseGraph build(const markov::EntrySpecification & action, const markov::Parameters & parameters,
                              const nlohmann::json & work) const {
-        auto entry = selection_.select(action.action, action.condition, parameters);
+        const auto states = worker_.state_inputs(work.value("bindings", nlohmann::json::object()), work);
+        auto entry = selection_.select(action.action, action.condition, parameters, states);
         worker_.bind(entry.frame, "local", work);
         markov::GraphInvocation call{ action.action, action.condition, parameters, library_.resources, work,
                                       "local/" + std::to_string(action.scope), environment_, library_.domain, {} };
         for (auto & resource : call.resources) resource.rank = environment_.at("parallel").at("rank").get<std::int64_t>();
         for (const auto & [name, _] : entry.frame.constants) call.parameters.erase(name);
+        if (!states.empty()) {
+            for (const auto & [name, state] : entry.frame.state_inputs()) call.state_inputs.emplace(name, states.at(name));
+        }
         for (const auto & port : library_.definitions[entry.frame.definition].ports) {
             if (port.use == markov::PortUse::Signal) call.signals.emplace(port.name, call.identity + "/signal/" + port.name);
         }
@@ -52,9 +56,9 @@ private:
         for (const auto & tensor : frame.tensors) {
             if (tensor && tensor->external) call.storage.try_emplace(tensor->storage, markov::StorageBinding{ tensor->storage, 0 });
         }
-        const auto & body = library_.definitions[frame.definition];
-        for (const auto & access : body.kv_accesses) call.pools.try_emplace(access.pool, access.pool);
-        for (const auto & access : body.slot_accesses) call.pools.try_emplace(access.pool, access.pool);
+        const auto & state = frame.state_input ? call.state_inputs.at(*frame.state_input) : frame.state;
+        for (const auto & value : state.kv) call.pools.try_emplace(value.pool, value.pool);
+        for (const auto & pool : state.slots) call.pools.try_emplace(pool, pool);
         for (const auto & child : frame.children) bind(child, call);
     }
 

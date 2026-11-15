@@ -178,6 +178,8 @@ Ascend PD 部署必须为两侧设置同一个 `ASCEND_MF_STORE_URL=tcp://<可�
 
 输出目录必须不存在，失败目录不自动恢复或覆盖。instances/<序号>/ 保存该 Engine 的 session、role-plan、request-delivery 和窗口关闭标记；rank-<全局rank>.json、native/rank-<全局rank>/、runtime/ 保存角色事实、原始 profiler 及原生 API/阶段记录。PD 的 kv-pools/<全局rank>.json 在统一预热排空及采集排空时发布每个真实端点的注册和布局，小型注册事实不要求该角色导出完整 trace。模型/本地池角色事实在初始化时交换，最终代表在全部实例预热排空后、profiler 启动前确定；该请求内不执行 world collective，以免阻塞 PP 请求转发。capture.json 只在所有实例正常收尾后发布，记录各实例角色及初始化/预热/采集时间；中途产生文件不等于任务完成。
 
+role-plan的representatives决定结构复用，observed_roles决定本次实际观察，二者分别维护。EP输入的Prefill/Decode接收机会和padding来自已验证的workload路由及原生专家划分；若某结构类的原代表缺少其他成员的输入机会，预先有限增选观察者，不改变代表映射或用户路由。生产按实际观察清单编译和连接，额外观察可提供合同相容的局部实现；原生协议仍全员参与。机会覆盖不证明实际批次已触发全部分支，最终资格仍需观察、guard和完整对照。
+
 ## 离线图与模板生产入口
 
 capture.json 发布后，外围入口按实际 observed_roles 顺序执行 SDK 导出、解释和粗图构造。`--product templates`（默认）继续编译并连接来源模板；`--product graphs`只发布实测粗图，供独立目标对照使用。目标真值不依赖模板编译成功，不借模板选择或变换规则判断实测结构。未观察的等价 worker 不重复生产，也不从目录扫描猜测角色。
@@ -334,9 +336,11 @@ markov_local_graphs expand <source-libraries.json> <action-inputs.json> <local-g
 
 ## Serving 的受控执行输入
 
-公开 `markov_workflow predict` 可附加 `--execution-inputs <execution-inputs.json>`。文件由 `actors`、`ingress`、`notifications`、`transfers` 组成；同一份输入只规定时间和可见性条件，不提供组批、查询返回值、资源分配或图体。未提供时使用任务显式给定的工作耗时；提供后，流程内缺记录、操作/工作不符或结束时未消费完均失败，不退回给定耗时。
+公开 `markov_workflow predict` 可附加 `--execution-inputs <execution-inputs.json>`。文件由 `actors`、`ingress`、`notifications`、`transfers` 组成，提供时间、可见性及显式原生调用绑定，不提供组批、查询返回值、资源分配或图体。未提供时使用任务显式给定的工作耗时及原生适配器当前收到的调用绑定；提供后，流程内缺记录、操作/工作不符或结束时未消费完均失败，不退回给定耗时。
 
 `actors` 按参与者保存有序 `steps`。每步包含 `operation`、`identity`、`source`：action核对动作、参数和完整工作；cpu核对原生操作和工作；input核对实例、读取上下文及既有交付。工作去除物理slot，保留token范围、调用祖先、继续位置和实际放置。source只供追溯：观察图scope、原始post及post/wait阶段、原始输入读取引用；不参与决策。核心游标保存已核对前缀，明细输出condition_used；首处分歧或未消费完仍失败。
+
+action另含bindings对象，无额外绑定时为空。PD的transport_order来自已独立核对的原生同步服务CPU进入顺序和实际注册目的池；它明确隔离后台预约到达的非确定性。核心在构图前核对同一工作身份并交接此输入，构图后仍逐项核对真实端点、载荷和必要串行因果；字节几何只由来源库提供。独立评价从原始证据重建绑定并核对实际展开，不读输入文件自证。该结果证明给定原生绑定下的结构，不证明自主预测网络到达顺序。规则调整后重新提取派生执行输入及从保留粗图重编模板，不兼容读取旧模板字段。
 
 图操作的 `boundaries` 以 `at` 和 `window: {begin_ns, end_ns}` 表示完成条件。具名端口的at为 `{port, direction}`，必须包含实际call.enter和call.return；资源收尾先用 `{resource: {port, direction}}` 定位已有具名端口的资源，再用 `{resource: {kind, role}}` 补齐未被业务端口命名的唯一职责资源。已命名资源不再参与职责候选，生成的resource.enter/exit只承接接口，不充当业务命名。条件绑定本次图已声明的资源出口，不传入原生线程/stream编号或节点序号；剩余职责存在歧义时缺少测量对应资格，不能任选。独立提取保留各串行资源在该动作中的实际收尾，CPU返回不替代后台提交尾部。别名窗口取交集，不能消除图依赖。`service_ns` 是该调用各工作共同采用的显式给定服务，null表示都未知；原生提取保持null，不把含等待的API墙钟当成本。共享执行时间类型仍支持逐节点已知/未知服务。
 
@@ -359,6 +363,8 @@ rank 事实统一保存 `state_queries`，每项包含 `kind`（event / transpor
 Event 查询在每次运行内核对返回值、完成状态及所读对象：原生 state_queries.point 对应已导出的事件代次，目标 completion_read.signal 对应实际生产者。当前请求进度不能唯一标识一次可重复就绪读取，因此查询不因仅观察一次便取得跨运行调用对应；其共同内容、运行内读值与因果仍检查，逐次对应保持未覆盖。等待另要求完成依赖，非阻塞查询不要求该边；不能因为两个不同信号都已完成就认为读取一致。
 
 协议观察的 session 使用 `protocol_requests` 保存实际提交的预约编号到 workload 请求的映射，预热编号不进入该映射。rank 记录的 `protocol_states` 保存原生状态更新前后值及 RAW 时间区间；状态由原生维护，观察无需等待 profiler 激活或元数据行分配。独立检查按原生非失败状态的单调性核对就绪和成功区间，同一次变化的重叠观察取交集；缺少就绪写入保持缺失，不由首次查询推算。旧的仅成功状态记录不自动作为当前合同输入。预约发送另保留原生目标 endpoint、拓扑对端位置及 RAW 调用区间，kv_reservation 是独立 CPU 动作，reservation.ready 导出调用入口而非发送返回；该信号仅表示因果下界。kv_ready 通知合并实际发布者的信号，对应 Prefill 的完整预约可见；Decode 自身初始化的 WaitingForInput 不生成同名远端通知。独立工具用实际传输 session 反向核对预约参与者、发送与状态写入顺序，再核对目标执行边；缺少发送记录单列为 missing_publications。
+
+初始化注册覆盖全部真实参与者，代表来源的设备图只覆盖选定rank，两者分别维护。预约指向已注册但未观察的peer时，以unobserved_transfer_peers保留无法核对的传输，不伪造发送或判成已观察peer不匹配；重复预约、未知endpoint及已观察peer的错误匹配仍拒绝。该缺口阻止全组完整资格，完整真实目标及对照必须没有此项；代表来源只能取得已观察范围的资格。
 
 CPU点对点通信共用发送、接收、异步post及Work.wait切口，保存原生拓扑角色、方向、tag、dtype、shape、元素数及元素字节数。wrapper暂停父CPU片段，协议由共同运行服务表达；不生成语义通信模板，阻塞API内部委托不重复计费。核心维护post、wire就绪和消费完成，broker只维护数值与原生通道位置，接收值在核心放行后复制。初始化明确属于计时窗外，排空后才可取消私有尾部等待；预贴Work可跨观察边界，使用实际等待上下文。所有参与者发布必要协议事实，独立于代表设备采集及可选资源明细；原始post/consume保留operation、scope、线程、计数器区间和执行上下文。独立检查验证运行服务、真实两端post及wire/消费因果，服务事件进入全图依赖，不制造模型调用配对。
 

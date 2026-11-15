@@ -340,7 +340,7 @@ class ProductionEvidence:
                 f"已观察物理请求绑定 {case_report['physical_bindings']['observed_request_bindings']} 项。",
                 "", f"PD 载荷范围：核对 {payload.get('scopes_checked', 0)} 个传输组、"
                 f"{payload.get('kv_accesses_checked', 0)} 项 KV 访问和 {payload.get('metadata_accesses_checked', 0)} 项元数据访问；"
-                "依据注册缓冲区、真实复制字节及请求页表，不证明数值内容或重复复制次数。",
+                "依据注册缓冲区、真实复制字节及请求页表，同时检查复制前后的模型层和K/V成分；不证明数值内容或重复复制次数。",
             ])
             for finding in case_report["findings"]:
                 lines.extend(["", f"{finding['category']}：{finding.get('reason', finding['kind'])}"])

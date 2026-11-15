@@ -640,7 +640,9 @@ class NativeEffectEvidence:
         self.require(begin < end and self.payload_ranges.enclosing(Interval(begin, end, host, {})) is not None,
                      "synchronous transfer is absent from its caller payload")
         raw = self.native["scopes"][source_scope]
-        while "device_entry" not in raw and raw["parent"] is not None:
+
+        # Only a semantic device owner publishes copy readiness; caller envelopes contain observer markers.
+        while ("device_entry" not in raw or raw.get("envelope", False)) and raw["parent"] is not None:
             raw = self.native["scopes"][raw["parent"]]
         if "device_entry" not in raw:
             return host

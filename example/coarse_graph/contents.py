@@ -91,6 +91,30 @@ class GraphContents(ActionScopes):
     def pool(self, name, group):
         return group if name == "local" else self.pools.get(name, name)
 
+    def invocation_bindings(self, root, group):
+        order = []
+        children = [child for child in self.children[root] if self.graph["scopes"][child]["role"] == "kv_transfer"]
+        if "evidence" in self.graph:
+            entries = {child: next(port["event"] for port in self.graph["scopes"][child]["ports"] if port["name"] == "call.enter")
+                       for child in children}
+
+            # Native service entries are measured CPU calls; graph scope numbering is not an ordering witness.
+            children.sort(key=lambda child: self.graph["evidence"]["events"][entries[child]]["time_ns"])
+        for child in children:
+            scope = self.graph["scopes"][child]
+            peers = {self.pool(access["pool"], group)
+                     for field in ("kv_accesses", "slot_accesses") for access in scope[field] if access["access"] == "write"}
+            if not peers:
+                continue
+            peer, = peers
+
+            # Original synchronous service order supplies a native choice, never a predicted graph or an ordinal peer ID.
+            if not order or order[-1] != peer:
+                if peer in order:
+                    raise ValueError("native transport returns to an already completed destination")
+                order.append(peer)
+        return {"transport_order": order} if order else {}
+
     def resource(self, index):
         resource = self.graph["resources"][index]
         return {name: resource[name] for name in ("kind", "role", "rank", "serial")}

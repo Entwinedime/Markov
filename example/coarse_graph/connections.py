@@ -133,6 +133,9 @@ class Connections:
                     "metadata": scope["role"] == "metadata_collective", "values": metadata.get(index),
                     "elements": scope["parameters"].get("elements"), "group_role": scope["bindings"].get("collective_group"),
                 }
+                if "required_peers" in scope["bindings"]:
+                    origin, = scope["bindings"]["source_scopes"]
+                    endpoint["peer_rows"] = raw["scopes"][origin]["expert_exchange"]
                 self.channels[instance, communication["channel"]][rank].append(endpoint)
                 endpoints.append(endpoint)
 
@@ -469,7 +472,7 @@ class Connections:
     def native_communication(self, dependencies):
         self.native_rounds = list(self.exchanges(self.channels, dependencies, "native_evidence"))
         complete = True
-        exchanges = 0
+        exchanges, row_pairs = 0, 0
         for endpoints in self.native_rounds:
             if endpoints is None:
                 complete = False
@@ -478,10 +481,24 @@ class Connections:
             self.check_metadata(endpoints, "native")
             peers = {endpoint["rank"]: endpoint for endpoint in endpoints}
             for endpoint in endpoints:
+
+                # Actual send/receive splits must agree across peers, independently of target route derivation.
+                if traffic := endpoint.get("peer_rows"):
+                    for index, peer in enumerate(endpoints):
+                        incoming = peer.get("peer_rows")
+                        if incoming is None:
+                            complete = False
+                            self.finding("native_evidence", endpoint["work"], reason="peer exchange has no observed row counts", peer=peer["rank"])
+                        elif traffic["send"][index] != incoming["receive"][peer["members"].index(endpoint["rank"])]:
+                            complete = False
+                            self.finding("communication_payload", endpoint["work"], reason="native send and receive row counts disagree", peer=peer["rank"])
+                        else:
+                            row_pairs += 1
+
                 for rank in endpoint["required"]:
                     self.native_communication_edges.add(((rank, peers[rank]["ready"]), (endpoint["rank"], endpoint["complete"])))
         self.counts.update(communication_channels=len(self.channels), communication_exchanges=exchanges,
-                           native_communication_protocol_complete=complete)
+                           native_communication_protocol_complete=complete, native_peer_row_pairs=row_pairs)
 
     def compare_communication(self, pairs):
         expected, unresolved, unpaired = set(), False, 0

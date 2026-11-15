@@ -153,6 +153,7 @@ class NativeCase:
         counts = Counter(category for category, _, _ in findings)
         missing_pd = {name: len(self.readiness[name]) for name in (
             "missing_publications", "missing_reservation_updates", "missing_completion_updates", "missing_success_reads",
+            "unobserved_transfer_peers",
         )}
         metadata_unknown = self.connections.counts.get("native_metadata_unobserved", 0)
         batch_unknown = any(self.connections.batch_sync.counts.get("native_" + name, 0)
@@ -169,7 +170,7 @@ class NativeCase:
             "status": "differences" if counts.keys() - self.evidence_categories else "consistent" if complete else "incomplete",
             "workers": len(self.sources), "actions": self.observed_actions, "counts": dict(counts), "findings": selected,
             "model_communication": {name: self.connections.counts[name] for name in (
-                "communication_channels", "communication_exchanges", "native_communication_protocol_complete",
+                "communication_channels", "communication_exchanges", "native_communication_protocol_complete", "native_peer_row_pairs",
             )},
             "model_links": len(self.connections.native_communication_edges), "pd_links": len(self.pd_links),
             "cpu_protocol": self.cpu.report(), "metadata_unobserved": metadata_unknown,
@@ -180,5 +181,5 @@ class NativeCase:
             "logical_wait_boundaries": sum(map(len, self.logical.values())),
             "pd_payload": self.payload_counts,
             "resource_reads": sum(value["count"] for value in self.effects.reads["native"].values()),
-            "scope": "Original worker declarations, empty logical resource pools, getter checkpoints, pool bindings, PD byte footprints/metadata, enqueue slot ownership and retained page/row intervals, model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
+            "scope": "Original worker declarations, empty logical resource pools, getter checkpoints, pool bindings, PD byte footprints/metadata and layer/K-V correspondence, enqueue slot ownership and retained page/row intervals, model rounds, CPU messages and PD prerequisites. No prediction, occurrence pairing, numerical payload verification or exact notification time.",
         }

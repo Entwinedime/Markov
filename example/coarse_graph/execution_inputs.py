@@ -59,9 +59,11 @@ class NativeInputs:
             begin = evidence["events"][entered]["time_ns"]
             if begin is None or "work" not in identity:
                 raise ValueError("native action lacks its measured entry or complete logical identity")
+            bindings = source.invocation_bindings(index, group)
+            self.counts["bound_invocations"] += bool(bindings)
             self.steps[group].append((begin, {"operation": "action", "identity": {
                 name: identity[name] for name in ("action", "parameters", "work")
-            }, "source": {"scope": index}, "service_ns": None, "boundaries": boundaries}, None))
+            }, "source": {"scope": index}, "bindings": bindings, "service_ns": None, "boundaries": boundaries}, None))
 
     def input_reads(self, instance, rank, raw, aliases, requests, origin):
         if not raw["request_ingress"]:
@@ -144,7 +146,7 @@ class NativeInputs:
                     self.origins[group] = origin
                     raw = self.read(self.capture / f"rank-{rank}.json")
                     graph = self.read(self.graphs / f"{rank}-graph.json")
-                    source = evidence.observe(rank, graph, raw)
+                    evidence.observe(rank, graph, raw)
                     self.input_reads(instance, rank, raw, aliases, requests, origin)
                     self.cpu(instance, rank, origin)
                 if instance["id"] not in self.ingress:
@@ -202,6 +204,7 @@ class ConsumedInputs:
         self.ranks = {group: rank for rank, group in case.groups.items()}
         self.origin_ns = ingress.origin_ns
         self.ports, self.cpu_times = {}, {}
+        self.bindings = {}
         self.boundaries = defaultdict(set)
         self.realization = None
         self.expected = None
@@ -222,6 +225,8 @@ class ConsumedInputs:
             for index, identity in identities.items():
                 self.ports[group, index] = [boundary for boundary in source.completion_boundaries(index)
                                             if boundary["event"] not in self.logical[rank]]
+                if bindings := source.invocation_bindings(index, group):
+                    self.bindings[group, index] = bindings
                 origins = source.graph["scopes"][index]["bindings"]["source_scopes"]
                 begin = min(raw["scopes"][origin]["host_interval"]["begin_raw_ns"] if "service" in raw["scopes"][origin] else host[origin]
                             for origin in origins)
@@ -315,6 +320,10 @@ class ConsumedInputs:
             raise ValueError("instantiated graph differs from its consumed execution condition")
         ports = {(port["name"], port["direction"]): row["event_ids"][port["event"]] for port in root["ports"]}
         if operation == "action":
+            bindings = self.bindings.get((group, record["source"]["scope"]), {})
+            if root["work"]["bindings"] != bindings or contents.invocation_bindings(0, group) != bindings:
+                raise ValueError("instantiated graph changes its native invocation binding")
+            self.counts["bound_invocations"] += bool(bindings)
             for boundary in self.ports[group, record["source"]["scope"]]:
                 event = row["event_ids"][contents.boundary_event(0, boundary["at"])]
                 self.boundaries[event].add((self.ranks[group], boundary["event"]))
