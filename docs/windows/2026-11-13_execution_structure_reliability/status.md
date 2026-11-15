@@ -2,7 +2,7 @@
 
 更新：2026-11-15。
 
-goal运行中。A0–A2已分层提交推送，A3审查完成、待分层交付；尚未开始A4或独立验证。当前分支refactor/modeling-redesign，阶段起点8d02571。运行根data/20261114T161057Z_execution-structure-development；下面的results、inputs、sources及work均相对此根。
+goal运行中；A0–A3已提交推送，A4功能、责任审定及代码/文档/数据检查完成，本次分层交付记录为results/a4-stage-delivery.json。A5尚未启动，独立验证和性能层未开始。分支refactor/modeling-redesign，A4起点c9da95c；运行根data/20261114T161057Z_execution-structure-development，以下数据路径均相对此根。
 
 ## 阶段与资格
 
@@ -10,47 +10,60 @@ goal运行中。A0–A2已分层提交推送，A3审查完成、待分层交付�
 | --- | --- |
 | A0 基线、遗留归因和额度 | 完成，acc8c68 |
 | A1 完整闭环及基础合同 | F01–F18审定开发范围完成，b1c8f52 |
-| A2 状态与结构变换 | 普通Serving范围完成，8d02571；9完整目标32276动作，PD动态责任在A4 |
-| A3 多实现族和自动来源 | F29–F36审定范围完成；15完整目标10094动作，分层提交推送待确认 |
-| A4 多rank、PP/EP/PD及连接反馈 | 待执行，承接PD延迟归还/排序及在途再用 |
-| A5 调度、缓存及持续运行 | 待执行 |
+| A2 状态与结构变换 | 普通Serving完成，8d02571；9完整目标32276动作，PD责任由A4承接 |
+| A3 多实现族和自动来源 | F29–F36审定范围完成，c9da95c；15完整目标10094动作 |
+| A4 多rank、PP/EP/PD及连接反馈 | F26/F27的PD部分、F37–F46审定开发范围完成；13完整目标278093动作 |
+| A5 调度、缓存及持续运行 | 待执行，先按A4交付核对现状及既有事实，再固定有限作业 |
 | A6 工程收口、整合回归及冻结 | 待前述责任闭合 |
-| B1–B4 独立验证 | 固定库16、新域12、模型留出8、组合12，共48个完整目标；未启动 |
+| B1–B4 独立验证 | 固定库16、新域12、模型留出8、组合12，共48个完整目标，未启动 |
 | B5 处置、有限复核和交付 | 未开始；性能层不属本goal |
 
-[场景表](verification_matrix.md)维护56项行为/合同责任，责任数不是采集数。Meta-Llama-3.1-8B-Instruct、GLM-4-9B-Chat仍是留出候选，须在冻结前核实原生支持和历史介入。
+[场景表](verification_matrix.md)维护56项行为/合同责任，责任数不是采集数。Meta-Llama-3.1-8B-Instruct、GLM-4-9B-Chat仍为留出候选，冻结前须核实原生支持及历史介入。
 
-## A3当前实现与证据
+## A4完成部分的逻辑
 
-来源规划预先选择有限互补作业，完整预测从正式集合选一份主来源，按声明导入局部实现；不跨采集拼物理流，不由目标失败自动补采。容量互补、路由及padding分组采用共同机会选择；专家数规划时取得并由真实模块核对，纯预测不访问模型目录。缓存输入机会复用ABI guard；默认示例实际两个作业，额度说明同步。
+1. **选来源和角色：** 结构等价代表与输入机会分开。EP8观察0/1/7而非全部rank；PD4→2来源只观察PF0/1/2，目标全4个PF均能展开。协议仍有全部实际worker参与，局部实现保留目标rank及资源绑定。
+2. **构造和绑定模板：** 共享定义保存工作、规则及端口，调用帧保存池/层/切片。声明的状态输入保留池别名、相对层、相对字节位置和宽度；adapter取得来源端点几何，按本次预约顺序重绑定，不为每种顺序补库。
+3. **动态连接与反馈：** EP Dispatch保留全组metadata，Combine按真实双向split及输入推导必要peer。PP保留真实复制并移除观察envelope制造的伪栅栏；PD区分CPU中间循环、设备尾部、载荷可见和原生Success后的源释放。
+4. **独立核对：** 真实目标检查全rank内容、内部/跨图依赖及控制/资源历史。代表来源可保留未观察范围，完整目标必须正式检查退出0；实际复制还核对全局层和K/V身份，不能以地址真实代替载荷语义正确。
 
-缓存启用时，采集/原生控制/解释显式交接页大小、缓存长度及进入时保护长度，避免空/正拷贝歧义。原始事实不改写，30次调用用原生insert/free独立核对。普通Serving与PD共用已有有限merge/subset来源；一次四请求MoE辅助运行后，旧单/多请求目标172/568动作对应，主来源不变、C++不加特例。
+## A4完整开发目标
 
-- results/a3-sources/final-opportunity-checks.json：四组规划、10项选择、共享前缀guard及无模型目录的纯选择；规划不是原生覆盖。
-- sources/a3-models：八个旧模型/页域按相同原生输入正式重建，14代表库各38–49定义；所有本地层均有实际scope，Qwen8/32分别36/64层，Mistral32层，Mixtral32层/8experts/top2。
-- results/a3-models/comparisons.json及results/a3-api-regression/comparisons.json：八模型/页目标共8046动作对应。原矩阵五例直接通过，三例因example漏传环境的工具错误定向复核通过；原结论保留。
-- results/a3-cache-regression/comparisons.json：FP16短/非均匀及旧prefix/压力四例1204动作对应；来源三份均发布，无重复采集。
-- results/a3-moe-local-regression/comparisons.json：两例740动作对应，包含曾缺merge的多请求到达案例。
-- inputs/a3-mixtral-short：沿用旧EP1库，一次新真实短目标完整104动作对应；results/a3-mixtral-short/comparisons.json保留终态。
+本表使用各自报告记录的程序，不代表所有目标均在最终二进制下重跑。收尾针对受影响PP4/PD和EP8以ff9bf38247a5复核；最终83ab6b12998d仅将两处父节点读取改为受检读取，原图编译产物逐字节相等及畸形输入拒绝另有证据。
 
-以上为开发回归，原始旧独立调查不改判。来源检查只有代表rank时，全组通信部分状态不冒充全rank证明；目标对照使用各自实际全rank事实。Mixtral历史EP>1的14次失败发生在原生swiglu_quant的UB编译容量，不patch框架；其EP1成功是另一项事实。七次历史PP watchdog由A4继续分析。
+| 案例 | 动作 | results下的入口 |
+| --- | ---: | --- |
+| Mistral PD 1→2 | 1735 | a4-mistral-pd-flow/comparisons.json |
+| Qwen8 TP1×PP4 | 4618 | a4-qwen8-pp4-copy-owner/comparisons.json |
+| Mistral PD 2→1压力 | 38848 | a4-pd-reuse-copy-owner/comparisons.json |
+| Qwen30 EP8集中 | 1256 | a4-ep8-local-placement/comparisons.json |
+| Mistral TP8 | 1782 | a4-mistral-tp8-local-placement/comparisons.json |
+| Qwen30 EP4阶段来源到均衡目标 | 2028 | a4-moe-pipeline-qualified/comparisons.json |
+| Mistral PP3不等分 | 2558 | a4-parallel-directions/peer-scope/comparisons.json |
+| Mistral TP2×PP4 | 6582 | a4-state-bindings/comparisons.json |
+| Qwen30 TP2×PP3×EP2 | 5708 | a4-parallel-coupling/comparisons.json |
+| Mistral PD 2→4 | 66292 | a4-state-bindings/comparisons.json |
+| Mistral Prefill TP1×PP4→Decode TP2 | 45198 | a4-pd-pp4/comparisons.json |
+| Mistral TP2×PP4，实际微批4/4/1 | 5844 | a4-pp4-microbatch/comparisons.json |
+| Mistral PD 4→2，只读通知诊断目标 | 95644 | a4-pd-notifications/comparisons.json |
 
-## 程序、镜像和代码
+A4的12项责任映射及资格见results/a4-parallel/acceptance.json；关联代码审查在work/a4-parallel/repository-review.md。实际微批与驻留槽、排序及原生split分别在a4-parallel/microbatch-behavior.json、pd-sorting-witness.json及a4-moe-pipeline/native-splits.json。PD压力的42项在途冲突有序，归还时在途KV页0；成功释放受Success保护，不把零计数当作异步释放见证。
 
-C++本阶段未改。程序build/resource-parameters/markov，SHA256为94a439a70e8aa7d6cc66a18ed8738d362d8ad853cec58f71b7cc9419e209b986。source/control当前ID为ffb5e580539e/13dc6a85682f，modeling为e066a5196c3b；实际完整ID及包校验在work/a3-sources/cache-package-verification.json。17层原生基础相同，官方SGLang 4e155ecc31af未改；旧任务保留当时实际ID。构建首次代理网络失败保留，host构建网络成功，不改变无设备预测的隔离。
+## 失败与限制
 
-当前src171文件/21830行，example27文件/7997行，共29827行，相比A2业务净增158、示例净增4。Ruff F、126文件Python3.10 AST、消费者及空白检查通过，阶段静态审查和依据索引在results/a3-sources/acceptance.json；不反复构建未改的C++。
+- **原生PP2：** 两份失败恢复14次HCCL/28通知代次，前五次配对无环，随后输出send→receive形成六指令环。无device/data，不声称恢复实际设备停滞context。另有PP2来源成功，不能一概称全部PP2不支持。见a4-parallel/pp-output-order-diagnosis.md、plain-pp-diagnosis.json及a4-moe-pipeline/native-qualification.md。
+- **原生PP3/PD地址：** 32层的10/11/11布局被上游误判draft，V起点30/22而非32，目的V22–V31缺写且部分V落入K。源48/目标54次错误识别，旧整组consistent资格撤销，36688调用partial保留。合法PP4/PD另取独立来源及完整目标，不改判旧输入，不patch上游或补造KV。见a4-parallel/pd-layer-routes/explanation.md。
+- **旧PD4→2预热超时：** 旧记录缺少通知链，唯一历史原因仍未知；一次同输入只读诊断52次通知全部送达，8组预热及18组正式计数闭合，但观察可能改变交错，不能称已修复。见a4-parallel/pd-notifications/summary.md。
+- **证据范围：** 旧EP8 split由固定注入路由与实测行数恢复，新来源另有2880条真实handle和11520对peer行数；两者不混淆。时间及后台顺序是明确验证输入，目标几何/图体未进入预测；自主网络时序、数值载荷、粗图未观察细节及性能精度均不取得资格。时钟校准不确定性保留。
 
-## 既有阶段恢复入口及边界
+一次费用脚本误写首个MoE来源execution.json，原始profile/input未改，必要字段已显式恢复，但原序列化字节丢失；owner/recovery.json保留事故，预算采用固定清单和单一原子写入点。旧失败与恢复费用不清零。
 
-A1：results/a1-values/summary.md及results/a1-contracts/summary.md；基础参数/层次、SDK发生实例、多stream、原始载荷/张量用途及父子发布关系已分别核对。TP1/TP2/PP3的233/104/1070动作完整开发见证不代替其他配置资格；零接收和最小输入分别只是所列局部/完整范围。
+## 程序、规模、费用及下一步
 
-A2：results/a2-state/summary.md、acceptance.json及results/a2-stage-delivery.json。九例32276动作、6507页表快照、231在途冲突均有保护路径；最大并发配置128、实测最大批70，KV4096到262144由小池规则变换。普通路径归还时在途页0，PD异步归还和排序仍在A4；单请求output2给定耗时和三项局部几何不冒充新真实目标。
+source/control/modeling为3e7b3d4db695、bc251fd3aeae、e066a5196c3b，最终程序83ab6b12998d固定在inputs/a4-parallel/stage-review/final。source8份/control6份本阶段模块与工作区逐字节一致，官方SGLang 4e155ecc31af未改。统一C++23构建、126份Python3.10语法及全src/example Ruff F通过。两次完整收尾回归见results/a4-stage-review，字节平移/重叠及父节点边界见a4-parallel/stage-review-contracts、stage-review-boundary-evidence.json；错误诊断文案断言的失败记录保留，不改写成命令成功。
 
-历史根data/20261113T111324.301829Z_execution-structure-reliability及data/20261114T084338.925689Z_interactive-structure-validation保留原调查、六例长度回归及原始SDK；只按明确消费者复用，不自动找最新资产。旧调查3通过/3失败及跨域失败不改写，修正后结果归开发。
+业务171文件22145行、示例27文件8097行，总30242行；A4净增315/100，无新业务文件。数据、模型、构建、deprecated和用户reference工作不提交；受保护文件、原暂存及.clang-format保持原样。阶段提交和远端实际HEAD在results/a4-stage-delivery.json。
 
-## 费用与交付
+A4累计32次7384.633原生秒、27092.249已测处理秒及300秒未测观察预留；窗口135次26514.413秒、余105次。阶段上限32次/12600原生秒/38400处理秒/64GiB，当前运行根约47GiB。本次收尾无新增原生、SDK重导或目标范围扩张，全部本阶段作业终态。
 
-A1原生3次/447.668秒，处理1171.010秒；A2原生3次/434.210秒，处理4252.682秒及120秒未测区间预留。A3原生5次/671.606秒，处理5156.231秒及60秒未测区间预留；阶段上限5次/4500原生秒、16000处理秒、128GiB。总窗口103次/19129.779秒，总上限240次、原生及处理各172800秒；新增任务终态随后由真实owner合计，旧事实引用不重复收费。
-
-当前不授予任意模型、配置、容量/压力或复杂调度组合支持；测量校准范围和粗化可见性保留。未知guard不能任选或填默认值，缺口不挪给性能层。A3审查、数据/文档整理及分层提交推送后才进入A4；用户.gitignore、.gitmodules、reference暂存及.clang-format保持原样。
+下一步A5先核对chunk、mixed、prefix的原生分支及既有真实事实，明确实际触发和有限来源，再做调度/缓存/压力及256/1024请求持续运行；不能只重复配置开关或先跑全量找缺口。A6之后才冻结并启动48项独立目标。A1、A2、A3恢复入口分别为results/a1-values、a2-stage-delivery.json、a3-stage-delivery.json；历史事实仅显式引用，旧调查不改判。
