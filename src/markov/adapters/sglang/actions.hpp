@@ -19,12 +19,13 @@ namespace markov::sglang {
 class NativeActionGraphs final : public ActionGraphs {
 public:
     NativeActionGraphs(const TemplateLibrary & library, nlohmann::json environment, std::vector<Resource> resources, std::string group, std::string instance);
-    CoarseGraph build(const ServingAction & action) override;
+    CoarseGraph build(const ServingAction & action, const nlohmann::json & bindings) override;
     std::map<std::string, TensorLayout> outputs(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const override;
     std::set<std::string> retained_bindings() const override;
 
 private:
-    TemplateEntry select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const;
+    TemplateEntry select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters,
+                         const std::map<std::string, StateBindings> & state_inputs = {}) const;
     std::set<std::string> bind_values(const TemplateEntry & entry, const nlohmann::json & values, Direction direction, GraphInvocation & call) const;
     void bind_inputs(const TemplateFrame & frame, const std::map<std::string, StorageBinding> & fields, const std::set<std::string> & explicit_inputs,
                      GraphInvocation & call) const;

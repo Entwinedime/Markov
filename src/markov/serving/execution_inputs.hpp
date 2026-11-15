@@ -33,6 +33,7 @@ public:
     static nlohmann::json work_identity(const nlohmann::json & work);
     static nlohmann::json action_identity(const ServingAction & action);
     static nlohmann::json notification_identity(const nlohmann::json & value);
+    const nlohmann::json & bindings(const std::string & group, const nlohmann::json & identity) const;
     InvocationInput graph(const std::string & group, const std::string & operation, const nlohmann::json & identity, const CoarseGraph & graph);
     std::optional<TimeWindow> input(const std::string & group, const nlohmann::json & identity, bool in_flow);
     TimeWindow notification(const nlohmann::json & identity);
@@ -50,6 +51,7 @@ private:
     };
 
     const nlohmann::json & take(const std::string & group, const std::string & operation, const nlohmann::json & identity);
+    const nlohmann::json & peek(const std::string & group, const std::string & operation, const nlohmann::json & identity) const;
     static TimeWindow window(const nlohmann::json & record);
     static ServiceDuration service(const nlohmann::json & record);
     static std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector);

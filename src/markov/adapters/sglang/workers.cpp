@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -39,6 +40,52 @@ WorkerBindings::WorkerBindings(const TemplateLibrary & library, const nlohmann::
     if (source_.contains("kv_peers")) {
         for (const auto & [name, peer] : source_.at("kv_peers").items()) bind_pool(name, peer.at("layout"), target_.at("kv_peers").at(name).at("layout"));
     }
+
+    std::vector<const TemplateFrame *> frames;
+    for (const auto & entry : library.entries) frames.push_back(&entry.frame);
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+        const auto & frame = *frames[index];
+        for (const auto & child : frame.children) frames.push_back(&child);
+        if (!frame.state_input) continue;
+        const auto & body = library.definitions[frame.definition];
+        std::set<std::string> peers;
+        for (std::size_t access = 0; access < body.kv_accesses.size(); ++access) {
+            if (body.kv_accesses[access].access == StateAccess::Write) peers.insert(frame.state.kv[access].pool);
+        }
+        for (std::size_t access = 0; access < body.slot_accesses.size(); ++access) {
+            if (body.slot_accesses[access].access == StateAccess::Write) peers.insert(frame.state.slots[access]);
+        }
+        if (peers.size() != 1) throw std::invalid_argument("native transport binding requires one observed destination");
+        const auto kind = frame.state_input->substr(0, frame.state_input->find('/'));
+        const auto [found, inserted] = states_[kind].emplace(*peers.begin(), frame.state);
+        if (!inserted && found->second != frame.state)
+            throw std::invalid_argument("native transport destination has conflicting observed geometry: " + *peers.begin());
+    }
+}
+
+std::map<std::string, StateBindings> WorkerBindings::state_inputs(const nlohmann::json & bindings, const nlohmann::json & work) const {
+    std::map<std::string, StateBindings> result;
+    if (!bindings.is_object()) throw std::invalid_argument("native invocation bindings require an object");
+    if (bindings.empty()) return result;
+    if (bindings.size() != 1) throw std::invalid_argument("native graph received unknown invocation bindings");
+    const auto order = bindings.at("transport_order").get<std::vector<std::string>>();
+    std::map<std::string, std::string> destinations;
+    for (const auto & [name, owner] : work.at("pools").get<std::map<std::string, std::string>>()) {
+        if (!destinations.emplace(owner, name).second) throw std::invalid_argument("native transport repeats a destination owner");
+    }
+    const std::set<std::string> unique(order.begin(), order.end());
+    if (unique.size() != order.size() || order.size() != destinations.size())
+        throw std::invalid_argument("native transport order does not cover each destination once");
+
+    // Geometry comes from captured endpoint facts; only the invocation's iteration order is dynamic.
+    for (const auto & [kind, peers] : states_) {
+        for (std::size_t index = 0; index < order.size(); ++index) {
+            auto state = peers.at(destinations.at(order[index]));
+            for (auto & value : state.kv) value.layer = layers_.at(value.pool).at(value.layer);
+            result.emplace(kind + "/" + std::to_string(index), std::move(state));
+        }
+    }
+    return result;
 }
 
 void WorkerBindings::bind_pool(const std::string & name, const nlohmann::json & source, const nlohmann::json & target) {
@@ -52,7 +99,7 @@ void WorkerBindings::bind_pool(const std::string & name, const nlohmann::json & 
 }
 
 void WorkerBindings::bind(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const {
-    bind_worker(frame, instance);
+    bind_worker(frame, instance, work);
     if (work.contains("transfer") || (frame.communication && frame.communication->operation == "transfer")) {
         auto & communication = frame.communication;
         if (!communication || communication->operation != "transfer") throw std::invalid_argument("native transfer requires a transfer template");
@@ -65,12 +112,11 @@ void WorkerBindings::bind(TemplateFrame & frame, const std::string & instance, c
     }
 }
 
-void WorkerBindings::bind_worker(TemplateFrame & frame, const std::string & instance) const {
+void WorkerBindings::bind_worker(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const {
     if (const auto site = sites_.find(frame.site); site != sites_.end()) frame.site = site->second;
-    const auto & accesses = library_.definitions[frame.definition].kv_accesses;
 
     // Local and remote pools each use their own initialized layer correspondence.
-    for (std::size_t index = 0; index < accesses.size(); ++index) { frame.kv_layers[index] = layers_.at(accesses[index].pool).at(frame.kv_layers[index]); }
+    for (auto & value : frame.state.kv) value.layer = layers_.at(value.pool).at(value.layer);
     if (frame.communication) {
         auto & communication = *frame.communication;
         communication.rank = target_.at("parallel").at("rank").get<std::int64_t>();
@@ -91,9 +137,17 @@ void WorkerBindings::bind_worker(TemplateFrame & frame, const std::string & inst
             }
             communication.members = members;
             communication.channel = instance + "/" + target.at("channel").get<std::string>();
+            if (frame.bindings.contains("required_peers")) {
+
+                // Source-declared peer slots bind to this invocation, never to the representative's old traffic.
+                communication.required.clear();
+                const auto & key = frame.bindings.at("required_peers").get_ref<const std::string &>();
+                for (const auto peer : work.at("expert_peers").at(key).get<std::vector<std::size_t>>())
+                    communication.required.push_back(members.at(peer));
+            }
         }
     }
-    for (auto & child : frame.children) bind_worker(child, instance);
+    for (auto & child : frame.children) bind_worker(child, instance, work);
 }
 
 } // namespace markov::sglang

@@ -169,7 +169,7 @@ class FlowExecution(CallSegments):
         work = {**frame.work, "continuation": frame.continuation}
         self.scheduler.bind_state(work, accesses)
         condition = {**frame.condition, "owner": frame.operation}
-        if not frame.host_only:
+        if not frame.host_fragment:
             condition.update(entry=frame.entry, exit=frame.exit)
         outputs = frame.outputs if frame.terminal else ()
         tensors = {name: tensor for name, (tensor, _) in frame.tensor_outputs.items()}

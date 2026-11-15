@@ -101,8 +101,8 @@ nlohmann::json ExecutionInputs::notification_identity(const nlohmann::json & val
     return {{ "group", group }, { "name", name }, { "work", work }};
 }
 
-const nlohmann::json & ExecutionInputs::take(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
-    auto & actor = actors_.at(group);
+const nlohmann::json & ExecutionInputs::peek(const std::string & group, const std::string & operation, const nlohmann::json & identity) const {
+    const auto & actor = actors_.at(group);
     const nlohmann::json actual{{ "operation", operation }, { "identity", identity }};
     if (actor.next == actor.steps.size())
         throw std::invalid_argument("execution input exhausted for " + group + " before " + actual.dump());
@@ -111,9 +111,21 @@ const nlohmann::json & ExecutionInputs::take(const std::string & group, const st
         throw std::invalid_argument("first execution input divergence: " + nlohmann::json{
             { "group", group }, { "step", actor.next }, { "expected", expected }, { "actual", actual }
         }.dump());
+    return expected;
+}
+
+const nlohmann::json & ExecutionInputs::take(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
+    const auto & expected = peek(group, operation, identity);
+    auto & actor = actors_.at(group);
     if (observer_) observer_->condition_used(group, actor.next, operation, identity, expected.at("source"));
     ++actor.next;
     return expected;
+}
+
+const nlohmann::json & ExecutionInputs::bindings(const std::string & group, const nlohmann::json & identity) const {
+    const auto & value = peek(group, "action", identity).at("bindings");
+    if (!value.is_object()) throw std::invalid_argument("execution invocation bindings require an object");
+    return value;
 }
 
 std::size_t ExecutionInputs::boundary(const CoarseGraph & graph, const nlohmann::json & selector) {

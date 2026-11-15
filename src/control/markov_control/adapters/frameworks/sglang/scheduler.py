@@ -177,6 +177,8 @@ class NativeScheduler(Scheduler):
         parameters.update(BatchTensors.model_parameters(batch, parameters["input_tokens"]))
         if self.experts is not None:
             parameters.update(self.experts.parameters(work["members"], parameters["model_tokens"]))
+            if self.experts.size > 1:
+                work["expert_peers"] = self.experts.required_peers(work["members"], parameters["model_tokens"])
         return parameters, work
 
     def run_batch(self, batch, *args, **kwargs):

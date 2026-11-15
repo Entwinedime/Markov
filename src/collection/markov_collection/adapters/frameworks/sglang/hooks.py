@@ -142,7 +142,8 @@ class SGLangObservation:
             "modules": [path for path, _ in self.model.named_modules() if path in sites],
             "expert_layers": self.modules.expert_layers,
         }
-        self.roles = WorkerRolePlan(self.model, facts)
+        conditions = () if self.routing is None else self.routing.geometry.observation_conditions(self.routing.input["requests"])
+        self.roles = WorkerRolePlan(self.model, facts, conditions)
         if any(worker["expert_layers"] for worker in self.roles.workers) != (self.routing is not None):
             raise ValueError("MoE models require a declared expert topology and routes; dense models do not accept them")
         self.content.configure(self.roles.workers)
@@ -161,8 +162,9 @@ class SGLangObservation:
         # The shared warmup barrier already published every endpoint; final selection needs no native collective.
         plan = self.roles.document(peers)
         self.worker_roles = plan["workers"]
-        self.selected = self.description["observe_all_workers"] or self.parallel["rank"] in plan["representatives"]
-        plan["observed_roles"] = self.description["native_participants"] if self.description["observe_all_workers"] else plan["representatives"]
+        if self.description["observe_all_workers"]:
+            plan["observed_roles"] = self.description["native_participants"]
+        self.selected = self.parallel["rank"] in plan["observed_roles"]
         if self.parallel["pp_rank"] == 0 and self.parallel["tp_rank"] == 0:
             write_json(Path(self.description["instance_directory"]) / "role-plan.json", plan, indent=2)
 

@@ -98,8 +98,9 @@ void NativeActionGraphs::bind_buffers(const TemplateFrame & frame, GraphInvocati
     }
 }
 
-TemplateEntry NativeActionGraphs::select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const {
-    auto entry = selection_.select(action, NativeTemplates::condition(action, condition), parameters);
+TemplateEntry NativeActionGraphs::select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters,
+                                        const std::map<std::string, StateBindings> & state_inputs) const {
+    auto entry = selection_.select(action, NativeTemplates::condition(action, condition), parameters, state_inputs);
     const auto & expected = library_.definitions[entry.frame.definition].parameters;
 
     // Native descriptions include fixed parameters too; the shared selector already checks names and values.
@@ -117,15 +118,24 @@ std::map<std::string, TensorLayout> NativeActionGraphs::outputs(std::string_view
     return result;
 }
 
-CoarseGraph NativeActionGraphs::build(const ServingAction & action) {
+CoarseGraph NativeActionGraphs::build(const ServingAction & action, const nlohmann::json & bindings) {
     if (action.task.group != group_) throw std::invalid_argument("action sent to another participant's graph provider");
-    auto entry = select(action.name, action.condition, action.parameters);
+    const auto state_inputs = worker_.state_inputs(bindings, action.work);
+    auto entry = select(action.name, action.condition, action.parameters, state_inputs);
     worker_.bind(entry.frame, instance_, action.work);
+    auto graph_work = action.work;
+    graph_work["bindings"] = bindings;
+
+    // Peer requirements are consumed bindings; each graph already publishes the resulting communication contract.
+    graph_work.erase("expert_peers");
     const auto live = action.work.at("live_batches").get<std::set<std::size_t>>();
     std::erase_if(batches_, [&](const auto & batch) { return !live.contains(batch.first); });
     GraphInvocation call{ action.name,  entry.condition, action.parameters,
-                          resources_,   action.work,     group_ + "/action/" + std::to_string(action.task.sequence),
+                          resources_,   std::move(graph_work), group_ + "/action/" + std::to_string(action.task.sequence),
                           environment_, library_.domain, {} };
+    if (!state_inputs.empty()) {
+        for (const auto & [name, state] : entry.frame.state_inputs()) call.state_inputs.emplace(name, state_inputs.at(name));
+    }
     call.pools.emplace("local", group_);
     if (action.work.contains("pools")) {
         for (const auto & [name, owner] : action.work.at("pools").get<std::map<std::string, std::string>>()) {

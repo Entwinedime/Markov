@@ -145,7 +145,7 @@ class FlowScopes(CallSegments):
                 "owner": frame.operation,
             }
             call.record["bindings"]["condition"] = frame.condition
-            if frame.host_only:
+            if frame.host_fragment:
                 call.record["bindings"]["segment"]["host_only"] = True
             for name, (tensor, shape) in frame.tensor_outputs.items():
                 call.output(name, owner.tensors.observe(tensor, shape), use="device", preceding=frame.observations)

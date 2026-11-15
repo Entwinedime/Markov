@@ -138,22 +138,27 @@ class DisaggregatedCalls:
             frame.tensor_outputs = BatchTensors.boundaries(batch)
         return result
 
-    def batch(self, operation, original, batch, arguments, keywords):
+    def batch(self, operation, original, batch, arguments, keywords, *, host_only=False, device_tail=False):
         if not self.calls.enabled:
             return original(*arguments, **keywords)
         members = BatchTensors.members(batch)
         parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in members))
-        with self.calls.request_state.members(batch), self.calls.call(operation, original, parameters=parameters, work=self.calls.work(batch, members)) as frame:
+        with self.calls.request_state.members(batch), self.calls.call(
+            operation, original, parameters=parameters, work=self.calls.work(batch, members),
+            host_only=host_only, device_tail=device_tail,
+        ) as frame:
             result = original(*arguments, **keywords)
             if operation == "prebuilt_result":
                 frame.outputs = self.calls.completed(batch.reqs)
             return result
 
     def commit(self, original, batch, *args, **kwargs):
-        return self.batch("prebuilt_commit", original, batch, (batch, *args), kwargs)
+
+        # Native cache calls interrupt a CPU loop; token materialization and relay writes follow its last iteration.
+        return self.batch("prebuilt_commit", original, batch, (batch, *args), kwargs, device_tail=True)
 
     def result(self, original, processor, batch):
-        return self.batch("prebuilt_result", original, batch, (processor, batch), {})
+        return self.batch("prebuilt_result", original, batch, (processor, batch), {}, host_only=True)
 
     def send(self, original, scheduler, req, last_chunk=False, end_idx=None):
         if not self.calls.enabled:

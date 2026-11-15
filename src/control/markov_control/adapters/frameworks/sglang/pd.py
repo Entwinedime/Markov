@@ -227,8 +227,9 @@ class NativeKvSender(NativeKvPolling, MooncakeKVSender):
         if len(kv_indices) or last:
             signals["transfer.complete"] = f"{scheduler.group}/pd/{identity}"
         metadata = self.kv_mgr.rows.read(self.aux_index) if last else None
-        for target, peer in backend.topology.peers.items():
-            destination = backend.reservations[self.bootstrap_room][target]
+        reservations = backend.reservations[self.bootstrap_room]
+        for target, destination in reservations.items():
+            peer = backend.topology.peers[target]
             if len(destination["pages"][index_slice]) != len(kv_indices):
                 raise ValueError("native PD sender chunk exceeds its receiver's page reservation")
             pools[peer["binding"]] = peer["pool"]
@@ -248,6 +249,7 @@ class NativeKvSender(NativeKvPolling, MooncakeKVSender):
         work = {
             **scheduler.calls.request_work(req, begin, end),
             "pools": pools, "signals": signals,
+            "bindings": {"transport_order": [backend.topology.peers[target]["pool"] for target in reservations]},
         }
         parameters = {"transfer_pages": len(kv_indices), "transfer_tokens": end - begin, "last_chunk": int(last)}
 

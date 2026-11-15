@@ -1,5 +1,7 @@
 #include "markov/templates/library.hpp"
 
+#include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -18,6 +20,43 @@ std::vector<std::size_t> indices(const nlohmann::json & source) {
 }
 
 } // namespace
+
+StateBindings StateBindings::read(const nlohmann::json & source) {
+    StateBindings result;
+    for (const auto & value : source.at("kv"))
+        result.kv.push_back({ value.at("pool").get<std::string>(), static_cast<std::int64_t>(index(value.at("layer"))), KvSlice::read(value.at("slice")) });
+    result.slots = source.at("slots").get<std::vector<std::string>>();
+    return result;
+}
+
+nlohmann::json StateBindings::document() const {
+    nlohmann::json result{{ "kv", nlohmann::json::array() }, { "slots", slots }};
+    for (const auto & value : kv)
+        result["kv"].push_back({{ "pool", value.pool }, { "layer", value.layer }, { "slice", value.slice.document() }});
+    return result;
+}
+
+nlohmann::json StateBindings::contract() const {
+    std::map<std::string, std::pair<std::int64_t, std::int64_t>> bases;
+    for (const auto & value : kv) {
+        auto & [layer, byte] = bases.try_emplace(value.pool, value.layer, value.slice.begin).first->second;
+        layer = std::min(layer, value.layer);
+        byte = std::min(byte, value.slice.begin);
+    }
+    std::map<std::string, std::size_t> pools;
+    const auto pool = [&](const std::string & name) { return pools.try_emplace(name, pools.size()).first->second; };
+    nlohmann::json result{{ "kv", nlohmann::json::array() }, { "slots", nlohmann::json::array() }};
+
+    // Whole-pool relocation preserves relative layers and byte aliases, never overlapping independent slices.
+    for (const auto & value : kv) {
+        const auto & [first_layer, first_byte] = bases.at(value.pool);
+        result["kv"].push_back({{ "pool", pool(value.pool) }, { "layer", value.layer - first_layer },
+                                { "begin", value.slice.begin - first_byte },
+                                { "token_bytes", value.slice.token_bytes }, { "bytes", value.slice.end - value.slice.begin }});
+    }
+    for (const auto & name : slots) result["slots"].push_back(pool(name));
+    return result;
+}
 
 TensorLayout TensorRule::evaluate(const Parameters & parameters) const {
     TensorLayout result{ dtype, {} };
@@ -118,17 +157,14 @@ TemplateDefinition TemplateDefinition::read(const nlohmann::json & source) {
     result.imports = indices(source.at("imports"));
     for (const auto & endpoint : source.at("exports").get_ref<const nlohmann::json::array_t &>()) result.exports.push_back(TemplateReference::read(endpoint));
     for (const auto & access : source.at("slot_accesses"))
-        result.slot_accesses.push_back({ access.at("pool").get<std::string>(),
-                                         access.at("field").get<std::string>(),
+        result.slot_accesses.push_back({ access.at("field").get<std::string>(),
                                          state_access(access.at("access").get<std::string>()),
                                          access.at("members").get<std::string>(),
                                          TemplateReference::read(access.at("start")),
                                          TemplateReference::read(access.at("finish")),
                                          access.value("publication", std::string{}) });
     for (const auto & access : source.at("kv_accesses").get_ref<const nlohmann::json::array_t &>())
-        result.kv_accesses.push_back({ access.at("pool").get<std::string>(),
-                                       state_access(access.at("access").get<std::string>()),
-                                       KvSlice::read(access.at("slice")),
+        result.kv_accesses.push_back({ state_access(access.at("access").get<std::string>()),
                                        TokenRangeRule::read(access.at("rule")),
                                        TemplateReference::read(access.at("start")),
                                        TemplateReference::read(access.at("finish")) });
@@ -190,7 +226,6 @@ nlohmann::json TemplateDefinition::document() const {
     result["slot_accesses"] = nlohmann::json::array();
     for (const auto & access : slot_accesses) {
         result["slot_accesses"].push_back({
-            {    "pool",                      access.pool },
             {   "field",                     access.field },
             {  "access", state_access_name(access.access) },
             { "members",                   access.members },
@@ -203,9 +238,7 @@ nlohmann::json TemplateDefinition::document() const {
     for (const auto & endpoint : exports) result["exports"].push_back(endpoint.document());
     for (const auto & access : kv_accesses)
         result["kv_accesses"].push_back({
-            {   "pool",                      access.pool },
             { "access", state_access_name(access.access) },
-            {  "slice",          access.slice.document() },
             {   "rule",           access.rule.document() },
             {  "start",          access.start.document() },
             { "finish",         access.finish.document() }
@@ -254,10 +287,8 @@ TemplateFrame TemplateFrame::read(const nlohmann::json & source) {
     result.bindings = source.at("bindings");
     result.constants = read_parameters(source.at("constants"));
     result.resources = indices(source.at("resources"));
-    for (const auto & layer : source.at("kv_layers").get_ref<const nlohmann::json::array_t &>()) {
-        if (!layer.is_number_integer()) throw std::invalid_argument("KV layer must be an integer");
-        result.kv_layers.push_back(layer.get<std::int64_t>());
-    }
+    result.state = StateBindings::read(source.at("state"));
+    if (!source.at("state_input").is_null()) result.state_input = source.at("state_input").get<std::string>();
     for (const auto & tensor : source.at("tensors").get_ref<const nlohmann::json::array_t &>()) {
         if (tensor.is_null()) result.tensors.push_back(std::nullopt);
         else {
@@ -284,7 +315,8 @@ nlohmann::json TemplateFrame::local_document() const {
         {  "constants",               constants },
         {  "resources",               resources },
         {    "tensors", nlohmann::json::array() },
-        {  "kv_layers",               kv_layers }
+        {      "state",        state.document() },
+        { "state_input", state_input ? nlohmann::json(*state_input) : nlohmann::json(nullptr) }
     };
     for (const auto & tensor : tensors) {
         if (tensor)
@@ -306,6 +338,21 @@ nlohmann::json TemplateFrame::document() const {
     auto result = local_document();
     result["children"] = nlohmann::json::array();
     for (const auto & child : children) result["children"].push_back(child.document());
+    return result;
+}
+
+std::map<std::string, StateBindings> TemplateFrame::state_inputs() const {
+    std::map<std::string, StateBindings> result;
+    std::vector<const TemplateFrame *> pending{ this };
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const auto & frame = *pending[index];
+        if (frame.state_input) {
+            const auto [found, inserted] = result.emplace(*frame.state_input, frame.state);
+            if (!inserted && found->second != frame.state)
+                throw std::invalid_argument("template state input has conflicting source bindings: " + *frame.state_input);
+        }
+        for (const auto & child : frame.children) pending.push_back(&child);
+    }
     return result;
 }
 

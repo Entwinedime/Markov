@@ -26,8 +26,9 @@ public:
         if (invocation.identity.empty() || !invocation.work.is_object() || invocation.resources.size() != library.resources.size())
             throw std::invalid_argument("graph invocation requires an identity, work and explicit resource bindings");
         if (!invocation.environment.is_object()) throw std::invalid_argument("invocation requires its target environment");
-        external_storage(entry.frame);
+        validate_inputs(entry.frame);
         if (external_.size() != invocation.storage.size()) throw std::invalid_argument("invocation has unknown external storage bindings");
+        if (state_inputs_.size() != invocation.state_inputs.size()) throw std::invalid_argument("invocation has unknown state inputs");
         std::set<std::string> signals;
         for (const auto & port : library.definitions[entry.frame.definition].ports) {
             if (port.use != PortUse::Signal) continue;
@@ -63,14 +64,19 @@ public:
     }
 
 private:
-    void external_storage(const TemplateFrame & frame) {
+    void validate_inputs(const TemplateFrame & frame) {
+        if (frame.state_input) {
+            if (invocation_.state_inputs.at(*frame.state_input).contract() != frame.state.contract())
+                throw std::invalid_argument("invocation changes its state binding contract: " + *frame.state_input);
+            state_inputs_.insert(*frame.state_input);
+        }
         for (const auto & tensor : frame.tensors) {
             if (!tensor || !tensor->external) continue;
             const auto & target = invocation_.storage.at(tensor->storage);
             if (target.identity.empty() || target.version < 0) throw std::invalid_argument("invalid target storage identity or version");
             external_.insert(tensor->storage);
         }
-        for (const auto & child : frame.children) external_storage(child);
+        for (const auto & child : frame.children) validate_inputs(child);
     }
 
     void append(const TemplateFrame & frame, std::optional<std::size_t> parent, std::size_t call, const Parameters & arguments,
@@ -132,9 +138,11 @@ private:
         const auto & node = scopes_[scope];
         const auto & frame = *node.frame;
         const auto & definition = library_.definitions[frame.definition];
-        for (const auto & access : definition.slot_accesses) {
+        const auto & state = frame.state_input ? invocation_.state_inputs.at(*frame.state_input) : frame.state;
+        for (std::size_t index = 0; index < definition.slot_accesses.size(); ++index) {
+            const auto & access = definition.slot_accesses[index];
             graph_.scopes[scope].slot_accesses.push_back({
-                { invocation_.pools.at(access.pool),
+                { invocation_.pools.at(state.slots[index]),
                  access.field,
                  access.access,
                  access.members,
@@ -146,11 +154,12 @@ private:
         }
         for (std::size_t index = 0; index < definition.kv_accesses.size(); ++index) {
             const auto & access = definition.kv_accesses[index];
+            const auto & binding = state.kv[index];
             graph_.scopes[scope].kv_accesses.push_back({
-                { invocation_.pools.at(access.pool),
-                 frame.kv_layers[index],
+                { invocation_.pools.at(binding.pool),
+                 binding.layer,
                  access.access,
-                 access.slice,
+                 binding.slice,
                  access.rule.evaluate(graph_.scopes[scope].info.work),
                  access.rule },
                 event(scope, access.start),
@@ -206,6 +215,7 @@ private:
     const TemplateLibrary & library_;
     const TemplateEntry & entry_;
     const GraphInvocation & invocation_;
+    std::set<std::string> state_inputs_;
     CoarseGraph graph_;
     std::vector<InstanceScope> scopes_;
     std::set<std::string> external_;

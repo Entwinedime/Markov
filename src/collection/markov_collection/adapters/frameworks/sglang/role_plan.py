@@ -8,7 +8,7 @@ from markov_collection.adapters.frameworks.sglang.module_layout import ModuleStr
 
 
 class WorkerRolePlan:
-    def __init__(self, model: Any, facts: dict[str, Any]) -> None:
+    def __init__(self, model: Any, facts: dict[str, Any], observation_conditions) -> None:
         import torch.distributed as distributed
         from sglang.srt.distributed import get_world_group
 
@@ -20,6 +20,7 @@ class WorkerRolePlan:
         layout.update(start_layer=0, end_layer=last - first)
         facts = {
             **facts,
+            "observation_conditions": observation_conditions,
             "key": (
                 parallel["tp_rank"] == 0,
                 parallel["pp_rank"] == 0,
@@ -34,6 +35,19 @@ class WorkerRolePlan:
 
         # PP forwards control requests after local handling, so whole-world exchange belongs to initialization.
         distributed.all_gather_object(self.workers, facts, group=group)
+
+    @staticmethod
+    def observed_ranks(workers, bindings):
+        selected = {worker["representative"] for worker in bindings.values()}
+        for representative in sorted(selected):
+            group = {worker["parallel"]["rank"]: set(worker["observation_conditions"]) for worker in workers
+                     if bindings[str(worker["parallel"]["rank"])]["representative"] == representative}
+            missing = set().union(*group.values()) - group[representative]
+            while missing:
+                rank = min(group, key=lambda rank: (-len(group[rank] & missing), rank))
+                selected.add(rank)
+                missing.difference_update(group[rank])
+        return sorted(selected)
 
     def document(self, peers) -> dict[str, Any]:
         representatives = []
@@ -50,12 +64,13 @@ class WorkerRolePlan:
                 representatives.append(worker)
             bindings[str(worker["parallel"]["rank"])] = {
                 "representative": source["parallel"]["rank"],
-                **{name: value for name, value in worker.items() if name != "key"},
+                **{name: value for name, value in worker.items() if name not in {"key", "observation_conditions"}},
             }
 
         return {
-            "basis": "native_module_layout_and_group_roles",
+            "basis": "native_module_layout_group_roles_and_source_conditions",
             "participants": len(self.workers),
             "representatives": [worker["parallel"]["rank"] for worker in representatives],
+            "observed_roles": self.observed_ranks(self.workers, bindings),
             "workers": bindings,
         }

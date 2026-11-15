@@ -114,8 +114,10 @@ nlohmann::json TemplateLibrary::local_contract(const TemplateFrame & frame, cons
         const auto member = [&](std::int64_t rank) { return std::ranges::find(group.members, rank) - group.members.begin(); };
         auto required = nlohmann::json::array();
         for (const auto rank : group.required) required.push_back(member(rank));
-        communication = { { "operation", group.operation }, { "size", group.members.size() }, { "rank", member(group.rank) },
-                          { "required", std::move(required) } };
+
+        // The recipient keeps its rank binding when importing a closed body from another observed participant.
+        communication = { { "operation", group.operation }, { "size", group.members.size() }, { "required", std::move(required) } };
+        if (frame.bindings.contains("required_peers")) communication.erase("required");
         if (!group.agreements.empty()) communication["agreements"] = group.document().at("agreements");
     }
     return { { "interface", interface.document() },

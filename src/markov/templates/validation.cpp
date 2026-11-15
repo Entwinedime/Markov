@@ -35,7 +35,7 @@ void frame(const TemplateLibrary & library, const TemplateFrame & bindings, cons
     variables(bindings.guard, definition.parameters);
     if (!bindings.bindings.is_object() || bindings.resources.size() != definition.resources.size() || bindings.tensors.size() != definition.ports.size()
         || bindings.children.size() != definition.children.size() || bindings.constants.size() != definition.fixed.size()
-        || bindings.kv_layers.size() != definition.kv_accesses.size())
+        || bindings.state.kv.size() != definition.kv_accesses.size() || bindings.state.slots.size() != definition.slot_accesses.size())
         throw std::invalid_argument("template frame does not match its definition");
 
     if (bindings.communication) {
@@ -51,8 +51,13 @@ void frame(const TemplateLibrary & library, const TemplateFrame & bindings, cons
     const auto rendezvous = std::ranges::count_if(definition.ports, [](const auto & port) { return port.rendezvous.has_value(); });
     if (rendezvous != (bindings.communication ? 1 : 0)) throw std::invalid_argument("template communication binding differs from its ports");
     for (const auto & name : definition.fixed) bindings.constants.at(name);
-    for (const auto layer : bindings.kv_layers) {
-        if (layer < 0) throw std::invalid_argument("KV layer must be nonnegative");
+    if (bindings.state_input && bindings.state_input->empty()) throw std::invalid_argument("template state input has no name");
+    for (const auto & binding : bindings.state.kv) {
+        if (binding.pool.empty() || binding.layer < 0) throw std::invalid_argument("template KV binding requires a pool and nonnegative layer");
+        binding.slice.validate();
+    }
+    for (const auto & pool : bindings.state.slots) {
+        if (pool.empty()) throw std::invalid_argument("template slot binding has no pool");
     }
     for (std::size_t index = 0; index < bindings.resources.size(); ++index) {
         const auto & resource = library.resources.at(bindings.resources[index]);
@@ -168,7 +173,7 @@ void TemplateLibrary::validate() const {
             reference(definition, edge.target);
         }
         for (const auto & access : definition.slot_accesses) {
-            if (access.pool.empty() || access.field.empty() || access.members.empty())
+            if (access.field.empty() || access.members.empty())
                 throw std::invalid_argument("template slot access has an incomplete binding");
             if (!access.publication.empty() && access.access != StateAccess::Write)
                 throw std::invalid_argument("only template slot writes can declare a replicated publication");
@@ -176,8 +181,6 @@ void TemplateLibrary::validate() const {
             reference(definition, access.finish);
         }
         for (const auto & access : definition.kv_accesses) {
-            if (access.pool.empty()) throw std::invalid_argument("template KV access has no pool binding");
-            access.slice.validate();
             reference(definition, access.start);
             reference(definition, access.finish);
         }
@@ -221,11 +224,14 @@ void TemplateLibrary::validate() const {
 
     // A published library must select one implementation for its own observations, before any serving run needs it.
     const TemplateSelection selection(*this);
-    std::set<std::tuple<std::string, nlohmann::json, Parameters>> checked;
+    std::set<std::tuple<std::string, nlohmann::json, Parameters, nlohmann::json>> checked;
     for (const auto & entry : entries) {
+        const auto inputs = entry.frame.state_inputs();
+        auto state = nlohmann::json::object();
+        for (const auto & [name, value] : inputs) state[name] = value.document();
         for (const auto & parameters : entry.observations) {
-            if (checked.emplace(entry.action, entry.condition, parameters).second)
-                selection.select(entry.action, entry.condition, parameters);
+            if (checked.emplace(entry.action, entry.condition, parameters, state).second)
+                selection.select(entry.action, entry.condition, parameters, inputs);
         }
     }
 }

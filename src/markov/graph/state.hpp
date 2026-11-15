@@ -47,6 +47,7 @@ struct KvSlice {
     nlohmann::json document() const;
     void validate() const;
     std::vector<std::pair<std::int64_t, std::int64_t>> ranges(std::int64_t token_begin, std::int64_t token_end) const;
+    bool operator==(const KvSlice &) const = default;
 };
 
 struct KvAccess {

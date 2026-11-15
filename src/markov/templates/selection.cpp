@@ -60,6 +60,8 @@ public:
         auto local = frame.local_document();
         local.erase("definition");
         local.erase("guard");
+        if (frame.state_input) local["state"] = frame.state.contract();
+        if (frame.communication && frame.bindings.contains("required_peers")) local["communication"].erase("required");
         local["interface"] = library_.call_interface(frame).document();
         std::set<nlohmann::json> shared;
         std::map<std::string, Expression> arguments;
@@ -132,10 +134,12 @@ private:
 
 class FrameSelection {
 public:
-    FrameSelection(const TemplateLibrary & library, const std::vector<FrameFamily> & families, const std::map<const TemplateFrame *, std::size_t> & membership)
+    FrameSelection(const TemplateLibrary & library, const std::vector<FrameFamily> & families,
+                   const std::map<const TemplateFrame *, std::size_t> & membership, const std::map<std::string, StateBindings> & state_inputs)
         : library_(library),
           families_(families),
-          membership_(membership) {}
+          membership_(membership),
+          state_inputs_(state_inputs) {}
 
     FrameChoice resolve(std::span<const TemplateFrame * const> candidates, const Parameters & arguments) const {
         FrameChoice result;
@@ -175,6 +179,14 @@ public:
                 if (!rejected) rejected = candidate;
                 continue;
             }
+            if (candidate->state_input) {
+                const auto input = state_inputs_.find(*candidate->state_input);
+                if (input == state_inputs_.end() || input->second.contract() != candidate->state.contract()) {
+                    result.rejected_parameters = nlohmann::json{{ "site", candidate->site }, { "state_input", *candidate->state_input },
+                                                               { "reason", "missing or incompatible state binding" }}.dump();
+                    continue;
+                }
+            }
             std::vector<std::size_t> children;
             for (const auto & child : candidate->children) children.push_back(membership_.at(&child));
             implementations.try_emplace(std::pair{ candidate->definition, std::move(children) }, candidate);
@@ -205,7 +217,8 @@ public:
                               source.resources,
                               source.tensors,
                               {},
-                              source.kv_layers,
+                              source.state,
+                              source.state_input,
                               source.communication },
                 {},
                 {},
@@ -233,6 +246,7 @@ private:
     const TemplateLibrary & library_;
     const std::vector<FrameFamily> & families_;
     const std::map<const TemplateFrame *, std::size_t> & membership_;
+    const std::map<std::string, StateBindings> & state_inputs_;
 };
 
 } // namespace
@@ -242,11 +256,12 @@ TemplateSelection::TemplateSelection(const TemplateLibrary & library) : library_
     for (const auto & entry : library.entries) roots_[{ entry.action, entry.condition }].insert(index.add(entry, entry.frame));
 }
 
-TemplateEntry TemplateSelection::select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const {
+TemplateEntry TemplateSelection::select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters,
+                                       const std::map<std::string, StateBindings> & state_inputs) const {
     const auto roots = roots_.find({ std::string(action), condition });
     if (roots == roots_.end())
         throw std::invalid_argument("template action has no declared candidates: " + std::string(action) + " condition=" + condition.dump());
-    FrameSelection selection(library_, families_, membership_);
+    FrameSelection selection(library_, families_, membership_, state_inputs);
     FrameChoice chosen;
     for (const auto family : roots->second) chosen.merge(selection.resolve(families_[family], parameters), action);
     if (chosen.ambiguity)

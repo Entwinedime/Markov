@@ -97,16 +97,13 @@ struct TemplateCall {
 };
 
 struct TemplateKvAccess {
-    std::string pool;
     StateAccess access;
-    KvSlice slice;
     TokenRangeRule rule;
     TemplateReference start;
     TemplateReference finish;
 };
 
 struct TemplateSlotAccess {
-    std::string pool;
     std::string field;
     StateAccess access;
     std::string members;
@@ -147,6 +144,25 @@ struct TensorBinding {
     std::string buffer;
 };
 
+struct KvBinding {
+    std::string pool;
+    std::int64_t layer;
+    KvSlice slice;
+
+    bool operator==(const KvBinding &) const = default;
+};
+
+// Access rules are shared; pool identities and byte placement belong to each invocation.
+struct StateBindings {
+    std::vector<KvBinding> kv;
+    std::vector<std::string> slots;
+
+    static StateBindings read(const nlohmann::json & source);
+    nlohmann::json document() const;
+    nlohmann::json contract() const;
+    bool operator==(const StateBindings &) const = default;
+};
+
 struct TemplateFrame {
 
     // Implementation selection belongs to this call; the shared caller only specifies its interface.
@@ -158,12 +174,14 @@ struct TemplateFrame {
     std::vector<std::size_t> resources;
     std::vector<std::optional<TensorBinding>> tensors;
     std::vector<TemplateFrame> children;
-    std::vector<std::int64_t> kv_layers;
+    StateBindings state;
+    std::optional<std::string> state_input;
     std::optional<CommunicationGroup> communication;
 
     static TemplateFrame read(const nlohmann::json & source);
     nlohmann::json local_document() const;
     nlohmann::json document() const;
+    std::map<std::string, StateBindings> state_inputs() const;
 };
 
 struct GraphInvocation {
@@ -178,6 +196,7 @@ struct GraphInvocation {
     std::map<std::string, StorageBinding> storage;
     std::map<std::string, std::string> signals{};
     std::map<std::string, std::string> pools{};
+    std::map<std::string, StateBindings> state_inputs{};
 };
 
 struct TemplateEntry {

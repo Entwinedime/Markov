@@ -12,6 +12,7 @@ from markov_adapters.sglang.pipeline import PipelineABI
 
 from markov_collection.adapters.frameworks.sglang.module_scopes import tensor_ports
 from markov_collection.adapters.runtimes.pytorch.layouts import GatherLayout
+from markov_collection.instrumentation.parameters import ScopeParameters
 
 
 class NativeCommunications:
@@ -150,6 +151,19 @@ class NativeCommunications:
         dispatch = original.__name__ == "dispatch"
         tensor = bound.arguments["hidden_states"] if dispatch else bound.arguments["combine_input"].hidden_states
         with self.exchange(original, implementation.group) as call:
+            if not dispatch:
+
+                # Ascend AllToAll Combine has no dense metadata exchange; retain actual send and receive peers.
+                counts = {"send": list(implementation.handle["output_splits"]),
+                          "receive": list(implementation.handle["input_splits"])}
+                members = call.record["communication"]["members"]
+                call.record["communication"]["required"] = [
+                    rank for rank, sent, received in zip(members, counts["send"], counts["receive"], strict=True)
+                    if rank == call.record["communication"]["rank"] or sent or received
+                ]
+                parameter = ScopeParameters(owner.capture.scopes).resolve("expert_received_tokens", call.identity)
+                call.record["bindings"]["required_peers"] = parameter.name
+                call.record["expert_exchange"] = counts
             rows = "expert_input_tokens" if dispatch else "expert_received_tokens"
             owner.experts.port(call, "hidden_states", "input", tensor, rows)
             result = original(dispatcher, *args, **kwargs)

@@ -15,9 +15,10 @@ class WorkerBindings {
 public:
     WorkerBindings(const TemplateLibrary & library, const nlohmann::json & environment);
     void bind(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const;
+    std::map<std::string, StateBindings> state_inputs(const nlohmann::json & bindings, const nlohmann::json & work) const;
 
 private:
-    void bind_worker(TemplateFrame & frame, const std::string & instance) const;
+    void bind_worker(TemplateFrame & frame, const std::string & instance, const nlohmann::json & work) const;
     void bind_pool(const std::string & name, const nlohmann::json & source, const nlohmann::json & target);
 
     const TemplateLibrary & library_;
@@ -25,6 +26,7 @@ private:
     const nlohmann::json & target_;
     std::map<std::string, std::string> sites_;
     std::map<std::string, std::map<std::int64_t, std::int64_t>> layers_;
+    std::map<std::string, std::map<std::string, StateBindings>> states_;
 };
 
 } // namespace markov::sglang

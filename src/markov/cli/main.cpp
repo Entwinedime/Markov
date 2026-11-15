@@ -149,6 +149,9 @@ markov::GraphInvocation invocation(const nlohmann::json & source) {
     result.domain = markov::sglang::NativeTemplates::domain(result.environment);
     result.pools = source.at("pools").get<std::map<std::string, std::string>>();
     if (source.contains("signals")) result.signals = source.at("signals").get<std::map<std::string, std::string>>();
+    if (source.contains("state_inputs")) {
+        for (const auto & [name, value] : source.at("state_inputs").items()) result.state_inputs.emplace(name, markov::StateBindings::read(value));
+    }
     for (const auto & [name, storage] : source.at("storage").get_ref<const nlohmann::json::object_t &>()) {
         const auto version = markov::read_parameters({
                                                          { "version", storage.at("version") }
@@ -213,7 +216,7 @@ int main(int argc, char ** argv) {
             const auto library = markov::TemplateLibrary::read(read_json(argv[2]));
             const auto call = invocation(read_json(argv[3]));
             const markov::TemplateSelection selection(library);
-            output = library.instantiate(selection.select(call.action, call.condition, call.parameters), call).document();
+            output = library.instantiate(selection.select(call.action, call.condition, call.parameters, call.state_inputs), call).document();
         }
         else if (command == "serve" && (argc == 5 || (argc == 7 && std::string_view(argv[5]) == "--trace"))) {
             destination = argv[4];

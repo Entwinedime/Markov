@@ -262,7 +262,9 @@ class AscendObservation:
             # A successful driver transfer is caller work, not a queued device command.
             self.host_transfer(source.scope, source.completion)
         for scope, transfer in self.host_copies:
-            while scope not in self.device and scope != 0:
+
+            # An observation envelope cannot promote synchronous caller work into a device-stream fence.
+            while scope != 0 and (scope not in self.device or self.raw["scopes"][scope].get("envelope", False)):
                 scope = self.scopes[scope]["parent"]
             if scope in self.device:
                 span = self.device[scope]

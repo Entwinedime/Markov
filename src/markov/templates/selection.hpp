@@ -18,7 +18,8 @@ public:
     explicit TemplateSelection(const TemplateLibrary & library);
     TemplateSelection(const TemplateSelection &) = delete;
     TemplateSelection & operator=(const TemplateSelection &) = delete;
-    TemplateEntry select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const;
+    TemplateEntry select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters,
+                         const std::map<std::string, StateBindings> & state_inputs = {}) const;
 
 private:
     using Family = std::vector<const TemplateFrame *>;

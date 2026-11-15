@@ -227,12 +227,16 @@ private:
         frame.site = observed.info.site;
         frame.communication = observed.communication;
         frame.bindings = observed.info.bindings;
+        if (frame.bindings.contains("state_input")) {
+            frame.state_input = frame.bindings.at("state_input").get<std::string>();
+            frame.bindings.erase("state_input");
+        }
         frame.constants = observed.info.constants;
         for (const auto & access : observed.slot_accesses) {
             if (observed.info.work.at(access.value.members).get<std::vector<std::string>>() != access.value.requests)
                 throw std::invalid_argument("slot member binding differs from observation at " + frame.site);
-            definition.slot_accesses.push_back({ access.value.pool,
-                                                 access.value.field,
+            frame.state.slots.push_back(access.value.pool);
+            definition.slot_accesses.push_back({ access.value.field,
                                                  access.value.access,
                                                  access.value.members,
                                                  reference(scope, access.start, definition, frame),
@@ -243,13 +247,11 @@ private:
             if (!access.value.rule) throw std::invalid_argument("KV access has no declared member range rule at " + frame.site);
             if (access.value.rule->evaluate(observed.info.work) != access.value.regions)
                 throw std::invalid_argument("declared KV range differs from observation at " + frame.site);
-            definition.kv_accesses.push_back({ access.value.pool,
-                                               access.value.access,
-                                               access.value.slice,
+            definition.kv_accesses.push_back({ access.value.access,
                                                *access.value.rule,
                                                reference(scope, access.start, definition, frame),
                                                reference(scope, access.finish, definition, frame) });
-            frame.kv_layers.push_back(access.value.layer);
+            frame.state.kv.push_back({ access.value.pool, access.value.layer, access.value.slice });
         }
         for (const auto event : compiled.events) definition.events.push_back(resource(source_.events[event].resource, definition, frame));
         definition.exports.resize(compiled.exports.size());

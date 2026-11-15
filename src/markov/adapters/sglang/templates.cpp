@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -149,6 +150,7 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
     auto graph = observation;
     const ActionConditions conditions(observation);
     std::vector<EntrySpecification> entries;
+    std::map<std::size_t, std::map<std::string, std::size_t>> transfer_peers;
     for (std::size_t scope = 0; scope < graph.scopes.size(); ++scope) {
         declare_payload_agreements(graph.scopes[scope]);
         auto & info = graph.scopes[scope].info;
@@ -156,14 +158,30 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
 
         // Entry selection is separate from per-worker model and collective bindings.
         info.bindings = nlohmann::json::object();
-        for (const auto name : { "weights", "collective_group", "local_implementation" }) {
+        for (const auto name : { "weights", "collective_group", "local_implementation", "required_peers" }) {
             if (observed.bindings.contains(name)) info.bindings[name] = observed.bindings.at(name);
+        }
+
+        if (info.role == "kv_transfer") {
+            std::set<std::string> peers;
+            for (const auto & access : graph.scopes[scope].kv_accesses) {
+                if (access.value.access == StateAccess::Write) peers.insert(access.value.pool);
+            }
+            for (const auto & access : graph.scopes[scope].slot_accesses) {
+                if (access.value.access == StateAccess::Write) peers.insert(access.value.pool);
+            }
+            if (!peers.empty()) {
+                if (peers.size() != 1) throw std::invalid_argument("native transport service requires one destination pool");
+                auto & ordered = transfer_peers[info.parent.value()];
+                const auto position = ordered.try_emplace(*peers.begin(), ordered.size()).first->second;
+                info.bindings["state_input"] = std::string(graph.scopes[scope].kv_accesses.empty() ? "slot/" : "kv/") + std::to_string(position);
+            }
         }
 
         // Expert tensor calls retain their initialized model domain, independently of the enclosing serving phase.
         const auto & communication = observation.scopes[scope].communication;
         if (info.role == "expert_compute" || (communication && (communication->operation == "dispatch" || communication->operation == "combine"))) {
-            const auto & owner = observation.scopes.at(*observed.parent).info;
+            const auto & owner = observation.scopes.at(observed.parent.value()).info;
             info.bindings["local_implementation"] = owner.bindings.at("local_implementation");
         }
 
@@ -189,6 +207,18 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
         condition = NativeTemplates::condition(info.role, std::move(condition));
         conditions.validate(scope, info.role, condition);
         entries.push_back({ scope, info.role, std::move(condition) });
+    }
+    for (const auto & [scope, peers] : transfer_peers) {
+        std::vector<std::string> order(peers.size());
+        auto pools = nlohmann::json::object();
+        for (const auto & [peer, position] : peers) {
+            order[position] = peer;
+            pools[peer] = peer;
+        }
+
+        // Local expansion receives endpoint identities and order, never target byte geometry or graph bodies.
+        graph.scopes[scope].info.work["bindings"] = {{ "transport_order", order }};
+        graph.scopes[scope].info.work["pools"] = std::move(pools);
     }
     return { std::move(graph), std::move(entries) };
 }

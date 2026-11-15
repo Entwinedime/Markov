@@ -45,10 +45,15 @@ class CallFrame:
     tensor_outputs: dict = field(default_factory=dict)
     condition: dict = field(default_factory=dict)
     host_inputs: dict = field(default_factory=dict)
+    device_tail: bool = False
 
     @property
     def terminal(self):
         return self.exit == "call.return"
+
+    @property
+    def host_fragment(self):
+        return self.host_only or self.device_tail and not self.terminal
 
     @property
     def continuation(self):
@@ -222,7 +227,7 @@ class CallSegments:
     @contextmanager
     def call(
         self, operation, original, *, parameters=None, work=None, inputs=None, guards=(),
-        host_only=False, tensor_inputs=None, tensor_outputs=None, metadata_inputs=None, allocations=None, condition=None, host_inputs=None,
+        host_only=False, device_tail=False, tensor_inputs=None, tensor_outputs=None, metadata_inputs=None, allocations=None, condition=None, host_inputs=None,
     ):
         parent = self.current.get()
         work = dict(parent.work if work is None else work)
@@ -241,6 +246,7 @@ class CallSegments:
             tensor_allocations={} if allocations is None else allocations,
             condition={} if condition is None else condition,
             host_inputs={} if host_inputs is None else host_inputs,
+            device_tail=device_tail,
         )
         previous = self.current.set(frame)
         try:

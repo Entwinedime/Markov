@@ -16,7 +16,7 @@ public:
     virtual ~ActionGraphs() = default;
 
     // Graph construction owns structural validation before dependency binding and execution consume the result.
-    virtual CoarseGraph build(const ServingAction & action) = 0;
+    virtual CoarseGraph build(const ServingAction & action, const nlohmann::json & bindings) = 0;
     virtual std::map<std::string, TensorLayout> outputs(std::string_view action, const nlohmann::json & condition, const Parameters & parameters) const = 0;
     virtual std::set<std::string> retained_bindings() const = 0;
 };
