@@ -98,10 +98,16 @@ class LocalSources:
                 entry for entry in original["ep_routes"][key]["assignments"] if entry["request"] == request["id"]
             ]} for key in topologies}
         serving = ServingInput({"model": self.model, "instances": instances, "workload": seed})
-        normalized = LifecycleProbes(serving.instances, topologies).normalize(seed)
-        request = normalized["requests"][0]
+        probes = LifecycleProbes(serving.instances, topologies)
+        normalized = probes.normalize(seed)
+        request = dict(normalized["requests"][0])
         request.pop("prefix_id", None)
         page = configuration["page_size"]
+        if serving.instances[0].configuration.values["prefix_cache"] and 1 < page <= request["prompt_tokens"]:
+
+            # Existing output1/2 pairs finish immediately below/at a whole page without extra requests.
+            request["prompt_tokens"] = page - 1
+            normalized = probes.resize(normalized, {request["id"]: request})
         chunk = serving.instances[0].configuration.values["prefill_chunk_tokens"]
         paged_tokens = (request["prompt_tokens"] + page - 1) // page * page
 

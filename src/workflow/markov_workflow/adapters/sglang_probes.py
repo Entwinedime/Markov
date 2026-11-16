@@ -60,16 +60,20 @@ class LifecycleProbes:
                   "output_tokens": outputs[request["output_tokens"]]}
             for key, request in requests.items()
         }
-        result = {**workload, "requests": list(normalized.values())}
+        return self.resize(workload, normalized)
+
+    def resize(self, workload, requests):
+        original = {request["id"]: request for request in workload["requests"]}
+        result = {**workload, "requests": list(requests.values())}
         result.pop("ep_routes", None)
 
-        # Only remove homogeneous tails; shift the original route intervals without inventing expert assignments.
+        # Keep original expert choices for retained tokens; shorter Prefill moves Decode's origin.
         routes = {}
         for topology in self.topologies:
             source = workload["ep_routes"][topology]
             assignments = []
             for entry in source["assignments"]:
-                before, after = requests[entry["request"]], normalized[entry["request"]]
+                before, after = original[entry["request"]], requests[entry["request"]]
                 tokens = []
                 for position in entry["tokens"]:
                     if position < before["prompt_tokens"]:
