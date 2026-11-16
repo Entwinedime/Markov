@@ -30,6 +30,9 @@ class NativeConfiguration:
             value = self.values[name]
             if type(value) is not int or not 0 < value < 1 << 63:
                 raise ValueError(f"native {name} must be a positive signed 64-bit integer")
+        if self.values["max_total_tokens"] < self.values["page_size"]:
+            raise ValueError("native token capacity must contain at least one KV page")
+
         chunk = self.values["prefill_chunk_tokens"]
         if type(chunk) is not int or not 0 <= chunk < 1 << 63:
             raise ValueError("native prefill_chunk_tokens must be a nonnegative signed 64-bit integer")
