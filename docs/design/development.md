@@ -86,6 +86,8 @@ padding位置的基本数组/整数区间在ServingInput交接时检查，不等
 
 启用缓存时，来源筛选复用缓存调用ABI的guard：按请求最终提交长度区分空/非空整页key，按未完成Prefill区分尾页及新增索引是否为空。共享前缀的连续探针保留已保护整页的机会；中间chunk的实际端点仍由原生调度决定。这些是有限输入机会，不代替原生分支覆盖或模板选择。
 
+批次操作的局部探针复用输出1/2的成对请求。启用缓存且page_size大于1时，已有prompt达到一页便缩到page_size−1，使这对请求分别在不足一页和恰好一页时结束，不增加请求或作业。缩短时沿共同区间映射保留Prefill头部、平移原Decode路由，padding不变；已有更短请求不延长，page_size=1及禁缓存输入不变。主来源仍保留原有页/chunk及共享前缀机会，是否实际得到两种缓存实现由原生观察确认。
+
 输出input.json、plan.md、各作业的sources/<任务号>.json，最后发布引用这些输入的plan.json；sources数组保存作业，实现域不是作业编号。sources 输入可直接交给 capture；目标集合仍保留原配置/workload 两个维度。报告列出选中workload、逻辑成本和对应目标范围；共享前缀不等于实际命中，不同输出长度不等于实际发生subset，输入机会相同也不保证全部实际guard或路由分支可用。
 
 分页 Prefill 的原生实现分支也参与输入选择：同到达组中可容纳的请求，按原生有效批容量、页容量及 prefill/chunk 预算计算冷输入新页数上界；未显式配置微批时采用max(max_running_requests//pp,1)，再受总槽位限制，再使用共享分配器 ABI 区分逐请求路径的触发机会。ignore-EOS 路径可在加入完整请求后才耗尽 prefill 预算，不能把该预算直接当作硬截断长度。同一调用的重复写入单独保留机会：至少两个槽位和同到达成员、最小两项页数能入池，且首项之后仍有 prefill/chunk 预算；跨组的多请求不能替代。PD Decode 的预分配和 page_size=1 不套用分页 Extend 分支。同一冷输入计算同时保留多成员Prefill机会，不能仅凭workload中有多个请求就认定能够合批。两个上界都不是组批预测；准入余量、前缀命中及实际到达仍可能使原生执行走另一条路径，实际模板覆盖必须观察确认。
@@ -119,14 +121,14 @@ PD 的局部操作来源按参与者的普通实施域规划。多请求、多�
 集合的原生时间和尝试额度只统计本集合拥有的采集，包括其失败尝试；引用的历史费用由原任务保留。所有域在本集合内产生的后处理继续计费。原生额度耗尽仍可生产已引用的观察，后处理额度独立约束；这不为未采集的域增加原生额度。
 
 ```bash
-PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow acquire-sources \
+PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 -m markov_workflow acquire-sources \
   --plan <来源计划目录> --deployment <部署.json> --output <集合目录> \
   --binary <modeling构建的markov> --timeout <单次原生秒数> \
   --native-budget-seconds <原生累计秒数> --attempt-limit <原生累计尝试数> \
   --postprocessing-budget-seconds <后处理累计秒数> --storage-bytes <集合逻辑字节上限>
 ```
 
-根目录 input.json 固定输入，inputs/markov 保存集合程序，status.json 提供额度和失败摘要；sources/<任务号> 保存本次采集任务，assets/<任务号> 保存模板生产目录。只有全部作业生产成功且域匹配，才发布 result.json 的 productions 及对应 captures 列表；captures明确指向实际任务所有者，包括显式引用的外部任务。predict --production消费整个发布集合，按目标实现域和已声明输入机会选择一个完整来源，并交接该来源声明的局部实现。相同实现域允许预先选定多个互补作业，完整worker资源仍来自一次原生任务，不合并跨采集物理流；输入机会不是支持判据。该结果表示初始来源编译完成，不表示目标覆盖或独立验证通过。集合内源trace、SDK临时导出和模板计入集合存储；外部引用的唯一原始事实由原所有者额度维护，外围矩阵另监测整个运行根，不能因引用而忽略总体保留量。默认沿用produce的中间件清理规则，完整明细需显式--keep-intermediates或--resource-trace。
+根目录 input.json 持有完整plan和按任务号保存的jobs，inputs/markov 保存集合程序，status.json 提供额度和失败摘要；sources/<任务号> 保存本次采集任务，assets/<任务号> 保存模板生产目录。只有全部作业生产成功且域匹配，才发布 result.json 的 productions 及对应 captures 列表；captures明确指向实际任务所有者，包括显式引用的外部任务。发布后的预测和来源核对共同读取该集合的plan/jobs，不再要求外部规划目录。predict --production按目标实现域和已声明输入机会选择一个完整来源，并交接该来源声明的局部实现。相同实现域允许预先选定多个互补作业，完整worker资源仍来自一次原生任务，不合并跨采集物理流；输入机会不是支持判据。该结果表示初始来源编译完成，不表示目标覆盖或独立验证通过。集合内源trace、SDK临时导出和模板计入集合存储；外部引用的唯一原始事实由原所有者额度维护，外围矩阵另监测整个运行根，不能因引用而忽略总体保留量。默认沿用produce的中间件清理规则，完整明细需显式--keep-intermediates或--resource-trace。
 
 集合持有独占锁，并直接从各子任务的原生尝试和生产记录汇总用量，不维护第二套计费账本。每次调用每个域最多新增一次原生尝试；第一处失败即停止，恢复时重新执行同一命令，可显式增加额度，不能换输入、程序或镜像。已有成功采集及完成的生产步骤复用，失败和中断预留仍计费；后处理失败不重启已成功的原生任务。不要绕过集合入口并发运行其子目录任务。
 
@@ -141,7 +143,7 @@ PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow a
 正式外围入口在声明的设备上启动一个采集容器，模型只读挂载，输出归本次新目录；需要 Python≥3.10 和 Docker CLI。
 
 ```bash
-PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow capture \
+PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 -m markov_workflow capture \
   --input <job.json> --deployment <deployment.json> \
   --output <采集任务目录> --timeout 900 --budget-seconds 1800 --attempt-limit 2
 ```
@@ -191,7 +193,7 @@ role-plan的representatives决定结构复用，observed_roles决定本次实际
 capture.json 发布后，外围入口按实际 observed_roles 顺序执行 SDK 导出、解释和粗图构造。`--product templates`（默认）继续编译并连接来源模板；`--product graphs`只发布实测粗图，供独立目标对照使用。目标真值不依赖模板编译成功，不借模板选择或变换规则判断实测结构。未观察的等价 worker 不重复生产，也不从目录扫描猜测角色。
 
 ```bash
-PYTHONPATH=src/workflow:src/adapters:src/collection python3 -m markov_workflow produce \
+PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 -m markov_workflow produce \
   --capture <已闭合的原始来源目录> --output <生产目录> \
   --binary <modeling构建的markov> --budget-seconds 600
 ```
@@ -220,7 +222,7 @@ SDK未导出直接关联任务时，解释器核实实际执行方式。异步�
 
 张量检查直接对照原始端口集合、用途、几何、存储/版本、写入者及分配所有者，数据依赖不能被重分类为布局元数据。读取按原生声明的进入或返回边界消费；异步输出按实际通信完成，父调用转出子调用已经发布的同一版本时保留子调用的就绪点。该关系由原始发布顺序及调用层次核对，不用父调用的较晚返回替代。
 
-在 modeling 环境的仓库根目录运行 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/source_evidence.py --production <生产目录> --capture <原始采集目录> --output <新报告目录>`。仅加载无设备依赖的原始区间/计数转换和原生缓冲区布局类型，不安装推理框架或运行生产解释器；矩阵入口自动设置该路径。生产须保留 `--keep-intermediates` 的 SDK 导出、facts、graph 及测量/原生作用证据，原始采集提供同次运行的设备校准采样；两个目录均显式指定容器内路径，不依赖生产时宿主机的绝对路径。检查器不启动采集、重建模板或修改业务资产。
+在 modeling 环境的仓库根目录运行 `PYTHONPATH=src/collection:src/adapters:src/workload python3 example/coarse_graph/source_evidence.py --production <生产目录> --capture <原始采集目录> --output <新报告目录>`。仅加载无设备依赖的原始区间/计数转换和原生缓冲区布局类型，不安装推理框架或运行生产解释器；矩阵入口自动设置该路径。生产须保留 `--keep-intermediates` 的 SDK 导出、facts、graph 及测量/原生作用证据，原始采集提供同次运行的设备校准采样；两个目录均显式指定容器内路径，不依赖生产时宿主机的绝对路径。检查器不启动采集、重建模板或修改业务资产。
 
 报告分别说明来源映射与时间约束：直接用原始主机记录核对调用进入/返回及CPU/服务区间的计数器和RAW测量，核对原始状态访问声明、张量最后写入者，并由实际SDK记录/等待核对Event与Work的完成代次、等待端点和生产者到消费者的路径；返回true的查询核对观察路径，false不强加等待。从原始runtime、SDK和实际队列代次核对异步拷贝/stream等待未遗漏或重复，核对保留SDK任务的stream顺序，随后核对环境、调用层级/上下文、通信声明、完整边界及其语义归属、工作/顺序区间、端口、实际张量几何、KV/槽位区间、原生依赖及测量交接。时间检查保留中点测量上的名义倒置，同时核对每个rank是否存在同一套、位于原始两端查询区间内的仿射时钟关系，能满足该图全部已测依赖；不能逐边独立放宽偏移，也不求取或回写校正时间。相容不等于精确时钟、原生关联正确或跨rank时间已校准；缺少测量仍为未知，不能填零。先核对生产清单完整对应原始采集的observed_roles，按共同框架ABI解释原始scope的参数/常量/调用绑定，再检查implementation、实际输入与guards、张量事实及分配所有者，以及声明的shape/token规则是否在解释和投影中保留原有语义；分配scope经过已有来源映射对应，不直接比较重编号前后的整数；声明比较允许二元add/mul/eq交换操作数，保留其他顺序和常量/变量区别；不根据观察值认定公式等价，不判断这些规则对目标配置是否成立，也不能证明原生观察没有遗漏。
 
@@ -248,7 +250,7 @@ SDK的任务编号及关联字段不是全局发生实例，编号复用不能�
 一个任务为一个普通实例或一对 P/D 实例。微批次容量 microbatch_requests 可选；未指定时由原生调度器计算。该入口完成单次预测装配，配置集合的来源规划、完整任务恢复与独立评价仍在开发。
 
 ```bash
-PYTHONPATH=src/workflow:src/adapters python3 -m markov_workflow predict \
+PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow predict \
   --production <已发布的来源集合目录> --input <prediction.json> \
   --binary <modeling构建的markov> --output <新的输出目录> --timeout 180
 ```
@@ -394,17 +396,19 @@ Event 返回 true 只说明完成不晚于查询返回，false 只说明完成�
 
 共同原生检查核对实际测得边界沿完整rank内DAG的因果次序；未测量节点不截断路径。发生倒置时停止，而非平移时间或只挑选相容调用。跨rank次序继续由模型通信、CPU协议及PD事实单独核对，局部时间相容不替代这些证明。
 
-独立动作比较在CPU control容器内使用 `PYTHONPATH=src/collection:src/adapters python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。实际完成时间通过已核对的具名端口对应原始测量；独立核对CPU边界及全部已消费设备端点是否具有一套共同仿射解释，不读取生成条件中的时钟映射自证。向上取整的开闭区间按精确有理数约束验证，不增加经验容差。 两者按共同框架ABI解释资源调用输入，其他原始字段仍逐项核对；随后核对 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
+独立动作比较在CPU control容器内使用 `PYTHONPATH=src/collection:src/adapters:src/workload python3 example/coarse_graph/compare_actions.py --capture <closed-native-case> --graphs <projected-graphs> --execution <prediction.jsonl> --output <new-directory>`。它先调用与来源检查共用的原生阶段，再消费预测明细进行配对；原生图不依赖预测是否成功。它与时间提取共用逻辑工作身份，读取实际粗图及预测明细，不调用模板选择或实例化。实际完成时间通过已核对的具名端口对应原始测量；独立核对CPU边界及全部已消费设备端点是否具有一套共同仿射解释，不读取生成条件中的时钟映射自证。向上取整的开闭区间按精确有理数约束验证，不增加经验容差。 两者按共同框架ABI解释资源调用输入，其他原始字段仍逐项核对；随后核对 worker 记录与粗图的环境、scope 身份、绑定声明及查询归属，并逐个核对原始张量端口的 dtype、shape、value/storage 身份、版本和 buffer。原始记录必须具有统一状态查询数组，缺少记录不等于没有查询；作用或输出声明不能在图转换中丢失。每个动作按父子调用位置核对层次、参数、端口、数据张量的形状/别名/相对版本/生产者、工作种类及数量、逻辑 KV/槽位访问和通信参与者。运行地址和图事件编号不跨案例配对；元数据端口只比较布局，不把它声明成数据存储所有权。
 
 矩阵示例维护sources、targets、compare三个明确阶段：sources调用正式规划/采集/模板生产并独立检查来源；targets取得每个目标的原生记录、真实粗图及来源检查；compare从目标证据提取必要时间条件，再用来源模板预测和独立比较。矩阵声明具名domain的exploration/deployment及各目标的capture_input、prediction_input和configuration；environment.json固定镜像和全调查共享的validation_budget，同目录markov固定实际程序。不手工编制source_catalog或把目标图装入来源。
 
-来源失败不阻止独立目标取证。代表worker的局部来源映射和共同校准须成立，整组原生资格另行记录；目标整组或时间资格不足时，不发布完整闭环通过。三阶段分别在results/<矩阵名>维护精简sources.json、targets.json、comparisons.json，详细报告留在具名对象目录。预测成功检查execution.jsonl，失败仍可检查execution.partial.jsonl；保留任务成功、前缀资格和完整结构结论各自的边界。
+targets/compare先核对整个选中范围的capture/prediction是否使用相同model、instances和workload，目标以同一请求序列提交，不能夹入来源采集的多组idle屏障；已发布目标及显式observation还须与原生owner的完整输入一致。已有合格集合通过正式预测同一装配方法核对实际库和参与者，然后才启动第一个目标Engine或比较。模型身份沿正式引用合同，不因配置内容相同自动换路径。来源失败仍可单独取得目标事实，但未验证来源适用性不能记为预检通过。
+
+代表worker的局部来源映射和共同校准须成立，整组原生资格另行记录；目标整组或时间资格不足时，不发布完整闭环通过。三阶段分别在results/<矩阵名>维护精简sources.json、targets.json、comparisons.json，详细报告留在具名对象目录。预测成功检查execution.jsonl，失败仍可检查execution.partial.jsonl；保留任务成功、前缀资格和完整结构结论各自的边界。
 
 调用形式为`python3 example/coarse_graph/matrix.py --root <运行根> --matrix <固定矩阵.json> --phase sources|targets|compare`。全调查共用预算锁和原生设备占用锁，CPU比较独立；已结束步骤不自动重试。普通失败与产物错误分别记录，执行状态不明时保留额度及进程身份并停止，检查真实进程后再恢复。工具代码不实现采集恢复、分配或模板规则，继续使用正式任务的唯一所有者。
 
-输入准备使用`python3 example/coarse_graph/prepare_matrix.py --root <运行根> --specification <覆盖声明.json> --stage <阶段> --seed <冻结交付提交> --phase sources|targets`。覆盖声明保留配置、请求取值范围、固定来源探针及抽样方法；同域固定库先发布来源并取得终态，再生成目标请求，跨域任务则先生成用户输入，再交给来源规划。已发布文件只允许相同内容接续，不重新抽样替换。EP路由属于实验输入构造，仍经正式请求/路由合同检查，不在示例实现原生组批或图变换。
+输入准备使用`PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 example/coarse_graph/prepare_matrix.py --root <运行根> --specification <覆盖声明.json> --stage <阶段> --seed <冻结交付提交> --phase sources|targets`。覆盖声明保留配置、请求取值范围、固定来源探针及抽样方法；同域固定库先发布来源并取得终态，再生成目标请求，整批实际装配通过后才发布输入。跨域任务先生成用户输入，再交给来源规划。已发布文件只允许相同内容接续，不重新抽样替换。EP路由属于实验输入构造，仍经正式请求/路由合同检查，不在示例实现原生组批或图变换。
 
-请求按循环的`patterns`声明每个位置的prompt/output候选值及可选前缀；单值候选固定必要边界，多个候选在冻结后按seed选择。MoE模式还声明分层expert条件的偏移，可表达相同前缀仅在远端层路由不同；这些只是已有路由输入的构造，不是适配规则。固定库domain用`source`显式指定原`collection`与`plan`，来源阶段只复核已有事实，不规划、采集或占用物理卡；自动新来源domain仍走正式来源规划。
+请求按循环的`patterns`声明每个位置的prompt/output候选值及可选前缀；单值候选固定必要边界，多个候选在冻结后按seed选择。MoE模式还声明分层expert条件的偏移，可表达相同前缀仅在远端层路由不同；这些只是已有路由输入的构造，不是适配规则。固定库domain用`source`指定原`collection`，来源阶段只复核该集合拥有的计划、实际输入及原始事实，不规划、采集或占用物理卡；自动新来源domain仍走正式来源规划。
 
 依赖比较先核实每次运行自身的模型通信、CPU协议及PD前提，再将其全部rank图按真实端点连接。真实PD关系来自预留发送入口、实际服务返回和读取到的状态，不猜通知时刻；预测采用执行器实际输出的跨rank通信、信号和状态边。关系类别保留，CPU终止消息检查也使用同一完整图。内部具名边界可达关系、粗工作位置、跨动作顺序和重复调用位置统一使用这两份全rank图；路径可以离开动作树、经过其他rank后返回。不以孤立rank图中没有路径认定全局缺边，也不重复生成本地、仅模型通信及CPU通信多套判定。协议覆盖不足时保留内容和运行内检查，因果比较明确报告证据不足，不选择较弱图宣称对应。
 
