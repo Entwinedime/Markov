@@ -255,11 +255,13 @@ class NativeEffectEvidence:
                     self.require(interval.begin <= first <= last <= interval.end,
                                  "semantic device interval escapes its original marker envelope")
                     counts["device_intervals"] += 1
-            if scope["role"] == "segment" and len(origins) > 1:
+            if scope["role"] == "segment" and (
+                len(origins) > 1 or raw["bindings"].get("segment", {}).get("host_only", False)
+            ):
 
-                # A CPU-only region cannot conceal real SDK work, even if its semantic declarations were incomplete.
-                self.require(device_owners.isdisjoint(origins), "closed CPU region hides native device work")
-                counts["closed_cpu_regions"] += 1
+                # Check raw SDK ownership for individual declarations as well as merged CPU regions.
+                self.require(device_owners.isdisjoint(origins), f"CPU-only scope {index} hides native device work")
+                counts["cpu_only_regions"] += 1
             if "service" in raw:
                 service = resources["service", f"service/{thread}"]
                 self.require(not graph["resources"][service]["serial"], "synchronous service is charged as a serial caller resource")
