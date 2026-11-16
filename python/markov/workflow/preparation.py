@@ -34,7 +34,11 @@ class PerformancePreparation:
             deployment = Deployment.parse(cells[0]["deployment"])
             if len(self.task.settings.devices) < tp:
                 raise ValueError(f"TP={tp} sampling needs at least {tp} declared capture devices")
-            group = {"cells": cells, "cost_requirements": requirements, "sampling_context": cells[0]["sampling_context"]}
+            group = {
+                "cells": cells,
+                "cost_requirements": requirements,
+                "sampling_context": cells[0]["sampling_context"],
+            }
             selected = self.prepare_models(deployment, group, path)
             if selected is None:
                 return None
@@ -44,6 +48,8 @@ class PerformancePreparation:
     def prepare_models(self, deployment: Deployment, report: dict, models: Path) -> Path | None:
         if self.request.deployment.framework == "sglang":
             from markov.adapters.sglang.sampling import sampling_commands
+        elif self.request.deployment.framework == "ktransformers":
+            from markov.adapters.ktransformers.sampling import sampling_commands
         else:
             return None
 

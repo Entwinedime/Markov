@@ -1,6 +1,6 @@
 # 用户输入与正式流程
 
-本文定义用户输入、准备行为和结果合同。正式预测入口支持限定的串行 SGLang/Ascend 路径；规则或成本不足时明确保留缺口。
+本文定义用户输入、准备行为和结果合同。正式预测入口按框架解释限定的串行 SGLang／KT Ascend 路径；规则或成本不足时明确保留缺口。
 
 ## 完整预测
 
@@ -129,7 +129,15 @@ status=completed 仅表示评价完成。正常精度仍须使用 measure；prof
 
 ## KTransformers 运行范围
 
-DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家。该部署的采集、独立成本、预测与回放尚不支持，旧 dense/Torch 产物不能作为新部署的来源或成本。
+DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家，deployment.framework 为 ktransformers。使用同一组 plan、capture、calibrate、predict、measure 和 maintain 入口；输入示例为 [KT 请求](../../configs/ktransformers_prediction.json)。旧 dense/Torch 产物不能作为新部署的来源或成本。
+
+base.configuration 提供 kt_weight_path 的绝对 GGUF 模板路径，以及 kt_cpuinfer、kt_threadpool_count、kt_num_gpu_experts。它们分别是总 CPU 推理线程、NUMA 池数、每层 NPU 驻留专家数；target.configuration 可覆盖这三项，省略的字段继承 base。路径模板含 {layer_idx}，专家目录只读挂载；框架原生参数由适配器映射，不重复在 deployment 声明 CPU 数量。
+
+当前范围是同一模型／量化、单 NPU、prefix 放置、显式 eager 和无调度重叠；关闭 radix 复用和延后专家，每请求一次完整 Prefill 后逐 token Decode。输出固定，输入不超过声明的单个 Prefill chunk。capture.detail 选 semantic；kernel_cache_initial_state 选 empty，按实际 base 请求历史保留初次使用。NPU graph 和其他策略不自动取得支持。
+
+来源记录原生已经拷到 CPU 的路由编号直方图、MoE submit／combine 端口及客户端边界，不采 tensor snapshot。目标按 base 路由和目标驻留集合推导 CPU／NPU 工作，不能读取目标路由。未变工作可迁移闭合响应，变化工作查询独立数据；没有合格成本则保留 missing_costs，不产生零成本成功。配置变化可能改变后续路由，条件预测与正常精度须分开验证。
+
+面板可载入对应框架示例并直接编辑目标线程、池数和驻留专家数，准备和预算仍由正式流程管理。保存的执行路径可用普通静态回放；semantic manifest 不授予详细原始图或完整设备因果资格。
 
 ## 本地用户面板
 

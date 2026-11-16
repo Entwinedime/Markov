@@ -31,12 +31,24 @@ CAPTURE_OWNED_ARGUMENTS = {
 }
 
 
-def server_arguments(deployment, configuration):
+def auxiliary_mounts(configuration):
+    return ()
+
+
+def validate_prediction(request):
+    """Detailed SGLang work support is checked against the captured source."""
+
+
+def server_arguments(deployment, configuration, *, calibration=False):
     if CAPTURE_OWNED_ARGUMENTS.intersection(configuration):
         raise ValueError("Model, dtype and TP belong to deployment; capture owns the isolated endpoint and startup")
     if configuration.get("disable_cuda_graph", True) is not True:
         raise ValueError("The restored base capture currently supports eager execution")
     if configuration.get("hicache_transfer_bandwidth") is not None:
+        if calibration:
+            raise ValueError(
+                "Independent native cost calibration excludes transfer quotas; remove hicache_transfer_bandwidth"
+            )
         from markov.adapters.sglang.bandwidth import limits
 
         limits(configuration["hicache_transfer_bandwidth"])

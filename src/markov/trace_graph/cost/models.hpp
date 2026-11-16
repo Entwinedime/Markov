@@ -68,6 +68,7 @@ enum class Coverage {
     NewCombination,
     Extrapolated,
     SourceService,
+    SourceObservedResponse,
     SourceResidual,
     SourceRegionResidual,
     SourceCpuResidual,

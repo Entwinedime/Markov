@@ -8,7 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 单 NPU 流程已完成非空生成和同配置复启，其采集和预测尚不支持。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
+当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 已接通单 NPU 语义采集及最小同配置预测；CPU／专家变化的成本覆盖和精度仍在验证。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
 
 ## 怎样运行
 
@@ -98,7 +98,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
 SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
-HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；模型加载、非空生成和同配置复启均已通过；不支持采集、成本建模或预测。
+HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；尚未授予 NPU graph、CPU／专家变化或正常精度的完整验证资格。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格。
 
 ### DeepSeek-V4-Flash 单 NPU 运行
 

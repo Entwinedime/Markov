@@ -1,0 +1,57 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B3",
+    "framework": "ktransformers",
+    "runtime": "ascend",
+    "model": "/path/to/DeepSeek-V4-Flash-W8A8",
+    "dtype": "bfloat16",
+    "tensor_parallel": 1
+  },
+  "base": {
+    "configuration": {
+      "kt_weight_path": "/path/to/experts/dsv4_layer{layer_idx}_mxfp4.gguf",
+      "kt_cpuinfer": 64,
+      "kt_threadpool_count": 8,
+      "kt_num_gpu_experts": 32,
+      "disable_cuda_graph": true,
+      "disable_overlap_schedule": true
+    }
+  },
+  "workload": "workload.json",
+  "targets": [
+    {"name": "reference", "configuration": {}},
+    {"name": "fewer_cpu_threads", "configuration": {"kt_cpuinfer": 32}},
+    {"name": "more_cpu_experts", "configuration": {"kt_num_gpu_experts": 24}}
+  ],
+  "performance": {
+    "database": "../data/kt_performance.sqlite",
+    "sampling_budget": {
+      "starts": 12,
+      "wall_sec": 12000,
+      "requests": 100,
+      "input_tokens": 40000,
+      "output_tokens": 1000,
+      "retained_mib": 256
+    }
+  },
+  "execution": {
+    "output": "../data/kt_prediction",
+    "memory_limit_gib": 8,
+    "kernel_cache_initial_state": "empty",
+    "capture": {
+      "image": "markov-ktransformers:dsv4",
+      "devices": [0],
+      "memory_limit_gib": 360,
+      "cpus": 128,
+      "detail": "semantic",
+      "budget": {
+        "starts": 3,
+        "wall_sec": 7200,
+        "requests": 12,
+        "input_tokens": 4096,
+        "output_tokens": 256,
+        "retained_mib": 256
+      }
+    }
+  }
+}

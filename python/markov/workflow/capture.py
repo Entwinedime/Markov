@@ -9,6 +9,7 @@ from pathlib import Path
 from markov.artifacts.capture import DeviceCommand
 from markov.artifacts.request import PredictionRequest, read_json
 from markov.artifacts.workload import Workload
+from markov.adapters.inference import capture_adapter
 from markov.workflow.device_task import DeviceTask
 
 
@@ -51,8 +52,7 @@ class InferenceCapture:
             return self._run(recapture, reuse)
 
     def _run(self, recapture: bool, reuse: bool) -> dict:
-        if self.request.deployment.framework != "sglang":
-            raise ValueError(f"Inference capture does not support framework {self.request.deployment.framework}")
+        adapter = capture_adapter(self.request.deployment.framework)
         if self.request.base.manifest is not None:
             if not self.profiling:
                 raise ValueError("Normal measurement requires base.configuration; a trace is not a normal observation")
@@ -66,14 +66,10 @@ class InferenceCapture:
             raise ValueError("Inference capture currently supports the Ascend runtime")
         if len(self.settings.devices) != self.request.deployment.tensor_parallel:
             raise ValueError("Single-host capture needs at least one declared device per tensor-parallel rank")
-        from markov.adapters.sglang import capture as adapter
-
         workload = self.workload if self.workload is not None else Workload.load(self.request.workload)
-        if self.calibration and self.request.base.configuration.get("hicache_transfer_bandwidth") is not None:
-            raise ValueError(
-                "Independent native cost calibration excludes transfer quotas; remove hicache_transfer_bandwidth"
-            )
-        server = adapter.server_arguments(self.request.deployment, self.request.base.configuration)
+        server = adapter.server_arguments(
+            self.request.deployment, self.request.base.configuration, calibration=self.calibration
+        )
         task = DeviceTask(self.settings, self.directory)
         task.recover()
         existing = task.state.get(self.result_key)
@@ -93,6 +89,7 @@ class InferenceCapture:
         )
         payload = {
             "deployment": asdict(self.request.deployment),
+            "configuration": self.request.base.configuration,
             "server": server,
             "environment": environment,
             "profiling": self.profiling and not self.semantic,
@@ -108,7 +105,7 @@ class InferenceCapture:
             payload,
             self.result_file,
             self.result_key,
-            ((model, "/model", False),),
+            ((model, "/model", False), *adapter.auxiliary_mounts(self.request.base.configuration)),
             payload["environment"],
             len(workload.requests),
             sum(len(row.input_ids) for row in workload.requests)
@@ -133,14 +130,16 @@ class InferenceCapture:
     def preview(self, workload: Workload) -> dict:
         if self.request.base.manifest is not None:
             return {"status": "declared", "manifest": str(self.request.base.manifest)}
+        adapter = capture_adapter(self.request.deployment.framework)
+        server = adapter.server_arguments(
+            self.request.deployment, self.request.base.configuration, calibration=self.calibration
+        )
         state = self.directory / "capture_state.json"
         if not state.exists():
             return {"status": "capture_required"}
         ledger = read_json(state)
         existing = ledger.get(self.result_key)
         if existing:
-            from markov.adapters.sglang.capture import server_arguments
-
-            self.check_reuse(Path(existing), workload, server_arguments(self.request.deployment, self.request.base.configuration))
+            self.check_reuse(Path(existing), workload, server)
             return {"status": "matching_capture", "manifest": existing}
         return {"status": "unfinished", "capture_state": str(state), "waiting_for": ledger.get("waiting_for")}

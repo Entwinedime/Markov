@@ -1,1 +1,7 @@
 **
+!pyproject.toml
+!python
+!python/**
+!docker
+!docker/ktransformers
+!docker/ktransformers/entrypoint.sh

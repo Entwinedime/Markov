@@ -64,6 +64,8 @@ struct PlannedOperation {
     std::optional<simulation::Component> owner = std::nullopt;
     std::optional<OperationPosition> position = std::nullopt;
     std::optional<BandwidthReservation> reservation = std::nullopt;
+    // A closed observed response is reusable only with the same work variables.
+    std::optional<std::size_t> source_cost = std::nullopt;
 };
 
 struct PlannedMutation {

@@ -9,12 +9,12 @@ from markov.artifacts.request import PredictionRequest
 from markov.artifacts.workload import Workload
 from markov.artifacts.performance import PerformanceData
 from markov.workflow.capture import InferenceCapture
+from markov.adapters.inference import capture_adapter
 
 
 def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
     """Describe known inputs; dynamic work and model coverage remain unexamined."""
-    if request.deployment.framework != "sglang":
-        raise ValueError(f"Prediction does not support framework {request.deployment.framework}")
+    capture_adapter(request.deployment.framework).validate_prediction(request)
     workload = Workload.load(request.workload)
     if request.base.manifest is not None:
         request.base.manifest.stat()
@@ -31,7 +31,9 @@ def plan_prediction(request: PredictionRequest) -> dict[str, Any]:
             deployments = {target.deployment.tensor_parallel: target.deployment for target in request.targets}
             for deployment in deployments.values():
                 selected = store.selected_models(asdict(deployment))
-                costs.append({"deployment": asdict(deployment), "response_count": len(selected["models"]) if selected else 0})
+                costs.append(
+                    {"deployment": asdict(deployment), "response_count": len(selected["models"]) if selected else 0}
+                )
         finally:
             store.close()
 

@@ -25,6 +25,7 @@ class Queries {
 public:
     explicit Queries(const Models & models, const source::SourceContext * source = nullptr, const source::CpuCosts * cpu_costs = nullptr);
     const Response & query(const planning::Work & work);
+    const Response & query_observation(const planning::Work & work, std::size_t observation);
     const Response & query_source(const planning::Work & work, std::size_t observation, std::size_t resource);
     const Response & query_region_gap(std::size_t interval);
     const Response & query_client_delay(std::size_t request, planning::ClientInterval interval);
@@ -32,8 +33,8 @@ public:
     const Response & query_source_work(const planning::Work & work, std::size_t interval, std::size_t resource);
     std::size_t requests() const { return requests_; }
     std::size_t evaluations() const {
-        return responses_.size() + source_evaluations_ + region_gaps_.size() + client_delays_.size() + source_cpu_evaluations_ + source_cpu_work_evaluations_
-               + source_dispatch_evaluations_ + source_control_evaluations_;
+        return responses_.size() + observed_responses_.size() + source_evaluations_ + region_gaps_.size() + client_delays_.size() + source_cpu_evaluations_
+               + source_cpu_work_evaluations_ + source_dispatch_evaluations_ + source_control_evaluations_;
     }
     std::size_t source_evaluations() const { return source_evaluations_; }
     std::size_t residual_evaluations() const { return region_gaps_.size() + client_delays_.size(); }
@@ -53,6 +54,7 @@ private:
     const source::CpuCosts * cpu_costs_;
     bool source_costs_prepared_ = false;
     std::map<planning::Work, Response> responses_;
+    std::map<std::size_t, Response> observed_responses_;
     std::set<std::size_t> limited_models_;
     std::vector<std::optional<Response>> source_responses_;
     std::map<std::size_t, Response> region_gaps_;

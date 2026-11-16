@@ -13,6 +13,7 @@ from markov.instrumentation.modeling import ModelingProcess
 from markov.workflow.capture import InferenceCapture
 from markov.workflow.performance import select_models
 from markov.workflow.preparation import PerformancePreparation
+from markov.adapters.inference import capture_adapter
 
 
 def predict(request: PredictionRequest) -> dict:
@@ -30,6 +31,7 @@ def predict(request: PredictionRequest) -> dict:
 
 
 def _predict(request: PredictionRequest) -> dict:
+    capture_adapter(request.deployment.framework).validate_prediction(request)
     begin = time.monotonic()
     state = request.execution.output / "workflow_state.json"
     write_json(state, {"phase": "selecting_costs", "targets": len(request.targets)})
@@ -43,7 +45,9 @@ def _predict(request: PredictionRequest) -> dict:
         raise ValueError("Mixed target deployments require performance.database for independent model selection")
     models = {
         tp: select_models(
-            deployment, request.models, request.database,
+            deployment,
+            request.models,
+            request.database,
             request.execution.output / "performance" / f"tp{tp}",
             request.sampling_budget is not None,
         )
@@ -84,7 +88,9 @@ def _predict(request: PredictionRequest) -> dict:
         for cell in result["cells"]:
             for gap in cell["cost_gaps"]:
                 deployment = cell["deployment"]
-                entry = requirements.setdefault(encoded([deployment, gap]), {**gap, "deployment": deployment, "targets": []})
+                entry = requirements.setdefault(
+                    encoded([deployment, gap]), {**gap, "deployment": deployment, "targets": []}
+                )
                 entry["targets"].append(cell["name"])
         result["cost_requirements"] = list(requirements.values())
         if not requirements or request.sampling_budget is None:
@@ -99,7 +105,10 @@ def _predict(request: PredictionRequest) -> dict:
         performance_begin = time.monotonic()
         if preparation is None:
             preparation = PerformancePreparation(request)
-        write_json(state, {"phase": "preparing_costs", "targets": len(request.targets), "requirements": list(requirements.values())})
+        write_json(
+            state,
+            {"phase": "preparing_costs", "targets": len(request.targets), "requirements": list(requirements.values())},
+        )
         next_models = preparation.prepare(result, models)
         performance_sec += time.monotonic() - performance_begin
         if next_models is None:
@@ -115,10 +124,14 @@ def _predict(request: PredictionRequest) -> dict:
     }
     result["workflow_sec"] = time.monotonic() - begin
     write_json(process.report, result)
-    write_json(state, {
-        "phase": result["status"], "targets": len(request.targets),
-        "completed_targets": sum(cell["status"] == "predicted" for cell in result["cells"]),
-        "cost_requirements": result["cost_requirements"],
-    })
+    write_json(
+        state,
+        {
+            "phase": result["status"],
+            "targets": len(request.targets),
+            "completed_targets": sum(cell["status"] == "predicted" for cell in result["cells"]),
+            "cost_requirements": result["cost_requirements"],
+        },
+    )
     result["report"] = str(process.report)
     return result

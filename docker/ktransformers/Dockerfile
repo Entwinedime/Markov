@@ -27,5 +27,12 @@ RUN git init "$KTRANSFORMERS_REPO" \
 RUN bash "$KTRANSFORMERS_REPO/kt-kernel/tools/ascend_dsv4/setup.sh" deps \
     && bash "$KTRANSFORMERS_REPO/kt-kernel/tools/ascend_dsv4/setup.sh" kt-kernel
 
+COPY pyproject.toml /opt/markov/pyproject.toml
+COPY python /opt/markov/python
+RUN python3 -m pip install --no-index --no-deps --no-build-isolation /opt/markov
+COPY docker/ktransformers/entrypoint.sh /opt/markov/entrypoint.sh
+ENV SGLANG_PLUGINS=markov_kt_facts
+
 WORKDIR /opt/dsv4
+ENTRYPOINT ["bash", "/opt/markov/entrypoint.sh"]
 CMD ["bash"]

@@ -163,7 +163,13 @@ caller 在响应期间持有调用权，较早的结果或备份调用可在两�
 
 ## KTransformers 成本
 
-DeepSeek-V4-Flash 的 CPU 专家、NPU 工作和控制成本尚未建立；不能复用已删除的 dense/Torch 阶段响应。
+DeepSeek-V4-Flash 的串行 eager 路径按每层原生 submit／combine 边界定义闭合 MoE 响应，包含输入搬运、CPU／NPU 内部重叠、汇合与输出搬运，不再叠加内部单项成本。没有跨区域交错才可采用这种粒度；NPU graph、延后专家及跨区域重叠不能直接套用。不能复用旧 dense/Torch 的阶段响应。
+
+结构侧保留 base 的实际专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 分开维护；独立响应使用非负形式 `T=a+bq+c×P_cpu/t+d×U_cpu/p+e×P_npu+f×U_npu`，其中 q 是 query tokens，在已测 NUMA 池数锚点之间插值系数。这是闭合响应的近似，不能视为严格并行缩放或独占 CPU 服务；带宽饱和、内存放置及实际路由漂移另列不确定性。
+
+ktransformers_regions 导入单独校准任务生成的 region_measurements.json。资源数量在工作特征中表达，同一模型部署共用响应，不为每个 CPU／卸载完整配置维护专用模型。共享采样从整组缺口选取资源端点，以有界、与目标文本不同的 token 序列观察工作；不采目标 trace 或按 E2E 残差选参数。首个准备请求不参加拟合。工作分布的计数外推明确标注，资源档位和 query 范围不足时仍返回缺口，不把外推解释为已测。
+
+只有工作变量完全一致的闭合源响应可按引用迁移，标为 source_observed_response；它不是 source_device_service。其余非 MoE 区间保留源响应／残余近似，客户端和未归属时间不删除。源 batch 的剩余区间扣除已单独计费的 MoE 响应，避免父子重复计费；这个余量不是按目标误差拟合的系数，也不代表全部 CPU 服务。
 
 ## 两种成本来源
 

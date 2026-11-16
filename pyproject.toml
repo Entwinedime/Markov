@@ -14,6 +14,7 @@ where = ["python"]
 
 [project.entry-points."sglang.srt.plugins"]
 markov_input_facts = "markov.adapters.sglang.input_facts:install"
+markov_kt_facts = "markov.adapters.ktransformers.probe:install"
 
 [tool.ruff]
 target-version = "py310"

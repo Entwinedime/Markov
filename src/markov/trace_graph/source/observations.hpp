@@ -140,6 +140,7 @@ struct ObservedCost {
     ObservedRegion region;
     std::optional<std::vector<std::int64_t>> data = std::nullopt;
     bool contiguous = true;
+    bool residual = false;
 };
 
 struct NativeQueueCall {

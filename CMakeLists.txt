@@ -72,6 +72,9 @@ add_library(markov_adapters
     src/markov/adapters/costs.cpp
     src/markov/adapters/source.cpp
     src/markov/adapters/prediction.cpp
+    src/markov/adapters/sglang/prediction.cpp
+    src/markov/adapters/ktransformers/observations.cpp
+    src/markov/adapters/ktransformers/prediction.cpp
     src/markov/adapters/replay.cpp
     src/markov/adapters/ascend/causality.cpp
     src/markov/adapters/ascend/trace.cpp
@@ -108,6 +111,8 @@ add_executable(markov_core
     src/markov/commands/source.cpp
     src/markov/commands/page_work.cpp
     src/markov/commands/prediction.cpp
+    src/markov/commands/sglang_prediction.cpp
+    src/markov/commands/ktransformers_prediction.cpp
     src/markov/commands/cpu_costs.cpp
 )
 target_link_libraries(markov_core PRIVATE markov_reports)

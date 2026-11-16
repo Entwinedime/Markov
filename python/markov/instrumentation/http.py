@@ -16,10 +16,11 @@ import urllib.request
 from markov.artifacts.writing import write_json
 
 
-def encode_inputs(requests: list[dict], model_path: str, input_budget: int, trust_remote_code: bool = False) -> None:
+def encode_inputs(
+    requests: list[dict], model_path: str, input_budget: int, trust_remote_code: bool = False, *, tokenizer=None
+) -> None:
     """Fill text requests in place before startup, within the remaining token budget."""
-    tokenizer = None
-    if any(row["prompt"] is not None for row in requests):
+    if tokenizer is None and any(row["prompt"] is not None for row in requests):
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(

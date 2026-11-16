@@ -14,6 +14,23 @@ Queries::Queries(const Models & models, const source::SourceContext * source, co
       cpu_costs_(cpu_costs),
       source_responses_(source ? source->observations().work_observations.size() : 0) {}
 
+const Response & Queries::query_observation(const planning::Work & work, std::size_t observation) {
+    if (!source_) throw std::logic_error("Observed cost requested without source evidence");
+    const auto & original = source_->observations().cost_observations.at(observation);
+    if (original.work != work) return query(work);
+    if (original.duration_ns < 0) throw std::logic_error("Observed response cannot have a negative duration");
+
+    ++requests_;
+    return observed_responses_
+        .try_emplace(observation,
+                     Response{ Status::Ready,
+                               original.duration_ns,
+                               original.residual ? Coverage::SourceRegionResidual : Coverage::SourceObservedResponse,
+                               {},
+                               std::nullopt })
+        .first->second;
+}
+
 void Queries::prepare_source_costs() {
     if (source_costs_prepared_) return;
 
