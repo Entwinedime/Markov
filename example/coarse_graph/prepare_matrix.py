@@ -31,13 +31,12 @@ class MatrixInputs:
             return
         write_json(path, document, indent=2, replace=False)
 
-    def choose(self, case, request, field):
-        choices = case[field]
+    def choose(self, case, request, field, choices):
         key = "\n".join((self.seed, case["id"], str(request), field)).encode()
         return choices[int.from_bytes(hashlib.sha256(key).digest(), "big") % len(choices)]
 
     @staticmethod
-    def routes(requests, prefixes, geometry, mode):
+    def routes(requests, prefixes, geometry, mode, patterns):
         content = WorkloadContent(requests, prefixes)
         experts, top_k = geometry["experts"], geometry["top_k"]
         if mode not in {"balanced", "concentrated", "alternating"}:
@@ -52,25 +51,27 @@ class MatrixInputs:
             cuts = sorted(cuts)
             for begin, end in zip(cuts, cuts[1:]):
 
-                # Shared prefix tokens keep identical logical choices; private suffixes can change their distribution.
+                # Prefix conditions are explicit too: a remote layer's different experts must prevent a false cache hit.
                 balanced = begin < prefix or mode == "balanced" or (mode == "alternating" and begin < length // 2)
                 step = experts // top_k if balanced else 1
-                offset = 0 if begin < prefix else index * 13
-                assignments.append({
-                    "request": request["id"], "layers": [0, geometry["layers"]], "tokens": [begin, end],
-                    "experts": [(offset + expert * step) % experts for expert in range(top_k)],
-                })
+                for condition in patterns[index % len(patterns)]["expert_conditions"]:
+                    offset = condition["offset"] + (0 if begin < prefix else index * 13)
+                    assignments.append({
+                        "request": request["id"], "layers": condition["layers"], "tokens": [begin, end],
+                        "experts": [(offset + expert * step) % experts for expert in range(top_k)],
+                    })
         return assignments
 
     def workload(self, case, instances, geometry):
         requests = []
         for index in range(case["requests"]):
+            pattern = case["patterns"][index % len(case["patterns"])]
             request = {
                 "id": f"req-{index:04d}", "arrival_ns": index // case["arrival_group"] * case["arrival_gap_ns"],
-                "prompt_tokens": self.choose(case, index, "prompt_tokens"),
-                "output_tokens": self.choose(case, index, "output_tokens"),
+                "prompt_tokens": self.choose(case, index, "prompt_tokens", pattern["prompt_tokens"]),
+                "output_tokens": self.choose(case, index, "output_tokens", pattern["output_tokens"]),
             }
-            prefix = case["prefix_ids"][index % len(case["prefix_ids"])]
+            prefix = pattern["prefix_id"]
             if prefix is not None:
                 request["prefix_id"] = prefix
             requests.append(request)
@@ -83,7 +84,7 @@ class MatrixInputs:
                 identity = configuration["ep"]["id"]
                 topologies[identity] = max(topologies.get(identity, 0), configuration["tp"] - 1)
         if topologies:
-            assignments = self.routes(requests, case["prefixes"], geometry, case["routes"])
+            assignments = self.routes(requests, case["prefixes"], geometry, case["routes"], case["patterns"])
             balanced = [expert * (geometry["experts"] // geometry["top_k"]) for expert in range(geometry["top_k"])]
             result["ep_routes"] = {}
             layers = [{"layer": layer, "experts": geometry["experts"], "top_k": geometry["top_k"]}
@@ -116,6 +117,8 @@ class MatrixInputs:
             return
 
         for domain in self.domains.values():
+            if "source" in domain:
+                continue
             workloads = domain["source_workloads"]
             if not workloads:
                 workloads = [json.loads((self.root / case["capture_input"]).read_text())["workload"]

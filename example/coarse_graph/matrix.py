@@ -127,6 +127,13 @@ class MatrixRun:
 
     def sources(self, domain):
         name = domain["id"]
+        if "source" in domain:
+            source = domain["source"]
+            collection = Path(source["collection"]).resolve(strict=True)
+            plan = Path(source["plan"]).resolve(strict=True)
+
+            # Fixed-library validation checks its explicit original sources without planning or collecting from the new targets.
+            return {"id": name, "collection": str(collection), "source_kind": "fixed_library"} | self.source_evidence(name, collection, plan)
         plan = self.root / "assets" / self.name / name / "plan"
         code = self.process(f"{name}/plan", self.commands.command(
             "plan-sources", "--input", self.root / domain["exploration"], "--output", plan,
@@ -277,7 +284,7 @@ class MatrixRun:
         with ExitStack() as contexts:
             lock = contexts.enter_context((self.steps / f".{phase}.lock").open("a"))
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            needs_native = phase == "sources" or (phase == "targets" and any(
+            needs_native = (phase == "sources" and any("source" not in domain for domain in domains)) or (phase == "targets" and any(
                 "observation" not in case for domain in domains for case in domain["targets"]
             ))
             if needs_native:
