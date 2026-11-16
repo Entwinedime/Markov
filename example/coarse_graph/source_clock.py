@@ -153,8 +153,11 @@ class ClockRealization:
 
     def coefficients(self, rank, point):
         a, b, constant = point
-        row = [Fraction(0)] * self.size
-        row[self.columns[rank]] = [a * x + b * y for x, y in self.vertices[rank]]
+        row = [0] * self.size
+
+        # Fixed RAW points have no calibration terms; keep exact zeroes without multiplying fractions.
+        if a != 0 or b != 0:
+            row[self.columns[rank]] = [a * x + b * y for x, y in self.vertices[rank]]
         return row, constant
 
     def difference(self, source, target):

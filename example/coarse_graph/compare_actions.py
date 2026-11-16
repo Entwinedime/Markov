@@ -114,9 +114,10 @@ class ActionComparison:
         sources = native_case.sources
         cpu_protocol, protocol_source = native_case.cpu, native_case.protocol
         expected, predicted_dependencies = {}, {}
-        occurrences, full_occurrences = defaultdict(list), defaultdict(list)
+        occurrences, full_occurrences = defaultdict(list), Counter()
+        native_contexts = defaultdict(list)
         native_classes, predicted_classes = defaultdict(set), defaultdict(set)
-        native_scope_keys, native_reads = {}, {}
+        native_reads = {}
         native_polling = PdPollingEvidence(protocol_source.admission_members)
         state_values = StateValueComparison(groups)
         action_results = ActionResults(groups)
@@ -149,9 +150,9 @@ class ActionComparison:
                 key = source.structure_key(index, identity, controls)
                 full_key = ActionIdentity.logical_key(identity)
                 occurrences[key].append(index)
-                full_occurrences[full_key].append(index)
+                full_occurrences[full_key] += 1
+                native_contexts[full_key, key].append(index)
                 native_classes[full_key].add(key)
-                native_scope_keys[rank, index] = key
                 expected.setdefault(key, (source, index, identity))
 
         connections, bindings = native_case.connections, native_case.bindings
@@ -285,18 +286,18 @@ class ActionComparison:
         for key, (_, _, identity) in expected.items():
             if not predicted_counts[key]:
                 self.finding("unmatched_native" if ended else "native_tail_unexecuted", identity, {})
-        for key, indices in full_occurrences.items():
+        for key, count in full_occurrences.items():
             if not full_predicted_counts[key] and any(predicted_counts[value] for value in native_classes[key]):
-                self.finding("unpaired_native_context", json.loads(key), {"observed_calls": len(indices)})
-            if len(indices) > 1 and not checked_prefix:
+                self.finding("unpaired_native_context", json.loads(key), {"observed_calls": count})
+            if count > 1 and not checked_prefix:
                 self.finding("ambiguous_native_identity", json.loads(key), {
-                    "observed_calls": len(indices), "predicted_calls": full_predicted_counts[key],
+                    "observed_calls": count, "predicted_calls": full_predicted_counts[key],
                     "reason": "complete logical context repeats; structure is checked independently",
                 })
         for key, count in full_predicted_counts.items():
             if not full_occurrences[key] and predicted_classes[key] & expected.keys():
                 self.finding("unpaired_predicted_context", json.loads(key), {"predicted_calls": count})
-            if count > 1 and len(full_occurrences[key]) <= 1 and not checked_prefix:
+            if count > 1 and full_occurrences[key] <= 1 and not checked_prefix:
                 self.finding("ambiguous_predicted_identity", json.loads(key), {"predicted_calls": count})
         if not ended:
             self.finding("incomplete_execution", {}, {})
@@ -311,8 +312,10 @@ class ActionComparison:
         actions, repeated_groups = [], {}
         for key, rank, identity, source, index, target_key, predicted, content_match, snapshot, conditioned_scope in pending:
             full_key = ActionIdentity.logical_key(identity)
-            indices = [index for index in full_occurrences[full_key] if native_scope_keys[rank, index] == key]
-            unique = len(indices) == len(full_occurrences[full_key]) == full_predicted_counts[full_key] == 1
+
+            # Index once by logical work and structure; repeated calls must not rescan their whole native context.
+            indices = native_contexts[full_key, key]
+            unique = len(indices) == full_occurrences[full_key] == full_predicted_counts[full_key] == 1
             paired_index = conditioned_scope
             if paired_index is None and unique and ActionIdentity.occurrence_anchored(identity):
                 paired_index = indices[0]
