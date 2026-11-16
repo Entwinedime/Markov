@@ -71,8 +71,14 @@ PreparedPrediction prepare_prediction(const Json & raw, source::ProfileManifest 
         const auto threads = positive(configuration, "kt_cpuinfer");
         const auto pools = positive(configuration, "kt_threadpool_count");
         const auto resident = positive(configuration, "kt_num_gpu_experts");
-        if (threads < pools || pools > positive(model, "moe_intermediate_size") / 256 || resident >= positive(model, "n_routed_experts"))
+        const auto expert_width = positive(model, "moe_intermediate_size");
+        if (threads < pools || expert_width % pools || expert_width % 256 || pools > expert_width / 256 || resident >= positive(model, "n_routed_experts"))
             throw std::runtime_error("KT CPU pools or expert partition are not valid for the native backend geometry");
+        if (captured.contains("resource_envelope")) {
+            const auto & resources = captured.at("resource_envelope");
+            if (threads > resources.at("cpu_ids").size() || pools > resources.at("numa_nodes").get<std::size_t>())
+                throw std::runtime_error("KT target exceeds the CPU/NUMA resources observed in the source deployment");
+        }
         targets.push_back({ item.at("name").get<std::string>(), std::move(configuration), threads, pools, resident });
     }
     auto source = read_source(std::move(manifest), captured);
@@ -101,7 +107,8 @@ PreparedPrediction prepare_prediction(const Json & raw, source::ProfileManifest 
              std::move(paths),
              std::move(targets),
              read_node_scale(raw.value("node_scale", Json::array())),
-             raw.value("record_graph", false) };
+             raw.value("record_graph", false),
+             captured.value("resource_envelope", Json::object()) };
 }
 
 void Program::start(planning::ProgramRuntime & runtime) {

@@ -51,6 +51,7 @@ def context(captured, deployment):
         "disable_cuda_graph": settings["disable_cuda_graph"],
         "disable_overlap_schedule": settings["disable_overlap_schedule"],
         "placement": settings.get("kt_expert_placement_strategy", "prefix"),
+        "resource_envelope": captured["resource_envelope"],
     }
 
 

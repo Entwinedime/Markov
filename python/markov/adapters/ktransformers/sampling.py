@@ -67,7 +67,7 @@ def sampling_commands(deployment, report, requirements):
                 sum(row["max_new_tokens"] for row in workload["requests"]),
                 "workload_report.json",
                 "ktransformers_regions",
-                ("runtime.kt.batch",),
+                ("runtime.kt.batch", "runtime.kt.placement"),
                 device_count=deployment.tensor_parallel,
             )
         )

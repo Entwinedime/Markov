@@ -97,9 +97,8 @@ execution.node_scale 可显式声明 [{"name": "prepare.prefill", "factor": 0.5}
 
 ## 有限资源搜索
 
-`search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名）、maximum_time_sec 或 maximum_time_ratio、
-fixed_device_gib_per_rank、fixed_host_gib 和 resource_plans。相对路径以搜索请求所在目录为起点。
-pricing 为必填的资源单价声明。
+`search --request` 接受 prediction（现有预测请求路径）、baseline（其中一个目标名），以及 maximum_time_sec 或 maximum_time_ratio。
+相对路径以搜索请求所在目录为起点。objective 默认为 minimum_cost，此时还需 fixed_device_gib_per_rank、fixed_host_gib、resource_plans 和 pricing。
 每个资源档位声明 name、device_gib_per_rank 和 host_gib；GiB 配额为正整数，名字不重复。档位只限定能否部署。
 pricing 声明 device_gib_hour、host_gib_hour、storage_gib_hour 三项每 GiB·小时单价，以及
 四项 `<direction>_gibps_hour`（direction 为 device_to_host、host_to_device、host_to_storage、storage_to_host），均为有限正数。
@@ -119,6 +118,11 @@ fixed_host_gib 表示整组非 KV 主存预留。前者覆盖权重、workspace 
 配额只限定部署，单价是声明假设；不含 CPU、整卡算力租价或按字节的流量费。
 hourly_cost_breakdown 给七项费用，window_cost_units 为小时资源成本乘正式 HTTP 秒数除以 3600，不覆盖启动和完整账单。
 recommended 与 worst_within_budget 分别为不超过 baseline 小时费用时的预测最快/最慢；并列按较低费用及稳定名字选择，正常真值不参与选点。
+
+objective=minimum_time 时，改为提供非空 resource_limits，例如 {"cpu_threads":64,"numa_pools":8,"resident_experts_per_layer":24}。
+每项是预测结果 resource_reservation 中同名标量资源量的上限，单位沿用该字段；缺项明确报告，不忽略限制。
+这一模式在资源与时间约束内选择预测最快的候选，不接受 pricing 或虚构零费用。baseline 的预测耗时可作为相对时间界，即使它自身超过本次资源限制；无候选满足时明确无解。
+KT 提供线程数、NUMA 池数和每层驻留专家数；有来源资源记录时另提供 host_memory_reserved_bytes，表示部署容器预留上限，不能当作目标实测峰值或证明显存一定足够。
 
 ## 独立 target 评价
 
@@ -140,6 +144,8 @@ status=completed 仅表示评价完成。正常精度仍须使用 measure；prof
 DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家，deployment.framework 为 ktransformers。使用同一组 plan、capture、calibrate、predict、measure 和 maintain 入口；输入示例为 [KT 请求](../../configs/ktransformers_prediction.json)。旧 dense/Torch 产物不能作为新部署的来源或成本。
 
 base.configuration 提供 kt_weight_path 的绝对 GGUF 模板路径，以及 kt_cpuinfer、kt_threadpool_count、kt_num_gpu_experts。它们分别是总 CPU 推理线程、NUMA 池数、每层 NPU 驻留专家数；target.configuration 可覆盖这三项，省略的字段继承 base。路径模板含 {layer_idx}，专家目录只读挂载；框架原生参数由适配器映射，不重复在 deployment 声明 CPU 数量。
+
+线程池数须整除专家中间维度，且每池至少分得一个 256 元素的 LLAMAFILE 量化块；记录了来源资源时，目标线程／池数还不能超过可见 CPU／NUMA 范围。采集在首次 forward 后记录一次实际线程亲和性和内存放置摘要；这不是固定内存绑定或目标峰值内存的保证。独立成本仍需匹配实际运行条件，不能仅凭线程数处于数值范围内就授予新平台资格。
 
 当前范围是同一模型／量化、单 NPU、prefix 放置、显式 eager 和无调度重叠；关闭 radix 复用和延后专家，每请求一次完整 Prefill 后逐 token Decode。输出固定，输入不超过声明的单个 Prefill chunk。capture.detail 选 semantic；kernel_cache_initial_state 选 empty，按实际 base 请求历史保留初次使用。NPU graph 和其他策略不自动取得支持。
 

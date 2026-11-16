@@ -76,6 +76,13 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
         const Json sampling{
             { "configuration", target.configuration }
         };
+        Json resources{
+            {                "cpu_threads",      target.cpu_threads },
+            {                 "numa_pools",       target.numa_pools },
+            { "resident_experts_per_layer", target.resident_experts }
+        };
+        if (input.resource_envelope.contains("memory_limit_bytes") && !input.resource_envelope.at("memory_limit_bytes").is_null())
+            resources["host_memory_reserved_bytes"] = input.resource_envelope.at("memory_limit_bytes");
         cells.push_back({
             {                  "name",                                                  target.name                                      },
             {            "deployment",                                                                                   input.deployment },
@@ -84,9 +91,11 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
              { { "cpu_threads", target.cpu_threads },
              { "numa_pools", target.numa_pools },
              { "resident_experts_per_layer", target.resident_experts },
+             { "cpu_experts_per_layer", input.batches.front().layers.front().expert_counts.size() - target.resident_experts },
              { "routing", "Base per-layer expert histograms; target routing is not read" },
              { "region_scope", "Closed serial MoE submit/compute/join response includes internal CPU/NPU overlap" } }                    },
             {      "sampling_context",                                                                                           sampling },
+            {  "resource_reservation",                                                                                          resources },
             {                "status",                                                           complete ? "predicted" : "missing_costs" },
             {         "e2e_predicted",                                                                                           complete },
             {       "formal_http_sec", complete && formal_begin && formal_end ? Json((*formal_end - *formal_begin) / 1e9) : Json(nullptr) },
@@ -112,6 +121,7 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
     const auto usage_status = getrusage(RUSAGE_SELF, &usage);
     return {
         { "deployment", input.deployment },
+        { "resource_envelope", input.resource_envelope },
         { "status", std::ranges::all_of(cells, [](const Json & cell) { return cell.at("e2e_predicted").get<bool>(); }) ? "completed" : "incomplete" },
         { "manifest", input.source.manifest.path.string() },
         { "models", { { "1", input.models_paths.at(1).string() } } },
@@ -129,6 +139,8 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
             "Each MoE region is closed at native submit/combine ports. Independent closed responses include internal CPU/NPU overlap, not a sum of separate "
             "services.",
             "The target uses base routing; numerical changes under different expert placement can change future routing and require independent qualification.",
+            "CPU/NUMA counts are bounded by source deployment resources when recorded. Host memory is a container reservation, not a target peak estimate; "
+            "changed expert placement has no general device-memory feasibility guarantee.",
             "Unchanged non-MoE work and frontend intervals retain source responses or residual approximations; no gap, unknown control or HTTP time is "
             "deleted.",
             "Semantic probe and event overhead has not yet been calibrated; semantic execution is not detailed source replay or normal accuracy "

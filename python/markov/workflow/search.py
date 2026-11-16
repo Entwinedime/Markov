@@ -83,30 +83,55 @@ class SearchPolicy:
     fixed_host_gib: float
     maximum_time_ratio: float | None
     plans: tuple[ResourcePlan, ...]
-    pricing: ResourcePricing
+    pricing: ResourcePricing | None
     maximum_time_sec: float | None = None
+    resource_limits: dict[str, float] | None = None
 
     @classmethod
     def parse(cls, raw: dict) -> SearchPolicy:
+        objective = raw.get("objective", "minimum_cost")
+        if objective not in {"minimum_cost", "minimum_time"}:
+            raise ValueError("Search objective must be minimum_cost or minimum_time")
         reject_unknown(
             raw,
             {
                 "prediction",
                 "baseline",
-                "fixed_device_gib_per_rank",
-                "fixed_host_gib",
+                "objective",
                 "maximum_time_ratio",
                 "maximum_time_sec",
-                "resource_plans",
-                "pricing",
-            },
+            }
+            | (
+                {"resource_limits"}
+                if objective == "minimum_time"
+                else {"fixed_device_gib_per_rank", "fixed_host_gib", "resource_plans", "pricing"}
+            ),
             "resource search",
         )
+        if ("maximum_time_sec" in raw) == ("maximum_time_ratio" in raw):
+            raise ValueError("Declare exactly one of maximum_time_sec and maximum_time_ratio")
+        if objective == "minimum_time":
+            if not isinstance(raw["resource_limits"], dict) or not raw["resource_limits"]:
+                raise ValueError("minimum_time needs nonempty resource_limits")
+            limits = {
+                required_text(name, "resource limit name"): positive_number(value, name)
+                for name, value in raw["resource_limits"].items()
+            }
+            return cls(
+                required_text(raw["baseline"], "baseline"),
+                0,
+                0,
+                positive_number(raw["maximum_time_ratio"], "maximum_time_ratio")
+                if "maximum_time_ratio" in raw
+                else None,
+                (),
+                None,
+                positive_number(raw["maximum_time_sec"], "maximum_time_sec") if "maximum_time_sec" in raw else None,
+                limits,
+            )
         plans = tuple(ResourcePlan.parse(plan) for plan in raw["resource_plans"])
         if not plans or len({plan.name for plan in plans}) != len(plans):
             raise ValueError("Resource plans must be nonempty and have unique names")
-        if ("maximum_time_sec" in raw) == ("maximum_time_ratio" in raw):
-            raise ValueError("Declare exactly one of maximum_time_sec and maximum_time_ratio")
         return cls(
             required_text(raw["baseline"], "baseline"),
             positive_number(raw["fixed_device_gib_per_rank"], "fixed_device_gib_per_rank"),
@@ -118,6 +143,8 @@ class SearchPolicy:
         )
 
     def rank(self, prediction: dict) -> dict:
+        if self.resource_limits is not None:
+            return self.rank_time(prediction)
         rows = []
         for cell in prediction["cells"]:
             participants = cell.get("deployment", prediction["deployment"])["tensor_parallel"]
@@ -240,6 +267,7 @@ class SearchPolicy:
             row for row in rows if row["status"] not in {"ranked", "resource_envelope_exceeded", "resource_infeasible"}
         ]
         return {
+            "objective": "minimum_cost",
             "status": "completed" if not unresolved and limit is not None else "incomplete",
             "baseline": self.baseline,
             "maximum_time_sec": limit,
@@ -259,6 +287,63 @@ class SearchPolicy:
             "pricing": asdict(self.pricing),
             "candidates": rows,
             "qualification": "Finite supplied candidates, complete formal HTTP. Seven charges cover device/host/file capacity and four transfer reservations; shared file service is apportioned once. PCIe limits are per rank and group totals are charged. No CPU, compute rental or per-byte traffic charge. Fixed reserves and prices are declared assumptions. Transfer admission permits one native-operation burst and retains native operation costs; these are software quotas, not replacement hardware. Incomplete coverage makes selection provisional. No target observations or refitting.",
+        }
+
+    def rank_time(self, prediction: dict) -> dict:
+        rows = []
+        for cell in prediction["cells"]:
+            resources = cell.get("resource_reservation", {})
+            row = {
+                "name": cell["name"],
+                "deployment": cell.get("deployment", prediction["deployment"]),
+                "status": cell["status"],
+                "prediction_status": cell["status"],
+                "predicted_sec": cell["formal_http_sec"],
+                "resource_reservation": resources,
+                "work_layout": cell.get("work_layout", {}),
+                "hourly_cost_units": None,
+                "window_cost_units": None,
+                "cost_gaps": cell["cost_gaps"],
+            }
+            if cell["status"] == "predicted":
+                missing = [name for name in self.resource_limits if type(resources.get(name)) not in (int, float)]
+                if missing:
+                    row.update(
+                        status="resource_accounting_unavailable",
+                        issue="Missing scalar resources: " + ", ".join(missing),
+                    )
+                elif any(resources[name] > limit for name, limit in self.resource_limits.items()):
+                    row["status"] = "resource_envelope_exceeded"
+                else:
+                    row["status"] = "ranked"
+            rows.append(row)
+        ranked = [row for row in rows if row["status"] == "ranked"]
+        baseline = next(row for row in rows if row["name"] == self.baseline)
+        limit = self.maximum_time_sec
+        if self.maximum_time_ratio is not None and baseline["prediction_status"] == "predicted":
+            limit = baseline["predicted_sec"] * self.maximum_time_ratio
+        feasible = [row for row in ranked if limit is not None and row["predicted_sec"] <= limit]
+        chosen = min(feasible, key=lambda row: (row["predicted_sec"], row["name"])) if feasible else None
+        fastest = min(ranked, key=lambda row: (row["predicted_sec"], row["name"])) if ranked else None
+        unresolved = [
+            row for row in rows if row["status"] not in {"ranked", "resource_envelope_exceeded", "resource_infeasible"}
+        ]
+        return {
+            "objective": "minimum_time",
+            "status": "completed" if not unresolved and limit is not None else "incomplete",
+            "baseline": self.baseline,
+            "maximum_time_sec": limit,
+            "selected": chosen["name"] if chosen else None,
+            "selection_status": "selected" if chosen else "no_ranked_candidate_meets_time_constraint",
+            "fastest": fastest["name"] if fastest else None,
+            "recommended": chosen["name"] if chosen else None,
+            "expected": len(rows),
+            "ranked": len(ranked),
+            "statuses": dict(Counter(row["status"] for row in rows)),
+            "resource_limits": self.resource_limits,
+            "pricing": None,
+            "candidates": rows,
+            "qualification": "Finite supplied candidates ranked by complete HTTP within declared scalar resource limits. No price or zero-cost substitution. Container memory reservation is not measured target peak; expert-memory feasibility and fine ranking need independent verification.",
         }
 
 
@@ -283,6 +368,8 @@ def search(path: Path) -> dict:
             else {"status": "incomplete", "prediction_result": prediction}
         )
         result["prediction_report"] = str(request.execution.output / "prediction/report.json")
+        result["prediction_limitations"] = prediction.get("limitations", [])
+        result["cost_assumptions"] = prediction.get("cost_assumptions", [])
         write_json(report, result)
         result["report"] = str(report)
         return result

@@ -28,6 +28,7 @@ struct PreparedPrediction {
     std::vector<PredictionTarget> targets;
     std::vector<trace_graph::cost::ScalingRule> node_scale;
     bool record_graph;
+    nlohmann::json resource_envelope;
 };
 
 struct RequestResult {

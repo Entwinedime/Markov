@@ -1,5 +1,6 @@
 """Observe closed KT regions and the routing already copied by the native worker."""
 
+from collections import Counter
 import os
 from pathlib import Path
 import time
@@ -18,6 +19,43 @@ class KtProbe:
         self.iterations = {}
         self.pending_moe = {}
         self.moe_events = {}
+        self.placement_recorded = False
+
+    def record_placement(self):
+        affinities = Counter()
+        for path in Path("/proc/self/task").glob("*/status"):
+            try:
+                fields = dict(line.split(":", 1) for line in path.read_text().splitlines())
+            except FileNotFoundError:
+                continue
+            affinities[
+                (fields["Name"].strip(), fields["Cpus_allowed_list"].strip(), fields["Mems_allowed_list"].strip())
+            ] += 1
+
+        policies, pages = Counter(), Counter()
+        for line in Path("/proc/self/numa_maps").read_text().splitlines():
+            fields = line.split()
+            policies[fields[1]] += 1
+            for field in fields[2:]:
+                name, _, value = field.partition("=")
+                if name.startswith("N") and name[1:].isdigit():
+                    pages[name] += int(value)
+        now = time.time_ns()
+        self.writer.write(
+            "runtime.kt.placement",
+            now,
+            now,
+            {
+                "cpu_affinity_groups": [
+                    {"thread_name": name, "cpus": cpus, "memory_nodes": nodes, "threads": count}
+                    for (name, cpus, nodes), count in sorted(affinities.items())
+                ],
+                "numa_mapping_policies": dict(policies),
+                "resident_pages_by_node": dict(pages),
+                "qualification": "Observed once after the first forward; thread roles are not inferred and page counts are not a peak-memory measurement.",
+            },
+        )
+        self.placement_recorded = True
 
     def batch(self, original, scheduler, batch, *args, **kwargs):
         if self.active is not None:
@@ -50,6 +88,8 @@ class KtProbe:
                 moe["stream_ns"] = round(events[0].elapsed_time(events[1]) * 1e6)
             fields["status"] = "returned"
             self.writer.write("runtime.kt.batch", begin, end, fields)
+            if not self.placement_recorded:
+                self.record_placement()
             return result
         finally:
             self.active = None

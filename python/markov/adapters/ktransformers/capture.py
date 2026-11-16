@@ -121,9 +121,32 @@ class Capture(SerialHttpClient):
         if server["kt_num_gpu_experts"] >= model["n_routed_experts"]:
             raise ValueError("KT expert placement must leave at least one routed expert on CPU")
         threads, pools = server["kt_cpuinfer"], server["kt_threadpool_count"]
-        if threads > len(os.sched_getaffinity(0)) or pools > len(
-            list(Path("/sys/devices/system/node").glob("node[0-9]*"))
-        ):
+        expert_width = model["moe_intermediate_size"]
+        if expert_width % pools or expert_width % 256 or pools > expert_width // 256:
+            raise ValueError(
+                "KT NUMA pools must divide the expert width and each receive a LLAMAFILE quantization block"
+            )
+        resources = {
+            "cpu_ids": sorted(os.sched_getaffinity(0)),
+            "numa_nodes": len(list(Path("/sys/devices/system/node").glob("node[0-9]*"))),
+        }
+        cpu_max = Path("/sys/fs/cgroup/cpu.max")
+        if cpu_max.is_file():
+            quota, period = cpu_max.read_text().split()
+            resources["cpu_quota_cores"] = None if quota == "max" else int(quota) / int(period)
+        else:
+            quota = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+            if quota.is_file():
+                value = int(quota.read_text())
+                resources["cpu_quota_cores"] = (
+                    None if value < 0 else value / int(quota.with_name("cpu.cfs_period_us").read_text())
+                )
+        for path in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+            if path.is_file():
+                value = path.read_text().strip()
+                resources["memory_limit_bytes"] = None if value == "max" else int(value)
+                break
+        if threads > len(resources["cpu_ids"]) or pools > resources["numa_nodes"]:
             raise ValueError("KT threads or NUMA pools exceed the container's visible resources")
         for layer in range(model["num_hidden_layers"]):
             Path(server["kt_weight_path"].format(layer_idx=layer)).stat()
@@ -150,6 +173,7 @@ class Capture(SerialHttpClient):
             {
                 "deployment": self.plan["deployment"],
                 "model_configuration": model,
+                "resource_envelope": resources,
                 "configuration": self.plan["configuration"],
                 "workload": self.plan["workload"],
                 "server": {"command": command, "arguments": server, "environment": self.plan["environment"]},
@@ -165,6 +189,7 @@ class Capture(SerialHttpClient):
         storage = sum(path.stat().st_size for path in self.directory.rglob("*") if path.is_file())
         facts = sorted((self.directory / "probe").glob("*.jsonl"))
         regions = sorted((self.directory / "regions").glob("*.jsonl"))
+        phases = self.validate_observations(facts or regions) if facts or regions else []
         if self.plan.get("semantic", False):
             self.publish_manifest(facts, storage)
         elif self.plan["calibration"]:
@@ -179,12 +204,11 @@ class Capture(SerialHttpClient):
                     "capture_origin": origin,
                     "deployment": self.plan["deployment"],
                     "configuration": server,
+                    "resource_envelope": resources,
                     "formal_begin_index": self.formal_begin_index,
                     "files": [str(path.relative_to(self.directory)) for path in regions],
-                    "measurement_ports": ["runtime.kt.batch"],
-                    "phases": ["prefill", "decode"]
-                    if any(row["measure"] and row["generated_tokens"] > 1 for row in self.rows)
-                    else ["prefill"],
+                    "measurement_ports": ["runtime.kt.batch", "runtime.kt.placement"],
+                    "phases": phases,
                     "temporary_storage_bytes": storage,
                     "startup_sec": startup_sec,
                 },
@@ -204,9 +228,11 @@ class Capture(SerialHttpClient):
                 },
             )
 
-    def publish_manifest(self, files, storage):
+    def validate_observations(self, files):
         expected = Counter({row["logical_request_id"]: 1 for row in self.rows})
         received, sent, batches = Counter(), Counter(), Counter()
+        formal = {row["logical_request_id"] for row in self.rows if row["measure"]}
+        phases, placements = set(), 0
         for path in files:
             with path.open() as stream:
                 for line in stream:
@@ -222,6 +248,10 @@ class Capture(SerialHttpClient):
                         batches.update(fields["request_ids"])
                         if not fields["layers"]:
                             raise ValueError("KT base has an empty forward observation")
+                        if formal.intersection(fields["request_ids"]):
+                            phases.add(fields["phase"])
+                    elif event["name"] == "runtime.kt.placement":
+                        placements += 1
         if (
             received != expected
             or sent != expected
@@ -230,6 +260,11 @@ class Capture(SerialHttpClient):
             raise ValueError(
                 f"KT request ports or forward counts are incomplete: received={received}, sent={sent}, batches={batches}"
             )
+        if placements != 1:
+            raise ValueError("KT capture requires one actual worker placement observation")
+        return [phase for phase in ("prefill", "decode") if phase in phases]
+
+    def publish_manifest(self, files, storage):
         write_json(
             self.directory / "profile_manifest.json",
             {
