@@ -144,19 +144,36 @@ class DeviceTask:
         if attempt["retained_bytes"] > self.settings.budget["retained_mib"] * 1024**2:
             attempt["limit_reached"] = "retained_mib"
         artifact = output / attempt["artifact"]
-        ready = code == 0 and artifact.exists() and read_json(artifact)["status"] == "completed"
-        attempt["status"] = "completed" if code == 0 and ready and "limit_reached" not in attempt else "failed"
+        document = read_json(artifact) if artifact.exists() else {}
+        reported = document.get("status")
+        missing_ports = set(attempt.get("required_measurement_ports", ())) - set(document.get("measurement_ports", ()))
+        if reported == "completed" and missing_ports:
+            reported = "measurement_incomplete"
+            attempt["issue"] = "Missing required measurement ports: " + ", ".join(sorted(missing_ports))
+        attempt["status"] = (
+            reported
+            if code == 0 and reported in {"completed", "resource_infeasible"} and "limit_reached" not in attempt
+            else "failed"
+        )
         if attempt["status"] == "completed":
             self.state[attempt["result_key"]] = str(artifact)
         write_json(self.state_path, self.state)
-        return {
+        result = {
             "status": attempt["status"],
             attempt["result_key"]: str(artifact) if attempt["status"] == "completed" else None,
             "capture_state": str(self.state_path),
             "log": str(output / "run.log"),
         }
+        if attempt["status"] == "resource_infeasible":
+            result.update(issue=document["issue"], resource_report=str(artifact))
+        elif "issue" in attempt:
+            result["issue"] = attempt["issue"]
+        return result
 
     def run(self, command: DeviceCommand) -> dict:
+        if command.device_count > len(self.settings.devices):
+            raise ValueError(f"This device task needs {command.device_count} declared devices")
+        self.runtime = AscendDevices(self.settings.devices[: command.device_count])
         remaining = self.remaining()
         if remaining["starts"] <= 0 or remaining["wall_sec"] <= 0:
             raise CaptureBudgetExceeded("Cumulative device-start or wall-time budget is exhausted; history is retained")
@@ -174,15 +191,30 @@ class DeviceTask:
             try:
                 self.state["waiting_for"] = "capture_slot"
                 write_json(self.state_path, self.state)
-                while True:
-                    try:
-                        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        left = deadline - time.monotonic()
-                        if left <= 0:
-                            raise CaptureBudgetExceeded("The cumulative budget was reached waiting for the device capture slot")
-                        time.sleep(min(2, left))
+                # The inherited open description keeps the acquired lock here;
+                # blocking waiters wake on release instead of missing short gaps.
+                waiter = subprocess.Popen(
+                    [
+                        "flock",
+                        "--exclusive",
+                        "--timeout",
+                        str(max(0, deadline - time.monotonic())),
+                        str(lease.fileno()),
+                    ],
+                    pass_fds=(lease.fileno(),),
+                )
+                try:
+                    code = waiter.wait()
+                    if code == 1:
+                        raise CaptureBudgetExceeded(
+                            "The cumulative budget was reached waiting for the device capture slot"
+                        )
+                    if code != 0:
+                        raise subprocess.CalledProcessError(code, waiter.args)
+                finally:
+                    if waiter.poll() is None:
+                        waiter.terminate()
+                        waiter.wait()
 
                 self.state["waiting_for"] = "idle_devices"
                 write_json(self.state_path, self.state)
@@ -215,6 +247,7 @@ class DeviceTask:
                 "artifact": command.artifact,
                 "usage_file": command.usage_file,
                 "result_key": command.result_key,
+                "required_measurement_ports": command.required_measurement_ports,
             }
             self.state["attempts"].append(attempt)
             write_json(self.state_path, self.state)

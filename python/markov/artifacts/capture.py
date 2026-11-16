@@ -35,6 +35,7 @@ class DeviceCommand:
     usage_file: str | None = None
     measurement_adapter: str | None = None
     required_measurement_ports: tuple[str, ...] = ()
+    device_count: int = 1
 
 
 @dataclass(frozen=True)

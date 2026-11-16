@@ -27,6 +27,7 @@ struct OperationEvidence {
     Component owner;
     std::optional<Action> completion;
     std::optional<planning::OperationPosition> position;
+    std::optional<std::size_t> source_cost_exclusion;
 };
 
 struct ProgramResult {

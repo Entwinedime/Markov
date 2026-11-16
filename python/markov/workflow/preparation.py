@@ -103,7 +103,9 @@ class PerformancePreparation:
                 }
                 path = self.directory / f"tp{deployment.tensor_parallel}" / "maintenance.json"
                 write_json(path, raw)
-                result = maintain_performance(path)
+                result = maintain_performance(path, extend_coverage=True)
+                raw["responses"] = result["trained_responses"]
+                write_json(path, raw)
                 models = Path(result["models"])
             finally:
                 self.task.record_processing(time.monotonic() - begin)

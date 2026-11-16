@@ -13,11 +13,13 @@ performance.database 指向已维护的性能库，或用 performance.models 显
 数据库只在准备阶段按目标部署读取现行选择，分别导出小型只读模型；混合 TP 目标使用同一数据库。显式 models 文件用于单一目标部署，不能混装多个 TP。报告的 models 按 TP 列出实际选择，各 cell 给出有效 deployment。预测容器不打开数据库，不自动训练未选中的原始记录。
 可选 performance.sampling_budget 声明整组共享补采的六项累计预算，需要同时提供 database 和 execution.capture。
 没有现行模型时可从空库开始；只有实际成本查询发现缺口才补采，维护后重新执行目标，绝不填零遍历分支。
+已有库缺少某个目标部署的模型时，该目标仍进行结构与资源检查，分别报告缺成本或不可行；不因一个部署没有模型就让整组提前退出。没有补采预算时只报告缺口。
 execution.kernel_cache_initial_state 必须为 empty 或 prepared。
 empty/prepared 是声明的初始条件，不是自动检测结果。输入准备另按原生工作规格记录新准备数量；
 首次 phase 仍覆盖未细分的初次准备，不能保证还原全部编译器或驱动缓存状态。
 
-当前要求同平台、框架、runtime、模型与 dtype；SGLang/Qwen3 BF16 可声明同机 TP=1↔2 目标。输入保持串行、ignore_eos=true，以及与 base 一致的输出数量和 formal_begin_index；实际资格以工作流记录为准。
+当前要求同平台、框架、runtime、模型与 dtype；SGLang/Qwen3 BF16 的目标规则接收同机 TP1／2／4／8，具体模型仍受部署容量及成本覆盖约束。8B 已有上述 TP 的有限实验，32B 扩展的正常评分仍在进行，不能据此推定任意配置精度。输入保持串行、ignore_eos=true，以及与 base 一致的输出数量和 formal_begin_index；实际资格以工作流记录为准。
+改变 TP 时，在目标中填写 deployment.tensor_parallel，例如 {"name":"tp4","deployment":{"tensor_parallel":4},"configuration":{}}；采集设备列表须足以覆盖 base 和所有需要补采的目标，流程只为当前任务选择所需卡数。公共 SGLang 示例默认两张卡和 semantic 来源；模型路径、平台、镜像及预算须按实际部署填写，示例不默认占用八张卡。
 文本 prompt 需与采集原文相同，由 manifest 声明的配置取得实际 token，再核对源语义；预测不加载 tokenizer。
 采集配置没有保留实际编码时不能猜 token，已有 input_ids 仍直接核对源前缀。目标配置覆盖 base 对应字段，name 仅用于结果标识。
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
@@ -26,6 +28,8 @@ hicache_write_policy、hicache_io_backend、hicache_mem_layout，以及下述文
 设备容量还受 SGLang 的准入预留约束：页对齐后的输入加所需输出之外，再留一页，并满足严格小于池的条件。
 否则框架可能缩减输出，甚至无法入场；HTTP 成功也不代表完成了原工作量，采集另核对真实结束原因和固定输出数量。
 不满足时目标返回 resource_infeasible、HTTP 为 null，不生成假想的成功结果。显式采集的已知不可能请求在启动模型前拒绝。
+采集会先用短生命周期原生进程读取设备内存；未量化、未 CPU 卸载的 Qwen3 可按 checkpoint 字节判断权重下界。
+来源记录设备容量时，目标也检查权重分片加 KV 池的容量下界。通过只表示未被该下界排除，不能证明 workspace、通信缓冲或动态主机分配一定成功。
 当前区域预测不支持关闭 radix cache 的另一套调度分支。
 
 主机池按原生规则计算：先把设备 token 池向下对齐页大小，再以浮点 ratio 相乘并截断 token，
@@ -104,7 +108,11 @@ pricing 声明 device_gib_hour、host_gib_hour、storage_gib_hour 三项每 GiB�
 
 HiCache 预测单元提供 resource_reservation：device_kv_bytes_per_rank、host_kv_bytes_per_rank 来自原生池布局，包含 padding 及池内缓冲；
 有限文件缓存提供整组 storage_reserved_bytes，传输配额提供整组 bandwidth_bytes_per_sec。未声明有限文件容量或带宽时仍可预测，
-但七项资源计价返回 resource_accounting_unavailable，不填零报价。固定 device 预留按 rank、host 预留按组，覆盖权重、workspace 和池外缓冲。
+但七项资源计价返回 resource_accounting_unavailable，不填零报价。fixed_device_gib_per_rank 表示 base 部署的每 rank 非 KV 预留，
+fixed_host_gib 表示整组非 KV 主存预留。前者覆盖权重、workspace 和池外缓冲；跨 TP 时按模型参数分片调整权重部分，
+其余每 rank 余量保持用户声明。当前参数估计适用于无 attention bias 的 dense Qwen3/BF16，包含复制的归一化参数，
+不包含词表 padding 或运行时额外分配；预留仍须覆盖这些部分。缺少必要分片元数据时不为跨 TP 目标报价。
+声明的 base 非 KV 预留小于权重参数量时返回 resource_reservation_invalid，不能借负余量得出低价。
 
 费用包含三级预留容量与四向带宽。PCIe 两向为各 rank 独立全双工预留；文件两向共同收费量不超过 shared，
 按各向声明速率的比例分配共同资源份额。比如两向合计要求大于共同上限时，不能把共同服务全额重复收费。

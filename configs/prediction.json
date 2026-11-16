@@ -1,6 +1,6 @@
 {
   "deployment": {
-    "platform": "Ascend 910B",
+    "platform": "Ascend 910B3",
     "framework": "sglang",
     "runtime": "ascend",
     "model": "/path/to/local/model",
@@ -13,8 +13,8 @@
       "max_total_tokens": 4096,
       "max_prefill_tokens": 4096,
       "enable_hierarchical_cache": true,
-      "hicache_ratio": 1.2,
-      "hicache_write_policy": "write_back",
+      "hicache_ratio": 2.5,
+      "hicache_write_policy": "write_through_selective",
       "hicache_io_backend": "kernel_ascend",
       "hicache_mem_layout": "page_first_direct"
     }
@@ -28,8 +28,8 @@
         "max_total_tokens": 4096,
         "max_prefill_tokens": 4096,
         "enable_hierarchical_cache": true,
-        "hicache_ratio": 1.2,
-        "hicache_write_policy": "write_back",
+        "hicache_ratio": 2.5,
+        "hicache_write_policy": "write_through_selective",
         "hicache_io_backend": "kernel_ascend",
         "hicache_mem_layout": "page_first_direct"
       }
@@ -40,10 +40,11 @@
     "memory_limit_gib": 4,
     "kernel_cache_initial_state": "empty",
     "capture": {
-      "image": "markov-sglang:ubuntu22.04",
+      "image": "markov-rebuild-sglang:ubuntu22.04",
       "devices": [0, 1],
-      "memory_limit_gib": 120,
-      "cpus": 16,
+      "memory_limit_gib": 192,
+      "cpus": 8,
+      "detail": "semantic",
       "budget": {
         "starts": 2,
         "wall_sec": 600,
@@ -57,11 +58,11 @@
   "performance": {
     "database": "../data/performance.sqlite",
     "sampling_budget": {
-      "starts": 5,
-      "wall_sec": 900,
-      "requests": 64,
-      "input_tokens": 20000,
-      "output_tokens": 192,
+      "starts": 12,
+      "wall_sec": 3600,
+      "requests": 128,
+      "input_tokens": 200000,
+      "output_tokens": 1000,
       "retained_mib": 256
     }
   }

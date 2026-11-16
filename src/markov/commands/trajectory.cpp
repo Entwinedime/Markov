@@ -83,6 +83,11 @@ nlohmann::json generated_graph_report(const simulation::ProgramResult & result) 
                 { "type", "work" }
             };
             node["work"] = work_json(*work);
+            if (evidence.source_cost_exclusion)
+                node["origin"] = {
+                    {          "type",                "work_remainder" },
+                    { "observed_part", *evidence.source_cost_exclusion }
+                };
         }
         else if (const auto * gap = std::get_if<planning::SourceRegionGap>(&*evidence.work))
             node["origin"] = {

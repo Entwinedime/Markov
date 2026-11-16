@@ -466,7 +466,21 @@ void ProbeReader::observe_result(const ProbeEvent & event) {
     if (sent) {
         std::vector<Index> requests;
         for (const auto & request : args.at("request_ids")) requests.push_back(output_.name(request.get<std::string>()));
-        result_sends_[identity].push_back({ region, std::move(requests) });
+        const auto cpu = args.at("thread_cpu_ns").get<Time>();
+        if (cpu < 0) throw std::runtime_error("Send CPU service cannot be negative");
+        const auto cost = output_.cost_observations.size();
+        output_.cost_observations.push_back({
+            std::nullopt,
+            0,
+            std::nullopt,
+            "transport",
+            { { "response.send", "pyzmq.Socket.send_pyobj", "thread_cpu" }, { { "requests", static_cast<double>(requests.size()) } } },
+            cpu,
+            region,
+            std::nullopt,
+            false
+        });
+        result_sends_[identity].push_back({ region, std::move(requests), cost });
         return;
     }
     if (run) {

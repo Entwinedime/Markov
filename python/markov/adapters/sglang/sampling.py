@@ -19,6 +19,8 @@ def capture_command(deployment: Deployment, configuration: dict, workload: dict,
         required_ports = ("prefetch.query",)
     elif adapter == "sglang_regions":
         required_ports = ("region.stream.input_metadata",)
+    elif adapter == "sglang_scheduler":
+        required_ports = ("region.scheduler_idle",)
     payload = {
         "deployment": asdict(deployment),
         "server": server_arguments(deployment, configuration),
@@ -41,6 +43,7 @@ def capture_command(deployment: Deployment, configuration: dict, workload: dict,
         "workload_report.json",
         adapter,
         required_ports,
+        device_count=deployment.tensor_parallel,
     )
 
 
@@ -251,7 +254,8 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
 
     commands = []
     for page, pages in sorted(failed_load_pages.items()):
-        commands.append(failed_load_capture(deployment, page, pages))
+        maximum = max(pages, math.ceil(context["max_context_tokens"] / page))
+        commands.append(failed_load_capture(deployment, page, maximum))
     for page in sorted(control_pages):
         commands.append(_prefetch_capture(deployment, page, "wait_complete"))
         commands.append(_prefetch_capture(deployment, page, "best_effort"))
@@ -285,27 +289,29 @@ def sampling_commands(deployment: Deployment, report: dict, requirements: list[d
         commands.append(command)
     if scheduler_pages:
         page = min(scheduler_pages)
-        # Two alternating prefixes exceed both small pools; later requests
-        # exercise real pending file prefetch, rather than an artificial sleep.
+        pages = max(7, math.ceil(context["max_context_tokens"] / page))
+        # Three prefixes exceed the two-prefix host pool. Drain their backups
+        # before revisiting, so protected pages cannot shrink the file read.
         workload = {
             "requests": [
                 {
                     "prompt": None,
-                    "input_ids": [index % 2] * (7 * page + 1),
+                    "input_ids": [identity] * (pages * page + 1),
                     "max_new_tokens": 1,
                     "ignore_eos": True,
                     "return_logprob": False,
                 }
-                for index in range(4)
+                for identity in (0, 1, 2, 0, 1)
             ],
-            "formal_begin_index": 0,
+            "formal_begin_index": 3,
+            "drain_before_formal": True,
         }
         configuration = {
             "page_size": page,
-            "max_total_tokens": 10 * page,
-            "max_prefill_tokens": 8 * page,
+            "max_total_tokens": (pages + 3) * page,
+            "max_prefill_tokens": (pages + 1) * page,
             "enable_hierarchical_cache": True,
-            "hicache_ratio": 1.1,
+            "hicache_ratio": 2.0,
             "hicache_write_policy": "write_through",
             "hicache_storage_backend": "file",
             "hicache_storage_prefetch_policy": "wait_complete",

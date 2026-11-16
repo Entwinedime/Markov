@@ -230,6 +230,7 @@ struct HostControl {
 struct ResultSend {
     ObservedRegion region;
     std::vector<Index> requests;
+    Index cpu_cost;
 };
 
 struct BatchResult {

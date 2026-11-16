@@ -71,6 +71,10 @@ nlohmann::json prediction_report(const adapters::sglang::PreparedPrediction & in
             { "device_kv_bytes_per_rank", pool_bytes.device_per_rank },
             {   "host_kv_bytes_per_rank",   pool_bytes.host_per_rank }
         };
+        if (target.work_layout.contains("model_weight_bytes_per_rank")) {
+            reservation["model_weight_bytes_per_rank"] = target.work_layout.at("model_weight_bytes_per_rank");
+            reservation["base_model_weight_bytes_per_rank"] = target.work_layout.at("base_model_weight_bytes_per_rank");
+        }
         if (target.cache.storage && target.cache.storage->capacity_pages) {
             const auto extra = Json::parse(target.configuration.at("hicache_storage_backend_extra_config").get<std::string>());
             reservation["storage_reserved_bytes"] = extra.at("max_size").get<double>() * backend.participants;
@@ -299,6 +303,8 @@ nlohmann::json prediction_report(const adapters::sglang::PreparedPrediction & in
             "First-phase initialization remains an estimate. New input preparations use the adapter's specialization rules, not raw token lengths.",
             "Modeled parent waits use target readiness ports. Other source frontend/control intervals retain their opaque work and waits; unidentified "
             "probe overhead and changed control behavior remain uncertain.",
+            "Response handoff uses send entry, independently of caller return. Result CPU partitions the independent envelope around unchanged source "
+            "send service; fixed output payload and transferred transport latency remain approximations.",
             "Background file queries use a shared group-response lane and warm metadata costs; rank-return skew and file changes during a query remain "
             "approximate. File issue/check/accept use closed group responses; other frontend and radix lookup retain source residuals. Competing I/O/compute "
             "needs further validation.",

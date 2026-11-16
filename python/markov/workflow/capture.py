@@ -113,6 +113,7 @@ class InferenceCapture:
             else None,
             sum(row.max_new_tokens for row in workload.requests),
             "workload_report.json",
+            device_count=self.request.deployment.tensor_parallel,
         )
         return task.run(command)
 

@@ -26,6 +26,7 @@ public:
     explicit Queries(const Models & models, const source::SourceContext * source = nullptr, const source::CpuCosts * cpu_costs = nullptr);
     const Response & query(const planning::Work & work);
     const Response & query_observation(const planning::Work & work, std::size_t observation);
+    const Response & query_remainder(const planning::Work & whole, std::size_t observed_part);
     const Response & query_source(const planning::Work & work, std::size_t observation, std::size_t resource);
     const Response & query_region_gap(std::size_t interval);
     const Response & query_client_delay(std::size_t request, planning::ClientInterval interval);
@@ -55,6 +56,7 @@ private:
     bool source_costs_prepared_ = false;
     std::map<planning::Work, Response> responses_;
     std::map<std::size_t, Response> observed_responses_;
+    std::map<std::pair<planning::Work, std::size_t>, Response> remainders_;
     std::set<std::size_t> limited_models_;
     std::vector<std::optional<Response>> source_responses_;
     std::map<std::size_t, Response> region_gaps_;

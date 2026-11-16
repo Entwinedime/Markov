@@ -345,7 +345,14 @@ function results(box, report) {
         text(
             box,
             "p",
-            "部分配置没有声明完整的存储或带宽配额。耗时预测已保留，但目前无法计算资源费用或完成排序；请补充资源声明。",
+            "部分配置缺少完整的容量、带宽或跨 TP 权重分片信息。耗时预测已保留，但目前无法计算资源费用或完成排序；请检查结果中的资源说明。",
+            "notice",
+        );
+    if (rows.some((row) => row.status === "resource_reservation_invalid"))
+        text(
+            box,
+            "p",
+            "声明的 base 非 KV 显存预留小于模型权重本身。请增加这项预留，并计入运行缓冲；这些配置没有参与费用排序。",
             "notice",
         );
     rows.filter((row) => row.issue).forEach((row) =>
@@ -539,7 +546,7 @@ async function init() {
     $("load-template").onclick = () => fill(templates[$("framework").value]);
     $("policy").value = pretty({
         baseline: targetRows[0].name,
-        fixed_device_gib_per_rank: 20,
+        fixed_device_gib_per_rank: 48,
         fixed_host_gib: 8,
         maximum_time_ratio: 1.1,
         resource_plans: [

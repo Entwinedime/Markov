@@ -440,8 +440,19 @@ void RegionCompute::submit_result(ProgramRuntime & runtime, std::size_t id) {
                               { { *frame.result_control, begin, graph::EdgeKind::DataDependency } } };
     for (const auto peer : groups_[frame.group]) mutation.dependencies.push_back({ *stats_.frames[peer].completed, begin, graph::EdgeKind::DataDependency });
     if (frame.sends) {
+        const auto & sends = source_.frame_result(frame.description.source_frame)->final_sends;
+        if (sends.size() != 1) {
+            issue_ = "semantic_final_send_partition_unavailable";
+            return;
+        }
+        const auto cost = sends.front().cpu_cost;
+        mutation.operations.front().source_cost_exclusion = cost;
+        const auto & body = source_.observations().cost_observations[cost];
+        mutation.operations.push_back({ frame.caller, std::cref(body.work) });
+        mutation.operations.back().source_cost = cost;
         mutation.operations.push_back({ frame.caller, std::cref(frame.result_tail), action(ActionKind::ResultDone, id) });
         mutation.dependencies.push_back({ begin, begin + 1, graph::EdgeKind::DataDependency });
+        mutation.dependencies.push_back({ begin + 1, begin + 2, graph::EdgeKind::DataDependency });
     }
     identify(runtime, mutation, frame, "result");
     if (runtime.submit(std::move(mutation))) stats_.frames[id].callers_entry = begin;

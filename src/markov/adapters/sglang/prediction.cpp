@@ -18,6 +18,21 @@ std::size_t positive(const Json & raw, const char * name) {
     return value;
 }
 
+std::size_t qwen3_weight_bytes_per_rank(const Json & model, std::size_t participants) {
+    const auto hidden = positive(model, "hidden_size");
+    const auto dim = positive(model, "head_dim");
+    const auto layers = positive(model, "num_hidden_layers");
+    const auto q_heads = positive(model, "num_attention_heads");
+    const auto kv_heads = positive(model, "num_key_value_heads");
+    const auto ffn = positive(model, "intermediate_size");
+    const auto embeddings = model.value("tie_word_embeddings", false) ? 1u : 2u;
+    const auto sharded = embeddings * positive(model, "vocab_size") * hidden + layers * (2 * hidden * (q_heads + kv_heads) * dim + 3 * hidden * ffn);
+
+    // Q/K head norms, layer norms and the final norm remain replicated.
+    const auto replicated = layers * (2 * dim + 2 * hidden) + hidden;
+    return 2 * (sharded / participants + replicated);
+}
+
 } // namespace
 
 PreparedPrediction prepare_prediction(const Json & raw, trace_graph::source::ProfileManifest manifest) {
@@ -43,6 +58,9 @@ PreparedPrediction prepare_prediction(const Json & raw, trace_graph::source::Pro
     const auto captured = Json::parse(config);
     if (captured.at("deployment") != raw.at("deployment")) throw std::runtime_error("Base capture belongs to a different deployment");
     const auto & base = captured.at("server").at("arguments");
+    const bool quantized =
+        !base.value("quantization", Json(nullptr)).is_null()
+        || (captured.contains("model_configuration") && !captured.at("model_configuration").value("quantization_config", Json(nullptr)).is_null());
     if (base.value("disable_radix_cache", false))
         throw std::runtime_error("Regional prediction requires an active radix cache; cache-disabled scheduling is not restored");
     const std::set<std::string> variable{ "page_size",
@@ -119,6 +137,7 @@ PreparedPrediction prepare_prediction(const Json & raw, trace_graph::source::Pro
     const auto & observations = source.context.observations();
     const auto cache_backend = sglang::cache_backend(source.context);
     const auto source_participants = deployment.at("tensor_parallel").get<std::size_t>();
+    const std::set<std::size_t> supported_tp{ 1, 2, 4, 8 };
     std::set<std::size_t> observed_ranks;
     for (const auto & frame : observations.compute_frames) {
         if (!frame.participant || *frame.participant >= source_participants)
@@ -135,24 +154,34 @@ PreparedPrediction prepare_prediction(const Json & raw, trace_graph::source::Pro
             { "local_kv_bytes_per_token",                                                              target.backend.bytes_per_token },
             { "communication_cost_scope", "Embedded in the target-deployment batch stream response; no additional communication cost" }
         };
+        if (captured.contains("model_configuration")) {
+            const auto & model = captured.at("model_configuration");
+            if (model.value("model_type", "") == "qwen3" && deployment.at("dtype") == "bfloat16" && !model.value("attention_bias", false) && !quantized
+                && base.value("cpu_offload_gb", 0.0) == 0) {
+                target.work_layout.update({
+                    { "model_weight_bytes_per_rank", qwen3_weight_bytes_per_rank(model, target.backend.participants) },
+                    { "base_model_weight_bytes_per_rank", qwen3_weight_bytes_per_rank(model, source_participants) },
+                    { "model_weight_scope", "Dense BF16 parameter payload; excludes vocabulary padding, runtime buffers and workspace" }
+                });
+            }
+        }
         if (!target.regions.transfer_source_control) {
             if (!captured.contains("model_configuration")) throw std::runtime_error("Cross-TP prediction needs model_configuration from the base capture");
             const auto & model = captured.at("model_configuration");
             if (model.at("model_type") != "qwen3" || deployment.at("dtype") != "bfloat16")
                 throw std::runtime_error("Cross-TP currently supports Qwen3 dense BF16 execution");
             if (base.value("dp_size", 1) != 1 || base.value("pp_size", 1) != 1 || base.value("enable_dp_attention", false)
-                || base.value("enable_dp_lm_head", false) || base.value("enable_lora", false)
-                || (base.contains("quantization") && !base.at("quantization").is_null()))
-                throw std::runtime_error("Cross-TP requires plain dense TP without DP, PP, LoRA or quantization");
+                || base.value("enable_dp_lm_head", false) || base.value("enable_lora", false) || quantized || base.value("cpu_offload_gb", 0.0) > 0)
+                throw std::runtime_error("Cross-TP requires plain dense TP without DP, PP, LoRA, quantization or CPU weight offload");
             const auto tp = target.backend.participants;
-            if (tp != 1 && tp != 2) throw std::runtime_error("Cross-TP is currently limited to same-host TP=1 or TP=2");
+            if (!supported_tp.contains(tp)) throw std::runtime_error("Cross-TP supports same-host TP=1, 2, 4 or 8");
             const auto heads = positive(model, "num_attention_heads");
             const auto kv_heads = positive(model, "num_key_value_heads");
             const auto dim = positive(model, "head_dim");
             if (heads % tp || kv_heads % tp || positive(model, "intermediate_size") % tp || positive(model, "vocab_size") % tp)
                 throw std::runtime_error("Target TP must divide Qwen3 attention and feed-forward shards; replicated KV is not restored");
             const auto source_tp = deployment.at("tensor_parallel").get<std::size_t>();
-            if (source_tp != 1 && source_tp != 2) throw std::runtime_error("Cross-TP source is currently limited to same-host TP=1 or TP=2");
+            if (!supported_tp.contains(source_tp)) throw std::runtime_error("Cross-TP source supports same-host TP=1, 2, 4 or 8");
             const auto bytes = positive(model, "num_hidden_layers") * kv_heads * dim * 2 * 2;
             if (bytes / source_tp != cache_backend.bytes_per_token) throw std::runtime_error("Captured KV geometry disagrees with model_configuration");
             target.backend.bytes_per_token = bytes / tp;
@@ -184,6 +213,15 @@ PreparedPrediction prepare_prediction(const Json & raw, trace_graph::source::Pro
                                                           target.cache.device_pages,
                                                           target.cache.host_pages,
                                                           target.page_tokens * target.backend.bytes_per_token);
+        if (captured.contains("device_memory") && target.work_layout.contains("model_weight_bytes_per_rank")) {
+            std::size_t capacity = 0;
+            for (const auto & device : captured.at("device_memory").at("devices")) capacity = std::max(capacity, device.at("total_bytes").get<std::size_t>());
+            const auto pool = sglang::cache_pool_bytes(target.cache, target.page_tokens, target.backend.bytes_per_token);
+            const auto required = target.work_layout.at("model_weight_bytes_per_rank").get<std::size_t>() + pool.device_per_rank;
+            target.work_layout["observed_device_capacity_bytes"] = capacity;
+            if (required > capacity)
+                target.infeasible = "Weights and KV pool alone exceed the observed device capacity; runtime workspace requires additional memory";
+        }
     }
     if (observations.counts.contains("schedule_input_facts.unsupported"))
         throw std::runtime_error("Regional prediction currently supports plain eager inputs without speculative, multimodal or logprob branches");

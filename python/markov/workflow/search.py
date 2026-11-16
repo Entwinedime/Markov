@@ -143,7 +143,26 @@ class SearchPolicy:
                 rows.append(row)
                 continue
 
-            device = self.fixed_device_gib_per_rank + reservation["device_kv_bytes_per_rank"] / GIB
+            fixed_device = self.fixed_device_gib_per_rank
+            if "model_weight_bytes_per_rank" in reservation:
+                base_weights = reservation["base_model_weight_bytes_per_rank"] / GIB
+                if fixed_device < base_weights:
+                    row.update(
+                        status="resource_reservation_invalid",
+                        issue="The declared base non-KV reservation is smaller than its model weight payload",
+                    )
+                    rows.append(row)
+                    continue
+                fixed_device += reservation["model_weight_bytes_per_rank"] / GIB - base_weights
+            elif participants != prediction["deployment"]["tensor_parallel"]:
+                row.update(
+                    status="resource_accounting_unavailable",
+                    issue="Cross-TP resource ranking requires model weight partition metadata",
+                )
+                rows.append(row)
+                continue
+
+            device = fixed_device + reservation["device_kv_bytes_per_rank"] / GIB
             host = self.fixed_host_gib + participants * reservation["host_kv_bytes_per_rank"] / GIB
             row.update(device_reserved_gib_per_rank=device, host_reserved_gib=host)
             device_total = participants * device
@@ -154,7 +173,7 @@ class SearchPolicy:
                 device_kv_gib=participants * reservation["device_kv_bytes_per_rank"] / GIB,
                 host_kv_gib=participants * reservation["host_kv_bytes_per_rank"] / GIB,
                 fixed_storage_hourly_cost_units=(
-                    participants * self.fixed_device_gib_per_rank * self.pricing.device_gib_hour
+                    participants * fixed_device * self.pricing.device_gib_hour
                     + self.fixed_host_gib * self.pricing.host_gib_hour
                 ),
                 hourly_cost_units=hourly,

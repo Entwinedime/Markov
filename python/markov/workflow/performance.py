@@ -42,7 +42,7 @@ Points = list[tuple[dict[str, float], float]]
 
 
 def select_models(
-    deployment: Deployment, models: Path | None, database: Path | None, output: Path, allow_empty: bool = False
+    deployment: Deployment, models: Path | None, database: Path | None, output: Path, allow_create: bool = False
 ) -> Path:
     """Export the maintained selection; prediction neither fits nor opens SQLite."""
     if models is not None:
@@ -50,7 +50,7 @@ def select_models(
         return models
     if database is None:
         raise ValueError("Prediction needs performance.models or a maintained performance.database")
-    if allow_empty:
+    if allow_create:
         database.parent.mkdir(parents=True, exist_ok=True)
     else:
         database.stat()
@@ -59,8 +59,6 @@ def select_models(
         selected = store.selected_models(asdict(deployment))
     finally:
         store.close()
-    if selected is None and not allow_empty:
-        raise ValueError("The performance database has no maintained models for this deployment")
     if selected is None:
         selected = {"deployment": asdict(deployment), "models": []}
 
@@ -266,7 +264,7 @@ def train_response(kind: tuple[str, str, str], recipe: dict, samples: Points, so
     }
 
 
-def maintain_performance(path: Path) -> dict:
+def maintain_performance(path: Path, *, extend_coverage: bool = False) -> dict:
     raw = maintenance_document(path)
     database = Path(raw["database"])
     deployment = raw["deployment"]
@@ -334,11 +332,11 @@ def maintain_performance(path: Path) -> dict:
             recipes.update(
                 (kind, recipe)
                 for kind, recipe in ADAPTERS[adapter_name].recipes(metadata).items()
-                if responses is None or kind in responses
+                if responses is None or kind in responses or extend_coverage
             )
             for operation, implementation, scope, features, duration in samples:
                 kind = (operation, implementation, scope)
-                if responses is not None and kind not in responses:
+                if responses is not None and kind not in responses and not extend_coverage:
                     continue
 
                 if kind in conditions and conditions[kind] != current:
@@ -347,6 +345,19 @@ def maintain_performance(path: Path) -> dict:
                 grouped.setdefault(kind, []).append((features, duration))
                 sources.setdefault(kind, set()).add(capture.identity)
                 sample_count += 1
+        if responses is not None and extend_coverage:
+            # One capture can extend several related responses, not only the
+            # first missing operation that stopped the previous simulation.
+            for model in selected["models"]:
+                kind = tuple(model[key] for key in ("operation", "implementation", "timing_scope"))
+                if any(
+                    value < model["ranges"][name][0] or value > model["ranges"][name][1]
+                    for features, _ in grouped.get(kind, [])
+                    for name, value in features.items()
+                ):
+                    responses.add(kind)
+            recipes = {kind: recipe for kind, recipe in recipes.items() if kind in responses}
+            sample_count = sum(len(grouped.get(kind, [])) for kind in recipes)
         trained = [
             train_response(kind, recipe, grouped.get(kind, []), sorted(sources.get(kind, set())))
             for kind, recipe in recipes.items()
@@ -374,6 +385,9 @@ def maintain_performance(path: Path) -> dict:
         "training_captures": len(training),
         "training_samples": sample_count,
         "trained_models": len(trained),
+        "trained_responses": [
+            {key: model[key] for key in ("operation", "implementation", "timing_scope")} for model in trained
+        ],
         "selected_models": len(by_kind),
         "models": str(output) if output else None,
         "qualification": "Offline fit from explicitly selected independent captures; not held-out or E2E accuracy evidence",

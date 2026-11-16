@@ -31,6 +31,27 @@ const Response & Queries::query_observation(const planning::Work & work, std::si
         .first->second;
 }
 
+const Response & Queries::query_remainder(const planning::Work & whole, std::size_t observed_part) {
+    if (!source_) throw std::logic_error("Response partition requested without source evidence");
+    const auto key = std::pair(whole, observed_part);
+    const auto existing = remainders_.find(key);
+    if (existing != remainders_.end()) return existing->second;
+
+    auto result = query(whole);
+    const auto & part = source_->observations().cost_observations.at(observed_part);
+    if (part.duration_ns < 0 || part.work.kind.timing_scope != whole.kind.timing_scope)
+        throw std::logic_error("Response partition requires a nonnegative part with the same timing scope");
+    if (result.duration_ns) {
+        if (*result.duration_ns < part.duration_ns) {
+            result.status = Status::InvalidResponse;
+            result.duration_ns.reset();
+            result.coverage.reset();
+        }
+        else *result.duration_ns -= part.duration_ns;
+    }
+    return remainders_.emplace(key, std::move(result)).first->second;
+}
+
 void Queries::prepare_source_costs() {
     if (source_costs_prepared_) return;
 

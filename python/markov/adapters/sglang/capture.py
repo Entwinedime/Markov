@@ -189,12 +189,53 @@ class Capture(SerialHttpClient):
         if profiling_requested or semantic:
             (self.directory / "probe").mkdir()
         requests = self.prepare_inputs()
+        from markov.adapters.ascend.memory import device_memory
+
+        devices = device_memory(self.plan["deployment"]["tensor_parallel"])
+        model_configuration = read_json(Path(self.plan["server"]["model_path"]) / "config.json")
+        index = Path(self.plan["server"]["model_path"]) / "model.safetensors.index.json"
+        lower_bound = None
+        if (
+            model_configuration.get("model_type") == "qwen3"
+            and model_configuration.get("torch_dtype", model_configuration.get("dtype"))
+            == self.plan["deployment"]["dtype"]
+            and not self.plan["server"].get("quantization")
+            and not model_configuration.get("quantization_config")
+            and not self.plan["server"].get("cpu_offload_gb", 0)
+            and index.is_file()
+        ):
+            lower_bound = read_json(index)["metadata"]["total_size"] / self.plan["deployment"]["tensor_parallel"]
+        memory = {
+            "devices": devices,
+            "weight_lower_bound_bytes_per_rank": lower_bound,
+            "qualification": "Before-load allocatable memory; passing the weight bound does not prove KV/workspace feasibility",
+        }
+        if lower_bound is not None and any(row["free_bytes"] < lower_bound for row in devices):
+            artifact = (
+                "profile_manifest.json"
+                if profiling_requested or semantic
+                else "file_measurements.json"
+                if self.plan["environment"].get("MARKOV_FILE_MEASUREMENTS")
+                else "region_measurements.json"
+                if self.plan["calibration"]
+                else "normal_observation.json"
+            )
+            write_json(
+                self.directory / artifact,
+                {
+                    "status": "resource_infeasible",
+                    "memory": memory,
+                    "issue": "Unquantized weight payload alone exceeds available device memory; no model loading attempted",
+                },
+            )
+            return
         command = [sys.executable, "-m", "markov.adapters.sglang.capture", "server", "--input", str(self.path)]
         write_json(
             self.directory / "config.json",
             {
                 "deployment": self.plan["deployment"],
-                "model_configuration": read_json(Path(self.plan["server"]["model_path"]) / "config.json"),
+                "model_configuration": model_configuration,
+                "device_memory": memory,
                 "workload": self.plan["workload"],
                 "server": {
                     "command": command,

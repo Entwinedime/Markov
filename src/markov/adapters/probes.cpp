@@ -27,7 +27,8 @@ void ProbeReader::record(std::size_t position, const nlohmann::json & raw) {
     const bool sent = event.name == "runtime.response.scheduler_send";
     if (received || sent) {
         const auto resource = output_.resource(ResourceKind::CpuThread, "cpu:" + event.process + ":" + event.thread);
-        const auto point = output_.point({ sent ? event.end_ns : event.begin_ns, resource, output_.name(event.name), event.record });
+        // The response can reach the client before send_pyobj returns.
+        const auto point = output_.point({ event.begin_ns, resource, output_.name(event.name), event.record });
         for (const auto & identity : event.args.at("request_ids")) {
             auto & ports = requests[identity.get<std::string>()];
             (sent ? ports.sent : ports.received).push_back(point);

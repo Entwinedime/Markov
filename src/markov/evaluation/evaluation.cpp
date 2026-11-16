@@ -40,6 +40,7 @@ struct Measurement {
 };
 
 std::optional<Address> address(const Json & node) {
+    if (node.at("origin").at("type") == "work_remainder") return std::nullopt;
     if (node.at("origin").at("type") == "source_client") {
         const auto & origin = node.at("origin");
         return Address{ origin.at("request").get<std::size_t>(), 0, std::nullopt, origin.at("interval").get<std::string>(), std::nullopt };
@@ -202,7 +203,8 @@ Json report(const PreparedEvaluation & input) {
         const auto & key = addresses[id];
         const auto candidates = key ? measured.find(*key) : measured.end();
         std::string issue;
-        if (!key) issue = "semantic_address_unavailable";
+        if (node.at("origin").at("type") == "work_remainder") issue = "partitioned_response_not_directly_observed";
+        else if (!key) issue = "semantic_address_unavailable";
         else if (key->work && !key->participant) issue = "participant_unobserved";
         else if (counts.at(*key) != 1) issue = "ambiguous_predicted_address";
         else if (candidates == measured.end()) issue = "target_work_or_scope_unobserved";

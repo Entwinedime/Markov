@@ -66,6 +66,8 @@ struct PlannedOperation {
     std::optional<BandwidthReservation> reservation = std::nullopt;
     // A closed observed response is reusable only with the same work variables.
     std::optional<std::size_t> source_cost = std::nullopt;
+    // A modeled envelope can be partitioned around an unchanged observed part.
+    std::optional<std::size_t> source_cost_exclusion = std::nullopt;
 };
 
 struct PlannedMutation {

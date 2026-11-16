@@ -68,6 +68,7 @@ def sampling_commands(deployment, report, requirements):
                 "workload_report.json",
                 "ktransformers_regions",
                 ("runtime.kt.batch",),
+                device_count=deployment.tensor_parallel,
             )
         )
     return commands

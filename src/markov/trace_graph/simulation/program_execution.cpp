@@ -27,7 +27,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
     for (const auto & operation : mutation.operations) {
         const cost::Response * response = nullptr;
         if (const auto * work = std::get_if<std::reference_wrapper<const planning::Work>>(&operation.cost)) {
-            if (operation.source_cost) response = &costs_.query_observation(work->get(), *operation.source_cost);
+            if (operation.source_cost_exclusion) response = &costs_.query_remainder(work->get(), *operation.source_cost_exclusion);
+            else if (operation.source_cost) response = &costs_.query_observation(work->get(), *operation.source_cost);
             else if (operation.source_native_work) response = &costs_.query_source_work(work->get(), *operation.source_native_work, operation.resource);
             else if (operation.source_operation) response = &costs_.query_source(work->get(), *operation.source_operation, operation.resource);
             else response = &costs_.query(work->get());
@@ -72,7 +73,8 @@ std::optional<graph::NodeId> ProgramExecution::submit(planning::PlannedMutation 
                                  response ? response->coverage : std::nullopt,
                                  operation.owner.value_or(mutation.owner),
                                  operation.completion,
-                                 operation.position });
+                                 operation.position,
+                                 operation.source_cost_exclusion });
     }
     if (!gaps_.empty()) {
         clock_.stop();
