@@ -17,6 +17,14 @@ const labels = {
     preparing_costs: "准备独立成本",
     capture_slot: "等待串行采集名额",
     idle_devices: "等待空闲设备",
+    predicted: "已预测",
+    ranked: "可参与选择",
+    missing_costs: "缺少成本数据",
+    resource_infeasible: "资源不足",
+    resource_envelope_exceeded: "超过资源上限",
+    resource_accounting_unavailable: "缺少资源信息",
+    resource_reservation_invalid: "资源预留不合理",
+    structure_unavailable: "执行结构尚不支持",
 };
 let token,
     templates,
@@ -165,6 +173,33 @@ function showTargets() {
     $("target-json").value = pretty(targetRows);
 }
 
+function defaultPolicy(request) {
+    const common = { baseline: request.targets[0].name, maximum_time_ratio: 1.1 };
+    if (request.deployment.framework === "ktransformers")
+        return {
+            ...common,
+            objective: "minimum_time",
+            resource_limits: { cpu_threads: 64, numa_pools: 8 },
+        };
+    return {
+        ...common,
+        fixed_device_gib_per_rank: 48,
+        fixed_host_gib: 8,
+        resource_plans: [
+            { name: "local", device_gib_per_rank: 64, host_gib: 128 },
+        ],
+        pricing: {
+            device_gib_hour: 8,
+            host_gib_hour: 1,
+            storage_gib_hour: 0.05,
+            device_to_host_gibps_hour: 1,
+            host_to_device_gibps_hour: 1,
+            host_to_storage_gibps_hour: 1,
+            storage_to_host_gibps_hour: 1,
+        },
+    };
+}
+
 function fill(request) {
     current = structuredClone(request);
     ["model", "platform", "framework", "runtime", "dtype"].forEach(
@@ -196,6 +231,11 @@ function fill(request) {
     $("request-json").value = pretty(request);
     targetRows = structuredClone(request.targets);
     showTargets();
+    $("policy").value = pretty(defaultPolicy(request));
+    $("search-section").querySelector("summary").textContent =
+        request.deployment.framework === "ktransformers"
+            ? "资源上限与耗时选择"
+            : "搜索约束与七项资源价格";
 }
 
 function form() {
@@ -345,7 +385,7 @@ function results(box, report) {
         text(
             box,
             "p",
-            "部分配置缺少完整的容量、带宽或跨 TP 权重分片信息。耗时预测已保留，但目前无法计算资源费用或完成排序；请检查结果中的资源说明。",
+            "部分配置缺少当前排序所需的资源信息。耗时预测已保留；请检查结果中的具体缺项和资源声明。",
             "notice",
         );
     if (rows.some((row) => row.status === "resource_reservation_invalid"))
@@ -372,23 +412,24 @@ function results(box, report) {
         text(
             box,
             "p",
-            `时间约束下的成本选择：${report.selected || "无可行结果"}；最快：${report.fastest || "无"}。`,
+            `${report.objective === "minimum_time" ? "资源限制内的耗时选择" : "时间约束下的成本选择"}：${report.selected || "无可行结果"}；最快：${report.fastest || "无"}。`,
         );
     const wrap = document.createElement("div");
     wrap.className = "table-scroll";
     box.append(wrap);
+    const kt = rows[0]?.deployment?.framework === "ktransformers";
+    const priced = report.candidates && report.objective !== "minimum_time";
     function draw() {
         wrap.replaceChildren();
         const table = document.createElement("table"),
             head = document.createElement("tr");
         [
             "配置",
-            "TP",
+            ...(kt ? ["CPU 线程", "NUMA 池", "NPU 驻留／CPU 卸载专家（每层）"] : ["TP"]),
             "状态",
             "完整 HTTP（秒）",
             "相对基准",
-            "每小时资源权重",
-            "窗口资源权重",
+            ...(priced ? ["每小时资源权重", "窗口资源权重"] : []),
         ].forEach((name) => text(head, "th", name));
         table.append(head);
         const base = rows.find((row) => row.name === select.value),
@@ -398,16 +439,18 @@ function results(box, report) {
                 seconds = row.predicted_sec ?? row.formal_http_sec;
             const number = (value) =>
                 value == null ? "—" : Number(value).toFixed(3);
+            const work = row.work_layout || row.resource_reservation || {};
             [
                 row.name,
-                row.deployment?.tensor_parallel ?? "—",
-                row.status,
+                ...(kt
+                    ? [work.cpu_threads ?? "—", work.numa_pools ?? "—", `${work.resident_experts_per_layer ?? "—"}／${work.cpu_experts_per_layer ?? "—"}`]
+                    : [row.deployment?.tensor_parallel ?? "—"]),
+                labels[row.status] || row.status,
                 number(seconds),
                 baseTime && seconds != null
                     ? `${((seconds / baseTime - 1) * 100).toFixed(2)}%`
                     : "—",
-                number(row.hourly_cost_units),
-                number(row.window_cost_units),
+                ...(priced ? [number(row.hourly_cost_units), number(row.window_cost_units)] : []),
             ].forEach((value) => text(tr, "td", String(value)));
             table.append(tr);
         });
@@ -421,7 +464,15 @@ function results(box, report) {
         "耗时为完整正式 HTTP 预测。缺项或不支持保留其状态；这里没有正常实测，不能据此判断精度。",
         "hint",
     );
-    if (report.qualification) text(box, "p", report.qualification, "hint");
+    if (report.qualification)
+        text(
+            box,
+            "p",
+            report.objective === "minimum_time"
+                ? "只比较本次提供的候选，不计算资源费用。内存预留量不等于实测峰值，配置是否能部署仍需核对。"
+                : "资源费用按声明的容量、带宽和单价计算，不包含模型启动和完整账单。适用范围见下方完整结果。",
+            "hint",
+        );
     rawDetails(box, "成本缺口、资源与适用范围（完整结果）", report);
 }
 
@@ -544,24 +595,6 @@ async function init() {
     fill(templates.sglang);
     $("framework").onchange = showTargets;
     $("load-template").onclick = () => fill(templates[$("framework").value]);
-    $("policy").value = pretty({
-        baseline: targetRows[0].name,
-        fixed_device_gib_per_rank: 48,
-        fixed_host_gib: 8,
-        maximum_time_ratio: 1.1,
-        resource_plans: [
-            { name: "local", device_gib_per_rank: 64, host_gib: 128 },
-        ],
-        pricing: {
-            device_gib_hour: 8,
-            host_gib_hour: 1,
-            storage_gib_hour: 0.05,
-            device_to_host_gibps_hour: 1,
-            host_to_device_gibps_hour: 1,
-            host_to_storage_gibps_hour: 1,
-            storage_to_host_gibps_hour: 1,
-        },
-    });
     $("preview").onclick = () => safely(preview, $("preview"));
     $("start").onclick = () =>
         safely(async () => {

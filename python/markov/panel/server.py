@@ -201,6 +201,12 @@ class Handler(BaseHTTPRequestHandler):
                     fields = [
                         "name",
                         "status",
+                        "framework",
+                        "tensor_parallel",
+                        "cpu_threads",
+                        "numa_pools",
+                        "resident_experts_per_layer",
+                        "cpu_experts_per_layer",
                         "formal_http_sec",
                         "predicted_sec",
                         "hourly_cost_units",
@@ -209,7 +215,16 @@ class Handler(BaseHTTPRequestHandler):
                     stream = io.StringIO()
                     writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
                     writer.writeheader()
-                    writer.writerows(rows)
+                    for row in rows:
+                        layout = row.get("work_layout", {})
+                        writer.writerow(
+                            {
+                                **row,
+                                "framework": row.get("deployment", {}).get("framework"),
+                                "tensor_parallel": row.get("deployment", {}).get("tensor_parallel"),
+                                **{name: layout.get(name) for name in fields if name in layout},
+                            }
+                        )
                     self.send(
                         stream.getvalue().encode("utf-8-sig"),
                         content_type="text/csv; charset=utf-8",

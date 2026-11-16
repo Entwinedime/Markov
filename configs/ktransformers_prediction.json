@@ -20,7 +20,7 @@
   "workload": "workload.json",
   "targets": [
     {"name": "reference", "configuration": {}},
-    {"name": "fewer_cpu_threads", "configuration": {"kt_cpuinfer": 32}},
+    {"name": "fewer_cpu_threads", "configuration": {"kt_cpuinfer": 32, "kt_threadpool_count": 4}},
     {"name": "more_cpu_experts", "configuration": {"kt_num_gpu_experts": 24}}
   ],
   "performance": {

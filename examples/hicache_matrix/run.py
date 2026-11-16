@@ -306,7 +306,7 @@ class Matrix:
             request = self.request(base, workload, output, "source_budget")
             entry = {"base": base, "workload": workload}
             try:
-                source = InferenceCapture(request, record_regions=True).run(reuse=True)
+                source = InferenceCapture(request, record_regions=self.deployment.framework == "sglang").run(reuse=True)
                 entry["source"] = source
                 if source["status"] in {"completed", "reused"} and self.models is None:
                     prepared = predict(self.prediction_request(base, workload, source["manifest"], sampling=True))

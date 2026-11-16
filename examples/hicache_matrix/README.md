@@ -31,6 +31,10 @@ workload_inputs 可将 workload 名映射到已有正式 workload JSON，路径�
 normal_repetitions_by_workload 可按 workload、配置名预定参考条件的重复次数，其余使用 normal_repetitions；
 例如 `"revisit": {"tp2_resident": 3}`，以默认一次加少量预定重复控制实测量。未达到各条件声明次数时仍报告未完成。
 
+同一编排也接受 deployment.framework=ktransformers 的声明，使用正式 KT 采集、共享成本和预测入口；
+配置填原生 CPU 线程、线程池和驻留专家参数，workload_inputs 提供已编码请求，保持 HiCache 设置为空。
+每个 base 自动附带同配置预测，计入报告和正常复用；不为减少这些纯预测另建 KT 专用编排。
+
 扩展到完整面板，使用同一输出继续运行：
 
 ```bash
