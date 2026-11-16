@@ -9,11 +9,13 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from markov_adapters.artifacts import write_json
+from markov_adapters.sglang.configuration import CaptureInput
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
+from markov_workflow.prediction import SourceProductions
 
-from run import SourceProductions, WorkflowCommands
+from run import WorkflowCommands
 
 
 class MatrixRun:
@@ -130,10 +132,9 @@ class MatrixRun:
         if "source" in domain:
             source = domain["source"]
             collection = Path(source["collection"]).resolve(strict=True)
-            plan = Path(source["plan"]).resolve(strict=True)
 
             # Fixed-library validation checks its explicit original sources without planning or collecting from the new targets.
-            return {"id": name, "collection": str(collection), "source_kind": "fixed_library"} | self.source_evidence(name, collection, plan)
+            return {"id": name, "collection": str(collection), "source_kind": "fixed_library"} | self.source_evidence(name, collection)
         plan = self.root / "assets" / self.name / name / "plan"
         code = self.process(f"{name}/plan", self.commands.command(
             "plan-sources", "--input", self.root / domain["exploration"], "--output", plan,
@@ -161,14 +162,14 @@ class MatrixRun:
         if code:
             return result | {"status": "source-acquisition-failed"}
 
-        return result | self.source_evidence(name, collection, plan)
+        return result | self.source_evidence(name, collection)
 
-    def source_evidence(self, name, collection, plan):
-        published = SourceProductions(collection, plan)
+    def source_evidence(self, name, collection):
+        published = SourceProductions(collection)
         checks = []
         for job in published.plan["sources"]:
             identity = job["id"]
-            observation = CaptureProcess.published(published.captures[identity], json.loads((plan / job["source"]["input"]).read_text()))
+            observation = CaptureProcess.published(published.captures[identity], published.jobs[str(identity)])
             output = self.results / "sources" / name / str(identity)
             self.evaluate(f"{name}/source-evidence-{identity}", "source_evidence.py",
                           "--production", published.paths[identity], "--capture", observation, "--output", output)
@@ -177,6 +178,33 @@ class MatrixRun:
             checks.append({"job": identity, "report": str(path), "mapped": report is not None and self.mapped(report),
                            "native_group_status": None if report is None else report["native_case"]["status"]})
         return {"status": "ready" if all(row["mapped"] for row in checks) else "source-evidence-unqualified", "jobs": checks}
+
+    def prepare_targets(self, domains, sources, targets):
+        for domain in domains:
+            source = sources.get(domain["id"], {"status": "not-executed"})
+            published = SourceProductions(Path(source["collection"])) if source["status"] == "ready" else None
+            for case in domain["targets"]:
+                native = json.loads((self.root / case["capture_input"]).read_text())
+                prediction = json.loads((self.root / case["prediction_input"]).read_text())
+                serving = CaptureInput(native)
+                changed = [name for name in ("model", "instances", "workload") if native[name] != prediction[name]]
+                if changed:
+                    raise ValueError(f"{case['id']}: native and prediction inputs differ in {changed}")
+                if serving.submission_groups != [[request["id"] for request in serving.workload["requests"]]]:
+                    raise ValueError(f"{case['id']}: a target must submit the same request sequence as its prediction")
+
+                # A missing source is a separate finding; available libraries must use the real prediction assembly.
+                if published is not None:
+                    try:
+                        published.prepare(prediction)
+                    except ValueError as error:
+                        raise ValueError(f"{case['id']}: {error}") from error
+                target = targets.get(case["id"], {})
+                if "observation" in case or "native" in target:
+                    owner = self.root / case.get("observation", f"targets/{self.name}/{case['id']}/native")
+                    observation = CaptureProcess.published(owner, native)
+                    if "native" in target and observation != Path(target["native"]).resolve(strict=True):
+                        raise ValueError(f"{case['id']}: target report refers to a different native observation")
 
     def target(self, domain, case):
         name = case["id"]
@@ -284,6 +312,10 @@ class MatrixRun:
         with ExitStack() as contexts:
             lock = contexts.enter_context((self.steps / f".{phase}.lock").open("a"))
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if phase != "sources":
+
+                # Check the entire selected range before spending any native allowance or comparing unlike inputs.
+                self.prepare_targets(domains, sources, targets)
             needs_native = (phase == "sources" and any("source" not in domain for domain in domains)) or (phase == "targets" and any(
                 "observation" not in case for domain in domains for case in domain["targets"]
             ))

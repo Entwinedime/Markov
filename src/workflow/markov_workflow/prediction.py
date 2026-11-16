@@ -13,31 +13,31 @@ from markov_workflow.adapters.sglang_planning import SourcePlanning
 from markov_workflow.containers import OwnedContainers
 
 
-class PredictionProcess:
-    def __init__(self, arguments) -> None:
-        self.arguments = arguments
+class SourceProductions:
+    """Own the published source plan, native inputs and primary/local assembly."""
 
-    def run(self) -> None:
-        args = self.arguments
-        if not math.isfinite(args.timeout) or args.timeout <= 0:
-            raise ValueError("Prediction timeout must be positive")
-        deadline = time.monotonic() + args.timeout
-        source = json.loads(args.input.read_text())
-        collection = args.production.resolve(strict=True)
-        plan = json.loads((collection / "input.json").read_text())["plan"]
+    def __init__(self, collection):
+        collection = collection.resolve(strict=True)
+        inputs = json.loads((collection / "input.json").read_text())
+        self.plan, self.jobs = inputs["plan"], inputs["jobs"]
         publication = json.loads((collection / "result.json").read_text())
-        jobs = plan["sources"]
-        if len(publication["productions"]) != len(jobs):
-            raise ValueError("source collection omits a planned production")
-        primary = SourcePlanning.primary(plan, source)
-        local_sources = [job["id"] for job in jobs
+        jobs = self.plan["sources"]
+        if (not len(jobs) == len(publication["productions"]) == len(publication["captures"])
+                or self.jobs.keys() != {str(job["id"]) for job in jobs}):
+            raise ValueError("source publication does not match the planned source jobs")
+        self.paths = {job["id"]: collection / name for job, name in zip(jobs, publication["productions"], strict=True)}
+
+        # Explicit observations keep their original owners, which may live outside this collection.
+        self.captures = {job["id"]: collection / name for job, name in zip(jobs, publication["captures"], strict=True)}
+
+    def prepare(self, source):
+        primary = SourcePlanning.primary(self.plan, source)
+        local_sources = [job["id"] for job in self.plan["sources"]
                          if any(consumer["source"] == primary for consumer in job.get("local_consumers", []))]
-        selected = [primary, *local_sources]
-        paths = {job["id"]: collection / path for job, path in zip(jobs, publication["productions"], strict=True)}
         templates = []
         productions = []
-        for identity in selected:
-            directory = paths[identity].resolve(strict=True)
+        for identity in [primary, *local_sources]:
+            directory = self.paths[identity].resolve(strict=True)
             publication = json.loads((directory / "result.json").read_text())
             libraries = []
             for name in publication["templates"]:
@@ -48,6 +48,20 @@ class PredictionProcess:
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
         document = SGLangTask(productions[0], productions[1:]).document(source)
+        return templates, productions[0], document
+
+
+class PredictionProcess:
+    def __init__(self, arguments) -> None:
+        self.arguments = arguments
+
+    def run(self) -> None:
+        args = self.arguments
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("Prediction timeout must be positive")
+        deadline = time.monotonic() + args.timeout
+        source = json.loads(args.input.read_text())
+        templates, primary, document = SourceProductions(args.production).prepare(source)
         timing = args.execution_inputs.resolve(strict=True) if args.execution_inputs is not None else None
         binary = args.binary.resolve(strict=True)
         descriptions = {
@@ -56,7 +70,7 @@ class PredictionProcess:
             ))[0]
             for role, image in (("modeling", args.modeling_image), ("control", args.control_image))
         }
-        SourceDomain.require_control(descriptions["control"], productions[0])
+        SourceDomain.require_control(descriptions["control"], primary)
         images = {role: image["Id"] for role, image in descriptions.items()}
         output = args.output.resolve()
         output.mkdir(parents=True)

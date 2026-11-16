@@ -9,6 +9,7 @@ from markov_adapters.artifacts import write_json
 from markov_adapters.sglang.configuration import CaptureInput
 from markov_workload import WorkloadContent
 from markov_workload.expert_routes import ExpertRoutes
+from markov_workflow.prediction import SourceProductions
 
 
 class MatrixInputs:
@@ -100,6 +101,9 @@ class MatrixInputs:
     def run(self, phase):
         models = self.specification["models"]
         if phase == "targets":
+            sources = {domain["id"]: SourceProductions(Path(domain["source"]["collection"]))
+                       for domain in self.domains.values() if "source" in domain}
+            inputs = []
             for case in self.cases:
                 domain = self.domains[case["domain"]]
                 model = models[domain["model"]]
@@ -108,8 +112,15 @@ class MatrixInputs:
                 common = {"model": model["model"], "instances": configuration["instances"], "workload": workload}
                 native = {**common, "observe_all_workers": True}
                 CaptureInput(native)
+                prediction = {**common, "given_work_ns": 1}
+                if domain["id"] in sources:
+                    sources[domain["id"]].prepare(prediction)
+                inputs.append((case, native, prediction))
+
+            # A conflicting fixed source must not leave a partially published request draw.
+            for case, native, prediction in inputs:
                 self.publish(case["capture_input"], native)
-                self.publish(case["prediction_input"], {**common, "given_work_ns": 1})
+                self.publish(case["prediction_input"], prediction)
             self.publish(f"inputs/independent/{self.stage}/draw.json", {
                 "seed": self.seed, "cases": [case["id"] for case in self.cases],
                 "selection": self.specification["sampling"],

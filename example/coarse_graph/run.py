@@ -38,21 +38,6 @@ class WorkflowCommands:
         return command + [str(value) for value in arguments]
 
 
-class SourceProductions:
-    """Read the published finite collection and preserve primary/local assembly roles."""
-
-    def __init__(self, directory, plan):
-        self.plan = json.loads((plan / "plan.json").read_text())
-        publication = json.loads((directory / "result.json").read_text())
-        if not len(self.plan["sources"]) == len(publication["productions"]) == len(publication["captures"]):
-            raise ValueError("source publication does not match the planned source jobs")
-
-        self.paths = {job["id"]: directory / name
-                      for job, name in zip(self.plan["sources"], publication["productions"])}
-        self.captures = {job["id"]: directory / name
-                         for job, name in zip(self.plan["sources"], publication["captures"])}
-
-
 class ExplorationRun:
     def __init__(self, arguments):
         self.arguments = arguments
