@@ -31,6 +31,7 @@ def metrics(rows: list[dict]) -> dict:
         "scored_subset_wape_percent": wape,
         "p90_ape_percent": errors[math.ceil(0.9 * len(errors)) - 1] if complete else None,
         "maximum_ape_percent": max(errors) if complete else None,
+        "at_or_above_10_percent": sum(error >= 10 for error in errors) if complete else None,
         "signed_error_percent": 100 * sum(row["predicted_sec"] - row["normal_sec"] for row in scored) / total_normal_sec
         if complete
         else None,
@@ -45,7 +46,14 @@ def grouped_metrics(rows: list[dict], field: str) -> dict[str, dict]:
     return {name: metrics([row for row in rows if row[field] == name]) for name in sorted({row[field] for row in rows})}
 
 
-def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], set[str]], repetitions: int) -> dict:
+def write_report(
+    output: Path,
+    cases: list[dict],
+    groups: dict[tuple[str, str], set[str]],
+    repetitions: int,
+    condition_repetitions: dict[tuple[str, str], int],
+) -> dict:
+    declaration = read_json(output / "plan.json")
     predictions = read_json(output / "predictions.json")
     by_cell, group_status = {}, {}
     overhead = []
@@ -81,9 +89,21 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         {"panel": "self", "base": base, "workload": workload, "target": base} for base, workload in groups
     ]
     conditions = {(case["target"], case["workload"]) for case in all_cases}
-    completed_conditions = sum(key in normal and normal[key]["n"] >= repetitions for key in conditions)
+    completed_conditions = sum(key in normal and normal[key]["n"] >= condition_repetitions[key] for key in conditions)
     for case in all_cases:
         base, workload, target = case["base"], case["workload"], case["target"]
+        source_tp = declaration["configuration_deployments"][base]["tensor_parallel"]
+        target_tp = declaration["configuration_deployments"][target]["tensor_parallel"]
+        changed_configuration = declaration["configurations"][base] != declaration["configurations"][target]
+        change = (
+            "parallel_and_configuration"
+            if source_tp != target_tp and changed_configuration
+            else "parallel_only"
+            if source_tp != target_tp
+            else "configuration_only"
+            if changed_configuration
+            else "unchanged"
+        )
         cell = by_cell.get((base, workload, target))
         actual = normal.get((target, workload))
         predicted = cell["formal_http_sec"] if cell else None
@@ -91,6 +111,9 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         status = cell["status"] if cell else group_status.get((base, workload), "not_predicted")
         row = {
             **case,
+            "base_tp": source_tp,
+            "target_tp": target_tp,
+            "change": change,
             "status": status,
             "predicted_sec": predicted,
             "normal_sec": observed,
@@ -120,11 +143,19 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         "bases": grouped_metrics(cross, "base"),
         "workloads": grouped_metrics(cross, "workload"),
         "targets": grouped_metrics(cross, "target"),
+        "changes": grouped_metrics(cross, "change"),
+        "large_errors": sorted(
+            (row for row in rows if row["ape_percent"] is not None and row["ape_percent"] >= 10),
+            key=lambda row: -row["ape_percent"],
+        ),
         "statuses": dict(Counter(row["status"] for row in cross)),
         "models": predictions["models"],
         "formal_prediction_overhead": overhead,
         "qualification": "Complete formal HTTP including client intervals, gaps, unassigned control and Prefill/Decode. Warmup excluded by declared boundary. Normal samples are shared by target configuration/workload; self is separate. No refitting from scores.",
-        "normal_conditions": [{"configuration": key[0], "workload": key[1], **value} for key, value in normal.items()],
+        "normal_conditions": [
+            {"configuration": key[0], "workload": key[1], "required_repetitions": condition_repetitions[key], **value}
+            for key, value in normal.items()
+        ],
         "normal_coverage": {
             "expected_conditions": len(conditions),
             "completed_conditions": completed_conditions,
@@ -149,20 +180,37 @@ def write_report(output: Path, cases: list[dict], groups: dict[tuple[str, str], 
         return "—" if value is None else f"{value:.3f}"
 
     lines = [
-        "# HiCache 跨配置预测结果",
+        "# 配置变化预测结果",
         "",
         "计时取首个正式请求发出至最后一个正式响应结束，保留请求间隔、gap、未归属控制和 Prefill/Decode。",
         "",
         "正常实测按 target 配置与 workload 共享；同一实测被多个 base 引用，不代表多次独立采集。self 单独统计。",
-        f"每条件要求 {repetitions} 次正常实测，已满足 {completed_conditions}/{len(conditions)} 个条件；有单次评分不等于重复采集已完成。",
+        f"默认每条件 {repetitions} 次正常实测，预定参考条件可另加重复；已满足各自声明次数的条件为 {completed_conditions}/{len(conditions)}。",
         f"所引用采集账本累计 {sum(attempt_statuses.values())} 次尝试，其中 {attempt_statuses['failed']} 次失败；误差使用成功的完整 HTTP 窗口，续跑不会抹掉历史失败。",
+        f"同配置预测已评分 {summary['self']['scored']}/{summary['self']['expected']} 格，WAPE {number(summary['self']['wape_percent'])}%，最大 APE {number(summary['self']['maximum_ape_percent'])}%。",
+        f"已评分结果中有 {len(summary['large_errors'])} 格误差达到或超过 10%（含同配置）；完整列表保留在 results.json 的 large_errors 中。",
         "",
-        "| 面板 | 应有 cross | 已预测 | 已评分 | WAPE (%) | P90 APE (%) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| 面板 | 应有 cross | 已预测 | 已评分 | WAPE (%) | P90 APE (%) | 最大 APE (%) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for panel, values in summary["panels"].items():
         lines.append(
-            f"| {panel} | {values['expected']} | {values['predicted']} | {values['scored']} | {number(values['wape_percent'])} | {number(values['p90_ape_percent'])} |"
+            f"| {panel} | {values['expected']} | {values['predicted']} | {values['scored']} | {number(values['wape_percent'])} | {number(values['p90_ape_percent'])} | {number(values['maximum_ape_percent'])} |"
+        )
+    labels = {
+        "parallel_and_configuration": "同时改变 TP 和配置",
+        "parallel_only": "只改变 TP",
+        "configuration_only": "只改变配置",
+        "unchanged": "参数不变",
+    }
+    lines += [
+        "",
+        "| 变化类型 | 应有 cross | 已评分 | WAPE (%) | 最大 APE (%) |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for change, values in summary["changes"].items():
+        lines.append(
+            f"| {labels[change]} | {values['expected']} | {values['scored']} | {number(values['wape_percent'])} | {number(values['maximum_ape_percent'])} |"
         )
     if summary["cross"]["scored"] != summary["cross"]["expected"]:
         lines += ["", "仍有缺项，完整矩阵精度尚不能给出；JSON 中另列已评分子集指标，失败没有记为零或从格数中删除。"]

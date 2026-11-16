@@ -15,12 +15,19 @@ import tempfile
 import time
 import urllib.request
 
-from markov.artifacts.request import Deployment, PredictionRequest, read_json, resolve_path
+from markov.artifacts.request import (
+    Deployment,
+    PredictionRequest,
+    Target,
+    positive_integer,
+    read_json,
+    reject_unknown,
+    resolve_path,
+)
 from markov.artifacts.workload import Workload
 from markov.artifacts.writing import write_json
 from markov.workflow.capture import InferenceCapture
 from markov.workflow.device_task import DeviceTask
-from markov.workflow.performance import select_models
 from markov.workflow.prediction import predict
 
 from report import write_report
@@ -52,6 +59,20 @@ class Matrix:
             name: {**self.recipe["common_configuration"], **configuration}
             for name, configuration in self.recipe["configurations"].items()
         }
+        reject_unknown(
+            self.recipe.get("configuration_deployments", {}), set(self.configurations), "configuration_deployments"
+        )
+        self.deployments = {
+            name: Target.parse(
+                {
+                    "name": name,
+                    "configuration": {},
+                    "deployment": self.recipe.get("configuration_deployments", {}).get(name, {}),
+                },
+                self.deployment,
+            ).deployment
+            for name in self.configurations
+        }
         sets = {**self.recipe["configuration_sets"], "all": list(self.configurations)}
         self.panels = list(self.recipe["panels"]) if args.panel == "all" else [args.panel]
         self.cells, self.groups = [], defaultdict(set)
@@ -72,6 +93,19 @@ class Matrix:
         for name in set(self.configurations) | {workload for _, workload in self.groups}:
             if name in {".", ".."} or Path(name).name != name:
                 raise ValueError("Experiment identifiers must be single path components")
+        self.conditions = sorted({(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups))
+        overrides = self.recipe.get("normal_repetitions_by_workload", {})
+        reject_unknown(overrides, {workload for _, workload in self.conditions}, "normal_repetitions_by_workload")
+        for workload, counts in overrides.items():
+            reject_unknown(counts, {name for name, work in self.conditions if work == workload}, "normal repetitions")
+        self.normal_counts = {
+            (name, workload): positive_integer(
+                overrides.get(workload, {}).get(name, self.repetitions), "normal repetitions"
+            )
+            for name, workload in self.conditions
+        }
+        if self.models is not None and len({self.deployments[name] for name, _ in self.conditions}) > 1:
+            raise ValueError("Mixed TP experiments require --database, rather than one fixed --models selection")
 
     def progress(self, phase: str, completed: int, total: int, current: str = "") -> None:
         value = {"phase": phase, "completed": completed, "total": total, "current": current}
@@ -79,7 +113,7 @@ class Matrix:
         print(f"[{time.strftime('%H:%M:%S')}] {phase} {completed}/{total} {current}", flush=True)
 
     def plan(self) -> dict:
-        targets = {(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups)
+        targets = set(self.conditions)
         return {
             "panels": self.panels,
             "cross_cells": len(self.cells),
@@ -87,9 +121,15 @@ class Matrix:
             "base_profiles": len(self.groups),
             "normal_conditions": len(targets),
             "normal_repetitions": self.repetitions,
-            "normal_measurements": len(targets) * self.repetitions,
+            "normal_measurements": sum(self.normal_counts.values()),
+            "normal_conditions_required": [
+                {"configuration": name, "workload": workload, "repetitions": self.normal_counts[(name, workload)]}
+                for name, workload in self.conditions
+            ],
             "additional_structure_profiles": len(targets - set(self.groups)) if self.args.structure else 0,
             "deployment": asdict(self.deployment),
+            "configuration_deployments": {name: asdict(value) for name, value in self.deployments.items()},
+            "configurations": self.configurations,
             "devices": self.capture["devices"],
             "database": str(self.database),
             "models": str(self.models) if self.models else None,
@@ -101,6 +141,20 @@ class Matrix:
     def prepare_inputs(self) -> None:
         directory = self.output / "inputs"
         directory.mkdir(parents=True, exist_ok=True)
+        if "workload_inputs" in self.recipe:
+            for workload in sorted({workload for _, workload in self.groups}):
+                source = resolve_path(self.args.recipe.resolve().parent, self.recipe["workload_inputs"][workload])
+                target = directory / f"{workload}.json"
+                work = Workload.load(source)
+                if target.exists():
+                    if Workload.load(target) != work:
+                        raise ValueError(
+                            "This experiment output belongs to different workload inputs; use a new output"
+                        )
+                else:
+                    write_json(target, asdict(work))
+            return
+
         if all((directory / f"{workload}.json").is_file() for _, workload in self.groups):
             return
 
@@ -166,13 +220,20 @@ class Matrix:
         budget = dict(self.recipe[budget_name])
         budget.update(
             requests=len(work.requests) * budget["starts"],
-            input_tokens=sum(len(row.input_ids) for row in work.requests) * budget["starts"],
+            input_tokens=sum(len(row.input_ids) for row in work.requests) * budget["starts"]
+            if all(row.input_ids is not None for row in work.requests)
+            else budget["input_tokens"],
             output_tokens=sum(row.max_new_tokens for row in work.requests) * budget["starts"],
         )
+        capture = self.capture
+        original = self.reuse.get("source", {}).get(workload, {}).get(base)
+        if budget_name == "source_budget" and original:
+            prior = read_json(resolve_path(self.reuse_directory, original))
+            capture = {**capture, "detail": prior["execution"]["capture"].get("detail", "diagnostic")}
         write_json(
             path,
             {
-                "deployment": asdict(self.deployment),
+                "deployment": asdict(self.deployments[base]),
                 "base": {"configuration": self.configurations[base]},
                 "workload": str(self.output / "inputs" / f"{workload}.json"),
                 "targets": [{"name": base, "configuration": {}}],
@@ -181,7 +242,7 @@ class Matrix:
                     "output": str(output),
                     "kernel_cache_initial_state": "empty",
                     "memory_limit_gib": self.recipe["prediction_memory_limit_gib"],
-                    "capture": {**self.capture, "budget": budget},
+                    "capture": {**capture, "budget": budget},
                 },
             },
         )
@@ -194,29 +255,32 @@ class Matrix:
         path = resolve_path(self.reuse_directory, value[repetition] if kind == "normal" else value)
         return resolve_path(path.parent, read_json(path)["execution"]["output"])
 
-    def prediction_request(self, base: str, workload: str, manifest: str, models: Path | None) -> PredictionRequest:
-        directory = self.output / ("predictions" if models else "preparation") / workload / base
+    def prediction_request(self, base: str, workload: str, manifest: str, *, sampling: bool) -> PredictionRequest:
+        directory = self.output / ("preparation" if sampling else "predictions") / workload / base
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "request.json"
         raw = {
-            "deployment": asdict(self.deployment),
+            "deployment": asdict(self.deployments[base]),
             "base": {"manifest": manifest},
             "workload": str(self.output / "inputs" / f"{workload}.json"),
             "targets": [
-                {"name": target, "configuration": self.configurations[target]}
+                {
+                    "name": target,
+                    "configuration": self.configurations[target],
+                    "deployment": asdict(self.deployments[target]),
+                }
                 for target in sorted(self.groups[(base, workload)])
             ],
-            "performance": {"models": str(models)}
-            if models
-            else {"database": str(self.database), "sampling_budget": self.recipe["sampling_budget"]},
+            "performance": {"models": str(self.models)} if self.models else {"database": str(self.database)},
             "execution": {
                 "output": str(directory),
                 "kernel_cache_initial_state": "empty",
                 "memory_limit_gib": self.recipe["prediction_memory_limit_gib"],
-                "record_graph": bool(models and self.args.structure),
+                "record_graph": not sampling and self.args.structure,
             },
         }
-        if models is None:
+        if sampling:
+            raw["performance"]["sampling_budget"] = self.recipe["sampling_budget"]
             raw["execution"]["capture"] = {**self.capture, "budget": self.recipe["sampling_budget"]}
         write_json(path, raw)
         return PredictionRequest.load(path)
@@ -245,7 +309,7 @@ class Matrix:
                 source = InferenceCapture(request, record_regions=True).run(reuse=True)
                 entry["source"] = source
                 if source["status"] in {"completed", "reused"} and self.models is None:
-                    prepared = predict(self.prediction_request(base, workload, source["manifest"], None))
+                    prepared = predict(self.prediction_request(base, workload, source["manifest"], sampling=True))
                     entry["preparation"] = {
                         "status": prepared["status"],
                         "report": str(self.output / "preparation" / workload / base / "prediction/report.json"),
@@ -266,9 +330,8 @@ class Matrix:
             sampling = self.output / "preparation" / workload / base / "performance" / "sampling"
             owners.append((base, workload, output, sampling, "sampling_budget"))
 
-        conditions = {(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups)
-        for base, workload in sorted(conditions):
-            for repetition in range(self.repetitions):
+        for base, workload in self.conditions:
+            for repetition in range(self.normal_counts[(base, workload)]):
                 output = self.reused_output(
                     "normal", base, workload, repetition
                 ) or self.output / "normal" / workload / base / str(repetition + 1)
@@ -290,35 +353,41 @@ class Matrix:
     def predict(self) -> None:
         prepared = read_json(self.output / "preparation.json")["entries"]
         by_group = {(row["base"], row["workload"]): row for row in prepared}
-        models = select_models(
-            self.deployment, self.models, self.database, self.output / "shared_performance", allow_empty=True
-        )
         entries = []
         begin = time.monotonic()
         for base, workload in self.groups:
             self.progress("predict", len(entries), len(self.groups), f"{workload}/{base}")
             source = by_group.get((base, workload), {}).get("source", {})
-            entry = {"base": base, "workload": workload, "status": "source_unavailable"}
+            entry = {"base": base, "workload": workload, "status": source.get("status", "source_unavailable")}
             if source.get("status") in {"completed", "reused"}:
-                request = self.prediction_request(base, workload, source["manifest"], models)
+                request = self.prediction_request(base, workload, source["manifest"], sampling=False)
                 try:
                     result = predict(request)
                     entry.update(
                         status=result["status"],
-                        report=str(request.execution.output / "prediction/report.json"),
                         manifest=source["manifest"],
+                        models=result.get("models"),
                     )
+                    report = request.execution.output / "prediction/report.json"
+                    if report.is_file():
+                        entry["report"] = str(report)
+                    else:
+                        entry["failure"] = result
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     entry.update(status="prediction_failed", error=str(error))
             entries.append(entry)
             write_json(
                 self.output / "predictions.json",
-                {"entries": entries, "models": str(models), "wall_sec": time.monotonic() - begin},
+                {
+                    "entries": entries,
+                    "models": str(self.models) if self.models else {"database": str(self.database)},
+                    "wall_sec": time.monotonic() - begin,
+                },
             )
         self.progress("predicted", len(entries), len(self.groups))
 
     def measure(self) -> None:
-        conditions = sorted({(cell["target"], cell["workload"]) for cell in self.cells} | set(self.groups))
+        conditions = list(self.conditions)
         random.Random(self.recipe.get("measurement_seed", 0)).shuffle(conditions)
         entries = {
             (base, workload): {
@@ -332,16 +401,19 @@ class Matrix:
         }
         begin = time.monotonic()
         completed = 0
-        for repetition in range(self.repetitions):
+        total = sum(self.normal_counts.values())
+        for repetition in range(max(self.normal_counts.values())):
             # Independent service lifetimes remain unchanged; spread repeats
             # across the panel and reverse each other round to expose drift.
             order = conditions if repetition % 2 == 0 else list(reversed(conditions))
             for base, workload in order:
+                if repetition >= self.normal_counts[(base, workload)]:
+                    continue
                 entry = entries[(base, workload)]
                 self.progress(
                     "measure",
                     completed,
-                    len(conditions) * self.repetitions,
+                    total,
                     f"{workload}/{base}/{repetition + 1}",
                 )
                 output = self.reused_output(
@@ -362,7 +434,7 @@ class Matrix:
                     {"entries": list(entries.values()), "wall_sec": time.monotonic() - begin},
                 )
                 completed += 1
-        self.progress("measured", len(conditions) * self.repetitions, len(conditions) * self.repetitions)
+        self.progress("measured", completed, total)
 
     def diagnostics(self) -> None:
         # Target wrappers and observations are loaded only after formal prediction.
@@ -460,7 +532,7 @@ def main() -> None:
         if args.phase in {"all", "report"}:
             if args.structure or args.source_reports:
                 matrix.diagnostics()
-            result = write_report(matrix.output, matrix.cells, matrix.groups, matrix.repetitions)
+            result = write_report(matrix.output, matrix.cells, matrix.groups, matrix.repetitions, matrix.normal_counts)
             normal = result["normal_coverage"]
             complete = (
                 result["cross"]["scored"] == result["cross"]["expected"]

@@ -24,6 +24,13 @@ examples/hicache_matrix/run.sh --model /path/to/Qwen3-32B \
 报告另列满足重复次数的正常条件数；cross、self 或要求的正常重复未完成时，运行仍标为未完成。
 `plan` 只列任务数量，不证明镜像、设备、输入或成本可用。
 
+同一模型的跨 TP 实验仍使用这个入口：配方可用 configuration_deployments 按配置名声明 deployment 覆盖，
+例如 `"tp4_host": {"tensor_parallel": 4}`。base、target、正常实测和成本准备使用各自声明的 TP；模型和框架保持一致。
+混合 TP 必须使用性能库，不能用一个固定的 --models 文件代替各部署的独立选择。
+workload_inputs 可将 workload 名映射到已有正式 workload JSON，路径相对配方，不再执行输入生成或下载。
+normal_repetitions_by_workload 可按 workload、配置名预定参考条件的重复次数，其余使用 normal_repetitions；
+例如 `"revisit": {"tp2_resident": 3}`，以默认一次加少量预定重复控制实测量。未达到各条件声明次数时仍报告未完成。
+
 扩展到完整面板，使用同一输出继续运行：
 
 ```bash

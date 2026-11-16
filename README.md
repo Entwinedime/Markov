@@ -23,6 +23,7 @@ scripts/markov.sh plan --request configs/prediction.json
 plan 只预览输入与准备动作，不启动设备。先按实际部署修改示例中的模型位置、镜像、设备和预算；
 预览不会核验这些资源能否真正启动。
 请求中的相对路径以请求文件目录为起点。
+设备任务使用宿主的 Docker、npu-smi 和 Linux flock；驱动与推理镜像须已准备好。
 
 本地浏览器面板使用同一条工作流，不需要安装前端依赖：
 
@@ -44,13 +45,13 @@ scripts/markov.sh predict --request /path/to/request.json
 execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/prediction/report.json，
 包含完整正式 HTTP、逐请求耗时、后台完成、缺口、成本来源、近似、图规模和运行开销。
 同一会话只准备一次 source；每个 target 独立维护缓存和执行状态。
-SGLang 普通预测解释语义 probe 与客户端记录；execution.capture.detail="semantic" 可只采这些记录，当前默认 diagnostic 另保留 profiler/native-hook 用于原始图诊断。
+SGLang 普通预测解释语义 probe 与客户端记录；示例声明 execution.capture.detail="semantic"，只采这些记录；省略 detail 时使用 diagnostic，另保留 profiler/native-hook 用于原始图诊断。
 语义采集没有完整源图回放资格；两种模式的实际精度与开销分别验证。可选 capture.cpu_set 固定采集进程的 CPU 放置。
 预测容器只挂载指定程序、base、模型和输出，不挂载整个仓库、真实设备或正常评分数据。
 
 首次建立性能库时，声明 performance.database、performance.sampling_budget 和 execution.capture。
 流程先使用现有模型，按整组缺少的工作生成小型独立采样，维护模型后继续预测；不会采集 target trace 或按误差补参数。
-自动准备更新本轮缺口，并复用同次采集补入尚缺的其他响应；其余成本继续使用已有选择。
+自动准备更新本轮缺口，并复用同次采集补入尚缺或确实扩大覆盖范围的相关响应；已覆盖且无关的成本继续使用已有选择。
 当前自动采样覆盖 SGLang/Ascend 串行区域响应、批量备份、整批回载及消费控制、失败回载控制、文件预取控制/查询及 buffered 读写 worker。
 文件预取保留发起返回、最终检查、停止快照和接受完成的边界；后台可在检查期间继续发布，停止后固定接受页数。
 文件 worker 与查询补采只观察后台调用，保留正常前台轮询，不插入计算区域的 NPU 事件探针。
@@ -76,8 +77,8 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 
 ## 已验证范围与限制
 
-当前实际输入包括 Qwen3-32B/BF16/TP2 和 Qwen3-8B/BF16/TP1、TP2，各用自己的 base 和独立成本；平台为 Ascend 910B3、SGLang eager/FIA，串行固定输出。
-8B 同机 TP=1↔2 的 24 个预测已完成正常对照，整体 WAPE 4.50%、最大单格误差 12.49%；另四个小型留出预测误差为 0.62%～2.33%。两格写回/限时预取条件仍超过 10%，紧主机池下的原生分配失败仍不能可靠预测。历史 315 格回归数值保持，不能用它替代新模型的精度资格。
+当前实际输入包括 Qwen3-32B/BF16/TP2、4、8 和 Qwen3-8B/BF16/TP1、2、4、8，各用自己的 base 和独立成本；平台为 Ascend 910B3、SGLang eager/FIA，串行固定输出。32B/TP1 的权重下界超过原生可用设备总容量，已安全排除。
+8B 的 40 个预测已完成正常对照，涵盖换 base 和 TP／HiCache 联合变化：34 个跨配置预测 WAPE 4.67%、最大单格误差 11.23%，6 个同配置预测最大误差 6.48%。32B 的全量正常评分仍在进行；紧主机池下的原生分配失败仍不能可靠预测。历史 315 格是独立的回归基线，不能代替本轮代码的最终复验或新模型的精度资格。
 预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
 需要在准备结束后清空后台工作时，workload 设置 drain_before_formal=true；SGLang 以轻量状态等待 HiCache 空闲，预测保留同一控制语义。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
