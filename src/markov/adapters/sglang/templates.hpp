@@ -25,7 +25,7 @@ public:
     static TemplateLibrary compile(const CoarseGraph & observation);
     static nlohmann::json condition(std::string_view action, nlohmann::json facts);
     static nlohmann::json domain(const nlohmann::json & environment);
-    static nlohmann::json share_batch_transforms(std::map<std::size_t, TemplateLibrary> & libraries);
+    static nlohmann::json share_closed_actions(std::map<std::size_t, TemplateLibrary> & libraries);
 };
 
 } // namespace markov::sglang

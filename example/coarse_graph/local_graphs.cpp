@@ -108,7 +108,7 @@ int main(int argc, char ** argv) {
         if (libraries.empty()) throw std::invalid_argument("local expansion requires a primary source library");
 
         // Assemble the same source candidates as serving; the first library owns this worker's action interface.
-        markov::sglang::NativeTemplates::share_batch_transforms(libraries);
+        markov::sglang::NativeTemplates::share_closed_actions(libraries);
         std::vector<markov::TemplateLibrary *> sources;
         for (auto & [_, library] : libraries) sources.push_back(&library);
         markov::TemplateLibrary::link_local_implementations(sources);

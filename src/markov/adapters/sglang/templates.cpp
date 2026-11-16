@@ -242,8 +242,8 @@ TemplateLibrary NativeTemplates::compile(const CoarseGraph & observation) {
 }
 
 nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::json facts) {
-    constexpr std::array<std::string_view, 6> resource_calls{
-        "cache.finished", "cache.unfinished", "pages.free", "pages.flush", "pages.sort", "slots.free"
+    constexpr std::array<std::string_view, 7> resource_calls{
+        "eviction", "cache.finished", "cache.unfinished", "pages.free", "pages.flush", "pages.sort", "slots.free"
     };
 
     // Scalar reads use their declared read contract; serving phase remains in the caller's work identity.
@@ -295,15 +295,13 @@ nlohmann::json NativeTemplates::domain(const nlohmann::json & environment) {
     return result;
 }
 
-nlohmann::json NativeTemplates::share_batch_transforms(std::map<std::size_t, TemplateLibrary> & libraries) {
+nlohmann::json NativeTemplates::share_closed_actions(std::map<std::size_t, TemplateLibrary> & libraries) {
     struct Candidate {
         std::size_t source;
         std::size_t entry;
-        TemplateEntry call;
-        TemplateDefinition body;
     };
     std::map<nlohmann::json, std::vector<Candidate>> candidates;
-    std::map<std::size_t, nlohmann::json> domains;
+    std::map<std::size_t, std::set<nlohmann::json>> domains;
     std::map<std::size_t, std::vector<std::size_t>> resources;
     for (const auto & [index, library] : libraries) {
         auto environment = library.domain;
@@ -312,27 +310,35 @@ nlohmann::json NativeTemplates::share_batch_transforms(std::map<std::size_t, Tem
         for (const auto field : { "worker_roles", "kv_peers", "parallel", "kv_layout", "expert_layers" }) environment.erase(field);
         environment.at("implementation").erase("disaggregation_mode");
         environment.at("implementation").erase("expert_layout");
-        domains.emplace(index, environment);
+        domains.emplace(index, std::set<nlohmann::json>{ library.domain, environment });
         resources.emplace(index, batch_resources(library));
         for (std::size_t entry = 0; entry < library.entries.size(); ++entry) {
             const auto & call = library.entries[entry];
-            if (call.action != "batch_transform") continue;
-            const auto & transform = call.condition.at("transformation");
-            if (!((transform.at("operation") == "merge" && transform.at("effect") == "merge")
-                  || (transform.at("operation") == "filter" && transform.at("effect") == "subset")))
-                continue;
-            candidates[environment].push_back({ index, entry, call, library.definitions.at(call.frame.definition) });
+            auto domain = library.domain;
+            if (call.action == "batch_transform") {
+                const auto & transform = call.condition.at("transformation");
+                if ((transform.at("operation") == "merge" && transform.at("effect") == "merge")
+                    || (transform.at("operation") == "filter" && transform.at("effect") == "subset"))
+                    domain = environment;
+            }
+
+            // Other closed actions retain their complete worker domain, including layout and native mechanisms.
+            candidates[domain].push_back({ index, entry });
         }
     }
 
     auto imports = nlohmann::json::array();
     for (auto & [index, library] : libraries) {
-        const auto found = candidates.find(domains.at(index));
-        if (found == candidates.end()) continue;
-        for (const auto & candidate : found->second) {
-            if (candidate.source == index) continue;
-            if (const auto entry = library.import_leaf(candidate.body, candidate.call, resources.at(index)))
-                imports.push_back({ { "recipient", index }, { "entry", *entry }, { "source", candidate.source }, { "source_entry", candidate.entry } });
+        for (const auto & domain : domains.at(index)) {
+            const auto found = candidates.find(domain);
+            if (found == candidates.end()) continue;
+            for (const auto & candidate : found->second) {
+                if (candidate.source == index) continue;
+                const auto & source = libraries.at(candidate.source);
+                const auto & call = source.entries.at(candidate.entry);
+                if (const auto entry = library.import_leaf(source.definitions.at(call.frame.definition), call, resources.at(index)))
+                    imports.push_back({ { "recipient", index }, { "entry", *entry }, { "source", candidate.source }, { "source_entry", candidate.entry } });
+            }
         }
     }
     return imports;

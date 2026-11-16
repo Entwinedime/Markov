@@ -42,7 +42,9 @@ public:
 
 private:
     struct Actor {
-        nlohmann::json steps;
+
+        // The immutable condition document stays alive for the complete serving call.
+        const nlohmann::json & steps;
         std::size_t next = 0;
     };
     struct Condition {

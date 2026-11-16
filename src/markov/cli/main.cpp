@@ -95,7 +95,8 @@ constexpr std::string_view usage = "markov project <native-facts.json> <coarse.j
                                    "markov link-templates <source-libraries.json> <output-directory>\n"
                                    "markov instantiate <templates.json> <invocation.json> <coarse.json>\n"
                                    "markov execute <coarse.json> <given-timing.json> <execution.json> [--trace <execution.jsonl>]\n"
-                                   "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>]\n";
+                                   "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] "
+                                   "[--execution-inputs <conditions.json>]\n";
 
 nlohmann::json execute(const markov::CoarseGraph & graph, const nlohmann::json & timing, markov::ExecutionObserver * observer) {
     std::vector<markov::ServiceDuration> work_ns;
@@ -218,29 +219,38 @@ int main(int argc, char ** argv) {
             const markov::TemplateSelection selection(library);
             output = library.instantiate(selection.select(call.action, call.condition, call.parameters, call.state_inputs), call).document();
         }
-        else if (command == "serve" && (argc == 5 || (argc == 7 && std::string_view(argv[5]) == "--trace"))) {
+        else if (command == "serve" && argc >= 5 && (argc - 5) % 2 == 0) {
             destination = argv[4];
+            std::map<std::string_view, std::filesystem::path> options;
+            for (int argument = 5; argument < argc; argument += 2) {
+                const std::string_view option = argv[argument];
+                if ((option != "--trace" && option != "--execution-inputs") || !options.emplace(option, argv[argument + 1]).second)
+                    throw std::invalid_argument("unknown or repeated serving option: " + std::string(option));
+            }
             const auto task = read_json(argv[3]);
             for (const auto & [field, _] : task.items()) {
                 if (field != "template_sources" && field != "instances" && field != "workload"
-                    && field != "given_work_ns" && field != "execution_inputs")
+                    && field != "given_work_ns")
                     throw std::invalid_argument("unknown serving input field: " + field);
             }
+
+            // Conditions are an independent immutable asset, not a second copy nested in the serving task.
+            const auto timing = options.contains("--execution-inputs") ? read_json(options.at("--execution-inputs")) : nlohmann::json();
             std::map<std::size_t, markov::TemplateLibrary> libraries;
             for (const auto & source : task.at("template_sources")) {
                 const auto index = source.get<std::size_t>();
                 libraries.emplace(index, markov::TemplateLibrary::read(read_json(std::filesystem::path(argv[2]) / (std::to_string(index) + ".json"))));
             }
-            const auto imports = markov::sglang::NativeTemplates::share_batch_transforms(libraries);
+            const auto imports = markov::sglang::NativeTemplates::share_closed_actions(libraries);
 
             // Auxiliary productions supply closed local bodies as well as complete batch actions.
             std::vector<markov::TemplateLibrary *> sources;
             for (auto & [_, library] : libraries) sources.push_back(&library);
             markov::TemplateLibrary::link_local_implementations(sources);
             std::unique_ptr<markov::ExecutionTrace> trace;
-            if (argc == 7) trace = std::make_unique<markov::ExecutionTrace>(argv[6]);
+            if (options.contains("--trace")) trace = std::make_unique<markov::ExecutionTrace>(options.at("--trace"));
             StreamPeer peer;
-            output = markov::sglang::serve(libraries, task, peer, trace.get(), trace.get(), trace.get());
+            output = markov::sglang::serve(libraries, task, timing, peer, trace.get(), trace.get(), trace.get());
             output["template_imports"] = imports;
             if (trace) trace->finish();
         }

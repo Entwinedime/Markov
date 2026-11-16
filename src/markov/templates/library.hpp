@@ -224,7 +224,7 @@ public:
     nlohmann::json local_contract(const TemplateFrame & frame, const std::vector<std::size_t> & position) const;
     void collect_local_implementations();
     static void link_local_implementations(std::span<TemplateLibrary *> libraries);
-    std::optional<std::size_t> import_leaf(const TemplateDefinition & definition, TemplateEntry entry,
+    std::optional<std::size_t> import_leaf(const TemplateDefinition & definition, const TemplateEntry & source,
                                          std::span<const std::size_t> recipient_resources);
     CoarseGraph instantiate(const TemplateEntry & entry, const GraphInvocation & invocation) const;
 

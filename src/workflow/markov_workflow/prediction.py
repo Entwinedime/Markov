@@ -19,6 +19,9 @@ class PredictionProcess:
 
     def run(self) -> None:
         args = self.arguments
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("Prediction timeout must be positive")
+        deadline = time.monotonic() + args.timeout
         source = json.loads(args.input.read_text())
         collection = args.production.resolve(strict=True)
         plan = json.loads((collection / "input.json").read_text())["plan"]
@@ -45,13 +48,12 @@ class PredictionProcess:
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
         document = SGLangTask(productions[0], productions[1:]).document(source)
-        if args.execution_inputs is not None:
-            document["execution_inputs"] = json.loads(args.execution_inputs.read_text())
+        timing = args.execution_inputs.resolve(strict=True) if args.execution_inputs is not None else None
         binary = args.binary.resolve(strict=True)
-        if not math.isfinite(args.timeout) or args.timeout <= 0:
-            raise ValueError("Prediction timeout must be positive")
         descriptions = {
-            role: json.loads(subprocess.check_output(["docker", "image", "inspect", image], text=True))[0]
+            role: json.loads(subprocess.check_output(
+                ["docker", "image", "inspect", image], text=True, timeout=max(0, deadline - time.monotonic()),
+            ))[0]
             for role, image in (("modeling", args.modeling_image), ("control", args.control_image))
         }
         SourceDomain.require_control(descriptions["control"], productions[0])
@@ -59,33 +61,38 @@ class PredictionProcess:
         output = args.output.resolve()
         output.mkdir(parents=True)
         task = output / ".task.json"
-        with task.open("x") as stream:
-            json.dump(document, stream)
-            stream.write("\n")
         stem = f"markov-serve-{uuid4().hex}"
         names = [f"{stem}-core", f"{stem}-control"]
-
-        # Container-local deadlines survive a killed coordinator; logs retain the resolved image and exact command.
-        commands = [
-            [
-                "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--name", names[0],
-                "--entrypoint", "/usr/bin/timeout",
-                "--mount", f"type=bind,src={binary},dst=/app/markov,readonly",
-                *[item for index, path in enumerate(templates) for item in ("--mount", f"type=bind,src={path},dst=/inputs/templates/{index}.json,readonly")],
-                "--mount", f"type=bind,src={task},dst=/inputs/task.json,readonly",
-                "--mount", f"type=bind,src={output},dst=/output",
-                images["modeling"], "--signal=KILL", f"{args.timeout}s",
-                "/app/markov", "serve", "/inputs/templates", "/inputs/task.json", "/output/.result.json",
-                *(["--trace", "/output/execution.partial.jsonl"] if args.execution_trace else []),
-            ],
-            [
-                "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--shm-size", "512m", "--name", names[1],
-                "--entrypoint", "/usr/bin/timeout", images["control"], "--signal=KILL", f"{args.timeout}s",
-                "python3", "-m", "markov_control", "--kernel-python", "/opt/markov/sglang/sgl-kernel/python",
-            ],
-        ]
         try:
-            self.execute(commands, names, output)
+            with task.open("x") as stream:
+                json.dump(document, stream)
+                stream.write("\n")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Prediction preparation exhausted its time allowance")
+
+            # Conditions stay one read-only asset; only the core parses their complete work identities.
+            commands = [
+                [
+                    "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--name", names[0],
+                    "--entrypoint", "/usr/bin/timeout",
+                    "--mount", f"type=bind,src={binary},dst=/app/markov,readonly",
+                    *[item for index, path in enumerate(templates) for item in ("--mount", f"type=bind,src={path},dst=/inputs/templates/{index}.json,readonly")],
+                    "--mount", f"type=bind,src={task},dst=/inputs/task.json,readonly",
+                    *(["--mount", f"type=bind,src={timing},dst=/inputs/execution-inputs.json,readonly"] if timing else []),
+                    "--mount", f"type=bind,src={output},dst=/output",
+                    images["modeling"], "--signal=KILL", f"{remaining}s",
+                    "/app/markov", "serve", "/inputs/templates", "/inputs/task.json", "/output/.result.json",
+                    *(["--trace", "/output/execution.partial.jsonl"] if args.execution_trace else []),
+                    *(["--execution-inputs", "/inputs/execution-inputs.json"] if timing else []),
+                ],
+                [
+                    "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--shm-size", "512m", "--name", names[1],
+                    "--entrypoint", "/usr/bin/timeout", images["control"], "--signal=KILL", f"{remaining}s",
+                    "python3", "-m", "markov_control", "--kernel-python", "/opt/markov/sglang/sgl-kernel/python",
+                ],
+            ]
+            self.execute(commands, names, output, deadline)
 
             # Both endpoints and their owned containers must close before the result becomes consumable.
             if args.execution_trace:
@@ -94,12 +101,11 @@ class PredictionProcess:
             os.link(output / ".result.json", output / "result.json")
         finally:
             (output / ".result.json").unlink(missing_ok=True)
-            task.unlink()
+            task.unlink(missing_ok=True)
         print(f"Created {output / 'result.json'}")
 
-    def execute(self, commands, names, output) -> None:
+    def execute(self, commands, names, output, deadline) -> None:
         processes = []
-        deadline = time.monotonic() + self.arguments.timeout
         try:
             with ExitStack() as logs, ExitStack() as pipes:
                 core_read, control_write = os.pipe()

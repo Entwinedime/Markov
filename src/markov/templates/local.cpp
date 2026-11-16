@@ -33,12 +33,12 @@ private:
 
 } // namespace
 
-std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition & definition, TemplateEntry entry,
+std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition & definition, const TemplateEntry & source,
                                                      std::span<const std::size_t> recipient_resources) {
     if (!definition.children.empty() || !definition.imports.empty() || !definition.kv_accesses.empty() || !definition.slot_accesses.empty()
-        || entry.frame.communication || !entry.frame.bindings.empty())
+        || source.frame.communication || !source.frame.bindings.empty())
         return std::nullopt;
-    for (const auto & tensor : entry.frame.tensors) {
+    for (const auto & tensor : source.frame.tensors) {
         if (tensor && (!tensor->buffer.empty() || (tensor->external && tensor->writer))) return std::nullopt;
     }
     for (const auto & port : definition.ports) {
@@ -46,6 +46,7 @@ std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition
     }
 
     // The adapter supplies the recipient lane; roles must be unique within it, including their original aliases.
+    auto entry = source;
     const auto original_resources = entry.frame.resources;
     entry.frame.resources.clear();
     for (const auto & slot : definition.resources) {

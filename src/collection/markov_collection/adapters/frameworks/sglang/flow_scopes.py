@@ -221,6 +221,7 @@ class FlowScopes(CallSegments):
         ):
             HookRegistry.register(target, hook, HookType.AROUND)
         self.selection.install()
+        self.resources.install()
         DecisionClocks(self).install()
         HostReads(self).install()
         MetadataCollectives(self).install()

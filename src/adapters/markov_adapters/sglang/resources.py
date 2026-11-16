@@ -57,6 +57,7 @@ class ResourceInputs:
     """Scalar inputs owned by the resource ABI; request context travels separately in work."""
 
     declarations = {
+        "eviction": ("eviction_tokens",),
         "cache.finished": (),
         "cache.unfinished": (),
         "slots.free": (),
@@ -142,6 +143,14 @@ class ResourceCalls:
         self.bind_reader(allocator, "available_size", {"kind": "state_slots", "field": field, "operation": "available"})
         self.bind_internal(allocator, ("alloc", "free"))
 
+    def evict(self, original, tree_cache, num_tokens):
+        if self.calls.current.get() is None:
+            return original(tree_cache, num_tokens)
+
+        # The scalar resource check owns its CPU loop; nested page releases retain their own execution graphs.
+        with self.calls.call("eviction", original, parameters={"eviction_tokens": num_tokens}, host_only=True):
+            return original(tree_cache, num_tokens)
+
     def invoke(self, operation, owner, original, signature, *args, **kwargs):
         parent = self.calls.current.get()
         if parent is None:
@@ -203,7 +212,6 @@ class ResourceCalls:
         return result
 
     def bind(self, cache, allocator, slots) -> None:
-
         original = cache.match_prefix
         cache.match_prefix = update_wrapper(partial(self.match, cache, original), original)
 
@@ -233,3 +241,9 @@ class ResourceCalls:
                 original = getattr(owner, name)
                 wrapper = partial(self.invoke, operation, owner, original, inspect.signature(original))
                 setattr(owner, name, update_wrapper(wrapper, original))
+
+    def install(self):
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        # Register before the framework applies hooks; cache objects are bound later during worker construction.
+        HookRegistry.register("sglang.srt.mem_cache.common.evict_from_tree_cache", self.evict, HookType.AROUND)

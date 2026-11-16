@@ -43,7 +43,7 @@ struct Participant {
 
 } // namespace
 
-nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, ControlPeer & peer, ExecutionObserver * execution_observer,
+nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, const nlohmann::json & timing, ControlPeer & peer, ExecutionObserver * execution_observer,
                      ResourceObserver * resource_observer, ControlObserver * control_observer) {
     const auto & workload = task.at("workload");
     auto requests = Request::read(workload.at("requests"));
@@ -52,11 +52,11 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     })
                               .at("given_work_ns");
     if (duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
-    const auto timing = task.value("execution_inputs", nlohmann::json());
     if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
     std::optional<ExecutionInputs> inputs;
     if (!timing.is_null()) inputs.emplace(timing, control_observer);
-    const auto ingress = timing.is_null() ? nlohmann::json() : timing.at("ingress");
+    const nlohmann::json empty;
+    const auto & ingress = timing.is_null() ? empty : timing.at("ingress");
     if (!ingress.is_null() && !ingress.is_object()) throw std::invalid_argument("ingress must be an instance mapping");
     std::vector<Resource> resources;
     std::map<std::string, std::unique_ptr<Participant>> participants;
