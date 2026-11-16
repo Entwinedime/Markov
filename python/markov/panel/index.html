@@ -41,13 +41,20 @@
                     >
                     <label>模型目录<input id="model" required /></label
                     ><label>平台<input id="platform" required /></label>
-                    <label>推理框架<input id="framework" required /></label
+                    <label
+                        >推理框架<select id="framework">
+                            <option value="sglang">SGLang</option>
+                            <option value="ktransformers">KTransformers</option>
+                        </select></label
                     ><label>运行后端<input id="runtime" required /></label>
                     <label>数据类型<input id="dtype" required /></label
                     ><label
                         >Base TP<input id="tp" type="number" min="1" required
                     /></label>
                 </div>
+                <button id="load-template" class="secondary">
+                    载入所选框架的示例输入
+                </button>
                 <h2>请求与来源</h2>
                 <label
                     >Workload 本机路径<input id="workload-path" required
@@ -104,14 +111,14 @@
                     ></textarea>
                 </details>
                 <h2>目标配置</h2>
-                <p class="hint">
+                <p class="hint" id="target-hint">
                     容量为每 rank 的 KV token 池，页大小单位为
                     token；主存倍数相对于对应设备 KV 池。未改字段继承 base。
                 </p>
                 <div class="table-scroll">
                     <table>
                         <thead>
-                            <tr>
+                            <tr id="target-columns">
                                 <th>名称</th>
                                 <th>TP</th>
                                 <th>设备 token 池</th>

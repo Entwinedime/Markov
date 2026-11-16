@@ -19,6 +19,7 @@ const labels = {
     idle_devices: "等待空闲设备",
 };
 let token,
+    templates,
     current,
     targetRows = [],
     selected,
@@ -89,6 +90,29 @@ function text(parent, tag, value, className = "") {
 
 function showTargets() {
     $("targets").replaceChildren();
+    const kt = $("framework").value === "ktransformers";
+    const configurationFields = kt
+        ? [
+              ["CPU 总线程", "kt_cpuinfer"],
+              ["NUMA 线程池", "kt_threadpool_count"],
+              ["NPU 驻留专家", "kt_num_gpu_experts"],
+          ]
+        : [
+              ["设备 token 池", "max_total_tokens"],
+              ["主存倍数", "hicache_ratio"],
+              ["页 tokens", "page_size"],
+              ["写策略", "hicache_write_policy"],
+          ];
+    $("target-columns").replaceChildren();
+    [
+        "名称",
+        "TP",
+        ...configurationFields.map(([label]) => label),
+        "操作",
+    ].forEach((label) => text($("target-columns"), "th", label));
+    $("target-hint").textContent = kt
+        ? "线程数是 CPU 推理总线程，线程池对应 NUMA 分区；驻留数是每层留在 NPU 的路由专家数。空白继承 base，KT 不使用 HiCache。"
+        : "容量为每 rank 的 KV token 池，页大小单位为 token；主存倍数相对于对应设备 KV 池。未改字段继承 base。";
     targetRows.forEach((row, index) => {
         const tr = document.createElement("tr");
         const fields = [
@@ -101,37 +125,18 @@ function showTargets() {
                     (row.deployment = { tensor_parallel: Number(value) }),
                 "number",
             ],
-            [
-                "设备 token 池",
-                row.configuration.max_total_tokens ?? "",
-                (value) => set("max_total_tokens", value),
-                "number",
-            ],
-            [
-                "主存倍数",
-                row.configuration.hicache_ratio ?? "",
-                (value) => set("hicache_ratio", value),
-                "number",
-            ],
-            [
-                "页 tokens",
-                row.configuration.page_size ?? "",
-                (value) => set("page_size", value),
-                "number",
-            ],
-            [
-                "写策略",
-                row.configuration.hicache_write_policy ?? "",
-                (value) => {
-                    if (value) row.configuration.hicache_write_policy = value;
-                    else delete row.configuration.hicache_write_policy;
-                },
-                "text",
-            ],
+            ...configurationFields.map(([label, key]) => [
+                label,
+                row.configuration[key] ?? "",
+                (value) => set(key, value),
+                key === "hicache_write_policy" ? "text" : "number",
+            ]),
         ];
         function set(name, value) {
             if (value === "") delete row.configuration[name];
-            else row.configuration[name] = Number(value);
+            else
+                row.configuration[name] =
+                    name === "hicache_write_policy" ? value : Number(value);
         }
         fields.forEach(([name, value, update, type]) => {
             const cell = document.createElement("td"),
@@ -524,9 +529,14 @@ async function detail() {
 async function init() {
     const bootstrap = await api("/api/bootstrap");
     token = bootstrap.token;
-    bootstrap.request.execution.output = `${bootstrap.directory}/work/default`;
-    bootstrap.request.execution.capture.detail = "semantic";
-    fill(bootstrap.request);
+    templates = bootstrap.templates;
+    for (const [framework, request] of Object.entries(templates)) {
+        request.execution.output = `${bootstrap.directory}/work/${framework}`;
+        request.execution.capture.detail = "semantic";
+    }
+    fill(templates.sglang);
+    $("framework").onchange = showTargets;
+    $("load-template").onclick = () => fill(templates[$("framework").value]);
     $("policy").value = pretty({
         baseline: targetRows[0].name,
         fixed_device_gib_per_rank: 20,

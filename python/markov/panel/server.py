@@ -104,9 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Origin") not in (None, self.server.origin):
                 self.send({"error": "Cross-origin access is disabled"}, 403)
                 return
-            if mutation and not secrets.compare_digest(
-                self.headers.get("X-Markov-Token", ""), self.server.token
-            ):
+            if mutation and not secrets.compare_digest(self.headers.get("X-Markov-Token", ""), self.server.token):
                 self.send({"error": "Refresh this panel before submitting"}, 403)
                 return
             route = urlsplit(self.path).path
@@ -144,7 +142,12 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "token": self.server.token,
                     "directory": str(self.server.tasks.directory),
-                    "request": PredictionRequest.load(ROOT / "configs/prediction.json").document(),
+                    "templates": {
+                        "sglang": PredictionRequest.load(ROOT / "configs/prediction.json").document(),
+                        "ktransformers": PredictionRequest.load(
+                            ROOT / "configs/ktransformers_prediction.json"
+                        ).document(),
+                    },
                 }
             )
         elif route == "/api/tasks":
@@ -226,9 +229,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(
                     {
                         "policy": raw,
-                        "request": PredictionRequest.load(
-                            (path.parent / raw["prediction"]).resolve()
-                        ).document(),
+                        "request": PredictionRequest.load((path.parent / raw["prediction"]).resolve()).document(),
                     }
                 )
             else:
@@ -263,6 +264,4 @@ def serve(directory: Path, port: int) -> None:
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
-            print(
-                "Panel stopped; running task workers continue. Restart with the same --directory.", flush=True
-            )
+            print("Panel stopped; running task workers continue. Restart with the same --directory.", flush=True)
