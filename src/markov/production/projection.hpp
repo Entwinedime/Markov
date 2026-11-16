@@ -22,7 +22,9 @@ struct ProjectionEvidence {
 // Source and independent target runs use this projection, without evaluating template rules.
 class CoarseProjection {
 public:
-    static CoarseGraph project(const NativeObservation & observation, ProjectionEvidence * evidence = nullptr);
+
+    // Semantic declarations move into the graph; measurement storage remains available for evidence.
+    static CoarseGraph project(NativeObservation && observation, ProjectionEvidence * evidence = nullptr);
 };
 
 } // namespace markov

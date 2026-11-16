@@ -188,25 +188,25 @@ nlohmann::json ProjectionEvidence::document(const NativeObservation & observatio
     return result;
 }
 
-CoarseGraph CoarseProjection::project(const NativeObservation & observation, ProjectionEvidence * evidence) {
+CoarseGraph CoarseProjection::project(NativeObservation && observation, ProjectionEvidence * evidence) {
     if (evidence) *evidence = {};
     CoarseGraph graph;
-    graph.environment = observation.environment;
+    graph.environment = std::move(observation.environment);
     for (const auto & resource : observation.resources) graph.resources.push_back(resource.descriptor);
-    for (const auto & scope : observation.scopes) graph.scopes.push_back({ scope.info, {}, {}, scope.communication });
+    for (auto & scope : observation.scopes) graph.scopes.push_back({ std::move(scope.info), {}, {}, std::move(scope.communication) });
 
     ResourceProjection projection(observation, graph, evidence);
     projection.project();
     for (std::size_t scope = 0; scope < observation.scopes.size(); ++scope) {
-        for (const auto & access : observation.scopes[scope].kv_accesses)
-            graph.scopes[scope].kv_accesses.push_back({ access.value, projection.event(access.start), projection.event(access.finish) });
-        for (const auto & access : observation.scopes[scope].slot_accesses)
-            graph.scopes[scope].slot_accesses.push_back({ access.value, projection.event(access.start), projection.event(access.finish) });
-        for (const auto & port : observation.scopes[scope].ports) {
-            GraphPort boundary{ port.name, port.direction, port.use, port.relation, projection.event(port.at), port.tensor };
+        for (auto & access : observation.scopes[scope].kv_accesses)
+            graph.scopes[scope].kv_accesses.push_back({ std::move(access.value), projection.event(access.start), projection.event(access.finish) });
+        for (auto & access : observation.scopes[scope].slot_accesses)
+            graph.scopes[scope].slot_accesses.push_back({ std::move(access.value), projection.event(access.start), projection.event(access.finish) });
+        for (auto & port : observation.scopes[scope].ports) {
+            GraphPort boundary{ std::move(port.name), port.direction, port.use, port.relation, projection.event(port.at), std::move(port.tensor) };
             if (port.wait) boundary.wait = StreamWait<std::size_t>{ port.wait->resource, projection.event(port.wait->begin) };
             if (port.rendezvous) boundary.rendezvous = projection.event(*port.rendezvous);
-            boundary.signal = port.signal;
+            boundary.signal = std::move(port.signal);
             graph.scopes[scope].ports.push_back(std::move(boundary));
         }
     }

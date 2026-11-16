@@ -180,15 +180,15 @@ int main(int argc, char ** argv) {
         nlohmann::json output;
         if (command == "project" && (argc == 4 || (argc == 5 && std::string_view(argv[4]) == "--evidence"))) {
             destination = argv[3];
-            const auto observation = markov::NativeObservation::read(read_json(argv[2]));
+            auto observation = markov::NativeObservation::read(read_json(argv[2]));
             markov::ProjectionEvidence evidence;
-            output = markov::CoarseProjection::project(observation, argc == 5 ? &evidence : nullptr).document();
+            output = markov::CoarseProjection::project(std::move(observation), argc == 5 ? &evidence : nullptr).document();
             if (argc == 5) output["evidence"] = evidence.document(observation);
         }
         else if (command == "templates" && argc == 4) {
-            const auto source = markov::CoarseGraph::read(read_json(argv[2]));
+            auto source = markov::CoarseGraph::read(read_json(argv[2]));
             if (source.environment.at("framework") != "sglang") throw std::invalid_argument("source framework has no template recipe adapter");
-            output = markov::sglang::NativeTemplates::compile(source).document();
+            output = markov::sglang::NativeTemplates::compile(std::move(source)).document();
         }
         else if (command == "link-templates" && argc == 4) {
             std::vector<markov::TemplateLibrary> libraries;

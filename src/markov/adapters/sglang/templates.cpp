@@ -65,9 +65,8 @@ public:
         }
     }
 
-    nlohmann::json segment(std::size_t scope) const {
+    nlohmann::json segment(std::size_t scope, const nlohmann::json & segment) const {
         const auto & info = graph_.scopes[scope].info;
-        const auto & segment = info.bindings.at("segment");
         const auto & continuation = info.work.at("continuation");
         if (continuation.at("owner") != segment.at("owner"))
             throw std::invalid_argument("segment continuation names a different native owner: " + info.site);
@@ -146,20 +145,30 @@ private:
 
 } // namespace
 
-TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) {
-    auto graph = observation;
-    const ActionConditions conditions(observation);
+TemplateDeclarations NativeTemplates::describe(CoarseGraph graph) {
+    const ActionConditions conditions(graph);
     std::vector<EntrySpecification> entries;
     std::map<std::size_t, std::map<std::string, std::size_t>> transfer_peers;
+
+    // Read initialized parent implementations before deriving the parent's own expert-call binding.
+    for (std::size_t scope = graph.scopes.size(); scope-- > 0;) {
+        auto & observed = graph.scopes[scope];
+        const auto & communication = observed.communication;
+        if (observed.info.role == "expert_compute" || (communication && (communication->operation == "dispatch" || communication->operation == "combine"))) {
+            const auto & owner = graph.scopes.at(observed.info.parent.value()).info;
+            observed.info.bindings["local_implementation"] = owner.bindings.at("local_implementation");
+        }
+    }
+
     for (std::size_t scope = 0; scope < graph.scopes.size(); ++scope) {
         declare_payload_agreements(graph.scopes[scope]);
         auto & info = graph.scopes[scope].info;
-        const auto & observed = observation.scopes[scope].info;
+        auto bindings = std::move(info.bindings);
 
         // Entry selection is separate from per-worker model and collective bindings.
         info.bindings = nlohmann::json::object();
         for (const auto name : { "weights", "collective_group", "local_implementation", "required_peers" }) {
-            if (observed.bindings.contains(name)) info.bindings[name] = observed.bindings.at(name);
+            if (bindings.contains(name)) info.bindings[name] = std::move(bindings.at(name));
         }
 
         if (info.role == "kv_transfer") {
@@ -178,32 +187,25 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
             }
         }
 
-        // Expert tensor calls retain their initialized model domain, independently of the enclosing serving phase.
-        const auto & communication = observation.scopes[scope].communication;
-        if (info.role == "expert_compute" || (communication && (communication->operation == "dispatch" || communication->operation == "combine"))) {
-            const auto & owner = observation.scopes.at(observed.parent.value()).info;
-            info.bindings["local_implementation"] = owner.bindings.at("local_implementation");
-        }
-
         // Native selection can run between PD caller segments while remaining an independently submitted action.
-        const bool action = info.role == "segment" || observed.bindings.value("action", false) || (info.parent == 0 && info.role != "invocation");
+        const bool action = info.role == "segment" || bindings.value("action", false) || (info.parent == 0 && info.role != "invocation");
         if (scope == 0 || !action) continue;
 
         nlohmann::json condition{
             { "phase", info.work.value("phase", std::string("idle")) }
         };
         condition["state_accesses"] = conditions.bind_state(scope, info);
-        if (observed.bindings.contains("condition")) condition.update(observed.bindings.at("condition"));
-        if (info.role == "segment") condition.update(conditions.segment(scope));
+        if (bindings.contains("condition")) condition.update(bindings.at("condition"));
+        if (info.role == "segment") condition.update(conditions.segment(scope, bindings.at("segment")));
         if (info.role == "signal_wait") {
-            const bool device = observed.bindings.at("device_wait").get<bool>();
+            const bool device = bindings.at("device_wait").get<bool>();
             condition["device_wait"] = device;
-            if (device) condition["stream"] = observed.work.at("context").at("wait_stream").get<std::string>();
+            if (device) condition["stream"] = info.work.at("context").at("wait_stream").get<std::string>();
         }
-        if (info.role == "signal_record") condition["stream"] = observed.work.at("context").at("record_stream").get<std::string>();
-        if (info.role == "stream_wait") condition["streams"] = observed.bindings.at("streams");
-        if (info.role == "gather") condition["collective"] = observed.bindings.at("collective");
-        if (info.role == "transfer_send" || info.role == "transfer_receive") condition["dtype"] = observed.bindings.at("dtype");
+        if (info.role == "signal_record") condition["stream"] = info.work.at("context").at("record_stream").get<std::string>();
+        if (info.role == "stream_wait") condition["streams"] = bindings.at("streams");
+        if (info.role == "gather") condition["collective"] = bindings.at("collective");
+        if (info.role == "transfer_send" || info.role == "transfer_receive") condition["dtype"] = bindings.at("dtype");
         condition = NativeTemplates::condition(info.role, std::move(condition));
         conditions.validate(scope, info.role, condition);
         entries.push_back({ scope, info.role, std::move(condition) });
@@ -223,19 +225,19 @@ TemplateDeclarations NativeTemplates::describe(const CoarseGraph & observation) 
     return { std::move(graph), std::move(entries) };
 }
 
-TemplateLibrary NativeTemplates::compile(const CoarseGraph & observation) {
-    const auto declarations = describe(observation);
-    const auto & graph = declarations.graph;
-    auto library = TemplateCompiler::compile(graph, declarations.entries, domain(graph.environment));
+TemplateLibrary NativeTemplates::compile(CoarseGraph graph) {
+    const auto declarations = describe(std::move(graph));
+    const auto & source = declarations.graph;
+    auto library = TemplateCompiler::compile(source, declarations.entries, domain(source.environment));
 
     // All candidate libraries belong to one initialized model/layout; PD mode and capacity remain caller-owned.
     library.local_domain = nlohmann::json::object();
-    for (const auto field : { "framework", "device", "torch", "torch_npu" }) library.local_domain[field] = graph.environment.at(field);
-    const auto & implementation = graph.environment.at("implementation");
+    for (const auto field : { "framework", "device", "torch", "torch_npu" }) library.local_domain[field] = source.environment.at(field);
+    const auto & implementation = source.environment.at("implementation");
     for (const auto field : { "model", "dtype", "load_format", "framework_revision" }) library.local_domain[field] = implementation.at(field);
     library.local_domain["expert_layout"] = implementation.value("expert_layout", nlohmann::json());
-    library.local_domain["expert_layers"] = graph.environment.value("expert_layers", nlohmann::json::array());
-    for (const auto field : { "logical_tp", "logical_pp", "logical_ep" }) library.local_domain[field] = graph.environment.at("parallel").at(field);
+    library.local_domain["expert_layers"] = source.environment.value("expert_layers", nlohmann::json::array());
+    for (const auto field : { "logical_tp", "logical_pp", "logical_ep" }) library.local_domain[field] = source.environment.at("parallel").at(field);
     library.collect_local_implementations();
     library.validate();
     return library;

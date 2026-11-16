@@ -73,8 +73,8 @@ private:
 int main(int argc, char ** argv) {
     try {
         if (argc == 4 && std::string_view(argv[1]) == "actions") {
-            const auto observed = markov::CoarseGraph::read(read_json(argv[2]));
-            const auto declarations = markov::sglang::NativeTemplates::describe(observed);
+            auto observed = markov::CoarseGraph::read(read_json(argv[2]));
+            const auto declarations = markov::sglang::NativeTemplates::describe(std::move(observed));
             if (declarations.entries.empty()) throw std::invalid_argument("target contains no native actions");
             nlohmann::json actions = nlohmann::json::array();
             for (const auto & action : declarations.entries) {
@@ -94,7 +94,7 @@ int main(int argc, char ** argv) {
             // Export declared invocation inputs; generation runs without access to the observed graph.
             std::ofstream output(argv[3], std::ios::out | std::ios::noreplace);
             output.exceptions(std::ios::failbit | std::ios::badbit);
-            output << nlohmann::json{ { "environment", observed.environment }, { "actions", std::move(actions) } }.dump() << '\n';
+            output << nlohmann::json{ { "environment", declarations.graph.environment }, { "actions", std::move(actions) } }.dump() << '\n';
             output.close();
             return 0;
         }

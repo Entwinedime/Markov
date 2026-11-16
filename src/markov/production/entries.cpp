@@ -29,12 +29,9 @@ public:
         // Preserve source binding order, visiting only this call's descendants.
         std::ranges::sort(subtree);
         for (const auto scope : subtree) {
-            auto copy = source.scopes[scope];
+            GraphScope copy{ source.scopes[scope].info, {}, {}, source.scopes[scope].communication };
             copy.info.parent = scope == root ? std::nullopt : std::optional(scope_ids_.at(*copy.info.parent));
             if (scope == root) copy.info.arguments.clear();
-            copy.ports.clear();
-            copy.kv_accesses.clear();
-            copy.slot_accesses.clear();
             scope_ids_.emplace(scope, graph_.scopes.size());
             graph_.scopes.push_back(std::move(copy));
         }

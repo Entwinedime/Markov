@@ -134,12 +134,16 @@ void TemplateLibrary::collect_local_implementations() {
 }
 
 void TemplateLibrary::link_local_implementations(std::span<TemplateLibrary *> libraries) {
+    struct Candidate {
+        const TemplateLibrary * source;
+        std::size_t definition;
+        Expression guard;
+    };
     using Key = std::pair<nlohmann::json, nlohmann::json>;
-    std::map<Key, std::vector<std::pair<TemplateDefinition, Expression>>> candidates;
+    std::map<Key, std::vector<Candidate>> candidates;
     for (const auto * source : libraries) {
-        const auto & library = *source;
-        for (const auto & local : library.implementations)
-            candidates[{ library.local_domain, local.contract }].emplace_back(library.definitions.at(local.definition), local.guard);
+        for (const auto & local : source->implementations)
+            candidates[{ source->local_domain, local.contract }].push_back({ source, local.definition, local.guard });
     }
 
     for (auto * target : libraries) {
@@ -153,11 +157,14 @@ void TemplateLibrary::link_local_implementations(std::span<TemplateLibrary *> li
 
         // Only import bodies for contracts already declared by this recipient; whole actions and domains remain separate.
         for (const auto & contract : contracts) {
-            for (const auto & [body, guard] : candidates.at({ library.local_domain, contract })) {
+            for (const auto & candidate : candidates.at({ library.local_domain, contract })) {
+
+                // Libraries only append definitions; indices survive growth, while guards outlive the cleared candidate lists.
+                const auto & body = candidate.source->definitions.at(candidate.definition);
                 const auto [found, inserted] = definitions.try_emplace(body.document(), library.definitions.size());
                 if (inserted) library.definitions.push_back(body);
-                if (seen.emplace(contract, found->second, guard.document()).second)
-                    library.implementations.push_back({ contract, found->second, guard });
+                if (seen.emplace(contract, found->second, candidate.guard.document()).second)
+                    library.implementations.push_back({ contract, found->second, candidate.guard });
             }
         }
         library.validate();
