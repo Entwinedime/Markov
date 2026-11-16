@@ -96,7 +96,7 @@ class NativeScheduler(Scheduler):
         if has_experts:
             routes = ExpertRoutes(
                 settings["expert_routes"], workload["requests"], worker["expert_layers"],
-                source["model_config"]["num_hidden_layers"], source["ep"] - 1,
+                source["model_config"]["num_hidden_layers"], source["tp"] - 1,
             )
             self.experts = ExpertBatch(routes, source["ep"], ep_rank, args.moe_a2a_backend, args.deepep_mode)
             if source["expert_layout"] != self.experts.layout:

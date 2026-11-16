@@ -38,12 +38,14 @@ class ExpertBatch:
                     if last > prompts[identity]:
                         conditions.add((local, "decode", receiving))
 
-            # Padding may give an otherwise empty receiver work; it is a separate declared opportunity.
-            for _, _, experts in self.routes.padding_routes.get(layer, ()):
-                conditions.add((local, "padding", any(begin <= expert < end for expert in experts)))
+            # Unused table positions cannot require observing an additional receiver.
+            for first, _, experts in self.routes.padding_routes.get(layer, ()):
+                if first < self.routes.padding_limit:
+                    conditions.add((local, "padding", any(begin <= expert < end for expert in experts)))
         return sorted(conditions)
 
     def parameters(self, members, model_tokens: int) -> dict[str, int]:
+        self.routes.check_batch(members, model_tokens)
         if self.size == 1:
 
             # Local dispatch keeps token rows; expert expansion happens inside the computation scope.

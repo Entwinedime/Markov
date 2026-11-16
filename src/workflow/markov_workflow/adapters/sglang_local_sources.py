@@ -46,16 +46,18 @@ class LocalSources:
             shared = {}
             for need in needed:
                 implementation = need["structure"]["instances"]["null"]
-                key = tuple((name, value) for name, value in sorted(implementation.items()) if name not in {"tp", "pp", "ep"})
+                independent = set() if implementation["mixed_batches"] else {"tp", "pp", "ep"}
+                key = tuple((name, value) for name, value in sorted(implementation.items()) if name not in independent)
                 shared.setdefault(key, []).append(need)
             for group in shared.values():
 
-                # Native continuous batching needs merge/subset; one model witness can supply arrays across shard layouts.
+                # Mixed execution owns its nested merge; only ordinary batch arrays share across shard layouts.
                 donor = min(group, key=lambda item: (
                     not item["required"],
                     item["structure"]["instances"]["null"]["tp"] * item["structure"]["instances"]["null"]["pp"],
                 ))
-                donor["required"].update(("merge", "subset"))
+                operation = "mix" if donor["structure"]["instances"]["null"]["mixed_batches"] else "merge"
+                donor["required"].update((operation, "subset"))
                 donor["consumers"].extend(consumer for item in group if item is not donor for consumer in item["consumers"])
 
         for need in needed:
@@ -83,7 +85,7 @@ class LocalSources:
         instances = [{"id": "serving", "mode": "null", "configuration": configuration}]
         topology = configuration.get("ep")
         topologies = [] if topology is None else [topology["id"]]
-        outputs = 2 if "merge" in required else 1
+        outputs = 2 if "subset" in required else 1
         name, request = min(
             ((name, request) for name, workload in self.workloads.items() for request in workload["requests"]
              if request["output_tokens"] >= outputs),
@@ -100,10 +102,15 @@ class LocalSources:
         request = normalized["requests"][0]
         request.pop("prefix_id", None)
         page = configuration["page_size"]
+        chunk = serving.instances[0].configuration.values["prefill_chunk_tokens"]
         paged_tokens = (request["prompt_tokens"] + page - 1) // page * page
 
         # Cached admission rejects equality before adding; ignore-EOS admission stops at zero after adding.
         configuration["max_prefill_tokens"] = 2 * paged_tokens + int(configuration.get("prefix_cache", False))
+        if chunk:
+
+            # Both unequal-output requests must finish Prefill together before filtering their shared batch.
+            configuration["prefill_chunk_tokens"] = max(chunk, 2 * paged_tokens)
 
         # Each PP slot receives two pairs; unequal outputs also exercise survivor filtering and merging.
         workload = {**normalized, "id": "local-operations", "prefixes": [], "requests": [

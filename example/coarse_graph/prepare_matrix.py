@@ -76,19 +76,23 @@ class MatrixInputs:
             requests.append(request)
         result = {"id": case["id"], "requests": requests, "prefixes": case["prefixes"]}
         WorkloadContent(requests, case["prefixes"])
-        topologies = {instance["configuration"]["ep"]["id"]: instance["configuration"]["ep"]["size"]
-                      for instance in instances if "ep" in instance["configuration"]}
+        topologies = {}
+        for instance in instances:
+            configuration = instance["configuration"]
+            if "ep" in configuration:
+                identity = configuration["ep"]["id"]
+                topologies[identity] = max(topologies.get(identity, 0), configuration["tp"] - 1)
         if topologies:
             assignments = self.routes(requests, case["prefixes"], geometry, case["routes"])
             balanced = [expert * (geometry["experts"] // geometry["top_k"]) for expert in range(geometry["top_k"])]
             result["ep_routes"] = {}
             layers = [{"layer": layer, "experts": geometry["experts"], "top_k": geometry["top_k"]}
                       for layer in range(geometry["layers"])]
-            for identity, size in topologies.items():
-                route = {"assignments": assignments, "padding": [] if size == 1 else [{
-                    "layers": [0, geometry["layers"]], "tokens": [0, size - 1], "experts": balanced,
+            for identity, padding_tokens in topologies.items():
+                route = {"assignments": assignments, "padding": [] if padding_tokens == 0 else [{
+                    "layers": [0, geometry["layers"]], "tokens": [0, padding_tokens], "experts": balanced,
                 }]}
-                ExpertRoutes(route, requests, layers, geometry["layers"], size - 1)
+                ExpertRoutes(route, requests, layers, geometry["layers"], padding_tokens)
                 result["ep_routes"][identity] = route
         return result
 

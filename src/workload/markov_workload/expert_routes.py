@@ -6,10 +6,10 @@ from typing import Any
 
 
 class ExpertRoutes:
-    def __init__(self, source, requests, layers, model_layers: int, padding_tokens: int) -> None:
+    def __init__(self, source, requests, layers, model_layers: int, padding_limit: int) -> None:
         self.layers = {layer["layer"]: layer for layer in layers}
         self.model_layers = model_layers
-        self.padding = padding_tokens
+        self.padding_limit = padding_limit
         if len(self.layers) != len(layers):
             raise ValueError("conditional routes need unique native expert layers")
         for layer in layers:
@@ -34,15 +34,25 @@ class ExpertRoutes:
             self.coverage(segments[name], length, name)
         self.assignments = segments
 
-        padding = source.get("padding", [])
-        if not isinstance(padding, list):
-            raise ValueError("padding routes must be an array")
+        padding = self.padding_input(source)
         segments = {}
+        self.padding = max((assignment["tokens"][1] for assignment in padding), default=0)
         for assignment in padding:
             self.insert(assignment, segments, self.padding, False)
+
+        # A shared route table may cover several TP layouts; unused positions do not create padded work.
         if self.padding:
             self.coverage(segments, self.padding, "padding")
         self.padding_routes = segments
+
+    @staticmethod
+    def padding_input(source):
+        padding = source.get("padding", [])
+        if not isinstance(padding, list):
+            raise ValueError("padding routes must be an array")
+        for assignment in padding:
+            ExpertRoutes.interval(assignment["tokens"], (1 << 63) - 1, "padding tokens")
+        return padding
 
     def insert(
         self, source: dict[str, Any], segments: dict[int, list[tuple[int, int, list[int]]]], tokens: int, request: bool
@@ -81,10 +91,14 @@ class ExpertRoutes:
             if covered != tokens:
                 raise ValueError(f"incomplete route for {context}, layer {layer}")
 
-    def batch_segments(self, members, layer: int, padded_tokens: int):
+    def check_batch(self, members, padded_tokens):
         tokens = sum(member["new_tokens"] for member in members)
-        if not tokens <= padded_tokens <= tokens + self.padding:
-            raise ValueError("native token padding exceeds the supplied route coverage")
+        if not tokens <= padded_tokens <= tokens + min(self.padding, self.padding_limit):
+            raise ValueError("native token padding exceeds its TP alignment or supplied route coverage")
+        return tokens
+
+    def batch_segments(self, members, layer: int, padded_tokens: int):
+        tokens = self.check_batch(members, padded_tokens)
         ranges = [
             (self.assignments[member["id"]][layer], member["context_tokens"], member["context_tokens"] + member["new_tokens"])
             for member in members

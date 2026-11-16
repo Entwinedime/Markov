@@ -63,10 +63,13 @@ class RepresentativeSources:
             conditions.add("later_arrival")
         for instance in instances:
             config = instance.configuration.values
+            page_size = config["page_size"]
             prefix = instance.mode + "/"
             conditions.update(prefix + condition for condition in self.route_conditions(instance, workload))
             if config["prefix_cache"]:
                 conditions.update(prefix + condition for condition in self.cache_conditions(instance.mode, config, content))
+                if self.cached_page_demand(instance.mode, page_size, content) > config["max_total_tokens"] // page_size:
+                    conditions.add(prefix + "cached_pages_exceed_pool")
             if NativeConfiguration.batch_capacity(config) > 1 and len(requests) > 1:
                 conditions.add(prefix + "multiple_requests")
                 if len({request["output_tokens"] for request in requests}) > 1:
@@ -77,7 +80,6 @@ class RepresentativeSources:
                     conditions.add(prefix + "decode_turnover_inputs")
 
             # Prefill hands off after its prompt; other roles retain KV as Decode extends each request.
-            page_size = config["page_size"]
             pages = [(request["prompt_tokens"] + (0 if instance.mode == "prefill" else request["output_tokens"] - 1)
                       + page_size - 1) // page_size for request in requests]
 
@@ -102,6 +104,48 @@ class RepresentativeSources:
             if config["prefix_cache"] and LifecycleProbes.shared_prefix_requests(content, page_size):
                 conditions.add(prefix + "shared_prefix")
         return conditions
+
+    @staticmethod
+    def cached_page_demand(mode, page_size, content):
+        pages, shared = 0, set()
+        for request in content.requests.values():
+            tokens = request["prompt_tokens"] + (0 if mode == "prefill" else request["output_tokens"] - 1)
+            prefix = request.get("prefix_id")
+            pages += tokens // page_size - content.lengths[prefix] // page_size
+
+            # Shared token paths count once; conditional expert routes can split them further.
+            while prefix is not None and prefix not in shared:
+                shared.add(prefix)
+                parent = content.prefixes[prefix].get("parent")
+                pages += content.lengths[prefix] // page_size - content.lengths[parent] // page_size
+                prefix = parent
+        return pages
+
+    def reduce_requests(self, instances, workload, required):
+        reduced = workload
+        minimum = 1
+        for instance in instances:
+            config = instance.configuration.values
+            if instance.mode == "null" and config["mixed_batches"] and "decode" in required:
+
+                # Preserve competing work beyond the resident PP/batch window, rather than trimming away mixed execution.
+                resident = min(config["max_running_requests"], config["pp"] * NativeConfiguration.batch_capacity(config))
+                minimum = max(minimum, min(len(workload["requests"]), resident + 1))
+
+        ordered = sorted(workload["requests"], key=lambda row: (row["prompt_tokens"] + row["output_tokens"], row["id"]), reverse=True)
+        for request in ordered:
+            if len(reduced["requests"]) == minimum:
+                break
+            candidate = {**reduced, "requests": [row for row in reduced["requests"] if row["id"] != request["id"]]}
+            if "ep_routes" in reduced:
+                candidate["ep_routes"] = {name: {**route, "assignments": [
+                    entry for entry in route["assignments"] if entry["request"] != request["id"]
+                ]} for name, route in reduced["ep_routes"].items()}
+
+            # Keep whole requests and original arrival/route intervals; only redundant input opportunities disappear.
+            if required <= self.conditions(instances, candidate):
+                reduced = candidate
+        return reduced
 
     @staticmethod
     def cache_conditions(mode, configuration, content):
@@ -237,7 +281,7 @@ class RepresentativeSources:
                 remaining.remove(item)
                 covered.update(item["conditions"])
 
-            # A later witness can subsume an earlier workload; discard whole redundant inputs, never individual requests.
+            # A later workload can subsume an earlier one before reducing requests within the retained inputs.
             for item in sorted(selected, key=lambda item: (
                 item["cost"]["prompt_tokens"] + item["cost"]["decode_tokens"], item["name"],
             ), reverse=True):
@@ -248,18 +292,19 @@ class RepresentativeSources:
             topologies = [name for name, _ in padding]
             probes = LifecycleProbes(instances[configuration], topologies)
             normalized = {}
+            covered = set()
             for item in selected:
                 name, conditions = item["name"], item["conditions"]
                 original = self.workloads[name]
-                normalized[name] = original
+                normalized[name] = self.reduce_requests(instances[configuration], original, conditions)
 
                 # Fixed arrival gaps cannot be rescaled without knowing native execution time.
                 if "later_arrival" not in conditions:
-                    shortened = probes.normalize(original)
+                    shortened = probes.normalize(normalized[name])
                     shortened_conditions = self.conditions(instances[configuration], shortened)
                     if conditions <= shortened_conditions:
                         normalized[name] = shortened
-                        covered.update(shortened_conditions)
+                covered.update(self.conditions(instances[configuration], normalized[name]))
             workload, submissions = self.combine(names, topologies, normalized)
             single_model = any(self.model_coverage(instance.mode, instance.configuration.values, covered)
                                for instance in instances[configuration])

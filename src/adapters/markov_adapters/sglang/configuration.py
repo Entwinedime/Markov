@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from markov_workload.expert_routes import ExpertRoutes
+
 
 class NativeConfiguration:
     @staticmethod
@@ -122,7 +124,11 @@ class ServingInput:
             raise ValueError("native PD transfer requires equal page sizes")
         self.workload = self.workload_input(source["workload"])
         for instance in self.instances:
-            instance.configuration.routes(self.workload)
+            routes = instance.configuration.routes(self.workload)
+            if routes is not None:
+
+                # Validate declared positions before loading a model; native geometry later checks their consumers.
+                ExpertRoutes.padding_input(routes)
 
     @staticmethod
     def workload_input(source: dict) -> dict:

@@ -28,12 +28,13 @@ class NativeExpertRoutes:
 
     def configure(self, experts: dict, layers: list[dict], model_layers: int) -> None:
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.server_args import get_global_server_args
 
         if any(module.moe_ep_size != self.size for module in experts.values()):
             raise ValueError("injected routes must match the native expert group")
 
-        self.conditions = ExpertRoutes(self.source, self.input["requests"], layers, model_layers, self.size - 1)
+        self.conditions = ExpertRoutes(self.source, self.input["requests"], layers, model_layers, get_parallel().attn_tp_size - 1)
         args = get_global_server_args()
         self.geometry = ExpertBatch(self.conditions, self.size, get_moe_ep_group().rank_in_group, args.moe_a2a_backend, args.deepep_mode)
 
