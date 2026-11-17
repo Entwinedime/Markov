@@ -65,9 +65,14 @@ def recipes(captured):
                 "npu_token_expert_pairs",
                 "active_npu_experts",
             ],
-            "curve": "numa_pools",
             "nonnegative": True,
-            "coverage_features": ["cpu_token_expert_pairs", "active_cpu_experts", "cpu_threads", "resident_experts"],
+            "coverage_features": [
+                "cpu_token_expert_pairs",
+                "active_cpu_experts",
+                "cpu_threads",
+                "numa_pools",
+                "resident_experts",
+            ],
             "extrapolation_features": [
                 "cpu_token_expert_pairs",
                 "npu_token_expert_pairs",
@@ -79,7 +84,7 @@ def recipes(captured):
             "limitations": [
                 "Closed native MoE response includes D2H, CPU/NPU overlap, drain, merge and H2D; constituent services are not separately identifiable.",
                 "CPU work per thread and active experts per pool approximate scaling; bandwidth saturation and placement can break this model.",
-                "NUMA pool interpolation and unmeasured work combinations need independent verification; base routing remains conditional.",
+                "CPU/NUMA counts share coefficients through work variables; unmeasured combinations need independent verification and base routing remains conditional.",
             ],
         }
         for phase in captured["phases"]

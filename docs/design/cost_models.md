@@ -167,7 +167,7 @@ caller 在响应期间持有调用权，较早的结果或备份调用可在两�
 
 DeepSeek-V4-Flash 的串行 eager 路径按每层原生 submit／combine 边界定义闭合 MoE 响应，包含输入搬运、CPU／NPU 内部重叠、汇合与输出搬运，不再叠加内部单项成本。没有跨区域交错才可采用这种粒度；NPU graph、延后专家及跨区域重叠不能直接套用。不能复用旧 dense/Torch 的阶段响应。
 
-结构侧保留 base 的实际专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 分开维护；独立响应使用非负形式 `T=a+bq+c×P_cpu/t+d×U_cpu/p+e×P_npu+f×U_npu`，其中 q 是 query tokens，在已测 NUMA 池数锚点之间插值系数。这是闭合响应的近似，不能视为严格并行缩放或独占 CPU 服务；带宽饱和、内存放置及实际路由漂移另列不确定性。
+结构侧保留 base 的实际专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 分开维护；独立响应使用非负形式 `T=a+bq+c×P_cpu/t+d×U_cpu/p+e×P_npu+f×U_npu`，其中 q 是 query tokens。各资源档位共享同一组系数，池数通过 U_cpu/p 进入工作量，不再按池数另拟合系数；原始线程数、池数和驻留数仍限制覆盖范围。这是闭合响应的近似，不能视为严格并行缩放或独占 CPU 服务；带宽饱和、内存放置、观察开销及实际路由漂移另列不确定性。
 
 ktransformers_regions 导入单独校准任务生成的 region_measurements.json。资源数量在工作特征中表达，同一模型部署共用响应，不为每个 CPU／卸载完整配置维护专用模型。共享采样从整组缺口选取资源端点，以有界、与目标文本不同的 token 序列观察工作；不采目标 trace 或按 E2E 残差选参数。首个准备请求不参加拟合。工作分布的计数外推明确标注，资源档位和 query 范围不足时仍返回缺口，不把外推解释为已测。
 
