@@ -8,7 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 已完成单 NPU 语义采集及线程／池／专家驻留变化的条件预测和声明面板正常评分，仍有尾部误差。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
+两款 Qwen 的同机 TP／HiCache 和 KT＋DeepSeek 的单 NPU CPU／专家配置变化已完成正式使用流程、有限搜索及独立正常确认。流程可以交接，精度尚未全部达到单格 <10%：新请求的两个 KT 目标仍有明显低估，历史面板也有尾部。实际范围、最新结果和限制见[项目工作流](docs/workflow.md)。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
 
 ## 怎样运行
 
@@ -46,7 +46,7 @@ scripts/markov.sh predict --request /path/to/request.json
 请求提供 deployment、workload、base、targets、performance.database（或显式 performance.models），以及 execution.output 和
 execution.kernel_cache_initial_state（empty 或 prepared）。结果在 output/prediction/report.json，
 包含完整正式 HTTP、逐请求耗时、后台完成、缺口、成本来源、近似、图规模和运行开销。
-同一会话只准备一次 source；每个 target 独立维护缓存和执行状态。
+同次 predict 只解释一次 source；每个 target 独立维护缓存和执行状态。重跑命令可复用采集，但仍要重新解释来源，不等于跨任务常驻缓存。
 SGLang 普通预测解释语义 probe 与客户端记录；示例声明 execution.capture.detail="semantic"，只采这些记录；省略 detail 时使用 diagnostic，另保留 profiler/native-hook 用于原始图诊断。
 语义采集没有完整源图回放资格；两种模式的实际精度与开销分别验证。可选 capture.cpu_set 固定采集进程的 CPU 放置。
 预测容器只挂载指定程序、base、模型和输出，不挂载整个仓库、真实设备或正常评分数据。
@@ -80,7 +80,7 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 ## 已验证范围与限制
 
 当前实际输入包括 Qwen3-32B/BF16/TP2、4、8 和 Qwen3-8B/BF16/TP1、2、4、8，各用自己的 base 和独立成本；平台为 Ascend 910B3、SGLang eager/FIA，串行固定输出。32B/TP1 的权重下界超过原生可用设备总容量，已安全排除。
-两款 Qwen 的开发面板均已完成正常对照，涵盖换 base 和 TP／HiCache 联合变化：8B 的 34 个跨配置预测 WAPE 4.67%、最大单格误差 11.23%；32B 的 23 个跨配置预测 WAPE 5.00%、最大 10.53%。仍有超标格子，紧主机池下的原生分配失败也不能可靠预测。现行代码已重跑历史 315 格，WAPE 1.97%、最大 9.95%；这是既有正常真值上的回归，不能代替新增 TP 或 KT 的精度资格。
+最新独立新请求共 12 格：Qwen3-8B／32B 各四格，最大误差分别为 5.024%／6.563%；KT 四格中两个 128 线程目标为 18.310%／17.819%。历史 110 格 WAPE 4.970%、最大 12.789%，九格 ≥10%；历史 315 格 WAPE 1.975%、最大 9.993%，全部 <10%。历史回归不代替新请求验证，紧主机池的原生分配可行性也仍有限制。
 预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
 需要在准备结束后清空后台工作时，workload 设置 drain_before_formal=true；SGLang 以轻量状态等待 HiCache 空闲，预测保留同一控制语义。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
@@ -102,6 +102,8 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
 HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；CPU／池／专家变化使用共享独立完整前向响应，目标沿用 base 路由。30 个开发跨配置预测 WAPE 为 5.04%、最大误差 12.79%，三格仍 ≥10%；四个开发同配置最大 7.06%。这些是既有正常参考上的修正核对，不是本轮新请求终验。实际路由可能漂移，内存预留也不保证目标峰值；原生 NPU graph 尚未覆盖。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格；没有完整前向结束边界的旧 KT 来源需要用当前探针重新采集。
+
+新 KT base 会自动记录逐 NUMA 绑核需要的物理核与允许 CPU，目标必须满足原生本地放置规则，不能只看线程总数。不可行点保留原因并从推荐排除。旧来源缺拓扑时仍可条件预测，但不能据此认证新资源放置；可用原来的 base.configuration 请求重新 capture，并使用返回的新 manifest。显式 base.manifest 始终指向所指定的那份来源。
 
 ### DeepSeek-V4-Flash 单 NPU 运行
 
