@@ -1,0 +1,98 @@
+{
+  "deployment": {
+    "platform": "Ascend 910B3",
+    "framework": "sglang",
+    "runtime": "ascend",
+    "model": "/path/to/Qwen3-8B",
+    "dtype": "bfloat16",
+    "tensor_parallel": 1
+  },
+  "base": {
+    "configuration": {
+      "page_size": 64,
+      "max_total_tokens": 4096,
+      "max_prefill_tokens": 4096,
+      "enable_hierarchical_cache": true,
+      "hicache_ratio": 2.5,
+      "hicache_write_policy": "write_through_selective",
+      "hicache_io_backend": "kernel_ascend",
+      "hicache_mem_layout": "page_first_direct"
+    }
+  },
+  "workload": "workload.json",
+  "targets": [
+    {
+      "name": "reference",
+      "configuration": {}
+    },
+    {
+      "name": "tp2_reference",
+      "deployment": {
+        "tensor_parallel": 2
+      },
+      "configuration": {}
+    },
+    {
+      "name": "tp4_host",
+      "deployment": {
+        "tensor_parallel": 4
+      },
+      "configuration": {
+        "max_total_tokens": 2048,
+        "hicache_ratio": 4.0
+      }
+    },
+    {
+      "name": "tp8_file",
+      "deployment": {
+        "tensor_parallel": 8
+      },
+      "configuration": {
+        "max_total_tokens": 1024,
+        "hicache_write_policy": "write_through",
+        "hicache_storage_backend": "file",
+        "hicache_storage_prefetch_policy": "wait_complete"
+      }
+    }
+  ],
+  "execution": {
+    "output": "../data/qwen3_8b_prediction",
+    "memory_limit_gib": 8,
+    "kernel_cache_initial_state": "empty",
+    "capture": {
+      "image": "markov-rebuild-sglang:ubuntu22.04",
+      "devices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "memory_limit_gib": 192,
+      "cpus": 8,
+      "detail": "semantic",
+      "budget": {
+        "starts": 2,
+        "wall_sec": 1800,
+        "requests": 8,
+        "input_tokens": 10000,
+        "output_tokens": 128,
+        "retained_mib": 2048
+      }
+    }
+  },
+  "performance": {
+    "database": "../data/performance.sqlite",
+    "sampling_budget": {
+      "starts": 32,
+      "wall_sec": 10800,
+      "requests": 512,
+      "input_tokens": 1000000,
+      "output_tokens": 8192,
+      "retained_mib": 512
+    }
+  }
+}

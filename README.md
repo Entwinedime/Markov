@@ -8,7 +8,7 @@ base trace → 源语义区域 → target 工作、依赖与条件程序 ─┐
 独立性能采集 → SQLite → 离线成本模型 ────────────────┴→ 执行 → HTTP 预测
 ```
 
-当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 已接通单 NPU 语义采集及线程／池／专家驻留变化的条件预测；完整正常精度仍在验证。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
+当前正式预测入口已运行限定范围的 SGLang 主机/文件回访；原始/扩展矩阵、有限资源搜索及固定模型后的新配置和新请求验证已有独立正常对照。KTransformers 的 DeepSeek-V4-Flash 已完成单 NPU 语义采集及线程／池／专家驻留变化的条件预测和声明面板正常评分，仍有尾部误差。实际范围、最新成绩及限制见[项目工作流](docs/workflow.md)。单格达标仍受正常实测波动和成本适用范围限制，不代表限时预取路径、细微配置排序或任意配置均已验证。旧工程严格同成本对照未完成，相对旧实现的 10× 提速尚未证实。
 
 ## 怎样运行
 
@@ -19,6 +19,8 @@ docker build -t markov-modeling:ubuntu24.04 -f docker/modeling/Dockerfile .
 scripts/build.sh Release
 scripts/markov.sh plan --request configs/prediction.json
 ```
+
+两款模型的跨 TP 输入分别是 [Qwen3-8B](configs/qwen3_8b_prediction.json) 和 [Qwen3-32B](configs/qwen3_32b_prediction.json)，另有 [KT＋DeepSeek](configs/ktransformers_prediction.json)。Qwen 跨 TP 示例显式声明八张设备，分别从 TP1／TP2 预测到 TP4、TP8，并包含 HiCache 联合变化；可在面板导入，也可交给同一条 predict 命令。先根据实际卡组调整目标和设备，再填写模型路径与预算。
 
 plan 只预览输入与准备动作，不启动设备。先按实际部署修改示例中的模型位置、镜像、设备和预算；
 预览不会核验这些资源能否真正启动。
@@ -78,7 +80,7 @@ predict 从数据库导出本组的只读选择，用户无需手拼模型文件
 ## 已验证范围与限制
 
 当前实际输入包括 Qwen3-32B/BF16/TP2、4、8 和 Qwen3-8B/BF16/TP1、2、4、8，各用自己的 base 和独立成本；平台为 Ascend 910B3、SGLang eager/FIA，串行固定输出。32B/TP1 的权重下界超过原生可用设备总容量，已安全排除。
-8B 的 40 个预测已完成正常对照，涵盖换 base 和 TP／HiCache 联合变化：34 个跨配置预测 WAPE 4.67%、最大单格误差 11.23%，6 个同配置预测最大误差 6.48%。32B 的全量正常评分仍在进行；紧主机池下的原生分配失败仍不能可靠预测。历史 315 格是独立的回归基线，不能代替本轮代码的最终复验或新模型的精度资格。
+两款 Qwen 的开发面板均已完成正常对照，涵盖换 base 和 TP／HiCache 联合变化：8B 的 34 个跨配置预测 WAPE 4.67%、最大单格误差 11.23%；32B 的 23 个跨配置预测 WAPE 5.00%、最大 10.53%。仍有超标格子，紧主机池下的原生分配失败也不能可靠预测。现行代码已重跑历史 315 格，WAPE 1.97%、最大 9.95%；这是既有正常真值上的回归，不能代替新增 TP 或 KT 的精度资格。
 预测需使用与 base 一致的输入、ignore_eos 和输出数量。文本使用采集时记录的实际 token，不在预测容器加载 tokenizer。
 需要在准备结束后清空后台工作时，workload 设置 drain_before_formal=true；SGLang 以轻量状态等待 HiCache 空闲，预测保留同一控制语义。
 目标可声明页大小、设备容量和 HiCache 策略等受支持设置；有规则不等于成本覆盖，域外工作明确停止。
@@ -99,7 +101,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
 SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
-HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；CPU／池／专家变化使用共享独立 MoE 响应，目标沿用 base 路由。实际路由可能漂移，内存预留也不保证目标峰值；NPU graph 和完整正常精度尚未验收。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格。
+HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；CPU／池／专家变化使用共享独立 MoE 响应，目标沿用 base 路由。30 个开发跨配置预测 WAPE 为 7.44%、最大误差 21.33%，精度仍未全部达标。实际路由可能漂移，内存预留也不保证目标峰值；原生 NPU graph 尚未覆盖。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格。
 
 ### DeepSeek-V4-Flash 单 NPU 运行
 

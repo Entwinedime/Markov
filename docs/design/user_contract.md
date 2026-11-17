@@ -18,8 +18,8 @@ execution.kernel_cache_initial_state 必须为 empty 或 prepared。
 empty/prepared 是声明的初始条件，不是自动检测结果。输入准备另按原生工作规格记录新准备数量；
 首次 phase 仍覆盖未细分的初次准备，不能保证还原全部编译器或驱动缓存状态。
 
-当前要求同平台、框架、runtime、模型与 dtype；SGLang/Qwen3 BF16 的目标规则接收同机 TP1／2／4／8，具体模型仍受部署容量及成本覆盖约束。8B 已有上述 TP 的有限实验，32B 扩展的正常评分仍在进行，不能据此推定任意配置精度。输入保持串行、ignore_eos=true，以及与 base 一致的输出数量和 formal_begin_index；实际资格以工作流记录为准。
-改变 TP 时，在目标中填写 deployment.tensor_parallel，例如 {"name":"tp4","deployment":{"tensor_parallel":4},"configuration":{}}；采集设备列表须足以覆盖 base 和所有需要补采的目标，流程只为当前任务选择所需卡数。公共 SGLang 示例默认两张卡和 semantic 来源；模型路径、平台、镜像及预算须按实际部署填写，示例不默认占用八张卡。
+当前要求同平台、框架、runtime、模型与 dtype；SGLang/Qwen3 BF16 的目标规则接收同机 TP1／2／4／8，具体模型仍受部署容量及成本覆盖约束。Qwen3-8B 与 Qwen3-32B 分别使用对应模型的 base，不能借用另一模型的来源或成本选择；规则可接收的配置不等于已有精度资格。输入保持串行、ignore_eos=true，以及与 base 一致的输出数量和 formal_begin_index；实际资格以工作流记录为准。
+改变 TP 时，在目标中填写 deployment.tensor_parallel，例如 {"name":"tp4","deployment":{"tensor_parallel":4},"configuration":{}}；采集设备列表须足以覆盖 base 和所有需要补采的目标，流程只为当前任务选择所需卡数。通用 SGLang 示例默认两张卡和 semantic 来源；两款 Qwen 的跨 TP 示例显式声明八张设备以覆盖 TP8。模型路径、目标、卡组、平台、镜像及预算须按实际部署填写。
 文本 prompt 需与采集原文相同，由 manifest 声明的配置取得实际 token，再核对源语义；预测不加载 tokenizer。
 采集配置没有保留实际编码时不能猜 token，已有 input_ids 仍直接核对源前缀。目标配置覆盖 base 对应字段，name 仅用于结果标识。
 支持变更 page_size、max_total_tokens、max_prefill_tokens、enable_hierarchical_cache、hicache_ratio、
