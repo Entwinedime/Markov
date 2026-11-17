@@ -146,7 +146,7 @@ DeepSeek-V4-Flash 单 NPU 部署使用 SGLang 服务和 KT-Kernel CPU 专家，d
 
 base.configuration 提供 kt_weight_path 的绝对 GGUF 模板路径，以及 kt_cpuinfer、kt_threadpool_count、kt_num_gpu_experts。它们分别是总 CPU 推理线程、NUMA 池数、每层 NPU 驻留专家数；target.configuration 可覆盖这三项，省略的字段继承 base。路径模板含 {layer_idx}，专家目录只读挂载；框架原生参数由适配器映射，不重复在 deployment 声明 CPU 数量。
 
-线程池数须整除专家中间维度，且每池至少分得一个 256 元素的 LLAMAFILE 量化块；记录了来源资源时，目标线程／池数还不能超过可见 CPU／NUMA 范围。采集在首次 forward 后记录一次实际线程亲和性和内存放置摘要；这不是固定内存绑定或目标峰值内存的保证。独立成本仍需匹配实际运行条件，不能仅凭线程数处于数值范围内就授予新平台资格。
+线程池数须整除专家中间维度，且每池至少分得一个 256 元素的 LLAMAFILE 量化块；总线程数须能在池间均分。采集记录各 NUMA 节点的物理核代表 CPU 与容器允许 CPU；原生每池绑定本节点前若干物理核，目标必须满足这条本地放置规则，不能只检查全局 CPU 总数。不满足时返回 resource_infeasible，不启动模型，也不将其作为推荐；旧来源没有核拓扑时明确保留绑核未验证资格。采集在首次 forward 后另记录一次实际线程亲和性和内存放置摘要；这不是固定内存绑定或目标峰值内存的保证。独立成本仍需匹配实际运行条件，不能仅凭线程数处于数值范围内就授予新平台资格。
 
 当前范围是同一模型／量化、单 NPU、prefix 放置、显式 eager 和无调度重叠；关闭 radix 复用和延后专家，每请求一次完整 Prefill 后逐 token Decode。输出固定，输入不超过声明的单个 Prefill chunk。capture.detail 选 semantic；kernel_cache_initial_state 选 empty，按实际 base 请求历史保留初次使用。NPU graph 和其他策略不自动取得支持。
 

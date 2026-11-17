@@ -62,7 +62,11 @@ def context(captured, deployment):
         "disable_overlap_schedule": settings["disable_overlap_schedule"],
         "placement": settings.get("kt_expert_placement_strategy", "prefix"),
         "timing_scope": captured.get("timing_scope"),
-        "resource_envelope": captured["resource_envelope"],
+
+        # Topology qualifies native placement; the measured CPU mask and quota stay identical.
+        "resource_envelope": {
+            key: value for key, value in captured["resource_envelope"].items() if key != "numa_core_cpu_ids"
+        },
     }
 
 

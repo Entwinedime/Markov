@@ -42,6 +42,8 @@ def server_arguments(deployment, configuration, *, calibration=False):
         positive_integer(configuration[key], key)
     if configuration["kt_cpuinfer"] < configuration["kt_threadpool_count"]:
         raise ValueError("Each KT thread pool needs at least one CPU inference thread")
+    if configuration["kt_cpuinfer"] % configuration["kt_threadpool_count"]:
+        raise ValueError("KT CPU threads must divide evenly between the native NUMA pools")
     if configuration.get("enable_hierarchical_cache", False):
         raise ValueError("HiCache is not part of the KT DeepSeek execution path")
     if not configuration.get("disable_cuda_graph", True) or not configuration.get("disable_overlap_schedule", True):
@@ -127,10 +129,21 @@ class Capture(SerialHttpClient):
             raise ValueError(
                 "KT NUMA pools must divide the expert width and each receive a LLAMAFILE quantization block"
             )
+        nodes = sorted(Path("/sys/devices/system/node").glob("node[0-9]*"), key=lambda node: int(node.name[4:]))
         resources = {
             "cpu_ids": sorted(os.sched_getaffinity(0)),
-            "numa_nodes": len(list(Path("/sys/devices/system/node").glob("node[0-9]*"))),
+            "numa_nodes": len(nodes),
         }
+
+        cores_by_node = {}
+        for node in nodes:
+            cores = set()
+            for cpu in node.glob("cpu[0-9]*"):
+                siblings = (cpu / "topology/thread_siblings_list").read_text().strip()
+                cores.add(int(siblings.split(",")[0].split("-")[0]))
+            cores_by_node[node.name.removeprefix("node")] = sorted(cores)
+        resources["numa_core_cpu_ids"] = cores_by_node
+
         cpu_max = Path("/sys/fs/cgroup/cpu.max")
         if cpu_max.is_file():
             quota, period = cpu_max.read_text().split()
@@ -147,8 +160,27 @@ class Capture(SerialHttpClient):
                 value = path.read_text().strip()
                 resources["memory_limit_bytes"] = None if value == "max" else int(value)
                 break
-        if threads > len(resources["cpu_ids"]) or pools > resources["numa_nodes"]:
-            raise ValueError("KT threads or NUMA pools exceed the container's visible resources")
+
+        issue = None
+        allowed = set(resources["cpu_ids"])
+        for pool in range(pools):
+            cores = cores_by_node.get(str(pool), [])
+
+            # Native pools select the first local physical cores, one PU each.
+            if len(cores) < threads // pools or not set(cores[: threads // pools]) <= allowed:
+                issue = f"KT NUMA pool {pool} cannot bind {threads // pools} local physical cores in the container CPU set"
+                break
+        if issue is not None:
+            artifact = (
+                "profile_manifest.json"
+                if self.plan.get("semantic", False)
+                else "region_measurements.json"
+                if self.plan["calibration"]
+                else "normal_observation.json"
+            )
+            write_json(self.directory / artifact, {"status": "resource_infeasible", "resource_envelope": resources, "issue": issue})
+            return
+
         for layer in range(model["num_hidden_layers"]):
             Path(server["kt_weight_path"].format(layer_idx=layer)).stat()
         if self.plan["workload"].get("drain_before_formal", False):

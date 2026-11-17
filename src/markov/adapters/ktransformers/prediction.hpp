@@ -16,6 +16,7 @@ struct PredictionTarget {
     std::string name;
     nlohmann::json configuration;
     std::size_t cpu_threads, numa_pools, resident_experts;
+    std::optional<std::string> infeasible;
 };
 
 struct PreparedPrediction {

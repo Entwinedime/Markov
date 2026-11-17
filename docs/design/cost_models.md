@@ -166,6 +166,8 @@ caller 在响应期间持有调用权，较早的结果或备份调用可在两�
 
 ## KTransformers 成本
 
+先由框架适配器检查原生逐 NUMA 绑核是否可行，再查询完整前向成本。核拓扑来自 base，不是回归系数；不存在的本地核或容器不允许的 CPU 不能按名义线程数外推。性能库仍沿用相同 CPU 掩码、配额及内存预留的独立事实，新增拓扑观察不改变这些事实或参数。通过资源检查也不保证新的资源组合已有精度资格。
+
 DeepSeek-V4-Flash 的串行 eager 路径以一次完整前向为闭合响应，操作为 forward.prefill／forward.decode，计时口径为 closed_forward_response。探针记录 Scheduler.run_batch 的墙钟，并在返回处同步当前流一次；包含 dense、attention、MoE、搬运及其内部重叠。每层只读取原生已经复制到 CPU 的路由计数，不再插入逐层设备事件。没有对外交错才可采用这种粒度；NPU graph、延后专家及跨区域重叠不能直接套用。
 
 结构侧保留 base 的逐层专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U，再跨层求和；相同编号在不同层是不同的专家工作。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 各用一组共享非负系数：`T=a+bq+cA+d×P_cpu/t+e×U_cpu/p+f×P_npu+g×U_npu`。q 为本次 query 长度，A 为 `q×(2×context−q+1)/2` 的因果上下文规模代理（字段 attention_pairs）；它并不等于 DeepSeek 滑窗／压缩注意力的真实计算量，适用范围由该部署的独立数据限定。前两类变量近似 dense／attention 变化，专家项描述资源与卸载变化。系数来自独立完整前向的测量，不给每个资源档位另拟合一套参数。该式近似整个闭合响应，不是各服务的独立耗时之和；带宽饱和、内存放置、观察扰动和路由漂移仍有限制。

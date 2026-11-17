@@ -24,6 +24,34 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
     for (const auto & batch : input.batches)
         maximum_query = std::max(maximum_query, observations.cost_observations[batch.source_cost].work.features.at("query_tokens"));
     for (const auto & target : input.targets) {
+        if (target.infeasible) {
+            cells.push_back({
+                {                  "name",                                target.name                                          },
+                {            "deployment",                                                                     input.deployment },
+                {         "configuration",                                                                 target.configuration },
+                {                "status",                                                                "resource_infeasible" },
+                {                 "issue",                                                                   *target.infeasible },
+                {         "e2e_predicted",                                                                                false },
+                {       "formal_http_sec",                                                                              nullptr },
+                { "background_finish_sec",                                                                              nullptr },
+                {             "cost_gaps",                                                                        Json::array() },
+                {              "coverage",                                                                       Json::object() },
+                {      "sampling_context", { { "configuration", target.configuration }, { "max_query_tokens", maximum_query } } },
+                {  "resource_reservation",
+                 { { "cpu_threads", target.cpu_threads },
+                 { "numa_pools", target.numa_pools },
+                 { "resident_experts_per_layer", target.resident_experts },
+                 { "native_cpu_binding_checked", input.resource_envelope.contains("numa_core_cpu_ids") } }                     },
+                {           "work_layout",                                                                       Json::object() },
+                {              "requests",                                                                        Json::array() },
+                {            "node_scale",                                                                        Json::array() },
+                {       "generated_nodes",                                                                                    0 },
+                {        "executed_nodes",                                                                                    0 },
+                {       "generated_edges",                                                                                    0 },
+                {        "simulation_sec",                                                                                    0 }
+            });
+            continue;
+        }
         const auto begin = std::chrono::steady_clock::now();
         adapters::ktransformers::Program program(input, target);
         auto result = simulation::ProgramExecution(program, costs, 1, input.node_scale, input.record_graph).run();
@@ -81,9 +109,10 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
             { "max_query_tokens",        maximum_query }
         };
         Json resources{
-            {                "cpu_threads",      target.cpu_threads },
-            {                 "numa_pools",       target.numa_pools },
-            { "resident_experts_per_layer", target.resident_experts }
+            {                "cpu_threads",                                    target.cpu_threads },
+            {                 "numa_pools",                                     target.numa_pools },
+            { "resident_experts_per_layer",                               target.resident_experts },
+            { "native_cpu_binding_checked", input.resource_envelope.contains("numa_core_cpu_ids") }
         };
         if (input.resource_envelope.contains("memory_limit_bytes") && !input.resource_envelope.at("memory_limit_bytes").is_null())
             resources["host_memory_reserved_bytes"] = input.resource_envelope.at("memory_limit_bytes");
@@ -144,6 +173,7 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
             "The target uses base routing; numerical changes under different expert placement can change future routing and require independent qualification.",
             "CPU/NUMA counts are bounded by source deployment resources when recorded. Host memory is a container reservation, not a target peak estimate; "
             "changed expert placement has no general device-memory feasibility guarantee.",
+            "Per-NUMA native CPU binding is checked only when the base records physical-core topology; older sources retain unverified placement.",
             "Only an identical forward reuses its source response. Other forwards use independent models; frontend residuals remain approximations and no HTTP "
             "time is deleted.",
             "End synchronization and routing observation can perturb timing; semantic execution is not detailed source replay or normal accuracy "

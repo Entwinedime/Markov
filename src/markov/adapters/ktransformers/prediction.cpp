@@ -19,6 +19,27 @@ std::size_t positive(const Json & raw, const char * name) {
     return value.get<std::size_t>();
 }
 
+std::optional<std::string> binding_issue(const Json & resources, std::size_t threads, std::size_t pools) {
+    if (threads % pools) return "KT CPU threads must divide evenly between the native NUMA pools";
+    if (resources.empty()) return std::nullopt;
+    if (threads > resources.at("cpu_ids").size() || pools > resources.at("numa_nodes").get<std::size_t>())
+        return "KT threads or NUMA pools exceed the captured container resources";
+    if (!resources.contains("numa_core_cpu_ids")) return std::nullopt;
+
+    const auto allowed = resources.at("cpu_ids").get<std::set<std::size_t>>();
+    const auto & topology = resources.at("numa_core_cpu_ids");
+    for (std::size_t pool = 0; pool < pools; ++pool) {
+        const auto node = std::to_string(pool);
+        const auto count = threads / pools;
+        if (!topology.contains(node) || topology.at(node).size() < count)
+            return "KT NUMA pool " + node + " has fewer physical cores than the native worker count";
+        for (std::size_t index = 0; index < count; ++index)
+            if (!allowed.contains(topology.at(node).at(index).get<std::size_t>()))
+                return "KT NUMA pool " + node + " cannot bind its native workers within the captured CPU set";
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 PreparedPrediction prepare_prediction(const Json & raw, source::ProfileManifest manifest) {
@@ -74,12 +95,8 @@ PreparedPrediction prepare_prediction(const Json & raw, source::ProfileManifest 
         const auto expert_width = positive(model, "moe_intermediate_size");
         if (threads < pools || expert_width % pools || expert_width % 256 || pools > expert_width / 256 || resident >= positive(model, "n_routed_experts"))
             throw std::runtime_error("KT CPU pools or expert partition are not valid for the native backend geometry");
-        if (captured.contains("resource_envelope")) {
-            const auto & resources = captured.at("resource_envelope");
-            if (threads > resources.at("cpu_ids").size() || pools > resources.at("numa_nodes").get<std::size_t>())
-                throw std::runtime_error("KT target exceeds the CPU/NUMA resources observed in the source deployment");
-        }
-        targets.push_back({ item.at("name").get<std::string>(), std::move(configuration), threads, pools, resident });
+        auto infeasible = binding_issue(captured.value("resource_envelope", Json::object()), threads, pools);
+        targets.push_back({ item.at("name").get<std::string>(), std::move(configuration), threads, pools, resident, std::move(infeasible) });
     }
     auto source = read_source(std::move(manifest), captured);
     if (source.source.context.observations().requests.size() != workload.at("requests").size())
