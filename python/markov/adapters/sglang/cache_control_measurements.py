@@ -20,9 +20,11 @@ def recipes(captured: dict) -> dict:
             "feature": ["pages", "segments"],
             "curve": "page_tokens",
             "nonnegative": True,
+            "extrapolation_features": ["pages"],
             "limitations": [
                 "Native init_load_back after two failed device allocations; threshold/quota skips are excluded.",
                 "Thread CPU excludes successful nested backups and their completion checks, which are delegated work.",
+                "Page-count extrapolation preserves this fixed failure branch; page size and radix segment count remain bounded by observations.",
                 "Small serial synthetic reuse workload; unrelated tree size, logging and light observation add uncertainty.",
             ],
         }
