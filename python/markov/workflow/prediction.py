@@ -30,6 +30,9 @@ def predict(request: PredictionRequest) -> dict:
         state = request.execution.output / "workflow_state.json"
         try:
             result = _predict(request)
+        except KeyboardInterrupt:
+            write_json(state, {"phase": "stopped", "targets": len(request.targets)})
+            raise
         except Exception as error:
             write_json(state, {"phase": "failed", "targets": len(request.targets), "issue": str(error)})
             raise
