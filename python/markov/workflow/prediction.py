@@ -27,7 +27,23 @@ def predict(request: PredictionRequest) -> dict:
     request.execution.output.mkdir(parents=True, exist_ok=True)
     with (request.execution.output / "prediction.lock").open("a") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _predict(request)
+        state = request.execution.output / "workflow_state.json"
+        try:
+            result = _predict(request)
+        except Exception as error:
+            write_json(state, {"phase": "failed", "targets": len(request.targets), "issue": str(error)})
+            raise
+
+        write_json(
+            state,
+            {
+                "phase": result["status"],
+                "targets": len(request.targets),
+                "completed_targets": sum(cell["status"] == "predicted" for cell in result.get("cells", [])),
+                "cost_requirements": result.get("cost_requirements", []),
+            },
+        )
+        return result
 
 
 def _predict(request: PredictionRequest) -> dict:
@@ -124,14 +140,5 @@ def _predict(request: PredictionRequest) -> dict:
     }
     result["workflow_sec"] = time.monotonic() - begin
     write_json(process.report, result)
-    write_json(
-        state,
-        {
-            "phase": result["status"],
-            "targets": len(request.targets),
-            "completed_targets": sum(cell["status"] == "predicted" for cell in result["cells"]),
-            "cost_requirements": result["cost_requirements"],
-        },
-    )
     result["report"] = str(process.report)
     return result
