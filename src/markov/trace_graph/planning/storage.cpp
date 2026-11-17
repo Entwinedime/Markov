@@ -384,18 +384,18 @@ bool Storage::on_event(ProgramRuntime & runtime, const simulation::Event & event
     const auto subject = event.action.subject;
     const auto request = subject / participants_, rank = subject % participants_;
     switch (static_cast<ActionKind>(event.action.kind)) {
-    case ActionKind::Issued: {
+    case ActionKind::Enqueued: {
         auto & result = results_[subject];
-        result.issue_finished_ns = runtime.now_ns();
-        if (prefetches_.contains(subject)) {
-            result.issued_ns = runtime.now_ns();
-            prefetches_.at(subject).enqueue_cause = event.identity;
-            ++stats_.queries;
-            queries_.push_back(subject);
-            if (queries_.size() == 1) start_query(runtime, subject);
-        }
+        result.issued_ns = runtime.now_ns();
+        prefetches_.at(subject).enqueue_cause = event.identity;
+        ++stats_.queries;
+        queries_.push_back(subject);
+        if (queries_.size() == 1) start_query(runtime, subject);
         return true;
     }
+    case ActionKind::Issued:
+        results_[subject].issue_finished_ns = runtime.now_ns();
+        return true;
     case ActionKind::Checked:
         return finish_check(runtime, subject, event.identity);
     case ActionKind::Allocated:

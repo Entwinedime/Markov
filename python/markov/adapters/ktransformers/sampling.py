@@ -9,7 +9,7 @@ from markov.adapters.ktransformers.capture import auxiliary_mounts, capture_envi
 
 def sampling_commands(deployment, report, requirements):
     features = [
-        row["work"]["features"] for row in requirements if "work" in row and row["work"]["operation"].startswith("moe.")
+        row["work"]["features"] for row in requirements if "work" in row and row["work"]["operation"].startswith("forward.")
     ]
     if not features:
         return []
@@ -27,15 +27,27 @@ def sampling_commands(deployment, report, requirements):
         settings = {name: value for name, value in zip(keys.values(), counts)}
         configuration = {**report["sampling_context"]["configuration"], **settings}
         configurations.append(configuration)
-    query = max(int(row["query_tokens"]) for row in features)
+    query = max(max(int(row["query_tokens"]) for row in features), int(report["sampling_context"]["max_query_tokens"]))
     lengths = sorted({1, max(2, query // 2), query})
     workload = {"formal_begin_index": 1, "drain_before_formal": False, "requests": []}
-    for length in [lengths[0], *lengths, lengths[-1]]:
+    for length in [lengths[0], *lengths]:
         workload["requests"].append(
             {
                 "prompt": None,
                 "input_ids": [1] + list(range(10, 10 + length - 1)),
-                "max_new_tokens": 3,
+                "max_new_tokens": 16,
+                "ignore_eos": True,
+                "return_logprob": False,
+            }
+        )
+    # Equal lengths with different token patterns separate routing distribution
+    # from query size; several Decode steps expose the post-Prefill transition.
+    for tokens in (list(range(10, 10 + query - 1))[::-1], [10 + index % 32 for index in range(query - 1)]):
+        workload["requests"].append(
+            {
+                "prompt": None,
+                "input_ids": [1, *tokens],
+                "max_new_tokens": 16,
                 "ignore_eos": True,
                 "return_logprob": False,
             }

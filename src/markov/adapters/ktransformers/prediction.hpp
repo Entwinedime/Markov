@@ -36,8 +36,8 @@ struct RequestResult {
     bool completed = false;
 };
 
-// Each MoE response is closed at the native submit/combine ports. There is no
-// external interleaving inside it in this serial, non-deferred eager scope.
+// A complete forward is closed before result processing. Internal CPU/NPU
+// work has no external interleaving in this serial, non-deferred eager scope.
 class Program final : public trace_graph::planning::Program {
 public:
     Program(const PreparedPrediction & input, const PredictionTarget & target) : input_(input), target_(target) {}

@@ -101,7 +101,7 @@ MARKOV_MODELING_MEMORY=8g scripts/run.sh modeling -- \
 独立目标诊断用 `scripts/markov.sh evaluate --request configs/target_evaluation.json`，需要已记录的预测图和另采的 target manifest。
 SGLang target 采集加 `--record-regions`；评价器单独编译，不进入预测/训练流程。
 报告列出真实成本替换范围、未对应工作和可观察的 CPU 顺序；带 profiler 的回放不能代替正常精度。
-HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；CPU／池／专家变化使用共享独立 MoE 响应，目标沿用 base 路由。30 个开发跨配置预测 WAPE 为 7.44%、最大误差 21.33%，精度仍未全部达标。实际路由可能漂移，内存预留也不保证目标峰值；原生 NPU graph 尚未覆盖。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格。
+HiCache 只属于 SGLang。KTransformers 的 DeepSeek-V4-Flash 部署使用 SGLang 服务与 KT-Kernel CPU 专家；正式入口通过 framework=ktransformers 选择适配器，共用设备任务、性能库及执行器。输入示例为 [ktransformers_prediction.json](configs/ktransformers_prediction.json)，先修改模型、GGUF、设备和资源。当前语义预测限定单 NPU eager、无调度重叠、无 radix 复用及固定输出；CPU／池／专家变化使用共享独立完整前向响应，目标沿用 base 路由。30 个开发跨配置预测 WAPE 为 5.04%、最大误差 12.79%，三格仍 ≥10%；四个开发同配置最大 7.06%。这些是既有正常参考上的修正核对，不是本轮新请求终验。实际路由可能漂移，内存预留也不保证目标峰值；原生 NPU graph 尚未覆盖。保存的预测路径可静态回放，语义来源不具备详细原始图回放资格；没有完整前向结束边界的旧 KT 来源需要用当前探针重新采集。
 
 ### DeepSeek-V4-Flash 单 NPU 运行
 

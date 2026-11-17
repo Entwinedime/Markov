@@ -20,6 +20,9 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
     auto & selected = input.costs.at(1);
     cost::Queries costs(selected.models, &source);
     auto cells = Json::array();
+    double maximum_query = 0;
+    for (const auto & batch : input.batches)
+        maximum_query = std::max(maximum_query, observations.cost_observations[batch.source_cost].work.features.at("query_tokens"));
     for (const auto & target : input.targets) {
         const auto begin = std::chrono::steady_clock::now();
         adapters::ktransformers::Program program(input, target);
@@ -74,7 +77,8 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
                 { "matched_nodes", result.scale_matches.empty() ? 0 : result.scale_matches[id] }
             });
         const Json sampling{
-            { "configuration", target.configuration }
+            {    "configuration", target.configuration },
+            { "max_query_tokens",        maximum_query }
         };
         Json resources{
             {                "cpu_threads",      target.cpu_threads },
@@ -93,7 +97,7 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
              { "resident_experts_per_layer", target.resident_experts },
              { "cpu_experts_per_layer", input.batches.front().layers.front().expert_counts.size() - target.resident_experts },
              { "routing", "Base per-layer expert histograms; target routing is not read" },
-             { "region_scope", "Closed serial MoE submit/compute/join response includes internal CPU/NPU overlap" } }                    },
+             { "region_scope", "Complete serial forward includes dense/MoE work and internal CPU/NPU overlap" } }                        },
             {      "sampling_context",                                                                                           sampling },
             {  "resource_reservation",                                                                                          resources },
             {                "status",                                                           complete ? "predicted" : "missing_costs" },
@@ -136,14 +140,13 @@ nlohmann::json prediction_report(const adapters::ktransformers::PreparedPredicti
         { "cells", std::move(cells) },
         { "limitations",
          { "Single-NPU eager DeepSeek-V4, prefix expert placement, serial requests without scheduler overlap, radix reuse or deferred experts.",
-            "Each MoE region is closed at native submit/combine ports. Independent closed responses include internal CPU/NPU overlap, not a sum of separate "
-            "services.",
+            "A complete serial forward is closed by stream synchronization. Independent responses include dense, attention, MoE and internal CPU/NPU overlap.",
             "The target uses base routing; numerical changes under different expert placement can change future routing and require independent qualification.",
             "CPU/NUMA counts are bounded by source deployment resources when recorded. Host memory is a container reservation, not a target peak estimate; "
             "changed expert placement has no general device-memory feasibility guarantee.",
-            "Unchanged non-MoE work and frontend intervals retain source responses or residual approximations; no gap, unknown control or HTTP time is "
-            "deleted.",
-            "Semantic probe and event overhead has not yet been calibrated; semantic execution is not detailed source replay or normal accuracy "
+            "Only an identical forward reuses its source response. Other forwards use independent models; frontend residuals remain approximations and no HTTP "
+            "time is deleted.",
+            "End synchronization and routing observation can perturb timing; semantic execution is not detailed source replay or normal accuracy "
             "evidence." } }
     };
 }

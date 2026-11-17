@@ -26,24 +26,24 @@ def recipes(captured: dict) -> dict:
     for part in ("issue", "check", "accept"):
         if "prefetch." + part not in captured.get("measurement_ports", []):
             continue
-        result[("cache.prefetch." + part, "sglang.HiRadixCache.prefetch", "controller_group_response")] = {
-            "feature": features[part],
-            "curve": "page_tokens",
-            "nonnegative": True,
-            "extrapolation_features": features[part] if part != "check" else [],
-            "limitations": [
-                "Group response after every rank enters; caller ownership is retained, not exclusive CPU service.",
-                "Issue precedes query enqueue; final check precedes the stop snapshot and acceptance follows it.",
-                "Pending checks belong to idle-turn responses; warm serial small-tree data do not certify contention or large tree overhead.",
-            ],
-        }
+        scopes = ("controller_enqueue_response", "controller_return_response") if part == "issue" else ("controller_group_response",)
+        for scope in scopes:
+            result[("cache.prefetch." + part, "sglang.HiRadixCache.prefetch", scope)] = {
+                "feature": features[part],
+                "curve": "page_tokens",
+                "nonnegative": True,
+                "extrapolation_features": features[part] if part != "check" else [],
+                "limitations": [
+                    "Group response after every rank enters; caller ownership is retained, not exclusive CPU service.",
+                    "Query begins at enqueue and can overlap the issue return; final check precedes the stop snapshot and acceptance follows it.",
+                    "Pending checks belong to idle-turn responses; warm serial small-tree data do not certify contention or large tree overhead.",
+                ],
+            }
     return result
 
 
 def measurements(path: Path, captured: dict) -> Iterator[Measurement]:
-    yield from response_measurements(
-        (row for row in events(path, captured) if row[1]["name"] != "prefetch.query"), captured
-    )
+    yield from (sample for sample in response_measurements(events(path, captured), captured) if sample.operation != OPERATION)
 
 
 def response_measurements(records: Iterator[tuple[int, dict, bool]], captured: dict) -> Iterator[Measurement]:
@@ -71,6 +71,30 @@ def response_measurements(records: Iterator[tuple[int, dict, bool]], captured: d
         features = {
             key: max(event["args"]["features"][key] for _, event, _ in rows) for key in rows[0][1]["args"]["features"]
         }
+        if rows[0][1]["name"] == "prefetch.issue":
+            queued = end
+            if features["allocated_pages"]:
+                queries = groups[("prefetch.query", tuple(rows[0][1]["args"]["request_ids"]))]
+                if {row[1]["args"]["participant"] for row in queries} != ranks or len(queries) != len(rows):
+                    raise ValueError("Prefetch issue needs one observed enqueue port per participant")
+                queued = max(event["args"]["queued_at_ns"] for _, event, _ in queries)
+            if not begin <= queued <= end:
+                raise ValueError("Prefetch enqueue lies outside its issuing group response")
+            spans = [("enqueue", begin, queued)]
+            if features["allocated_pages"]:
+                spans.append(("return", queued, end))
+            for port, start, finish in spans:
+                yield Measurement(
+                    rows[0][0],
+                    f"controller_{port}_response_ns",
+                    "cache.prefetch.issue",
+                    "sglang.HiRadixCache.prefetch",
+                    f"controller_{port}_response",
+                    features,
+                    finish - start,
+                    all(row[2] for row in rows),
+                )
+            continue
         yield Measurement(
             rows[0][0],
             "query_group_response_ns" if query else "controller_group_response_ns",

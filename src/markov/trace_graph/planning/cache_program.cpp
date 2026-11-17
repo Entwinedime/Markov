@@ -206,8 +206,10 @@ void CacheProgram::finish_compute(ProgramRuntime & runtime, std::size_t request)
     // A response does not release storage still used by in-flight work.
     cache_.release(*running.buffer);
     running.buffer.reset();
-    cache_.unpin_device(*running.pin);
-    running.pin.reset();
+    if (running.pin) {
+        cache_.unpin_device(*running.pin);
+        running.pin.reset();
+    }
     requests_[request].work_completed = cause_;
     compute_stats_.add(running.compute->stats());
     running.compute.reset();
@@ -666,9 +668,10 @@ void CacheProgram::commit(ProgramRuntime & runtime, std::size_t request) {
         cache_.acknowledge(*running.final_publication);
         running.final_publication.reset();
     }
+    // cache_finished_req releases its radix lock; a speculative trailing frame
+    // retains its own buffer and stream dependencies, not the completed prefix.
     cache_.unpin_device(*running.pin);
-    running.pin = running.committed;
-    cache_.pin_device(*running.pin);
+    running.pin.reset();
     if (!running.final_publication && !requests_[request].kv_published) requests_[request].kv_published = cause_;
     if (!running.final_insertion) backup_prefix(runtime, *running.committed, request);
     respond(runtime, request);

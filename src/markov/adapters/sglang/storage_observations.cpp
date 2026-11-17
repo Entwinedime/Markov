@@ -58,28 +58,52 @@ void ProbeReader::finish_prefetch_responses() {
             continue;
         }
         if (end < begin) throw std::runtime_error("Prefetch response precedes its group start");
-        const auto representative = std::ranges::find(responses, source::Index{ 0 }, &PrefetchResponse::participant);
-        auto region = representative->region;
-        region.begin_ns = begin;
-        region.end_ns = end;
         std::string_view port = "storage_query";
         if (name == "prefetch.issue") port = "storage_issue";
         else if (name == "prefetch.check") port = "storage_check";
         else if (name == "prefetch.accept") port = "storage_accept";
-        const planning::WorkKind kind{ "cache." + name,
-                                       query ? "sglang.file.prefetch_query" : "sglang.HiRadixCache.prefetch",
-                                       query ? "query_group_response" : "controller_group_response" };
-        output_.cost_observations.push_back({
-            request,
-            0,
-            0,
-            port,
-            { kind, std::move(features) },
-            end - begin,
-            region,
-            std::nullopt,
-            false
-        });
+        struct Part {
+            source::Time begin, end;
+            std::string_view port, scope;
+        };
+        std::vector<Part> parts{
+            { begin, end, port, query ? "query_group_response" : "controller_group_response" }
+        };
+        if (name == "prefetch.issue") {
+            auto queued = end;
+            if (features.at("allocated_pages") > 0) {
+                const auto peers = prefetch_responses_.find({ "prefetch.query", request });
+                if (peers == prefetch_responses_.end() || peers->second.size() != participants) {
+                    ++output_.counts["prefetch.issue.enqueue_unobserved"];
+                    continue;
+                }
+                queued =
+                    std::ranges::max_element(peers->second, {}, [](const PrefetchResponse & response) { return *response.queued_at_ns; })->queued_at_ns.value();
+            }
+            if (queued < begin || queued > end) throw std::runtime_error("Prefetch enqueue lies outside its issuing group response");
+            parts = {
+                { begin, queued, "storage_enqueue", "controller_enqueue_response" }
+            };
+            if (features.at("allocated_pages") > 0) parts.push_back({ queued, end, "storage_issue", "controller_return_response" });
+        }
+        const auto representative = std::ranges::find(responses, source::Index{ 0 }, &PrefetchResponse::participant);
+        for (const auto & part : parts) {
+            auto region = representative->region;
+            region.begin_ns = part.begin;
+            region.end_ns = part.end;
+            const planning::WorkKind kind{ "cache." + name, query ? "sglang.file.prefetch_query" : "sglang.HiRadixCache.prefetch", std::string(part.scope) };
+            output_.cost_observations.push_back({
+                request,
+                0,
+                0,
+                part.port,
+                { kind, features },
+                part.end - part.begin,
+                region,
+                std::nullopt,
+                false
+            });
+        }
         ++output_.counts[name + ".group_response"];
     }
     prefetch_responses_.clear();

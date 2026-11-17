@@ -149,7 +149,7 @@ base.configuration 提供 kt_weight_path 的绝对 GGUF 模板路径，以及 kt
 
 当前范围是同一模型／量化、单 NPU、prefix 放置、显式 eager 和无调度重叠；关闭 radix 复用和延后专家，每请求一次完整 Prefill 后逐 token Decode。输出固定，输入不超过声明的单个 Prefill chunk。capture.detail 选 semantic；kernel_cache_initial_state 选 empty，按实际 base 请求历史保留初次使用。NPU graph 和其他策略不自动取得支持。
 
-来源记录原生已经拷到 CPU 的路由编号直方图、MoE submit／combine 端口及客户端边界，不采 tensor snapshot。目标按 base 路由和目标驻留集合推导 CPU／NPU 工作，不能读取目标路由。未变工作可迁移闭合响应，变化工作查询独立数据；没有合格成本则保留 missing_costs，不产生零成本成功。配置变化可能改变后续路由，条件预测与正常精度须分开验证。
+来源记录原生已经拷到 CPU 的逐层路由直方图、完整前向及客户端边界，不采 tensor snapshot；在前向返回处同步当前流一次，不插逐层设备事件。目标按 base 路由和目标驻留集合推导 CPU／NPU 工作，不能读取目标路由。相同工作可迁移完整响应，变化工作整体查询独立数据，不再叠加 source 的非 MoE 相减余量。缺少完整前向结束边界的历史来源需要重新采集，不能替换一个字段就当作新口径。没有合格成本则保留 missing_costs，不产生零成本成功；路由漂移和采集扰动仍需独立验证。
 
 面板可载入对应框架示例并直接编辑目标线程、池数和驻留专家数，准备和预算仍由正式流程管理。保存的执行路径可用普通静态回放；semantic manifest 不授予详细原始图或完整设备因果资格。
 
@@ -255,14 +255,16 @@ scripts/markov.sh calibrate --request /path/to/calibration_request.json
 measure 将 profiler、Markov Python 与原生观察全部关闭，输出 normal/normal_observation.json 及独立 workload_report。
 该时间可以供后续评价读取，预测与训练不读取它。当前入口只运行声明的单个配置，并非已经实现整组 target 的评价编排。
 
-calibrate 运行独立选择的小型 workload，安装输入准备、分配规格、eager batch、结果处理/发送包络和异步 NPU event。
+SGLang 的 calibrate 运行独立选择的小型 workload，安装输入准备、分配规格、eager batch、结果处理/发送包络和异步 NPU event。
 它不安装底层算子探针、不采 snapshot、不启 profiler，输出 calibration/region_measurements.json 及轻量 JSONL。
 线程 CPU、caller 返回与 current-stream 区间分开记录；查询已完成 event 不新增前向同步。
 Ascend eager 另记录输入元数据的墙钟、线程 CPU 和设备区间。batch 的 CPU/返回模型使用 input_ready_thread_cpu、input_ready_caller_interval，按同边界的主机/设备时间差估计并扣除输入等待及自旋，由目标依赖重新表达；差值可能混入主机准备和事件排队，不能当作严格界限。未配对的末尾记录不补零。旧采集缺少这一边界时不能提供这两项新成本，其他有效观察仍可使用。
 结果模型区分 HiRadixCache 与 RadixCache，不能用未启 HiCache 的结果 CPU 响应冒充启用分支。
 结果发送前与发送后的线程时间由同一观察划分，不算两次独立实验。
 warmup 依据 formal_begin_index 排除，请求身份仅用于关联与预热划分，不进入回归特征。
-默认维护入口以 sglang_regions 导入，显式选 training 后导出模型；不会自动训练或根据 target 误差补采。
+上述 SGLang 区域以 sglang_regions 导入，显式选 training 后导出模型；不会根据 target 误差补采。
+
+KT 的 calibrate 观察完整串行前向及逐层路由，以 ktransformers_regions 导入。自动准备根据整组已知 query 上界和缺少的资源范围，共享有界采样；输入排列与连续 Decode 由采样配方提供，不使用 target 文本。它在前向末端同步当前流以闭合响应，这项观察扰动在正常评价中单独说明。
 
 三种运行分别保留 base、normal、calibration 子目录及累计状态；失败与 recapture 均不重置所属预算。
 校准仍需显式累计运行及存储预算，不能将额外性能采样转记到 base 或评价。

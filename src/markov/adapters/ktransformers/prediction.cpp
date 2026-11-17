@@ -93,10 +93,8 @@ PreparedPrediction prepare_prediction(const Json & raw, source::ProfileManifest 
         if (batch.layers.size() != positive(model, "num_hidden_layers")) throw std::runtime_error("KT source does not cover every model layer");
         for (const auto & layer : batch.layers) {
             if (layer.layer >= positive(model, "num_hidden_layers")) throw std::runtime_error("KT observed layer lies outside the model geometry");
-            if (layer.expert_counts.size() != positive(model, "n_routed_experts") || layer.work.features.at("cpu_threads") != positive(server, "kt_cpuinfer")
-                || layer.work.features.at("numa_pools") != positive(server, "kt_threadpool_count")
-                || layer.work.features.at("resident_experts") != positive(server, "kt_num_gpu_experts"))
-                throw std::runtime_error("KT observed resources disagree with the captured native invocation");
+            if (layer.expert_counts.size() != positive(model, "n_routed_experts"))
+                throw std::runtime_error("KT observed expert count disagrees with the model geometry");
         }
     }
     return { std::move(source.source),
@@ -142,16 +140,19 @@ void Program::start(planning::ProgramRuntime & runtime) {
         while (batch_index < input_.batches.size() && input_.batches[batch_index].request == source.requests[id].identity) {
             const auto & batch = input_.batches[batch_index++];
             observed_cost(batch.frontend_cost, id, batch.iteration, "frontend");
-            observed_cost(batch.residual_cost, id, batch.iteration, "non_moe");
-            for (const auto & layer : batch.layers) {
-                const auto phase = layer.work.kind.operation.substr(4);
-                const auto query = static_cast<std::size_t>(layer.work.features.at("query_tokens"));
-                work_.push_back(moe_work(phase, layer.expert_counts, query, target_.resident_experts, target_.cpu_threads, target_.numa_pools));
-                planning::PlannedOperation operation{ 0, std::cref(work_.back()) };
-                operation.source_cost = layer.source_cost;
-                operation.position = planning::OperationPosition{ id, batch.iteration, 0, "moe" };
-                append(std::move(operation));
-            }
+            const auto & original = source.cost_observations[batch.source_cost].work;
+            const auto phase = original.kind.operation.substr(8);
+            work_.push_back(forward_work(phase,
+                                         batch.layers,
+                                         static_cast<std::size_t>(original.features.at("query_tokens")),
+                                         static_cast<std::size_t>(original.features.at("context_tokens")),
+                                         target_.resident_experts,
+                                         target_.cpu_threads,
+                                         target_.numa_pools));
+            planning::PlannedOperation operation{ 0, std::cref(work_.back()) };
+            operation.source_cost = batch.source_cost;
+            operation.position = planning::OperationPosition{ id, batch.iteration, 0, "forward" };
+            append(std::move(operation));
         }
         observed_cost(input_.request_tails[id], id, 0, "frontend_tail");
         append({

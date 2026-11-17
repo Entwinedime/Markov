@@ -27,16 +27,17 @@ std::optional<graph::NodeId> Storage::begin_prefetch(ProgramRuntime & runtime, s
     auto & control = foreground_[request];
     control.callers.assign(callers.begin(), callers.end());
     allocate_prefetch(request, lookup, matched);
-    return control_response(runtime,
-                            request,
-                            backend_.issue,
-                            {
-                                { "candidate_pages", static_cast<double>(control.candidate_pages) },
-                                { "allocated_pages",  static_cast<double>(result.requested_pages) }
-    },
-                            ActionKind::Issued,
-                            "storage_issue",
-                            cause);
+    const Features features{
+        { "candidate_pages", static_cast<double>(control.candidate_pages) },
+        { "allocated_pages",  static_cast<double>(result.requested_pages) }
+    };
+    const bool active = prefetches_.contains(request);
+    const auto enqueued =
+        control_response(runtime, request, backend_.issue, features, active ? ActionKind::Enqueued : ActionKind::Issued, "storage_enqueue", cause);
+    if (!active || !enqueued) return enqueued;
+
+    // The background query may run while the caller finishes issuing it.
+    return control_response(runtime, request, backend_.issue_return, features, ActionKind::Issued, "storage_issue", enqueued);
 }
 
 bool Storage::finish_check(ProgramRuntime & runtime, std::size_t request, graph::NodeId cause) {

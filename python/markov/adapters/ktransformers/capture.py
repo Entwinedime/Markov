@@ -12,6 +12,7 @@ from markov.artifacts.capture import capture_origin
 from markov.artifacts.request import positive_integer, read_json
 from markov.artifacts.writing import write_json
 from markov.instrumentation.http import SerialHttpClient, encode_inputs, inference_server
+from markov.adapters.ktransformers.probe import TIMING_SCOPE
 
 
 def auxiliary_mounts(configuration):
@@ -199,6 +200,7 @@ class Capture(SerialHttpClient):
                 self.directory / "region_measurements.json",
                 {
                     "kind": "independent_kt_measurements",
+                    "timing_scope": TIMING_SCOPE,
                     "status": "completed",
                     "profiling": False,
                     "capture_origin": origin,
@@ -245,6 +247,8 @@ class Capture(SerialHttpClient):
                     elif event["name"] == "runtime.response.scheduler_send":
                         sent.update(fields["request_ids"])
                     elif event["name"] == "runtime.kt.batch":
+                        if fields.get("timing_scope") != TIMING_SCOPE:
+                            raise ValueError("KT capture needs complete forward observations")
                         batches.update(fields["request_ids"])
                         if not fields["layers"]:
                             raise ValueError("KT base has an empty forward observation")

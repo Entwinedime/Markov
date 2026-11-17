@@ -109,18 +109,18 @@ H 按原生批大小计入首次缺页所在批的全部哈希，E 包含首次�
 
 ### 前台预取控制
 
-三段闭合响应共用 `controller_group_response`：从所有 rank 均已进入到最后返回，保留 caller 调用权，不代表排他 CPU。
-`cache.prefetch.issue` 支付主机申请、必要树操作和原生发起；返回后查询才可入队。采用非负 `a+b×candidate_pages+c×allocated_pages`。
-候选页数由实际剩余输入决定，实际分配页数由主机容量决定；跳过也有观测到的调用成本，不能按零处理。
+预取控制保留 caller 调用权，不代表排他 CPU。`cache.prefetch.issue` 分为入队前和入队后返回两项响应，分别使用 `controller_enqueue_response` 和 `controller_return_response`；两项均采用非负 `a+b×candidate_pages+c×allocated_pages`。
+前项从所有 rank 均已进入到最晚入队，支付主机申请、必要树操作和发起；后项从该入队边界到最后返回。后台查询在入队时即可推进，与后项并行，timeout 也从入队时开始，不能等整个发起调用返回后才开始。
+入队边界来自同一次独立查询中记录的 operation 创建时间，两项之和恰好覆盖发起包络。候选页数由实际剩余输入决定，实际分配页数由主机容量决定；未分配时只有完整的前项调用成本，不生成不存在的入队后工作。缺少入队观察的正分配记录不能用于这两项估计，不将未知时间填零。
 
-`cache.prefetch.check` 只表示最终返回 ready 的一次检查中、停止之前的部分；无在途操作时就是整个短调用。
+`cache.prefetch.check` 使用 `controller_group_response`，只表示最终返回 ready 的一次检查中、停止之前的部分；无在途操作时就是整个短调用。
 形式为非负 `a+b×operation_present+c×state_reductions`，后两者分别为是否存在操作、是否执行状态归约，均由规则取 0/1。
 此前返回 pending 的检查已经包含在独立空闲回合中，不再计一次相同成本。
 检查执行期间后台可以继续发布；结束后才固定各 rank 的完成前缀并停止继续发布。
 
-`cache.prefetch.accept` 从停止到主机树更新及返回，采用非负 `a+b×pages`；pages 为各 rank 停止快照的最大本地完成页数。
+`cache.prefetch.accept` 使用 `controller_group_response`，从停止到主机树更新及返回，采用非负 `a+b×pages`；pages 为各 rank 停止快照的最大本地完成页数。
 缓存可见前缀仍取所有 rank 的共同部分，和该成本变量分开。停止后的已开始读取/复制继续到原生返回点，不能提前释放缓冲。
-接受完成后才允许回载/重新计算准入，三段都在同一执行时钟推进。
+接受完成后才允许回载/重新计算准入，所有边界都在同一执行时钟推进。
 当前停止时间取原生控制器终止调用入口；内部锁内推进及 rank 间微小偏差仍属于近似。
 
 固定的六/七页小负载分别运行 wait_complete 与 best_effort，整组共享；独立记录按实际端口导入，查询数据也可在同次启动取得。
@@ -165,13 +165,13 @@ caller 在响应期间持有调用权，较早的结果或备份调用可在两�
 
 ## KTransformers 成本
 
-DeepSeek-V4-Flash 的串行 eager 路径按每层原生 submit／combine 边界定义闭合 MoE 响应，包含输入搬运、CPU／NPU 内部重叠、汇合与输出搬运，不再叠加内部单项成本。没有跨区域交错才可采用这种粒度；NPU graph、延后专家及跨区域重叠不能直接套用。不能复用旧 dense/Torch 的阶段响应。
+DeepSeek-V4-Flash 的串行 eager 路径以一次完整前向为闭合响应，操作为 forward.prefill／forward.decode，计时口径为 closed_forward_response。探针记录 Scheduler.run_batch 的墙钟，并在返回处同步当前流一次；包含 dense、attention、MoE、搬运及其内部重叠。每层只读取原生已经复制到 CPU 的路由计数，不再插入逐层设备事件。没有对外交错才可采用这种粒度；NPU graph、延后专家及跨区域重叠不能直接套用。
 
-结构侧保留 base 的实际专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 分开维护；独立响应使用非负形式 `T=a+bq+c×P_cpu/t+d×U_cpu/p+e×P_npu+f×U_npu`，其中 q 是 query tokens。各资源档位共享同一组系数，池数通过 U_cpu/p 进入工作量，不再按池数另拟合系数；原始线程数、池数和驻留数仍限制覆盖范围。这是闭合响应的近似，不能视为严格并行缩放或独占 CPU 服务；带宽饱和、内存放置、观察开销及实际路由漂移另列不确定性。
+结构侧保留 base 的逐层专家直方图，按目标 prefix 驻留集合推得 CPU／NPU 的 token—expert 组合数量 P 和活跃专家数量 U，再跨层求和；相同编号在不同层是不同的专家工作。CPU 总线程 t、NUMA 池数 p 与 NPU 驻留数是资源变量。Prefill／Decode 各用一组共享非负系数：`T=a+bq+cA+d×P_cpu/t+e×U_cpu/p+f×P_npu+g×U_npu`。q 为本次 query 长度，A 为 `q×(2×context−q+1)/2` 的因果上下文规模代理（字段 attention_pairs）；它并不等于 DeepSeek 滑窗／压缩注意力的真实计算量，适用范围由该部署的独立数据限定。前两类变量近似 dense／attention 变化，专家项描述资源与卸载变化。系数来自独立完整前向的测量，不给每个资源档位另拟合一套参数。该式近似整个闭合响应，不是各服务的独立耗时之和；带宽饱和、内存放置、观察扰动和路由漂移仍有限制。
 
-ktransformers_regions 导入单独校准任务生成的 region_measurements.json。资源数量在工作特征中表达，同一模型部署共用响应，不为每个 CPU／卸载完整配置维护专用模型。共享采样从整组缺口选取资源端点，以有界、与目标文本不同的 token 序列观察工作；不采目标 trace 或按 E2E 残差选参数。首个准备请求不参加拟合。工作分布的计数外推明确标注，资源档位和 query 范围不足时仍返回缺口，不把外推解释为已测。
+ktransformers_regions 导入单独校准任务生成的 region_measurements.json。资源数量在工作特征中表达，同一模型部署共用响应，不为每个 CPU／卸载完整配置维护专用模型。共享采样从整组缺口选取资源端点，以有界、与目标文本不同的 token 序列观察工作；在相同长输入下使用顺序、逆序和短周期三种 token 排列，避免把一种路由分布当成长度规律。每请求生成 16 tokens，以观察 Prefill 后的连续 Decode，而非只取最初两步；这仍不是长期稳态保证。不采目标 trace 或按 E2E 残差选参数，首个准备请求不参加拟合。工作分布的计数外推明确标注，资源档位和 query 范围不足时仍返回缺口，不把外推解释为已测。
 
-只有工作变量完全一致的闭合源响应可按引用迁移，标为 source_observed_response；它不是 source_device_service。其余非 MoE 区间保留源响应／残余近似，客户端和未归属时间不删除。源 batch 的剩余区间扣除已单独计费的 MoE 响应，避免父子重复计费；这个余量不是按目标误差拟合的系数，也不代表全部 CPU 服务。
+只有工作变量完全一致的完整前向可按引用迁移，标为 source_observed_response；它不是 source_device_service。变化的前向整体查询独立模型，不再单独叠加 source 的“batch 减去 MoE”余量。前向之外的客户端、框架控制和未归属间隔仍保留为来源近似。闭合末端同步可能改变少量 CPU／NPU 重叠，不能视为观察开销已归零。没有闭合前向边界的历史来源不能用于当前目标预测；保存的历史执行图仍可固定路径回放。
 
 ## 两种成本来源
 

@@ -1,23 +1,32 @@
-"""Import independent KT closed regions into the shared performance database."""
+"""Import independent complete KT forwards into the shared performance database."""
 
 from dataclasses import asdict
+from decimal import Decimal
 import json
 
 from markov.artifacts.performance import Measurement
 from markov.artifacts.request import Deployment, read_json
-from markov.adapters.ktransformers.probe import IMPLEMENTATION
+from markov.adapters.ktransformers.probe import IMPLEMENTATION, TIMING_SCOPE
 
 
-def work_features(counts, query, resident, threads, pools):
-    cpu = counts[resident:]
-    npu = counts[:resident]
-    cpu_pairs, active_cpu = sum(cpu), sum(count > 0 for count in cpu)
+def work_features(layers, query, context_tokens, resident, threads, pools):
+    cpu_pairs = npu_pairs = active_cpu = active_npu = 0
+    for layer in layers:
+        counts = layer["moe"]["expert_counts"]
+        cpu, npu = counts[resident:], counts[:resident]
+        cpu_pairs += sum(cpu)
+        npu_pairs += sum(npu)
+        active_cpu += sum(count > 0 for count in cpu)
+        active_npu += sum(count > 0 for count in npu)
     return {
         "query_tokens": query,
+        "context_tokens": context_tokens,
+        "attention_pairs": query * (2 * context_tokens - query + 1) / 2,
+        "layers": len(layers),
         "cpu_token_expert_pairs": cpu_pairs,
-        "npu_token_expert_pairs": sum(npu),
+        "npu_token_expert_pairs": npu_pairs,
         "active_cpu_experts": active_cpu,
-        "active_npu_experts": sum(count > 0 for count in npu),
+        "active_npu_experts": active_npu,
         "cpu_threads": threads,
         "numa_pools": pools,
         "resident_experts": resident,
@@ -33,6 +42,7 @@ def metadata(path):
         or result["status"] != "completed"
         or result["profiling"]
         or not result["files"]
+        or result.get("timing_scope") != TIMING_SCOPE
     ):
         raise ValueError(f"KT independent measurement is incomplete: {path}")
     return result
@@ -51,15 +61,17 @@ def context(captured, deployment):
         "disable_cuda_graph": settings["disable_cuda_graph"],
         "disable_overlap_schedule": settings["disable_overlap_schedule"],
         "placement": settings.get("kt_expert_placement_strategy", "prefix"),
+        "timing_scope": captured.get("timing_scope"),
         "resource_envelope": captured["resource_envelope"],
     }
 
 
 def recipes(captured):
     return {
-        (f"moe.{phase}", IMPLEMENTATION, "closed_stream_response"): {
+        (f"forward.{phase}", IMPLEMENTATION, TIMING_SCOPE): {
             "feature": [
                 "query_tokens",
+                "attention_pairs",
                 "cpu_pairs_per_thread",
                 "active_cpu_experts_per_pool",
                 "npu_token_expert_pairs",
@@ -67,6 +79,8 @@ def recipes(captured):
             ],
             "nonnegative": True,
             "coverage_features": [
+                "layers",
+                "context_tokens",
                 "cpu_token_expert_pairs",
                 "active_cpu_experts",
                 "cpu_threads",
@@ -74,6 +88,8 @@ def recipes(captured):
                 "resident_experts",
             ],
             "extrapolation_features": [
+                "context_tokens",
+                "attention_pairs",
                 "cpu_token_expert_pairs",
                 "npu_token_expert_pairs",
                 "active_cpu_experts",
@@ -82,8 +98,9 @@ def recipes(captured):
                 "active_cpu_experts_per_pool",
             ],
             "limitations": [
-                "Closed native MoE response includes D2H, CPU/NPU overlap, drain, merge and H2D; constituent services are not separately identifiable.",
-                "CPU work per thread and active experts per pool approximate scaling; bandwidth saturation and placement can break this model.",
+                "Complete serial forward includes dense/attention/MoE work, transfers and internal CPU/NPU overlap; no source non-MoE remainder is added.",
+                "The end-of-forward stream synchronization closes the observation; its perturbation and caller work outside the forward remain limitations.",
+                "Work per thread, active experts per pool and causal context size approximate scaling; the context proxy does not reconstruct compressed/sliding attention kernels.",
                 "CPU/NUMA counts share coefficients through work variables; unmeasured combinations need independent verification and base routing remains conditional.",
             ],
         }
@@ -103,28 +120,36 @@ def measurements(path, captured):
                 if event["name"] != "runtime.kt.batch":
                     continue
                 fields = event["args"]
-                if fields["status"] != "returned" or fields["implementation"] != IMPLEMENTATION:
+                if fields["status"] != "returned" or fields["implementation"] != IMPLEMENTATION or fields.get("timing_scope") != TIMING_SCOPE:
                     raise ValueError("KT independent forward failed or uses another implementation")
                 warmup = all(
                     int(rid.removeprefix("request_")) < captured["formal_begin_index"] for rid in fields["request_ids"]
                 )
+                settings = captured["configuration"]
+                query = fields["query_tokens"]
+                if not fields["layers"] or fields["context_tokens"] < query:
+                    raise ValueError("KT independent forward has incomplete routing or context")
                 for layer in fields["layers"]:
-                    position += 1
                     moe = layer["moe"]
-                    features = work_features(
-                        moe["expert_counts"],
-                        fields["query_tokens"],
-                        moe["resident_experts"],
-                        moe["cpu_threads"],
-                        moe["numa_pools"],
-                    )
-                    yield Measurement(
-                        position,
-                        "closed_moe",
-                        f"moe.{fields['phase']}",
-                        IMPLEMENTATION,
-                        "closed_stream_response",
-                        features,
-                        moe["stream_ns"],
-                        warmup,
-                    )
+                    if (
+                        len(moe["expert_counts"]) != moe["experts"]
+                        or sum(moe["expert_counts"]) != query * moe["top_k"]
+                        or (moe["cpu_threads"], moe["numa_pools"], moe["resident_experts"])
+                        != (settings["kt_cpuinfer"], settings["kt_threadpool_count"], settings["kt_num_gpu_experts"])
+                    ):
+                        raise ValueError("KT independent routing or resources disagree with the capture")
+                features = work_features(
+                    fields["layers"], query, fields["context_tokens"], settings["kt_num_gpu_experts"],
+                    settings["kt_cpuinfer"], settings["kt_threadpool_count"]
+                )
+                position += 1
+                yield Measurement(
+                    position,
+                    "closed_forward",
+                    f"forward.{fields['phase']}",
+                    IMPLEMENTATION,
+                    TIMING_SCOPE,
+                    features,
+                    int(Decimal(str(event["dur"])) * 1000),
+                    warmup,
+                )

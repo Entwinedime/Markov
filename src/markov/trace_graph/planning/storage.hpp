@@ -53,6 +53,7 @@ private:
         Prepared,
         PageWritten,
         PageTouched,
+        Enqueued,
         Issued,
         Checked
     };

@@ -23,7 +23,7 @@ struct StorageBackend {
     std::size_t batch_pages;
     WorkKind allocate, read_page, copy_publish, read_return;
     WorkKind gather, batch_prepare, new_page, existing_page;
-    WorkKind query, issue, check, accept;
+    WorkKind query, issue, issue_return, check, accept;
 };
 
 struct PrefetchResult {
