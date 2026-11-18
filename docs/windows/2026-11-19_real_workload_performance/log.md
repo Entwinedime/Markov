@@ -201,3 +201,103 @@
 **验证：** 核对真实工作与同步搬运边界、CPU 父子计时、低观测启动及不改结构的身份旁路，业务代码净增 776 行。Release 增量构建已通过，普通模板输出与 S3 程序逐字节一致，工作身份可重现。公开采样和拟合入口产生 145 项模型。两请求对照中 CPU 覆盖 77/3,044，其中 2,946 项没有模型、21 项超出范围。另一轻量运行的 32 个标量 CPU 观测全部可查询，按四类特征点的相对误差中位数为 22.13%。 [样本、拟合及需求](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s4/baseline.json)
 
 **结论与限制：** S4 交付独立成本资产、需求范围和采样复现材料。S5 接入在线查询并覆盖剩余 CPU 服务和形状，当前缺口可从需求表定位，端到端精度仍待开发及留出对照。
+
+## 2026-11-19 — S5 开始：核对正式计时入口及预热资格
+
+**范围：** 从已核对远端的 `ecadfc4` 起步。复核执行结构、成本资产和原生真值入口，复用已保留的两请求试采及八组来源。
+
+**改动：** 正常预测由任务显式选择成本资产，模板实例化交付归一化工作身份，执行前统一核对成本覆盖。将形状预热纳入本阶段，保留编译状态和重置业务 KV 各自的职责。
+
+**验证：** 两请求试采的原生 KV 分配片段墙钟为 2,678.02 毫秒，其中调度线程实际运行 97.62 毫秒。另一会话内，4 路、2,216 token 的相同 Prefill 分配由第一次的 2,716.00 毫秒降至第二次的 16.60 毫秒。原生分配器的 Triton 调用以向上取整到 2 的幂的批次成员数和扩展 token 数进行特化。 [预热资格诊断](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-prewarm-qualification.json) · [原生分配器](../../../third_party/sglang/python/sglang/srt/hardware_backend/npu/allocator_npu.py#L53)
+
+**结论与限制：** 已定位首次大延迟所在的原生工作，现有预热无法为该类工作保证稳态。时间与代码支持优先检查形状首次编译，其实际耗时尚无独立记录。在线接入和稳态复测仍待完成。
+
+## 2026-11-19 — S5：接入独立时长与形状预热
+
+**范围：** 使用 S4 的正式成本资产、S3 两请求开发例及原有真实时间事实。预热验证在设备 4 上完成一次，额度 240 秒，原生实耗 102.82 秒，其中预热 41.43 秒，正式观测 0.86 秒。
+
+**改动：** 模板实例化按需交付每项工作对应的定义和区间。C++ 一次装载并按选中定义索引成本资产，查询时复用作用域特征。在动作进入时间线前发布首个缺口。原生采集接受与 workload 同合同的预热输入，在同一 Engine 执行并重置业务缓存。
+
+**验证：** Release 编译通过。两请求的真实时间结构回归覆盖 150 个动作和 4,084 项工作，结果和执行记录均与 S3 逐字节一致。独立入口在无设备、无结构真值挂载下查到 Prefill 准备的首个 CPU 缺口，保留 `cost-gap.json`。同形状预热后，原生两请求 TTFT 从 3,411.08 变为 715.28 毫秒，多 token 请求的 TPOT 为 72.08 毫秒，两次均生成 4 个 token。 [两条入口证据](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-timing-entry.json) · [形状预热对照](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-shape-warmup.json)
+
+**结论与限制：** 在线时间来源和缺口交接已验证。两请求预热只证明该形状的首次开销可移出测量窗口，尚需对一般形状识别首次特化。原生队列切点及 CPU 自身服务的统一采样仍是完整预测的主要缺口，端到端精度尚待验证。
+
+## 2026-11-19 — S5 采样线程活动并收紧直接设备提交的边界
+
+**范围** 同形状预热后，两请求 CPU 试采共两次，各计入 240 秒额度。第一次因切换记录丢失失败，耗时 164.26 秒。改为持续读取后完成，耗时 109.52 秒，其中预热 45.01 秒、观测及收尾 1.33 秒，完整保留约 2.4 MB。 [首次采集记录](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-activity/native/execution.json) · [成功采集](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-activity-buffered/native/result.json)
+
+**改动** 将调用、队列及 runtime 的实测切点交到同一线程活动计时，扣除等待、独立搬运和有记录的观测开销。模型内两段 CPU 工作被同线程的 SDK 包装入口隔开，直接提交统一以驱动实际提交为界，异步队列继续保留调用方入队依赖。发现 CPU-only profiler 的启动换算存在约 4 微秒偏移后，增加同次观测前后的独立计时夹点，删除旧线程时钟字段。
+
+**验证** 成功记录的控制和提交线程均无丢失，队列完整配对 1,633 项，未发现新 Triton 特化。用同一原始记录重建后，试算匹配 2,847／2,936 项 CPU 工作。新版图独立对照通过 150 个动作、3,976 项工作、5,674 个端点和全部 616 个设备提交，分配及请求结果与原回归一致。正式独立入口在 `ScheduleBatch.prepare_for_extend` 的提交线程缺成本处停止。原生桥 Release 构建和主机时钟夹点检查通过。 [CPU 试算](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/direct/host.json) · [结构回归](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-direct-submission/comparison/actions.json) · [首处成本缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-independent-live/prediction/cost-gap.json) · [主机时钟](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-cpu-queue-clock.json)
+
+**结论与限制** CPU 试算使用当时记录的换算，新校准仍需在正式观测内验证。剩余缺口集中在采样与结构的分段入口，以及队列和驱动的时间对齐。两档开发流量与留出对照仍待完整独立输出。
+
+## 2026-11-19 — S5：统一原生切点并打通两请求独立预测
+
+**范围：** 两请求和已保留的 48 请求八组来源各采一次 CPU 时间，分别用 240 和 360 秒额度。实际共耗 258.55 秒，预热分别 44.50 和 63.33 秒，观测及收尾分别 1.36 和 24.09 秒，保留约 2.47 和 55.66 MB。 [两请求采集](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-shared-cuts/native/result.json) · [八组采集](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-representative/native/result.json)
+
+**改动：** 结构侧与轻量侧共用调度、KV、主机读取和模型切点，轻量侧直接记录原生作用域。相同 workload 预热复用原有请求分组。局部操作按自身参数取成本，移除通用阶段回退。按相同出现次数和顺序配对运行时端点，保留无法对应的实际观测。
+
+**验证：** C++23 Release 构建通过。两个案例分别配对 1,633 和 24,391 项原生队列记录，观测内的 RAW 校准范围分别为 −1,300 至 −1,230 ns 和 −2,700 至 −2,650 ns。取得全部 2,936 和 44,191 项 CPU 工作时长。正式预测完成两请求与 4 个 token，运行时查询 3,976 次，累计 2.54 ms。与单独的轻量原生运行比较，TTFT MAPE 为 1.18%（两条），TPOT MAPE 为 0.45%（一条）。 [时长证据](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/representative-host.json) · [性能对照](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-two-request-performance.json)
+
+**结论与限制：** 两请求的两条正式路径均完成。该例的 CPU 样本覆盖同一 workload 的独立运行，精度数字仅支持开发回归。两份现有模板来源在单成员、不同长度及部分原生操作上仍有 CPU 成本缺口，按需求表扩展采样。 [开发成本覆盖](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/development-costs.json)
+
+## 2026-11-19 — S5：补齐模板来源样本并检查真实流量
+
+**范围：** 对 11 请求主模板来源和 4 请求局部来源各做一次轻量 CPU 采样，各计入 240 秒额度。实耗共 250.96 秒，正式观测分别为 11.38 和 2.01 秒，保留约 27.50 和 3.55 MB。原始结构记录沿用两份已保留来源。 [主来源采样](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-template-sources/0/native/result.json) · [局部来源采样](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-host-template-sources/1/native/result.json)
+
+**改动：** 用原生实测时长补齐两份来源的 37,935 项 CPU 工作，合并四份开发数据并发布 549 项模型。指标示例接收独立预测结果，按实际 token 发布核对 TTFT、TPOT 和吞吐。
+
+**验证：** 四份开发图的已见工作全部通过成本覆盖检查。Azure 3 请求片段在两档并发均完成 44 个 token，两边各执行 42,573 次成本查询。100 请求片段分别在 24.01 和 24.49 秒报告首个范围缺口，并发 4 的 Prefill 分配为 3,015 token，样本上限为 2,609，并发 8 的批次合并右侧为 7 个请求，样本上限为 2。 [合并成本](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/expanded-costs.json) · [并发 4 三请求](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-3/concurrency-4/prediction/result.json) · [并发 8 三请求](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-3/concurrency-8/prediction/result.json)
+
+**结论与限制：** 新工作负载已通过小例预测闭环。100 请求的下一个采样范围由分配分支的有效长度和真实批次合并的成员分布决定。两次停止时间用于定位首个缺口，完整性能和墙钟仍待取得。 [并发 4 缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100/concurrency-4/prediction/cost-gap.json) · [并发 8 缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100/concurrency-8/prediction/cost-gap.json)
+
+## 2026-11-19 — S5：覆盖批次合并并核对批次退出需求
+
+**范围：** 48 请求分八组，在设备 4 分别采详细结构和轻量 CPU。共两次，累计额度 720 秒，实耗 345.47 秒，有效观测分别为 34.18 和 20.77 秒，原生记录合计约 148 MiB。 [采样范围](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-boundary-coverage/scope.json) · [详细结构](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-boundary-coverage/detailed/result.json) · [轻量 CPU](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-boundary-coverage/host/result.json)
+
+**改动：** 同一容量下取得小于 200 页的分配上界、合并人数两端和长上下文。观测到 1+7 与 7+1 合并。纳入 40,163 项 CPU、8,153 项设备工作和 5,870 项同步搬运时长。 [CPU 样本](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/boundary-host.json) · [设备与搬运](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/boundary-device.json)
+
+**验证：** 五份开发图的已见工作均被成本资产覆盖。100 请求两档越过已有缺口，分别于 24.40 与 24.70 秒在同一过滤操作停下，缩减规模为 4→1 和 8→5。已有部分退出样本的输入批次最多 3 人，存留最多 2 人。 [并发 4 缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-bounded/concurrency-4/prediction/cost-gap.json) · [并发 8 缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-bounded/concurrency-8/prediction/cost-gap.json)
+
+**结论与限制：** 同长同输出组覆盖入批与同步退出，遗漏在途批次部分请求陆续完成的形状。下一轮在固定目标池内改变输出长度，覆盖过滤前后人数、页分配分界和在途长上下文。复测尚未产出完整的真实流量性能结果。 [分批退出配方](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-cohort-coverage/scope.json)
+
+## 2026-11-19 — S5：测量分批退出并统一拟合容量
+
+**范围：** 固定 32,768 token 的 KV 池。同一串 55 条开发配方分九组，详细结构和轻量 CPU 各采一次，累计额度 1,080 秒，实耗 358.83 秒，原生记录约 270 MiB。 [配方](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-cohort-coverage/scope.json) · [详细运行](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-cohort-coverage/detailed/result.json) · [轻量运行](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-cohort-coverage/host/result.json)
+
+**改动：** 结合三份同容量来源拟合 549 项成本模型，局部参数与批次组合均使用各工作自身的记录。轻量真值复用 CPU 采样已有的 Triton 特化记录，保留业务窗口内新加载的特化，以核对稳态。 [固定容量资产](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/target-pool-costs.json)
+
+**验证：** 实际覆盖 4→1、8→1、8→7 等部分退出，最大 Decode 合计 32,632 token。详细结构和轻量 CPU 对应到 86 个批次，取得 79,231 项 CPU 时长，全部排定的工作都有样本。固定容量资产覆盖三个来源的 220,487 项已见工作及四处已报告的范围缺口。新版轻量原生镜像保持原生框架与 SDK 版本，已启动 100 请求性能测量。 [CPU 样本](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/scope-features/cohort-host.json) · [测量范围](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-native/scope.json)
+
+**结论与限制：** 开发拟合使用同一 KV 容量，避免从前几轮混合容量选择长度的间接指标。真实 100 请求对新覆盖与模型误差的检验仍在运行。
+
+## 2026-11-19 — S5：分开自身工作特征与外层计算量
+
+**范围：** 两次预测均通过批次部分退出，分别于 75.50 与 40.59 秒因 7,194 token 的长分配停止。并发 8 另行轻量实测 100 请求一次，额度 1,200 秒，实耗 486.87 秒，其中预热 252.87 秒，观测及收尾 174.09 秒。 [长分配缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-pool/concurrency-8/prediction/cost-gap.json) · [原生运行](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-native/native/result.json)
+
+**改动：** 分配器按实际请求和页处理，外层 Attention 计算量无对应输入。采样与在线查询均由子图的局部 KV 读取决定是否加入上下文及 Attention 特征。拟合按工作已声明的容量坐标约束样本，无此坐标的工作复用已有同定义观测。 [特征提取](../../../src/markov/performance/work_features.cpp) · [拟合](../../../src/workflow/markov_workflow/fit_costs.py)
+
+**验证：** C++23 Release 构建通过。重新生成六份图的身份表，规范定义、物理区间及采集窗口逐项一致，沿原身份复用全部时长。549 项新版模型覆盖三份目标容量图的 220,487 项已见工作。并发 8 原生实测完成 100 条、10,483 token，业务窗口无新 Triton 特化，吞吐为 60.22 token/s。 [新版成本](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/work-geometry/assignment.json) · [原生指标](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-azure-development-100-native.json)
+
+**结论与限制：** 同一长分配定义现有 7,207 token 的原生样本可以覆盖该范围。原生入口相对声明到达的偏差中位数为 433.22 毫秒，P95 为 885.17 毫秒，作性能偏差归因时独立考虑。新版两档完整预测仍在运行。
+
+## 2026-11-19 — S5：按数据端口与实际页访问确定工作特征
+
+**范围：** 两档越过长分配，分别于 219.47 和 141.23 秒到达同一处短 Prefill 缺口。56 token 已在旧采样的长度范围内，固定 KV 容量轴后，同池样本最短为 128 token。 [并发 4 证据](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-geometry/concurrency-4/prediction/cost-gap.json) · [并发 8 证据](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s5-azure-development-100-geometry/concurrency-8/prediction/cost-gap.json)
+
+**改动：** 按数据端口与 guard 取工作形状，KV 容量元数据继续用于图结构和绑定。Attention 的原生调用按实际页表、上下文及最大 query 长度表达访问，成本提取沿相同原则复用小形状观测。移除试用的固定成本坐标选项。 [特征提取](../../../src/markov/performance/work_features.cpp)
+
+**验证：** Release 构建通过，复用原采集重建六份工作身份表，区间归属和原生时长保持一致。549 项模型覆盖四份图的 224,463 项已见工作，Prefill Attention 的输入范围为 15–8,176 token。 [成本资产与需求](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/data-port-geometry/assignment.json)
+
+**结论与限制：** 已直接核对短 Prefill 工作的特征范围。两档全量开发预测已开始，新的端到端结果待发布。
+
+## 2026-11-19 — S5 收尾：完成真实开发流量两档预测
+
+**范围：** 复用独立模板和已发布成本，运行 Azure 前 100 条的两档预测。并发 8 使用另一次预热后的原生轻量记录评分。
+
+**改动：** TTFT 统一到请求提交至调度器首 token 发布。原生使用实际提交时间，仿真使用声明时间。原生调度器取入时间单独保留，提交至取入的等待在 TTFT 内计入。原先混合两种起点得到 8.60% 的 TTFT MAPE。 [原口径证据](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-azure-development-100-accuracy.json)
+
+**验证：** 两档各完成全部 100 条、10,483 token，逐请求核对生成步和结束标记。并发 8 墙钟为 270.04 秒，S2 同配置给定时长为 268.16 秒，两次分别处理 166.49 万和 172.79 万项工作。两档查时累计 2.82 和 1.75 秒，占墙钟 0.82% 和 0.65%。独立两请求图的 616 项设备和 424 项同步搬运均有成本，逐特征点相对误差中位数为 2.00% 和 4.65%。 [阶段证据](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-development-closure.json)
+
+**结论与限制：** 并发 8 的开发 TTFT、TPOT MAPE 为 3.93% 和 4.65%，各 100 条。实测和预测吞吐分别为 60.22 和 57.84 token/s。阶段审查覆盖原生采样、模板身份、模型装载、时间线前查询、输出发布及外围评价，业务变更净增 1,110 行，示例净增 62 行。发布保留复现输入、证据及开发失败，数据留在 Git 之外。性能正常路径的验证范围是单实例 dense TP1，独立留出与全窗口验收进入下一阶段。

@@ -180,7 +180,13 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
-普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。投递偏差仍从 request-delivery 取得。该模式只发布延迟证据，图与模板生产要求有原生图观测的采集。可用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。
+普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。评估稳态时核对 `specialization_loads` 及 request-delivery 的提交偏差。图与模板生产要求原生图观测。
+
+用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
+
+CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配器声明，Ascend 观测器记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同一配置和 workload 的结构观测对齐切点，将取得完整证据的 CPU 服务发布为成本样本。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
+
+采样和在线查询采用同一特征提取。数据端口及局部 guard 提供工作形状，局部 KV 读取决定是否使用序列上下文与计算量。KV backing 张量的容量是元数据。实际参与 Attention 的长度来自已绑定的请求成员。
 
 这些转换只还原导出的坐标，不校准设备计数器频率，不消除 SDK 设备/主机测量本身的因果矛盾，也不代表跨机时钟同步。校准需要独立依据，不能按目标误差、等待边或首次失败位置拟合偏移/倍率；来源冲突继续报告，不能改图或截断时间求通过。
 
@@ -260,6 +266,8 @@ PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow pre
 ```
 
 --production 指定一份已由acquire-sources完整发布的来源集合。入口读取集合固定计划及生产索引，根据目标实施域和输入机会自动选完整来源及它的局部供体；未知输入仍由实际模板合同核对，不把规划机会标签变成额外支持门槛。模型专家数来自规划发布的元数据，纯预测不重新打开模型目录。模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
+
+正常性能预测用只含 `model`、`instances` 和 `workload` 的输入，并指定 `predict --costs <成本资产.json>`。核心进程按每次实例化得到的归一化工作及其实际参数查询服务时长。在首个无模型或超出样本范围的工作处报告 `cost-gap.json`。预测完成后可用 `example/coarse_graph/latency_metrics.py --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
 
 PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；正式预测入口负责来源选择，示例不维护第二套装配规则。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
 
