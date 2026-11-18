@@ -37,16 +37,21 @@ class NativeRendezvous:
 
 
 class NativeServingSession:
-    def __init__(self, source, output: Path, resource_trace: bool = False) -> None:
+    def __init__(self, source, output: Path, *, resource_trace: bool = False, latency_only: bool = False) -> None:
         self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
         serving = CaptureInput(source)
         self.output = output.resolve()
         self.instances = []
         offset = 0
         for index, description in enumerate(serving.instances):
-            instance = NativeServingInstance(serving, description, self.output, index, offset, serving.observe_all_workers, resource_trace)
+            instance = NativeServingInstance(
+                serving, description, self.output, index, offset, resource_trace=resource_trace, latency_only=latency_only,
+            )
             self.instances.append(instance)
             offset += len(instance.roles)
+        if latency_only and (resource_trace or len(self.instances) != 1 or offset != 1
+                             or "ep" in self.instances[0].configuration or len(serving.submission_groups) != 1):
+            raise ValueError("latency measurement requires a single ordinary dense TP1 worker and one submission group")
 
     @staticmethod
     def execute(instance, barrier, clock, bootstrap, rendezvous, connection):

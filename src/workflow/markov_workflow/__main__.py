@@ -31,7 +31,9 @@ def main() -> None:
     capture.add_argument("--budget-seconds", type=float, required=True, help="cumulative native allowance across attempts and resumes")
     capture.add_argument("--attempt-limit", type=int, required=True, help="cumulative native attempts; each invocation starts at most one")
     capture.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
-    capture.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
+    observation = capture.add_mutually_exclusive_group()
+    observation.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
+    observation.add_argument("--latency-only", action="store_true", help="run without the profiler and record scheduler latency")
     acquisition = commands.add_parser("acquire-sources", help="capture and compile a finite plan under shared cumulative allowances")
     acquisition.add_argument("--plan", type=Path, required=True)
     acquisition.add_argument("--observations", type=Path, help="JSON map of planned source job IDs to published capture task paths; native inputs must match")
@@ -60,7 +62,7 @@ def main() -> None:
     elif arguments.command == "capture":
         from markov_workflow.capture import CaptureProcess
 
-        CaptureProcess(arguments).run()
+        CaptureProcess(arguments, latency_only=arguments.latency_only).run()
     elif arguments.command == "acquire-sources":
         from markov_workflow.acquisition import SourceAcquisition
 

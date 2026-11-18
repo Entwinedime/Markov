@@ -35,7 +35,7 @@ class SGLangObservation:
         self.request_state = RequestStateCalls(observe=description["resource_trace"])
         self.action_values = []
         self.tensors = TensorBoundaries(self.capture)
-        self.content = NativeContent(self.tensors, description)
+        self.content = NativeContent(description, self.tensors.auxiliary)
         self.native = ctypes.CDLL(None).markov_set_runtime_enabled
         self.native.argtypes = [ctypes.c_int]
         self.native.restype = None
@@ -427,5 +427,12 @@ class SGLangObservation:
 
 def install() -> None:
     path = os.environ.get("MARKOV_GRAPH_SESSION")
-    if path is not None:
-        SGLangObservation(json.loads(Path(path).read_text())).install()
+    if path is None:
+        return
+    description = json.loads(Path(path).read_text())
+    if description["latency_only"]:
+        from markov_collection.adapters.frameworks.sglang.latency import NativeLatency
+
+        NativeLatency(description).install()
+    else:
+        SGLangObservation(description).install()

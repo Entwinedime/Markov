@@ -18,11 +18,12 @@ from markov_adapters.artifacts import write_json
 class NativeServingInstance:
     def __init__(
         self, source: CaptureInput, instance: InstanceConfiguration, output: Path, index: int, rank_offset: int,
-        observe_all_workers: bool, resource_trace: bool,
+        *, resource_trace: bool, latency_only: bool,
     ) -> None:
         self.model = source.model
-        self.observe_all_workers = observe_all_workers
+        self.observe_all_workers = source.observe_all_workers
         self.resource_trace = resource_trace
+        self.latency_only = latency_only
         self.output = output.resolve()
         self.instance = instance
         self.directory = self.output / "instances" / str(index)
@@ -61,11 +62,28 @@ class NativeServingInstance:
     def reset(self, engine: Any, phase: str) -> None:
 
         # End observed serving at native idle before sending the driver's administrative reset.
-        ObservationWindow.wait(self.output, self.roles, phase, "drained")
+        if not self.latency_only:
+            ObservationWindow.wait(self.output, self.roles, phase, "drained")
         result = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
         if not result.success:
             raise RuntimeError(f"native cache reset failed: {result.message}")
-        ObservationWindow.wait(self.output, self.roles, phase, "complete")
+        if not self.latency_only:
+            ObservationWindow.wait(self.output, self.roles, phase, "complete")
+
+    def observe(self, engine, capture, clock, barrier) -> tuple[int, ...]:
+        engine.start_profile(output_dir=str(self.output / "native"), activities=["CPU", "GPU"], record_shapes=False, with_stack=False)
+        ObservationWindow.wait(self.output, self.roles, "profiler", "complete")
+        plan = json.loads((self.directory / "role-plan.json").read_text())
+        selected = tuple(plan["observed_roles"])
+        try:
+            barrier.wait()
+            self.generate(engine, "capture", capture, clock, barrier)
+            self.reset(engine, "source")
+            barrier.wait()
+        finally:
+            engine.stop_profile()
+            NativeProfiles.wait(self.output, selected, self.roles)
+        return selected
 
     def run(self, barrier, clock, bootstrap, rendezvous) -> dict:
         self.directory.mkdir()
@@ -83,6 +101,7 @@ class NativeServingInstance:
             "pp_size": self.pp, "ep_size": self.ep,
             "observe_all_workers": self.observe_all_workers,
             "resource_trace": self.resource_trace,
+            "latency_only": self.latency_only,
             "warmup_requests": [f"warmup/{index}" for index in range(len(warmup["requests"]))],
             "source_requests": [f"capture/{index}" for index in range(len(self.workload["requests"]))],
             "protocol_requests": capture.protocol_requests,
@@ -146,18 +165,19 @@ class NativeServingInstance:
             warmed_ns = time.monotonic_ns()
 
             barrier.wait()
-            engine.start_profile(output_dir=str(self.output / "native"), activities=["CPU", "GPU"], record_shapes=False, with_stack=False)
-            ObservationWindow.wait(self.output, self.roles, "profiler", "complete")
-            plan = json.loads((self.directory / "role-plan.json").read_text())
-            selected = tuple(plan["observed_roles"])
-            try:
-                barrier.wait()
+            metrics = {}
+            if self.latency_only:
                 self.generate(engine, "capture", capture, clock, barrier)
                 self.reset(engine, "source")
-                barrier.wait()
-            finally:
-                engine.stop_profile()
-                NativeProfiles.wait(self.output, selected, self.roles)
+                selected = ()
+
+                # Flush and publication are ordered on the same scheduler, so its report is now visible.
+                report = self.directory / "latency.json"
+                if not report.is_file():
+                    raise RuntimeError("native scheduler did not publish complete request latencies")
+                metrics["latency"] = str(report.relative_to(self.output))
+            else:
+                selected = self.observe(engine, capture, clock, barrier)
             captured_ns = time.monotonic_ns()
         finally:
             try:
@@ -172,5 +192,5 @@ class NativeServingInstance:
             "native_participants": self.roles,
             "initialization_ns": initialized_ns - started_ns,
             "warmup_ns": warmed_ns - initialized_ns,
-            "capture_ns": captured_ns - warmed_ns,
+            "capture_ns": captured_ns - warmed_ns, **metrics,
         }

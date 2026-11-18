@@ -1,19 +1,21 @@
 """Supply synthetic output content without replacing native sampling work."""
 
+from contextlib import nullcontext
+
 import torch
 from markov_workload import WorkloadContent
 from markov_workload.routing import RoutedContent
 
 
 class NativeContent:
-    def __init__(self, values, description) -> None:
+    def __init__(self, description, auxiliary=nullcontext) -> None:
         source = description["content"]
         self.content = WorkloadContent(source["requests"], source["prefixes"])
         self.aliases = {
             native: request["id"]
             for native, request in zip(description["source_requests"], source["requests"], strict=True)
         }
-        self.values = values
+        self.auxiliary = auxiliary
         self.tokens = None
         self.routing = None
         self.route_assignments = None
@@ -59,7 +61,7 @@ class NativeContent:
         if self.tokens is not None:
 
             # Keep the sampler's tensor identity and work; injected values are workload setup, not model work.
-            with self.values.auxiliary():
+            with self.auxiliary():
                 result.copy_(torch.tensor(self.tokens, dtype=result.dtype, device=result.device))
         return result
 

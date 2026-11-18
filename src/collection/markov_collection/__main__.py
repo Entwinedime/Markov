@@ -13,7 +13,9 @@ def main() -> None:
     capture = commands.add_parser("capture", help="run one normalized native observation job")
     capture.add_argument("--input", type=Path, required=True)
     capture.add_argument("--output", type=Path, required=True)
-    capture.add_argument("--resource-trace", action="store_true", help="observe resources and input reads for independent comparison")
+    observation = capture.add_mutually_exclusive_group()
+    observation.add_argument("--resource-trace", action="store_true", help="observe resources and input reads for independent comparison")
+    observation.add_argument("--latency-only", action="store_true", help="record scheduler ingress and token publication only")
     interpret = commands.add_parser("interpret", help="interpret an SDK-exported worker recording")
     interpret.add_argument("--trace", type=Path, required=True)
     interpret.add_argument("--evidence", action="store_true", help="retain measured boundary clocks for source auditing")
@@ -26,7 +28,10 @@ def main() -> None:
     if arguments.command == "capture":
         from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
 
-        NativeServingSession(json.loads(arguments.input.read_text()), arguments.output, arguments.resource_trace).run()
+        NativeServingSession(
+            json.loads(arguments.input.read_text()), arguments.output,
+            resource_trace=arguments.resource_trace, latency_only=arguments.latency_only,
+        ).run()
     elif arguments.command == "export":
         from markov_collection.adapters.runtimes.ascend.export import AscendExport
 
