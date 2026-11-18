@@ -180,6 +180,8 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
+普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。投递偏差仍从 request-delivery 取得。该模式只发布延迟证据，图与模板生产要求有原生图观测的采集。可用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。
+
 这些转换只还原导出的坐标，不校准设备计数器频率，不消除 SDK 设备/主机测量本身的因果矛盾，也不代表跨机时钟同步。校准需要独立依据，不能按目标误差、等待边或首次失败位置拟合偏移/倍率；来源冲突继续报告，不能改图或截断时间求通过。
 
 rank 事实中的 `request_ingress` 记录首个 PP 阶段从外部取入、尚未广播的请求集合；`request_receive_rounds` 记录每个 worker 经广播或 PP 转发实际收到的请求集合；`request_receipts` 保留逐条 dispatch 入口。三者都用 `received_raw_ns`，角色由所属字段明确。请求成员保留原生 ID，经 session 声明映射到 workload ID；空轮次和采集范围外的管理请求不进入记录。这些是输入交付证据，不是执行批次，也不用于反推或强制组批。模板代表复用不允许复制代表的实测完成时间给其他 worker；需要逐参与者独立时间对照时使用已有 `observe_all_workers` 采集范围。
@@ -352,6 +354,10 @@ markov_local_graphs expand <source-libraries.json> <action-inputs.json> <local-g
 
 公开 `markov_workflow predict` 可附加 `--execution-inputs <execution-inputs.json>`。文件由 `actors`、`ingress`、`notifications`、`transfers` 和 `context_values` 组成，提供时间、可见性及显式原生调用绑定。组批、查询返回值、资源分配及图体仍由实际执行产生。未提供时使用任务显式给定的工作耗时及原生适配器当前收到的调用绑定。提供后，流程内缺记录、操作或工作不符、结束时未消费完均失败。
 
+全节点对照增加 `layouts`，在独立生成实际图后按作用域、资源职责、端口和工作区间匹配实测起止。用 `markov action-layouts <带证据粗图> <rank-layouts.json>` 取得动作切图的来源映射，再用 `example/coarse_graph/execution_inputs.py --layouts <目录>` 生成时间事实。工作区间若有独立切出的服务边界，服务时间一并交给时间线。原生 API 和 SDK 证据共同确认无设备提交的逻辑等待可由前驱实测时刻确定。缺少实体工作端点时报告首个位置，不能用后继上界取得全节点资格。此方式由本次仿真动作提供构图绑定，目前覆盖无需 CPU 消息收发的执行。独立对照核对真实时间的消费、工作、必要边和状态。
+
+同一工作通过模板定义内的位置、区间类型、资源职责和绑定后特征关联测量与查询。CPU 采用已切开的同线程工作，等待与搬运另行归属。设备记录保留实际 task 的运行时间和 task 间隔，后者由依赖及提交时序解释。搬运可用实际方向与字节数。请求编号、物理 stream 或 SDK 任务名仅用于追溯同次观测。
+
 `actors` 按参与者保存有序 `steps`。每步包含 `operation`、`identity` 和用于追溯的 `source`。工作去除物理 slot，保留 token 范围、调用祖先、继续位置和实际放置。调用帧的 `context`、`entry_context`、`exit_context` 和 `observation_context` 中各字段的值由 `context_values` 提供。索引仅在本文件内解析，动作、CPU 工作和输入读取都按完整实际身份核对。核心为每次调用核对一次记录，使用同一记录取绑定和时间。游标保存已核对的前缀，明细用 `condition_used` 记录位置及来源。
 
 action另含bindings对象，无额外绑定时为空。PD的transport_order来自已独立核对的原生同步服务CPU进入顺序和实际注册目的池；它明确隔离后台预约到达的非确定性。核心在构图前核对同一工作身份并交接此输入，构图后仍逐项核对真实端点、载荷和必要串行因果；字节几何只由来源库提供。独立评价从原始证据重建绑定并核对实际展开，不读输入文件自证。该结果证明给定原生绑定下的结构，不证明自主预测网络到达顺序。规则调整后重新提取派生执行输入及从保留粗图重编模板，不兼容读取旧模板字段。
@@ -368,9 +374,9 @@ SGLang的schedule/forward/copy职责来自原生事件及等待声明，由Ascen
 
 在CPU control环境运行 `python3 example/coarse_graph/execution_inputs.py --capture <closed-native-case> --graphs <projected-graphs> --output <new-directory>`。全部实际参与者必须有原始记录和带evidence的粗图，只读真实事实，不读模板或预测。使用镜像已有的SciPy稀疏优化器提供候选基，再由SymPy以有理数重建并精确认证原始查询区间、全rank必要因果及严格取整单元。时钟只按真实独立快照分段，同物理设备的多个记录在重合区间保持同一映射；数值求解成功本身不取得资格，不能证明时明确未核对。CPU入口/返回保持直接RAW时间，设备具名端口按所选映射向上取整到纳秒，交给既有核心完成接口。输出execution-inputs-report.json记录所选实现和原始校准不确定性；全部必要事实齐全才发布execution-inputs.json。所选实现不是唯一精确测量，也不代表成本预测。
 
-没有实测时间的端口或工作完成保留partial报告，不发布可消费条件，也不改用整轮观测窗口。原始矛盾或缺少必要事实发布unverified报告，不能从预测补造。CPU消息wire及状态通知自身的有界测量另行保留，不伪称设备完成或最早可见。受控结果只报告checked_causal_execution_inputs，不附带未使用的given_work_ns；work_intervals由执行器统计全部已插入图的工作，包含模型动作和CPU消息服务，协议就绪事件另计。
+没有实测时间的必要端口或工作完成保留缺口报告，只有完整匹配后才发布全节点条件。CPU 消息 wire 和状态通知各保留独立的时间依据。结果以 `checked_causal_execution_inputs` 表示局部条件，以 `fully_matched_native_endpoints` 表示全节点条件。执行器统计插入图的全部工作，协议就绪事件另计。
 
-批次变换的上下文保留左右请求进度及结果成员，实际工作和父片段快照分别维护；不能将后来结果回写前置片段。PP模型/结果的实际流水线位置保留在observation_context，结构复用不能授予绝对时间复用。旁路只用于固定案例的结构验证；结果标记checked_causal_execution_inputs，不作为性能层建设或精度验收。
+批次变换的上下文保留左右请求进度及结果成员，实际工作和父片段快照分别维护。PP 模型与结果的实际流水线位置记录在 `observation_context`。旁路验证以固定案例实际观察的时间为依据，每次运行需匹配自己的端点。
 
 rank 事实统一保存 `state_queries`，每项包含 `kind`（event / transport / metadata）、独立 query scope、查询前后 RAW 时间及 `result`。Event 另存生产者的 point，结果为完成布尔值；协议轮询结果为原生整数状态，逻辑请求放在该 scope 的工作上下文中；metadata gate 记录该请求的 room 字段是否非零，不用原生 room 数字作为跨运行身份。无查询时明确保存空数组，缺字段不能解释成没有发生查询。每个 query 动作必须恰有一条实际读取记录，不能把窗口根或普通 CPU 片段当作它的切口。
 
