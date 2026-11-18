@@ -199,14 +199,14 @@ class AscendObservation:
             origin = self.trace.origin(self.trace.native_api(native))
             owner = self.trace.owner(origin)
             if owner is not None and owner not in self.trace.closed_scopes and self.trace.excluded_ranges.enclosing(origin) is None:
-                self.host_transfer(owner, native)
+                self.host_transfer(owner, native, native.record["direction"])
         self.host_index = self.span_index("thread")
 
-    def host_transfer(self, scope: int, interval: Interval) -> None:
+    def host_transfer(self, scope: int, interval: Interval, direction: int) -> None:
         resource = self.resource("thread", interval.thread, "native")
         span = self.span(scope, resource, interval.begin, interval.end, "transfer")
         self.resources[resource]["payload"].append([interval.begin, interval.end])
-        self.host_copies.append((scope, span))
+        self.host_copies.append((scope, span, interval, direction))
 
     def service_spans(self) -> None:
         for scope, raw in enumerate(self.raw["scopes"]):
@@ -264,8 +264,8 @@ class AscendObservation:
                 continue
 
             # A successful driver transfer is caller work, not a queued device command.
-            self.host_transfer(source.scope, source.completion)
-        for scope, transfer in self.host_copies:
+            self.host_transfer(source.scope, source.completion, source.native.record["direction"])
+        for scope, transfer, _, _ in self.host_copies:
 
             # An observation envelope cannot promote synchronous caller work into a device-stream fence.
             while scope != 0 and (scope not in self.device or self.raw["scopes"][scope].get("envelope", False)):
@@ -727,5 +727,10 @@ class AscendObservation:
         self.normalize_device_spans(result)
         if measurements:
             result["measurements"] = self.streams.measurements(result)
+            result["measurements"]["synchronous_copies"] = [
+                [self.spans[span]["resource"], interval.begin, interval.end,
+                 interval.record["end_raw_ns"] - interval.record["begin_raw_ns"], interval.record["bytes"], direction]
+                for _, span, interval, direction in self.host_copies
+            ]
             result["native_effects"] = self.streams.evidence(self.resource_ids)
         return result

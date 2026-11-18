@@ -288,7 +288,7 @@ class StreamCommands:
             clocks[command.stream, command.begin] = interval.begin if interval else None
             clocks[command.stream, command.end] = interval.end if interval else None
 
-        coordinates = []
+        coordinates, device_services = [], []
         for resource, orders in enumerate(positions):
             descriptor = resources[resource]
             stream = int(descriptor["identity"].split("/")[1]) if descriptor["kind"] == "stream" else None
@@ -299,8 +299,17 @@ class StreamCommands:
                 if stream is not None and measured is not None and not trace.clock.begin_ns <= measured <= trace.clock.end_ns:
                     raise ValueError("observed device boundary lies outside the clock calibration window")
                 coordinates.append({"resource": resource, "order": order, "time_ns": measured})
+            if stream is not None:
+
+                # Only physical payload contributes service time. Gaps between commands remain timeline evidence.
+                for begin, end in descriptor["payload"]:
+                    start, finish = clocks[stream, begin], clocks[stream, end]
+                    if start is None or finish is None or finish < start:
+                        raise ValueError("native device payload has no ordered execution measurements")
+                    device_services.append([resource, begin, end, finish - start])
         return {
             "clock": "monotonic_raw_ns",
             "window_ns": [trace.host_times[f"thread/{trace.window.thread}", side] for side in (trace.window.begin, trace.window.end)],
             "coordinates": coordinates,
+            "device_services": device_services,
         }

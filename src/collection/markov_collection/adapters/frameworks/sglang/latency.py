@@ -6,6 +6,7 @@ from pathlib import Path
 
 from markov_adapters.artifacts import write_json
 from markov_collection.adapters.frameworks.sglang.content import NativeContent
+from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
 
 
 class NativeLatency:
@@ -14,6 +15,15 @@ class NativeLatency:
         self.content = NativeContent(description)
         self.requests = {native: {"id": identity} for native, identity in self.content.aliases.items()}
         self.pending = set(self.requests)
+        self.host = None
+        self.window = None
+        if description.get("host_targets"):
+            from markov_collection.adapters.frameworks.sglang.host_samples import NativeHostSamples
+
+            self.host = NativeHostSamples(description["host_targets"], self.content.aliases)
+            if len(description["submission_groups"]) > 1:
+                self.window = ObservationWindow(Path(description["output"]), description)
+                self.rank, = description["native_participants"]
 
     def receive(self, original, receiver):
         from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
@@ -32,6 +42,10 @@ class NativeLatency:
             for request in requests:
                 if request.rid in self.requests:
                     self.requests[request.rid].setdefault("ingress_raw_ns", received_ns)
+                    if self.host is not None:
+                        self.host.enabled = True
+                    if self.window is not None:
+                        self.window.begin(request.rid)
         return messages
 
     def publish(self, original, sender, output, *args, **kwargs):
@@ -56,7 +70,25 @@ class NativeLatency:
 
         if not self.pending:
             write_json(self.path, {"clock": "monotonic_raw_ns", "requests": list(self.requests.values())}, replace=False)
+            if self.host is not None:
+                self.host.enabled = False
         return result
+
+    def flush(self, original, scheduler, *args, **kwargs):
+        result = original(scheduler, *args, **kwargs)
+        if result and not self.pending:
+
+            # Flush follows terminal publication on the same scheduler, including the emitter's caller return.
+            write_json(self.path.with_name("host-samples.json"), self.host.document(), replace=False)
+        return result
+
+    def idle(self, original, scheduler):
+        if scheduler.is_fully_idle():
+            group = self.window.group
+            self.window.group_idle(self.rank)
+            if self.window.group != group:
+                self.host.enabled = False
+        return original(scheduler)
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -72,3 +104,8 @@ class NativeLatency:
             self.publish, HookType.AROUND,
         )
         self.content.install()
+        if self.host is not None:
+            self.host.install()
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.flush_cache", self.flush, HookType.AROUND)
+        if self.window is not None:
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.on_idle", self.idle, HookType.AROUND)

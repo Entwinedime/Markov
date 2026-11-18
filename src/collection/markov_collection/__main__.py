@@ -16,6 +16,7 @@ def main() -> None:
     observation = capture.add_mutually_exclusive_group()
     observation.add_argument("--resource-trace", action="store_true", help="observe resources and input reads for independent comparison")
     observation.add_argument("--latency-only", action="store_true", help="record scheduler ingress and token publication only")
+    observation.add_argument("--host-targets", type=json.loads, help="sample selected native calls without profilers")
     interpret = commands.add_parser("interpret", help="interpret an SDK-exported worker recording")
     interpret.add_argument("--trace", type=Path, required=True)
     interpret.add_argument("--evidence", action="store_true", help="retain measured boundary clocks for source auditing")
@@ -28,9 +29,15 @@ def main() -> None:
     if arguments.command == "capture":
         from markov_collection.adapters.frameworks.sglang.session import NativeServingSession
 
+        targets = arguments.host_targets
+        if targets is not None and (not isinstance(targets, list) or not targets
+                                    or not all(isinstance(target, str) for target in targets)
+                                    or len(targets) != len(set(targets))):
+            parser.error("host targets require a nonempty array of distinct callable names")
         NativeServingSession(
             json.loads(arguments.input.read_text()), arguments.output,
             resource_trace=arguments.resource_trace, latency_only=arguments.latency_only,
+            host_targets=tuple(targets or ()),
         ).run()
     elif arguments.command == "export":
         from markov_collection.adapters.runtimes.ascend.export import AscendExport

@@ -37,21 +37,26 @@ class NativeRendezvous:
 
 
 class NativeServingSession:
-    def __init__(self, source, output: Path, *, resource_trace: bool = False, latency_only: bool = False) -> None:
+    def __init__(self, source, output: Path, *, resource_trace: bool = False, latency_only: bool = False,
+                 host_targets: tuple[str, ...] = ()) -> None:
         self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
         serving = CaptureInput(source)
         self.output = output.resolve()
+        latency_only = latency_only or bool(host_targets)
         self.instances = []
         offset = 0
         for index, description in enumerate(serving.instances):
             instance = NativeServingInstance(
-                serving, description, self.output, index, offset, resource_trace=resource_trace, latency_only=latency_only,
+                serving, description, self.output, index, offset,
+                resource_trace=resource_trace, latency_only=latency_only, host_targets=host_targets,
             )
             self.instances.append(instance)
             offset += len(instance.roles)
         if latency_only and (resource_trace or len(self.instances) != 1 or offset != 1
-                             or "ep" in self.instances[0].configuration or len(serving.submission_groups) != 1):
-            raise ValueError("latency measurement requires a single ordinary dense TP1 worker and one submission group")
+                             or "ep" in self.instances[0].configuration):
+            raise ValueError("light observation requires a single ordinary dense TP1 worker")
+        if latency_only and not host_targets and len(serving.submission_groups) != 1:
+            raise ValueError("latency-only measurement requires one submission group")
 
     @staticmethod
     def execute(instance, barrier, clock, bootstrap, rendezvous, connection):

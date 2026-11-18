@@ -18,12 +18,13 @@ from markov_adapters.artifacts import write_json
 class NativeServingInstance:
     def __init__(
         self, source: CaptureInput, instance: InstanceConfiguration, output: Path, index: int, rank_offset: int,
-        *, resource_trace: bool, latency_only: bool,
+        *, resource_trace: bool, latency_only: bool, host_targets: tuple[str, ...],
     ) -> None:
         self.model = source.model
         self.observe_all_workers = source.observe_all_workers
         self.resource_trace = resource_trace
         self.latency_only = latency_only
+        self.host_targets = host_targets
         self.output = output.resolve()
         self.instance = instance
         self.directory = self.output / "instances" / str(index)
@@ -102,6 +103,7 @@ class NativeServingInstance:
             "observe_all_workers": self.observe_all_workers,
             "resource_trace": self.resource_trace,
             "latency_only": self.latency_only,
+            "host_targets": self.host_targets,
             "warmup_requests": [f"warmup/{index}" for index in range(len(warmup["requests"]))],
             "source_requests": [f"capture/{index}" for index in range(len(self.workload["requests"]))],
             "protocol_requests": capture.protocol_requests,
@@ -176,6 +178,11 @@ class NativeServingInstance:
                 if not report.is_file():
                     raise RuntimeError("native scheduler did not publish complete request latencies")
                 metrics["latency"] = str(report.relative_to(self.output))
+                if self.host_targets:
+                    samples = self.directory / "host-samples.json"
+                    if not samples.is_file():
+                        raise RuntimeError("native scheduler did not publish host service samples")
+                    metrics["host_samples"] = str(samples.relative_to(self.output))
             else:
                 selected = self.observe(engine, capture, clock, barrier)
             captured_ns = time.monotonic_ns()
