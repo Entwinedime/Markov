@@ -1,4 +1,4 @@
-"""Measure the native scheduler's ingress and token publication with two hooks."""
+"""Measure native scheduler ingress and token publication without full profiling."""
 
 import ctypes
 import time
@@ -7,6 +7,7 @@ from pathlib import Path
 from markov_adapters.artifacts import write_json
 from markov_collection.adapters.frameworks.sglang.content import NativeContent
 from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
+from markov_collection.adapters.runtimes.ascend.host_profile import AscendSpecializations
 
 
 class NativeLatency:
@@ -17,13 +18,16 @@ class NativeLatency:
         self.pending = set(self.requests)
         self.host = None
         self.window = None
-        if description.get("host_targets"):
+        self.specializations = None
+        if description["host_timing"]:
             from markov_collection.adapters.frameworks.sglang.host_samples import NativeHostSamples
 
-            self.host = NativeHostSamples(description["host_targets"], self.content.aliases)
-            if len(description["submission_groups"]) > 1:
-                self.window = ObservationWindow(Path(description["output"]), description)
-                self.rank, = description["native_participants"]
+            self.rank, = description["native_participants"]
+            self.host = NativeHostSamples(self.content.aliases, self.rank, self.path.parent)
+            self.content.auxiliary = self.host.auxiliary
+            self.window = ObservationWindow(Path(description["output"]), description)
+        else:
+            self.specializations = AscendSpecializations()
 
     def receive(self, original, receiver):
         from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
@@ -41,12 +45,22 @@ class NativeLatency:
                 continue
             for request in requests:
                 if request.rid in self.requests:
+                    if self.specializations is not None and not self.specializations.started:
+                        self.specializations.start()
                     self.requests[request.rid].setdefault("ingress_raw_ns", received_ns)
-                    if self.host is not None:
-                        self.host.enabled = True
-                    if self.window is not None:
-                        self.window.begin(request.rid)
         return messages
+
+    def request(self, original, scheduler, request):
+        self.window.begin(request.rid)
+        if request.rid in self.requests:
+            self.host.enabled = True
+        return original(scheduler, request)
+
+    def write_latency(self):
+        report = {"clock": "monotonic_raw_ns", "requests": list(self.requests.values())}
+        if self.specializations is not None:
+            report["specialization_loads"] = self.specializations.finish()
+        write_json(self.path, report, replace=False)
 
     def publish(self, original, sender, output, *args, **kwargs):
         from sglang.srt.managers.io_struct import BatchTokenIDOutput
@@ -68,44 +82,46 @@ class NativeLatency:
                 row.update(last_publication_raw_ns=published_ns, output_tokens=count)
                 self.pending.remove(rid)
 
-        if not self.pending:
-            write_json(self.path, {"clock": "monotonic_raw_ns", "requests": list(self.requests.values())}, replace=False)
-            if self.host is not None:
-                self.host.enabled = False
+        if not self.pending and self.host is None:
+            self.write_latency()
         return result
 
     def flush(self, original, scheduler, *args, **kwargs):
         result = original(scheduler, *args, **kwargs)
-        if result and not self.pending:
+        if result and not self.host.profile.started:
+            self.host.scheduler = scheduler
+            self.host.profile.start()
+        elif result and not self.pending:
 
             # Flush follows terminal publication on the same scheduler, including the emitter's caller return.
+            self.host.enabled = False
             write_json(self.path.with_name("host-samples.json"), self.host.document(), replace=False)
+            self.write_latency()
         return result
 
     def idle(self, original, scheduler):
         if scheduler.is_fully_idle():
-            group = self.window.group
             self.window.group_idle(self.rank)
-            if self.window.group != group:
+            if self.window.inputs_complete() and not self.pending:
                 self.host.enabled = False
         return original(scheduler)
 
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-        if getattr(ctypes.CDLL(None), "markov_set_runtime_enabled", None) is not None:
+        if self.host is None and getattr(ctypes.CDLL(None), "markov_set_runtime_enabled", None) is not None:
             raise ValueError("latency measurement requires the native observer to be unloaded")
         HookRegistry.register(
             "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver._pull_raw_reqs",
             self.receive, HookType.AROUND,
         )
+        if self.host is not None:
+            self.host.install()
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.handle_generate_request", self.request, HookType.AROUND)
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.flush_cache", self.flush, HookType.AROUND)
+            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.on_idle", self.idle, HookType.AROUND)
+        self.content.install()
         HookRegistry.register(
             "sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output",
             self.publish, HookType.AROUND,
         )
-        self.content.install()
-        if self.host is not None:
-            self.host.install()
-            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.flush_cache", self.flush, HookType.AROUND)
-        if self.window is not None:
-            HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.on_idle", self.idle, HookType.AROUND)

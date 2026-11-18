@@ -500,7 +500,10 @@ class AscendObservation:
 
         # Queue entry follows any CPU preparation inside the API; its outer entry is not a launch witness.
         launched = self.host_anchor(Interval(begin, begin, api.thread, {}))
-        self.edge(self.host_anchor(origin), launched, "submission")
+        if origin is not api:
+
+            # A separate enqueue is visible before the worker submits. A direct call enters the queue at the driver boundary.
+            self.edge(self.host_anchor(origin), launched, "submission")
         self.edge(launched, self.task_anchor(task, side), "submission")
 
     def submissions(self) -> None:

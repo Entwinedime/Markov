@@ -18,13 +18,13 @@ from markov_adapters.artifacts import write_json
 class NativeServingInstance:
     def __init__(
         self, source: CaptureInput, instance: InstanceConfiguration, output: Path, index: int, rank_offset: int,
-        *, resource_trace: bool, latency_only: bool, host_targets: tuple[str, ...],
+        *, resource_trace: bool, latency_only: bool, host_timing: bool,
     ) -> None:
         self.model = source.model
         self.observe_all_workers = source.observe_all_workers
         self.resource_trace = resource_trace
         self.latency_only = latency_only
-        self.host_targets = host_targets
+        self.host_timing = host_timing
         self.output = output.resolve()
         self.instance = instance
         self.directory = self.output / "instances" / str(index)
@@ -32,7 +32,9 @@ class NativeServingInstance:
         configuration = instance.configuration
         self.configuration = configuration.values
         self.workload = source.workload
+        self.warmup = source.warmup if source.warmup is not None else self.warmup_requests(self.configuration["page_size"])
         self.submission_groups = source.submission_groups
+        self.warmup_groups = self.submission_groups if source.warmup == self.workload else None
         self.tp, self.pp, self.ep = configuration.tp, configuration.pp, configuration.ep
         self.roles = tuple(range(rank_offset, rank_offset + self.tp * self.pp))
         self.delivery = {}
@@ -89,12 +91,12 @@ class NativeServingInstance:
     def run(self, barrier, clock, bootstrap, rendezvous) -> dict:
         self.directory.mkdir()
         description = self.directory / "session.json"
-        warmup = self.warmup_requests(self.configuration["page_size"])
         mode = self.instance.mode
-        warm = EngineSubmissions(warmup, mode)
+        warm = EngineSubmissions(self.warmup, mode, self.warmup_groups)
         capture = EngineSubmissions(self.workload, mode, self.submission_groups)
         warm.prepare("warmup", bootstrap, 1)
-        capture.prepare("capture", bootstrap, 1 + len(warmup["requests"]))
+        warmup_count = len(self.warmup["requests"])
+        capture.prepare("capture", bootstrap, 1 + warmup_count)
         session = {
             "output": str(self.output), "instance_directory": str(self.directory), "mode": mode,
             "rendezvous": {"host": rendezvous["MASTER_ADDR"], "port": int(rendezvous["MASTER_PORT"])},
@@ -103,12 +105,12 @@ class NativeServingInstance:
             "observe_all_workers": self.observe_all_workers,
             "resource_trace": self.resource_trace,
             "latency_only": self.latency_only,
-            "host_targets": self.host_targets,
-            "warmup_requests": [f"warmup/{index}" for index in range(len(warmup["requests"]))],
+            "host_timing": self.host_timing,
+            "warmup_requests": [f"warmup/{index}" for index in range(warmup_count)],
             "source_requests": [f"capture/{index}" for index in range(len(self.workload["requests"]))],
             "protocol_requests": capture.protocol_requests,
             "content": self.workload,
-            "submission_groups": self.submission_groups,
+            "request_groups": {"warmup": warm.request_groups(), "source": capture.request_groups()},
             "serving_input": {"configuration": self.configuration, **self.workload},
         }
         write_json(description, session)
@@ -178,7 +180,7 @@ class NativeServingInstance:
                 if not report.is_file():
                     raise RuntimeError("native scheduler did not publish complete request latencies")
                 metrics["latency"] = str(report.relative_to(self.output))
-                if self.host_targets:
+                if self.host_timing:
                     samples = self.directory / "host-samples.json"
                     if not samples.is_file():
                         raise RuntimeError("native scheduler did not publish host service samples")

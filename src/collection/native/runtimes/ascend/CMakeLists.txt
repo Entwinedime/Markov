@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
 # The bridge consumes only the SDK C ABI; model-selection and Torch workspace code are not part of observation.
-add_library(markov_ascend_observer SHARED native_calls.cpp)
+add_library(markov_ascend_observer SHARED native_calls.cpp runtime_timing.cpp thread_activity.cpp)
 target_include_directories(markov_ascend_observer SYSTEM PRIVATE "${MARKOV_ASCEND_INCLUDE_DIR}")
 target_link_libraries(markov_ascend_observer PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(markov_ascend_observer PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

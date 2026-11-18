@@ -162,12 +162,13 @@ class ServingInput:
 class CaptureInput(ServingInput):
     def __init__(self, source: dict) -> None:
         required = {"model", "instances", "workload", "observe_all_workers"}
-        if not required <= source.keys() or source.keys() - required - {"submission_groups"}:
+        if not required <= source.keys() or source.keys() - required - {"submission_groups", "warmup"}:
             raise ValueError("a native job needs one model, explicit instances, workload and observation role policy")
         if type(source["observe_all_workers"]) is not bool:
             raise TypeError("observation role policy must be a boolean")
         super().__init__(source)
         self.observe_all_workers = source["observe_all_workers"]
+        self.warmup = self.workload_input(source["warmup"]) if "warmup" in source else None
         identities = [request["id"] for request in self.workload["requests"]]
         self.submission_groups = source.get("submission_groups", [identities])
         if not isinstance(self.submission_groups, list) or not self.submission_groups or any(

@@ -18,9 +18,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "runtime_timing.hpp"
+
 namespace {
 
-std::atomic_bool runtime_enabled{ false };
+using markov::ascend::Observation;
+using markov::ascend::RuntimeSample;
+using markov::ascend::observation;
 thread_local std::int64_t service_scope = -1;
 
 template <class Function> Function original(const char * name) {
@@ -57,12 +61,17 @@ std::int64_t monotonic_raw_ns() {
     return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
 }
 
-HostTimestamp host_timestamp() {
+std::uint64_t host_counter() {
     std::uint64_t counter;
 
-    // Match the profiler's AArch64 counter for ordering; RAW remains a separately observed measurement.
     asm volatile("isb; mrs %0, cntvct_el0" : "=r"(counter) : : "memory");
-    return { counter, monotonic_raw_ns() };
+    return counter;
+}
+
+HostTimestamp host_timestamp() {
+
+    // Match the profiler's AArch64 counter for ordering; RAW remains a separately observed measurement.
+    return { host_counter(), monotonic_raw_ns() };
 }
 
 class RuntimeLog {
@@ -122,12 +131,16 @@ void append_record(const char * directory, const char * record, int size, std::s
 class DriverCall {
 public:
     explicit DriverCall(const char * name, bool lifecycle = false)
-        : directory_(lifecycle || runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
+        : sample_(name, !lifecycle),
+          directory_(record(lifecycle) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
-          begin_(directory_ == nullptr ? HostTimestamp{} : host_timestamp()) {}
+          begin_(directory_ == nullptr ? HostTimestamp{} : host_timestamp()) {
+        sample_.enter();
+    }
 
     drvError_t finish(drvError_t result, std::uint32_t device, std::uint32_t system, std::uint32_t queue,
                       std::uint32_t stream = 0, std::uint32_t tasks = 0) const {
+        sample_.finish(static_cast<int>(result), tasks);
         if (directory_ == nullptr) return result;
 
         const auto end = host_timestamp();
@@ -155,6 +168,7 @@ public:
     }
 
     drvError_t finish(drvError_t result, const void * source, const void * destination, std::size_t bytes) const {
+        sample_.finish(static_cast<int>(result), 0, bytes);
         if (directory_ == nullptr) return result;
 
         // Driver workers need no ACL context; observing a completed transfer must not create or query one.
@@ -180,6 +194,12 @@ public:
     }
 
 private:
+    static bool record(bool lifecycle) {
+        const auto mode = observation.load(std::memory_order_relaxed);
+        return mode == Observation::Structure || (lifecycle && mode == Observation::Off);
+    }
+
+    RuntimeSample sample_;
     const char * directory_;
     const char * name_;
     HostTimestamp begin_;
@@ -189,14 +209,18 @@ class RuntimeCall {
 public:
     RuntimeCall(const char * name, aclrtStream stream = nullptr, bool has_stream = false, std::size_t bytes = 0, int direction = -1,
                 aclrtEvent event = nullptr, const void * source = nullptr, const void * destination = nullptr)
-        : directory_(runtime_enabled.load(std::memory_order_relaxed) ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
+        : sample_(name),
+          directory_(observation.load(std::memory_order_relaxed) == Observation::Structure ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr),
           name_(name),
           bytes_(bytes),
           direction_(direction),
           event_(event),
           source_(source),
           destination_(destination) {
-        if (directory_ == nullptr) return;
+        if (directory_ == nullptr) {
+            sample_.enter();
+            return;
+        }
 
         static const auto get_device = original<decltype(&aclrtGetDevice)>("aclrtGetDevice");
         static const auto get_stream = original<decltype(&aclrtStreamGetId)>("aclrtStreamGetId");
@@ -208,6 +232,7 @@ public:
     }
 
     aclError finish(aclError result, aclrtEvent created = nullptr) const {
+        sample_.finish(static_cast<int>(result), 0, bytes_, direction_);
         if (directory_ == nullptr) return result;
 
         const auto end = host_timestamp();
@@ -248,6 +273,7 @@ public:
     }
 
 private:
+    RuntimeSample sample_;
     const char * directory_;
     const char * name_;
     std::size_t bytes_;
@@ -269,6 +295,12 @@ extern "C" void markov_sample_host(std::uint64_t * values) {
     const auto sample = host_timestamp();
     values[0] = sample.counter;
     values[1] = static_cast<std::uint64_t>(sample.raw_ns);
+}
+
+extern "C" void markov_sample_host_clock(std::uint64_t * values) {
+    values[1] = static_cast<std::uint64_t>(monotonic_raw_ns());
+    values[0] = host_counter();
+    values[2] = static_cast<std::uint64_t>(monotonic_raw_ns());
 }
 
 extern "C" int markov_sample_device(std::uint32_t device, std::uint64_t * values) {
@@ -294,7 +326,9 @@ extern "C" int markov_sample_device(std::uint32_t device, std::uint64_t * values
     return 0;
 }
 
-extern "C" void markov_set_runtime_enabled(int enabled) { runtime_enabled.store(enabled != 0, std::memory_order_relaxed); }
+extern "C" void markov_set_runtime_enabled(int enabled) {
+    observation.store(enabled ? Observation::Structure : Observation::Off, std::memory_order_relaxed);
+}
 
 extern "C" std::int64_t markov_set_service_scope(std::int64_t scope) { return std::exchange(service_scope, scope); }
 

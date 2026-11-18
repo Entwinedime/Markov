@@ -207,13 +207,7 @@ class SGLangObservation:
         return requests
 
     def batch_work(self, batch: Any) -> dict[str, Any]:
-        members = BatchTensors.members(batch)
-        for member in members:
-            member["id"] = self.content.aliases[member["id"]]
-        return {
-            "phase": BatchTensors.phase(batch), "rank": self.parallel["rank"], "members": members,
-            "context": {"members": self.calls.progress(batch.reqs)},
-        }
+        return self.calls.batch_work(batch)
 
     def model_work(self, batch: Any):
         work = self.batch_work(batch)
@@ -389,22 +383,20 @@ class SGLangObservation:
         from markov_collection.adapters.frameworks.sglang.profiles import NativeProfiles
         from markov_collection.adapters.frameworks.sglang.kv_scopes import NativeKvScopes
         from markov_collection.adapters.frameworks.sglang.flow_scopes import FlowScopes
+        from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
         from markov_adapters.sglang.metadata_transfers import MetadataTransfers
 
         targets = {
-            "sglang.srt.model_executor.model_runner.ModelRunner.load_model": self.load_model,
-            "sglang.srt.model_executor.model_runner.ModelRunner.forward": self.forward,
             "sglang.srt.managers.scheduler.Scheduler.handle_generate_request": self.request,
             "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver.recv_requests": self.receive,
             "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver._pull_raw_reqs": partial(self.receive, ingress=True),
-            "sglang.srt.managers.scheduler.Scheduler.run_batch": self.run_batch,
-            "sglang.srt.model_executor.model_runner.ModelRunner.sample": self.sample,
             "sglang.srt.managers.scheduler.Scheduler.flush_cache": self.flush,
             "sglang.srt.managers.scheduler.Scheduler.on_idle": self.idle,
             "sglang.srt.managers.scheduler_components.flush_wrapper.SchedulerFlushWrapper.__init__": self.flush_wrapper,
         }
         for target, hook in targets.items():
             HookRegistry.register(target, hook, HookType.AROUND)
+        ModelScopes.install_engine_hooks(self)
         self.request_state.install()
         self.calls = FlowScopes(self)
         NativeProfiles(self).install()

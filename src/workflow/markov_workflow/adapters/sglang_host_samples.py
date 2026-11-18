@@ -4,6 +4,8 @@ from collections import Counter, defaultdict
 import json
 
 from markov_adapters.artifacts import write_json
+from markov_collection.adapters.runtimes.ascend.host_alignment import AscendHostAlignment
+from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.cost_samples import ServiceSamples, WorkCatalog
 
@@ -11,90 +13,78 @@ from markov_workflow.cost_samples import ServiceSamples, WorkCatalog
 class HostCostSamples:
     def __init__(self, arguments):
         self.arguments = arguments
-        self.children = defaultdict(list)
         self.qualification = Counter()
 
     @staticmethod
     def read(path):
         return json.loads(path.read_text())
 
-    def target(self, scope):
-        name = scope["implementation"]
-        return name if name in self.targets else name + ".forward"
-
-    def capture(self, scopes, probe):
-        source, observed = defaultdict(list), defaultdict(list)
-        enclosing, batches = {}, []
-        for scope in scopes:
-            parent = scope["parent"]
-            self.children[parent].append(scope)
-            if scope["role"] == "run_batch":
-                batch = len(batches)
-                work = scope["work"]
-                batches.append({"phase": work["phase"], "members": [member["id"] for member in work["members"]]})
-            else:
-                batch = enclosing.get(parent)
-            enclosing[scope["id"]] = batch
-
-            # Within-batch calls use their owning batch. Scheduler calls use the interval between batches.
-            target = self.target(scope)
-            if target in self.targets and scope["role"] != "segment":
-                key = (batch is not None, batch if batch is not None else len(batches), target)
-                source[key].append(scope)
-
-        if batches != probe["batches"]:
-            raise ValueError("native host observation changed the workload's actual batches")
-        next_batch = 0
-        for row in probe["intervals"]:
-            batch = row["batch"]
-            key = (batch is not None, batch if batch is not None else next_batch, row["target"])
-            observed[key].append(row)
-            if row["target"] == "sglang.srt.managers.scheduler.Scheduler.run_batch":
-                next_batch += 1
-        return source, observed
-
-    def fragments(self, scope, observed):
-        direct = self.children[scope["id"]]
-        if not direct and not observed:
-            return [scope]
-        if len(direct) != 2 * len(observed) + 1 or [self.target(child) for child in direct[1::2]] != observed:
-            return ()
-
-        # The retained native cut is valid only when the sampled children partition the same caller.
-        fragments = direct[::2]
-        entry = "call.enter"
-        for fragment in fragments:
-            if fragment["role"] != "segment" or self.target(fragment) != self.target(scope):
-                return ()
-            continuation = fragment["work"]["continuation"]
-            if continuation["entry"] != entry:
-                return ()
-            entry = continuation["exit"]
-        return fragments if entry == "call.return" else ()
+    @staticmethod
+    def records(path):
+        with path.open() as source:
+            return [json.loads(line) for line in source]
 
     @staticmethod
-    def whole_work(catalog, facts):
-        graph = catalog.graph
-        events = graph["evidence"]["events"]
-        work = defaultdict(list)
-        for (piece, definition, interval, features), span_index in zip(catalog, graph["evidence"]["work_spans"], strict=True):
-            if piece["kind"] != "host" or graph["resources"][piece["resource"]]["role"] != "control":
+    def identity(scope):
+        role, work = scope["role"], scope["work"]
+        detail = None
+        if role == "run_batch":
+            detail = [work["phase"], [{key: value for key, value in member.items() if key != "slot"} for member in work["members"]]]
+        elif role == "segment":
+            detail = [work["continuation"], scope["bindings"]["condition"]]
+        elif role in {"invocation", "query", "host_read", "batch_transform", "cache_match"}:
+            detail = work.get("context")
+        return role, scope["implementation"], scope["site"], json.dumps(detail, sort_keys=True)
+
+    def children(self, scopes):
+        indexed = defaultdict(list)
+        for scope in scopes[1:]:
+            indexed[scope["parent"]].append((self.identity(scope), scope["id"]))
+        return indexed
+
+    @staticmethod
+    def group(scopes):
+        grouped = defaultdict(list)
+        for key, scope in scopes:
+            grouped[key].append(scope)
+        return grouped
+
+    def match(self, scopes, observed):
+        batches = [[self.identity(scope) for scope in rows if scope["role"] == "run_batch"] for rows in (scopes, observed)]
+        if batches[0] != batches[1]:
+            raise ValueError("native host observation changed the workload's actual batches")
+        source, measured = (self.children(rows) for rows in (scopes, observed))
+        pairs = {}
+        pending = [(0, 0)]
+        while pending:
+            left, right = pending.pop()
+            old, new = source[left], measured[right]
+            if [key for key, _ in old] == [key for key, _ in new]:
+
+                # A caller's charged interval requires the same ordered partition by its children.
+                if left:
+                    pairs[left] = right
+                pending.extend((a, b) for (_, a), (_, b) in zip(old, new, strict=True))
                 continue
-            scope = graph["scopes"][piece["scope"]]
-            source = scope["bindings"]["source_scopes"]
-            span = facts["spans"][span_index]
-            start, finish = piece["start"], piece["finish"]
-            if len(source) == 1 and (events[start]["order"], events[finish]["order"]) == (span["begin"], span["end"]):
-                work[source[0]].append((definition, interval, features))
-        return {source: pieces[0] for source, pieces in work.items() if len(pieces) == 1}
+            self.qualification["different_call_boundaries"] += bool(left)
+            candidates = self.group(new)
+            for key, values in self.group(old).items():
+                matches = candidates.get(key, [])
+                if len(values) == len(matches):
+                    pending.extend(zip(values, matches, strict=True))
+                else:
+                    self.qualification["native_call_census"] += len(values)
+        return pairs, len(batches[0])
 
     def run(self):
         detailed = self.arguments.detailed
         lightweight = self.arguments.host
         source, host = (self.read(task / "execution.json")["inputs"] for task in (detailed, lightweight))
-        for field in ("job", "deployment", "framework_revision"):
+        for field in ("deployment", "framework_revision"):
             if source[field] != host[field]:
                 raise ValueError(f"host cost capture changes the measured native {field}")
+        if (source["job"] | {"warmup": None}) != (host["job"] | {"warmup": None}):
+            raise ValueError("host cost capture changes the measured native workload or configuration")
         source_root = CaptureProcess.published(detailed, source["job"])
         host_root = CaptureProcess.published(lightweight, host["job"])
         instance, = self.read(lightweight / "result.json")["instances"]
@@ -107,42 +97,47 @@ class HostCostSamples:
         if (facts["measurements"]["window_ns"] != catalog.window
                 or facts["environment"] != graph["environment"] or original["environment"] != graph["environment"]):
             raise ValueError("host measurement uses a graph from a different native capture")
-        if probe["clock"] != "thread_cpu_ns" or probe["targets"] != host["host_targets"]:
+        if probe["clock"] != "monotonic_raw_ns" or not host["host_timing"]:
             raise ValueError("host samples do not match their declared measurement")
 
-        self.targets = set(probe["targets"])
-        calls, observed = self.capture(original["scopes"], probe)
-        work = self.whole_work(catalog, facts)
+        pairs, batches = self.match(original["scopes"], probe["scopes"])
+        timing = probe["timing"]
+        directory = (host_root / instance["host_samples"]).parent
+        queues = self.read(directory / timing["queues"])
+        if queues["clock"] != "monotonic_raw_ns" or queues["unpaired"]:
+            raise ValueError("native CPU timing requires paired queue evidence on the RAW clock")
+        if timing["specialization_loads"]:
+            raise ValueError(f"CPU measurement loaded {len(timing['specialization_loads'])} new specializations after warmup")
+        profile, = (source_root / "native" / f"rank-{rank}").glob("*_ascend_pt")
+        trace = AscendTrace(profile, source_root / "runtime", original, self.arguments.trace)
+        alignment = AscendHostAlignment(
+            trace, probe["scopes"], pairs, queues["commands"], self.records(directory / timing["runtime"]),
+            self.records(directory / timing["activity"]), probe["auxiliary_intervals"], original["state_queries"],
+        )
+
+        evidence = graph["evidence"]["events"]
         samples = ServiceSamples(catalog)
-        matched = 0
-        for key, scopes in calls.items():
-            records = observed[key]
-            if (len(scopes) != len(records) or len({scope["thread"] for scope in scopes}) != 1
-                    or len({row["thread"] for row in records}) != 1):
-                self.qualification["native_call_census"] += len(scopes)
+        measured, missing = Counter(), Counter()
+        for piece, definition, interval, features in catalog:
+            if piece["kind"] != "host":
                 continue
-            for scope, row in zip(scopes, records, strict=True):
-                fragments = self.fragments(scope, row["children"])
-                if not fragments:
-                    self.qualification["different_call_boundaries"] += 1
-                    continue
-                for fragment, raw_ns in zip(fragments, row["fragments_ns"], strict=True):
-                    piece = work.get(fragment["id"])
-                    duration = raw_ns - probe["timer_bracket_ns"]
-                    if piece is None or duration <= 0:
-                        self.qualification["partial_work" if piece is None else "below_clock_bracket"] += 1
-                        continue
+            resource = graph["resources"][piece["resource"]]
+            scope = graph["scopes"][piece["scope"]]
+            key = f"{resource['role']}/{scope['role']}"
+            begin, end = (evidence[piece[side]]["order"] for side in ("start", "finish"))
+            thread = int(resource["identity"].split("/")[1])
+            duration = alignment.duration(thread, begin, end, resource["role"] == "submission")
+            if duration is None:
+                missing[key] += 1
+                continue
+            samples.add(definition, interval, features, duration)
+            measured[key] += 1
 
-                    definition, interval, features = piece
-                    read = fragment["bindings"].get("condition", {}).get("read", {})
-                    if fragment["role"] == "query" and read.get("kind") in {"capacity", "clock"}:
-                        features = {"phase": "", "axes": {}}
-                    samples.add(definition, interval, features, duration)
-                    matched += 1
-
-        report = samples.document({"host": sum(piece["kind"] == "host" for piece in graph["work"]) - matched})
+        report = samples.document({"host": sum(missing.values())})
         report["qualification"] = {
-            "timer_bracket_ns": probe["timer_bracket_ns"], "native_batches": len(probe["batches"]),
-            "matched_works": matched, "misses": dict(self.qualification),
+            "native_batches": batches,
+            "queue_correction_ns": queues["raw_correction_ns"],
+            "measured": dict(measured), "missing": dict(missing),
+            "alignment": dict(self.qualification + alignment.misses), "lost_threads": alignment.service.loss,
         }
         write_json(self.arguments.output, report, replace=False)

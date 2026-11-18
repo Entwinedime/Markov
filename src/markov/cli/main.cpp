@@ -26,6 +26,7 @@
 #include "markov/execution/timing.hpp"
 #include "markov/graph/observation.hpp"
 #include "markov/graph/types.hpp"
+#include "markov/performance/work_costs.hpp"
 #include "markov/performance/work_features.hpp"
 #include "markov/production/entries.hpp"
 #include "markov/production/projection.hpp"
@@ -101,7 +102,7 @@ constexpr std::string_view usage = "markov project <native-facts.json> <coarse.j
                                    "markov instantiate <templates.json> <invocation.json> <coarse.json>\n"
                                    "markov execute <coarse.json> <given-timing.json> <execution.json> [--trace <execution.jsonl>]\n"
                                    "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] "
-                                   "[--execution-inputs <conditions.json>]\n";
+                                   "[--execution-inputs <conditions.json> | --costs <costs.json>]\n";
 
 nlohmann::json work_identities(markov::CoarseGraph source, const nlohmann::json & observation_window) {
     const auto work_count = source.work.size();
@@ -204,7 +205,7 @@ int main(int argc, char ** argv) {
         if (argc < 2) throw std::invalid_argument(std::string(usage));
 
         const std::string_view command = argv[1];
-        const char * destination = argv[argc - 1];
+        std::filesystem::path destination = argv[argc - 1];
         nlohmann::json output;
         if (command == "project" && (argc == 4 || (argc == 5 && std::string_view(argv[4]) == "--evidence"))) {
             destination = argv[3];
@@ -265,9 +266,12 @@ int main(int argc, char ** argv) {
             std::map<std::string_view, std::filesystem::path> options;
             for (int argument = 5; argument < argc; argument += 2) {
                 const std::string_view option = argv[argument];
-                if ((option != "--trace" && option != "--execution-inputs") || !options.emplace(option, argv[argument + 1]).second)
+                if ((option != "--trace" && option != "--execution-inputs" && option != "--costs")
+                    || !options.emplace(option, argv[argument + 1]).second)
                     throw std::invalid_argument("unknown or repeated serving option: " + std::string(option));
             }
+            if (options.contains("--execution-inputs") && options.contains("--costs"))
+                throw std::invalid_argument("select either measured execution inputs or independent costs");
             const auto task = read_json(argv[3]);
             for (const auto & [field, _] : task.items()) {
                 if (field != "template_sources" && field != "instances" && field != "workload"
@@ -275,8 +279,10 @@ int main(int argc, char ** argv) {
                     throw std::invalid_argument("unknown serving input field: " + field);
             }
 
-            // Conditions are an independent immutable asset, not a second copy nested in the serving task.
+            // Timing assets are immutable and selected at task startup; the core owns their decoding.
             const auto timing = options.contains("--execution-inputs") ? read_json(options.at("--execution-inputs")) : nlohmann::json();
+            const auto costs = options.contains("--costs") ? read_json(options.at("--costs")) : nlohmann::json();
+            if (options.contains("--costs") && !costs.is_object()) throw std::invalid_argument("cost asset requires an object");
             std::map<std::size_t, markov::TemplateLibrary> libraries;
             for (const auto & source : task.at("template_sources")) {
                 const auto index = source.get<std::size_t>();
@@ -291,7 +297,13 @@ int main(int argc, char ** argv) {
             std::unique_ptr<markov::ExecutionTrace> trace;
             if (options.contains("--trace")) trace = std::make_unique<markov::ExecutionTrace>(options.at("--trace"));
             StreamPeer peer;
-            output = markov::sglang::serve(libraries, task, timing, peer, trace.get(), trace.get(), trace.get());
+            try {
+                output = markov::sglang::serve(libraries, task, timing, costs, peer, trace.get(), trace.get(), trace.get());
+            }
+            catch (const markov::CostGap & gap) {
+                Publication(destination.parent_path() / "cost-gap.json").write(gap.details());
+                throw;
+            }
             output["template_imports"] = imports;
             if (trace) trace->finish();
         }
@@ -305,7 +317,7 @@ int main(int argc, char ** argv) {
         else throw std::invalid_argument(std::string(usage));
 
         Publication(destination).write(output);
-        std::cerr << "Created " << destination << '\n';
+        std::cerr << "Created " << destination.string() << '\n';
         return 0;
     }
     catch (const std::exception & error) {

@@ -19,6 +19,7 @@
 #include "markov/controller/native.hpp"
 #include "markov/execution/dependencies.hpp"
 #include "markov/execution/timeline.hpp"
+#include "markov/performance/work_costs.hpp"
 #include "markov/resources/kv_pool.hpp"
 #include "markov/resources/service.hpp"
 #include "markov/serving/execution_inputs.hpp"
@@ -43,15 +44,18 @@ struct Participant {
 
 } // namespace
 
-nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, const nlohmann::json & timing, ControlPeer & peer, ExecutionObserver * execution_observer,
+nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task,
+                     const nlohmann::json & timing, const nlohmann::json & costs, ControlPeer & peer, ExecutionObserver * execution_observer,
                      ResourceObserver * resource_observer, ControlObserver * control_observer) {
     const auto & workload = task.at("workload");
     auto requests = Request::read(workload.at("requests"));
-    const auto duration = read_parameters({
-                                              { "given_work_ns", task.at("given_work_ns") }
-    })
-                              .at("given_work_ns");
-    if (duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
+    ServiceDuration duration;
+    if (costs.is_null()) {
+        duration = read_parameters({ { "given_work_ns", task.at("given_work_ns") } }).at("given_work_ns");
+        if (*duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
+    } else if (!timing.is_null() || task.contains("given_work_ns")) {
+        throw std::invalid_argument("cost prediction requires an independent timing asset");
+    }
     if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
     std::optional<ExecutionInputs> inputs;
     if (!timing.is_null()) inputs.emplace(timing, control_observer);
@@ -61,6 +65,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     std::vector<Resource> resources;
     std::map<std::string, std::unique_ptr<Participant>> participants;
     std::map<std::string, ServingParticipant> execution;
+    std::map<std::size_t, WorkCosts> cost_models;
     std::vector<NativeInstance> instances;
     std::set<std::string> instance_ids;
     auto sources = nlohmann::json::array();
@@ -96,7 +101,8 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
         for (const auto & binding : description.at("participants").get_ref<const nlohmann::json::array_t &>()) {
             const auto group = binding.at("id").get<std::string>();
             if (group.empty() || participants.contains(group)) throw std::invalid_argument("serving participant identities must be unique and nonempty");
-            const auto & library = libraries.at(binding.at("template").get<std::size_t>());
+            const auto template_source = binding.at("template").get<std::size_t>();
+            const auto & library = libraries.at(template_source);
             const auto & environment = binding.at("environment");
             const auto & parallel = environment.at("parallel");
             if (ranks.empty()) {
@@ -147,7 +153,8 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                      .first->second;
             instance.participants.push_back({ group, static_cast<std::size_t>(rank), control_thread,
                                                participant.resources, participant.graphs, participant.dependencies });
-            execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies });
+            const auto * model = costs.is_null() ? nullptr : &cost_models.try_emplace(template_source, library, costs).first->second;
+            execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies, model });
         }
         if ((tp == 0 || ranks.size() % static_cast<std::size_t>(tp) != 0 || ranks.size() / static_cast<std::size_t>(tp) != static_cast<std::size_t>(pp))
             || std::set(ranks.begin(), ranks.end()).size() != ranks.size() || ranks.empty())

@@ -6,7 +6,7 @@
 
 namespace markov {
 
-CpuMessages::CpuMessages(Timeline & timeline, std::int64_t given_service_ns, ControlObserver * observer, ExecutionInputs * inputs)
+CpuMessages::CpuMessages(Timeline & timeline, ServiceDuration given_service_ns, ControlObserver * observer, ExecutionInputs * inputs)
     : timeline_(timeline), given_service_ns_(given_service_ns), observer_(observer), inputs_(inputs) {}
 
 void CpuMessages::add_actor(const std::string & group, CpuActor actor) { actors_.emplace(group, std::move(actor)); }
@@ -45,7 +45,7 @@ CpuMessages::Service CpuMessages::service(const nlohmann::json & key, const Endp
 
     // Blocking API time includes its wait, but only the local CPU service receives a duration.
     if (prerequisite) inputs.push_back({ *prerequisite, 1, Relation::Communication });
-    GraphTiming timing{ { given_service_ns_ }, {} };
+    GraphTiming timing;
     std::optional<InputPosition> position;
     if (inputs_) {
         auto supplied = inputs_->invocation(endpoint.group, "cpu", {
@@ -53,6 +53,9 @@ CpuMessages::Service CpuMessages::service(const nlohmann::json & key, const Endp
         });
         timing = supplied.timing(graph);
         position = std::move(supplied.position);
+    } else {
+        if (!given_service_ns_) throw std::runtime_error("cost asset has no native CPU protocol service model");
+        timing.work_ns.push_back(given_service_ns_);
     }
     const auto events = timeline_.insert(graph, timing.work_ns, inputs, timing.boundaries);
     ++service_count_;
@@ -89,13 +92,17 @@ void CpuMessages::resolve(const nlohmann::json & key, Message & message) {
         if (endpoint->entered) prerequisites.push_back(*endpoint->entered);
     }
     const bool in_flow = sender.execution.at("in_flow").get<bool>() || receiver.execution.at("in_flow").get<bool>();
-    message.timing = { in_flow ? given_service_ns_ : 0, {} };
-    if (in_flow && inputs_) {
+    if (!in_flow) {
+        message.timing = { 0, {} };
+    } else if (inputs_) {
         std::vector<InputPosition> positions;
         for (const auto & endpoint : message.endpoints) {
             if (endpoint->input) positions.push_back(*endpoint->input);
         }
         message.timing = inputs_->transfer(positions);
+    } else {
+        if (!given_service_ns_) throw std::runtime_error("cost asset has no native CPU transport model");
+        message.timing = { given_service_ns_, {} };
     }
     timeline_.resolve(*message.wire, prerequisites, Relation::Communication, message.timing.window, message.timing.service_ns);
 }

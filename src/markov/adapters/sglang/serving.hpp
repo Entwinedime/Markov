@@ -18,7 +18,8 @@ class ControlObserver;
 
 namespace markov::sglang {
 
-nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task, const nlohmann::json & timing, ControlPeer & peer,
+nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, const nlohmann::json & task,
+                     const nlohmann::json & timing, const nlohmann::json & costs, ControlPeer & peer,
                      ExecutionObserver * execution = nullptr,
                      ResourceObserver * resources = nullptr, ControlObserver * control = nullptr);
 

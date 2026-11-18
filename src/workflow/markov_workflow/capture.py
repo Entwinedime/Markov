@@ -33,10 +33,10 @@ class CaptureProcess:
             raise ValueError("published source lies outside its native task")
         return source
 
-    def __init__(self, arguments, limit=None, *, latency_only=False, host_targets=None) -> None:
+    def __init__(self, arguments, limit=None, *, latency_only=False, host_timing=False) -> None:
         self.arguments = arguments
-        self.host_targets = json.loads(host_targets.read_text()) if host_targets is not None else None
-        self.latency_only = latency_only or self.host_targets is not None
+        self.host_timing = host_timing
+        self.latency_only = latency_only or host_timing
         self.operation_limit = limit if limit is not None else OperationLimit()
         job = json.loads(arguments.input.read_text())
         serving = CaptureInput(job)
@@ -65,10 +65,11 @@ class CaptureProcess:
             "resource_trace": arguments.resource_trace,
         }
         if self.latency_only:
-            self.options.extend(("--env", "LD_PRELOAD="))
             self.inputs["latency_only"] = True
-        if self.host_targets is not None:
-            self.inputs["host_targets"] = self.host_targets
+            if not self.host_timing:
+                self.options.extend(("--env", "LD_PRELOAD="))
+        if self.host_timing:
+            self.inputs["host_timing"] = True
 
     def save(self) -> None:
         write_json(self.output / "execution.json", self.state, indent=2)
@@ -114,8 +115,8 @@ class CaptureProcess:
             self.inputs["image"], "--signal=KILL", f"{allowance_ns / 1_000_000_000}s", "/opt/markov/capture.sh",
             "--input", "/input.json", "--output", "/capture/source",
             *(["--resource-trace"] if self.arguments.resource_trace else []),
-            *(["--latency-only"] if self.latency_only and self.host_targets is None else []),
-            *(["--host-targets", json.dumps(self.host_targets)] if self.host_targets is not None else []),
+            *(["--latency-only"] if self.latency_only and not self.host_timing else []),
+            *(["--host-timing"] if self.host_timing else []),
         ]
         attempt = {
             "number": number, "container": container, "command": command, "timeout_ns": allowance_ns,

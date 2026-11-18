@@ -14,6 +14,7 @@
 
 #include "markov/serving/observer.hpp"
 #include "markov/serving/execution_inputs.hpp"
+#include "markov/execution/timing.hpp"
 #include "markov/execution/timeline.hpp"
 
 namespace markov {
@@ -26,7 +27,7 @@ struct CpuActor {
 // The broker owns numeric payloads and channel positions; this service owns their execution readiness.
 class CpuMessages {
 public:
-    CpuMessages(Timeline & timeline, std::int64_t given_service_ns, ControlObserver * observer, ExecutionInputs * inputs);
+    CpuMessages(Timeline & timeline, ServiceDuration given_service_ns, ControlObserver * observer, ExecutionInputs * inputs);
     void add_actor(const std::string & group, CpuActor actor);
     void prime();
     void call(std::size_t call, const std::string & group, const nlohmann::json & message);
@@ -83,7 +84,7 @@ private:
     void wait(std::size_t call, const std::string & group, const nlohmann::json & message);
 
     Timeline & timeline_;
-    std::int64_t given_service_ns_;
+    ServiceDuration given_service_ns_;
     ControlObserver * observer_;
     ExecutionInputs * inputs_;
     std::map<std::string, CpuActor> actors_;

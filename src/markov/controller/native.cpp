@@ -11,7 +11,7 @@ namespace markov {
 
 NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
                                    const nlohmann::json & prefixes, Timeline & timeline, const nlohmann::json & ingress,
-                                   std::int64_t given_work_ns, ExecutionInputs * execution_inputs, ResourceObserver * observer,
+                                   ServiceDuration given_work_ns, ExecutionInputs * execution_inputs, ResourceObserver * observer,
                                    ControlObserver * control_observer)
     : requests_(std::move(requests)),
       peer_(peer),

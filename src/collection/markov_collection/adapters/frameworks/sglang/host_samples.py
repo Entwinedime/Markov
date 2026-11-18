@@ -1,98 +1,118 @@
-"""Measure native calls on their own CPU threads without graph or device tracing."""
+"""Time the native scope hierarchy without recording tensor ports or device markers."""
 
-from functools import partial
-from statistics import median
-from threading import get_native_id, local
-from time import thread_time_ns
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import partial, update_wrapper
+from threading import get_native_id
+from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
-from markov_adapters.sglang.batches import BatchTensors
-from markov_adapters.sglang.clocks import DecisionClocks
-
-
-class HostCall:
-    def __init__(self, target, batch, resumed):
-        self.target = target
-        self.batch = batch
-        self.resumed = resumed
-        self.fragments_ns = []
-        self.children = []
-
-    def pause(self, now):
-        self.fragments_ns.append(now - self.resumed)
-
-    def resume(self):
-        self.resumed = thread_time_ns()
+from markov_adapters.sglang.state_calls import RequestStateCalls
+from markov_collection.adapters.frameworks.sglang.flow_scopes import ServingCuts
+from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
+from markov_collection.adapters.runtimes.ascend.host_profile import AscendHostProfile
 
 
-class NativeHostSamples:
-    batch_target = "sglang.srt.managers.scheduler.Scheduler.run_batch"
-
-    def __init__(self, targets, aliases):
-        self.targets = targets
-        self.aliases = aliases
+class NativeHostSamples(ServingCuts):
+    def __init__(self, aliases, rank, directory):
+        super().__init__(aliases)
+        self.rank = rank
         self.enabled = False
-        self.threads = local()
-        self.intervals = []
-        self.batches = []
+        self.request_state = RequestStateCalls(observe=False)
+        self.parent = ContextVar("timed_host_scope", default=0)
+        self.scopes = [{"id": 0, "parent": None, "role": "window", "site": "", "implementation": "", "work": {}, "bindings": {}}]
+        self.auxiliary_intervals = []
+        self.profile = AscendHostProfile(directory)
 
-    @staticmethod
-    def clock_cost():
-        costs = []
-        for _ in range(256):
-            begin = thread_time_ns()
-            finish = thread_time_ns()
-            costs.append(finish - begin)
-        return round(median(costs))
+    @contextmanager
+    def scope(self, role, site, implementation, *, work=None, condition=None):
+        occurrence = {
+            "id": len(self.scopes), "parent": self.parent.get(), "role": role, "site": site,
+            "implementation": implementation, "work": {} if work is None else dict(work),
+            "bindings": {} if condition is None else {"condition": condition}, "thread": get_native_id(),
+        }
+        self.scopes.append(occurrence)
+        previous = self.parent.set(occurrence["id"])
+        begin = clock_gettime_ns(CLOCK_MONOTONIC_RAW)
+        try:
+            yield occurrence
+        finally:
+            occurrence["raw_interval"] = [begin, clock_gettime_ns(CLOCK_MONOTONIC_RAW)]
+            self.parent.reset(previous)
 
-    def call(self, target, original, *args, **kwargs):
+    def native_call(self, role, original, **facts):
+        return self.scope(role, original.__qualname__, f"{original.__module__}.{original.__qualname__}", **facts)
+
+    def enclosing(self, frame):
+        return self.native_call("invocation", frame.original, work=frame.work)
+
+    @contextmanager
+    def fragment(self, frame):
+        with self.native_call("segment", frame.original, condition=frame.condition) as occurrence:
+            yield
+        occurrence["work"]["continuation"] = frame.continuation
+
+    @contextmanager
+    def boundary(self, original, boundary):
+        with self.native_call(boundary.operation, original, work=boundary.work) as occurrence:
+            yield
+        occurrence["work"]["context"] = boundary.work["context"]
+
+    @contextmanager
+    def read_boundary(self, kind, original, work, condition):
+        with self.native_call("query", original, work=work, condition=condition):
+            yield {}
+
+    def load_model(self, original, runner):
+        result = original(runner)
+        modules = dict(runner.model.named_modules())
+        for site, role in ModelScopes.selected(modules).items():
+            module = modules[site]
+            implementation = f"{type(module).__module__}.{type(module).__qualname__}"
+            forward = module.forward
+            module.forward = update_wrapper(partial(self.module, role, site, implementation, forward), forward)
+        return result
+
+    def module(self, role, site, implementation, original, *args, **kwargs):
         if not self.enabled:
             return original(*args, **kwargs)
-        parent = getattr(self.threads, "current", None)
-        if parent is not None:
-            parent.pause(thread_time_ns())
-            parent.children.append(target)
-        batch = parent.batch if parent is not None else None
-        if target == self.batch_target:
-            native = args[1] if len(args) > 1 else kwargs["batch"]
-            batch = len(self.batches)
-            self.batches.append({
-                "phase": BatchTensors.phase(native),
-                "members": [self.aliases[req.rid] for req in native.reqs],
-            })
-        current = HostCall(target, batch, 0)
-        self.threads.current = current
-
-        # A sampled child pauses its caller around the child and the recorder's bookkeeping.
-        current.resumed = thread_time_ns()
-        try:
+        with self.scope(role, site, implementation):
             return original(*args, **kwargs)
-        finally:
-            current.pause(thread_time_ns())
-            self.intervals.append({
-                "target": target, "batch": batch, "thread": get_native_id(),
-                "children": current.children, "fragments_ns": current.fragments_ns,
-            })
-            self.threads.current = parent
-            if parent is not None:
-                parent.resume()
 
-    def clock_read(self, original, description):
-        return self.call("time." + description["clock"], original)
+    def run_batch(self, original, scheduler, batch, *args, **kwargs):
+        if not self.enabled:
+            return original(scheduler, batch, *args, **kwargs)
+        with self.native_call("run_batch", original, work=self.batch_work(batch)):
+            return original(scheduler, batch, *args, **kwargs)
+
+    def forward(self, original, runner, *args, **kwargs):
+        if not self.enabled:
+            return original(runner, *args, **kwargs)
+        with self.native_call("model", original):
+            return original(runner, *args, **kwargs)
+
+    def sample(self, original, runner, *args, **kwargs):
+        if not self.enabled:
+            return original(runner, *args, **kwargs)
+        with self.native_call("sample", original):
+            return original(runner, *args, **kwargs)
+
+    @contextmanager
+    def auxiliary(self):
+        if not self.enabled:
+            yield
+            return
+        begin = clock_gettime_ns(CLOCK_MONOTONIC_RAW)
+        try:
+            yield
+        finally:
+            self.auxiliary_intervals.append([get_native_id(), begin, clock_gettime_ns(CLOCK_MONOTONIC_RAW)])
 
     def install(self):
-        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-        for target in self.targets:
-            if target.startswith("sglang.srt."):
-                HookRegistry.register(target, partial(self.call, target), HookType.AROUND)
-            elif target not in {"time.perf_counter", "time.monotonic", "time.time"}:
-                raise ValueError(f"unsupported native CPU timing target {target}")
-        if any(target.startswith("time.") for target in self.targets):
-            DecisionClocks(self).install()
-        self.timer_ns = self.clock_cost()
+        super().install()
+        ModelScopes.install_engine_hooks(self)
 
     def document(self):
         return {
-            "clock": "thread_cpu_ns", "timer_bracket_ns": self.timer_ns,
-            "targets": self.targets, "batches": self.batches, "intervals": self.intervals,
+            "clock": "monotonic_raw_ns", "scopes": self.scopes,
+            "auxiliary_intervals": self.auxiliary_intervals, "timing": self.profile.finish(),
         }

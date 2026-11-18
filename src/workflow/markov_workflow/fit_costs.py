@@ -106,10 +106,6 @@ class FitCosts:
     def query(self, definition, interval, features):
         phase = features["phase"]
         curve = self.curves.get((definition, interval, phase))
-        if curve is None and phase:
-            independent = self.curves.get((definition, interval, ""))
-            if independent is not None and not independent["bounds"]:
-                curve = independent
         if curve is None:
             return "unseen_work", None
         estimate = ServiceCurve.estimate(curve, features["axes"])

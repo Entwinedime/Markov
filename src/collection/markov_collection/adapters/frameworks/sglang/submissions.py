@@ -59,15 +59,19 @@ class EngineSubmissions:
                     )
                 self.submissions[-1].append((payload, {"group": group, "arrival_ns": arrival, "requests": indices}))
 
+    def request_groups(self) -> list[list[str]]:
+        return [[identity for payload, _ in group for identity in payload["rid"]] for group in self.submissions]
+
     async def run(self, endpoint: Any, clock: Any, barrier: Any, directory, ranks) -> None:
         origin_ns = clock.origin.value
+        phase = "warmup" if self.prefix == "warmup" else "source"
         records = [record for group in self.submissions for _, record in group]
         self.delivery = [{"clock": "monotonic_raw_ns", "origin_ns": origin_ns, "submissions": records}]
         for index, group in enumerate(self.submissions):
             if index:
 
                 # Worker idle, not client completion, closes a group; both PD instances join before advancing time.
-                await asyncio.to_thread(ObservationWindow.wait, directory, ranks, "source", f"group/{index - 1}")
+                await asyncio.to_thread(ObservationWindow.wait, directory, ranks, phase, f"group/{index - 1}")
                 barrier.wait()
             offset_ns = clock.origin.value - origin_ns
             for _, record in group:

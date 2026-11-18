@@ -19,10 +19,12 @@ struct InstanceScope {
 
 class GraphInstantiation {
 public:
-    GraphInstantiation(const TemplateLibrary & library, const TemplateEntry & entry, const GraphInvocation & invocation)
+    GraphInstantiation(const TemplateLibrary & library, const TemplateEntry & entry, const GraphInvocation & invocation,
+                       std::vector<TemplateInterval> * origins)
         : library_(library),
           entry_(entry),
-          invocation_(invocation) {
+          invocation_(invocation),
+          origins_(origins) {
         if (invocation.identity.empty() || !invocation.work.is_object() || invocation.resources.size() != library.resources.size())
             throw std::invalid_argument("graph invocation requires an identity, work and explicit resource bindings");
         if (!invocation.environment.is_object()) throw std::invalid_argument("invocation requires its target environment");
@@ -41,6 +43,7 @@ public:
     }
 
     CoarseGraph instantiate() {
+        if (origins_) origins_->clear();
         append(entry_.frame, std::nullopt, 0, invocation_.parameters, {});
 
         // Allocate all local boundaries before resolving cross-scope references; no event is copied or guessed.
@@ -166,8 +169,11 @@ private:
                 event(scope, access.finish)
             });
         }
-        for (const auto & piece : definition.work)
+        for (std::size_t interval = 0; interval < definition.work.size(); ++interval) {
+            const auto & piece = definition.work[interval];
             graph_.work.push_back({ scope, frame.resources[piece.resource], piece.kind, event(scope, piece.start), event(scope, piece.finish) });
+            if (origins_) origins_->push_back({ frame.definition, interval });
+        }
         for (const auto & edge : definition.edges) graph_.edges.push_back({ event(scope, edge.source), event(scope, edge.target), edge.kind });
 
         for (std::size_t port = 0; port < definition.ports.size(); ++port) {
@@ -215,6 +221,7 @@ private:
     const TemplateLibrary & library_;
     const TemplateEntry & entry_;
     const GraphInvocation & invocation_;
+    std::vector<TemplateInterval> * origins_;
     std::set<std::string> state_inputs_;
     CoarseGraph graph_;
     std::vector<InstanceScope> scopes_;
@@ -223,9 +230,10 @@ private:
 
 } // namespace
 
-CoarseGraph TemplateLibrary::instantiate(const TemplateEntry & entry, const GraphInvocation & invocation) const {
+CoarseGraph TemplateLibrary::instantiate(const TemplateEntry & entry, const GraphInvocation & invocation,
+                                         std::vector<TemplateInterval> * origins) const {
     if (invocation.domain != domain) throw std::invalid_argument("target implementation domain differs from the template source");
-    return GraphInstantiation(*this, entry, invocation).instantiate();
+    return GraphInstantiation(*this, entry, invocation, origins).instantiate();
 }
 
 } // namespace markov

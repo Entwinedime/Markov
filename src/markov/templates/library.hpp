@@ -43,6 +43,11 @@ struct TemplateWork {
     TemplateReference finish;
 };
 
+struct TemplateInterval {
+    std::size_t definition;
+    std::size_t interval;
+};
+
 struct TemplateEdge {
     TemplateReference source;
     TemplateReference target;
@@ -228,7 +233,8 @@ public:
     // Resource slots are explicitly bound by the adapter's operation declarations, then validated and normalized here.
     std::optional<std::size_t> import_leaf(const TemplateDefinition & definition, const TemplateEntry & source,
                                          std::span<const std::size_t> resource_bindings);
-    CoarseGraph instantiate(const TemplateEntry & entry, const GraphInvocation & invocation) const;
+    CoarseGraph instantiate(const TemplateEntry & entry, const GraphInvocation & invocation,
+                            std::vector<TemplateInterval> * origins = nullptr) const;
 
     nlohmann::json domain;
     nlohmann::json local_domain;

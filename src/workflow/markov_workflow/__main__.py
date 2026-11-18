@@ -16,7 +16,9 @@ def main() -> None:
     prediction.add_argument("--timeout", type=float, required=True)
     prediction.add_argument("--control-image", default="markov-next-control:ubuntu22.04")
     prediction.add_argument("--execution-trace", action="store_true", help="stream optional expanded graphs, dependencies and completion events")
-    prediction.add_argument("--execution-inputs", type=Path, help="supply checked per-actor time conditions and native ingress rounds")
+    timing = prediction.add_mutually_exclusive_group()
+    timing.add_argument("--execution-inputs", type=Path, help="supply checked per-actor time conditions and native ingress rounds")
+    timing.add_argument("--costs", type=Path, help="predict service durations from an independent cost asset")
     production = commands.add_parser("produce", help="project a closed native capture into graphs or source templates")
     production.add_argument("--product", choices=("graphs", "templates"), default="templates")
     production.add_argument("--capture", type=Path, required=True)
@@ -34,14 +36,14 @@ def main() -> None:
     observation = capture.add_mutually_exclusive_group()
     observation.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
     observation.add_argument("--latency-only", action="store_true", help="run without the profiler and record scheduler latency")
-    observation.add_argument("--host-targets", type=Path, help="record thread CPU time for a JSON array of native calls")
+    observation.add_argument("--host-timing", action="store_true", help="record native CPU work and queue cuts")
     samples = commands.add_parser("cost-samples", help="publish measured services from a projected source")
     samples.add_argument("--facts", type=Path, required=True)
     samples.add_argument("--graph", type=Path, required=True)
     samples.add_argument("--work-identities", type=Path, required=True)
     samples.add_argument("--output", type=Path, required=True)
     hosts = commands.add_parser("host-cost-samples", help="qualify independently measured native host services")
-    for name in ("detailed", "host", "facts", "graph", "work-identities", "output"):
+    for name in ("detailed", "host", "facts", "trace", "graph", "work-identities", "output"):
         hosts.add_argument("--" + name, type=Path, required=True)
     costs = commands.add_parser("fit-costs", help="fit bounded curves from qualified service samples")
     costs.add_argument("--samples", type=Path, nargs="+", required=True)
@@ -76,7 +78,7 @@ def main() -> None:
     elif arguments.command == "capture":
         from markov_workflow.capture import CaptureProcess
 
-        CaptureProcess(arguments, latency_only=arguments.latency_only, host_targets=arguments.host_targets).run()
+        CaptureProcess(arguments, latency_only=arguments.latency_only, host_timing=arguments.host_timing).run()
     elif arguments.command == "cost-samples":
         from markov_workflow.cost_samples import CostSamples
 

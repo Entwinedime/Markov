@@ -35,13 +35,43 @@ class ModelScopes:
         "captured_last_layer_outputs", "pp_proxy_tensors", "input_", "q", "k", "v",
     }
 
+    @staticmethod
+    def install_engine_hooks(observer) -> None:
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        for target, hook in (
+            ("sglang.srt.managers.scheduler.Scheduler.run_batch", observer.run_batch),
+            ("sglang.srt.model_executor.model_runner.ModelRunner.load_model", observer.load_model),
+            ("sglang.srt.model_executor.model_runner.ModelRunner.forward", observer.forward),
+            ("sglang.srt.model_executor.model_runner.ModelRunner.sample", observer.sample),
+        ):
+            HookRegistry.register(target, hook, HookType.AROUND)
+
+    @staticmethod
+    def selected(modules):
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.utils.common import PPMissingLayer
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+
+        selected = {"": "model_body"}
+        containers = [name for name, module in modules.items() if isinstance(module, torch.nn.ModuleList)]
+        outer = [name for name in containers if not any(name.startswith(parent + ".") for parent in containers if parent != name)]
+        for container in outer:
+            for name, layer in modules[container].named_children():
+                if not isinstance(layer, PPMissingLayer):
+                    path = f"{container}.{name}" if container else name
+                    selected[path] = "layer"
+        for name, module in modules.items():
+            if isinstance(module, RadixAttention):
+                selected[name] = "attention"
+            elif isinstance(module, VocabParallelEmbedding) and not isinstance(module, ParallelLMHead):
+                selected[name] = "embedding"
+        return selected
+
     def __init__(self, observation: Any, model: Any) -> None:
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopK
-        from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.layers.utils.common import PPMissingLayer
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
         self.observation = observation
         self.model = model
@@ -55,26 +85,13 @@ class ModelScopes:
             self.expert_layers.append({
                 "layer": module.layer_id, "experts": module._num_global_routed, "top_k": router.topk_config.top_k,
             })
-        selected: dict[str, str] = {"": "model_body"}
-        containers = [name for name, module in modules.items() if isinstance(module, torch.nn.ModuleList)]
-        outer = [name for name in containers if not any(name.startswith(parent + ".") for parent in containers if parent != name)]
-        for container in outer:
-            for name, layer in modules[container].named_children():
-                if isinstance(layer, PPMissingLayer):
-                    continue
-                path = f"{container}.{name}" if container else name
-                selected[path] = "layer"
-        for name, module in modules.items():
+        for module in modules.values():
             if isinstance(module, LogitsProcessor):
                 original = module._compute_lm_head
                 module._compute_lm_head = update_wrapper(partial(self.logits, original), original)
-            if isinstance(module, RadixAttention):
-                selected[name] = "attention"
-            elif isinstance(module, VocabParallelEmbedding) and not isinstance(module, ParallelLMHead):
-                selected[name] = "embedding"
 
         self.bindings = {}
-        for path, role in selected.items():
+        for path, role in self.selected(modules).items():
             module = modules[path]
             original = module.forward
             expert_layers = {child.layer_id for child in module.modules() if isinstance(child, FusedMoE)} if role == "layer" else set()

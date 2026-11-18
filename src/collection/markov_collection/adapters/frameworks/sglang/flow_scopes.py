@@ -14,13 +14,92 @@ from markov_adapters.sglang.resources import ResourceCalls
 from markov_adapters.sglang.selection import BatchSelection
 
 
-class FlowScopes(CallSegments):
-    def __init__(self, observation) -> None:
+class ServingCuts(CallSegments):
+    """Use the native scheduler's same cut points for structure and CPU timing."""
+
+    def __init__(self, aliases, *, effects=False) -> None:
         super().__init__()
-        self.observation = observation
-        self.request_state = observation.request_state
+        self.aliases = aliases
+        self.effects = effects
         self.resources = ResourceCalls(self)
         self.selection = BatchSelection(self)
+
+    def request_id(self, native_id):
+        return self.aliases[native_id]
+
+    def work(self, batch, members=None, *, phase="prefill"):
+        work = {} if batch is None else {"context": {"members": self.progress(batch.reqs)}}
+        if members is not None:
+            work.update(
+                phase=phase, rank=self.rank,
+                members=[{**member, "id": self.request_id(member["id"])} for member in members],
+            )
+        return work
+
+    def batch_work(self, batch):
+        return self.work(batch, BatchTensors.members(batch), phase=BatchTensors.phase(batch))
+
+    def result(self, original, scheduler, batch, output):
+        if not self.enabled:
+            return original(scheduler, batch, output)
+        work = self.batch_work(batch)
+        parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in work["members"]))
+        with self.call("result", original, parameters=parameters, work=work, host_inputs=HostReads.result_inputs(output)) as frame:
+            result = original(scheduler, batch, output)
+
+            # A nested prebuilt result already publishes its own completion boundary.
+            if self.effects and not batch.forward_mode.is_prebuilt():
+                frame.outputs = self.completed(batch.reqs)
+            return result
+
+    def publication(self, original, sender, output, *args, **kwargs):
+        from sglang.srt.managers.io_struct import BatchTokenIDOutput
+
+        if self.current.get() is None or not isinstance(output, BatchTokenIDOutput) or sender.socket is None:
+            return original(sender, output, *args, **kwargs)
+        with self.call("publication", original) as frame:
+            if self.effects:
+                frame.outputs = [
+                    {"id": self.request_id(request), "generated_tokens": tokens}
+                    for request, tokens in zip(output.rids, output.completion_tokens, strict=True)
+                ]
+            return original(sender, output, *args, **kwargs)
+
+    def bind(self, result, server_args):
+        allocator = result.token_to_kv_pool_allocator
+        allocator_type = type(allocator)
+        allocator._markov_allocation = AllocationABI(f"{allocator_type.__module__}.{allocator_type.__qualname__}")
+
+        # Diagnostics retain original readers before semantic cuts are installed.
+        if self.effects:
+            self.observe_pools(result, server_args)
+        self.resources.bind(result.tree_cache, allocator, result.req_to_token_pool)
+
+    def build(self, original, *args, **kwargs):
+        result = original(*args, **kwargs)
+        self.bind(result, kwargs["server_args"])
+        return result
+
+    def install(self) -> None:
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        for target, hook in (
+            ("sglang.srt.mem_cache.kv_cache_builder.build_kv_cache", self.build),
+            ("sglang.srt.managers.scheduler.Scheduler.process_batch_result", self.result),
+            ("sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output", self.publication),
+        ):
+            HookRegistry.register(target, hook, HookType.AROUND)
+        self.selection.install()
+        self.resources.install()
+        DecisionClocks(self).install()
+        HostReads(self).install()
+
+
+class FlowScopes(ServingCuts):
+    def __init__(self, observation) -> None:
+        super().__init__(observation.content.aliases, effects=True)
+        self.observation = observation
+        self.request_state = observation.request_state
         self.queries = []
 
     @property
@@ -42,21 +121,13 @@ class FlowScopes(CallSegments):
     def groups(self):
         return self.observation.groups
 
-    def request_id(self, native_id):
-        return self.observation.content.aliases[native_id]
-
-    def work(self, batch, members=None, *, phase="prefill"):
-        work = {} if batch is None else {"context": {"members": self.progress(batch.reqs)}}
-        if members is not None:
-            work.update(
-                phase=phase, rank=self.observation.parallel["rank"],
-                members=[{**member, "id": self.request_id(member["id"])} for member in members],
-            )
-        return work
+    @property
+    def rank(self):
+        return self.observation.parallel["rank"]
 
     def completed(self, requests):
         return [
-            {"id": self.observation.content.aliases[req.rid], "generated_tokens": len(req.output_ids), "finished": req.finished()}
+            {"id": self.request_id(req.rid), "generated_tokens": len(req.output_ids), "finished": req.finished()}
             for req in requests
         ]
 
@@ -71,9 +142,6 @@ class FlowScopes(CallSegments):
             with owner.capture.runtime.service_scope(query):
                 yield query
             self.queries.append(query)
-
-    def select(self, original, scheduler, *args, **kwargs):
-        return self.selection.select(original, scheduler, *args, **kwargs)
 
     def collective(self, original, boundary, arguments):
         owner = self.observation
@@ -159,45 +227,16 @@ class FlowScopes(CallSegments):
         # Segment identities also connect deferred tensor outputs when optional diagnostic recording is disabled.
         frame.observations.append(call.identity)
 
-    def result(self, original, scheduler, batch, output):
-        owner = self.observation
-        if not owner.active:
-            return original(scheduler, batch, output)
-        work = owner.batch_work(batch)
-        parameters = BatchTensors.parameters(batch, sum(member["new_tokens"] for member in work["members"]))
-        with self.call("result", original, parameters=parameters, work=work, host_inputs=HostReads.result_inputs(output)) as frame:
-            result = original(scheduler, batch, output)
-
-            # A nested prebuilt result already publishes its own completion boundary.
-            if not batch.forward_mode.is_prebuilt():
-                frame.outputs = self.completed(batch.reqs)
-            return result
-
-    def publication(self, original, sender, output, *args, **kwargs):
-        from sglang.srt.managers.io_struct import BatchTokenIDOutput
-
-        if self.current.get() is None or not isinstance(output, BatchTokenIDOutput) or sender.socket is None:
-            return original(sender, output, *args, **kwargs)
-        with self.call("publication", original) as frame:
-            frame.outputs = [
-                {"id": self.observation.content.aliases[request], "generated_tokens": tokens}
-                for request, tokens in zip(output.rids, output.completion_tokens, strict=True)
-            ]
-            return original(sender, output, *args, **kwargs)
-
-    def build(self, original, *args, **kwargs):
-        result = original(*args, **kwargs)
+    def observe_pools(self, result, server_args):
         allocator = result.token_to_kv_pool_allocator
         cache_type = type(result.tree_cache)
-        allocator_type = type(allocator)
-        allocator._markov_allocation = AllocationABI(f"{allocator_type.__module__}.{allocator_type.__qualname__}")
         self.observation.implementation["allocator"] = allocator._markov_allocation.implementation
 
         # Record the effective native choice, including model-driven cache disabling.
         self.observation.implementation["cache"] = {
             "type": f"{cache_type.__module__}.{cache_type.__qualname__}",
             "disabled": result.disable_radix_cache,
-            "eviction_policy": kwargs["server_args"].radix_eviction_policy.lower(),
+            "eviction_policy": server_args.radix_eviction_policy.lower(),
         }
 
         # A PD receiver can finish without a model call; pool geometry belongs to construction, not attention.
@@ -206,23 +245,8 @@ class FlowScopes(CallSegments):
         if self.observation.resource_history is not None:
             self.observation.resource_history.bind(result.tree_cache, allocator, result.req_to_token_pool)
 
-        # Diagnostics retain original readers before semantic cuts are installed; snapshots cannot create queries.
-        self.resources.bind(result.tree_cache, allocator, result.req_to_token_pool)
-        return result
-
     def install(self) -> None:
-        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-        for target, hook in (
-            ("sglang.srt.mem_cache.kv_cache_builder.build_kv_cache", self.build),
-            ("sglang.srt.managers.scheduler.Scheduler.process_batch_result", self.result),
-            ("sglang.srt.managers.scheduler_components.output_sender.SenderWrapper.send_output", self.publication),
-        ):
-            HookRegistry.register(target, hook, HookType.AROUND)
-        self.selection.install()
-        self.resources.install()
-        DecisionClocks(self).install()
-        HostReads(self).install()
+        super().install()
         MetadataCollectives(self).install()
         if self.observation.description["mode"] != "null":
             DisaggregatedCalls(self).install(self.observation.description["mode"])

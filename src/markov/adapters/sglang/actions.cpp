@@ -118,7 +118,8 @@ std::map<std::string, TensorLayout> NativeActionGraphs::outputs(std::string_view
     return result;
 }
 
-CoarseGraph NativeActionGraphs::build(const ServingAction & action, const nlohmann::json & bindings) {
+CoarseGraph NativeActionGraphs::build(const ServingAction & action, const nlohmann::json & bindings,
+                                      std::vector<TemplateInterval> * origins) {
     if (action.task.group != group_) throw std::invalid_argument("action sent to another participant's graph provider");
     const auto state_inputs = worker_.state_inputs(bindings, action.work);
     auto entry = select(action.name, action.condition, action.parameters, state_inputs);
@@ -159,7 +160,7 @@ CoarseGraph NativeActionGraphs::build(const ServingAction & action, const nlohma
     const auto & fields = batch.is_null() ? empty : batches_[batch.get<std::size_t>()];
     bind_inputs(entry.frame, fields, explicit_inputs, call);
     bind_buffers(entry.frame, call);
-    auto graph = library_.instantiate(entry, call);
+    auto graph = library_.instantiate(entry, call, origins);
     if (action.name == "query") graph.scopes.front().port("caller.return", Direction::Output);
     for (const auto & port : graph.scopes.front().ports) {
         if (port.use != PortUse::Data || port.direction != Direction::Output) continue;

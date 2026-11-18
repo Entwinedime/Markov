@@ -30,7 +30,7 @@ class SourceProductions:
         # Explicit observations keep their original owners, which may live outside this collection.
         self.captures = {job["id"]: collection / name for job, name in zip(jobs, publication["captures"], strict=True)}
 
-    def prepare(self, source):
+    def prepare(self, source, *, modeled=False):
         primary = SourcePlanning.primary(self.plan, source)
         local_sources = [job["id"] for job in self.plan["sources"]
                          if any(consumer["source"] == primary for consumer in job.get("local_consumers", []))]
@@ -47,7 +47,7 @@ class SourceProductions:
                 templates.append(path)
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
-        document = SGLangTask(productions[0], productions[1:]).document(source)
+        document = SGLangTask(productions[0], productions[1:]).document(source, modeled=modeled)
         return templates, productions[0], document
 
 
@@ -61,8 +61,14 @@ class PredictionProcess:
             raise ValueError("Prediction timeout must be positive")
         deadline = time.monotonic() + args.timeout
         source = json.loads(args.input.read_text())
-        templates, primary, document = SourceProductions(args.production).prepare(source)
-        timing = args.execution_inputs.resolve(strict=True) if args.execution_inputs is not None else None
+        templates, primary, document = SourceProductions(args.production).prepare(source, modeled=args.costs is not None)
+        timing_asset = args.costs or args.execution_inputs
+        timing_mount, timing_option = [], []
+        if timing_asset is not None:
+            option = "--costs" if args.costs is not None else "--execution-inputs"
+            path = f"/inputs/{option[2:]}.json"
+            timing_mount = ["--mount", f"type=bind,src={timing_asset.resolve(strict=True)},dst={path},readonly"]
+            timing_option = [option, path]
         binary = args.binary.resolve(strict=True)
         descriptions = {
             role: json.loads(subprocess.check_output(
@@ -85,7 +91,7 @@ class PredictionProcess:
             if remaining <= 0:
                 raise TimeoutError("Prediction preparation exhausted its time allowance")
 
-            # Conditions stay one read-only asset; only the core parses their complete work identities.
+            # The core alone receives the selected timing asset.
             commands = [
                 [
                     "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--name", names[0],
@@ -93,12 +99,12 @@ class PredictionProcess:
                     "--mount", f"type=bind,src={binary},dst=/app/markov,readonly",
                     *[item for index, path in enumerate(templates) for item in ("--mount", f"type=bind,src={path},dst=/inputs/templates/{index}.json,readonly")],
                     "--mount", f"type=bind,src={task},dst=/inputs/task.json,readonly",
-                    *(["--mount", f"type=bind,src={timing},dst=/inputs/execution-inputs.json,readonly"] if timing else []),
+                    *timing_mount,
                     "--mount", f"type=bind,src={output},dst=/output",
                     images["modeling"], "--signal=KILL", f"{remaining}s",
                     "/app/markov", "serve", "/inputs/templates", "/inputs/task.json", "/output/.result.json",
                     *(["--trace", "/output/execution.partial.jsonl"] if args.execution_trace else []),
-                    *(["--execution-inputs", "/inputs/execution-inputs.json"] if timing else []),
+                    *timing_option,
                 ],
                 [
                     "docker", "run", "--rm", "--init", "-i", "--runtime", "runc", "--network", "none", "--shm-size", "512m", "--name", names[1],

@@ -20,6 +20,7 @@
 #include "markov/serving/execution_inputs.hpp"
 #include "markov/serving/observer.hpp"
 #include "markov/execution/dependencies.hpp"
+#include "markov/execution/timing.hpp"
 #include "markov/resources/kv_pool.hpp"
 #include "markov/resources/observer.hpp"
 #include "markov/resources/service.hpp"
@@ -49,7 +50,7 @@ struct NativeInstance {
 class NativeController final : public ServingControl {
 public:
     NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer, const nlohmann::json & prefixes,
-                     Timeline & timeline, const nlohmann::json & ingress, std::int64_t given_work_ns,
+                     Timeline & timeline, const nlohmann::json & ingress, ServiceDuration given_work_ns,
                      ExecutionInputs * execution_inputs = nullptr, ResourceObserver * observer = nullptr,
                      ControlObserver * control_observer = nullptr);
 
