@@ -7,6 +7,7 @@ from pathlib import Path
 
 from actions import ActionIdentity, QueryResults
 from contents import GraphContents
+from context_values import ContextValues
 from execution_times import ExecutionTimes
 from execution_inputs import ConsumedInputs
 from stream_queues import StreamSynchronization
@@ -142,13 +143,15 @@ class ActionComparison:
         for category, identity, detail in native_case.findings:
             self.finding(category, identity, detail)
 
+        # Native and predicted work use the same local value table for comparison keys.
+        keys = ContextValues()
         # Use the native ABI only when every declaration is host-only; predicted contents never select a source class.
         for rank, (source, _, identities) in sources.items():
             for index, identity in identities.items():
                 if "work" not in identity:
                     continue
-                key = source.structure_key(index, identity, controls)
-                full_key = ActionIdentity.logical_key(identity)
+                key = source.structure_key(index, identity, controls, keys)
+                full_key = ActionIdentity.logical_key(identity, keys)
                 occurrences[key].append(index)
                 full_occurrences[full_key] += 1
                 native_contexts[full_key, key].append(index)
@@ -157,7 +160,7 @@ class ActionComparison:
 
         connections, bindings = native_case.connections, native_case.bindings
         effects = native_case.effects
-        ordering = ActionOrderComparison(self.details)
+        ordering = ActionOrderComparison(keys, self.details)
         predicted_dependencies = {rank: CausalGraph() for rank in sources}
         native_evidence = native_case.report(self.details)
         condition_inputs = ConsumedInputs(native_case, ingress)
@@ -179,9 +182,25 @@ class ActionComparison:
         stream_synchronization = StreamSynchronization()
         protocol_readiness = native_case.readiness
         protocol = PdPredictionEvidence(protocol_source, protocol_readiness, ingress.origin_ns)
-        with self.execution.open() as stream:
+        contexts = ContextValues()
+        with self.execution.open("rb") as stream:
             for line in stream:
+                if not line.endswith(b"\n"):
+                    # The writer may be killed mid-record; only terminated records belong to the available prefix.
+                    ended = False
+                    break
                 row = json.loads(line)
+                kind = row["kind"]
+                ended = kind == "end"
+                if kind == "context_value":
+                    contexts.declare(row)
+                    continue
+                if kind == "graph":
+                    for scope in row["graph"]["scopes"]:
+                        scope["work"] = contexts.decode(scope["work"])
+                elif kind == "input_read":
+                    row["identity"] = contexts.decode(row["identity"])
+
                 condition_inputs.observe(row)
                 execution_times.observe(row)
                 stream_synchronization.observe(row)
@@ -195,7 +214,6 @@ class ActionComparison:
                     action_results.observe(row)
                     query = queries.observe(row)
                     protocol.observe(row, query, queries)
-                ended = row["kind"] == "end"
                 if row["kind"] == "resources":
                     bindings.initialized(row)
                     effects.requests = [request["id"] for request in row["requests"]]
@@ -256,9 +274,9 @@ class ActionComparison:
                 except ValueError as error:
                     identity = {"group": group, "event": events[port["event"]], "action": root["role"]}
                     self.finding("missing_predicted_identity", identity, {"reason": str(error)})
-                key = target.structure_key(0, identity, controls) if "work" in identity else ActionIdentity.structure_key(identity)
+                key = target.structure_key(0, identity, controls, keys) if "work" in identity else ActionIdentity.structure_key(identity, keys)
                 predicted_counts[key] += 1
-                full_key = ActionIdentity.logical_key(identity)
+                full_key = ActionIdentity.logical_key(identity, keys)
                 full_predicted_counts[full_key] += 1
                 predicted_classes[full_key].add(key)
                 target_key = group, events[port["event"]]
@@ -279,7 +297,7 @@ class ActionComparison:
                     content_match = self.compare_contents(identity, contents[key], snapshot)
                     content_matches[key] += content_match
                 source, index, _ = native
-                pending.append((key, rank, identity, source, index, target_key, ActionBoundaries(target, 0, events),
+                pending.append((key, full_key, rank, identity, source, index, target_key, ActionBoundaries(target, 0, events),
                                 content_match, snapshot if key in varied else None, conditioned_scope))
         condition_scope = condition_inputs.finish()
         checked_prefix = condition_scope["verified_prefix"]
@@ -288,17 +306,17 @@ class ActionComparison:
                 self.finding("unmatched_native" if ended else "native_tail_unexecuted", identity, {})
         for key, count in full_occurrences.items():
             if not full_predicted_counts[key] and any(predicted_counts[value] for value in native_classes[key]):
-                self.finding("unpaired_native_context", json.loads(key), {"observed_calls": count})
+                self.finding("unpaired_native_context", keys.decode(json.loads(key)), {"observed_calls": count})
             if count > 1 and not checked_prefix:
-                self.finding("ambiguous_native_identity", json.loads(key), {
+                self.finding("ambiguous_native_identity", keys.decode(json.loads(key)), {
                     "observed_calls": count, "predicted_calls": full_predicted_counts[key],
                     "reason": "complete logical context repeats; structure is checked independently",
                 })
         for key, count in full_predicted_counts.items():
             if not full_occurrences[key] and predicted_classes[key] & expected.keys():
-                self.finding("unpaired_predicted_context", json.loads(key), {"predicted_calls": count})
+                self.finding("unpaired_predicted_context", keys.decode(json.loads(key)), {"predicted_calls": count})
             if count > 1 and full_occurrences[key] <= 1 and not checked_prefix:
-                self.finding("ambiguous_predicted_identity", json.loads(key), {"predicted_calls": count})
+                self.finding("ambiguous_predicted_identity", keys.decode(json.loads(key)), {"predicted_calls": count})
         if not ended:
             self.finding("incomplete_execution", {}, {})
         if len(completed) != len(event_ranks):
@@ -310,9 +328,7 @@ class ActionComparison:
         pairs, signatures, checks = {}, {}, []
         dependency_checks, dependency_matches = Counter(), Counter()
         actions, repeated_groups = [], {}
-        for key, rank, identity, source, index, target_key, predicted, content_match, snapshot, conditioned_scope in pending:
-            full_key = ActionIdentity.logical_key(identity)
-
+        for key, full_key, rank, identity, source, index, target_key, predicted, content_match, snapshot, conditioned_scope in pending:
             # Index once by logical work and structure; repeated calls must not rescan their whole native context.
             indices = native_contexts[full_key, key]
             unique = len(indices) == full_occurrences[full_key] == full_predicted_counts[full_key] == 1

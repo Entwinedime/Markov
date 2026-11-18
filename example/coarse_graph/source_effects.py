@@ -207,28 +207,26 @@ class NativeEffectEvidence:
         resources = {(resource["kind"], resource["identity"]): index for index, resource in enumerate(graph["resources"])}
         self.require(len(resources) == len(graph["resources"]), "coarse graph repeats a native resource")
 
-        # SDK ownership is fixed for this recording, so CPU regions share one device-owner set.
+        # Pure CPU declarations still require independent proof that they own no device payload.
         device_owners = {self.owner(api) for connection, api in self.apis.items() if self.sdk.connections.get(connection)}
         counts = Counter()
         for index, scope in enumerate(graph["scopes"]):
-            origins = scope["bindings"]["source_scopes"]
-            if origins == [0]:
+            origin, = scope["bindings"]["source_scopes"]
+            if origin == 0:
                 continue
-            records = [self.host_records[origin] for origin in origins]
-            raw = self.native["scopes"][origins[0]]
+            raw = self.native["scopes"][origin]
             thread = raw["thread"]
-            self.require(all(record["thread"] == thread for record in records), f"scope {index} changes its native caller thread")
-            begin = min(records, key=lambda record: record["begin_counter"])
-            end = max(records, key=lambda record: record["end_counter"])
+            begin = end = self.host_records[origin]
+            self.require(begin["thread"] == thread, f"scope {index} changes its native caller thread")
             ports = {port["name"]: port for port in scope["ports"]}
             kind = "wait" if "service" in raw else "boundary" if raw.get("envelope", False) else "host"
             if "communication" in raw and "device_entry" not in raw:
                 kind = "communication"
             host = resources["thread", f"thread/{thread}"]
-            if origins[0] in self.queries:
-                self.require(len(origins) == 1 and spans[index, host, begin["begin_counter"], end["end_counter"], "boundary"] == 1,
+            if origin in self.queries:
+                self.require(spans[index, host, begin["begin_counter"], end["end_counter"], "boundary"] == 1,
                              f"query {index} loses its uncharged caller envelope")
-                read = self.queries[origins[0]]
+                read = self.queries[origin]
                 self.require(begin["begin_counter"] <= read["begin_counter"] <= read["end_counter"] <= end["end_counter"],
                              f"query {index} escapes its original caller interval")
                 self.check_boundary(graph, ports["caller.return"]["event"], host, end, "end", index)
@@ -255,12 +253,8 @@ class NativeEffectEvidence:
                     self.require(interval.begin <= first <= last <= interval.end,
                                  "semantic device interval escapes its original marker envelope")
                     counts["device_intervals"] += 1
-            if scope["role"] == "segment" and (
-                len(origins) > 1 or raw["bindings"].get("segment", {}).get("host_only", False)
-            ):
-
-                # Check raw SDK ownership for individual declarations as well as merged CPU regions.
-                self.require(device_owners.isdisjoint(origins), f"CPU-only scope {index} hides native device work")
+            if scope["role"] == "segment" and raw["bindings"].get("segment", {}).get("host_only", False):
+                self.require(origin not in device_owners, f"CPU-only scope {index} hides native device work")
                 counts["cpu_only_regions"] += 1
             if "service" in raw:
                 service = resources["service", f"service/{thread}"]
@@ -277,7 +271,7 @@ class NativeEffectEvidence:
                     self.check_boundary(graph, access["finish"], service, end, "end", index)
                 counts["derived_state_accesses"] += len(scope["kv_accesses"]) + len(scope["slot_accesses"])
             else:
-                counts["declared_state_accesses"] += sum(len(self.native["scopes"][origin].get("state_accesses", ())) for origin in origins)
+                counts["declared_state_accesses"] += len(raw.get("state_accesses", ()))
         return dict(counts)
 
     def inspect_services(self):

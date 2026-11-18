@@ -5,9 +5,11 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from markov_adapters.artifacts import write_json
 from markov_adapters.pytorch import CpuTransfer
 
 from actions import ActionIdentity
+from context_values import ContextValues
 from ingress import IngressEvidence
 from native_case import NativeCase
 from source_clock import ClockRealization
@@ -20,6 +22,7 @@ class NativeInputs:
         self.cpu_posts = defaultdict(dict)
         self.origins, self.ingress = {}, {}
         self.counts = Counter()
+        self.contexts = ContextValues()
 
     @staticmethod
     def read(path):
@@ -61,9 +64,9 @@ class NativeInputs:
                 raise ValueError("native action lacks its measured entry or complete logical identity")
             bindings = source.invocation_bindings(index, group)
             self.counts["bound_invocations"] += bool(bindings)
-            self.steps[group].append((begin, {"operation": "action", "identity": {
+            self.steps[group].append((begin, {"operation": "action", "identity": self.contexts.encode({
                 name: identity[name] for name in ("action", "parameters", "work")
-            }, "source": {"scope": index}, "bindings": bindings, "service_ns": None, "boundaries": boundaries}, None))
+            }), "source": {"scope": index}, "bindings": bindings, "service_ns": None, "boundaries": boundaries}, None))
 
     def input_reads(self, instance, rank, raw, aliases, requests, origin):
         if not raw["request_ingress"]:
@@ -77,7 +80,7 @@ class NativeInputs:
         reads = IngressEvidence.reads(name, raw, aliases, origin)
         for number, (interval, read) in enumerate(zip(raw["request_input_attempts"], reads, strict=True)):
             self.steps[group].append((interval["begin_raw_ns"], {
-                "operation": "input", "identity": read["identity"], "source": {"input": number},
+                "operation": "input", "identity": self.contexts.encode(read["identity"]), "source": {"input": number},
                 "window": {"begin_ns": read["time_ns"], "end_ns": read["time_ns"]},
             }, None))
 
@@ -101,9 +104,9 @@ class NativeInputs:
                 work = {**work, "context": {**context, "cpu_transfer": CpuTransfer.identity(context["cpu_transfer"])}}
                 begin, end = interval["begin_raw_ns"], interval["end_raw_ns"]
                 self.steps[group].append((begin, {
-                    "operation": "cpu", "identity": {
+                    "operation": "cpu", "identity": self.contexts.encode({
                         "operation": execution["operation"], "work": ActionIdentity.work_identity(work),
-                    }, "source": {"post": list(key), "phase": "post" if position is not None else "wait"}, "service_ns": None, "boundaries": [
+                    }), "source": {"post": list(key), "phase": "post" if position is not None else "wait"}, "service_ns": None, "boundaries": [
                         self.port("call.enter", "input", self.window(begin, begin, origin)),
                         self.port("call.return", "output", self.window(end, end, origin)),
                     ],
@@ -179,15 +182,16 @@ class NativeInputs:
                 for name, field in (("kv_ready", "reservation_update"), ("kv_success", "completion_update"))
                 if row[field] is not None and (name != "kv_ready" or row["remote_reservation"])
             ]
-            document = {"actors": actors, "ingress": self.ingress, "notifications": notifications, "transfers": self.transfers()}
+            document = {"context_values": self.contexts.values, "actors": actors, "ingress": self.ingress,
+                        "notifications": notifications, "transfers": self.transfers()}
             report.update(status="partial" if self.counts["unmeasured_boundaries"] or self.counts["unmeasured_work_finishes"]
                           or native_report["status"] != "consistent" else "extracted",
                           native_evidence=native_report, clock_realization=realization.report(), counts=dict(self.counts),
                           steps={group: len(actor["steps"]) for group, actor in actors.items()})
             if report["status"] == "extracted":
-                (self.output / "execution-inputs.json").write_text(json.dumps(document) + "\n")
+                write_json(self.output / "execution-inputs.json", document, replace=False)
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
-            report["error"] = str(error)
+            report.update(status="unverified", error=str(error))
         report["scope"] = "Checked actor operations and one jointly feasible device-clock realization, rounded upward to integer nanoseconds. Original calibration ranges remain uncertain; a chosen realization is not a unique measurement. Unmeasured physical boundaries prevent publication; independently verified waits without SDK tasks or driver submissions remain causal gates without fake timestamps. CPU wire and notification intervals remain explicit bounds. No batches, query results, allocations, graph bodies or cost accuracy are supplied."
         (self.output / "execution-inputs-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         return 0 if report["status"] == "extracted" else 1
@@ -269,9 +273,13 @@ class ConsumedInputs:
                 self.realization = ClockRealization(self.clocks, self.native_graph)
             group = row["group"]
             position = self.positions[group]
-            record = {key: row[key] for key in ("operation", "identity", "source")}
-            if (type(row["step"]) is not int or row["step"] != position or position >= len(self.expected[group])
-                    or record != self.expected[group][position] or group in self.pending):
+            if (row.keys() != {"kind", "group", "step", "operation", "source"} or type(row["step"]) is not int
+                    or row["step"] != position or position >= len(self.expected[group]) or group in self.pending):
+                raise ValueError(f"invalid consumed execution condition position: {group} at {position}")
+
+            # The following graph or input read supplies the actual identity; the receipt only selects its original condition.
+            record = self.expected[group][position]
+            if row["operation"] != record["operation"] or row["source"] != record["source"]:
                 raise ValueError(f"consumed execution condition differs from its native causal prefix: {group} at {position}")
             self.positions[group] += 1
             self.counts[record["operation"]] += 1
@@ -341,7 +349,7 @@ class ConsumedInputs:
         return {"status": "complete" if not remaining and not self.pending and not self.reads and not self.boundaries else "partial", "verified_prefix": True,
                 "checked": dict(self.counts), "unconsumed": remaining, "unbound_graphs": len(self.pending), "unreturned_reads": len(self.reads),
                 "unfinished_measured_boundaries": len(self.boundaries), "clock_realization": self.realization.solve().report(),
-                "scope": "Consumed identities and native references checked in strict CPU order; actual named completions and CPU protocol boundaries checked against original measurements and one joint affine clock realization. No cost accuracy or independent target generalization claim."}
+                "scope": "Consumed identities and native references checked in strict CPU order; actual named completions and CPU protocol boundaries checked against original measurements and one shared clock realization whose only knots are independent calibration snapshots. No cost accuracy or independent target generalization claim."}
 
 
 def main():

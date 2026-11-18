@@ -7,7 +7,11 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+
+#include <nlohmann/json.hpp>
 
 #include "markov/execution/observer.hpp"
 #include "markov/serving/observer.hpp"
@@ -25,8 +29,7 @@ public:
     void completed(std::size_t event, std::int64_t time_ns) override;
     void constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns) override;
     void initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) override;
-    void condition_used(std::string_view group, std::size_t step, std::string_view operation,
-                        const nlohmann::json & identity, const nlohmann::json & source) override;
+    void condition_used(std::string_view group, std::size_t step, std::string_view operation, const nlohmann::json & source) override;
     void input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) override;
     void observed_values(std::string_view group, std::size_t boundary, const nlohmann::json & values, std::int64_t time_ns) override;
     void native_protocol(std::string_view group, const nlohmann::json & record, std::int64_t time_ns) override;
@@ -45,8 +48,11 @@ public:
     void finish();
 
 private:
+    std::size_t context_value(const nlohmann::json & value);
+
     std::ofstream stream_;
     std::map<std::size_t, std::size_t> completion_reads_;
+    std::unordered_map<std::string, std::size_t> context_indices_;
 };
 
 } // namespace markov

@@ -6,15 +6,37 @@
 #include <utility>
 #include <vector>
 
-#include "markov/serving/observer.hpp"
+#include "markov/contracts/context_values.hpp"
 #include "markov/graph/graph.hpp"
+#include "markov/serving/observer.hpp"
 
 namespace markov {
 
-ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver * observer) : observer_(observer) {
+namespace {
+
+TimeWindow window(const nlohmann::json & record) {
+    const auto values = read_parameters(record);
+    const TimeWindow result{ values.at("begin_ns"), values.at("end_ns") };
+    if (values.size() != 2 || result.begin_ns < 0 || result.end_ns < result.begin_ns)
+        throw std::invalid_argument("execution condition needs ordered nonnegative nanoseconds");
+    return result;
+}
+
+ServiceDuration service(const nlohmann::json & record) {
+    if (record.at("service_ns").is_null()) return std::nullopt;
+    const auto result = read_parameters({{ "service_ns", record.at("service_ns") }}).at("service_ns");
+    if (result < 0) throw std::invalid_argument("execution service must be nonnegative nanoseconds or unknown");
+    return result;
+}
+
+} // namespace
+
+ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver * observer)
+    : context_values_(source.at("context_values")), observer_(observer) {
     if (!source.at("actors").is_object()) throw std::invalid_argument("execution inputs require an actor mapping");
+    if (!context_values_.is_array()) throw std::invalid_argument("execution inputs require a context value array");
     for (const auto & [field, _] : source.items()) {
-        if (field != "actors" && field != "notifications" && field != "transfers" && field != "ingress")
+        if (field != "actors" && field != "context_values" && field != "notifications" && field != "transfers" && field != "ingress")
             throw std::invalid_argument("unknown execution input field: " + field);
     }
     for (const auto & [group, record] : source.at("actors").items()) {
@@ -64,21 +86,6 @@ void ExecutionInputs::bind(std::span<const std::string> participants) const {
         throw std::invalid_argument("execution input actors differ from the actual serving participants");
 }
 
-TimeWindow ExecutionInputs::window(const nlohmann::json & record) {
-    const auto values = read_parameters(record);
-    const TimeWindow result{ values.at("begin_ns"), values.at("end_ns") };
-    if (values.size() != 2 || result.begin_ns < 0 || result.end_ns < result.begin_ns)
-        throw std::invalid_argument("execution condition needs ordered nonnegative nanoseconds");
-    return result;
-}
-
-ServiceDuration ExecutionInputs::service(const nlohmann::json & record) {
-    if (record.at("service_ns").is_null()) return std::nullopt;
-    const auto result = read_parameters({{ "service_ns", record.at("service_ns") }}).at("service_ns");
-    if (result < 0) throw std::invalid_argument("execution service must be nonnegative nanoseconds or unknown");
-    return result;
-}
-
 nlohmann::json ExecutionInputs::work_identity(const nlohmann::json & work) {
     auto members = work.value("members", nlohmann::json::array());
     for (auto & member : members) member.erase("slot");
@@ -101,34 +108,37 @@ nlohmann::json ExecutionInputs::notification_identity(const nlohmann::json & val
     return {{ "group", group }, { "name", name }, { "work", work }};
 }
 
-const nlohmann::json & ExecutionInputs::peek(const std::string & group, const std::string & operation, const nlohmann::json & identity) const {
-    const auto & actor = actors_.at(group);
-    const nlohmann::json actual{{ "operation", operation }, { "identity", identity }};
-    if (actor.next == actor.steps.size())
-        throw std::invalid_argument("execution input exhausted for " + group + " before " + actual.dump());
-    const auto & expected = actor.steps[actor.next];
-    if (expected.at("operation") != operation || expected.at("identity") != identity)
-        throw std::invalid_argument("first execution input divergence: " + nlohmann::json{
-            { "group", group }, { "step", actor.next }, { "expected", expected }, { "actual", actual }
-        }.dump());
-    return expected;
-}
-
 const nlohmann::json & ExecutionInputs::take(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
-    const auto & expected = peek(group, operation, identity);
     auto & actor = actors_.at(group);
-    if (observer_) observer_->condition_used(group, actor.next, operation, identity, expected.at("source"));
+    if (actor.next == actor.steps.size())
+        throw std::invalid_argument("execution input exhausted for " + group + " before " + operation + ": " + identity.dump());
+    const auto & expected = actor.steps[actor.next];
+    if (expected.at("operation") != operation || !ContextValues::matches(expected.at("identity"), identity, context_values_))
+        throw std::invalid_argument("first execution input divergence: " + nlohmann::json{
+            { "group", group }, { "step", actor.next }, { "expected", expected },
+            { "actual", {{ "operation", operation }, { "identity", identity }} }
+        }.dump());
+
+    if (observer_) observer_->condition_used(group, actor.next, operation, expected.at("source"));
     ++actor.next;
     return expected;
 }
 
-const nlohmann::json & ExecutionInputs::bindings(const std::string & group, const nlohmann::json & identity) const {
-    const auto & value = peek(group, "action", identity).at("bindings");
+InvocationInput ExecutionInputs::invocation(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
+    const auto & record = take(group, operation, identity);
+    ++graph_count_;
+    return { record, { group, actors_.at(group).next - 1 } };
+}
+
+const nlohmann::json & InvocationInput::bindings() const {
+    const auto & value = record.at("bindings");
     if (!value.is_object()) throw std::invalid_argument("execution invocation bindings require an object");
     return value;
 }
 
-std::size_t ExecutionInputs::boundary(const CoarseGraph & graph, const nlohmann::json & selector) {
+namespace {
+
+std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector) {
     const auto & root = graph.scopes.front();
     const auto & identity = selector.contains("resource") ? selector.at("resource") : selector;
     if (identity.size() != 2 || (selector.contains("resource") && selector.size() != 1))
@@ -161,8 +171,9 @@ std::size_t ExecutionInputs::boundary(const CoarseGraph & graph, const nlohmann:
     return *result;
 }
 
-InvocationInput ExecutionInputs::graph(const std::string & group, const std::string & operation, const nlohmann::json & identity, const CoarseGraph & graph) {
-    const auto & record = take(group, operation, identity);
+} // namespace
+
+GraphTiming InvocationInput::timing(const CoarseGraph & graph) const {
     std::map<std::size_t, TimeWindow> times;
     std::set<std::pair<std::string, Direction>> names;
     std::set<nlohmann::json> selectors;
@@ -183,11 +194,7 @@ InvocationInput ExecutionInputs::graph(const std::string & group, const std::str
         throw std::invalid_argument("controlled invocation requires its actual CPU entry and return conditions");
     std::vector<BoundaryTime> boundaries;
     for (const auto & [event, value] : times) boundaries.push_back({ event, value });
-    ++graph_count_;
-    return {
-        GraphTiming::conditioned(graph, std::vector<ServiceDuration>(graph.work.size(), service(record)), std::move(boundaries)),
-        { group, actors_.at(group).next - 1 }
-    };
+    return GraphTiming::conditioned(graph, std::vector<ServiceDuration>(graph.work.size(), service(record)), std::move(boundaries));
 }
 
 std::optional<TimeWindow> ExecutionInputs::input(const std::string & group, const nlohmann::json & identity, bool in_flow) {

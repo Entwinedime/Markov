@@ -3,6 +3,7 @@
 #include <utility>
 #include <vector>
 
+#include "markov/contracts/context_values.hpp"
 #include "markov/graph/graph.hpp"
 #include "markov/resources/kv_pool.hpp"
 
@@ -14,16 +15,28 @@ ExecutionTrace::ExecutionTrace(const std::filesystem::path & path) {
     stream_.open(path, std::ios::out | std::ios::noreplace);
 }
 
+std::size_t ExecutionTrace::context_value(const nlohmann::json & value) {
+    const auto [entry, inserted] = context_indices_.try_emplace(value.dump(), context_indices_.size());
+    if (inserted) {
+        stream_ << "{\"kind\":\"context_value\",\"index\":" << entry->second << ",\"value\":" << entry->first << "}\n";
+    }
+    return entry->second;
+}
+
 void ExecutionTrace::inserted(const CoarseGraph & graph, std::span<const std::size_t> events, std::span<const ServiceDuration> work_ns, std::int64_t time_ns) {
 
     auto durations = nlohmann::json::array();
     for (const auto duration : work_ns) durations.push_back(duration ? nlohmann::json(*duration) : nlohmann::json(nullptr));
 
-    // Input and template assets own the environment; repeating it per invocation would dominate the trace.
+    // Input and template assets own the environment. The trace declares each shared context value before its first use.
+    auto document = graph.document(false);
+    for (auto & scope : document.at("scopes")) {
+        ContextValues::encode(scope.at("work"), [this](const auto & value) { return context_value(value); });
+    }
     stream_ << nlohmann::json{
         { "kind", "graph" },
         { "time_ns", time_ns },
-        { "graph", graph.document(false) },
+        { "graph", std::move(document) },
         { "event_ids", std::vector<std::size_t>(events.begin(), events.end()) },
         { "work_ns", std::move(durations) }
     } << '\n';
@@ -91,11 +104,12 @@ void ExecutionTrace::applied(std::string_view group, const nlohmann::json & oper
     } << '\n';
 }
 
-void ExecutionTrace::condition_used(std::string_view group, std::size_t step, std::string_view operation,
-                                   const nlohmann::json & identity, const nlohmann::json & source) {
+void ExecutionTrace::condition_used(std::string_view group, std::size_t step, std::string_view operation, const nlohmann::json & source) {
+
+    // The observed graph or input read already owns the actual work identity.
     stream_ << nlohmann::json{
         { "kind", "condition_used" }, { "group", group }, { "step", step }, { "operation", operation },
-        { "identity", identity }, { "source", source }
+        { "source", source }
     } << '\n';
 }
 
@@ -146,8 +160,10 @@ void ExecutionTrace::notification_ready(const nlohmann::json & identity, std::si
 }
 
 void ExecutionTrace::input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) {
+    auto observed = identity;
+    ContextValues::encode(observed, [this](const auto & value) { return context_value(value); });
     stream_ << nlohmann::json{
-        { "kind", "input_read" }, { "identity", identity }, { "time_ns", time_ns }, { "in_flow", in_flow },
+        { "kind", "input_read" }, { "identity", std::move(observed) }, { "time_ns", time_ns }, { "in_flow", in_flow },
         { "request_indices", std::vector<std::size_t>(requests.begin(), requests.end()) }
     } << '\n';
 }

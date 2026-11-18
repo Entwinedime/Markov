@@ -48,10 +48,10 @@ CpuMessages::Service CpuMessages::service(const nlohmann::json & key, const Endp
     GraphTiming timing{ { given_service_ns_ }, {} };
     std::optional<InputPosition> position;
     if (inputs_) {
-        auto supplied = inputs_->graph(endpoint.group, "cpu", {
+        auto supplied = inputs_->invocation(endpoint.group, "cpu", {
             { "operation", execution.at("operation") }, { "work", ExecutionInputs::work_identity(execution.at("work")) }
-        }, graph);
-        timing = std::move(supplied.timing);
+        });
+        timing = supplied.timing(graph);
         position = std::move(supplied.position);
     }
     const auto events = timeline_.insert(graph, timing.work_ns, inputs, timing.boundaries);

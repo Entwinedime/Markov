@@ -30,7 +30,7 @@ class NativeCase:
             raise ValueError("native case has repeated participants or invalid observed workers")
 
         self.sources, self.dependencies, self.clocks = {}, {}, {}
-        self.runtime, self.runtime_counts, self.logical = {}, {}, {}
+        self.logical = {}
         self.connections = Connections()
         self.cpu = CpuProtocolEvidence(capture, manifest["instances"])
         self.protocol = PdStateEvidence()
@@ -38,7 +38,7 @@ class NativeCase:
         self.findings = []
         self.observed_actions = 0
 
-    def observe(self, rank, graph, raw):
+    def observe(self, rank, graph, raw, logical_coordinates=None):
         if rank not in self.observed_roles or rank in self.sources:
             raise ValueError("native worker observation is unexpected or repeated")
         if raw["environment"]["implementation"]["framework_revision"] != self.manifest["framework_revision"]:
@@ -47,12 +47,20 @@ class NativeCase:
         source.validate_source(raw, rank)
         self.logical[rank] = set()
         if any(point["time_ns"] is None for point in graph["evidence"]["events"]):
-            facts = json.loads((self.graphs / f"{rank}-facts.json").read_text())
-            runtime = NativeEffectEvidence(self.capture, rank, raw, facts, self.graphs / f"{rank}-sdk/trace.json")
-            self.runtime_counts[rank] = runtime.inspect(graph)
-            self.runtime[rank] = runtime
-            self.logical[rank] = {event for event, point in enumerate(graph["evidence"]["events"])
-                                  if point["time_ns"] is None and (graph["events"][event]["resource"], point["order"]) in runtime.logical_coordinates}
+            if logical_coordinates is None:
+                facts = json.loads((self.graphs / f"{rank}-facts.json").read_text())
+                runtime = NativeEffectEvidence(self.capture, rank, raw, facts, self.graphs / f"{rank}-sdk/trace.json")
+                runtime.inspect(graph)
+                logical_coordinates = runtime.logical_coordinates
+
+                # SDK dictionaries are no longer needed while projecting the retained causal graph.
+                del runtime, facts
+            self.logical[rank] = {
+                event for event, point in enumerate(graph["evidence"]["events"])
+                if point["time_ns"] is None and (
+                    graph["events"][event]["resource"], point["order"]
+                ) in logical_coordinates
+            }
 
             # Elided waits gate order, not work or published data; those boundaries still require actual measurements.
             data = {event for work in graph["work"] for event in (work["start"], work["finish"])}
@@ -72,8 +80,9 @@ class NativeCase:
         for left, targets in dependencies.projected(anchors).next.items():
             for right in targets:
                 clock.constrain("causal", None, anchors[left], anchors[right])
+        clock.finish()
         if clock.conflict:
-            raise ValueError(f"native rank {rank} measurements have no common causal calibration: {clock.conflict}")
+            raise ValueError(f"native rank {rank} measurements have no common causal calibration: {clock.explain(graph)}")
         self.clocks[rank] = clock
         identities = {}
         for index, scope in enumerate(graph["scopes"]):
@@ -136,10 +145,6 @@ class NativeCase:
                 self.bindings.findings.append(("binding_evidence", {"group": group}, {"reason": "native resource history is absent"}))
         self.findings.extend(payload.findings)
         self.payload_counts = dict(payload.counts)
-
-        # Only source qualification needs SDK dictionaries; downstream consumers retain compact gate identities.
-        self.runtime.clear()
-        self.runtime_counts.clear()
 
         # These run-local rounds and links are also the source for later prediction comparison.
         self.connections.native_communication(self.dependencies)

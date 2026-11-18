@@ -21,8 +21,11 @@ struct InputPosition {
 };
 
 struct InvocationInput {
-    GraphTiming timing;
+    const nlohmann::json & record;
     InputPosition position;
+
+    const nlohmann::json & bindings() const;
+    GraphTiming timing(const CoarseGraph & graph) const;
 };
 
 // Positions retain an already checked causal prefix; operation and work must still match at every step.
@@ -33,8 +36,7 @@ public:
     static nlohmann::json work_identity(const nlohmann::json & work);
     static nlohmann::json action_identity(const ServingAction & action);
     static nlohmann::json notification_identity(const nlohmann::json & value);
-    const nlohmann::json & bindings(const std::string & group, const nlohmann::json & identity) const;
-    InvocationInput graph(const std::string & group, const std::string & operation, const nlohmann::json & identity, const CoarseGraph & graph);
+    InvocationInput invocation(const std::string & group, const std::string & operation, const nlohmann::json & identity);
     std::optional<TimeWindow> input(const std::string & group, const nlohmann::json & identity, bool in_flow);
     TimeWindow notification(const nlohmann::json & identity);
     EventTiming transfer(std::span<const InputPosition> posts);
@@ -53,11 +55,8 @@ private:
     };
 
     const nlohmann::json & take(const std::string & group, const std::string & operation, const nlohmann::json & identity);
-    const nlohmann::json & peek(const std::string & group, const std::string & operation, const nlohmann::json & identity) const;
-    static TimeWindow window(const nlohmann::json & record);
-    static ServiceDuration service(const nlohmann::json & record);
-    static std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector);
 
+    const nlohmann::json & context_values_;
     std::map<std::string, Actor> actors_;
     ControlObserver * observer_;
     std::map<nlohmann::json, Condition> notifications_;

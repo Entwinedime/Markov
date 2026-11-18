@@ -200,8 +200,8 @@ class ActionScopes:
         self.source_ids = {}
         for index, scope in enumerate(self.graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
-            if not origins or origins != sorted(set(origins)):
-                raise ValueError("coarse scope needs ordered unique native origins")
+            if len(origins) != 1:
+                raise ValueError("coarse scope requires one exact native declaration")
             for origin in origins:
                 if type(origin) is not int or not 0 <= origin < len(raw["scopes"]) or origin in self.source_ids:
                     raise ValueError("native scope has an invalid or competing coarse owner")
@@ -210,14 +210,9 @@ class ActionScopes:
             raise ValueError("coarse scopes omit native observations")
         publications = self.tensor_publications(raw)
 
-        # Ordinary declarations remain exact; only private CPU continuations may share an owner.
+        # Each interpreted call keeps its native declaration; private CPU suppression belongs to capture.
         for index, scope in enumerate(self.graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
-            if len(origins) > 1 and scope["role"] == "segment":
-                self.validate_control_region(index, origins, raw)
-                continue
-            if len(origins) != 1:
-                raise ValueError("ordinary coarse scope combines distinct native declarations")
             observed = raw["scopes"][origins[0]]
             if "required_peers" in observed["bindings"]:
                 group, counts = observed["communication"], observed["expert_exchange"]
@@ -327,52 +322,6 @@ class ActionScopes:
         if reads != {index for index, scope in enumerate(raw["scopes"]) if scope["role"] == "query"}:
             raise ValueError("query actions lack observed results")
         self.bind_pipeline_placements(raw)
-
-    def validate_control_region(self, index, origins, raw):
-        scope = self.graph["scopes"][index]
-        records = [raw["scopes"][origin] for origin in origins]
-        first, last = records[0], records[-1]
-        siblings = [record["id"] for record in raw["scopes"] if record["parent"] == first["parent"]]
-        begin = siblings.index(origins[0])
-        if (len(origins) < 3 or len(origins) % 2 != 1 or siblings[begin:begin + len(origins)] != origins
-                or any(record["parent"] in origins for record in raw["scopes"])):
-            raise ValueError("CPU region is not a closed consecutive native sibling sequence")
-        expected_work = {**first["work"], "continuation": {
-            **first["work"]["continuation"], **{key: last["work"]["continuation"][key] for key in ("exit", "exit_context")},
-        }}
-        if (scope["work"] != expected_work or scope["bindings"] != {**first["bindings"], "source_scopes": origins}
-                or scope["parent"] != self.source_ids[first["parent"]]
-                or any(scope[field] != first[field] for field in ("site", "implementation", "parameters", "constants"))
-                or self.declaration_expressions(scope) != self.declaration_expressions(first)):
-            raise ValueError("CPU region changes its native declaration or outer continuation")
-        for position, record in enumerate(records):
-            if (not record["complete"] or record["thread"] != first["thread"] or record["ports"]
-                    or any(record.get(field) for field in ("communication", "state_accesses", "effects", "publication", "service"))):
-                raise ValueError("CPU region contains an observable native effect")
-            if position % 2 == 0:
-                fields = ("role", "site", "implementation", "parameters", "constants", "bindings")
-                if (record["role"] != "segment" or not record["bindings"].get("segment", {}).get("host_only")
-                        or any(record[field] != first[field] for field in fields)
-                        or self.declaration_expressions(record) != self.declaration_expressions(first)
-                        or {key: value for key, value in record["work"].items() if key != "continuation"}
-                        != {key: value for key, value in first["work"].items() if key != "continuation"}):
-                    raise ValueError("CPU region changes its native control owner or logical work")
-            else:
-                before, after = records[position - 1]["work"]["continuation"], records[position + 1]["work"]["continuation"]
-                context = {"operation": "filter", "left": []}
-
-                # Prove the native early-return ABI from original observations, not the producer's grouping decision.
-                if (record["role"] != "batch_transform"
-                        or record["bindings"] != {"action": True, "condition": {"transformation": {"operation": "filter", "outcome": "unchanged"}}}
-                        or any(record["parameters"][name] != 0 for name in ("left_members", "right_members", "members"))
-                        or record["work"]["context"] != {**context, "result": []}
-                        or before["exit"] != "batch_transform" or after["entry"] != "batch_transform"
-                        or before["exit_context"] != context or after["entry_context"] != context):
-                    raise ValueError("CPU region hides work other than an empty native filter")
-        if (len(scope["ports"]) != 2 or scope["kv_accesses"] or scope["slot_accesses"] or scope.get("communication")
-                or {(port["name"], port["direction"], port["use"], port["relation"]) for port in scope["ports"]}
-                != {("call.enter", "input", "control", "control"), ("call.return", "output", "control", "control")}):
-            raise ValueError("CPU region exposes more than its outer control boundaries")
 
     def validate_state_accesses(self, index, observed, scope, ports):
         for space, field in (("kv", "kv_accesses"), ("slot", "slot_accesses")):
@@ -518,25 +467,25 @@ class ActionIdentity:
         return {"group": group, "action": scope["role"], "parameters": scope["parameters"], "work": cls.work_identity(scope["work"])}
 
     @staticmethod
-    def logical_key(record):
+    def logical_key(record, contexts):
         if "work" not in record:
             return json.dumps(record, sort_keys=True)
 
         # Placement qualifies absolute clocks; it cannot distinguish repeated logical work across runs.
         work = {name: value for name, value in record["work"].items() if name != "observation_context"}
-        return json.dumps({**record, "work": work}, sort_keys=True)
+        return json.dumps(contexts.encode({**record, "work": work}), sort_keys=True)
 
     @staticmethod
-    def structure_key(record):
+    def structure_key(record, contexts):
         if "work" not in record:
             return json.dumps(record, sort_keys=True)
 
         # Shared structure ignores caller state; logical pairing retains it and only absolute timing keeps placement.
         work = record["work"]
         callers = [{"owner": caller["owner"], "entry": caller["entry"]} for caller in work["callers"]]
-        return json.dumps({**record, "work": {
+        return json.dumps(contexts.encode({**record, "work": {
             "members": work["members"], "context": work["context"], "callers": callers, "continuation": work["continuation"],
-        }}, sort_keys=True)
+        }}), sort_keys=True)
 
     @staticmethod
     def group(graph, instance):

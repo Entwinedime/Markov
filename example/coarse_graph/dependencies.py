@@ -52,6 +52,55 @@ class ActionBoundaries:
         )
 
 
+class GraphProjection:
+    def __init__(self, graph, anchors):
+        self.graph = graph
+        self.indices = {event: index for index, event in enumerate(anchors)}
+        self.result = CausalGraph()
+        self.result.add_events(range(len(anchors)))
+        self.pending, self.live = {}, Counter()
+
+    def release(self, labels):
+        for label in labels:
+            self.live[label] -= 1
+            if not self.live[label]:
+                del self.live[label]
+
+    def receive(self, target, maximal, closure):
+        other, previous = self.pending.get(target, (set(), set()))
+        current = {label for label in closure if label in self.live}
+        previous = {label for label in previous if label in self.live}
+        merged = (maximal - previous) | (other - current) | (maximal & other)
+
+        # Retain incoming references before releasing the old frontier; labels cannot transiently disappear.
+        self.live.update(merged)
+        self.release(other)
+        self.pending[target] = merged, current | previous
+
+    def run(self):
+        for event, position in self.graph.positions.items():
+            previous, closure = self.pending.pop(position, (set(), set()))
+            closure = {label for label in closure if label in self.live}
+            anchor = self.indices.get(event)
+            maximal = previous
+            if anchor is not None:
+                for source in sorted(previous):
+                    self.result.connect(source, anchor, "order")
+                maximal = {anchor}
+                self.live.update(maximal)
+                closure = closure | maximal
+
+            # Popped predecessors remain live until every successor has received this frontier.
+            if maximal:
+                for target in self.graph.successors[position]:
+                    self.receive(target, maximal, closure)
+            self.release(previous)
+            if anchor is not None:
+                self.release(maximal)
+        self.result.prepare()
+        return self.result
+
+
 class CausalGraph:
     relations = ("order", "submission", "data", "signal", "control", "state", "communication", "observation")
 
@@ -80,37 +129,7 @@ class CausalGraph:
         return result
 
     def projected(self, anchors):
-        indices = {event: index for index, event in enumerate(anchors)}
-        result = CausalGraph()
-        result.add_events(range(len(anchors)))
-        frontier = {}
-
-        # Each active frontier holds its maximal retained predecessors and their full reflexive closure.
-        for event, position in self.positions.items():
-            maximal, closure = frontier.pop(position, (0, 0))
-            anchor = indices.get(event)
-            if anchor is not None:
-                while maximal:
-                    bit = maximal & -maximal
-                    result.connect(bit.bit_length() - 1, anchor, "order")
-                    maximal ^= bit
-                maximal = 1 << anchor
-                closure |= maximal
-
-            if not maximal:
-                continue
-            for target in self.successors[position]:
-                following = frontier.get(target)
-                if following is None:
-                    frontier[target] = maximal, closure
-                    continue
-                other, previous = following
-
-                # Remove strict ancestors on either side; a shared maximal boundary remains maximal.
-                frontier[target] = (maximal & ~previous) | (other & ~closure) | (maximal & other), closure | previous
-
-        result.prepare()
-        return result
+        return GraphProjection(self, anchors).run()
 
     def add_events(self, events):
         for event in events:
@@ -224,8 +243,8 @@ class CausalGraph:
         return masks
 
 class ActionOrderComparison:
-    def __init__(self, details=False):
-        self.details = details
+    def __init__(self, contexts, details=False):
+        self.contexts, self.details = contexts, details
         self.counts, self.findings = Counter(), []
         self.repeated_counts = Counter()
         self.qualified = False
@@ -299,7 +318,7 @@ class ActionOrderComparison:
                 return
 
             # Occurrence pairs are already established; repeated work still needs distinct order labels.
-            key = ActionIdentity.logical_key(identity), native.events["root/input:call.enter"]
+            key = ActionIdentity.logical_key(identity, self.contexts), native.events["root/input:call.enter"]
             identities[key] = identity
             for name, event in native.events.items():
                 labels[event, estimate.events[name]].append((key, name))

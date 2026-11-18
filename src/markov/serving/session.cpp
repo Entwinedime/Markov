@@ -4,6 +4,7 @@
 #include "markov/execution/communication.hpp"
 #include "markov/execution/timing.hpp"
 
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -41,11 +42,13 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs *
                 break;
             }
             auto & participant = participants_.at(action->task.group);
-            const auto identity = inputs ? ExecutionInputs::action_identity(*action) : nlohmann::json();
-            const auto bindings = inputs ? inputs->bindings(action->task.group, identity) : action->work.value("bindings", nlohmann::json::object());
+            const auto supplied = inputs
+                ? std::optional(inputs->invocation(action->task.group, "action", ExecutionInputs::action_identity(*action)))
+                : std::nullopt;
+            const auto bindings = supplied ? supplied->bindings() : action->work.value("bindings", nlohmann::json::object());
             const auto graph = participant.graphs.build(*action, bindings);
-            auto timing = inputs ? inputs->graph(action->task.group, "action", identity, graph).timing
-                                 : GraphTiming{ std::vector<ServiceDuration>(graph.work.size(), given_work_ns), {} };
+            const auto timing = supplied ? supplied->timing(graph)
+                                         : GraphTiming{ std::vector<ServiceDuration>(graph.work.size(), given_work_ns), {} };
             const auto events = participant.dependencies.insert(graph, timeline_, timing.work_ns, pools, timing.boundaries);
             communication.insert(graph, events, timeline_);
             const auto returned = events.at(graph.scopes.front().port("call.return", Direction::Output).event);

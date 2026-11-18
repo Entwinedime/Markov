@@ -62,9 +62,9 @@ class GraphContents(ActionScopes):
             raise ValueError("native host-only declaration contains undeclared execution structure")
         return True
 
-    def structure_key(self, root, identity, controls):
+    def structure_key(self, root, identity, controls, contexts):
         key = self.control_key(root, identity)
-        return key if key in controls else ActionIdentity.structure_key(identity)
+        return key if key in controls else ActionIdentity.structure_key(identity, contexts)
 
     def observed_pools(self, raw, registrations, groups):
 

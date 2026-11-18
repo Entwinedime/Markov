@@ -237,6 +237,41 @@ class ProductionEvidence:
     def __init__(self, production, capture, output, details):
         self.production, self.capture, self.output, self.details = production, capture, output, details
 
+    def observe_rank(self, native_case, rank):
+
+        # SDK/facts belong to this rank; the case retains only graph, clock and validated logical coordinates.
+        facts = json.loads((self.production / f"work/{rank}-facts.json").read_text())
+        graph = json.loads((self.production / f"work/{rank}-graph.json").read_text())
+        native = json.loads((self.capture / f"rank-{rank}.json").read_text())
+        SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
+        native_evidence = NativeEffectEvidence(
+            self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json",
+        )
+        effects = native_evidence.inspect(graph)
+        contents = native_case.observe(rank, graph, native, logical_coordinates=native_evidence.logical_coordinates)
+        measurements = native_evidence.inspect_measurements()
+        measurements["checked_device_measurements"] = effects["device_measurements"]
+        device_intervals = native_evidence.device_intervals()
+        boundaries = native_evidence.inspect_boundaries(graph, device_intervals)
+        services, private_streams = native_evidence.inspect_services()
+        payload = native_evidence.inspect_payload(graph, private_streams, device_intervals)
+        submissions = native_evidence.inspect_submissions()
+        generations = native_evidence.event_generations()
+        signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank], generations)
+        stream_roles = native_evidence.inspect_stream_roles(*PipelineABI.stream_declarations(native), generations[1])
+        report = SourceEvidence(
+            facts, graph, native_case.clocks[rank], native_case.logical[rank], self.details,
+        ).inspect()
+        report["native_effects"] = effects
+        report["native_stream_roles"] = stream_roles
+        report["native_payload"] = payload
+        report["native_measurements"] = measurements
+        report["native_boundaries"] = boundaries
+        report["native_services"] = services
+        report["native_submissions"] = submissions
+        report["native_signals"] = signals
+        return report
+
     def run(self):
         publication = json.loads((self.production / "result.json").read_text())
         capture = json.loads((self.capture / "capture.json").read_text())
@@ -246,36 +281,7 @@ class ProductionEvidence:
         reports = []
         for rank in publication["observed_roles"]:
             try:
-                facts = json.loads((self.production / f"work/{rank}-facts.json").read_text())
-                graph = json.loads((self.production / f"work/{rank}-graph.json").read_text())
-                native = json.loads((self.capture / f"rank-{rank}.json").read_text())
-                SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
-                contents = native_case.observe(rank, graph, native)
-                native_evidence = native_case.runtime.get(rank)
-                if native_evidence is None:
-                    native_evidence = NativeEffectEvidence(self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json")
-                effects = native_case.runtime_counts.get(rank)
-                if effects is None:
-                    effects = native_evidence.inspect(graph)
-                measurements = native_evidence.inspect_measurements()
-                measurements["checked_device_measurements"] = effects["device_measurements"]
-                device_intervals = native_evidence.device_intervals()
-                boundaries = native_evidence.inspect_boundaries(graph, device_intervals)
-                services, private_streams = native_evidence.inspect_services()
-                payload = native_evidence.inspect_payload(graph, private_streams, device_intervals)
-                submissions = native_evidence.inspect_submissions()
-                generations = native_evidence.event_generations()
-                signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank], generations)
-                stream_roles = native_evidence.inspect_stream_roles(*PipelineABI.stream_declarations(native), generations[1])
-                report = SourceEvidence(facts, graph, native_case.clocks[rank], native_case.logical[rank], self.details).inspect()
-                report["native_effects"] = effects
-                report["native_stream_roles"] = stream_roles
-                report["native_payload"] = payload
-                report["native_measurements"] = measurements
-                report["native_boundaries"] = boundaries
-                report["native_services"] = services
-                report["native_submissions"] = submissions
-                report["native_signals"] = signals
+                report = self.observe_rank(native_case, rank)
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
 
                 # A malformed or absent source is a finding; continue the remaining independent ranks.
