@@ -34,7 +34,7 @@ private:
 } // namespace
 
 std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition & definition, const TemplateEntry & source,
-                                                     std::span<const std::size_t> recipient_resources) {
+                                                     std::span<const std::size_t> resource_bindings) {
     if (!definition.children.empty() || !definition.imports.empty() || !definition.kv_accesses.empty() || !definition.slot_accesses.empty()
         || source.frame.communication || !source.frame.bindings.empty())
         return std::nullopt;
@@ -45,19 +45,18 @@ std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition
         if (port.use == PortUse::Signal || port.rendezvous) return std::nullopt;
     }
 
-    // The adapter supplies the recipient lane; roles must be unique within it, including their original aliases.
+    // The adapter binds the declared native operation; the core preserves resource types and original aliasing.
+    if (resource_bindings.size() != definition.resources.size()) return std::nullopt;
+    auto body = definition;
     auto entry = source;
     const auto original_resources = entry.frame.resources;
-    entry.frame.resources.clear();
-    for (const auto & slot : definition.resources) {
-        std::vector<std::size_t> matches;
-        for (const auto index : recipient_resources) {
-            const auto & resource = resources.at(index);
-            if (resource.kind == slot.kind && resource.role == slot.role && resource.serial == slot.serial) matches.push_back(index);
-        }
-        if (matches.size() != 1) return std::nullopt;
-        entry.frame.resources.push_back(matches.front());
+    for (std::size_t index = 0; index < resource_bindings.size(); ++index) {
+        const auto & resource = resources.at(resource_bindings[index]);
+        const auto & slot = definition.resources[index];
+        if (resource.kind != slot.kind || resource.serial != slot.serial) return std::nullopt;
+        body.resources[index].role = resource.role;
     }
+    entry.frame.resources.assign(resource_bindings.begin(), resource_bindings.end());
     for (std::size_t left = 0; left < original_resources.size(); ++left) {
         for (std::size_t right = 0; right < left; ++right) {
             if ((original_resources[left] == original_resources[right]) != (entry.frame.resources[left] == entry.frame.resources[right]))
@@ -65,14 +64,14 @@ std::optional<std::size_t> TemplateLibrary::import_leaf(const TemplateDefinition
         }
     }
 
-    const auto document = definition.document();
-    const auto found = std::ranges::find_if(definitions, [&](const auto & body) { return body.document() == document; });
+    const auto document = body.document();
+    const auto found = std::ranges::find_if(definitions, [&](const auto & existing) { return existing.document() == document; });
     entry.frame.definition = static_cast<std::size_t>(found - definitions.begin());
     const auto frame = entry.frame.document();
     for (const auto & existing : entries) {
         if (existing.action == entry.action && existing.condition == entry.condition && existing.frame.document() == frame) return std::nullopt;
     }
-    if (found == definitions.end()) definitions.push_back(definition);
+    if (found == definitions.end()) definitions.push_back(std::move(body));
 
     // Imported calls were observed in another library, not at this recipient's scope numbers.
     entry.observations.clear();

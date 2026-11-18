@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -36,17 +37,70 @@ void declare_payload_agreements(GraphScope & scope) {
     }
 }
 
-std::vector<std::size_t> batch_resources(const TemplateLibrary & library) {
-    std::set<std::size_t> resources;
-    for (const auto & entry : library.entries) {
-        const auto owner = entry.condition.value("owner", std::string{});
-        if (entry.action == "batch_transform" || (entry.action == "segment" && (owner == "preparation" || owner == "allocation")))
-            resources.insert(entry.frame.resources.begin(), entry.frame.resources.end());
+using NativeOperation = std::pair<std::string, std::string>;
+
+NativeOperation native_operation(const TemplateLibrary & library, const TemplateEntry & entry) {
+    return { entry.action, library.definitions.at(entry.frame.definition).implementation };
+}
+
+bool batch_array(const TemplateEntry & entry) {
+    if (entry.action != "batch_transform") return false;
+    const auto & transform = entry.condition.at("transformation");
+    return (transform.at("operation") == "merge" && transform.at("effect") == "merge")
+        || (transform.at("operation") == "filter" && transform.at("effect") == "subset");
+}
+
+class ActionDeclarations {
+public:
+    using Lane = std::set<std::size_t>;
+
+    explicit ActionDeclarations(const TemplateLibrary & library) : library_(library) {
+        for (const auto & entry : library.entries) {
+            operations_[native_operation(library, entry)].insert(entry.frame.resources.begin(), entry.frame.resources.end());
+            const auto owner = entry.condition.value("owner", std::string{});
+            if (entry.action == "batch_transform" || (entry.action == "segment" && (owner == "preparation" || owner == "allocation")))
+                foreground_.insert(entry.frame.resources.begin(), entry.frame.resources.end());
+        }
     }
 
-    // Observed batch preparation identifies the foreground lane independently of background KV transport.
-    return { resources.begin(), resources.end() };
-}
+    const Lane * operation(const NativeOperation & family) const {
+        const auto found = operations_.find(family);
+        return found == operations_.end() ? nullptr : &found->second;
+    }
+
+    const Lane & foreground() const { return foreground_; }
+
+    std::optional<std::vector<std::size_t>> bind(const ActionDeclarations & source, const TemplateEntry & entry, const Lane & lane) const {
+        const auto & source_lane = batch_array(entry) ? source.foreground_ : source.operations_.at(native_operation(source.library_, entry));
+        const auto source_streams = std::ranges::count_if(source_lane, [&](auto index) {
+            return source.library_.resources.at(index).kind == ResourceKind::Stream;
+        });
+        const auto target_streams = std::ranges::count_if(lane, [&](auto index) {
+            return library_.resources.at(index).kind == ResourceKind::Stream;
+        });
+        std::vector<std::size_t> bindings;
+        for (const auto original : entry.frame.resources) {
+            const auto & expected = source.library_.resources.at(original);
+            std::vector<std::size_t> matches;
+            for (const auto index : lane) {
+                const auto & actual = library_.resources.at(index);
+
+                // One observed operation lane can have different native stream roles in ordinary and PP workers.
+                const bool foreground = expected.kind == ResourceKind::Stream && source_streams == 1 && target_streams == 1;
+                if (actual.kind == expected.kind && actual.serial == expected.serial && (actual.role == expected.role || foreground))
+                    matches.push_back(index);
+            }
+            if (matches.size() != 1) return std::nullopt;
+            bindings.push_back(matches.front());
+        }
+        return bindings;
+    }
+
+private:
+    const TemplateLibrary & library_;
+    std::map<NativeOperation, Lane> operations_;
+    Lane foreground_;
+};
 
 class ActionConditions {
 public:
@@ -303,44 +357,45 @@ nlohmann::json NativeTemplates::share_closed_actions(std::map<std::size_t, Templ
         std::size_t entry;
     };
     std::map<nlohmann::json, std::vector<Candidate>> candidates;
-    std::map<std::size_t, std::set<nlohmann::json>> domains;
-    std::map<std::size_t, std::vector<std::size_t>> resources;
+    std::map<std::size_t, nlohmann::json> domains;
+    std::map<std::size_t, ActionDeclarations> declarations;
     for (const auto & [index, library] : libraries) {
         auto environment = library.domain;
 
-        // Closed batch arrays use member counts, not model shards or KV geometry; import_leaf checks their complete boundary.
+        // The initialized implementation stays fixed; an operation's closed ABI qualifies reuse across worker layouts.
         for (const auto field : { "worker_roles", "kv_peers", "parallel", "kv_layout", "expert_layers" }) environment.erase(field);
         environment.at("implementation").erase("disaggregation_mode");
         environment.at("implementation").erase("expert_layout");
-        domains.emplace(index, std::set<nlohmann::json>{ library.domain, environment });
-        resources.emplace(index, batch_resources(library));
-        for (std::size_t entry = 0; entry < library.entries.size(); ++entry) {
-            const auto & call = library.entries[entry];
-            auto domain = library.domain;
-            if (call.action == "batch_transform") {
-                const auto & transform = call.condition.at("transformation");
-                if ((transform.at("operation") == "merge" && transform.at("effect") == "merge")
-                    || (transform.at("operation") == "filter" && transform.at("effect") == "subset"))
-                    domain = environment;
-            }
+        domains.emplace(index, environment);
 
-            // Other closed actions retain their complete worker domain, including layout and native mechanisms.
-            candidates[domain].push_back({ index, entry });
-        }
+        // Imported entries cannot authorize more native methods or change the recipient's original lane declarations.
+        declarations.try_emplace(index, library);
+        for (std::size_t entry = 0; entry < library.entries.size(); ++entry) candidates[environment].push_back({ index, entry });
     }
 
     auto imports = nlohmann::json::array();
     for (auto & [index, library] : libraries) {
-        for (const auto & domain : domains.at(index)) {
-            const auto found = candidates.find(domain);
-            if (found == candidates.end()) continue;
-            for (const auto & candidate : found->second) {
-                if (candidate.source == index) continue;
-                const auto & source = libraries.at(candidate.source);
-                const auto & call = source.entries.at(candidate.entry);
-                if (const auto entry = library.import_leaf(source.definitions.at(call.frame.definition), call, resources.at(index)))
-                    imports.push_back({ { "recipient", index }, { "entry", *entry }, { "source", candidate.source }, { "source_entry", candidate.entry } });
-            }
+        const auto found = candidates.find(domains.at(index));
+        if (found == candidates.end()) continue;
+        const auto & declared = declarations.at(index);
+        for (const auto & candidate : found->second) {
+            if (candidate.source == index) continue;
+            const auto & source = libraries.at(candidate.source);
+            const auto & call = source.entries.at(candidate.entry);
+            const auto & body = source.definitions.at(call.frame.definition);
+            const auto * lane = declared.operation(native_operation(source, call));
+
+            // Device-side layout stays worker-specific; declared member arrays and closed native CPU residuals can cross it.
+            if (source.domain != library.domain && !batch_array(call)
+                && (lane == nullptr || !std::ranges::all_of(body.work, [](const auto & work) { return work.kind == WorkKind::Host; })))
+                continue;
+
+            // A control-only observation of filter does not declare its tensor branch; member arrays use the foreground ABI.
+            const auto & resources = !batch_array(call) && lane ? *lane : declared.foreground();
+            const auto bindings = declared.bind(declarations.at(candidate.source), call, resources);
+            if (!bindings) continue;
+            if (const auto entry = library.import_leaf(body, call, *bindings))
+                imports.push_back({ { "recipient", index }, { "entry", *entry }, { "source", candidate.source }, { "source_entry", candidate.entry } });
         }
     }
     return imports;
