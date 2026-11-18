@@ -120,10 +120,19 @@ public:
         }
     }
 
-    TemplateEntry compile(const EntrySpecification & entry) {
+    TemplateEntry compile(const EntrySpecification & entry, std::span<const std::size_t> original_events,
+                          std::vector<TemplateWorkEvidence> * evidence) {
 
         // Compile children first to derive their call interfaces before sharing the caller's structure.
-        for (std::size_t scope = scopes_.size(); scope-- > 0;) compile_scope(scope);
+        for (std::size_t scope = scopes_.size(); scope-- > 0;) {
+            compile_scope(scope);
+            if (!evidence) continue;
+            const auto & compiled = scopes_[scope];
+            for (std::size_t interval = 0; interval < compiled.work.size(); ++interval) {
+                const auto & piece = source_.work[compiled.work[interval]];
+                evidence->push_back({compiled.frame.definition, interval, original_events[piece.start], original_events[piece.finish]});
+            }
+        }
         return { entry.action, entry.condition, std::move(scopes_[0].frame), { source_.scopes[0].info.parameters } };
     }
 
@@ -336,7 +345,8 @@ private:
 
 } // namespace
 
-TemplateLibrary TemplateCompiler::compile(const CoarseGraph & source, std::span<const EntrySpecification> entries, nlohmann::json domain) {
+TemplateLibrary TemplateCompiler::compile(const CoarseGraph & source, std::span<const EntrySpecification> entries, nlohmann::json domain,
+                                          std::vector<TemplateWorkEvidence> * evidence) {
     source.validate();
     TemplateLibrary library;
     library.domain = std::move(domain);
@@ -345,8 +355,9 @@ TemplateLibrary TemplateCompiler::compile(const CoarseGraph & source, std::span<
     std::map<std::tuple<std::string, nlohmann::json, nlohmann::json>, std::size_t> shared_entries;
     const EntryExtraction extraction(source);
     for (const auto & specification : entries) {
-        const auto cut = extraction.extract(specification.scope);
-        auto entry = LibraryCompilation(cut, library, shared).compile(specification);
+        std::vector<std::size_t> original_events;
+        const auto cut = extraction.extract(specification.scope, evidence ? &original_events : nullptr);
+        auto entry = LibraryCompilation(cut, library, shared).compile(specification, original_events, evidence);
         auto key = std::tuple{ entry.action, entry.condition, entry.frame.document() };
         const auto [found, inserted] = shared_entries.try_emplace(std::move(key), library.entries.size());
         if (inserted) library.entries.push_back(std::move(entry));

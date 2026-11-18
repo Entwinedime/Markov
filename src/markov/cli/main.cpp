@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,6 +26,7 @@
 #include "markov/execution/timing.hpp"
 #include "markov/graph/observation.hpp"
 #include "markov/graph/types.hpp"
+#include "markov/performance/work_features.hpp"
 #include "markov/production/entries.hpp"
 #include "markov/production/projection.hpp"
 #include "markov/production/templates.hpp"
@@ -94,11 +96,35 @@ private:
 constexpr std::string_view usage = "markov project <native-facts.json> <coarse.json> [--evidence]\n"
                                    "markov action-layouts <observed-coarse.json> <layouts.json>\n"
                                    "markov templates <coarse.json> <templates.json>\n"
+                                   "markov work-identities <observed-coarse.json> <work.json>\n"
                                    "markov link-templates <source-libraries.json> <output-directory>\n"
                                    "markov instantiate <templates.json> <invocation.json> <coarse.json>\n"
                                    "markov execute <coarse.json> <given-timing.json> <execution.json> [--trace <execution.jsonl>]\n"
                                    "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] "
                                    "[--execution-inputs <conditions.json>]\n";
+
+nlohmann::json work_identities(markov::CoarseGraph source, const nlohmann::json & observation_window) {
+    const auto work_count = source.work.size();
+    auto features = nlohmann::json::array();
+    for (const auto & scope : source.scopes) features.push_back(markov::WorkFeatures(scope).document());
+    std::vector<markov::TemplateWorkEvidence> evidence;
+    evidence.reserve(work_count);
+    const auto library = markov::sglang::NativeTemplates::compile(std::move(source), &evidence);
+
+    std::set<std::pair<std::size_t, std::size_t>> measured;
+    auto intervals = nlohmann::json::array();
+    for (const auto & work : evidence) {
+        if (!measured.emplace(work.start, work.finish).second)
+            throw std::invalid_argument("source work belongs to more than one template interval");
+        intervals.push_back({work.start, work.finish, work.definition, work.interval});
+    }
+    if (measured.size() != work_count) throw std::invalid_argument("source work is missing a template interval");
+
+    auto definitions = nlohmann::json::array();
+    for (const auto & definition : library.definitions) definitions.push_back(definition.document());
+    return {{"domain", library.domain}, {"window_ns", observation_window},
+            {"definitions", std::move(definitions)}, {"features", std::move(features)}, {"intervals", std::move(intervals)}};
+}
 
 nlohmann::json execute(const markov::CoarseGraph & graph, const nlohmann::json & timing, markov::ExecutionObserver * observer) {
     std::vector<markov::ServiceDuration> work_ns;
@@ -187,10 +213,12 @@ int main(int argc, char ** argv) {
             output = markov::CoarseProjection::project(std::move(observation), argc == 5 ? &evidence : nullptr).document();
             if (argc == 5) output["evidence"] = evidence.document(observation);
         }
-        else if (command == "templates" && argc == 4) {
-            auto source = markov::CoarseGraph::read(read_json(argv[2]));
+        else if ((command == "templates" || command == "work-identities") && argc == 4) {
+            const auto document = read_json(argv[2]);
+            auto source = markov::CoarseGraph::read(document);
             if (source.environment.at("framework") != "sglang") throw std::invalid_argument("source framework has no template recipe adapter");
-            output = markov::sglang::NativeTemplates::compile(std::move(source)).document();
+            output = command == "templates" ? markov::sglang::NativeTemplates::compile(std::move(source)).document()
+                                            : work_identities(std::move(source), document.at("evidence").at("window_ns"));
         }
         else if (command == "action-layouts" && argc == 4) {
             const auto source = markov::sglang::NativeTemplates::describe(markov::CoarseGraph::read(read_json(argv[2])));

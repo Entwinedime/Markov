@@ -34,6 +34,20 @@ def main() -> None:
     observation = capture.add_mutually_exclusive_group()
     observation.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
     observation.add_argument("--latency-only", action="store_true", help="run without the profiler and record scheduler latency")
+    observation.add_argument("--host-targets", type=Path, help="record thread CPU time for a JSON array of native calls")
+    samples = commands.add_parser("cost-samples", help="publish measured services from a projected source")
+    samples.add_argument("--facts", type=Path, required=True)
+    samples.add_argument("--graph", type=Path, required=True)
+    samples.add_argument("--work-identities", type=Path, required=True)
+    samples.add_argument("--output", type=Path, required=True)
+    hosts = commands.add_parser("host-cost-samples", help="qualify independently measured native host services")
+    for name in ("detailed", "host", "facts", "graph", "work-identities", "output"):
+        hosts.add_argument("--" + name, type=Path, required=True)
+    costs = commands.add_parser("fit-costs", help="fit bounded curves from qualified service samples")
+    costs.add_argument("--samples", type=Path, nargs="+", required=True)
+    costs.add_argument("--check", type=Path, action="append", default=[])
+    costs.add_argument("--demand", type=Path, nargs=2, action="append", default=[], metavar=("GRAPH", "WORK"))
+    costs.add_argument("--output", type=Path, required=True)
     acquisition = commands.add_parser("acquire-sources", help="capture and compile a finite plan under shared cumulative allowances")
     acquisition.add_argument("--plan", type=Path, required=True)
     acquisition.add_argument("--observations", type=Path, help="JSON map of planned source job IDs to published capture task paths; native inputs must match")
@@ -62,7 +76,19 @@ def main() -> None:
     elif arguments.command == "capture":
         from markov_workflow.capture import CaptureProcess
 
-        CaptureProcess(arguments, latency_only=arguments.latency_only).run()
+        CaptureProcess(arguments, latency_only=arguments.latency_only, host_targets=arguments.host_targets).run()
+    elif arguments.command == "cost-samples":
+        from markov_workflow.cost_samples import CostSamples
+
+        CostSamples(arguments).run()
+    elif arguments.command == "host-cost-samples":
+        from markov_workflow.adapters.sglang_host_samples import HostCostSamples
+
+        HostCostSamples(arguments).run()
+    elif arguments.command == "fit-costs":
+        from markov_workflow.fit_costs import FitCosts
+
+        FitCosts(arguments).run()
     elif arguments.command == "acquire-sources":
         from markov_workflow.acquisition import SourceAcquisition
 

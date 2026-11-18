@@ -279,10 +279,10 @@ TemplateDeclarations NativeTemplates::describe(CoarseGraph graph) {
     return { std::move(graph), std::move(entries) };
 }
 
-TemplateLibrary NativeTemplates::compile(CoarseGraph graph) {
+TemplateLibrary NativeTemplates::compile(CoarseGraph graph, std::vector<TemplateWorkEvidence> * evidence) {
     const auto declarations = describe(std::move(graph));
     const auto & source = declarations.graph;
-    auto library = TemplateCompiler::compile(source, declarations.entries, domain(source.environment));
+    auto library = TemplateCompiler::compile(source, declarations.entries, domain(source.environment), evidence);
 
     // All candidate libraries belong to one initialized model/layout; PD mode and capacity remain caller-owned.
     library.local_domain = nlohmann::json::object();
