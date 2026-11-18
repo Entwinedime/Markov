@@ -285,6 +285,13 @@ std::optional<EventCompletion> Timeline::advance(std::optional<std::int64_t> unt
 
 bool Timeline::completed(std::size_t event) const { return events_.at(event).completed_ns.has_value(); }
 
+bool Timeline::in_flight(std::size_t event) const {
+
+    // Physical access histories can outlive the event records for finished work.
+    const auto found = events_.find(event);
+    return found != events_.end() && !found->second.completed_ns;
+}
+
 void Timeline::retain(std::set<std::size_t> external) {
     for (const auto tail : tails_) {
         if (tail) external.insert(*tail);

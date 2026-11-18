@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 
 namespace markov {
 namespace {
@@ -23,17 +24,6 @@ std::pair<std::size_t, std::size_t> interval(const CoarseGraph & graph, std::siz
     return { start, finish };
 }
 
-void prune_returned(auto & contents, const Timeline & timeline) {
-    for (auto it = contents.begin(); it != contents.end();) {
-        auto & value = it->second;
-        value.prune(timeline);
-
-        // Logical return clears contents; the last physical access must also finish before its record can disappear.
-        if (value.initialized.empty() && value.active.empty()) it = contents.erase(it);
-        else ++it;
-    }
-}
-
 } // namespace
 
 GraphDependencies::GraphDependencies(KvPool & pool, ResourceService & resources, std::span<const Request> requests, ResourceObserver * observer)
@@ -42,7 +32,15 @@ GraphDependencies::GraphDependencies(KvPool & pool, ResourceService & resources,
 }
 
 void GraphDependencies::Contents::prune(const Timeline & timeline) {
-    std::erase_if(active, [&](const auto & access) { return timeline.completed(access.finish); });
+    std::erase_if(active, [&](const auto & access) { return !timeline.in_flight(access.finish); });
+}
+
+bool GraphDependencies::Contents::release(const Timeline & timeline) {
+
+    // Logical return clears initialization immediately. Outstanding accesses still gate physical reuse.
+    initialized.clear();
+    prune(timeline);
+    return active.empty();
 }
 
 bool GraphDependencies::Contents::covers(std::int64_t begin, std::int64_t end) const {
@@ -67,16 +65,28 @@ void GraphDependencies::Contents::commit(const std::set<Access> & accesses, std:
     initialized = std::move(merged);
 }
 
-void GraphDependencies::invalidate(const ResourceChanges & changes) {
+void GraphDependencies::invalidate(const ResourceChanges & changes, const Timeline & timeline) {
     for (const auto page : changes.returned_pages) {
+        const auto found = pages_.find(page);
+        if (found == pages_.end()) continue;
 
-        // A logical return invalidates old contents now; in-flight hazards still protect physical reuse.
-        for (auto it = pages_.lower_bound({ page, 0 }); it != pages_.end() && it->first.first == page; ++it) it->second.initialized.clear();
+        auto & layers = found->second;
+        for (auto layer = layers.begin(); layer != layers.end();) {
+            if (layer->second.release(timeline)) layer = layers.erase(layer);
+            else ++layer;
+        }
+        if (layers.empty()) pages_.erase(found);
     }
+
     for (const auto slot : changes.returned_slots) {
-        for (const auto & field : resources_.request_fields()) slots_[{ slot, field }].initialized.clear();
+        for (const auto & field : resources_.request_fields()) invalidate_slot(slot, field, timeline);
     }
-    for (const auto & [field, slot] : changes.returned_fields) slots_[{ slot, field }].initialized.clear();
+    for (const auto & [field, slot] : changes.returned_fields) invalidate_slot(slot, field, timeline);
+}
+
+void GraphDependencies::invalidate_slot(std::size_t slot, const std::string & field, const Timeline & timeline) {
+    const auto found = slots_.find({ slot, field });
+    if (found != slots_.end() && found->second.release(timeline)) slots_.erase(found);
 }
 
 std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Timeline & timeline, std::span<const ServiceDuration> durations,
@@ -87,9 +97,9 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
     }
 
     // Aliased ports may expose one access repeatedly; distinct ranges, modes and event intervals stay distinct.
-    std::map<Contents *, std::set<Access>> accesses;
+    std::unordered_map<Contents *, std::set<Access>> accesses;
     std::map<std::size_t, std::vector<std::pair<Contents *, Access>>> uninitialized;
-    std::map<std::tuple<std::string, std::string, std::int64_t, std::int64_t>, std::vector<KvPageRange>> bindings;
+    std::map<std::tuple<std::string, std::string, std::int64_t, std::int64_t>, std::vector<KvPageRange>> page_bindings;
     std::map<std::tuple<std::string, std::string, std::string>, std::size_t> state_bindings;
     std::set<std::tuple<std::size_t, std::size_t, Relation>> dependencies;
 
@@ -156,9 +166,13 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
             // One-sided transfers update the destination owner's contents without inventing a receive invocation.
             auto & owner = *pools.at(access.value.pool);
             for (const auto & region : access.value.regions) {
-                auto ranges = owner.pool_.ranges(owner.requests_.at(region.request), region.begin, region.end);
-                for (const auto & range : ranges) {
-                    auto & contents = owner.pages_[{ range.page, access.value.layer }];
+
+                // Every layer in this invocation uses the same physical mapping for a request range.
+                const auto [mapping, added] = page_bindings.try_emplace({ access.value.pool, region.request, region.begin, region.end });
+                if (added) mapping->second = owner.pool_.ranges(owner.requests_.at(region.request), region.begin, region.end);
+
+                for (const auto & range : mapping->second) {
+                    auto & contents = owner.pages_[range.page][access.value.layer];
                     const bool write = access.value.access == StateAccess::Write;
                     for (const auto & [begin, end] : access.value.slice.ranges(range.begin, range.end)) {
                         const Access interval{ begin, end, write, access.start, access.finish };
@@ -166,9 +180,6 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
                         if (!write && !contents.covers(begin, end)) uninitialized[access.start].emplace_back(&contents, interval);
                     }
                 }
-
-                // Layers share the same physical mapping; diagnostics keep one copy per invocation and logical range.
-                if (observer_) bindings.try_emplace({ access.value.pool, region.request, region.begin, region.end }, std::move(ranges));
             }
         }
     }
@@ -227,20 +238,19 @@ std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Ti
     for (const auto & [source, target, relation] : dependencies) inputs.push_back({ source, target, relation });
     const auto events = timeline.insert(graph, durations, inputs, boundaries);
     observations_.clear();
-    for (const auto & [key, ranges] : bindings) {
-        const auto & [pool, request, begin, end] = key;
-        const auto & owner = *pools.at(pool);
-        observer_->bound(events.at(entered),
-                         pool,
-                         request,
-                         owner.pool_.residence(owner.requests_.at(request)).slot,
-                         begin,
-                         ranges);
+
+    if (observer_) {
+        for (const auto & [key, ranges] : page_bindings) {
+            const auto & [pool, request, begin, end] = key;
+            const auto & owner = *pools.at(pool);
+            observer_->bound(events.at(entered), pool, request, owner.pool_.residence(owner.requests_.at(request)).slot, begin, ranges);
+        }
+        for (const auto & [key, slot] : state_bindings) {
+            const auto & [pool, field, request] = key;
+            observer_->state_bound(events.at(entered), pool, field, request, slot);
+        }
     }
-    for (const auto & [key, slot] : state_bindings) {
-        const auto & [pool, field, request] = key;
-        observer_->state_bound(events.at(entered), pool, field, request, slot);
-    }
+
     for (auto & [contents, current] : accesses) contents->commit(current, events);
     for (const auto & port : graph.scopes.front().ports) {
         if (port.use == PortUse::Signal && port.direction == Direction::Output) signals_.emplace(port.signal, events[port.event]);
@@ -265,10 +275,8 @@ std::set<std::size_t> GraphDependencies::retain(const std::set<std::string> & bi
         if (!bindings.contains(it->first) && it->second.active.empty()) it = tensors_.erase(it);
         else ++it;
     }
-    prune_returned(pages_, timeline);
-    prune_returned(slots_, timeline);
 
-    // Active accesses finish in the future and the timeline keeps them; published values may already be complete.
+    // Published values and signals can still be consumed after their producing event has completed.
     std::set<std::size_t> retained = observations_;
     for (const auto & [_, value] : values_) retained.insert(value.second);
     for (const auto & [_, event] : signals_) retained.insert(event);

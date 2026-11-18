@@ -38,6 +38,7 @@ public:
                                     std::span<const BoundaryTime> boundaries = {});
     std::optional<EventCompletion> advance(std::optional<std::int64_t> until_ns = {});
     bool completed(std::size_t event) const;
+    bool in_flight(std::size_t event) const;
     void observe(std::size_t source, std::size_t boundary);
     std::size_t defer();
     void resolve(std::size_t event, std::span<const std::size_t> sources, Relation relation = Relation::Communication,

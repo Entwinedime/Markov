@@ -394,7 +394,7 @@ nlohmann::json NativeController::resource_call(const std::string & group, const 
 
     // Another participant may write this pool before its owner's next action; do not defer invalidation to that action.
     const auto changes = participant.resources.take_changes();
-    participant.dependencies.invalidate(changes);
+    participant.dependencies.invalidate(changes, timeline_);
     auto & input = inputs_.at(instances_.at(group));
     if (changes.capacity_increased) input.woken = true;
     if (observer_) observer_->applied(group, message, result, changes, timeline_.now_ns());
