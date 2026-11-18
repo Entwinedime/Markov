@@ -124,16 +124,21 @@ class TensorBoundaries(TorchDispatchMode):
 
     def __torch_dispatch__(self, operation: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
         keywords = {} if kwargs is None else kwargs
-        incoming = {
-            self.storage(tensor).identity
-            for tensor in _pytree.tree_leaves((args, keywords))
-            if isinstance(tensor, torch.Tensor)
-        }
+
+        # Keep weak input lifetimes for alias comparison; read-only weights need no persistent mutation record.
+        incoming = {}
+        for tensor in _pytree.tree_leaves((args, keywords)):
+            if isinstance(tensor, torch.Tensor):
+                lifetime = StorageWeakRef(tensor.untyped_storage())
+                incoming[lifetime.cdata] = lifetime
+
+        schema = operation._schema
         mutated = []
-        for index, parameter in enumerate(operation._schema.arguments):
-            if parameter.alias_info is not None and parameter.alias_info.is_write:
-                value = args[index] if index < len(args) else keywords.get(parameter.name)
-                mutated.extend(item for item in _pytree.tree_leaves(value) if isinstance(item, torch.Tensor))
+        if schema.is_mutable:
+            for index, parameter in enumerate(schema.arguments):
+                if parameter.alias_info is not None and parameter.alias_info.is_write:
+                    value = args[index] if index < len(args) else keywords.get(parameter.name)
+                    mutated.extend(item for item in _pytree.tree_leaves(value) if isinstance(item, torch.Tensor))
 
         result = operation(*args, **keywords)
         with torch._C.DisableTorchFunction(), _disable_current_modes():
@@ -145,7 +150,10 @@ class TensorBoundaries(TorchDispatchMode):
             for tensor in _pytree.tree_leaves(result):
                 if isinstance(tensor, torch.Tensor):
                     state = self.storage(tensor)
-                    if state.writer is None and (fresh or state.identity not in incoming):
+                    prior = incoming.get(state.lifetime.cdata)
+
+                    # Rebinding an input can retire its old storage during the call; an address alone is not a lifetime.
+                    if state.writer is None and (fresh or prior is None or prior.expired()):
                         state.writer = self.capture.current.get()
                         state.allocation = state.writer
                         state.exposed = False

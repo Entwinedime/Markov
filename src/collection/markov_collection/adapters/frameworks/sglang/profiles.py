@@ -64,15 +64,10 @@ class NativeProfiles:
                 self.observation.capture.runtime.release()
         return result
 
-    @staticmethod
-    def handler(original: Any, directory: str, *args: Any, **kwargs: Any) -> Any:
-
-        # Native recording must close before CPU-only SDK export and graph production begin.
-        kwargs["analyse_flag"] = False
-        return original(directory, *args, **kwargs)
-
     def install(self) -> None:
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+        from markov_collection.adapters.runtimes.ascend.profiling import AscendProfiling
 
         for target, hook in self.protocol.hooks():
             HookRegistry.register(target, hook, HookType.AROUND)
@@ -82,7 +77,7 @@ class NativeProfiles:
             manager + "_profile": self.request,
             manager + "_init_profile": self.start,
             manager + "_stop_profile": self.stop,
-            "torch_npu.profiler.tensorboard_trace_handler": self.handler,
         }
+        targets.update(AscendProfiling.hooks())
         for target, hook in targets.items():
             HookRegistry.register(target, hook, HookType.AROUND)

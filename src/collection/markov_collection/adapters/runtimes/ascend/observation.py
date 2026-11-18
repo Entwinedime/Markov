@@ -43,10 +43,14 @@ class AscendObservation:
                 "parent", "role", "site", "implementation", "parameters", "constants", "arguments", "work", "bindings",
             )}
             info["bindings"] = dict(info["bindings"])
+
             info["guards"] = scope.get("guards", [])
             for name in ("effects", "publication"):
                 if name in scope:
                     info["bindings"][name] = scope[name]
+
+            # Raw and interpreted scope IDs have separate consumers; record their owner at production.
+            info["bindings"]["source_scopes"] = [identity]
             if "communication" in scope:
                 info["communication"] = scope["communication"]
             info["ports"] = []

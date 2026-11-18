@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
-import time
+from bisect import bisect_right
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,41 +21,35 @@ class AscendClock:
         if status:
             raise RuntimeError(f"Ascend clock device mapping failed: {status}")
 
-        driver = ctypes.CDLL("libascend_hal.so")
-        query = driver.halGetDeviceInfo
-        query.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)]
-        query.restype = ctypes.c_int
-        samples = []
-        for _ in range(5):
-            native_raw, counter = ctypes.c_int64(), ctypes.c_int64()
-            begin = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        sample = ctypes.CDLL(None).markov_sample_device
+        sample.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+        sample.restype = ctypes.c_int
+        values = (ctypes.c_uint64 * 3)()
 
-            # Match the profiler's paired MONOTONIC_RAW / SYS_COUNT query; bracket both driver calls.
-            for kind, value in ((14, native_raw), (13, counter)):
-                status = query(device.value, 0, kind, ctypes.byref(value))
-                if status:
-                    raise RuntimeError(f"Ascend clock query {kind} failed: {status}")
-            end = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
-            samples.append({"device": device.value, "counter": counter.value, "begin_raw_ns": begin, "end_raw_ns": end})
-
-        # Minimize acquisition uncertainty, independently of any workload or graph completion time.
-        return min(samples, key=lambda sample: sample["end_raw_ns"] - sample["begin_raw_ns"])
+        # The native helper brackets only the actual queries; Python releases the GIL outside that interval.
+        status = sample(device.value, values)
+        if status:
+            raise RuntimeError(f"Ascend native clock acquisition failed: {status}")
+        counter, begin, end = values
+        return {"device": device.value, "counter": counter, "begin_raw_ns": begin, "end_raw_ns": end}
 
     def __init__(self, device: Path, samples: list[dict]) -> None:
-        self.first, self.last = samples
+        if len(samples) < 2:
+            raise ValueError("device clock requires at least two independent samples")
         physical = device.name.removeprefix("device_")
         for sample in samples:
             if sample["device"] != int(physical) or sample["begin_raw_ns"] > sample["end_raw_ns"]:
                 raise ValueError("device clock calibration has a different device or reversed host interval")
-        self.begin_ns = (self.first["begin_raw_ns"] + self.first["end_raw_ns"]) // 2
-        self.end_ns = (self.last["begin_raw_ns"] + self.last["end_raw_ns"]) // 2
-        self.counts = self.last["counter"] - self.first["counter"]
-        if self.counts <= 0 or self.first["end_raw_ns"] >= self.last["begin_raw_ns"]:
+        if any(left["counter"] >= right["counter"] or left["end_raw_ns"] >= right["begin_raw_ns"]
+               for left, right in zip(samples, samples[1:])):
             raise ValueError("device clock calibration requires advancing, separated counter samples")
+        self.counters = [sample["counter"] for sample in samples]
+        self.midpoints = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
+        self.begin_ns, self.end_ns = self.midpoints[0], self.midpoints[-1]
 
-        # Undo the SDK's export formula before applying our independently observed counter/RAW relation.
+        # Keep the epoch offset exact; float-to-string conversion can lose several device counter ticks.
         start = json.loads((device / f"start_info.{physical}").read_text())
-        self.offset_us = Decimal(str(float(start["collectionTimeBegin"]) - float(start["clockMonotonicRaw"]) / 1000))
+        self.offset_us = Decimal(str(start["collectionTimeBegin"])) - Decimal(start["clockMonotonicRaw"]) / 1000
         info = json.loads((device / f"info.json.{physical}").read_text())
         self.frequency = Decimal(info["DeviceInfo"][0]["hwts_frequency"]) * 1_000_000
         host = self.values(device / f"host_start.log.{physical}")
@@ -72,7 +66,12 @@ class AscendClock:
     def timestamp(self, microseconds: Decimal) -> int:
         raw = (microseconds - self.offset_us) * 1000
         counter = self.counter_anchor + round((raw - self.host_anchor) * self.frequency / 1_000_000_000)
-        return self.begin_ns + (counter - self.first["counter"]) * (self.end_ns - self.begin_ns) // self.counts
+
+        # Extrapolated SDK setup/teardown records are filtered outside the valid observation window.
+        index = min(max(bisect_right(self.counters, counter) - 1, 0), len(self.counters) - 2)
+        begin, end = self.counters[index:index + 2]
+        start, finish = self.midpoints[index:index + 2]
+        return start + (counter - begin) * (finish - start) // (end - begin)
 
     def interval(self, record: dict) -> tuple[int, int]:
         begin = Decimal(str(record["ts"]))

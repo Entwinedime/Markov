@@ -6,11 +6,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <limits>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <utility>
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -47,27 +51,72 @@ struct HostTimestamp {
     std::int64_t raw_ns;
 };
 
+std::int64_t monotonic_raw_ns() {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
+}
+
 HostTimestamp host_timestamp() {
     std::uint64_t counter;
 
     // Match the profiler's AArch64 counter for ordering; RAW remains a separately observed measurement.
     asm volatile("isb; mrs %0, cntvct_el0" : "=r"(counter) : : "memory");
-    timespec now;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-    return { counter, static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec };
+    return { counter, monotonic_raw_ns() };
 }
 
-void append_record(const char * directory, const char * record, int size, std::size_t capacity) {
-    char path[4'096];
-    const auto path_size = std::snprintf(path, sizeof(path), "%s/%d.jsonl", directory, getpid());
-    if (path_size < 0 || static_cast<std::size_t>(path_size) >= sizeof(path) || size < 0 || static_cast<std::size_t>(size) >= capacity) std::abort();
+class RuntimeLog {
+public:
+    ~RuntimeLog() { close(); }
 
-    // One append avoids inherited buffered state and locks across native worker forks.
-    const auto file = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-    if (file < 0 || write(file, record, static_cast<std::size_t>(size)) != size || close(file) != 0) {
+    void append(const char * directory, const char * record, std::size_t size) {
+        const auto process = getpid();
+        if (process_ != process || directory_ != directory) {
+            close();
+            char path[4'096];
+            const auto length = std::snprintf(path, sizeof(path), "%s/%d.jsonl", directory, process);
+            if (length < 0 || static_cast<std::size_t>(length) >= sizeof(path)) std::abort();
+            file_ = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+            if (file_ < 0) fail();
+            process_ = process;
+            directory_ = directory;
+        }
+
+        // One unbuffered append preserves complete concurrent records without opening the file for every API.
+        if (write(file_, record, size) != static_cast<ssize_t>(size)) fail();
+    }
+
+private:
+    static void fail() {
         std::perror("markov: cannot record native runtime API");
         std::abort();
     }
+
+    void close() {
+        if (file_ >= 0 && ::close(std::exchange(file_, -1)) != 0) fail();
+    }
+
+    pid_t process_ = -1;
+    int file_ = -1;
+    std::string directory_;
+};
+
+void append_record(const char * directory, const char * record, int size, std::size_t capacity) {
+    if (size < 0 || static_cast<std::size_t>(size) >= capacity) std::abort();
+
+    // Native teardown can log after C++ thread-local destruction; POSIX ownership permits a fresh per-thread handle.
+    static const auto key = [] {
+        pthread_key_t result;
+        if (pthread_key_create(&result, [](void * log) { delete static_cast<RuntimeLog *>(log); }) != 0) std::abort();
+        return result;
+    }();
+    auto * log = static_cast<RuntimeLog *>(pthread_getspecific(key));
+    if (log == nullptr) {
+        auto owned = std::make_unique<RuntimeLog>();
+        if (pthread_setspecific(key, owned.get()) != 0) std::abort();
+        log = owned.release();
+    }
+    log->append(directory, record, static_cast<std::size_t>(size));
 }
 
 class DriverCall {
@@ -220,6 +269,29 @@ extern "C" void markov_sample_host(std::uint64_t * values) {
     const auto sample = host_timestamp();
     values[0] = sample.counter;
     values[1] = static_cast<std::uint64_t>(sample.raw_ns);
+}
+
+extern "C" int markov_sample_device(std::uint32_t device, std::uint64_t * values) {
+    static const auto query = driver_original<decltype(&halGetDeviceInfo)>("halGetDeviceInfo");
+    auto narrowest = std::numeric_limits<std::int64_t>::max();
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        std::int64_t native_raw, counter;
+        const auto begin = monotonic_raw_ns();
+
+        // Keep the SDK's paired queries inside one native bracket, without Python or GIL handoffs between them.
+        auto status = query(device, MODULE_TYPE_SYSTEM, INFO_TYPE_MONOTONIC_RAW, &native_raw);
+        if (status != 0) return static_cast<int>(status);
+        status = query(device, MODULE_TYPE_SYSTEM, INFO_TYPE_SYS_COUNT, &counter);
+        if (status != 0) return static_cast<int>(status);
+        const auto end = monotonic_raw_ns();
+        if (end - begin < narrowest) {
+            narrowest = end - begin;
+            values[0] = static_cast<std::uint64_t>(counter);
+            values[1] = static_cast<std::uint64_t>(begin);
+            values[2] = static_cast<std::uint64_t>(end);
+        }
+    }
+    return 0;
 }
 
 extern "C" void markov_set_runtime_enabled(int enabled) { runtime_enabled.store(enabled != 0, std::memory_order_relaxed); }

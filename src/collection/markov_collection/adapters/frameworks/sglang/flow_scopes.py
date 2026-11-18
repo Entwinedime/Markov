@@ -117,12 +117,11 @@ class FlowScopes(CallSegments):
 
     @contextmanager
     def enclosing(self, frame):
+
+        # Segments and child calls own every device operation; this envelope preserves only their nesting.
         with self.observation.call(
             "invocation", frame.original, parameters=frame.parameters, work=frame.work,
-            device=not frame.host_only and frame.operation != "kv_enqueue",
         ) as call:
-
-            # Only the segments contain native business work; this envelope preserves their nesting.
             call.record["envelope"] = True
             yield
         if frame.values:

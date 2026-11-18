@@ -56,10 +56,12 @@ class ServiceExecutions:
             ServiceExecution(scope["id"], call["thread"], call["begin_counter"], call["end_counter"])
             for scope in scopes for call in scope["service"]["executions"]
         ]
-        for call in self.executions:
+        by_owner = defaultdict(list)
+        for index, call in enumerate(self.executions):
             interval = owners[call.scope]["host_interval"]
             if not interval["begin_counter"] <= call.begin <= call.end <= interval["end_counter"]:
                 raise ValueError("transport execution escapes its synchronous service boundary")
+            by_owner[call.scope, call.thread].append((index, call))
         self.submissions = {}
         queue_owners = {}
         submitted = set()
@@ -70,9 +72,8 @@ class ServiceExecutions:
             if type(row["tasks"]) is not int or row["tasks"] < 0:
                 raise ValueError("private queue submission requires its observed nonnegative SQE count")
             matches = [
-                (index, call) for index, call in enumerate(self.executions)
-                if call.scope == row["service"] and call.thread == native.thread
-                and call.begin <= native.begin and native.end <= call.end
+                (index, call) for index, call in by_owner[row["service"], native.thread]
+                if call.begin <= native.begin and native.end <= call.end
             ]
             if len(matches) != 1:
                 raise ValueError("native queue submission lacks one explicit service execution")

@@ -34,12 +34,10 @@ def main() -> None:
     else:
         from markov_adapters.sglang.pipeline import PipelineABI
         from markov_adapters.sglang.resources import ResourceInputs
-        from markov_collection.adapters.frameworks.sglang.closed_regions import ClosedRegions
         from markov_collection.adapters.frameworks.sglang.kv_facts import NativeKvFacts
         from markov_collection.adapters.runtimes.ascend.observation import AscendObservation
 
         native = NativeKvFacts(arguments.input, arguments.rank)
-        regions = ClosedRegions()
         recording = native.document()
         recording["scopes"] = ResourceInputs.scopes(recording["scopes"], recording["environment"])
 
@@ -48,7 +46,7 @@ def main() -> None:
         observation.name_streams(*PipelineABI.stream_declarations(recording))
         facts = observation.document(arguments.evidence)
         native.connect_metadata(facts)
-        write_json(arguments.output, regions.normalize(facts), replace=False)
+        write_json(arguments.output, facts, replace=False)
 
 
 if __name__ == "__main__":

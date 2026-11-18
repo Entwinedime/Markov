@@ -39,7 +39,6 @@ class NativeSignals:
             ) as call:
                 result = self.record_event(call, original, event, stream)
                 self.publish(call, event, "completion")
-            self.capture.runtime.retire()
             return result
         if call is None or self.capture.current.get() != call.identity:
             return original(event, stream)

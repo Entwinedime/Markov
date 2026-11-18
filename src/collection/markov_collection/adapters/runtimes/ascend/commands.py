@@ -30,6 +30,31 @@ class StreamCommand:
         return self.source.stream
 
 
+class CommandPositions:
+    def __init__(self, trace: AscendTrace, tasks: list[DeviceTask]) -> None:
+        bounds = [(api.end, api.begin, index) for index, task in enumerate(tasks)
+                  if (api := trace.apis.get(task.record["args"]["connection_id"])) is not None]
+
+        # CPU API boundaries constrain insertion, while the stored indices retain native device order.
+        endings = sorted((end, index + 1) for end, _, index in bounds)
+        self.before, self.latest = [end for end, _ in endings], [0]
+        for _, position in endings:
+            self.latest.append(max(self.latest[-1], position))
+
+        beginnings = sorted((begin, end, index) for end, begin, index in bounds)
+        self.after = [(begin, end) for begin, end, _ in beginnings]
+        self.earliest = [len(tasks)] * (len(beginnings) + 1)
+        for index in range(len(beginnings) - 1, -1, -1):
+            self.earliest[index] = min(self.earliest[index + 1], beginnings[index][2])
+
+    def bounds(self, api: Interval) -> tuple[int, int]:
+        lower = self.latest[bisect_right(self.before, api.begin)]
+
+        # The end-before branch wins when both APIs have zero duration at the same time.
+        upper = self.earliest[bisect_right(self.after, (api.end, api.begin))]
+        return lower, upper
+
+
 class StreamCommands:
     def __init__(self, trace: AscendTrace) -> None:
         self.trace = trace
@@ -91,6 +116,7 @@ class StreamCommands:
         for stream in sorted(streams.keys() | calls.keys()):
             tasks = sorted(streams[stream], key=lambda task: task.begin)
             positions = [task.begin for task in tasks]
+            command_positions = None
             gaps: dict[int, list[NativeStreamCall]] = defaultdict(list)
             for call in calls[stream]:
                 observed = trace.tasks.get(call.api.record["args"]["connection_id"], [])
@@ -106,15 +132,9 @@ class StreamCommands:
                         raise ValueError("unmatched stream wait has native queue submissions")
 
                     # Submission order bounds the missing command; concurrent commands cannot be guessed past.
-                    lower, upper = 0, len(tasks)
-                    for index, task in enumerate(tasks):
-                        api = trace.apis.get(task.record["args"]["connection_id"])
-                        if api is None:
-                            continue
-                        if api.end <= call.api.begin:
-                            lower = max(lower, index + 1)
-                        elif api.begin >= call.api.end:
-                            upper = min(upper, index)
+                    if command_positions is None:
+                        command_positions = CommandPositions(trace, tasks)
+                    lower, upper = command_positions.bounds(call.api)
                     if lower != upper:
                         raise ValueError(f"stream {stream} operation in scope {call.scope} has no unique command position: {lower}..{upper}")
                     position = lower

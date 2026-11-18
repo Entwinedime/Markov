@@ -87,8 +87,6 @@ class SGLangObservation:
         finally:
             if outer:
                 self.tensors.retire()
-        if outer:
-            self.capture.runtime.retire()
 
     def load_model(self, original: Any, runner: Any) -> Any:
         from sglang.srt.layers.radix_attention import RadixAttention
@@ -171,8 +169,7 @@ class SGLangObservation:
     def request(self, original: Any, scheduler: Any, request: Any) -> Any:
         self.window.begin(request.rid)
         if self.window.phase == "source" and self.selected and not self.active:
-            self.capture.runtime.calibrate()
-            self.window_scope = self.capture.runtime.scope("markov.window")
+            self.window_scope = self.capture.runtime.window()
             self.window_scope.__enter__()
             self.active = True
             self.native(1)
@@ -273,7 +270,9 @@ class SGLangObservation:
         with self.call("model", original, device=True) as call:
             call.record["parameters"].update(input_tokens=int(batch.input_ids.numel()), members=int(batch.batch_size))
             self.batch_ports(call, batch, "input")
-            return original(runner, batch, *args, **kwargs)
+            result = original(runner, batch, *args, **kwargs)
+        self.capture.runtime.checkpoint()
+        return result
 
     def model_geometry(self, tokens: int, members: int) -> None:
 
@@ -320,7 +319,6 @@ class SGLangObservation:
         self.native(0)
         if self.active:
             self.window_scope.__exit__(None, None, None)
-            self.capture.runtime.calibrate()
             self.active = False
             if self.resource_history is not None:
                 self.resource_history.close()

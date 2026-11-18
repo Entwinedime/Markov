@@ -26,7 +26,6 @@ class TransferWork:
         ) as call:
             call.work_signal("completion", "input", self.producer)
             result = self.work.wait(*args, **kwargs)
-        owner.capture.runtime.retire()
         return result
 
 
@@ -83,7 +82,6 @@ class NativeTransfers:
                 call.port("payload", "output", owner.tensors.observe(tensor, list(parameters)), use="device")
             call.work_signal("completion", "output", call.identity)
         owner.tensors.retire()
-        owner.capture.runtime.retire()
         return TransferWork(owner, self.messages, result, call.identity, direction, work["context"])
 
     def install(self):

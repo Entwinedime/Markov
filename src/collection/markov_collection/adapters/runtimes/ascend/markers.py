@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -17,20 +18,43 @@ from markov_collection.adapters.runtimes.ascend.clock import AscendClock
 class AscendMarkers:
     def __init__(self) -> None:
         self.points: list[dict[str, Any]] = []
-        self.events: list[Any] = []
+        self.stream_events: dict[Any, Any] = {}
         self.lock = threading.Lock()
         self.recording = ContextVar("observer_point", default=False)
         self.clock_samples = []
+        self.observing = False
         self.intervals = []
-        self.host_sample = ctypes.CDLL(None).markov_sample_host
+
+        # These bounded CPU-only helpers must not release the GIL just to read a clock or exchange a thread-local value.
+        bridge = ctypes.PyDLL(None)
+        self.host_sample = bridge.markov_sample_host
         self.host_sample.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
         self.host_sample.restype = None
-        self.native_service = ctypes.CDLL(None).markov_set_service_scope
+        self.native_service = bridge.markov_set_service_scope
         self.native_service.argtypes = [ctypes.c_int64]
         self.native_service.restype = ctypes.c_int64
 
-    def calibrate(self) -> None:
+    @contextmanager
+    def window(self):
         self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
+        self.observing = True
+        try:
+            with self.scope("markov.window"):
+                yield
+        finally:
+            self.observing = False
+            self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
+
+    def checkpoint(self) -> None:
+        if not self.observing:
+            return
+        elapsed_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - self.clock_samples[-1]["end_raw_ns"]
+        if elapsed_ns < 1_000_000_000:
+            return
+
+        # Sampling cadence controls observation overhead; the actual independent snapshots define the clock segments.
+        with self.scope("markov.observer"):
+            self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
 
     def timestamp(self, record, side):
         sample = (ctypes.c_uint64 * 2)()
@@ -42,7 +66,7 @@ class AscendMarkers:
 
     @contextmanager
     def scope(self, name: str):
-        if len(self.clock_samples) != 1:
+        if not self.observing:
             yield
             return
         record = {"name": name, "thread": threading.get_native_id()}
@@ -85,18 +109,17 @@ class AscendMarkers:
             self.recording.reset(token)
 
     def point(self, scope: int, side: str, stream=None) -> int:
+        stream = torch_npu.npu.current_stream() if stream is None else stream
 
-        # Keep in-flight events alive; the API log records handle lifetimes when completed markers are released.
-        event = torch_npu.npu.Event()
-        with self.native_point(scope, side) as identity:
+        # Nobody waits on observer handles; each repeated record has its own SDK measurement and point identity.
+        with self.native_point(scope, side) as identity, self.lock:
+            event = self.stream_events.get(stream)
+            if event is None:
+                event = torch_npu.npu.Event()
+                self.stream_events[stream] = event
             event.record(stream)
-        self.events.append(event)
         return identity
 
-    def retire(self) -> None:
-        with self.scope("markov.observer"):
-            self.events = [event for event in self.events if not event.query()]
-
     def release(self) -> None:
-        with self.scope("markov.observer"):
-            self.events.clear()
+        with self.scope("markov.observer"), self.lock:
+            self.stream_events.clear()

@@ -67,7 +67,6 @@ class PipelineScopes:
             parameters={}, work=work, bindings={"streams": streams}, device=True, stream=stream,
         ):
             result = original(stream, other)
-        owner.capture.runtime.retire()
         return result
 
     def install(self):
