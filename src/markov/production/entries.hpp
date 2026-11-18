@@ -17,7 +17,7 @@ namespace markov {
 class EntryExtraction {
 public:
     explicit EntryExtraction(const CoarseGraph & source);
-    CoarseGraph extract(std::size_t scope) const;
+    CoarseGraph extract(std::size_t scope, std::vector<std::size_t> * origins = nullptr) const;
 
 private:
     using SlotContent = std::tuple<std::string, std::string, std::string>;

@@ -25,6 +25,7 @@
 #include "markov/execution/timing.hpp"
 #include "markov/graph/observation.hpp"
 #include "markov/graph/types.hpp"
+#include "markov/production/entries.hpp"
 #include "markov/production/projection.hpp"
 #include "markov/production/templates.hpp"
 #include "markov/templates/library.hpp"
@@ -91,6 +92,7 @@ private:
 };
 
 constexpr std::string_view usage = "markov project <native-facts.json> <coarse.json> [--evidence]\n"
+                                   "markov action-layouts <observed-coarse.json> <layouts.json>\n"
                                    "markov templates <coarse.json> <templates.json>\n"
                                    "markov link-templates <source-libraries.json> <output-directory>\n"
                                    "markov instantiate <templates.json> <invocation.json> <coarse.json>\n"
@@ -189,6 +191,17 @@ int main(int argc, char ** argv) {
             auto source = markov::CoarseGraph::read(read_json(argv[2]));
             if (source.environment.at("framework") != "sglang") throw std::invalid_argument("source framework has no template recipe adapter");
             output = markov::sglang::NativeTemplates::compile(std::move(source)).document();
+        }
+        else if (command == "action-layouts" && argc == 4) {
+            const auto source = markov::sglang::NativeTemplates::describe(markov::CoarseGraph::read(read_json(argv[2])));
+            const markov::EntryExtraction extraction(source.graph);
+            output = nlohmann::json::object();
+            for (const auto & entry : source.entries) {
+                std::vector<std::size_t> origins;
+                auto layout = extraction.extract(entry.scope, &origins).action_layout();
+                for (auto & event : layout.events) event = origins[event];
+                output[std::to_string(entry.scope)] = {{"identity", std::move(layout.identity)}, {"events", std::move(layout.events)}};
+            }
         }
         else if (command == "link-templates" && argc == 4) {
             std::vector<markov::TemplateLibrary> libraries;

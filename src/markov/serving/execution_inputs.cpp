@@ -32,13 +32,15 @@ ServiceDuration service(const nlohmann::json & record) {
 } // namespace
 
 ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver * observer)
-    : context_values_(source.at("context_values")), observer_(observer) {
+    : context_values_(source.at("context_values")), layouts_(source.contains("layouts") ? &source.at("layouts") : nullptr), observer_(observer) {
     if (!source.at("actors").is_object()) throw std::invalid_argument("execution inputs require an actor mapping");
     if (!context_values_.is_array()) throw std::invalid_argument("execution inputs require a context value array");
     for (const auto & [field, _] : source.items()) {
-        if (field != "actors" && field != "context_values" && field != "notifications" && field != "transfers" && field != "ingress")
+        if (field != "actors" && field != "context_values" && field != "notifications" && field != "transfers" && field != "ingress" && field != "layouts")
             throw std::invalid_argument("unknown execution input field: " + field);
     }
+    if (layouts_ && (!layouts_->is_array() || layouts_->empty() || !source.at("transfers").empty()))
+        throw std::invalid_argument("full timing requires action layouts and directly measured work outside the CPU wire protocol");
     for (const auto & [group, record] : source.at("actors").items()) {
         const auto & steps = record.at("steps");
         if (group.empty() || !steps.is_array() || record.size() != 1)
@@ -48,6 +50,8 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
             if ((operation != "action" && operation != "cpu" && operation != "input") || !step.at("identity").is_object()
                 || !step.at("source").is_object() || step.at("source").empty())
                 throw std::invalid_argument("execution input requires an operation, logical identity and source reference");
+            if (layouts_ && (operation == "cpu" || (operation == "action" && (step.contains("bindings") || !step.at("layout").is_number_unsigned()))))
+                throw std::invalid_argument("full timing requires action time facts without native construction bindings");
         }
         actors_.emplace(group, Actor{ steps });
     }
@@ -80,6 +84,8 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
         if (!transfers_.emplace(key, Condition{ record }).second) throw std::invalid_argument("execution inputs repeat a CPU transfer");
     }
 }
+
+bool ExecutionInputs::full_coverage() const { return layouts_ != nullptr; }
 
 void ExecutionInputs::bind(std::span<const std::string> participants) const {
     if (participants.size() != actors_.size() || std::ranges::any_of(participants, [&](const auto & group) { return !actors_.contains(group); }))
@@ -127,7 +133,7 @@ const nlohmann::json & ExecutionInputs::take(const std::string & group, const st
 InvocationInput ExecutionInputs::invocation(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
     const auto & record = take(group, operation, identity);
     ++graph_count_;
-    return { record, { group, actors_.at(group).next - 1 } };
+    return { record, { group, actors_.at(group).next - 1 }, layouts_ };
 }
 
 const nlohmann::json & InvocationInput::bindings() const {
@@ -174,6 +180,45 @@ std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector)
 } // namespace
 
 GraphTiming InvocationInput::timing(const CoarseGraph & graph) const {
+    if (layouts) {
+        const auto layout = graph.action_layout();
+        const auto & timestamps = record.at("timestamps").get_ref<const nlohmann::json::array_t &>();
+        if (layout.identity != layouts->at(record.at("layout").get<std::size_t>()) || timestamps.size() != layout.events.size())
+            throw std::invalid_argument("first measured action layout divergence at " + position.group + " step " + std::to_string(position.step)
+                                        + " (" + graph.scopes.front().info.site + ")");
+
+        // Observed endpoints constrain the time line directly without deriving a predecessor's finish from a later event.
+        GraphTiming result{ std::vector<ServiceDuration>(graph.work.size()), {} };
+        result.boundaries.reserve(timestamps.size());
+        std::set<std::size_t> native_events;
+        for (std::size_t index = 0; index < timestamps.size(); ++index) {
+            const auto & observation = timestamps[index];
+            if (!observation.is_array() || observation.size() != 2 || !observation[0].is_number_unsigned() || !observation[1].is_number_integer())
+                throw std::invalid_argument("full timing needs an original event and its realized nanoseconds");
+            const auto source = observation[0].get<std::size_t>();
+            const auto time = observation[1].get<std::int64_t>();
+            if (time < 0 || !native_events.insert(source).second)
+                throw std::invalid_argument("full timing has a negative time or a repeated native event");
+            result.boundaries.push_back({ layout.events[index], {time, time}, source });
+        }
+        std::map<std::pair<std::size_t, std::size_t>, std::int64_t> services;
+        for (const auto & interval : record.at("services").get_ref<const nlohmann::json::array_t &>()) {
+            if (!interval.is_array() || interval.size() != 2 || !interval[0].is_number_unsigned() || !interval[1].is_number_unsigned())
+                throw std::invalid_argument("observed service requires two measured endpoint positions");
+            const auto & start = result.boundaries.at(interval[0].get<std::size_t>());
+            const auto & finish = result.boundaries.at(interval[1].get<std::size_t>());
+            if (const auto elapsed = finish.window.begin_ns - start.window.begin_ns;
+                elapsed < 0 || !services.emplace(std::pair{start.event, finish.event}, elapsed).second)
+                throw std::invalid_argument("observed service reverses time or repeats an interval");
+        }
+        for (std::size_t index = 0; index < graph.work.size(); ++index) {
+            const auto & work = graph.work[index];
+            if (auto measured = services.extract({work.start, work.finish}); !measured.empty()) result.work_ns[index] = measured.mapped();
+        }
+        if (!services.empty()) throw std::invalid_argument("observed service has no matched work");
+        return result;
+    }
+
     std::map<std::size_t, TimeWindow> times;
     std::set<std::pair<std::string, Direction>> names;
     std::set<nlohmann::json> selectors;
@@ -236,9 +281,9 @@ nlohmann::json ExecutionInputs::finish() const {
             if (!condition.consumed) throw std::runtime_error("execution ended with an unused completion condition: " + identity.dump());
         }
     }
-    return {{ "duration_basis", "checked_causal_execution_inputs" }, { "timed_invocations", graph_count_ },
+    return {{ "duration_basis", full_coverage() ? "fully_matched_native_endpoints" : "checked_causal_execution_inputs" }, { "timed_invocations", graph_count_ },
              { "timed_input_reads", input_count_ }, { "timed_notifications", notifications_.size() }, { "timed_cpu_transfers", transfers_.size() },
-             { "timing_scope", "supplied_conditions_and_earliest_causal_realization_not_cost_accuracy" }};
+             { "timing_scope", full_coverage() ? "measured_work_and_event_coverage" : "supplied_conditions_and_earliest_causal_realization_not_cost_accuracy" }};
 }
 
 } // namespace markov

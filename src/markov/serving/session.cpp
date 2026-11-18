@@ -45,7 +45,7 @@ nlohmann::json ServingSession::run(std::int64_t given_work_ns, ExecutionInputs *
             const auto supplied = inputs
                 ? std::optional(inputs->invocation(action->task.group, "action", ExecutionInputs::action_identity(*action)))
                 : std::nullopt;
-            const auto bindings = supplied ? supplied->bindings() : action->work.value("bindings", nlohmann::json::object());
+            const auto bindings = supplied && !inputs->full_coverage() ? supplied->bindings() : action->work.value("bindings", nlohmann::json::object());
             const auto graph = participant.graphs.build(*action, bindings);
             const auto timing = supplied ? supplied->timing(graph)
                                          : GraphTiming{ std::vector<ServiceDuration>(graph.work.size(), given_work_ns), {} };

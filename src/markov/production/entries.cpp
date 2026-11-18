@@ -80,7 +80,7 @@ public:
         for (const auto identity : work_ids_) retain(source.work[identity].start, source.work[identity].finish);
     }
 
-    CoarseGraph extract() {
+    CoarseGraph extract(std::vector<std::size_t> * origins) {
         std::vector<std::vector<std::size_t>> resources(source_.resources.size());
         std::vector<std::size_t> ordered_events;
         for (const auto & [event, _] : event_ids_) ordered_events.push_back(event);
@@ -97,6 +97,7 @@ public:
             event_ids_.at(event) = graph_.events.size();
             resources[observed.resource].push_back(graph_.events.size());
             graph_.events.push_back({ owner, observed.resource });
+            if (origins) origins->push_back(event);
         }
         for (const auto & [scope, mapped] : scope_ids_) {
             for (const auto & access : source_.scopes[scope].kv_accesses)
@@ -277,6 +278,8 @@ EntryExtraction::EntryExtraction(const CoarseGraph & source)
     }
 }
 
-CoarseGraph EntryExtraction::extract(std::size_t scope) const { return Cut(*this, scope).extract(); }
+CoarseGraph EntryExtraction::extract(std::size_t scope, std::vector<std::size_t> * origins) const {
+    return Cut(*this, scope).extract(origins);
+}
 
 } // namespace markov

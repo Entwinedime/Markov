@@ -108,6 +108,55 @@ class NativeCase:
         return [boundary for boundary in self.sources[rank][0].completion_boundaries(scope)
                 if boundary["event"] not in self.logical[rank]]
 
+    def logical_times(self, realization):
+        predecessors = {(rank, event): [] for rank, events in self.logical.items() for event in events}
+        if not predecessors:
+            return {}
+        for source, targets in self.graph.next.items():
+            for target in targets:
+                if target in predecessors:
+                    predecessors[target].append(source)
+
+        # A verified elided wait is ready once all real prerequisites are ready.
+        times = {}
+        for event in self.graph.positions:
+            if event not in predecessors:
+                continue
+            inputs = []
+            for source in predecessors[event]:
+                rank, boundary = source
+                if source in predecessors:
+                    inputs.append(times.get(source))
+                elif rank in self.clocks and 0 <= boundary < len(self.clocks[rank].points):
+                    inputs.append(realization.timestamp(rank, boundary))
+                else:
+                    inputs.append(None)
+            if inputs and None not in inputs:
+                times[event] = max(inputs)
+        return times
+
+    def measured_service_pairs(self, rank, graph, raw):
+        facts = json.loads((self.graphs / f"{rank}-facts.json").read_text())
+        payload = [{tuple(row) for row in lane["payload"]} for lane in facts["resources"]]
+        queries = {(raw["scopes"][read["scope"]]["thread"], read["begin_counter"], read["end_counter"])
+                   for read in raw["state_queries"]}
+        events = graph["evidence"]["events"]
+        result = set()
+        for piece in graph["work"]:
+            lane = piece["resource"]
+            resource = graph["resources"][lane]
+            start, finish = piece["start"], piece["finish"]
+            bounds = events[start]["order"], events[finish]["order"]
+
+            # One actual task/copy, or an independently cut CPU read, has no inter-task gap to charge.
+            if piece["kind"] in {"device", "transfer", "communication"} and bounds in payload[lane]:
+                result.add((start, finish))
+            elif piece["kind"] == "host" and resource["kind"] == "thread":
+                thread = int(resource["identity"].split("/")[1])
+                if (thread, *bounds) in queries:
+                    result.add((start, finish))
+        return result
+
     def finish(self):
         if self.sources.keys() != self.observed_roles:
             raise ValueError("native case omits observed workers")

@@ -69,13 +69,15 @@ void ExecutionTrace::completed(std::size_t event, std::int64_t time_ns) {
     } << '\n';
 }
 
-void ExecutionTrace::constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns) {
-    stream_ << nlohmann::json{
+void ExecutionTrace::constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> source_event) {
+    nlohmann::json record{
         {    "kind", "boundary_time" },
         {   "event",           event },
         { "begin_ns",       begin_ns },
         { "end_ns",           end_ns }
-    } << '\n';
+    };
+    if (source_event) record["source_event"] = *source_event;
+    stream_ << record << '\n';
 }
 
 void ExecutionTrace::initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) {

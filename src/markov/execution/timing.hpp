@@ -20,6 +20,7 @@ struct TimeWindow {
 struct BoundaryTime {
     std::size_t event;
     TimeWindow window;
+    std::optional<std::size_t> source_event{};
 };
 
 class CoarseGraph;

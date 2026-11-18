@@ -62,13 +62,13 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     for (const auto & input : inputs) {
         if (!events_.contains(input.source) || input.target >= graph.events.size()) throw std::invalid_argument("undefined invocation input boundary");
     }
-    std::map<std::size_t, TimeWindow> times;
+    std::map<std::size_t, const BoundaryTime *> times;
     for (const auto & boundary : boundaries) {
         const auto window = boundary.window;
         if (boundary.event >= graph.events.size() || window.begin_ns < 0 || window.end_ns < std::max(now_ns_, window.begin_ns))
             throw std::invalid_argument("invalid completion window for event " + std::to_string(boundary.event)
                                         + " at submission " + std::to_string(now_ns_));
-        if (!times.emplace(boundary.event, window).second) throw std::invalid_argument("duplicate invocation completion condition");
+        if (!times.emplace(boundary.event, &boundary).second) throw std::invalid_argument("duplicate invocation completion condition");
     }
 
     for (std::size_t index = 0; index < graph.work.size(); ++index) {
@@ -98,11 +98,12 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     unfinished_ += graph.events.size();
     work_count_ += graph.work.size();
     if (observer_) observer_->inserted(graph, identities, work_ns, now_ns_);
-    for (const auto & [event, window] : times) {
+    for (const auto & [event, boundary] : times) {
+        const auto window = boundary->window;
         auto & node = events_.at(offset + event);
         node.ready_ns = std::max(now_ns_, window.begin_ns);
         node.latest_ns = window.end_ns;
-        if (observer_) observer_->constrained(offset + event, window.begin_ns, window.end_ns);
+        if (observer_) observer_->constrained(offset + event, window.begin_ns, window.end_ns, boundary->source_event);
     }
     std::vector<bool> has_previous(graph.events.size()), has_next(graph.events.size());
     for (const auto & edge : graph.edges) {

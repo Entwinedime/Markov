@@ -70,10 +70,16 @@ struct GraphEdge {
     auto operator<=>(const GraphEdge &) const = default;
 };
 
+struct ActionLayout {
+    nlohmann::json identity;
+    std::vector<std::size_t> events;
+};
+
 class CoarseGraph {
 public:
     static CoarseGraph read(const nlohmann::json & source);
     nlohmann::json document(bool include_environment = true) const;
+    ActionLayout action_layout() const;
     void validate() const;
 
     // Parent scopes precede their children; shared boundaries belong to their common scope.

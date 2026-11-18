@@ -23,6 +23,7 @@ struct InputPosition {
 struct InvocationInput {
     const nlohmann::json & record;
     InputPosition position;
+    const nlohmann::json * layouts;
 
     const nlohmann::json & bindings() const;
     GraphTiming timing(const CoarseGraph & graph) const;
@@ -32,6 +33,7 @@ struct InvocationInput {
 class ExecutionInputs {
 public:
     ExecutionInputs(const nlohmann::json & source, ControlObserver * observer);
+    bool full_coverage() const;
     void bind(std::span<const std::string> participants) const;
     static nlohmann::json work_identity(const nlohmann::json & work);
     static nlohmann::json action_identity(const ServingAction & action);
@@ -57,6 +59,7 @@ private:
     const nlohmann::json & take(const std::string & group, const std::string & operation, const nlohmann::json & identity);
 
     const nlohmann::json & context_values_;
+    const nlohmann::json * layouts_;
     std::map<std::string, Actor> actors_;
     ControlObserver * observer_;
     std::map<nlohmann::json, Condition> notifications_;

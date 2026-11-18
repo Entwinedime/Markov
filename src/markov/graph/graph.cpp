@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
@@ -139,6 +140,70 @@ nlohmann::json CoarseGraph::document(bool include_environment) const {
 bool CoarseGraph::contains(std::size_t scope, std::size_t descendant) const {
     while (descendant > scope) descendant = *scopes[descendant].info.parent;
     return descendant == scope;
+}
+
+ActionLayout CoarseGraph::action_layout() const {
+    std::vector<std::vector<std::size_t>> children(scopes.size()), owned(scopes.size());
+    for (std::size_t scope = 1; scope < scopes.size(); ++scope) children[*scopes[scope].info.parent].push_back(scope);
+
+    using Lane = std::tuple<ResourceKind, std::int64_t, std::string_view, bool>;
+    std::map<Lane, std::size_t> lanes;
+    for (std::size_t event = 0; event < events.size(); ++event) {
+        const auto [scope, resource] = events[event];
+        owned[scope].push_back(event);
+        const auto & lane = resources[resource];
+        const auto [found, inserted] = lanes.try_emplace({lane.kind, lane.rank, lane.role, lane.serial}, resource);
+        if (!inserted && found->second != resource) throw std::invalid_argument("action timing has ambiguous logical resources");
+    }
+    auto logical_resources = nlohmann::json::array();
+    std::vector<std::size_t> resource_ids(resources.size());
+    for (const auto & [lane, resource] : lanes) {
+        const auto & [kind, rank, role, serial] = lane;
+        resource_ids[resource] = logical_resources.size();
+        logical_resources.push_back({resource_name(kind), rank, role, serial});
+    }
+
+    // Keep the template's within-scope boundary order on each logical lane. Raw graph IDs never cross runs.
+    ActionLayout result;
+    std::vector<std::size_t> order{0}, scope_ids(scopes.size()), event_ids(events.size());
+    order.reserve(scopes.size());
+    auto declarations = nlohmann::json::array();
+    for (std::size_t position = 0; position < order.size(); ++position) {
+        const auto scope = order[position];
+        scope_ids[scope] = position;
+        for (const auto child : children[scope]) order.push_back(child);
+        auto & local = owned[scope];
+        std::stable_sort(local.begin(), local.end(), [&](auto left, auto right) {
+            return resource_ids[events[left].resource] < resource_ids[events[right].resource];
+        });
+        auto positions = nlohmann::json::array();
+        for (const auto event : local) {
+            event_ids[event] = result.events.size();
+            result.events.push_back(event);
+            positions.push_back(resource_ids[events[event].resource]);
+        }
+        const auto & info = scopes[scope].info;
+        const nlohmann::json parent = info.parent ? nlohmann::json(scope_ids[*info.parent]) : nullptr;
+        declarations.push_back({parent, info.role, info.site, info.implementation, std::move(positions)});
+    }
+
+    auto interfaces = nlohmann::json::array();
+    for (const auto scope : order) {
+        for (const auto & port : scopes[scope].ports) {
+            if (scope == 0 && (port.name.starts_with("resource.enter/") || port.name.starts_with("resource.exit/"))) continue;
+            const nlohmann::json wait = port.wait ? nlohmann::json(event_ids[port.wait->begin]) : nullptr;
+            const nlohmann::json rendezvous = port.rendezvous ? nlohmann::json(event_ids[*port.rendezvous]) : nullptr;
+            interfaces.push_back({scope_ids[scope], port.name, direction_name(port.direction), event_ids[port.event], wait, rendezvous});
+        }
+    }
+    std::sort(interfaces.begin(), interfaces.end());
+
+    auto intervals = nlohmann::json::array();
+    for (const auto & piece : work)
+        intervals.push_back({scope_ids[piece.scope], work_name(piece.kind), event_ids[piece.start], event_ids[piece.finish]});
+    std::sort(intervals.begin(), intervals.end());
+    result.identity = {std::move(logical_resources), std::move(declarations), std::move(interfaces), std::move(intervals)};
+    return result;
 }
 
 std::size_t CoarseGraph::common_scope(std::size_t left, std::size_t right) const {
