@@ -5,6 +5,8 @@ from markov_adapters.sglang.resources import ResourceInputs
 
 class SGLangSourceScopes:
     relay_ports = {"run_batch": "output", "output_prepare": "input"}
+    qwen_layer = "sglang.srt.models.qwen3.Qwen3DecoderLayer"
+    rotary_layers = {qwen_layer, "sglang.srt.models.llama.LlamaDecoderLayer"}
 
     def __init__(self, environment):
         self.environment = environment
@@ -20,9 +22,17 @@ class SGLangSourceScopes:
         if (scope["implementation"] == "sglang.srt.mem_cache.common.alloc_for_decode"
                 and scope["role"] == "segment" and scope["work"]["continuation"]["exit"] == "call.return"):
             return "cache_locations", "output"
-        if (scope["implementation"] == "sglang.srt.models.llama.LlamaDecoderLayer"
-                and scope["role"] == "layer" and scope["site"].rsplit(".", 1)[-1] == self.first_layer
-                and scope["work"]["phase"] == "decode"):
+        if scope["role"] != "layer" or not self.environment["device"].startswith("Ascend"):
+            return None
+
+        implementation = scope["implementation"]
+        phase = scope["work"]["phase"]
+        if implementation == self.qwen_layer and phase in {"prefill", "mixed"}:
+
+            # Flattening each packed Q/K view for normalization copies when it crosses token rows.
+            return "argument.positions", "input"
+        if (implementation in self.rotary_layers
+                and scope["site"].rsplit(".", 1)[-1] == self.first_layer and phase == "decode"):
 
             # The first local decoder makes the strided RoPE rows contiguous only when there are multiple positions.
             return "argument.positions", "input"

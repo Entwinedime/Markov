@@ -77,7 +77,8 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
             const auto match = index.match(message.at("tokens").get<std::vector<std::int64_t>>());
             return {
                 {  "node",                match.node },
-                { "pages", index.binding(match.node) }
+                { "pages", index.binding(match.node) },
+                { "split", { match.split.prefix_tokens, match.split.suffix_tokens } },
             };
         }
         if (operation == "insert") {
@@ -90,7 +91,8 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
             changes_.capacity_increased |= index.evictable_tokens() > before;
             return {
                 {            "node",            inserted.node },
-                { "existing_tokens", inserted.existing_tokens }
+                { "existing_tokens", inserted.existing_tokens },
+                { "split", { inserted.split.prefix_tokens, inserted.split.suffix_tokens } },
             };
         }
         if (operation == "lock") {

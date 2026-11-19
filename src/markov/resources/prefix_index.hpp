@@ -10,14 +10,21 @@
 
 namespace markov {
 
+struct PrefixSplit {
+    std::size_t prefix_tokens = 0;
+    std::size_t suffix_tokens = 0;
+};
+
 struct PrefixMatch {
     std::size_t node = 0;
     std::size_t matched_tokens = 0;
+    PrefixSplit split;
 };
 
 struct PrefixInsertion {
     std::size_t node;
     std::int64_t existing_tokens;
+    PrefixSplit split;
 };
 
 // Content owns page bindings; the pool still owns allocation and execution owns content readiness.

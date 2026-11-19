@@ -67,7 +67,10 @@ PrefixMatch PrefixIndex::walk(std::span<const std::int64_t> tokens) {
         const auto & child = nodes_.at(identity);
         const auto end = std::ranges::mismatch(tokens, child.tokens).in1;
         const auto matched = static_cast<std::size_t>(end - tokens.begin()) / page_size_ * page_size_;
-        if (matched < child.tokens.size()) identity = split(identity, matched);
+        if (matched < child.tokens.size()) {
+            result.split = { matched, child.tokens.size() - matched };
+            identity = split(identity, matched);
+        }
 
         result.matched_tokens += matched;
         result.node = identity;
@@ -118,7 +121,7 @@ PrefixInsertion PrefixIndex::insert(std::span<const std::int64_t> tokens, std::s
         update_leaf(identity);
         matched.node = identity;
     }
-    return { matched.node, static_cast<std::int64_t>(existing) };
+    return { matched.node, static_cast<std::int64_t>(existing), matched.split };
 }
 
 std::int64_t PrefixIndex::lock(std::size_t identity, bool acquire) {

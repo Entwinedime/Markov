@@ -58,7 +58,7 @@ class HostCostSamples:
             detail = [work["phase"], [{key: value for key, value in member.items() if key != "slot"} for member in work["members"]]]
         elif role == "segment":
             detail = [work["continuation"], scope["bindings"]["condition"]]
-        elif role in {"invocation", "query", "host_read", "batch_transform", "cache_match", "kv_reservation"}:
+        elif role in {"invocation", "query", "host_read", "batch_transform", "cache_match", "cache_insert", "kv_reservation"}:
             detail = work.get("context")
         elif role == "metadata_collective":
             detail = [scope["parameters"], scope["bindings"]["condition"], work["context"].get("poll_requests")]

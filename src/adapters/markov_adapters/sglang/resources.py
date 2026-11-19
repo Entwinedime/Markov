@@ -8,30 +8,10 @@ from markov_adapters.sglang.calls import ActionCall
 
 
 class CacheInputs:
-    """Lower RadixCache request inputs and observed match returns to scalar copy extents."""
+    """Describe the request-owned inputs to RadixCache bookkeeping."""
 
     fields = ("page_size", "cache_tokens", "protected_tokens")
     operations = {"cache.finished", "cache.unfinished"}
-
-    def __init__(self, page_size):
-        self.page_size = page_size
-        self.protected = {}
-        self.calls = {}
-
-    def observe(self, scope):
-        if scope["role"] == "cache_match":
-            request = scope["work"]["context"]["request"]["id"]
-            self.protected[request] = scope["parameters"]["matched_tokens"]
-
-    def parameters(self, scope, owner, operation):
-        if owner not in self.calls:
-            request = scope["work"]["context"]["request"]
-
-            # Native get_fill_ids ends at extend.end; finished requests release their committed token prefix.
-            tokens = request["extend"][1] if operation == "cache.unfinished" else request["committed_tokens"]
-            self.calls[owner] = {"page_size": self.page_size, "cache_tokens": tokens,
-                                 "protected_tokens": self.protected[request["id"]]}
-        return self.calls[owner]
 
     @staticmethod
     def native(operation, owner, request):
@@ -61,7 +41,7 @@ class ResourceInputs:
         "cache.finished": (),
         "cache.unfinished": (),
         "slots.free": (),
-        "pages.free": ("page_size", "release_tokens", "release_grouped"),
+        "pages.free": ("page_size", "release_tokens", "release_grouped", "release_index_bytes"),
         "pages.flush": ("page_size", "release_calls", "release_tokens"),
         "pages.sort": ("page_size", "ready_pages", "released_pages"),
     }
@@ -77,28 +57,19 @@ class ResourceInputs:
         # Native records retain the enclosing observation; only formal inputs cross a resource call boundary.
         owners = {}
         enabled = not environment["implementation"]["cache"]["disabled"]
-        cache = CacheInputs(environment["implementation"]["page_size"]) if enabled else None
         for scope in scopes:
             operation = scope["bindings"].get("segment", {}).get("owner")
             if operation in cls.declarations:
-                owner = scope["parent"]
-                owners[scope["id"]] = operation, owner
-                owners[owner] = operation, owner
+                owners[scope["id"]] = operation
+                owners[scope["parent"]] = operation
 
         result = []
         for scope in scopes:
-            if cache is not None:
-                cache.observe(scope)
             if scope["id"] in owners:
-                operation, owner = owners[scope["id"]]
-                if cache is not None and operation in CacheInputs.operations:
-                    parameters = cache.parameters(scope, owner, operation)
-                    guards = list(scope.get("guards", ()))
-                    guards.extend(guard for guard in CacheInputs.guards(operation, parameters) if guard not in guards)
-                    scope = {**scope, "guards": guards,
-                             "arguments": {name: name for name in parameters} if scope["id"] != owner else {}}
-                else:
-                    parameters = cls.bind(operation, scope["parameters"], enabled)
+                operation = owners[scope["id"]]
+                parameters = cls.bind(operation, scope["parameters"], enabled)
+                if enabled and operation in CacheInputs.operations:
+                    scope = {**scope, "guards": CacheInputs.guards(operation, parameters)}
                 scope = {**scope, "parameters": parameters,
                          "constants": {name: value for name, value in scope["constants"].items() if name in parameters},
                          "arguments": {name: value for name, value in scope["arguments"].items() if name in parameters}}
@@ -110,6 +81,7 @@ class ResourceCalls:
     def __init__(self, calls) -> None:
         self.calls = calls
         self.in_resource = ContextVar("native_resource_implementation", default=False)
+        self.prefix_split = ContextVar("native_prefix_split", default=None)
 
     def read(self, description, unit, original, *args, **kwargs):
         if not self.calls.enabled or self.in_resource.get():
@@ -171,11 +143,14 @@ class ResourceCalls:
             indices = arguments.arguments[next(iter(signature.parameters))]
             tokens = int(indices.numel())
             grouped = int(not owner.is_not_in_free_group)
-            parameters.update(release_tokens=tokens, release_grouped=grouped)
+            width = indices.element_size() if tokens and not grouped else 0
+            parameters.update(release_tokens=tokens, release_grouped=grouped, release_index_bytes=width)
 
-            # Native free first skips empty indices, then either queues them or releases their pages.
+            # The immediate path copies indices of their original dtype before combining pages.
             guards = [["eq", "release_tokens", 0] if tokens == 0 else ["lt", 0, "release_tokens"],
                       ["eq", "release_grouped", grouped]]
+            if width:
+                guards.append(["eq", "release_index_bytes", width])
         elif operation == "pages.flush":
             parameters.update(
                 release_calls=len(owner.free_group),
@@ -190,30 +165,66 @@ class ResourceCalls:
         with self.calls.call(operation, original, parameters=ResourceInputs.bind(operation, parameters, cache_enabled), work=work, guards=tuple(guards)):
             return original(*args, **kwargs)
 
-    def match(self, owner, original, params):
+    def record_split(self, prefix, suffix):
+        if self.prefix_split.get() is not None:
+            self.prefix_split.set((prefix, suffix))
+
+    def split_node(self, original, key, child, split_len):
+        self.record_split(split_len, len(key) - split_len)
+        return original(key, child, split_len)
+
+    def prefix(self, operation, owner, original, params):
         parent = self.calls.current.get()
         if not self.calls.enabled or parent is None:
-            return original(params)
+            return self.internal(original, params)
+        inserting = operation == "cache_insert"
+        tokens = len(params.key)
         boundary = ActionCall(
-            "cache_match",
-            {"query_tokens": len(params.key), "matched_tokens": 0, "page_size": owner.page_size},
+            operation,
+            {"query_tokens": tokens, "page_size": owner.page_size},
             self.calls.work(None),
         )
+        request = None if inserting else params.req
         boundary.work["context"] = (
-            {"request": self.calls.progress((params.req,))[0]} if params.req is not None else dict(parent.work.get("context", {}))
+            {"request": self.calls.progress((request,))[0]} if request is not None else dict(parent.work.get("context", {}))
         )
         with self.calls.separate(boundary.operation, boundary.work), self.calls.boundary(original, boundary):
-            result = self.internal(original, params)
-            matched = int(result.device_indices.numel())
-            boundary.parameters["matched_tokens"] = matched
+            previous = self.prefix_split.set((0, 0))
+            try:
+                result = self.internal(original, params)
+                prefix, suffix = self.prefix_split.get()
+            finally:
+                self.prefix_split.reset(previous)
 
-            # A cache hit materializes indices; a miss returns the existing empty buffer.
-            boundary.guards = (["lt", 0, "matched_tokens"] if matched else ["eq", "matched_tokens", 0],)
+            if inserting:
+                boundary.parameters["existing_tokens"] = result.prefix_len
+                aligned = ["mul", ["floor_div", "query_tokens", "page_size"], "page_size"]
+                has_tail = result.prefix_len < tokens // owner.page_size * owner.page_size
+                guard = ["lt" if has_tail else "eq", "existing_tokens", aligned]
+            else:
+                matched = int(result.device_indices.numel())
+                boundary.parameters["matched_tokens"] = matched
+                guard = ["lt", 0, "matched_tokens"] if matched else ["eq", "matched_tokens", 0]
+
+            # A split copies both sides of an existing node; an insertion can also copy a new suffix.
+            boundary.guards = (guard,)
+            if not owner.disable:
+                boundary.parameters.update(split_prefix_tokens=prefix, split_suffix_tokens=suffix)
+                boundary.guards += (["lt", 0, "split_prefix_tokens"] if prefix else ["eq", "split_prefix_tokens", 0],)
         return result
 
-    def bind(self, cache, allocator, slots) -> None:
-        original = cache.match_prefix
-        cache.match_prefix = update_wrapper(partial(self.match, cache, original), original)
+    def bind(self, cache, allocator, slots, *, native_tree=True) -> None:
+        operations = {"match_prefix": "cache_match"}
+        if not cache.disable:
+            operations["insert"] = "cache_insert"
+            if native_tree:
+                split = cache._split_node
+                cache._split_node = update_wrapper(partial(self.split_node, split), split)
+            else:
+                cache.record_split = self.record_split
+        for name, operation in operations.items():
+            original = getattr(cache, name)
+            setattr(cache, name, update_wrapper(partial(self.prefix, operation, cache, original), original))
 
         for owner, method, resource, unit in (
             (slots, "available_size", "slots", 1),
@@ -227,7 +238,7 @@ class ResourceCalls:
         for owner, methods in (
             (slots, ("alloc",)),
             (allocator, ("alloc", "alloc_extend", "alloc_decode")),
-            (cache, ("insert", "inc_lock_ref", "dec_lock_ref", "evict")),
+            (cache, ("inc_lock_ref", "dec_lock_ref", "evict")),
         ):
             self.bind_internal(owner, methods)
 

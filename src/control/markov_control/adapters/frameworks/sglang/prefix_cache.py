@@ -65,6 +65,7 @@ class PrefixCache(RadixCache):
         if self.disable:
             return self._empty_match_result
         result = self.peer.call("prefix", operation="match", tokens=self.key_tokens(params.key))
+        self.record_split(*result["split"])
 
         # The core supplies the current binding, including splits; no mirrored native tree is maintained.
         indices = self.token_to_kv_pool_allocator.page_indices(result["pages"])
@@ -78,6 +79,7 @@ class PrefixCache(RadixCache):
         indices = params.value[: len(tokens)]
         pages = (indices[:: self.page_size] // self.page_size - 1).tolist()
         result = self.peer.call("prefix", operation="insert", tokens=tokens, pages=pages)
+        self.record_split(*result["split"])
         return InsertResult(prefix_len=result["existing_tokens"], last_device_node=result["node"])
 
     def inc_lock_ref(self, node):

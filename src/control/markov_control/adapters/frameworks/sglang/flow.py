@@ -50,7 +50,9 @@ class FlowExecution(CallSegments):
         self.selection.install()
         self.resources = ResourceCalls(self)
         self.resources.install()
-        self.resources.bind(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, scheduler.req_to_token_pool)
+        self.resources.bind(
+            scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, scheduler.req_to_token_pool, native_tree=False,
+        )
         scheduler.output_streamer.send_to_detokenizer = PublishedRequests(
             self, scheduler.output_streamer.send_to_detokenizer.socket is not None,
         )
