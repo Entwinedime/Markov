@@ -1,12 +1,12 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-19。**S0–S4 已验收。下一阶段是 S5，交付配置集正式入口。**
+更新日期为 2026-11-19。**S0–S5 已验收。下一阶段是 S6 的单机多卡扩展。**
 
 ## 进入窗口时已有证据
 
 - 执行结构已有七款模型、TP/PP/EP、非对称 PD 及具名资源和调度场景的对照。各案例保留原来的独立或开发资格。
 - 自主性能闭环覆盖 SGLang/Ascend、Qwen3-8B BF16 dummy、单实例 TP1、页宽 16、KV 容量 32,768、并发 4/8。四个留出组合的等权 TTFT MAPE 为 3.67%，TPOT MAPE 为 4.92%。[独立性能结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-independent-performance/independent-results.json)
-- 配置集示例可以跑给定耗时的结构流程。正式 `predict --costs` 接受单目标和已发布的成本资产。多角色主机采样、轻量评分及执行期间的 CPU 协调和传输计时需要推进。[现有示例](../../../example/coarse_graph/run.py) · [CPU 消息取时](../../../src/markov/controller/cpu_messages.cpp#L46)
+- 窗口起点的配置集示例使用给定耗时。正式 `predict --costs` 已有单目标能力，配置集自主预测及多角色采样需要推进。
 
 ## 阶段状态
 
@@ -14,8 +14,8 @@
 | --- | --- | --- |
 | M0 交付基线 | S0 | 已验收，具名场景和本机环境已登记 |
 | M1 多角色计时 | S1–S3 | 已验收，TP2 与非对称 PD 均完成开发闭环 |
-| M2 配置集探索 | S4–S5 | S4 已通过有界补采、样本复用与联合预测验证，S5 待启动 |
-| M3 正式支持范围 | S6–S8 | 待启动，依赖 M2 |
+| M2 配置集探索 | S4–S5 | 已验收，冷资产创建与换请求后复用均完成 |
+| M3 正式支持范围 | S6–S8 | S6 接续单机多卡，S7–S8 待推进 |
 | M4 独立验收与交付 | S9–S12 | 待启动，依赖 M3 |
 
 ## 基线、当前能力与下一步
@@ -30,4 +30,6 @@ S2 已完成 Qwen3-8B TP2 两 rank 的模板、CPU 与设备成本装配。两�
 
 S3 的 Prefill TP1、Decode TP2 开发例取得全节点结构对照。三个请求核对 38,500 个工作区间、64,275 个端点和 18 条收件或状态通知。自主预测覆盖三域，完成八个 token，预测吞吐 3.99 token/s，原生测得 4.05 token/s。TTFT MAPE 1.75%，TPOT MAPE 15.08%。该评分用于开发，正式精度走全新留出。组批合并和过滤的测量按相同定义与特征显式复用自 TP2，自动复用和采样需求生产由 S4 交付。[独立结构对照](../../../data/20261119T090556.273460Z_project-delivery/targets/s3-pd-transport-structure/comparison/actions.md) · [三域成本](../../../data/20261119T090556.273460Z_project-delivery/assets/s3-pd-qualified-costs.json) · [原生与预测评分](../../../data/20261119T090556.273460Z_project-delivery/results/s3-pd-performance.json)
 
-S4 从已知需求选择两次 PD 原生轻量采样，累计 277.35 秒。补采与已合格实测复用共同覆盖 PD 三 rank 的 38,500 个已知区间。联合资产还覆盖 TP2 两 rank 的 112,078 个已知区间和两个目标的实际首缺。TP2 与非对称 PD 从初始状态分别输出七和八个 token。S5 需将来源准备、成本获取及所有目标预测纳入一次有预算的用户任务。[补采资产](../../../data/20261119T090556.273460Z_project-delivery/assets/s4-pd-native-costs/costs.json) · [联合资产](../../../data/20261119T090556.273460Z_project-delivery/assets/s4-joint-costs.json)
+S4 的联合成本资产覆盖 PD、TP2 共五域的 150,578 个已知区间及两个实际首缺。两个目标从初态各输出七和八个 token。[联合资产](../../../data/20261119T090556.273460Z_project-delivery/assets/s4-joint-costs.json)
+
+S5 正式入口用两个单卡池容量与两组短请求完成四项自主预测。冷任务共五次原生采集、625.76 秒。新请求 ID 和到达时间复用同一模板和成本，采集与后处理均为零，四项目标全部完成。S6 按更高 TP、PP 微批、EP 及组合核对多角色工作和成本资格。[冷启动结果](../../../data/20261119T122453.716218Z_exploration/summary.md) · [纯复用结果](../../../data/20261119T124125.641276Z_exploration/summary.md)

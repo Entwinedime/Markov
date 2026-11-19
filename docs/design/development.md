@@ -39,38 +39,33 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohman
 
 结果通过临时文件原子发布，输入与输出不能互相覆盖。失败不发布空成功文件，不用旧结果或累计日志误认本次通过。旧资产不自动升级格式，明确重建，不维护双格式兼容。
 
-## 一键执行结构示例
+## 配置集性能探索
 
-`example/coarse_graph/run.py` 在宿主调用现有 workflow，顺序完成来源规划、有限采集及模板生产，再展开配置×workload 的全部目标。宿主只需 Python 标准库和本机 Docker CLI；协调进程使用 control 镜像的 Python，实际采集、后处理和预测仍由各自正式入口管理。运行前准备三个业务镜像及 modeling 构建的程序，模型须在本地。
+`python3 -m markov_workflow explore` 接受一个模型、候选配置集和 workload 集。它规划训练来源、准备模板和成本，然后从初态逐项预测。原生采集和成本补采共用原生秒数、尝试次数、后处理秒数及存储额度。每次采集和每项预测另受 `--timeout` 限制。
 
-默认输入 `example/coarse_graph/input.json` 为 Qwen3-8B BF16、两个 TP1 池容量配置及两个小请求集合。可复制修改模型路径、配置和 workload，并通过 `--input` 提供；默认模型位置为 `/models/Qwen3-8B`。部署文件由使用者明确提供，例如 `{"physical_devices": [4]}`，其中物理卡必须由本次任务独占；示例不会自动挑卡。PD 部署还需提供 store_url。
+宿主可用 `example/coarse_graph/run.py` 启动正式任务。默认配置输入在 `example/coarse_graph/input.json`，使用本地 `/models/Qwen3-8B` 和两个 TP1 池容量。部署需明确指定独占卡，例如 `{"physical_devices": [4]}`。PD 还需可达的 `store_url`。构建好业务镜像和 `build/coarse-graph/markov` 后可执行以下命令。
 
 ```bash
 python3 example/coarse_graph/run.py \
   --deployment /path/to/deployment.json \
-  --native-budget-seconds 1800 --postprocessing-budget-seconds 1200 \
-  --attempt-limit 2 --storage-bytes 32212254720
+  --native-budget-seconds 2520 --postprocessing-budget-seconds 1200 \
+  --attempt-limit 6 --storage-bytes 25769803776
 ```
 
-默认输入预先规划一个完整worker来源和一个批次merge/subset局部来源，共两个原生任务。这组额度都是上限，不是实际开销承诺；改变输入时先检查计划并明确累计额度，不会自动放宽、重试或补采。`--timeout` 默认 900 秒，分别限制每次原生尝试和每个目标预测。程序默认 `build/coarse-graph/markov`，可用 `--binary` 指定其他 modeling 构建路径。
-
-外围任务期限与框架内部等待策略分别配置：增加`--timeout`不会改变SGLang的PD期限。其`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`和`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`默认各300秒，由所选原生镜像的环境确定；source/control须采用相同策略，运行时记录实际数值与镜像ID。超时先核对触发者及实际进展，再决定调整原生策略还是修复执行；改变期限另记运行条件，保留原失败，不据此宣称观察开销下降。
-
-每次调用创建 `data/<UTC运行时间>_coarse-graph/`，不扫描或引用历史目录：
+`--input` 可替换默认配置与 workload，`--binary` 和三个镜像选项指定运行构建。每次默认新建 `data/<UTC运行时间>_exploration/`。给新任务同时提供 `--reuse <既有任务目录>` 和新输入时，先检查模型、部署、镜像及程序身份，再用已发布的模板和成本预测。缺少结构来源或出现模板、成本缺口的目标一起进入一次有界资产准备。范围不变的纯复用可将两项时间预算与尝试次数置零。用 `--output <原任务目录>` 恢复中断任务，保留已发布的资产和结果。
 
 | 位置 | 内容 |
 | --- | --- |
-| inputs/ | 解析为绝对模型路径的探索输入、部署、三个镜像 ID 及本次程序快照 |
-| plan/ | 预先确定的有限来源作业、代表输入及简短规划说明 |
-| collection/sources/ | 各来源作业的原生任务及不可替代的原始观察 |
-| collection/assets/ | 各来源作业的模板生产目录，包含发布模板、生产记录及必要日志 |
-| targets/<序号>/ | 该目标的 input.json 和 prediction/；使用数字目录，不把用户 ID 当作路径 |
-| logs/ | 每步的命令参数与外围日志，失败时定位对应子任务 |
-| summary.md、result.json | 人类摘要与精简目标索引；只有全部目标成功才发布 result.json |
+| inputs/ | 已解析输入、部署、镜像 ID 和程序快照 |
+| plan/ | 本次实际需要的新训练来源 |
+| collection/ | 原生训练观察、模板、生产记录和采集日志 |
+| assets/ | 成本资产、采样来源、已知覆盖和剩余缺口 |
+| targets/<序号>/ | 输入、各次预测日志及必要机器结果 |
+| summary.md、result.json | 人类摘要、逐组合状态及可比较排序 |
 
-默认只保留生产所需的来源和正式模板，已消费的 SDK 导出、解释事实和粗图由生产入口清理；原始观察不会自动删除。`--details` 开启来源中间产物、原生资源明细及目标执行图记录，供之后独立检查。`--storage-bytes` 监测 collection/ 内的逻辑字节，**不包含目标预测文件**；详细展开可能较大，使用者应另外预留存储。
+默认保留原始训练观察、正式模板、样本及预测结果。成本发布后释放可重建的来源 SDK 导出、事实和粗图。`--details` 保留这些产物并输出目标执行轨迹。存储额度监测任务目录内的逻辑字节，包括预测文件。已有资产由其原任务持有。结果按同一 workload 排序，给出 P95 TTFT、平均 TPOT 和吞吐，并列值保留同组。未能预测的组合带实际原因和证据文件，退出状态为非零，已完成组合的结果仍可读取。该任务的资格为自主预测，独立结构和性能评价各用自己的数据执行。
 
-预测默认每工作给定 1 ns，可用 `--given-work-ns` 修改。结果只表示给定耗时条件下的动态展开，不是性能预测、独立结构验收或泛化覆盖证明。输入规划也不保证所有目标分支已被观察。第一处失败即停止，保留已完成任务及摘要；子任务恢复使用 logs 中记录的正式命令及原目录，不重新执行一键脚本制造新采集。此示例不增加另一套恢复状态机。
+外围任务期限与框架内部等待策略分别配置。SGLang PD 的 `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` 和 `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` 默认各 300 秒，由所选原生镜像决定。source 与 control 使用相同策略，记录实际值与镜像 ID。超时先核对触发者及实际进展，再决定调整期限或修复执行。
 
 ## 配置集合的有限来源规划
 
@@ -182,7 +177,7 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单实例或一对 PD 实例的 dense TP、PP1 单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。PD 以 Prefill 的实际提交为延迟起点，以 Decode 的实际发布为输出。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
 
-用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
+在四个 workflow Python 源目录已加入 `PYTHONPATH` 的环境中，用 `example/coarse_graph/latency_metrics.py` 计算逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
 单实例或一对 PD 实例的 dense TP、PP1 CPU 成本采样使用 `capture --host-timing`。结构观测与主机采样共用原生调用切点。Ascend 观测器按 rank 记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同配置和 workload 的结构观测按实际批次几何、局部调用及子调用边界配对，报告未配对的工作和排除的冷批次。主机采样可采用不同提交分组，实际组批和参数仍由原生观测决定。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
 
@@ -190,7 +185,7 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 `acquire-costs` 使用一个或多个带 `--keep-intermediates` 的训练来源集合，产物 `costs.json` 可直接交给 `predict --costs`。除训练来源观察到的工作，可重复传入 `--demand <粗图> <工作身份文件>` 或 `--gap <预测目录/cost-gap.json>`；它们只声明需求。用 `--samples` 提供已经资格检查的训练样本。相同执行域优先查已有样本。SGLang 可将运行环境、局部调用及特征一致的闭合批次数组操作的主机实测复用于其他角色，资产保留原样本位置。
 
-补采按训练来源的原提交分组或逐请求分组，继续走原生 Engine。采样计划由需求去重后选取，采到的实际批次和调用须与详细来源匹配才进入模型。`--timeout`、`--native-budget-seconds`、`--postprocessing-budget-seconds`、`--attempt-limit` 和 `--storage-bytes` 约束该任务。报告区分预算停止、可观察但没有合格实测和无已知配方。每份在线缺口只记录停止位置的工作，后续未展开路径的需求仍未知。
+补采按训练来源的原提交分组或逐请求分组，继续走原生 Engine。配置集探索用代表请求预热。轻量观察若出现首次特化加载，按实际原生调用范围排除受影响的样本，剩余需求可触发一次按原分组预热的测量。采到的实际批次和调用匹配详细来源后才进入模型。`--timeout`、`--native-budget-seconds`、`--postprocessing-budget-seconds`、`--attempt-limit` 和 `--storage-bytes` 约束该任务。报告区分预算停止、可观察但没有合格实测和无已知配方。每份在线缺口只记录停止位置的工作，后续未展开路径的需求仍未知。
 
 Ascend 从同一次 HCCL 提交队列识别设备通信区间，独立保留本地整理工作。采样核对同一原生调用的全体参与者、算法、dtype 和元素数。跨设备校准能确定最后就绪者时，使用其同设备区间估计共同服务。执行使用所有参与者的就绪时间和该服务成本推导通信完成，调用输出继续受本地整理及原有依赖约束。无法确定对端或负载的观察保留为缺测。
 
@@ -277,7 +272,7 @@ PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow pre
 
 --production 指定一份已由acquire-sources完整发布的来源集合。入口读取集合固定计划及生产索引，根据目标实施域和输入机会自动选完整来源及它的局部供体；未知输入仍由实际模板合同核对，不把规划机会标签变成额外支持门槛。模型专家数来自规划发布的元数据，纯预测不重新打开模型目录。模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
 
-性能查询使用每次实例化得到的归一化工作及其实际参数。首个缺模型或超出样本范围的工作通过 `cost-gap.json` 报告。预测完成后可用 `example/coarse_graph/latency_metrics.py --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
+性能查询使用每次实例化得到的归一化工作及其实际参数。首个缺模型或超出样本范围的工作通过 `cost-gap.json` 报告。 模板选择的首个缺口通过 `template-gap.json` 记录实际动作和条件。预测完成后可用 `example/coarse_graph/latency_metrics.py --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
 
 PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；正式预测入口负责来源选择，示例不维护第二套装配规则。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
 

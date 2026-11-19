@@ -14,7 +14,7 @@
 
 多角色计时已在同模型的 TP2 和非对称 PD 开发例闭环。CPU 与设备 collective 在对端就绪后计费，PD 预约按实际到达推进，两个案例均可使用独立成本预测。 [TP2 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s2-tp2-performance.json) · [PD 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s3-pd-performance.json)
 
-成本准备已能合并多个目标的已知需求，优先复用合格实测，在预算内补采并发布资产。TP2 和非对称 PD 两个开发目标已使用同一资产完成自主预测。[联合成本资产](../data/20261119T090556.273460Z_project-delivery/assets/s4-joint-costs.json)
+配置集正式入口统一准备模板和成本，在预算内逐目标自主预测并汇总排序。Qwen3-8B 的两个 TP1 配置及两组请求完成冷资产运行，换请求后用同一资产完成零采集复用。[冷启动](../data/20261119T122453.716218Z_exploration/summary.md) · [复用](../data/20261119T124125.641276Z_exploration/summary.md)
 
 历史实现主要在同一来源域内复用请求长度、成员、到达、并发及 KV 容量变化；模型、并行拓扑、dtype、backend 和 page_size 变化分别取得来源。新的支持边界须重新说明并验证，不将未实现变换写成理论上不可能。
 
