@@ -1,16 +1,28 @@
 #pragma once
 
-#include <map>
 #include <deque>
+#include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "markov/templates/library.hpp"
 
 namespace markov {
+
+class TemplateGap final : public std::invalid_argument {
+public:
+    explicit TemplateGap(nlohmann::json details);
+    const nlohmann::json & details() const { return details_; }
+
+private:
+    nlohmann::json details_;
+};
 
 // The immutable library outlives this index; dynamic target choices never modify its source candidates.
 class TemplateSelection {

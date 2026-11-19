@@ -17,8 +17,8 @@ namespace {
 struct FrameChoice {
     std::optional<TemplateFrame> frame;
     std::optional<std::string> ambiguity;
-    std::optional<std::string> rejected_guard;
-    std::optional<std::string> rejected_parameters;
+    std::optional<nlohmann::json> rejected_guard;
+    std::optional<nlohmann::json> rejected_parameters;
 
     void merge(FrameChoice candidate, std::string_view site) {
         if (!rejected_guard) rejected_guard = std::move(candidate.rejected_guard);
@@ -149,7 +149,7 @@ public:
             if (!inserted && previous->second != value) {
                 result.rejected_parameters = nlohmann::json{
                     { "site", candidates.front()->site }, { "fixed", name }, { "expected", previous->second }, { "actual", value }
-                }.dump();
+                };
                 return result;
             }
         }
@@ -168,7 +168,7 @@ public:
             // Report the contract failure separately from guards on other, incompatible candidates.
             result.rejected_parameters = nlohmann::json{
                 { "site", candidates.front()->site }, { "missing", missing }, { "unexpected", unexpected }
-            }.dump();
+            };
             return result;
         }
 
@@ -183,7 +183,7 @@ public:
                 const auto input = state_inputs_.find(*candidate->state_input);
                 if (input == state_inputs_.end() || input->second.contract() != candidate->state.contract()) {
                     result.rejected_parameters = nlohmann::json{{ "site", candidate->site }, { "state_input", *candidate->state_input },
-                                                               { "reason", "missing or incompatible state binding" }}.dump();
+                                                               { "reason", "missing or incompatible state binding" }};
                     continue;
                 }
             }
@@ -200,7 +200,7 @@ public:
             result.rejected_guard = nlohmann::json{
                 { "site", rejected->site }, { "definition", rejected->definition },
                 { "guard", rejected->guard.document() }, { "parameters", relevant }
-            }.dump();
+            };
         }
         for (const auto & [choice, candidate] : implementations) {
             const auto & [identity, child_families] = choice;
@@ -251,6 +251,9 @@ private:
 
 } // namespace
 
+TemplateGap::TemplateGap(nlohmann::json details)
+    : std::invalid_argument("template selection failed: " + details.dump()), details_(std::move(details)) {}
+
 TemplateSelection::TemplateSelection(const TemplateLibrary & library) : library_(library) {
     FamilyIndex index(library_, families_, membership_, alternatives_);
     for (const auto & entry : library.entries) roots_[{ entry.action, entry.condition }].insert(index.add(entry, entry.frame));
@@ -259,19 +262,22 @@ TemplateSelection::TemplateSelection(const TemplateLibrary & library) : library_
 TemplateEntry TemplateSelection::select(std::string_view action, const nlohmann::json & condition, const Parameters & parameters,
                                        const std::map<std::string, StateBindings> & state_inputs) const {
     const auto roots = roots_.find({ std::string(action), condition });
-    if (roots == roots_.end())
-        throw std::invalid_argument("template action has no declared candidates: " + std::string(action) + " condition=" + condition.dump());
-    FrameSelection selection(library_, families_, membership_, state_inputs);
     FrameChoice chosen;
-    for (const auto family : roots->second) chosen.merge(selection.resolve(families_[family], parameters), action);
-    if (chosen.ambiguity)
-        throw std::invalid_argument("ambiguous local template implementation at " + *chosen.ambiguity + " action=" + std::string(action)
-                                    + " condition=" + condition.dump() + " parameters=" + nlohmann::json(parameters).dump());
-    if (!chosen.frame)
-        throw std::invalid_argument("template action has no matching local conditions: " + std::string(action) + " condition=" + condition.dump()
-                                    + " parameters=" + nlohmann::json(parameters).dump()
-                                    + (chosen.rejected_parameters ? " rejected_parameter_contract=" + *chosen.rejected_parameters : "")
-                                    + (chosen.rejected_guard ? " rejected_local_candidate=" + *chosen.rejected_guard : ""));
+    if (roots != roots_.end()) {
+        FrameSelection selection(library_, families_, membership_, state_inputs);
+        for (const auto family : roots->second) chosen.merge(selection.resolve(families_[family], parameters), action);
+    }
+    if (!chosen.frame) {
+        const auto status = roots == roots_.end() ? "no_declared_candidates"
+            : chosen.ambiguity ? "ambiguous_implementation" : "unmatched_conditions";
+        nlohmann::json details{
+            { "status", status }, { "action", action }, { "condition", condition }, { "parameters", parameters }, { "domain", library_.domain }
+        };
+        if (chosen.ambiguity) details["site"] = *chosen.ambiguity;
+        if (chosen.rejected_parameters) details["rejected_parameter_contract"] = std::move(*chosen.rejected_parameters);
+        if (chosen.rejected_guard) details["rejected_local_candidate"] = std::move(*chosen.rejected_guard);
+        throw TemplateGap(std::move(details));
+    }
 
     // A composed target is not an observed whole call; source observations remain on the stored candidates.
     return { std::string(action), condition, std::move(*chosen.frame), {} };

@@ -304,6 +304,10 @@ int main(int argc, char ** argv) {
                 Publication(destination.parent_path() / "cost-gap.json").write(gap.details());
                 throw;
             }
+            catch (const markov::TemplateGap & gap) {
+                Publication(destination.parent_path() / "template-gap.json").write(gap.details());
+                throw;
+            }
             output["template_imports"] = imports;
             if (trace) trace->finish();
         }
