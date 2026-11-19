@@ -13,7 +13,7 @@ from markov_adapters.sglang.configuration import CaptureInput
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
-from markov_workflow.prediction import SourceProductions
+from markov_workflow.source_productions import SourceProductions
 
 from run import WorkflowCommands
 

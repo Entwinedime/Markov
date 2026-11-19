@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 import json
 
 from markov_adapters.artifacts import write_json
+from markov_adapters.sglang.configuration import CaptureInput
 from markov_collection.adapters.runtimes.ascend.host_alignment import AscendHostAlignment
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
 from markov_workflow.capture import CaptureProcess
@@ -23,6 +24,18 @@ class HostCostSamples:
     def records(path):
         with path.open() as source:
             return [json.loads(line) for line in source]
+
+    @staticmethod
+    def recipes(job):
+        capture = CaptureInput(job)
+        yield "observed-submission", job
+        groups = [[request["id"]] for request in capture.workload["requests"]]
+        if not all(len(group) == 1 for group in capture.submission_groups):
+            yield "individual-requests", {**job, "submission_groups": groups}
+
+    @staticmethod
+    def supports(work, resource):
+        return work["kind"] == "host" or (work["kind"] == "collective" and resource["kind"] == "thread")
 
     @staticmethod
     def identity(scope):
@@ -172,17 +185,17 @@ class HostCostSamples:
         measured, missing = Counter(), Counter()
         for piece, definition, interval, features in catalog:
             resource = graph["resources"][piece["resource"]]
+            if not self.supports(piece, resource):
+                continue
             scope = graph["scopes"][piece["scope"]]
             key = f"{resource['role']}/{scope['role']}"
-            if piece["kind"] == "collective" and resource["kind"] == "thread":
+            if piece["kind"] == "collective":
                 source, = scope["bindings"]["source_scopes"]
                 duration = collectives.get(pairs.get(source))
-            elif piece["kind"] == "host":
+            else:
                 begin, end = (evidence[piece[side]]["order"] for side in ("start", "finish"))
                 thread = int(resource["identity"].split("/")[1])
                 duration = alignment.duration(thread, begin, end, resource["role"] == "submission")
-            else:
-                continue
             if duration is None:
                 missing[key] += 1
                 continue
@@ -190,6 +203,7 @@ class HostCostSamples:
             measured[key] += 1
 
         report = samples.document({"host": sum(missing.values())})
+        report["observation"] = {"detailed": str(detailed.resolve()), "host": str(lightweight.resolve()), "rank": rank}
         batches = {"detailed": 0, "host": 0, "matched": 0}
         for scope in original["scopes"]:
             if scope["role"] == "run_batch":

@@ -6,6 +6,8 @@ import json
 from statistics import median
 
 from markov_adapters.artifacts import write_json
+from markov_workflow.adapters.sglang_cost_reuse import BatchHostReuse
+from markov_workflow.cost_requirements import CostRequirements, cost_identity
 from markov_workflow.cost_samples import WorkCatalog
 
 
@@ -94,7 +96,7 @@ class DomainCosts:
         for source in sources:
             indices = []
             for definition in source["definitions"]:
-                key = self.identity(definition)
+                key = cost_identity(definition)
                 if key not in self.indices:
                     self.indices[key] = len(self.definitions)
                     self.definitions.append(definition)
@@ -104,23 +106,16 @@ class DomainCosts:
 
         self.curves = {key: ServiceCurve(rows).document() for key, rows in sorted(groups.items())}
 
-    @staticmethod
-    def identity(definition):
-        return json.dumps(definition, sort_keys=True, separators=(",", ":"))
-
-    def definitions_in(self, definitions):
-        return [self.indices.get(self.identity(item)) for item in definitions]
-
     def query(self, definition, interval, features):
         phase = features["phase"]
-        curve = self.curves.get((definition, interval, phase))
+        curve = self.curves.get((self.indices.get(definition), interval, phase))
         if curve is None:
             return "unseen_work", None
         estimate = ServiceCurve.estimate(curve, features["axes"])
         return ("outside_sample_ranges", None) if estimate is None else ("covered", estimate)
 
     def evaluate(self, source):
-        definitions = self.definitions_in(source["definitions"])
+        definitions = [cost_identity(value) for value in source["definitions"]]
         counts, errors = defaultdict(Counter), defaultdict(list)
         for row in source["samples"]:
             origin = row["definition"]
@@ -139,42 +134,40 @@ class DomainCosts:
             "unmeasured": source["unmeasured"],
         }
 
-    def demand(self, catalog, identities_path):
-        definitions = self.definitions_in(catalog.definitions)
-        counts, missing = defaultdict(Counter), {}
-        for piece, definition, interval, features in catalog:
-            status, _ = self.query(definitions[definition], interval, features)
-            kind = piece["kind"]
-            counts[kind][status] += 1
-            if status == "covered":
-                continue
-
-            # Group by the exact work requested, retaining coordinate ranges for the next measured recipe.
-            phase = features["phase"]
-            key = definition, interval, phase, status
-            if key not in missing:
-                owner = catalog.definitions[definition]
-                resource = catalog.graph["resources"][piece["resource"]]
-                missing[key] = {
-                    "definition": definition, "interval": interval, "phase": phase, "status": status,
-                    "implementation": owner["implementation"], "scope": owner["role"], "kind": kind,
-                    "resource": resource["role"], "work": 0,
-                    "axes": {name: [value, value] for name, value in features["axes"].items()},
-                }
-            group = missing[key]
-            group["work"] += 1
-            for name, value in features["axes"].items():
-                lo, hi = group["axes"].get(name, (value, value))
-                group["axes"][name] = [min(lo, value), max(hi, value)]
-        gaps = sorted(missing.values(), key=lambda group: group["work"], reverse=True)
-        return {"identities": str(identities_path.resolve()), "counts": counts, "gaps": gaps}
-
     def document(self, domain):
         return {
             "domain": domain, "definitions": self.definitions,
             "models": [{"definition": definition, "interval": interval, "phase": phase, **model}
                        for (definition, interval, phase), model in self.curves.items()],
         }
+
+
+class FittedCosts:
+    """Use one catalogue for fitting, coverage checks and publishing the selected domains."""
+
+    def __init__(self, sources):
+        grouped = defaultdict(list)
+        for source in sources:
+            grouped[cost_identity(source["domain"])].append(source)
+        self.domains = {key: DomainCosts(rows) for key, rows in grouped.items()}
+        self.descriptions = {key: rows[0]["domain"] for key, rows in grouped.items()}
+        self.empty = DomainCosts(())
+
+    def domain(self, identity):
+        return self.domains.get(identity, self.empty)
+
+    def document(self):
+        return [costs.document(self.descriptions[key]) for key, costs in self.domains.items()]
+
+    @classmethod
+    def qualify(cls, sources, demand):
+        fitted = cls(sources.values())
+        counts, missing = demand.check(fitted)
+        reused = BatchHostReuse.match(demand, missing, sources)
+        if reused:
+            fitted = cls([*sources.values(), *reused])
+            counts, missing = demand.check(fitted)
+        return fitted, reused, counts, missing
 
 
 class FitCosts:
@@ -186,29 +179,25 @@ class FitCosts:
         return json.loads(path.read_text())
 
     def run(self):
-        sources = [self.read(path) for path in self.arguments.samples]
-        grouped = defaultdict(list)
-        for source in sources:
-            grouped[DomainCosts.identity(source["domain"])].append(source)
-        domains = {key: DomainCosts(rows) for key, rows in grouped.items()}
-        absent = DomainCosts(())
+        sources = {path.resolve(strict=True): self.read(path) for path in self.arguments.samples}
+        demand = CostRequirements()
+        for graph_path, identities_path in self.arguments.demand:
+            demand.graph(str(graph_path.resolve()), WorkCatalog(graph_path, identities_path))
+        for path in self.arguments.gap:
+            demand.gap(str(path.resolve()), self.read(path))
 
-        # A request in another domain is an uncovered demand, even when its definitions look identical.
+        fitted, reused, counts, missing = FittedCosts.qualify(sources, demand)
         checks = []
         for path in self.arguments.check:
             source = self.read(path)
-            costs = domains.get(DomainCosts.identity(source["domain"]), absent)
+            costs = fitted.domain(cost_identity(source["domain"]))
             checks.append({"source": str(path.resolve()), **costs.evaluate(source)})
-        demand = []
-        for graph_path, identities_path in self.arguments.demand:
-            catalog = WorkCatalog(graph_path, identities_path)
-            costs = domains.get(DomainCosts.identity(catalog.domain), absent)
-            demand.append(costs.demand(catalog, identities_path))
 
         write_json(self.arguments.output, {
-            "domains": [costs.document(grouped[key][0]["domain"]) for key, costs in domains.items()],
-            "sources": [str(path.resolve()) for path in self.arguments.samples],
-            "source_gaps": [source["unmeasured"] for source in sources],
+            "domains": fitted.document(),
+            "sources": [str(path) for path in sources],
+            "source_gaps": [source["unmeasured"] for source in sources.values()],
+            "reused": reused,
             "checks": checks,
-            "demand": demand,
+            "demand": demand.report(counts, missing),
         }, replace=False)

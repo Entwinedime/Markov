@@ -49,20 +49,27 @@ def main() -> None:
     costs.add_argument("--samples", type=Path, nargs="+", required=True)
     costs.add_argument("--check", type=Path, action="append", default=[])
     costs.add_argument("--demand", type=Path, nargs=2, action="append", default=[], metavar=("GRAPH", "WORK"))
+    costs.add_argument("--gap", type=Path, action="append", default=[], help="recheck a prior prediction's actual cost demand")
     costs.add_argument("--output", type=Path, required=True)
+    sampling = commands.add_parser("acquire-costs", help="fulfil known cost requirements with bounded native sampling")
+    sampling.add_argument("--production", type=Path, action="append", required=True, help="training source collection with intermediates")
+    sampling.add_argument("--samples", type=Path, nargs="+", default=[], help="previously qualified training samples")
+    sampling.add_argument("--demand", type=Path, nargs=2, action="append", default=[], metavar=("GRAPH", "WORK"))
+    sampling.add_argument("--gap", type=Path, action="append", default=[], help="actual cost demand from a prior prediction")
     acquisition = commands.add_parser("acquire-sources", help="capture and compile a finite plan under shared cumulative allowances")
     acquisition.add_argument("--plan", type=Path, required=True)
     acquisition.add_argument("--observations", type=Path, help="JSON map of planned source job IDs to published capture task paths; native inputs must match")
     acquisition.add_argument("--deployment", type=Path, required=True)
-    acquisition.add_argument("--timeout", type=float, required=True, help="maximum seconds per native attempt")
-    acquisition.add_argument("--native-budget-seconds", type=float, required=True)
-    acquisition.add_argument("--postprocessing-budget-seconds", type=float, required=True)
-    acquisition.add_argument("--attempt-limit", type=int, required=True)
-    acquisition.add_argument("--storage-bytes", type=int, required=True, help="monitored logical bytes under this collection root")
-    acquisition.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
     acquisition.add_argument("--keep-intermediates", action="store_true")
     acquisition.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
-    for command in (production, prediction, acquisition):
+    for command in (acquisition, sampling):
+        command.add_argument("--timeout", type=float, required=True, help="maximum seconds per native attempt")
+        command.add_argument("--native-budget-seconds", type=float, required=True)
+        command.add_argument("--postprocessing-budget-seconds", type=float, required=True)
+        command.add_argument("--attempt-limit", type=int, required=True)
+        command.add_argument("--storage-bytes", type=int, required=True, help="monitored logical bytes under this collection root")
+        command.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
+    for command in (production, prediction, acquisition, sampling):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--binary", type=Path, required=True)
         command.add_argument("--modeling-image", default="markov-next-modeling:ubuntu24.04")
@@ -95,6 +102,10 @@ def main() -> None:
         from markov_workflow.acquisition import SourceAcquisition
 
         SourceAcquisition(arguments).run()
+    elif arguments.command == "acquire-costs":
+        from markov_workflow.cost_acquisition import CostAcquisition
+
+        CostAcquisition(arguments).run()
     else:
         from markov_workflow.prediction import PredictionProcess
 

@@ -126,6 +126,7 @@ class CostSamples:
         self.output = arguments.output
         root = arguments.production
         rank = arguments.rank
+        self.observation = {"production": str(root.resolve()), "rank": rank}
         ranks = json.loads((root / "result.json").read_text())["observed_roles"]
         if rank not in ranks:
             raise ValueError("cost samples require an observed production rank")
@@ -206,6 +207,7 @@ class CostSamples:
             samples.add_external({"operation": measured["operation"]}, "transfer", features, sum(span) // 2)
 
         report = samples.document(absent)
+        report["observation"] = self.observation
         if self.notifications:
             report["notification_measurements"] = self.notifications
         write_json(self.output, report, replace=False)

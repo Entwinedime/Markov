@@ -65,14 +65,15 @@ ServiceDuration WorkCosts::Curve::estimate(const WorkFeatures & features) const 
     return static_cast<std::int64_t>(std::nearbyint(service));
 }
 
-WorkCosts::WorkCosts(const TemplateLibrary & library, const nlohmann::json & asset) {
+WorkCosts::WorkCosts(const TemplateLibrary & library, const nlohmann::json & asset) : library_(library) {
+    definitions_.resize(library.definitions.size());
     const nlohmann::json * selected = nullptr;
     for (const auto & domain : asset.at("domains").get_ref<const nlohmann::json::array_t &>()) {
         if (domain.at("domain") != library.domain) continue;
         if (selected) throw std::invalid_argument("cost asset repeats the selected implementation domain");
         selected = &domain;
     }
-    if (!selected) throw std::invalid_argument("cost asset does not cover the selected template implementation domain");
+    if (!selected) return;
 
     const auto & definitions = selected->at("definitions").get_ref<const nlohmann::json::array_t &>();
     std::map<nlohmann::json, std::size_t> known;
@@ -99,10 +100,9 @@ WorkCosts::WorkCosts(const TemplateLibrary & library, const nlohmann::json & ass
     }
 
     // Source and target library indices are local to their assets. Compare canonical definitions only at load time.
-    definitions_.reserve(library.definitions.size());
-    for (const auto & definition : library.definitions) {
-        const auto source = known.find(definition.document());
-        definitions_.push_back(source == known.end() ? std::nullopt : std::optional(source->second));
+    for (std::size_t index = 0; index < library.definitions.size(); ++index) {
+        const auto source = known.find(library.definitions[index].document());
+        if (source != known.end()) definitions_[index] = source->second;
     }
 }
 
@@ -113,12 +113,13 @@ const WorkCosts::Curve * WorkCosts::curve(std::optional<std::size_t> definition,
     return exact == phases.end() ? nullptr : &exact->second;
 }
 
-CostGap WorkCosts::gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details) {
+CostGap WorkCosts::gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details) const {
     auto bounds = nlohmann::json::object();
     if (candidate) {
         for (const auto & [name, bound] : candidate->bounds) bounds[name] = { bound.lower, bound.upper };
     }
     details["status"] = candidate ? "outside_sample_ranges" : "unseen_work";
+    details["domain"] = library_.domain;
     details["features"] = features.document();
     details["sample_bounds"] = std::move(bounds);
     return CostGap(std::move(details));
@@ -142,7 +143,7 @@ GraphTiming WorkCosts::timing(const CoarseGraph & graph, std::span<const Templat
                 { "action_site", graph.scopes.front().info.site },
                 { "site", scope.info.site }, { "implementation", scope.info.implementation },
                 { "scope", scope.info.role }, { "work", work_name(work.kind) }, { "resource", graph.resources[work.resource].role },
-                { "definition", origin.definition }, { "interval", origin.interval },
+                { "definition", library_.definitions.at(origin.definition).document() }, { "interval", origin.interval },
             });
         }
         result.work_ns.push_back(estimate);

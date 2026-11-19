@@ -9,7 +9,7 @@ from markov_adapters.artifacts import write_json
 from markov_adapters.sglang.configuration import CaptureInput
 from markov_workload import WorkloadContent
 from markov_workload.expert_routes import ExpertRoutes
-from markov_workflow.prediction import SourceProductions
+from markov_workflow.source_productions import SourceProductions
 
 
 class MatrixInputs:

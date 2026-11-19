@@ -60,8 +60,9 @@ private:
 
     using PhaseCurves = std::map<std::string, Curve, std::less<>>;
     const Curve * curve(std::optional<std::size_t> definition, std::size_t interval, std::string_view phase) const;
-    static CostGap gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details);
+    CostGap gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details) const;
 
+    const TemplateLibrary & library_;
     std::vector<std::optional<std::size_t>> definitions_;
     std::map<nlohmann::json, std::pair<std::size_t, WorkKind>> external_;
     std::vector<std::vector<PhaseCurves>> models_;
