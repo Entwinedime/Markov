@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "markov/contracts/expression.hpp"
 #include "markov/graph/graph.hpp"
 
 namespace markov {
@@ -18,6 +19,7 @@ namespace markov {
 class WorkFeatures {
 public:
     explicit WorkFeatures(const GraphScope & scope);
+    explicit WorkFeatures(Parameters parameters);
 
     std::string_view phase() const { return phase_; }
     std::optional<double> value(std::string_view axis) const;

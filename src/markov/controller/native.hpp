@@ -50,9 +50,8 @@ struct NativeInstance {
 class NativeController final : public ServingControl {
 public:
     NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer, const nlohmann::json & prefixes,
-                     Timeline & timeline, const nlohmann::json & ingress, ServiceDuration given_work_ns,
-                     ExecutionInputs * execution_inputs = nullptr, ResourceObserver * observer = nullptr,
-                     ControlObserver * control_observer = nullptr);
+                     Timeline & timeline, const nlohmann::json & ingress, ServiceTimes & times,
+                     ResourceObserver * observer, ControlObserver * control_observer);
 
     std::optional<ServingAction> plan(std::int64_t now_ns) override;
     void finish(const ServingAction & action, std::size_t returned_event, std::size_t caller_returned_event, std::int64_t completed_ns,

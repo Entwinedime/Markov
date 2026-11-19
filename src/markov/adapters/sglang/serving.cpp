@@ -19,10 +19,10 @@
 #include "markov/controller/native.hpp"
 #include "markov/execution/dependencies.hpp"
 #include "markov/execution/timeline.hpp"
-#include "markov/performance/work_costs.hpp"
 #include "markov/resources/kv_pool.hpp"
 #include "markov/resources/service.hpp"
 #include "markov/serving/execution_inputs.hpp"
+#include "markov/serving/service_times.hpp"
 #include "markov/serving/session.hpp"
 
 namespace markov::sglang {
@@ -59,13 +59,13 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
     if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
     std::optional<ExecutionInputs> inputs;
     if (!timing.is_null()) inputs.emplace(timing, control_observer);
+    ServiceTimes service_times(duration, inputs ? &*inputs : nullptr, costs);
     const nlohmann::json empty;
     const auto & ingress = timing.is_null() ? empty : timing.at("ingress");
     if (!ingress.is_null() && !ingress.is_object()) throw std::invalid_argument("ingress must be an instance mapping");
     std::vector<Resource> resources;
     std::map<std::string, std::unique_ptr<Participant>> participants;
     std::map<std::string, ServingParticipant> execution;
-    std::map<std::size_t, WorkCosts> cost_models;
     std::vector<NativeInstance> instances;
     std::set<std::string> instance_ids;
     auto sources = nlohmann::json::array();
@@ -153,8 +153,8 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                      .first->second;
             instance.participants.push_back({ group, static_cast<std::size_t>(rank), control_thread,
                                                participant.resources, participant.graphs, participant.dependencies });
-            const auto * model = costs.is_null() ? nullptr : &cost_models.try_emplace(template_source, library, costs).first->second;
-            execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies, model });
+            service_times.bind(group, library);
+            execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies });
         }
         if ((tp == 0 || ranks.size() % static_cast<std::size_t>(tp) != 0 || ranks.size() / static_cast<std::size_t>(tp) != static_cast<std::size_t>(pp))
             || std::set(ranks.begin(), ranks.end()).size() != ranks.size() || ranks.empty())
@@ -192,9 +192,9 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
         { "instances", std::move(sources) }
     });
     Timeline timeline(std::move(resources), execution_observer);
-    NativeController control(std::move(requests), instances, peer, workload.at("prefixes"), timeline, ingress, duration,
-                             inputs ? &*inputs : nullptr, resource_observer, control_observer);
-    auto result = ServingSession(control, timeline, std::move(execution)).run(duration, inputs ? &*inputs : nullptr);
+    NativeController control(std::move(requests), instances, peer, workload.at("prefixes"), timeline, ingress, service_times,
+                             resource_observer, control_observer);
+    auto result = ServingSession(control, timeline, service_times, std::move(execution)).run();
     result.update(control.cpu_summary());
     if (!ingress.is_null()) result["arrival_basis"] = "supplied_ingress";
     return result;

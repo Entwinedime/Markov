@@ -39,8 +39,8 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
         if (field != "actors" && field != "context_values" && field != "notifications" && field != "transfers" && field != "ingress" && field != "layouts")
             throw std::invalid_argument("unknown execution input field: " + field);
     }
-    if (layouts_ && (!layouts_->is_array() || layouts_->empty() || !source.at("transfers").empty()))
-        throw std::invalid_argument("full timing requires action layouts and directly measured work outside the CPU wire protocol");
+    if (layouts_ && (!layouts_->is_array() || layouts_->empty()))
+        throw std::invalid_argument("measured action layouts require a nonempty array");
     for (const auto & [group, record] : source.at("actors").items()) {
         const auto & steps = record.at("steps");
         if (group.empty() || !steps.is_array() || record.size() != 1)
@@ -50,8 +50,9 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
             if ((operation != "action" && operation != "cpu" && operation != "input") || !step.at("identity").is_object()
                 || !step.at("source").is_object() || step.at("source").empty())
                 throw std::invalid_argument("execution input requires an operation, logical identity and source reference");
-            if (layouts_ && (operation == "cpu" || (operation == "action" && (step.contains("bindings") || !step.at("layout").is_number_unsigned()))))
-                throw std::invalid_argument("full timing requires action time facts without native construction bindings");
+            if (layouts_ && operation == "action" && (step.contains("bindings") || !step.at("layout").is_number_unsigned()))
+                throw std::invalid_argument("measured action layouts require time facts without native construction bindings");
+            has_cpu_steps_ |= operation == "cpu";
         }
         actors_.emplace(group, Actor{ steps });
     }
@@ -84,8 +85,6 @@ ExecutionInputs::ExecutionInputs(const nlohmann::json & source, ControlObserver 
         if (!transfers_.emplace(key, Condition{ record }).second) throw std::invalid_argument("execution inputs repeat a CPU transfer");
     }
 }
-
-bool ExecutionInputs::full_coverage() const { return layouts_ != nullptr; }
 
 void ExecutionInputs::bind(std::span<const std::string> participants) const {
     if (participants.size() != actors_.size() || std::ranges::any_of(participants, [&](const auto & group) { return !actors_.contains(group); }))
@@ -133,7 +132,7 @@ const nlohmann::json & ExecutionInputs::take(const std::string & group, const st
 InvocationInput ExecutionInputs::invocation(const std::string & group, const std::string & operation, const nlohmann::json & identity) {
     const auto & record = take(group, operation, identity);
     ++graph_count_;
-    return { record, { group, actors_.at(group).next - 1 }, layouts_ };
+    return { record, { group, actors_.at(group).next - 1 }, operation == "action" ? layouts_ : nullptr };
 }
 
 const nlohmann::json & InvocationInput::bindings() const {
@@ -281,9 +280,12 @@ nlohmann::json ExecutionInputs::finish() const {
             if (!condition.consumed) throw std::runtime_error("execution ended with an unused completion condition: " + identity.dump());
         }
     }
-    return {{ "duration_basis", full_coverage() ? "fully_matched_native_endpoints" : "checked_causal_execution_inputs" }, { "timed_invocations", graph_count_ },
+    const bool full = layouts_ && !has_cpu_steps_;
+    const auto scope = full ? "measured_work_and_event_coverage" : layouts_ ? "measured_action_endpoints_and_checked_cpu_protocol_bounds"
+                                                                          : "supplied_conditions_and_earliest_causal_realization_not_cost_accuracy";
+    return {{ "duration_basis", full ? "fully_matched_native_endpoints" : "checked_causal_execution_inputs" }, { "timed_invocations", graph_count_ },
              { "timed_input_reads", input_count_ }, { "timed_notifications", notifications_.size() }, { "timed_cpu_transfers", transfers_.size() },
-             { "timing_scope", full_coverage() ? "measured_work_and_event_coverage" : "supplied_conditions_and_earliest_causal_realization_not_cost_accuracy" }};
+             { "timing_scope", scope }};
 }
 
 } // namespace markov

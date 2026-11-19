@@ -223,8 +223,6 @@ class NativeInputs:
             document = {"context_values": self.contexts.values, "actors": actors, "ingress": self.ingress,
                         "notifications": notifications, "transfers": self.transfers()}
             if self.layouts is not None:
-                if self.cpu_posts:
-                    raise ValueError("full timing cannot qualify undivided CPU protocol intervals")
                 document["layouts"] = self.layout_values.values
             report.update(status="partial" if self.counts["unmeasured_boundaries"] or self.counts["unmeasured_work_finishes"]
                           or native_report["status"] != "consistent" else "extracted",

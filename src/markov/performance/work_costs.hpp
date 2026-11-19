@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -19,6 +20,7 @@ namespace markov {
 class CoarseGraph;
 class TemplateLibrary;
 class WorkFeatures;
+enum class WorkKind;
 struct TemplateInterval;
 
 class CostGap final : public std::runtime_error {
@@ -34,6 +36,7 @@ class WorkCosts {
 public:
     WorkCosts(const TemplateLibrary & library, const nlohmann::json & asset);
     GraphTiming timing(const CoarseGraph & graph, std::span<const TemplateInterval> origins) const;
+    std::int64_t external(const nlohmann::json & identity, WorkKind kind, const WorkFeatures & features) const;
 
 private:
     struct Bound {
@@ -56,9 +59,11 @@ private:
     };
 
     using PhaseCurves = std::map<std::string, Curve, std::less<>>;
-    const Curve * curve(const TemplateInterval & origin, std::string_view phase) const;
+    const Curve * curve(std::optional<std::size_t> definition, std::size_t interval, std::string_view phase) const;
+    static CostGap gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details);
 
     std::vector<std::optional<std::size_t>> definitions_;
+    std::map<nlohmann::json, std::pair<std::size_t, WorkKind>> external_;
     std::vector<std::vector<PhaseCurves>> models_;
 };
 

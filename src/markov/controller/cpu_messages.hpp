@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,8 @@
 
 namespace markov {
 
+class ServiceTimes;
+
 struct CpuActor {
     std::string instance;
     Resource control;
@@ -27,7 +30,7 @@ struct CpuActor {
 // The broker owns numeric payloads and channel positions; this service owns their execution readiness.
 class CpuMessages {
 public:
-    CpuMessages(Timeline & timeline, ServiceDuration given_service_ns, ControlObserver * observer, ExecutionInputs * inputs);
+    CpuMessages(Timeline & timeline, ServiceTimes & times, ControlObserver * observer);
     void add_actor(const std::string & group, CpuActor actor);
     void prime();
     void call(std::size_t call, const std::string & group, const nlohmann::json & message);
@@ -77,6 +80,7 @@ private:
     void observe(const nlohmann::json & key, const Endpoint & endpoint, const nlohmann::json & fields);
     void ensure_wire(const nlohmann::json & key, Message & message, const Endpoint & endpoint);
     void resolve(const nlohmann::json & key, Message & message);
+    ServiceDuration estimate(const Endpoint & owner, const nlohmann::json & execution, std::string_view operation, WorkKind kind);
     Service service(const nlohmann::json & key, const Endpoint & endpoint,
                     const nlohmann::json & execution, std::optional<std::size_t> prerequisite);
     void consume(const nlohmann::json & key, Endpoint & endpoint);
@@ -84,9 +88,8 @@ private:
     void wait(std::size_t call, const std::string & group, const nlohmann::json & message);
 
     Timeline & timeline_;
-    ServiceDuration given_service_ns_;
+    ServiceTimes & times_;
     ControlObserver * observer_;
-    ExecutionInputs * inputs_;
     std::map<std::string, CpuActor> actors_;
     std::map<nlohmann::json, Message> messages_;
     std::map<std::size_t, std::vector<Completion>> completions_;

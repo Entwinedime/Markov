@@ -1,11 +1,15 @@
 #include "markov/performance/work_features.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <utility>
 
 namespace markov {
+
+WorkFeatures::WorkFeatures(Parameters parameters)
+    : parameters_(std::make_move_iterator(parameters.begin()), std::make_move_iterator(parameters.end())) {}
 
 WorkFeatures::WorkFeatures(const GraphScope & scope) {
     const auto & info = scope.info;

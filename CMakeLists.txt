@@ -27,6 +27,7 @@ add_library(markov_core
     src/markov/execution/dependencies.cpp
     src/markov/execution/communication.cpp
     src/markov/serving/session.cpp
+    src/markov/serving/service_times.cpp
     src/markov/serving/execution_inputs.cpp
     src/markov/performance/work_costs.cpp
     src/markov/performance/work_features.cpp

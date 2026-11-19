@@ -83,24 +83,29 @@ class ServiceCurve:
         return cls.interpolate(knots[position - 1], knots[position], value)
 
 
-class FitCosts:
-    def __init__(self, arguments):
-        self.arguments = arguments
+class DomainCosts:
+    def __init__(self, sources):
         self.definitions = []
         self.indices = {}
-        self.curves = {}
+        groups = defaultdict(list)
+        for source in sources:
+            indices = []
+            for definition in source["definitions"]:
+                key = self.identity(definition)
+                if key not in self.indices:
+                    self.indices[key] = len(self.definitions)
+                    self.definitions.append(definition)
+                indices.append(self.indices[key])
+            for row in source["samples"]:
+                groups[indices[row["definition"]], row["interval"], row["features"]["phase"]].append(row)
 
-    @staticmethod
-    def read(path):
-        return json.loads(path.read_text())
+        self.curves = {key: ServiceCurve(rows).document() for key, rows in sorted(groups.items())}
 
     @staticmethod
     def identity(definition):
         return json.dumps(definition, sort_keys=True, separators=(",", ":"))
 
-    def definitions_in(self, domain, definitions):
-        if domain != self.domain:
-            raise ValueError("work and cost data belong to different template domains")
+    def definitions_in(self, definitions):
         return [self.indices.get(self.identity(item)) for item in definitions]
 
     def query(self, definition, interval, features):
@@ -112,7 +117,7 @@ class FitCosts:
         return ("outside_sample_ranges", None) if estimate is None else ("covered", estimate)
 
     def evaluate(self, source):
-        definitions = self.definitions_in(source["domain"], source["definitions"])
+        definitions = self.definitions_in(source["definitions"])
         counts, errors = defaultdict(Counter), defaultdict(list)
         for row in source["samples"]:
             origin = row["definition"]
@@ -131,9 +136,8 @@ class FitCosts:
             "unmeasured": source["unmeasured"],
         }
 
-    def demand(self, graph_path, identities_path):
-        catalog = WorkCatalog(graph_path, identities_path)
-        definitions = self.definitions_in(catalog.domain, catalog.definitions)
+    def demand(self, catalog, identities_path):
+        definitions = self.definitions_in(catalog.definitions)
         counts, missing = defaultdict(Counter), {}
         for piece, definition, interval, features in catalog:
             status, _ = self.query(definitions[definition], interval, features)
@@ -162,30 +166,46 @@ class FitCosts:
         gaps = sorted(missing.values(), key=lambda group: group["work"], reverse=True)
         return {"identities": str(identities_path.resolve()), "counts": counts, "gaps": gaps}
 
-    def run(self):
-        groups = defaultdict(list)
-        sources = [self.read(path) for path in self.arguments.samples]
-        self.domain = sources[0]["domain"]
-        for source in sources:
-            if source["domain"] != self.domain:
-                raise ValueError("cost samples belong to different template domains")
-            indices = []
-            for definition in source["definitions"]:
-                key = self.identity(definition)
-                if key not in self.indices:
-                    self.indices[key] = len(self.definitions)
-                    self.definitions.append(definition)
-                indices.append(self.indices[key])
-            for row in source["samples"]:
-                groups[indices[row["definition"]], row["interval"], row["features"]["phase"]].append(row)
-        for key, rows in sorted(groups.items()):
-            self.curves[key] = ServiceCurve(rows).document()
-        write_json(self.arguments.output, {
-            "domain": self.domain, "definitions": self.definitions,
+    def document(self, domain):
+        return {
+            "domain": domain, "definitions": self.definitions,
             "models": [{"definition": definition, "interval": interval, "phase": phase, **model}
                        for (definition, interval, phase), model in self.curves.items()],
+        }
+
+
+class FitCosts:
+    def __init__(self, arguments):
+        self.arguments = arguments
+
+    @staticmethod
+    def read(path):
+        return json.loads(path.read_text())
+
+    def run(self):
+        sources = [self.read(path) for path in self.arguments.samples]
+        grouped = defaultdict(list)
+        for source in sources:
+            grouped[DomainCosts.identity(source["domain"])].append(source)
+        domains = {key: DomainCosts(rows) for key, rows in grouped.items()}
+        absent = DomainCosts(())
+
+        # A request in another domain is an uncovered demand, even when its definitions look identical.
+        checks = []
+        for path in self.arguments.check:
+            source = self.read(path)
+            costs = domains.get(DomainCosts.identity(source["domain"]), absent)
+            checks.append({"source": str(path.resolve()), **costs.evaluate(source)})
+        demand = []
+        for graph_path, identities_path in self.arguments.demand:
+            catalog = WorkCatalog(graph_path, identities_path)
+            costs = domains.get(DomainCosts.identity(catalog.domain), absent)
+            demand.append(costs.demand(catalog, identities_path))
+
+        write_json(self.arguments.output, {
+            "domains": [costs.document(grouped[key][0]["domain"]) for key, costs in domains.items()],
             "sources": [str(path.resolve()) for path in self.arguments.samples],
             "source_gaps": [source["unmeasured"] for source in sources],
-            "checks": [{"source": str(path.resolve()), **self.evaluate(self.read(path))} for path in self.arguments.check],
-            "demand": [self.demand(*paths) for paths in self.arguments.demand],
+            "checks": checks,
+            "demand": demand,
         }, replace=False)

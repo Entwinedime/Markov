@@ -66,17 +66,31 @@ ServiceDuration WorkCosts::Curve::estimate(const WorkFeatures & features) const 
 }
 
 WorkCosts::WorkCosts(const TemplateLibrary & library, const nlohmann::json & asset) {
-    if (asset.at("domain") != library.domain)
-        throw std::invalid_argument("cost asset and selected templates use different implementation domains");
-    const auto & definitions = asset.at("definitions").get_ref<const nlohmann::json::array_t &>();
+    const nlohmann::json * selected = nullptr;
+    for (const auto & domain : asset.at("domains").get_ref<const nlohmann::json::array_t &>()) {
+        if (domain.at("domain") != library.domain) continue;
+        if (selected) throw std::invalid_argument("cost asset repeats the selected implementation domain");
+        selected = &domain;
+    }
+    if (!selected) throw std::invalid_argument("cost asset does not cover the selected template implementation domain");
+
+    const auto & definitions = selected->at("definitions").get_ref<const nlohmann::json::array_t &>();
     std::map<nlohmann::json, std::size_t> known;
     models_.resize(definitions.size());
     for (std::size_t index = 0; index < definitions.size(); ++index) {
-        if (!known.emplace(definitions[index], index).second)
+        const auto & definition = definitions[index];
+        const auto & work = definition.at("work").get_ref<const nlohmann::json::array_t &>();
+        if (definition.contains("external")) {
+            if (work.size() != 1) throw std::invalid_argument("external cost definition must declare one work interval");
+            const auto kind = work_kind(work.front().at("kind").get<std::string>());
+            if (!external_.emplace(definition.at("external"), std::pair{ index, kind }).second)
+                throw std::invalid_argument("cost asset repeats an external work definition");
+        } else if (!known.emplace(definition, index).second) {
             throw std::invalid_argument("cost asset repeats a template definition");
-        models_[index].resize(definitions[index].at("work").get_ref<const nlohmann::json::array_t &>().size());
+        }
+        models_[index].resize(work.size());
     }
-    for (const auto & model : asset.at("models").get_ref<const nlohmann::json::array_t &>()) {
+    for (const auto & model : selected->at("models").get_ref<const nlohmann::json::array_t &>()) {
         const auto definition = model.at("definition").get<std::size_t>();
         const auto interval = model.at("interval").get<std::size_t>();
         auto & phases = models_.at(definition).at(interval);
@@ -92,12 +106,22 @@ WorkCosts::WorkCosts(const TemplateLibrary & library, const nlohmann::json & ass
     }
 }
 
-const WorkCosts::Curve * WorkCosts::curve(const TemplateInterval & origin, std::string_view phase) const {
-    const auto definition = definitions_.at(origin.definition);
+const WorkCosts::Curve * WorkCosts::curve(std::optional<std::size_t> definition, std::size_t interval, std::string_view phase) const {
     if (!definition) return nullptr;
-    const auto & phases = models_[*definition].at(origin.interval);
+    const auto & phases = models_[*definition].at(interval);
     const auto exact = phases.find(phase);
     return exact == phases.end() ? nullptr : &exact->second;
+}
+
+CostGap WorkCosts::gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details) {
+    auto bounds = nlohmann::json::object();
+    if (candidate) {
+        for (const auto & [name, bound] : candidate->bounds) bounds[name] = { bound.lower, bound.upper };
+    }
+    details["status"] = candidate ? "outside_sample_ranges" : "unseen_work";
+    details["features"] = features.document();
+    details["sample_bounds"] = std::move(bounds);
+    return CostGap(std::move(details));
 }
 
 GraphTiming WorkCosts::timing(const CoarseGraph & graph, std::span<const TemplateInterval> origins) const {
@@ -111,25 +135,31 @@ GraphTiming WorkCosts::timing(const CoarseGraph & graph, std::span<const Templat
         const auto & scope = graph.scopes[work.scope];
         auto & geometry = features[work.scope];
         if (!geometry) geometry.emplace(scope);
-        const auto * candidate = curve(origin, geometry->phase());
+        const auto * candidate = curve(definitions_.at(origin.definition), origin.interval, geometry->phase());
         const auto estimate = candidate ? candidate->estimate(*geometry) : std::nullopt;
         if (!estimate) {
-            auto bounds = nlohmann::json::object();
-            if (candidate) {
-                for (const auto & [name, bound] : candidate->bounds) bounds[name] = { bound.lower, bound.upper };
-            }
-            throw CostGap({
-                { "status", candidate ? "outside_sample_ranges" : "unseen_work" },
+            throw gap(candidate, *geometry, {
                 { "action_site", graph.scopes.front().info.site },
                 { "site", scope.info.site }, { "implementation", scope.info.implementation },
                 { "scope", scope.info.role }, { "work", work_name(work.kind) }, { "resource", graph.resources[work.resource].role },
                 { "definition", origin.definition }, { "interval", origin.interval },
-                { "features", geometry->document() }, { "sample_bounds", std::move(bounds) },
             });
         }
         result.work_ns.push_back(estimate);
     }
     return result;
+}
+
+std::int64_t WorkCosts::external(const nlohmann::json & identity, WorkKind kind, const WorkFeatures & features) const {
+    const auto found = external_.find(identity);
+    if (found != external_.end() && found->second.second != kind)
+        throw std::invalid_argument("external cost definition changes the declared work kind");
+    const auto * candidate = found == external_.end() ? nullptr : curve(found->second.first, 0, features.phase());
+    if (const auto estimate = candidate ? candidate->estimate(features) : std::nullopt) return *estimate;
+
+    throw gap(candidate, features, {{ "site", identity.at("operation") }, { "work", work_name(kind) },
+                                   { "definition", {{ "external", identity }, { "work", {{{ "kind", work_name(kind) }}} }} },
+                                   { "interval", 0 }});
 }
 
 } // namespace markov

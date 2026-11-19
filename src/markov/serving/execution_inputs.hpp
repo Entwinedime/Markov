@@ -33,7 +33,6 @@ struct InvocationInput {
 class ExecutionInputs {
 public:
     ExecutionInputs(const nlohmann::json & source, ControlObserver * observer);
-    bool full_coverage() const;
     void bind(std::span<const std::string> participants) const;
     static nlohmann::json work_identity(const nlohmann::json & work);
     static nlohmann::json action_identity(const ServingAction & action);
@@ -66,6 +65,7 @@ private:
     std::map<nlohmann::json, Condition> transfers_;
     std::size_t graph_count_ = 0;
     std::size_t input_count_ = 0;
+    bool has_cpu_steps_ = false;
 };
 
 } // namespace markov

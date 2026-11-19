@@ -4,10 +4,13 @@
 #include <stdexcept>
 #include <utility>
 
+#include "markov/performance/work_features.hpp"
+#include "markov/serving/service_times.hpp"
+
 namespace markov {
 
-CpuMessages::CpuMessages(Timeline & timeline, ServiceDuration given_service_ns, ControlObserver * observer, ExecutionInputs * inputs)
-    : timeline_(timeline), given_service_ns_(given_service_ns), observer_(observer), inputs_(inputs) {}
+CpuMessages::CpuMessages(Timeline & timeline, ServiceTimes & times, ControlObserver * observer)
+    : timeline_(timeline), times_(times), observer_(observer) {}
 
 void CpuMessages::add_actor(const std::string & group, CpuActor actor) { actors_.emplace(group, std::move(actor)); }
 void CpuMessages::prime() { priming_ = false; }
@@ -25,6 +28,23 @@ void CpuMessages::ensure_wire(const nlohmann::json & key, Message & message, con
     message.wire = timeline_.defer();
     completions_[*message.wire].push_back({ Phase::Wire, key, endpoint.descriptor.at("receiving").get<bool>() ? 1U : 0U, {} });
     observe(key, endpoint, {{ "phase", "wire" }, { "event", *message.wire }});
+}
+
+ServiceDuration CpuMessages::estimate(const Endpoint & owner, const nlohmann::json & execution, std::string_view operation, WorkKind kind) {
+    const auto & route = execution.at("work").at("context").at("cpu_transfer");
+    const auto & descriptor = owner.descriptor;
+
+    // A logical route stays stable when native group IDs, message ordinals and payload lengths change.
+    const nlohmann::json identity{
+        { "operation", operation }, { "channel", route.at("group") },
+        { "source", descriptor.at("source") }, { "target", descriptor.at("target") },
+        { "dtype", descriptor.at("dtype") }
+    };
+    const WorkFeatures features(Parameters{
+        { "elements", descriptor.at("elements").get<std::int64_t>() },
+        { "element_bytes", descriptor.at("element_bytes").get<std::int64_t>() }
+    });
+    return times_.external(owner.group, identity, kind, features);
 }
 
 CpuMessages::Service CpuMessages::service(const nlohmann::json & key, const Endpoint & endpoint,
@@ -47,15 +67,14 @@ CpuMessages::Service CpuMessages::service(const nlohmann::json & key, const Endp
     if (prerequisite) inputs.push_back({ *prerequisite, 1, Relation::Communication });
     GraphTiming timing;
     std::optional<InputPosition> position;
-    if (inputs_) {
-        auto supplied = inputs_->invocation(endpoint.group, "cpu", {
+    if (auto * observed = times_.conditions()) {
+        auto supplied = observed->invocation(endpoint.group, "cpu", {
             { "operation", execution.at("operation") }, { "work", ExecutionInputs::work_identity(execution.at("work")) }
         });
         timing = supplied.timing(graph);
         position = std::move(supplied.position);
     } else {
-        if (!given_service_ns_) throw std::runtime_error("cost asset has no native CPU protocol service model");
-        timing.work_ns.push_back(given_service_ns_);
+        timing.work_ns.push_back(estimate(endpoint, execution, execution.at("operation").get_ref<const std::string &>(), WorkKind::Host));
     }
     const auto events = timeline_.insert(graph, timing.work_ns, inputs, timing.boundaries);
     ++service_count_;
@@ -94,15 +113,15 @@ void CpuMessages::resolve(const nlohmann::json & key, Message & message) {
     const bool in_flow = sender.execution.at("in_flow").get<bool>() || receiver.execution.at("in_flow").get<bool>();
     if (!in_flow) {
         message.timing = { 0, {} };
-    } else if (inputs_) {
+    } else if (auto * observed = times_.conditions()) {
         std::vector<InputPosition> positions;
         for (const auto & endpoint : message.endpoints) {
             if (endpoint->input) positions.push_back(*endpoint->input);
         }
-        message.timing = inputs_->transfer(positions);
+        message.timing = observed->transfer(positions);
     } else {
-        if (!given_service_ns_) throw std::runtime_error("cost asset has no native CPU transport model");
-        message.timing = { given_service_ns_, {} };
+        const auto & execution = sender.execution.at("in_flow").get<bool>() ? sender.execution : receiver.execution;
+        message.timing = { estimate(sender, execution, "cpu_transport", WorkKind::Transfer), {} };
     }
     timeline_.resolve(*message.wire, prerequisites, Relation::Communication, message.timing.window, message.timing.service_ns);
 }
@@ -254,8 +273,10 @@ bool CpuMessages::shutdown_ready() const {
 }
 
 nlohmann::json CpuMessages::summary() const {
+    const auto basis = times_.conditions() ? "checked_execution_inputs"
+        : times_.modeled() ? "independent_service_costs_outside_native_startup" : "given_service_duration_outside_native_startup";
     return {{ "cpu_protocol", {{ "service_intervals", service_count_ }, { "ready_messages", ready_count_ }, { "consumptions", consumed_count_ },
-                               { "timing_basis", inputs_ ? "checked_execution_inputs" : "given_service_duration_outside_native_startup" }} }};
+                               { "timing_basis", basis }} }};
 }
 
 } // namespace markov

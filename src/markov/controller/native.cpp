@@ -7,19 +7,20 @@
 #include <string>
 #include <utility>
 
+#include "markov/serving/service_times.hpp"
+
 namespace markov {
 
 NativeController::NativeController(std::vector<Request> requests, std::span<const NativeInstance> instances, ControlPeer & peer,
                                    const nlohmann::json & prefixes, Timeline & timeline, const nlohmann::json & ingress,
-                                   ServiceDuration given_work_ns, ExecutionInputs * execution_inputs, ResourceObserver * observer,
-                                   ControlObserver * control_observer)
+                                   ServiceTimes & times, ResourceObserver * observer, ControlObserver * control_observer)
     : requests_(std::move(requests)),
       peer_(peer),
       timeline_(timeline),
-      execution_inputs_(execution_inputs),
+      execution_inputs_(times.conditions()),
       observer_(observer),
       control_observer_(control_observer),
-      cpu_(timeline, given_work_ns, control_observer, execution_inputs) {
+      cpu_(timeline, times, control_observer) {
     auto configuration = nlohmann::json::array();
     if (!ingress.is_null() && (!ingress.is_object() || ingress.size() != instances.size()))
         throw std::invalid_argument("ingress must describe every serving instance");
