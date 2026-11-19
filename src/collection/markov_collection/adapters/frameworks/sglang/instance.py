@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from markov_adapters.sglang.configuration import CaptureInput, InstanceConfiguration
+from markov_adapters.sglang.configuration import CaptureInput, InstanceConfiguration, NativeConfiguration
 from markov_collection.adapters.frameworks.sglang.profiles import NativeProfiles
 from markov_collection.adapters.frameworks.sglang.submissions import EngineSubmissions
 from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
@@ -18,13 +18,14 @@ from markov_adapters.artifacts import write_json
 class NativeServingInstance:
     def __init__(
         self, source: CaptureInput, instance: InstanceConfiguration, output: Path, index: int, rank_offset: int,
-        *, resource_trace: bool, latency_only: bool, host_timing: bool,
+        *, resource_trace: bool, latency_only: bool, host_timing: bool, service_reference: bool,
     ) -> None:
         self.model = source.model
-        self.observe_all_workers = source.observe_all_workers
+        self.observe_all_workers = source.observe_all_workers or service_reference
         self.resource_trace = resource_trace
         self.latency_only = latency_only
         self.host_timing = host_timing
+        self.service_reference = service_reference
         self.output = output.resolve()
         self.instance = instance
         self.directory = self.output / "instances" / str(index)
@@ -77,10 +78,20 @@ class NativeServingInstance:
             return {"host_samples": {rank: str(path.relative_to(self.output)) for rank, path in records.items()}}
 
         measurements = [json.loads(path.read_text()) for path in records.values()]
-        requests, = (record["requests"] for record in measurements if record["requests"])
+        requests = {request["id"]: {"id": request["id"]} for request in self.workload["requests"]}
+        for record in measurements:
+            for row in record["requests"]:
+                combined = requests[row["id"]]
+                values = {name: value for name, value in row.items() if name != "id"}
+                if values.keys() & combined.keys():
+                    raise ValueError(f"more than one worker measured a request boundary for {row['id']}")
+                combined.update(values)
+        required = {"id", "ingress_raw_ns", "first_publication_raw_ns", "last_publication_raw_ns", "output_tokens"}
+        if any(row.keys() != required for row in requests.values()):
+            raise ValueError("native request measurement did not join ingress, first token and final token")
         loads = [{"rank": record["rank"], **event} for record in measurements for event in record["specialization_loads"]]
         path = self.directory / "latency.json"
-        write_json(path, {"clock": "monotonic_raw_ns", "requests": requests, "specialization_loads": loads}, replace=False)
+        write_json(path, {"clock": "monotonic_raw_ns", "requests": list(requests.values()), "specialization_loads": loads}, replace=False)
         return {"latency": str(path.relative_to(self.output))}
 
     def observe(self, engine, capture, clock, barrier) -> tuple[int, ...]:
@@ -116,8 +127,10 @@ class NativeServingInstance:
             "resource_trace": self.resource_trace,
             "latency_only": self.latency_only,
             "host_timing": self.host_timing,
+            "service_reference": self.service_reference,
             "warmup_requests": [f"warmup/{index}" for index in range(warmup_count)],
             "source_requests": [f"capture/{index}" for index in range(len(self.workload["requests"]))],
+            "representative_warmup": self.warmup_groups is not None,
             "protocol_requests": capture.protocol_requests,
             "content": self.workload,
             "request_groups": {"warmup": warm.request_groups(), "source": capture.request_groups()},
@@ -137,7 +150,7 @@ class NativeServingInstance:
         configuration = self.configuration
         chunk_tokens = configuration["prefill_chunk_tokens"]
         options = {
-            "model_path": model["path"], "dtype": model["dtype"], "device": "npu",
+            "model_path": model["path"], "dtype": model["dtype"], "device": NativeConfiguration.accelerator_device,
             "tp_size": self.tp, "pp_size": self.pp, "base_gpu_id": self.rank_offset,
             "nccl_port": int(rendezvous["MASTER_PORT"]),
             "attention_backend": configuration["attention_backend"],
@@ -196,6 +209,14 @@ class NativeServingInstance:
                 # Engine stops its workers but leaves the Prefill bootstrap thread to its owner.
                 if engine.tokenizer_manager.bootstrap_server is not None:
                     engine.tokenizer_manager.bootstrap_server.close()
+        if self.host_timing and self.pp > 1:
+            from markov_collection.adapters.runtimes.pytorch.gloo_samples import GlooSamples
+
+            records = {int(rank): json.loads((self.output / path).read_text())["protocol"]
+                       for rank, path in metrics["host_samples"].items()}
+            output = self.directory / "cpu-transports.json"
+            GlooSamples.run(records, output)
+            metrics["cpu_transports"] = str(output.relative_to(self.output))
         return {
             "id": self.instance.identity, "mode": mode, "rank_offset": self.rank_offset, "observed_roles": selected,
             "native_participants": self.roles,

@@ -6,7 +6,7 @@ from pathlib import Path
 from statistics import mean
 
 from markov_adapters.artifacts import write_json
-from markov_workflow.latency import PredictedLatency, percentile95
+from markov_workflow.latency import RequestLatency, percentile95
 
 
 class NativeLatencyMetrics:
@@ -128,7 +128,7 @@ class LatencyComparison:
     def report(self):
         result = self.result
         workload = [{**truth, "arrival_ns": truth["declared_ns"]} for truth in self.native["requests"]]
-        prediction = PredictedLatency(result, workload).report()
+        prediction = RequestLatency.predicted(result, workload).report()
         requests = prediction["requests"]
         accuracy = {}
         for metric in ("ttft_ns", "tpot_ns"):

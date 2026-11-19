@@ -8,12 +8,12 @@ from pathlib import Path
 from markov_adapters.artifacts import write_json
 from markov_adapters.pytorch import CpuTransfer
 
-from actions import ActionIdentity
-from context_values import ContextValues
-from dependencies import ActionBoundaries
-from ingress import IngressEvidence
-from native_case import NativeCase
-from source_clock import ClockRealization
+from .actions import ActionIdentity
+from .context_values import ContextValues
+from .dependencies import ActionBoundaries
+from .ingress import IngressEvidence
+from .native_case import NativeCase
+from .source_clock import ClockRealization
 
 
 class NativeInputs:
@@ -166,15 +166,13 @@ class NativeInputs:
             result.append({"posts": positions, "service_ns": None, "window": self.window(begin, min(consumed), origin)})
         return result
 
-    def run(self):
+    def run(self, reference=None):
         self.output.mkdir(parents=True)
-        manifest = self.read(self.capture / "capture.json")
-        evidence = NativeCase(self.capture, manifest, self.graphs)
         report = {"capture": str(self.capture.resolve()), "graphs": str(self.graphs.resolve()), "status": "unverified"}
         try:
-            for number, instance in enumerate(manifest["instances"]):
+            evidence = NativeCase.read(self.capture, self.graphs) if reference is None else reference
+            for number, (instance, session) in enumerate(zip(evidence.manifest["instances"], evidence.sessions, strict=True)):
                 directory = self.capture / "instances" / str(number)
-                session = self.read(directory / "session.json")
                 delivery, = self.read(directory / "request-delivery.json")["capture"]
                 if delivery["clock"] != "monotonic_raw_ns" or set(instance["observed_roles"]) != set(session["native_participants"]):
                     raise ValueError("native input needs the common clock and every actual participant")
@@ -184,16 +182,13 @@ class NativeInputs:
                 for rank in session["native_participants"]:
                     group = f"{instance['id']}/{rank}"
                     self.origins[group] = origin
-                    raw = self.read(self.capture / f"rank-{rank}.json")
-                    graph = self.read(self.graphs / f"{rank}-graph.json")
-                    evidence.observe(rank, graph, raw)
+                    _, raw, _ = evidence.sources[rank]
                     self.input_reads(instance, rank, raw, aliases, requests, origin)
                     self.cpu(instance, rank, origin)
                 if instance["id"] not in self.ingress:
                     raise ValueError("native case omits external ingress")
             if len(set(self.origins.values())) != 1:
                 raise ValueError("native serving instances have different workload origins")
-            evidence.finish()
             native_report = evidence.report(False)
             report["native_evidence"] = native_report
             if evidence.graph is None or native_report["status"] == "differences":
@@ -241,7 +236,7 @@ class NativeInputs:
             report.update(status="unverified", error=str(error))
         report["scope"] = "Checked actor operations and one jointly feasible device-clock realization, rounded upward to integer nanoseconds. Original calibration uncertainty remains. Full timing requires an actual measurement or independently verified elided wait with known prerequisites. CPU wire and notification intervals remain explicit bounds."
         (self.output / "execution-inputs-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-        return 0 if report["status"] == "extracted" else 1
+        return report
 
 
 class ConsumedInputs:
@@ -462,7 +457,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layouts", type=Path, help="require every action endpoint from markov action-layouts")
     args = parser.parse_args()
-    raise SystemExit(NativeInputs(args.capture, args.graphs, args.output, args.layouts).run())
+    report = NativeInputs(args.capture, args.graphs, args.output, args.layouts).run()
+    raise SystemExit(0 if report["status"] == "extracted" else 1)
 
 
 if __name__ == "__main__":

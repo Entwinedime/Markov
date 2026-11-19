@@ -9,6 +9,8 @@ from markov_workload.expert_routes import ExpertRoutes
 
 
 class NativeConfiguration:
+    accelerator_device = "npu"
+
     @staticmethod
     def upstream_revision(value: str | None) -> str:
         if not isinstance(value, str) or re.fullmatch("[0-9a-f]{40}", value) is None:

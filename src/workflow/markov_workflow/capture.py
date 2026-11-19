@@ -33,17 +33,18 @@ class CaptureProcess:
             raise ValueError("published source lies outside its native task")
         return source
 
-    def __init__(self, arguments, limit=None, *, latency_only=False, host_timing=False) -> None:
+    def __init__(self, arguments, limit=None, *, latency_only=False, host_timing=False, service_reference=False) -> None:
         self.arguments = arguments
         self.host_timing = host_timing
         self.latency_only = latency_only or host_timing
+        self.service_reference = service_reference
         self.operation_limit = limit if limit is not None else OperationLimit()
         job = json.loads(arguments.input.read_text())
         serving = CaptureInput(job)
         workers = sum(instance.configuration.tp * instance.configuration.pp for instance in serving.instances)
         deployment = json.loads(arguments.deployment.read_text())
         self.deployment = AscendDeployment(deployment, workers, len(serving.instances) > 1)
-        self.options = self.deployment.options()
+        self.options = self.deployment.options(detailed_timing=service_reference)
         self.model = Path(serving.model["path"]).resolve(strict=True)
         destination = str(Path(serving.model["path"]).absolute())
         self.output = arguments.output.resolve()
@@ -62,7 +63,7 @@ class CaptureProcess:
         self.inputs = {
             "job": job, "deployment": deployment, "image": image["Id"], "framework_revision": SourceDomain.image_revision(image),
             "model_path": str(self.model), "model_destination": destination,
-            "resource_trace": arguments.resource_trace,
+            "resource_trace": arguments.resource_trace or service_reference,
         }
         if self.latency_only:
             self.inputs["latency_only"] = True
@@ -70,6 +71,8 @@ class CaptureProcess:
                 self.options.extend(("--env", "LD_PRELOAD="))
         if self.host_timing:
             self.inputs["host_timing"] = True
+        if self.service_reference:
+            self.inputs["service_reference"] = True
 
     def save(self) -> None:
         write_json(self.output / "execution.json", self.state, indent=2)
@@ -117,6 +120,7 @@ class CaptureProcess:
             *(["--resource-trace"] if self.arguments.resource_trace else []),
             *(["--latency-only"] if self.latency_only and not self.host_timing else []),
             *(["--host-timing"] if self.host_timing else []),
+            *(["--service-reference"] if self.service_reference else []),
         ]
         attempt = {
             "number": number, "container": container, "command": command, "timeout_ns": allowance_ns,

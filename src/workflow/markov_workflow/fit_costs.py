@@ -1,12 +1,13 @@
 """Fit a bounded service model to independent source samples."""
 
-from bisect import bisect_left
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 import json
 from statistics import median
 
 from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.sglang_cost_reuse import BatchHostReuse
+from markov_workflow.containers import ModelingProcess
 from markov_workflow.cost_requirements import CostRequirements, cost_identity
 from markov_workflow.cost_samples import WorkCatalog
 
@@ -73,66 +74,24 @@ class ServiceCurve:
         return {"bounds": self.bounds, "axis": self.axis, "knots": self.knots, "points": self.points,
                 "ambiguous_payload_points": self.ambiguous_payloads}
 
-    @classmethod
-    def estimate(cls, curve, axes):
-        if any(axis not in axes or not lo <= axes[axis] <= hi for axis, (lo, hi) in curve["bounds"].items()):
-            return None
-        knots = curve["knots"]
-        axis = curve["axis"]
-        if axis is None:
-            return knots[0][1]
-        value = axes[axis]
-        position = bisect_left(knots, value, key=lambda pair: pair[0])
-        if knots[position][0] == value:
-            return knots[position][1]
-        return cls.interpolate(knots[position - 1], knots[position], value)
-
 
 class DomainCosts:
     def __init__(self, sources):
         self.definitions = []
-        self.indices = {}
+        indices_by_definition = {}
         groups = defaultdict(list)
         for source in sources:
             indices = []
             for definition in source["definitions"]:
                 key = cost_identity(definition)
-                if key not in self.indices:
-                    self.indices[key] = len(self.definitions)
+                if key not in indices_by_definition:
+                    indices_by_definition[key] = len(self.definitions)
                     self.definitions.append(definition)
-                indices.append(self.indices[key])
+                indices.append(indices_by_definition[key])
             for row in source["samples"]:
                 groups[indices[row["definition"]], row["interval"], row["features"]["phase"]].append(row)
 
         self.curves = {key: ServiceCurve(rows).document() for key, rows in sorted(groups.items())}
-
-    def query(self, definition, interval, features):
-        phase = features["phase"]
-        curve = self.curves.get((self.indices.get(definition), interval, phase))
-        if curve is None:
-            return "unseen_work", None
-        estimate = ServiceCurve.estimate(curve, features["axes"])
-        return ("outside_sample_ranges", None) if estimate is None else ("covered", estimate)
-
-    def evaluate(self, source):
-        definitions = [cost_identity(value) for value in source["definitions"]]
-        counts, errors = defaultdict(Counter), defaultdict(list)
-        for row in source["samples"]:
-            origin = row["definition"]
-            kind = source["definitions"][origin]["work"][row["interval"]]["kind"]
-            observations = row["observations_ns"]
-            status, estimate = self.query(definitions[origin], row["interval"], row["features"])
-            counts[kind][status] += len(observations)
-            if estimate is None:
-                continue
-            actual = median(observations)
-            if actual > 0:
-                errors[kind].append(abs(estimate - actual) / actual)
-        return {
-            "counts": counts,
-            "median_point_relative_error": {kind: median(values) for kind, values in sorted(errors.items())},
-            "unmeasured": source["unmeasured"],
-        }
 
     def document(self, domain):
         return {
@@ -143,30 +102,25 @@ class DomainCosts:
 
 
 class FittedCosts:
-    """Use one catalogue for fitting, coverage checks and publishing the selected domains."""
+    """Fit and publish the selected domains, using the modeling engine to qualify coverage."""
 
     def __init__(self, sources):
         grouped = defaultdict(list)
         for source in sources:
             grouped[cost_identity(source["domain"])].append(source)
-        self.domains = {key: DomainCosts(rows) for key, rows in grouped.items()}
-        self.descriptions = {key: rows[0]["domain"] for key, rows in grouped.items()}
-        self.empty = DomainCosts(())
-
-    def domain(self, identity):
-        return self.domains.get(identity, self.empty)
-
-    def document(self):
-        return [costs.document(self.descriptions[key]) for key, costs in self.domains.items()]
+        self.domains = [DomainCosts(rows).document(rows[0]["domain"]) for rows in grouped.values()]
 
     @classmethod
-    def qualify(cls, sources, demand):
-        fitted = cls(sources.values())
-        counts, missing = demand.check(fitted)
-        reused = BatchHostReuse.match(demand, missing, sources)
+    def qualify(cls, sources, demand, model, directory, accounting=nullcontext):
+        with accounting():
+            fitted = cls(sources.values())
+        counts, missing = demand.check(model, fitted.domains, directory, accounting)
+        with accounting():
+            reused = BatchHostReuse.match(demand, missing, sources)
+            if reused:
+                fitted = cls([*sources.values(), *reused])
         if reused:
-            fitted = cls([*sources.values(), *reused])
-            counts, missing = demand.check(fitted)
+            counts, missing = demand.check(model, fitted.domains, directory, accounting)
         return fitted, reused, counts, missing
 
 
@@ -178,6 +132,21 @@ class FitCosts:
     def read(path):
         return json.loads(path.read_text())
 
+    @staticmethod
+    def assess(source, estimates):
+        counts, errors = defaultdict(Counter), defaultdict(list)
+        for row, (status, estimate) in zip(source["samples"], estimates, strict=True):
+            kind = source["definitions"][row["definition"]]["work"][row["interval"]]["kind"]
+            observations = row["observations_ns"]
+            counts[kind][status] += len(observations)
+            if estimate is not None and (actual := median(observations)) > 0:
+                errors[kind].append(abs(estimate - actual) / actual)
+        return {
+            "counts": counts,
+            "median_point_relative_error": {kind: median(values) for kind, values in sorted(errors.items())},
+            "unmeasured": source["unmeasured"],
+        }
+
     def run(self):
         sources = {path.resolve(strict=True): self.read(path) for path in self.arguments.samples}
         demand = CostRequirements()
@@ -186,18 +155,31 @@ class FitCosts:
         for path in self.arguments.gap:
             demand.gap(str(path.resolve()), self.read(path))
 
-        fitted, reused, counts, missing = FittedCosts.qualify(sources, demand)
-        checks = []
+        checks = CostRequirements()
+        check_sources = []
         for path in self.arguments.check:
             source = self.read(path)
-            costs = fitted.domain(cost_identity(source["domain"]))
-            checks.append({"source": str(path.resolve()), **costs.evaluate(source)})
+            name = str(path.resolve())
+            check_sources.append((name, source, checks.samples(name, source)))
+
+        directory = self.arguments.output.parent.resolve()
+        model = None
+        if demand.points or checks.points:
+            if self.arguments.binary is None:
+                raise ValueError("cost demand and sample checks require --binary")
+            directory.mkdir(parents=True, exist_ok=True)
+            model = ModelingProcess(self.arguments.binary, self.arguments.modeling_image, self.arguments.timeout)
+
+        fitted, reused, counts, missing = FittedCosts.qualify(sources, demand, model, directory)
+        estimates = checks.query(model, fitted.domains, directory)
+        evaluations = [{"source": name, **self.assess(source, (estimates[point] for point in points))}
+                       for name, source, points in check_sources]
 
         write_json(self.arguments.output, {
-            "domains": fitted.document(),
+            "domains": fitted.domains,
             "sources": [str(path) for path in sources],
             "source_gaps": [source["unmeasured"] for source in sources.values()],
             "reused": reused,
-            "checks": checks,
+            "checks": evaluations,
             "demand": demand.report(counts, missing),
         }, replace=False)

@@ -14,7 +14,11 @@ class NativeProfiles:
         self.observation = observation
         from markov_collection.adapters.runtimes.pytorch.protocol import CpuProtocol
 
-        self.protocol = CpuProtocol(observation.capture, observation.description["native_participants"], observation.calls.communicating)
+        capture = observation.capture
+        self.protocol = CpuProtocol(
+            observation.description["native_participants"], observation.calls.communicating,
+            capture.current, capture.runtime.service_scope,
+        )
 
     @staticmethod
     def wait(directory: Path, ranks, participants) -> None:

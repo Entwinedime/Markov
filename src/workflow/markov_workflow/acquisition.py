@@ -59,11 +59,12 @@ class SourceAcquisition:
         self.sources = {identity: self.observations.get(identity, self.output / "sources" / str(identity))
                         for identity in self.jobs}
 
-        for value in (arguments.native_budget_seconds, arguments.postprocessing_budget_seconds, arguments.timeout):
+        for value in (arguments.postprocessing_budget_seconds, arguments.timeout):
             if not math.isfinite(value) or value < 1e-9:
-                raise ValueError("collection time allowances must be finite and at least one nanosecond")
-        if arguments.attempt_limit <= 0 or arguments.storage_bytes <= 0:
-            raise ValueError("collection attempt and storage allowances must be positive")
+                raise ValueError("collection operation and postprocessing times must be finite and positive")
+        if (not math.isfinite(arguments.native_budget_seconds) or arguments.native_budget_seconds < 0
+                or arguments.attempt_limit < 0 or arguments.storage_bytes <= 0):
+            raise ValueError("collection needs nonnegative native allowances and positive storage")
         self.binary = arguments.binary.resolve(strict=True)
         if not self.binary.is_file():
             raise ValueError("source collection requires a compiled executable")

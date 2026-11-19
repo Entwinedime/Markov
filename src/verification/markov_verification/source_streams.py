@@ -2,6 +2,14 @@
 
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceRelease:
+    submitted: int
+    previous: int | None
+    preceding_window_ns: tuple[int, int] | None
 
 
 class SdkStreams:
@@ -47,6 +55,23 @@ class SdkStreams:
         stream, occurrence = identity
         position = occurrence + bisect_right(self.logical_gaps.get(stream, ()), occurrence)
         return 2 * position, 2 * position + 1
+
+    def release_evidence(self, graph, launches):
+        coordinates = {(graph["resources"][event["resource"]]["identity"], point["order"]): index
+                       for index, (event, point) in enumerate(zip(graph["events"], graph["evidence"]["events"], strict=True))}
+        releases = {}
+        for target, ((stream, ordinal), post) in launches.items():
+            submitted = coordinates[f"thread/{post.thread}", post.begin]
+            preceding = stream, ordinal - 1
+            prior = self.records.get(preceding)
+            previous, seen = None, None
+            if prior is not None:
+                previous = coordinates.get((f"stream/{stream}", self.span(preceding)[1]))
+                completed = self.clock.interval(prior)[1]
+                if self.clock.begin_ns <= completed <= self.clock.end_ns:
+                    seen = self.clock.bounds(completed)
+            releases[target] = DeviceRelease(submitted, previous, seen)
+        return releases
 
     def inspect_coordinates(self, facts, apis, commands):
         logical = defaultdict(dict)

@@ -62,7 +62,7 @@ class SourcePlanning:
             job["source"]["input_cost"]["prompt_tokens"] + job["source"]["input_cost"]["decode_tokens"], job["id"],
         ))["id"]
 
-    def document(self):
+    def document(self, *, service_evidence=False):
         domains = []
         for identity, configuration in self.configurations.items():
             inputs = [(identity, name, ServingInput({
@@ -77,7 +77,7 @@ class SourcePlanning:
 
         jobs = []
         for domain in domains:
-            for selected, workload, groups, targets in self.representatives.select(domain["inputs"]):
+            for selected, workload, groups, targets in self.representatives.select(domain["inputs"], service_evidence=service_evidence):
                 identity = len(jobs)
                 instances = self.configurations[selected["configuration"]]["instances"]
                 selected["input"] = f"sources/{identity}.json"
@@ -94,6 +94,13 @@ class SourcePlanning:
                 }
 
         LocalSources(self.source["model"], self.workloads, self.configurations).extend(jobs, self.capture_inputs)
+        if service_evidence:
+            for job in jobs:
+                capture = self.capture_inputs[job["id"]]
+                capture["warmup"] = capture["workload"]
+
+                # Collective service needs readiness and payload evidence from every actual participant.
+                capture["observe_all_workers"] = job["native_workers"] > 1
         return {
             "framework": self.source["framework"], "sources": jobs, "expert_count": self.expert_count,
             "targets": {"configurations": list(self.configurations), "workloads": list(self.workloads),
@@ -103,6 +110,7 @@ class SourcePlanning:
                        "complementary jobs are fixed before capture; one complete job supplies target worker templates",
                        "selected workloads run sequentially after all-worker native idle; cache persists between groups",
                        "redundant whole requests are removed only while declared input opportunities remain; retained arrivals and expert routes are unchanged",
+                "performance sources preserve prompt and final Decode context endpoints and retain work up to native resident batch capacity",
                        "mixed source inputs preserve competing requests beyond the resident PP/batch window when available; actual mixing still requires observation",
                        "representative lengths preserve prefix, page/chunk remainders and route transitions; padding is unchanged",
                        "cached local output1/2 pairs shorten Prefill below one page when possible; request routes shift at the Prefill/Decode boundary",

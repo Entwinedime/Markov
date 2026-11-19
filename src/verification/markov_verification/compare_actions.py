@@ -5,17 +5,17 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from actions import ActionIdentity, QueryResults
-from contents import GraphContents
-from context_values import ContextValues
-from execution_times import ExecutionTimes
-from execution_inputs import ConsumedInputs
-from stream_queues import StreamSynchronization
-from native_case import NativeCase
-from ingress import IngressEvidence
-from dependencies import ActionBoundaries, ActionOrderComparison, CausalGraph
-from protocol_reads import PdPollingEvidence, PdPredictionEvidence
-from state_values import ActionResults, StateValueComparison
+from .actions import ActionIdentity, QueryResults
+from .contents import GraphContents
+from .context_values import ContextValues
+from .execution_times import ExecutionTimes
+from .execution_inputs import ConsumedInputs
+from .stream_queues import StreamSynchronization
+from .native_case import NativeCase
+from .ingress import IngressEvidence
+from .dependencies import ActionBoundaries, ActionOrderComparison, CausalGraph
+from .protocol_reads import PdPollingEvidence, PdPredictionEvidence
+from .state_values import ActionResults, StateValueComparison
 
 
 class ActionComparison:
@@ -28,8 +28,9 @@ class ActionComparison:
         "native_tail_unexecuted",
     })
 
-    def __init__(self, capture, graphs, execution, output, details):
-        self.capture, self.graphs, self.execution, self.output, self.details = capture, graphs, execution, output, details
+    def __init__(self, reference, execution, output, details):
+        self.reference, self.execution, self.output, self.details = reference, execution, output, details
+        self.capture, self.graphs = reference.capture, reference.graphs
         self.counts, self.findings = Counter(), []
 
     def finding(self, category, identity, detail):
@@ -66,51 +67,54 @@ class ActionComparison:
         order = report["action_order"]
         outside_flow = sum(value["input_reads"]["outside_flow"] for value in report["request_ingress"].values() if "input_reads" in value)
         rows = [
-            "# 执行结构独立对照", "",
-            f"整例结果：`{report['status']}`；证据覆盖：`{report['coverage']}`。", "",
-            "以下分别说明实际证明了什么。局部对应不能替代整例通过，轨迹差异数也不是独立 Bug 数。", "",
-            "| 检查对象 | 已检查 | 结果与未覆盖范围 |", "| --- | --- | --- |",
+            "# Independent Execution Structure Comparison", "",
+            f"Case outcome `{report['status']}`. Evidence coverage `{report['coverage']}`.", "",
+            "The case outcome depends on the full evidence scope. Multiple trace differences can share a root cause.", "",
+            "| Check | Coverage | Results and gaps |", "| --- | --- | --- |",
         ]
-        for name, label in (("contents", "模板展开内容"), ("dependencies", "调用内具名边界依赖")):
+        for name, label in (("contents", "Expanded template contents"), ("dependencies", "Named boundary dependencies within calls")):
             value = checks[name]
-            rows.append(f"| {label} | {value['checked']} / {checks['predicted_occurrences']} 次预测调用 | "
-                        f"对应 {value['matched']}，差异 {value['checked'] - value['matched']}，未验证 "
-                        f"{checks['predicted_occurrences'] - value['checked']}；共享内容检查不建立逐次调用配对 |")
+            rows.append(f"| {label} | {value['checked']} of {checks['predicted_occurrences']} predicted calls | "
+                        f"{value['matched']} matched, {value['checked'] - value['matched']} differed, "
+                        f"and {checks['predicted_occurrences'] - value['checked']} remain unchecked. "
+                        "Shared content checks establish coverage at the template level. |")
 
         rows.extend([
-            f"| 运行内生产与消费 | {connections['predicted_data_inputs_checked']} 个非空外部数据输入、"
-            f"{connections['predicted_signal_inputs_checked']} 个完成等待 | 数据就绪保护 "
-            f"{connections['predicted_data_inputs_ready']} 项、完成等待保护 {connections['predicted_signal_inputs_ready']} 项；"
-            "不依赖跨运行调用配对，查询不当作等待 |",
-            f"| 动态stream等待 | {streams.get('waits_checked', 0)} / {streams.get('declared_waits', 0)} 次等待 | "
-            f"{streams['matched_dependencies']} / {streams['required_dependencies']} 条前沿依赖对应，"
-            f"额外依赖 {streams['extra_dependencies']}，缺失激活事实 {streams['activations_missing']}；按实际接收时刻取队列快照 |",
-            f"| 运行内物理状态 | {state.get('tensor_ports_checked', 0)} 个非空可见张量端口、"
-            f"{state.get('kv_regions_checked', 0)} 个 KV 逻辑区间、"
-            f"{state.get('field_bindings_checked', 0)} 条字段绑定 | 未完整绑定的 KV 区间 "
-            f"{state.get('kv_regions_unbound', 0)}、字段访问 {state.get('field_bindings_missing', 0)}；"
-            f"{state.get('pending_conflicts_ordered', 0)} / {state.get('pending_conflicts', 0)} 个在途冲突有保护路径 |",
-            f"| 跨运行逐次对应 | {report['actions_compared']} 个已建立对应的调用 | 内容对应 "
-            f"{report['actions_contents_matched']}，内部依赖对应 {report['actions_dependencies_matched']}；"
-            f"其余原生 / 预测调用未配对 {report['unpaired_calls']['native']} / {report['unpaired_calls']['predicted']} |",
-            f"| 执行轨迹 | 两次运行的最小次序关系和资源历史 | 原生关系在预测中不成立 "
-            f"{order.get('missing_relations', 0)} 条，预测关系在原生中不成立 {order.get('extra_relations', 0)} 条；"
-            f"事件别名差异 {order.get('alias_conflicts', 0)}，重复位置差异 {counts.get('repeated_call_order', 0)}，"
-            f"资源历史差异 {counts.get('resource_effects', 0)}；不是独立 Bug 数 |",
-            f"| 资源条件读取 | 已记录：原生 {sum(value['count'] for value in reads['native'])} 次、"
-            f"预测 {sum(value['count'] for value in reads['predicted'])} 次标量查询 | "
-            "原始 getter 与语义切口已核对；次数和值域不作为跨运行逐次对应证明 |",
-            "", "控制交互还需核对输入交付、查询、通知、准入及决定性时间条件；内容或状态安全通过不能代替它们。",
-            f"输入读取按实际serving活动范围对照；范围外{outside_flow}次空读取仍保留于执行记录，全部非空请求交付继续检查。",
-            "未配对、协议缺失和未触发的复用继续保留证据限制；零在途页归还不证明在途复用正确。",
-            "完整分类、代表问题与各检查边界保留在 actions.json。", "",
+            f"| Production and consumption | {connections['predicted_data_inputs_checked']} nonempty external data inputs and "
+            f"{connections['predicted_signal_inputs_checked']} completion waits | "
+            f"Readiness dependencies protect {connections['predicted_data_inputs_ready']} data inputs and "
+            f"{connections['predicted_signal_inputs_ready']} waits. The check uses within-run evidence and treats queries as reads. |",
+            f"| Dynamic stream waits | {streams.get('waits_checked', 0)} of {streams.get('declared_waits', 0)} waits | "
+            f"{streams['matched_dependencies']} of {streams['required_dependencies']} queue frontier dependencies matched, "
+            f"with {streams['extra_dependencies']} extra dependencies and {streams['activations_missing']} missing activations. "
+            "Queue snapshots use the actual wait arrival. |",
+            f"| Physical state within each run | {state.get('tensor_ports_checked', 0)} nonempty visible tensor ports, "
+            f"{state.get('kv_regions_checked', 0)} logical KV regions, and {state.get('field_bindings_checked', 0)} field bindings | "
+            f"{state.get('kv_regions_unbound', 0)} KV regions and {state.get('field_bindings_missing', 0)} field accesses lack full bindings. "
+            f"{state.get('pending_conflicts_ordered', 0)} of {state.get('pending_conflicts', 0)} in-flight conflicts have an ordering path. |",
+            f"| Cross-run call pairing | {report['actions_compared']} paired calls | "
+            f"{report['actions_contents_matched']} matched in contents and {report['actions_dependencies_matched']} in internal dependencies. "
+            f"{report['unpaired_calls']['native']} native and {report['unpaired_calls']['predicted']} predicted calls remain unpaired. |",
+            f"| Execution trace | Minimal order relations and resource history from both runs | "
+            f"{order.get('missing_relations', 0)} relations appear only in the native run and {order.get('extra_relations', 0)} only in prediction. "
+            f"Other differences include {order.get('alias_conflicts', 0)} event alias conflicts, "
+            f"{counts.get('repeated_call_order', 0)} repeated call positions, and {counts.get('resource_effects', 0)} resource effects. |",
+            f"| Resource queries | {sum(value['count'] for value in reads['native'])} native and "
+            f"{sum(value['count'] for value in reads['predicted'])} predicted scalar reads | "
+            "The checks cover native getters and semantic boundaries. Per-call comparisons require paired evidence. |",
+            "", "Control interactions require separate evidence for input delivery, queries, notifications, admission, and "
+            "time conditions that affect decisions.",
+            f"Input comparisons cover the serving interval and all nonempty request deliveries. "
+            f"The trace retains {outside_flow} empty reads outside that interval.",
+            "Unpaired calls, missing protocol evidence, and reuse paths that never triggered limit coverage. "
+            "Verifying in-flight page reuse requires an observed in-flight return.",
+            "`actions.json` contains all finding categories, representative issues, and the scope of each check.", "",
         ])
         (self.output / "actions.md").write_text("\n".join(rows))
-        return 0 if report["status"] == "actions_matched" else 1
 
     def run(self):
-        capture = json.loads((self.capture / "capture.json").read_text())
-        native_case = NativeCase(self.capture, capture, self.graphs)
+        native_case = self.reference
+        capture = native_case.manifest
         groups, ranks = native_case.groups, native_case.ranks
         sources = native_case.sources
         cpu_protocol, protocol_source = native_case.cpu, native_case.protocol
@@ -125,10 +129,7 @@ class ActionComparison:
         ingress = IngressEvidence(self.capture, capture["instances"])
         for instance in capture["instances"]:
             for rank in instance["observed_roles"]:
-                graph = json.loads((self.graphs / f"{rank}-graph.json").read_text())
-                raw = json.loads((self.capture / f"rank-{rank}.json").read_text())
-                source = native_case.observe(rank, graph, raw)
-                identities = sources[rank][2]
+                source, raw, identities = sources[rank]
                 native_polling.native(raw, groups[rank])
                 state_values.source(raw, groups[rank])
                 action_results.source(raw, groups[rank], instance["mode"], source.source_ids)
@@ -138,7 +139,6 @@ class ActionComparison:
                         continue
                     index = source.source_ids[query["scope"]]
                     native_reads[groups[rank], index] = query["result"], identities[index]
-        native_case.finish()
         observed_actions, controls = native_case.observed_actions, native_case.controls
         for category, identity, detail in native_case.findings:
             self.finding(category, identity, detail)
@@ -557,7 +557,8 @@ class ActionComparison:
                             "PD unused padding and unsupported multimodal/logprob/speculative values; controller output values outside recorded progress and publication fields"],
             "scope": "Every invocation retains its run-local identity; cross-run occurrence pairs require either unique full logical work anchors or a checked consumed native prefix independently reconstructed from native CPU observations, protocol posts and input reads. Every actual consumed identity and source reference binds its instantiated graph; positions alone never establish correspondence. Without this witness, repeatable reads and unanchored control calls remain unpaired even if observed once. Logical matches retain ancestor contexts and exclude time-only observation placement. Structural classes omit ancestor state for common-content checks. Native ABIs whose every observed declaration is independently verified host-only also share CPU contents across queue snapshots and continuation cuts; their predicted body never selects a class, and logical/time identities remain unchanged. Classes never identify external producers or causal boundaries. Contents and within-action boundary reachability/work placement are checked separately for every predicted occurrence when their respective observed signatures are uniform. This does not pair external producers, effects, query outcomes or communication rounds. Every nonempty predicted external data input is separately checked against its own published storage/version export and the shared all-rank causal graph. Every explicit signal wait is checked against its actual generation and recorded direct signal edge; completion queries do not acquire a wait. These run-local checks do not require native occurrence pairs. Signal cross-run matched counts concern producer identity. All predicted communication edges are separately checked against run-local channel participants and causal order, including repeated calls; this does not establish cross-run occurrence pairing or payload correctness. A qualified full-context pair uses its own observed scope even when the structural class varies; unpaired variation remains unverified. No signature is selected by resemblance to the prediction. Cross-action order, data writers/export readiness and native protocol participant dependencies retain their independent checks. All causal comparisons use the same per-run all-rank graphs, including unnamed intermediates, dynamic prediction edges and verified model/CPU communication. A path may cross ranks and return. Missing protocol coverage withholds causal qualification rather than proving a negative from an isolated rank. Event numbers, raw edge counts and measured times are not matched. Differences require diagnosis, not automatic attribution to core bugs.",
         }
-        return self.publish(report)
+        self.publish(report)
+        return report
 
 
 def main():
@@ -568,7 +569,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--details", action="store_true", help="retain every observed difference")
     arguments = parser.parse_args()
-    raise SystemExit(ActionComparison(arguments.capture, arguments.graphs, arguments.execution, arguments.output, arguments.details).run())
+    reference = NativeCase.read(arguments.capture, arguments.graphs)
+    report = ActionComparison(reference, arguments.execution, arguments.output, arguments.details).run()
+    raise SystemExit(0 if report["status"] == "actions_matched" else 1)
 
 
 if __name__ == "__main__":

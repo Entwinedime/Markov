@@ -19,7 +19,7 @@ class ServiceTimes {
 public:
     ServiceTimes(ServiceDuration given, ExecutionInputs * conditions, const nlohmann::json & assets);
 
-    void bind(const std::string & group, const TemplateLibrary & library);
+    void bind(const std::string & group, nlohmann::json domain, std::span<const TemplateDefinition> definitions);
     bool modeled() const { return !assets_.is_null(); }
     ExecutionInputs * conditions() const { return conditions_; }
     std::optional<InvocationInput> action_input(const ServingAction & action);
@@ -32,8 +32,7 @@ private:
     ServiceDuration given_;
     ExecutionInputs * conditions_;
     const nlohmann::json & assets_;
-    std::map<const TemplateLibrary *, WorkCosts> library_costs_;
-    std::map<std::string, const WorkCosts *> participants_;
+    std::map<std::string, WorkCosts> participants_;
     std::size_t queries_ = 0;
     std::chrono::nanoseconds query_time_{};
 };

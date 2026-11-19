@@ -3,7 +3,7 @@
 import json
 from collections import Counter
 
-from actions import ActionIdentity, ActionScopes
+from .actions import ActionIdentity, ActionScopes
 
 
 class GraphContents(ActionScopes):

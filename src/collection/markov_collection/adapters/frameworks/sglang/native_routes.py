@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -11,18 +12,15 @@ from markov_workload.expert_routes import ExpertRoutes
 
 
 class NativeExpertRoutes:
-    def __init__(self, values: Any, description: dict[str, Any]) -> None:
-        self.values = values
+    def __init__(self, description, aliases, *, metadata=nullcontext, auxiliary=nullcontext) -> None:
+        self.metadata, self.auxiliary = metadata, auxiliary
         self.input = description["serving_input"]
         settings = self.input["configuration"]
         topology = settings["ep"]
         self.size = topology["size"]
         self.source = self.input["ep_routes"][topology["id"]]
 
-        self.aliases = {
-            native: request["id"]
-            for native, request in zip(description["source_requests"], self.input["requests"], strict=True)
-        }
+        self.aliases = aliases
 
         self.members: list[dict[str, Any]] | None = None
 
@@ -44,12 +42,12 @@ class NativeExpertRoutes:
 
     def run_batch(self, original: Any, scheduler: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
 
-        # Uniform warmup has its own requests; capture uses the supplied logical identities.
+        # Representative warmup and capture share the supplied logical choices.
         if not batch.reqs or batch.reqs[0].rid not in self.aliases:
             return original(scheduler, batch, *args, **kwargs)
 
         previous = self.members
-        with self.values.metadata():
+        with self.metadata():
             self.members = BatchTensors.members(batch)
             for member in self.members:
                 member["id"] = self.aliases[member["id"]]
@@ -71,7 +69,7 @@ class NativeExpertRoutes:
             raise ValueError("native expert input does not match the supplied route top-k")
 
         # DeepEP partitions padded tokens; a local expert group retains the entire token vector.
-        with self.values.auxiliary():
+        with self.auxiliary():
             group = get_moe_ep_group()
             rows = self.conditions.batch_rows(self.members, experts.layer_id, result.topk_ids.shape[0] * group.world_size)
 

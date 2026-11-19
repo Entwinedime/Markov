@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -98,33 +100,101 @@ constexpr std::string_view usage = "markov project <native-facts.json> <coarse.j
                                    "markov action-layouts <observed-coarse.json> <layouts.json>\n"
                                    "markov templates <coarse.json> <templates.json>\n"
                                    "markov work-identities <observed-coarse.json> <work.json>\n"
+                                   "markov work-costs <observed-coarse.json> <costs.json> <services.json>\n"
+                                   "markov cost-points <points.json> <costs.json> <estimates.json>\n"
                                    "markov link-templates <source-libraries.json> <output-directory>\n"
                                    "markov instantiate <templates.json> <invocation.json> <coarse.json>\n"
                                    "markov execute <coarse.json> <given-timing.json> <execution.json> [--trace <execution.jsonl>]\n"
+                                   "markov replay <fixed-execution.json> <services.json> <event-times.json>\n"
                                    "markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] "
                                    "[--execution-inputs <conditions.json> | --costs <costs.json>]\n";
 
+struct ObservedWork {
+    explicit ObservedWork(markov::CoarseGraph graph) : intervals(graph.work.size()) {
+        std::map<std::pair<std::size_t, std::size_t>, std::size_t> positions;
+        for (std::size_t index = 0; index < graph.work.size(); ++index) {
+            const auto & work = graph.work[index];
+            if (!positions.emplace(std::pair{work.start, work.finish}, index).second)
+                throw std::invalid_argument("native work must have distinct observed intervals");
+        }
+        std::vector<markov::TemplateWorkEvidence> evidence;
+        evidence.reserve(intervals.size());
+        library = markov::sglang::NativeTemplates::compile(std::move(graph), &evidence);
+
+        // Compiled definitions can be shared and reordered. Bind them to the original observed intervals.
+        for (const auto & work : evidence) {
+            const auto position = positions.find({work.start, work.finish});
+            if (position == positions.end()) throw std::invalid_argument("compiled work repeats or changes an observed interval");
+            intervals[position->second] = work;
+            positions.erase(position);
+        }
+        if (!positions.empty()) throw std::invalid_argument("observed work is missing a template interval");
+    }
+
+    markov::TemplateLibrary library;
+    std::vector<markov::TemplateWorkEvidence> intervals;
+};
+
 nlohmann::json work_identities(markov::CoarseGraph source, const nlohmann::json & observation_window) {
-    const auto work_count = source.work.size();
     auto features = nlohmann::json::array();
     for (const auto & scope : source.scopes) features.push_back(markov::WorkFeatures(scope).document());
-    std::vector<markov::TemplateWorkEvidence> evidence;
-    evidence.reserve(work_count);
-    const auto library = markov::sglang::NativeTemplates::compile(std::move(source), &evidence);
-
-    std::set<std::pair<std::size_t, std::size_t>> measured;
+    const ObservedWork observed(std::move(source));
     auto intervals = nlohmann::json::array();
-    for (const auto & work : evidence) {
-        if (!measured.emplace(work.start, work.finish).second)
-            throw std::invalid_argument("source work belongs to more than one template interval");
+    for (const auto & work : observed.intervals)
         intervals.push_back({work.start, work.finish, work.definition, work.interval});
-    }
-    if (measured.size() != work_count) throw std::invalid_argument("source work is missing a template interval");
 
     auto definitions = nlohmann::json::array();
-    for (const auto & definition : library.definitions) definitions.push_back(definition.document());
-    return {{"domain", library.domain}, {"window_ns", observation_window},
+    for (const auto & definition : observed.library.definitions) definitions.push_back(definition.document());
+    return {{"domain", observed.library.domain}, {"window_ns", observation_window},
             {"definitions", std::move(definitions)}, {"features", std::move(features)}, {"intervals", std::move(intervals)}};
+}
+
+nlohmann::json work_costs(const markov::CoarseGraph & graph, const nlohmann::json & costs) {
+    const ObservedWork observed(graph);
+    std::vector<markov::TemplateInterval> origins;
+    origins.reserve(observed.intervals.size());
+    for (const auto & piece : observed.intervals) origins.push_back({piece.definition, piece.interval});
+
+    nlohmann::json missing;
+    const markov::WorkCosts service(observed.library.domain, observed.library.definitions, costs);
+    auto timing = service.timing(graph, origins, &missing);
+    auto durations = nlohmann::json::array();
+    for (const auto duration : timing.work_ns) durations.push_back(duration ? nlohmann::json(*duration) : nlohmann::json());
+    return {{ "work_ns", std::move(durations) }, { "first_cost_gap", std::move(missing) }};
+}
+
+std::int64_t nonnegative(const nlohmann::json & value) {
+    if (!value.is_number_integer() || value.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::invalid_argument("fixed execution coordinates must be nonnegative signed 64-bit integers");
+    return value.get<std::int64_t>();
+}
+
+nlohmann::json replay(const nlohmann::json & plan, const nlohmann::json & scenarios) {
+    std::vector<std::int64_t> releases;
+    for (const auto & value : plan.at("releases_ns").get_ref<const nlohmann::json::array_t &>()) releases.push_back(nonnegative(value));
+    std::vector<markov::TimedDependency> edges;
+    for (const auto name : { "dependencies", "work" }) {
+        for (const auto & row : plan.at(name).get_ref<const nlohmann::json::array_t &>()) {
+            if (!row.is_array() || row.size() != 3) throw std::invalid_argument("fixed dependency needs two endpoints and an immutable delay");
+            edges.push_back({ static_cast<std::size_t>(nonnegative(row[0])), static_cast<std::size_t>(nonnegative(row[1])), nonnegative(row[2]) });
+        }
+    }
+
+    auto times = nlohmann::json::object();
+    auto work = std::span(edges).subspan(plan.at("dependencies").size());
+    std::vector<std::int64_t> fixed_delays;
+    for (const auto & edge : work) fixed_delays.push_back(edge.delay_ns);
+    for (const auto & [name, values] : scenarios.get_ref<const nlohmann::json::object_t &>()) {
+        if (!values.is_array() || values.size() != work.size()) throw std::invalid_argument("fixed replay needs one service value per declared work interval");
+        for (std::size_t index = 0; index < work.size(); ++index) {
+            const auto service = nonnegative(values[index]);
+            if (service > std::numeric_limits<std::int64_t>::max() - fixed_delays[index])
+                throw std::overflow_error("fixed work delay exceeds int64 nanoseconds");
+            work[index].delay_ns = fixed_delays[index] + service;
+        }
+        times[name] = markov::Timeline::replay(releases, edges);
+    }
+    return {{ "event_times_ns", std::move(times) }};
 }
 
 nlohmann::json execute(const markov::CoarseGraph & graph, const nlohmann::json & timing, markov::ExecutionObserver * observer) {
@@ -220,6 +290,15 @@ int main(int argc, char ** argv) {
             if (source.environment.at("framework") != "sglang") throw std::invalid_argument("source framework has no template recipe adapter");
             output = command == "templates" ? markov::sglang::NativeTemplates::compile(std::move(source)).document()
                                             : work_identities(std::move(source), document.at("evidence").at("window_ns"));
+        }
+        else if (command == "work-costs" && argc == 5) {
+            output = work_costs(markov::CoarseGraph::read(read_json(argv[2])), read_json(argv[3]));
+        }
+        else if (command == "cost-points" && argc == 5) {
+            output = markov::WorkCosts::evaluate(read_json(argv[2]), read_json(argv[3]));
+        }
+        else if (command == "replay" && argc == 5) {
+            output = replay(read_json(argv[2]), read_json(argv[3]));
         }
         else if (command == "action-layouts" && argc == 4) {
             const auto source = markov::sglang::NativeTemplates::describe(markov::CoarseGraph::read(read_json(argv[2])));

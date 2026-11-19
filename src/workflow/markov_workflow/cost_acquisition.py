@@ -10,12 +10,11 @@ import sys
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
-from uuid import uuid4
 
 from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.sglang_host_samples import HostCostSamples
 from markov_workflow.capture import CaptureProcess
-from markov_workflow.containers import OwnedContainers
+from markov_workflow.containers import ModelingCommand, OwnedContainers
 from markov_workflow.cost_requirements import CostRequirements
 from markov_workflow.cost_samples import WorkCatalog
 from markov_workflow.fit_costs import FittedCosts
@@ -30,7 +29,7 @@ def read(path):
 class CostSource:
     def __init__(self, production, capture, job, output):
         self.production, self.capture, self.job, self.output = production, capture, job, output
-        CaptureProcess.published(capture, job)
+        self.native = CaptureProcess.published(capture, job)
         self.deployment = read(capture / "execution.json")["inputs"]["deployment"]
         self.ranks = read(production / "result.json")["observed_roles"]
         self.recipes = {recipe.name: recipe for recipe in HostCostSamples.recipes(job)}
@@ -126,24 +125,20 @@ class CostAcquisition:
             self.state.update(postprocessing_ns=spent + time.monotonic_ns() - started, container=None)
             self.save()
 
-    def command(self, output, command, graph=None):
+    def command(self, output, command):
         if output.is_file():
             return
         output.parent.mkdir(parents=True, exist_ok=True)
-        name = f"markov-work-{uuid4().hex}" if graph is not None else None
+        name = command.name if isinstance(command, ModelingCommand) else None
         with self.processing(name) as allowance, output.with_suffix(".log").open("a") as log:
-            if graph is not None:
-                command = [
-                    "docker", "run", "--rm", "--init", "--runtime", "runc", "--network", "none", "--name", name,
-                    "--entrypoint", "/usr/bin/timeout",
-                    "--mount", f"type=bind,src={graph},dst=/graph.json,readonly",
-                    "--mount", f"type=bind,src={self.output},dst=/task",
-                    self.images["modeling"], "--signal=KILL", f"{allowance}s", "/task/markov",
-                    "work-identities", "/graph.json", f"/task/{output.relative_to(self.output)}",
-                ]
-            result = self.limit.run(command, log, allowance)
+            arguments = command.arguments(allowance) if name else command
+            result = self.limit.run(arguments, log, allowance)
             if result:
-                raise subprocess.CalledProcessError(result, command)
+                raise subprocess.CalledProcessError(result, arguments)
+
+    def run_model(self, operation, output, *inputs):
+        command = ModelingCommand(self.output / "markov", self.images["modeling"], operation, output, *inputs)
+        self.command(output, command)
 
     def samples_from(self, output, action, **inputs):
         command = [sys.executable, "-m", "markov_workflow", action]
@@ -155,11 +150,12 @@ class CostAcquisition:
         return sample
 
     def inspect(self, source):
+        external = HostCostSamples.external_work(source.native)
         for rank in source.ranks:
             work = source.production / "work"
             graph = work / f"{rank}-graph.json"
             identities = source.output / f"{rank}-work.json"
-            self.command(identities, None, graph)
+            self.run_model("work-identities", identities, graph)
             with self.processing():
                 catalog = WorkCatalog(graph, identities)
                 for point in self.demand.graph(str(graph), catalog):
@@ -167,6 +163,8 @@ class CostAcquisition:
                     interval = definition["work"][point.interval]
                     if HostCostSamples.supports(interval, definition["resources"][interval["resource"]]):
                         source.host_points.add(point)
+                for identity, kind, features in external[rank]:
+                    source.host_points.add(self.demand.external(str(graph), catalog.domain, identity, kind, features))
 
             # The same detailed observation must not contribute device durations twice.
             observation = {"production": str(source.production), "rank": rank}
@@ -208,8 +206,7 @@ class CostAcquisition:
             source.cold |= bool(sample["qualification"]["excluded_cold_scopes"])
 
     def fit(self):
-        with self.processing():
-            return FittedCosts.qualify(self.samples, self.demand)
+        return FittedCosts.qualify(self.samples, self.demand, self, self.output, self.processing)
 
     def acquire(self):
         for source in self.sources:
@@ -268,7 +265,7 @@ class CostAcquisition:
             for point in missing
         }
         return {
-            "domains": fitted.document(), "sources": [str(path) for path in self.samples], "reused": reused,
+            "domains": fitted.domains, "sources": [str(path) for path in self.samples], "reused": reused,
             "demand": self.demand.report(counts, missing, reasons), "recipes": evidence,
             **self.spending(), "retained_bytes": self.limit.bytes_used(),
             "status": "covered" if not missing else "native_budget_exhausted" if deferred else "uncovered",

@@ -39,17 +39,18 @@ class ExplorationReport:
     def markdown(self):
         completed = sum(row["status"] == "predicted" for row in self.targets)
         lines = [
-            "# 配置集性能探索", "",
-            f"{completed}/{len(self.targets)} 项完成自主预测。排序按同一 workload 的预测值。",
-            f"原生采集 {self.usage['native_attempts']} 次，用时 {self.usage['native_charged_ns'] / 1e9:.2f} 秒。"
-            f"来源和成本后处理 {self.usage['postprocessing_ns'] / 1e9:.2f} 秒。", "",
-            "| 配置 | Workload | 状态 | P95 TTFT / ms | 平均 TPOT / ms | token/s |", "| --- | --- | --- | ---: | ---: | ---: |",
+            "# Configuration Performance Exploration", "",
+            f"Completed {completed} of {len(self.targets)} target predictions. Rankings compare predictions for the same workload.",
+            f"Native capture used {self.usage['native_attempts']} attempts and charged {self.usage['native_charged_ns'] / 1e9:.2f} s. "
+            f"Source and cost processing took {self.usage['postprocessing_ns'] / 1e9:.2f} s.", "",
+            "| Configuration | Workload | Status | P95 TTFT (ms) | Mean TPOT (ms) | Tokens/s |",
+            "| --- | --- | --- | ---: | ---: | ---: |",
         ]
         for row in self.targets:
             values = [row["configuration"], row["workload"], row["status"]]
             for metric, scale in (("p95_ttft_ns", 1e6), ("mean_tpot_ns", 1e6), ("tokens_per_second", 1)):
                 value = row.get(metric)
-                values.append("—" if value is None else f"{value / scale:.3f}")
+                values.append("-" if value is None else f"{value / scale:.3f}")
             lines.append("| " + " | ".join(self.cell(value) for value in values) + " |")
-        lines.extend(("", "逐目标证据、采集用量和各指标的并列排序见 result.json。", ""))
+        lines.extend(("", "`result.json` includes each target's evidence, capture usage, and ties in each metric's rankings.", ""))
         return "\n".join(lines)

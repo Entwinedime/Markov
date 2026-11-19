@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 
 from markov_adapters.artifacts import write_json
+from markov_adapters.pytorch import CpuProtocolWork
 from markov_adapters.sglang.configuration import CaptureInput
 from markov_collection.adapters.runtimes.ascend.host_alignment import AscendHostAlignment
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
@@ -20,6 +21,8 @@ class HostRecipe:
 
 
 class HostCostSamples:
+    batch_roles = {"run_batch", "launch", "output_prepare", "output_skip"}
+
     def __init__(self, arguments):
         self.arguments = arguments
         self.qualification = Counter()
@@ -47,11 +50,11 @@ class HostCostSamples:
     def supports(work, resource):
         return work["kind"] == "host" or (work["kind"] == "collective" and resource["kind"] == "thread")
 
-    @staticmethod
-    def identity(scope):
+    @classmethod
+    def identity(cls, scope):
         role, work = scope["role"], scope["work"]
         detail = None
-        if role == "run_batch":
+        if role in cls.batch_roles:
             detail = [work["phase"], [{key: value for key, value in member.items() if key != "slot"} for member in work["members"]]]
         elif role == "segment":
             detail = [work["continuation"], scope["bindings"]["condition"]]
@@ -59,6 +62,18 @@ class HostCostSamples:
             detail = work.get("context")
         elif role == "metadata_collective":
             detail = [scope["parameters"], scope["bindings"]["condition"], work["context"].get("poll_requests")]
+        elif role in {"transfer_send", "transfer_receive"}:
+            detail = [work["context"]["message"], scope["bindings"]["dtype"]]
+        elif role in {"transfer_send_wait", "transfer_receive_wait", "signal_wait"}:
+            context = work["context"]
+            producer = context["producer"]
+            detail = [context["device_wait"], context.get("wait_stream"), producer.get("record_stream"), producer["message"]]
+        elif role == "stream_wait":
+            detail = work["context"]["streams"]
+        elif role == "signal_record":
+            detail = work["context"]["record_stream"]
+        elif role == "gather":
+            detail = scope["bindings"].get("collective")
         return role, scope["implementation"], scope["site"], json.dumps(detail, sort_keys=True)
 
     def index(self, scopes, paths, typed, excluded):
@@ -73,7 +88,7 @@ class HostCostSamples:
             identities[identity] = call
 
             # Batch geometry drives its model subtree; other enclosing queues only locate the local call.
-            component = call if scope["role"] == "run_batch" else call[:3]
+            component = call if scope["role"] in self.batch_roles else call[:3]
             routes[identity] = paths.setdefault((routes[parent], component), len(paths) + 1)
         indexed = defaultdict(list)
         for identity, route in routes.items():
@@ -147,6 +162,26 @@ class HostCostSamples:
                 durations[scope["id"]] = scope["raw_interval"][1] - arrival
         return durations
 
+    @classmethod
+    def external_work(cls, capture):
+        instances = cls.read(capture / "capture.json")["instances"]
+        records = {rank: cls.read(capture / "protocol" / f"rank-{rank}.json")
+                   for instance in instances for rank in instance["native_participants"]}
+        demands = {rank: [(identity, "host", features) for identity, features, _ in CpuProtocolWork.local(record)]
+                   for rank, record in records.items()}
+        for identity, features in CpuProtocolWork(records).wires():
+            demands[identity["source"]].append((identity, "transfer", features))
+        return demands
+
+    @staticmethod
+    def cpu_services(samples, protocol, service):
+        for identity, features, interval in CpuProtocolWork.local(protocol):
+            duration = service.duration(interval["thread"], interval["begin_raw_ns"], interval["end_raw_ns"], False)
+            if duration is not None:
+
+                # The waiting thread can sleep while the transport progresses. Count its actual CPU service only.
+                samples.add_external(identity, "host", features, duration)
+
     def run(self):
         detailed = self.arguments.detailed
         lightweight = self.arguments.host
@@ -214,6 +249,12 @@ class HostCostSamples:
             samples.add(definition, interval, features, duration)
             measured[key] += 1
 
+        if "protocol" in probe:
+            self.cpu_services(samples, probe["protocol"], alignment.service)
+            for row in self.read(host_root / instance["cpu_transports"]):
+                if row["identity"]["source"] == rank:
+                    for duration in row["observations_ns"]:
+                        samples.add_external(row["identity"], "transfer", row["features"], duration)
         report = samples.document({"host": sum(missing.values())})
         report["observation"] = {"detailed": str(detailed.resolve()), "host": str(lightweight.resolve()), "rank": rank}
         batches = {"detailed": 0, "host": 0, "matched": 0}

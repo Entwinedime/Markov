@@ -38,7 +38,7 @@ class NativeRendezvous:
 
 class NativeServingSession:
     def __init__(self, source, output: Path, *, resource_trace: bool = False, latency_only: bool = False,
-                 host_timing: bool = False) -> None:
+                 host_timing: bool = False, service_reference: bool = False) -> None:
         self.framework_revision = NativeConfiguration.upstream_revision(os.environ.get("MARKOV_SGLANG_REVISION"))
         serving = CaptureInput(source)
         self.output = output.resolve()
@@ -48,13 +48,13 @@ class NativeServingSession:
         for index, description in enumerate(serving.instances):
             instance = NativeServingInstance(
                 serving, description, self.output, index, offset,
-                resource_trace=resource_trace, latency_only=latency_only, host_timing=host_timing,
+                resource_trace=resource_trace or service_reference, latency_only=latency_only,
+                host_timing=host_timing, service_reference=service_reference,
             )
             self.instances.append(instance)
             offset += len(instance.roles)
-        if latency_only and (resource_trace or any(instance.pp != 1 or "ep" in instance.configuration
-                                                   for instance in self.instances)):
-            raise ValueError("light observation requires dense instances without pipeline parallelism")
+        if latency_only and resource_trace:
+            raise ValueError("light observation cannot include resource tracing")
         if latency_only and not host_timing and len(serving.submission_groups) != 1:
             raise ValueError("latency-only measurement requires one submission group")
 

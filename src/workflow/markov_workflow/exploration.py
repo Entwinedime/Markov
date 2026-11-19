@@ -18,7 +18,7 @@ from markov_workflow.acquisition import SourceAcquisition
 from markov_workflow.adapters.sglang_planning import SourcePlanning
 from markov_workflow.cost_acquisition import CostAcquisition
 from markov_workflow.exploration_report import ExplorationReport
-from markov_workflow.latency import PredictedLatency
+from markov_workflow.latency import RequestLatency
 from markov_workflow.limits import AllowanceExhausted, OperationLimit
 from markov_workflow.planning import PlanningProcess
 from markov_workflow.prediction import PredictionProcess
@@ -97,7 +97,7 @@ class ExplorationTarget:
     def evidence(self, output):
         result = output / "result.json"
         if result.is_file():
-            metrics = PredictedLatency(read(result), self.input["workload"]["requests"]).report()
+            metrics = RequestLatency.predicted(read(result), self.input["workload"]["requests"]).report()
             requests = metrics.pop("requests")
             write_json(output / "request-latency.json", requests)
             return {"status": "predicted", **metrics}, result
@@ -203,7 +203,7 @@ class ExplorationTask:
             write_json(training, source, indent=2)
             with tempfile.TemporaryDirectory(prefix=".planning-", dir=self.root) as temporary:
                 staged = Path(temporary) / "plan"
-                PlanningProcess(SimpleNamespace(input=training, output=staged), prewarm=True).run()
+                PlanningProcess(SimpleNamespace(input=training, output=staged), service_evidence=True).run()
                 staged.rename(directory)
         return directory
 

@@ -17,7 +17,7 @@ class ProtocolWork:
         if self.consumed:
             return self.native.wait(*args, **kwargs)
         interval = self.observer.interval()
-        with self.observer.runtime.service_scope(interval):
+        with self.observer.service_scope(interval):
             result = self.native.wait(*args, **kwargs)
         if result:
             self.consumed = True
@@ -26,10 +26,10 @@ class ProtocolWork:
 
 
 class CpuProtocol:
-    def __init__(self, capture, world, context) -> None:
-        self.capture = capture
+    def __init__(self, world, context, scope, service_scope) -> None:
         self.context = context
-        self.runtime = capture.runtime
+        self.scope = scope
+        self.service_scope = service_scope
         self.transfer = CpuTransfer(world)
         self.lock = threading.Lock()
         self.positions = {}
@@ -41,7 +41,7 @@ class CpuProtocol:
         execution = self.context.get()
         if execution is None:
             raise ValueError("Native CPU protocol observation requires its entering execution context")
-        return {"thread": threading.get_native_id(), "scope": self.capture.current.get(), "execution": execution}
+        return {"thread": threading.get_native_id(), "scope": self.scope.get(), "execution": execution}
 
     def begin(self):
         with self.lock:
@@ -83,7 +83,7 @@ class CpuProtocol:
         try:
 
             # Blocking PyTorch send/recv delegate to isend/irecv; retain one actual protocol operation.
-            with self.runtime.service_scope(post["interval"]):
+            with self.service_scope(post["interval"]):
                 result = original(*args, **kwargs)
         finally:
             self.enclosing.reset(previous)

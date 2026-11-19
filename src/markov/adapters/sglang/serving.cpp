@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "markov/adapters/sglang/actions.hpp"
+#include "markov/adapters/sglang/templates.hpp"
 #include "markov/contracts/serving.hpp"
 #include "markov/controller/control_peer.hpp"
 #include "markov/controller/native.hpp"
@@ -153,7 +154,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                      .first->second;
             instance.participants.push_back({ group, static_cast<std::size_t>(rank), control_thread,
                                                participant.resources, participant.graphs, participant.dependencies });
-            service_times.bind(group, library);
+            if (service_times.modeled()) service_times.bind(group, NativeTemplates::domain(environment), library.definitions);
             execution.emplace(group, ServingParticipant{ participant.graphs, participant.dependencies });
         }
         if ((tp == 0 || ranks.size() % static_cast<std::size_t>(tp) != 0 || ranks.size() / static_cast<std::size_t>(tp) != static_cast<std::size_t>(pp))

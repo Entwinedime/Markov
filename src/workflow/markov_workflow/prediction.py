@@ -26,14 +26,15 @@ class PredictionProcess:
         if path.exists():
             OwnedContainers(json.loads(path.read_text())).close()
 
-    def run(self) -> None:
+    def run(self, *, source=None, productions=None) -> None:
         args = self.arguments
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("Prediction timeout must be positive")
         self.limit.check()
         deadline = time.monotonic() + args.timeout
-        source = json.loads(args.input.read_text())
-        templates, primary, document = SourceProductions(args.production).prepare(source, modeled=args.costs is not None)
+        source = json.loads(args.input.read_text()) if source is None else source
+        productions = SourceProductions(args.production) if productions is None else productions
+        templates, primary, document = productions.prepare(source, modeled=args.costs is not None)
         timing_asset = args.costs or args.execution_inputs
         timing_mount, timing_option = [], []
         if timing_asset is not None:

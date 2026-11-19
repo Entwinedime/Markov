@@ -18,9 +18,9 @@
 namespace markov {
 
 class CoarseGraph;
-class TemplateLibrary;
 class WorkFeatures;
 enum class WorkKind;
+struct TemplateDefinition;
 struct TemplateInterval;
 
 class CostGap final : public std::runtime_error {
@@ -34,9 +34,10 @@ private:
 
 class WorkCosts {
 public:
-    WorkCosts(const TemplateLibrary & library, const nlohmann::json & asset);
-    GraphTiming timing(const CoarseGraph & graph, std::span<const TemplateInterval> origins) const;
+    WorkCosts(nlohmann::json domain, std::span<const TemplateDefinition> definitions, const nlohmann::json & asset);
+    GraphTiming timing(const CoarseGraph & graph, std::span<const TemplateInterval> origins, nlohmann::json * first_gap = nullptr) const;
     std::int64_t external(const nlohmann::json & identity, WorkKind kind, const WorkFeatures & features) const;
+    static nlohmann::json evaluate(const nlohmann::json & groups, const nlohmann::json & asset);
 
 private:
     struct Bound {
@@ -51,19 +52,34 @@ private:
 
     struct Curve {
         explicit Curve(const nlohmann::json & model);
-        ServiceDuration estimate(const WorkFeatures & features) const;
+        template<class Features>
+        ServiceDuration estimate(const Features & features) const;
 
         std::map<std::string, Bound, std::less<>> bounds;
         std::optional<std::string> axis;
         std::vector<Point> points;
     };
 
-    using PhaseCurves = std::map<std::string, Curve, std::less<>>;
-    const Curve * curve(std::optional<std::size_t> definition, std::size_t interval, std::string_view phase) const;
-    CostGap gap(const Curve * candidate, const WorkFeatures & features, nlohmann::json details) const;
+    struct Estimate {
+        const Curve * model;
+        ServiceDuration service_ns;
 
-    const TemplateLibrary & library_;
-    std::vector<std::optional<std::size_t>> definitions_;
+        std::string_view status() const;
+    };
+
+    using PhaseCurves = std::map<std::string, Curve, std::less<>>;
+
+    template<class Definitions>
+    WorkCosts(nlohmann::json domain, const nlohmann::json & asset, const Definitions & definitions);
+    std::optional<std::size_t> external_index(const nlohmann::json & identity, WorkKind kind) const;
+
+    template<class Features>
+    Estimate estimate(std::optional<std::size_t> definition, std::size_t interval, const Features & features) const;
+    CostGap gap(const Estimate & estimate, const WorkFeatures & features, nlohmann::json details) const;
+
+    nlohmann::json domain_;
+    std::span<const TemplateDefinition> definitions_;
+    std::vector<std::optional<std::size_t>> model_indices_;
     std::map<nlohmann::json, std::pair<std::size_t, WorkKind>> external_;
     std::vector<std::vector<PhaseCurves>> models_;
 };

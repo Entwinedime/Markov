@@ -47,6 +47,24 @@ Timeline::Timeline(std::vector<Resource> resources, ExecutionObserver * observer
       completed_commands_(resources_.size()),
       observer_(observer) {}
 
+std::vector<std::int64_t> Timeline::replay(std::span<const std::int64_t> releases_ns, std::span<const TimedDependency> dependencies) {
+    Timeline timeline({}, nullptr);
+    for (std::size_t index = 0; index < releases_ns.size(); ++index) timeline.defer();
+    for (const auto & edge : dependencies) {
+        if (edge.source >= releases_ns.size() || edge.target >= releases_ns.size() || edge.delay_ns < 0)
+            throw std::invalid_argument("a fixed dependency requires declared endpoints and a nonnegative duration");
+        timeline.connect(edge.source, edge.target, edge.delay_ns, Relation::Order);
+    }
+
+    // Release every boundary after installing its complete native prerequisites.
+    for (std::size_t index = 0; index < releases_ns.size(); ++index)
+        timeline.resolve(index, {}, Relation::Control, {}, releases_ns[index]);
+    std::vector<std::int64_t> times(releases_ns.size());
+    while (const auto event = timeline.advance()) times[event->event] = event->time_ns;
+    if (!timeline.done()) throw std::invalid_argument("fixed execution contains a causal cycle");
+    return times;
+}
+
 std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<const ServiceDuration> work_ns, std::span<const ExecutionInput> inputs,
                                           std::span<const BoundaryTime> boundaries) {
     if (work_ns.size() != graph.work.size()) throw std::invalid_argument("execution requires one service duration or completion condition per work interval");
@@ -116,7 +134,7 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     for (std::size_t index = 0; index < graph.work.size(); ++index) {
         const auto & work = graph.work[index];
 
-        // The communication channel charges collective service after all participants are ready.
+        // The communication channel charges collective service after its required peers are ready.
         if (work.kind == WorkKind::Collective) {
             auto & finish = events_.at(offset + work.finish);
             ++finish.pending;

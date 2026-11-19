@@ -68,23 +68,30 @@ class ModelScopes:
                 selected[name] = "embedding"
         return selected
 
-    def __init__(self, observation: Any, model: Any) -> None:
-        from sglang.srt.layers.logits_processor import LogitsProcessor
+    @staticmethod
+    def expert_structure(modules):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopK
+
+        experts = {name: module for name, module in modules.items() if isinstance(module, FusedMoE)}
+        layers = []
+        for path, module in experts.items():
+
+            # The enclosing MoE block pairs its routing module with the expert executor; executor top_k is optional.
+            router, = [child for child in modules[path.rpartition(".")[0]].children() if isinstance(child, TopK)]
+            layers.append({
+                "layer": module.layer_id, "experts": module._num_global_routed, "top_k": router.topk_config.top_k,
+            })
+        return experts, layers
+
+    def __init__(self, observation: Any, model: Any) -> None:
+        from sglang.srt.layers.logits_processor import LogitsProcessor
 
         self.observation = observation
         self.model = model
         modules = dict(model.named_modules())
-        self.experts = {name: module for name, module in modules.items() if isinstance(module, FusedMoE)}
-        self.expert_layers = []
-        for path, module in self.experts.items():
-
-            # The enclosing MoE block pairs its routing module with the expert executor; executor top_k is optional.
-            router, = [child for child in modules[path.rpartition(".")[0]].children() if isinstance(child, TopK)]
-            self.expert_layers.append({
-                "layer": module.layer_id, "experts": module._num_global_routed, "top_k": router.topk_config.top_k,
-            })
+        self.experts, self.expert_layers = self.expert_structure(modules)
+        experts = set(self.experts.values())
         for module in modules.values():
             if isinstance(module, LogitsProcessor):
                 original = module._compute_lm_head
@@ -94,7 +101,7 @@ class ModelScopes:
         for path, role in self.selected(modules).items():
             module = modules[path]
             original = module.forward
-            expert_layers = {child.layer_id for child in module.modules() if isinstance(child, FusedMoE)} if role == "layer" else set()
+            expert_layers = {child.layer_id for child in module.modules() if child in experts} if role == "layer" else set()
             if len(expert_layers) > 1:
                 raise ValueError("decoder scope contains multiple expert layers with independent routes")
             rows = {"input": "model_tokens", "output": "model_tokens"}

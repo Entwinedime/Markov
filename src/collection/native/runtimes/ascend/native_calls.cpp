@@ -1,7 +1,9 @@
 #include <acl/acl_rt.h>
 #include <driver/ascend_hal.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -11,10 +13,13 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <link.h>
 #include <pthread.h>
+#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -24,6 +29,7 @@ namespace {
 
 using markov::ascend::Observation;
 using markov::ascend::RuntimeSample;
+using markov::ascend::host_activity;
 using markov::ascend::observation;
 thread_local std::int64_t service_scope = -1;
 
@@ -127,6 +133,61 @@ void append_record(const char * directory, const char * record, int size, std::s
     }
     log->append(directory, record, static_cast<std::size_t>(size));
 }
+
+const auto & torch_npu_code() {
+    using Range = std::pair<std::uintptr_t, std::uintptr_t>;
+    static const auto ranges = [] {
+        std::vector<Range> result;
+        dl_iterate_phdr([](dl_phdr_info * module, std::size_t, void * output) {
+            if (!std::string_view(module->dlpi_name).ends_with("/libtorch_npu.so")) return 0;
+            auto & code = *static_cast<std::vector<Range> *>(output);
+            for (std::size_t index = 0; index < module->dlpi_phnum; ++index) {
+                const auto & segment = module->dlpi_phdr[index];
+                if (segment.p_type == PT_LOAD && (segment.p_flags & PF_X)) {
+                    const auto begin = module->dlpi_addr + segment.p_vaddr;
+                    code.emplace_back(begin, begin + segment.p_memsz);
+                }
+            }
+            return 1;
+        }, &result);
+        return result;
+    }();
+    return ranges;
+}
+
+class QueueNotification {
+public:
+    explicit QueueNotification(const void * site) : directory_(directory(site)),
+                                                      begin_(directory_ == nullptr ? HostTimestamp{} : host_timestamp()) {}
+
+    void finish(const char * api, int fd, eventfd_t value) const {
+        if (directory_ == nullptr) return;
+        const auto end = host_timestamp();
+        char record[320];
+        const auto size = std::snprintf(record, sizeof(record),
+                                        "{\"api\":\"%s\",\"thread\":%ld,\"fd\":%d,\"value\":%llu,\"result\":0,"
+                                        "\"begin_counter\":%llu,\"end_counter\":%llu,\"begin_raw_ns\":%lld,\"end_raw_ns\":%lld}\n",
+                                        api, syscall(SYS_gettid), fd, static_cast<unsigned long long>(value),
+                                        static_cast<unsigned long long>(begin_.counter), static_cast<unsigned long long>(end.counter),
+                                        static_cast<long long>(begin_.raw_ns), static_cast<long long>(end.raw_ns));
+        append_record(directory_, record, size, sizeof(record));
+    }
+
+private:
+    static const char * directory(const void * site) {
+        if (observation.load(std::memory_order_relaxed) != Observation::Structure || !host_activity.load(std::memory_order_relaxed)) return nullptr;
+
+        // Module and symbol lookup must stay off the notification path.
+        const auto address = reinterpret_cast<std::uintptr_t>(site);
+        const auto worker_queue = std::ranges::any_of(torch_npu_code(), [address](const auto & range) {
+            return range.first <= address && address < range.second;
+        });
+        return worker_queue ? std::getenv("MARKOV_NATIVE_RUNTIME_DIR") : nullptr;
+    }
+
+    const char * directory_;
+    HostTimestamp begin_;
+};
 
 class DriverCall {
 public:
@@ -291,6 +352,30 @@ private:
 
 } // namespace
 
+extern "C" int eventfd_read(int fd, eventfd_t * value) {
+    static const auto call = original<decltype(&eventfd_read)>("eventfd_read");
+    const QueueNotification notification(__builtin_return_address(0));
+    const auto result = call(fd, value);
+    if (result == 0) {
+        const auto before = errno;
+        notification.finish("eventfd_read", fd, *value);
+        errno = before;
+    }
+    return result;
+}
+
+extern "C" int eventfd_write(int fd, eventfd_t value) {
+    static const auto call = original<decltype(&eventfd_write)>("eventfd_write");
+    const QueueNotification notification(__builtin_return_address(0));
+    const auto result = call(fd, value);
+    if (result == 0) {
+        const auto before = errno;
+        notification.finish("eventfd_write", fd, value);
+        errno = before;
+    }
+    return result;
+}
+
 extern "C" void markov_sample_host(std::uint64_t * values) {
     const auto sample = host_timestamp();
     values[0] = sample.counter;
@@ -327,6 +412,7 @@ extern "C" int markov_sample_device(std::uint32_t device, std::uint64_t * values
 }
 
 extern "C" void markov_set_runtime_enabled(int enabled) {
+    if (enabled && host_activity.load(std::memory_order_relaxed)) static_cast<void>(torch_npu_code());
     observation.store(enabled ? Observation::Structure : Observation::Off, std::memory_order_relaxed);
 }
 

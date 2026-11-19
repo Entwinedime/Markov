@@ -5,20 +5,16 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from actions import ActionIdentity
-from contents import GraphContents
-from dependencies import ActionBoundaries, CausalGraph
-from native_case import NativeCase
+from .actions import ActionIdentity
+from .contents import GraphContents
+from .dependencies import ActionBoundaries, CausalGraph
+from .native_case import NativeCase
 
 
 class LocalComparison:
     def __init__(self, capture, graphs, expanded, output):
         self.capture, self.graphs, self.expanded, self.output = capture, graphs, expanded, output
         self.counts, self.findings = Counter(), []
-
-    @staticmethod
-    def read(path):
-        return json.loads(path.read_text())
 
     def finding(self, category, rank, scope, detail):
         self.counts[category] += 1
@@ -114,11 +110,7 @@ class LocalComparison:
         report = {"status": "unverified", "capture": str(self.capture.resolve()), "graphs": str(self.graphs.resolve()),
                   "expanded": str(self.expanded.resolve())}
         try:
-            manifest = self.read(self.capture / "capture.json")
-            case = NativeCase(self.capture, manifest, self.graphs)
-            for rank in sorted(case.observed_roles):
-                case.observe(rank, self.read(self.graphs / f"{rank}-graph.json"), self.read(self.capture / f"rank-{rank}.json"))
-            case.finish()
+            case = NativeCase.read(self.capture, self.graphs)
             report["native_evidence"] = case.report(False)
             if report["native_evidence"]["status"] == "differences":
                 raise ValueError("observed case has confirmed contradictions")
@@ -137,14 +129,15 @@ class LocalComparison:
         report.update(counts=dict(self.counts), findings=self.findings,
                       scope="Given action metadata, local contents and intrinsic dependencies only. Symbolic external values/pools/signals; no cross-graph binding, dynamic stream frontier, scheduling, execution time or held-out generalization claim.")
         (self.output / "local-graphs.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-        text = ["# 给定真实动作的局部构图检查", "", f"结果：`{report['status']}`。", "",
-                f"给定动作 {self.counts['given_actions']}，生成 {self.counts['built_actions']}。",
-                f"内容对应 {self.counts['contents_matched']} / {self.counts['contents_checked']}；"
-                f"局部依赖对应 {self.counts['dependencies_matched']} / {self.counts['dependencies_checked']}。",
-                f"动态stream前沿关系单列 {self.counts['stream_frontier_relations_deferred']} 条，其余局部依赖逐动作核对；"
-                "实际前沿绑定留给连接/执行检查。", "",
-                "这里给定了真实动作，只检查来源模板的局部展开。外部值、池和信号采用符号绑定；"
-                "不据此判断控制器、跨图关系或时间正确。同源还原也不证明留出目标的泛化。", ""]
+        text = [
+            "# Local Graph Expansion Check", "", f"Result `{report['status']}`.", "",
+            f"Expanded {self.counts['built_actions']} of {self.counts['given_actions']} supplied native actions.",
+            f"Matched contents for {self.counts['contents_matched']} of {self.counts['contents_checked']} checks and local "
+            f"dependencies for {self.counts['dependencies_matched']} of {self.counts['dependencies_checked']} checks.",
+            f"Execution checks cover the {self.counts['stream_frontier_relations_deferred']} deferred dynamic stream dependencies.", "",
+            "This check expands source templates for supplied native actions, with symbolic bindings for external values, pools, and signals. "
+            "Controller behavior, cross-graph dependencies, timing, and held-out generalization require separate evidence.", "",
+        ]
         (self.output / "local-graphs.md").write_text("\n".join(text))
         return 0 if report["status"] == "local_actions_matched" else 1
 

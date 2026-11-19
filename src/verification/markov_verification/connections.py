@@ -2,9 +2,9 @@
 
 from collections import defaultdict
 
-from actions import ActionIdentity
-from batch_sync import BatchSynchronization
-from protocol_reads import PdPollingEvidence
+from .actions import ActionIdentity
+from .batch_sync import BatchSynchronization
+from .protocol_reads import PdPollingEvidence
 
 
 class Connections:
@@ -143,7 +143,7 @@ class Connections:
                 }
                 if "required_peers" in scope["bindings"]:
                     origin, = scope["bindings"]["source_scopes"]
-                    endpoint["peer_rows"] = raw["scopes"][origin]["expert_exchange"]
+                    endpoint["peer_rows"] = raw["scopes"][origin]["peer_rows"]
                 self.channels[instance, communication["channel"]][rank].append(endpoint)
                 endpoints.append(endpoint)
 

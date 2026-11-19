@@ -1,12 +1,16 @@
 """Use native worker idle and reset boundaries for lightweight serving measurements."""
 
 import ctypes
+from contextlib import nullcontext
 from pathlib import Path
 from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
 from markov_adapters.artifacts import write_json
+from markov_adapters.sglang.pipeline import PipelineABI
 from markov_collection.adapters.frameworks.sglang.content import NativeContent
 from markov_collection.adapters.frameworks.sglang.host_samples import NativeHostSamples
+from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
+from markov_collection.adapters.frameworks.sglang.native_routes import NativeExpertRoutes
 from markov_collection.adapters.frameworks.sglang.window import ObservationWindow
 from markov_collection.adapters.runtimes.ascend.host_profile import AscendSpecializations
 
@@ -15,16 +19,40 @@ class NativeTiming:
     def __init__(self, description):
         self.directory = Path(description["instance_directory"]) / "timing"
         self.rank_offset = description["rank_offset"]
+        self.pipeline_stages = description["pp_size"]
         self.window = ObservationWindow(Path(description["output"]), description)
         self.content = NativeContent(description)
         self.host = None
+        self.routing = None
         if description["host_timing"]:
-            self.host = NativeHostSamples(self.content.aliases, description["mode"], self.rank_offset)
+            self.host = NativeHostSamples(self.content.aliases, description)
         if self.host is not None:
             self.content.auxiliary = self.host.auxiliary
         else:
             self.specializations = AscendSpecializations()
             self.requests = {native: {"id": identity} for native, identity in self.content.aliases.items()}
+        if "ep" in description["serving_input"]["configuration"]:
+            auxiliary = nullcontext if self.host is None else self.host.auxiliary
+            self.routing = NativeExpertRoutes(description, self.content.execution_aliases, metadata=auxiliary, auxiliary=auxiliary)
+
+    def load_routed_model(self, original, runner):
+        result = original(runner)
+        experts, layers = ModelScopes.expert_structure(dict(runner.model.named_modules()))
+        self.routing.configure(experts, layers, runner.model_config.hf_config.num_hidden_layers)
+        if self.host is not None:
+            self.host.observe_expert_layers(experts)
+        if self.content.route_assignments is not None:
+            workers = [{"expert_layers": layers}]
+            if self.pipeline_stages > 1:
+                import torch.distributed as distributed
+                from sglang.srt.distributed import get_world_group
+
+                # Every stage loads its model before serving; cache keys need all expert layer identities.
+                group = get_world_group().cpu_group
+                workers = [None] * distributed.get_world_size(group)
+                distributed.all_gather_object(workers, {"expert_layers": layers}, group=group)
+            self.content.configure(workers)
+        return result
 
     def rank(self, scheduler):
         coordinates = scheduler.ps
@@ -40,7 +68,7 @@ class NativeTiming:
         from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
 
         messages = original(receiver)
-        if not messages:
+        if not messages or receiver.ps.pp_rank != 0:
             return messages
         received_ns = clock_gettime_ns(CLOCK_MONOTONIC_RAW)
         for message in messages:
@@ -68,7 +96,7 @@ class NativeTiming:
             if rid not in self.requests or count <= 0:
                 continue
             row = self.requests[rid]
-            if "output_tokens" in row or row["ingress_raw_ns"] > published_ns:
+            if "output_tokens" in row:
                 raise ValueError(f"invalid native token publication for {rid}")
             row.setdefault("first_publication_raw_ns", published_ns)
             if finished is not None:
@@ -91,9 +119,7 @@ class NativeTiming:
             if self.host is not None:
                 record = self.host.document()
             else:
-                requests = [row for row in self.requests.values() if "first_publication_raw_ns" in row]
-                if requests and (len(requests) != len(self.requests) or any("output_tokens" not in row for row in requests)):
-                    raise ValueError("native output worker did not publish complete request latencies")
+                requests = [row for row in self.requests.values() if len(row) > 1]
                 record = {"requests": requests, "specialization_loads": self.specializations.finish()}
             write_json(directory / "record.json", {**record, "rank": rank}, replace=False)
 
@@ -101,7 +127,7 @@ class NativeTiming:
         return result
 
     def idle(self, original, scheduler):
-        if scheduler.is_fully_idle():
+        if scheduler.is_fully_idle() and not PipelineABI.pending_model_sends(scheduler):
             rank = self.rank(scheduler)
             self.window.group_idle(rank)
             if self.window.inputs_complete() and not self.window.drained:
@@ -129,6 +155,11 @@ class NativeTiming:
                 self.publish, HookType.AROUND,
             )
         self.content.install()
+        if self.routing is not None:
+            HookRegistry.register(
+                "sglang.srt.model_executor.model_runner.ModelRunner.load_model", self.load_routed_model, HookType.AROUND,
+            )
+            self.routing.install()
         HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.handle_generate_request", self.request, HookType.AROUND)
         HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.flush_cache", self.flush, HookType.AROUND)
         HookRegistry.register("sglang.srt.managers.scheduler.Scheduler.on_idle", self.idle, HookType.AROUND)

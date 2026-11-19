@@ -35,6 +35,7 @@ def main() -> None:
     capture.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
     observation = capture.add_mutually_exclusive_group()
     observation.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
+    observation.add_argument("--service-reference", action="store_true", help="record detailed structure and same-run CPU activity")
     observation.add_argument("--latency-only", action="store_true", help="run without the profiler and record scheduler latency")
     observation.add_argument("--host-timing", action="store_true", help="record native CPU work and queue cuts")
     samples = commands.add_parser("cost-samples", help="publish measured services from a projected source")
@@ -51,6 +52,9 @@ def main() -> None:
     costs.add_argument("--demand", type=Path, nargs=2, action="append", default=[], metavar=("GRAPH", "WORK"))
     costs.add_argument("--gap", type=Path, action="append", default=[], help="recheck a prior prediction's actual cost demand")
     costs.add_argument("--output", type=Path, required=True)
+    costs.add_argument("--binary", type=Path, help="Docker-built markov binary for demand and held-out sample checks")
+    costs.add_argument("--modeling-image", default="markov-next-modeling:ubuntu24.04")
+    costs.add_argument("--timeout", type=float, default=300, help="cumulative modeling allowance for cost checks in seconds")
     sampling = commands.add_parser("acquire-costs", help="fulfil known cost requirements with bounded native sampling")
     sampling.add_argument("--production", type=Path, action="append", required=True, help="training source collection with intermediates")
     sampling.add_argument("--samples", type=Path, nargs="+", default=[], help="previously qualified training samples")
@@ -93,7 +97,8 @@ def main() -> None:
     elif arguments.command == "capture":
         from markov_workflow.capture import CaptureProcess
 
-        CaptureProcess(arguments, latency_only=arguments.latency_only, host_timing=arguments.host_timing).run()
+        CaptureProcess(arguments, latency_only=arguments.latency_only, host_timing=arguments.host_timing,
+                       service_reference=arguments.service_reference).run()
     elif arguments.command == "cost-samples":
         from markov_workflow.cost_samples import CostSamples
 

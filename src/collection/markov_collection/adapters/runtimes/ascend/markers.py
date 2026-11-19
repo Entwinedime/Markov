@@ -6,13 +6,14 @@ import ctypes
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any
 
 import torch_npu
 
 from markov_collection.adapters.runtimes.ascend.clock import AscendClock
+from markov_collection.adapters.runtimes.ascend.thread_activity import AscendThreadActivity
 
 
 class AscendMarkers:
@@ -24,6 +25,7 @@ class AscendMarkers:
         self.clock_samples = []
         self.observing = False
         self.intervals = []
+        self.activity = None
 
         # These bounded CPU-only helpers must not release the GIL just to read a clock or exchange a thread-local value.
         bridge = ctypes.PyDLL(None)
@@ -35,15 +37,18 @@ class AscendMarkers:
         self.native_service.restype = ctypes.c_int64
 
     @contextmanager
-    def window(self):
-        self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
-        self.observing = True
-        try:
-            with self.scope("markov.window"):
-                yield
-        finally:
-            self.observing = False
+    def window(self, activity=None):
+        observer = nullcontext() if activity is None else AscendThreadActivity().record(activity)
+        with observer:
             self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
+            self.observing = True
+            try:
+                with self.scope("markov.window"):
+                    yield
+            finally:
+                self.observing = False
+                self.clock_samples.append(AscendClock.sample(torch_npu.npu.current_device()))
+        self.activity = activity
 
     def checkpoint(self) -> None:
         if not self.observing:
@@ -62,7 +67,10 @@ class AscendMarkers:
         record[f"{side}_counter"], record[f"{side}_raw_ns"] = sample
 
     def host_observation(self):
-        return {"process": os.getpid(), "intervals": self.intervals}
+        result = {"process": os.getpid(), "intervals": self.intervals}
+        if self.activity is not None:
+            result["activity"] = self.activity.name
+        return result
 
     @contextmanager
     def scope(self, name: str):

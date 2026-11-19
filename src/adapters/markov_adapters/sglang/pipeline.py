@@ -5,8 +5,9 @@ from functools import partial
 
 
 class PipelineMessages:
-    def __init__(self, calls):
+    def __init__(self, calls, *, wire_device=None):
         self.calls = calls
+        self.wire_device = wire_device
         self.message = ContextVar("pipeline_message", default=None)
 
     def work(self):
@@ -51,6 +52,8 @@ class PipelineMessages:
 
         message["kind"] = tensor_dict.get("__msg_type__")
         names = [name for name, value in metadata if isinstance(value, TensorMetadata)]
+        if self.wire_device is not None:
+            metadata = self.devices(metadata, "meta", self.wire_device)
         return metadata, self.fields(zip(names, tensors, strict=True), paired=False)
 
     def receive_metadata(self, original, group, *args, **kwargs):
@@ -59,7 +62,22 @@ class PipelineMessages:
         if message is None or message["direction"] != "receive":
             return metadata
         message["kind"] = dict(metadata).get("__msg_type__")
+        if self.wire_device is not None:
+            metadata = self.devices(metadata, self.wire_device, "meta")
         return self.fields(metadata, paired=True)
+
+    @staticmethod
+    def devices(metadata, source, target):
+        from sglang.srt.distributed.parallel_state import TensorMetadata
+
+        translated = []
+        for name, value in metadata:
+            if isinstance(value, TensorMetadata) and value.device == source:
+
+                # Native device.type gives each descriptor its own string for pickle's memo table.
+                value = value._replace(device=target.encode().decode())
+            translated.append((name, value))
+        return translated
 
     def fields(self, entries, *, paired):
 

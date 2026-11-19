@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 
-from dependencies import CausalGraph
+from .dependencies import CausalGraph
 
 
 class PdStateEvidence:

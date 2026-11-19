@@ -77,7 +77,7 @@ class DeviceCollectiveCuts:
         finally:
             self.enclosing.reset(token)
 
-    def install(self) -> None:
+    def install(self, expert_exchange=None) -> None:
         import torch.distributed as distributed
         from sglang.srt.distributed.parallel_state import GroupCoordinator
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -88,6 +88,10 @@ class DeviceCollectiveCuts:
         for name in ("all_gather_into_tensor", "all_reduce", "broadcast"):
             target = f"torch.distributed.{name}"
             HookRegistry.register(target, partial(self.distributed, inspect.signature(getattr(distributed, name))), HookType.AROUND)
+        if expert_exchange is not None:
+            for name in ("dispatch", "combine"):
+                target = f"sglang.srt.layers.moe.token_dispatcher.deepep.DeepEPDispatcher.{name}"
+                HookRegistry.register(target, expert_exchange, HookType.AROUND)
 
 
 class NativeCommunications:
@@ -191,23 +195,27 @@ class NativeCommunications:
         bound = inspect.signature(original).bind(dispatcher, *args, **kwargs)
         dispatch = original.__name__ == "dispatch"
         tensor = bound.arguments["hidden_states"] if dispatch else bound.arguments["combine_input"].hidden_states
-        with self.cuts.outer(), self.exchange(original, implementation.group) as call:
-            if not dispatch:
 
-                # Ascend AllToAll Combine has no dense metadata exchange; retain actual send and receive peers.
-                counts = {"send": list(implementation.handle["output_splits"]),
-                          "receive": list(implementation.handle["input_splits"])}
-                members = call.record["communication"]["members"]
-                call.record["communication"]["required"] = [
-                    rank for rank, sent, received in zip(members, counts["send"], counts["receive"], strict=True)
-                    if rank == call.record["communication"]["rank"] or sent or received
-                ]
-                parameter = ScopeParameters(owner.capture.scopes).resolve("expert_received_tokens", call.identity)
-                call.record["bindings"]["required_peers"] = parameter.name
-                call.record["expert_exchange"] = counts
+        # The layout all-gather owns its own rendezvous inside dispatch; the enclosing call owns AllToAllV and local work.
+        with self.exchange(original, implementation.group) as call:
+            handle = None if dispatch else implementation.handle
             rows = "expert_input_tokens" if dispatch else "expert_received_tokens"
             owner.experts.port(call, "hidden_states", "input", tensor, rows)
             result = original(dispatcher, *args, **kwargs)
+            if dispatch:
+                handle = implementation.handle
+            sent, received = list(handle["input_splits"]), list(handle["output_splits"])
+            if not dispatch:
+                sent, received = received, sent
+            exchange = call.record["communication"]
+            exchange["required"] = [
+                rank for rank, send, receive in zip(exchange["members"], sent, received, strict=True)
+                if rank == exchange["rank"] or send or receive
+            ]
+            parameter = ScopeParameters(owner.capture.scopes).resolve("expert_received_tokens", call.identity)
+            call.record["bindings"]["required_peers"] = parameter.name
+            call.record["peer_rows"] = {"send": sent, "receive": received}
+
             rows = "expert_received_tokens" if dispatch else "expert_input_tokens"
             owner.experts.port(call, "hidden_states", "output", result.hidden_states if dispatch else result, rows)
             if dispatch and result.hidden_states_scale is not None:
@@ -215,9 +223,4 @@ class NativeCommunications:
             return result
 
     def install(self) -> None:
-        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-        self.cuts.install()
-        for name in ("dispatch", "combine"):
-            target = f"sglang.srt.layers.moe.token_dispatcher.deepep.DeepEPDispatcher.{name}"
-            HookRegistry.register(target, self.experts, HookType.AROUND)
+        self.cuts.install(self.experts)

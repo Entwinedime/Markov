@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
+import json
 from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.commands import NativeStreamCall, StreamCommand, StreamCommands
+from markov_collection.adapters.runtimes.ascend.host_alignment import ThreadService
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace, Interval, ThreadIntervals
 from markov_collection.instrumentation.observation import ObservationReferences
 
@@ -18,6 +20,10 @@ class AscendObservation:
         self.rank = rank
         if raw["environment"]["parallel"]["rank"] != rank:
             raise ValueError("worker recording differs from the requested rank")
+        activity = raw["host_observation"].get("activity")
+        if activity is not None and activity != f"rank-{rank}-thread-activity.jsonl":
+            raise ValueError("CPU activity file differs from the observed rank")
+        self.activity_path = None if activity is None else directory / activity
         profile, = (directory / "native" / f"rank-{rank}").glob("*_ascend_pt")
         self.trace = AscendTrace(profile, directory / "runtime", raw, trace)
         self.streams = StreamCommands(self.trace)
@@ -166,7 +172,6 @@ class AscendObservation:
                 self.spans[self.host[scope]]["kind"] = "boundary"
                 self.host[scope] = self.span(scope, resource, read.begin, read.end, "host")
         self.host_index = self.span_index("thread")
-        pending = None
         for dequeue in sorted(self.trace.dequeue.values(), key=lambda value: (value.thread, value.begin)):
             enqueue = self.trace.enqueue[dequeue.record["args"]["correlation_id"]]
             if self.trace.excluded_ranges.enclosing(enqueue) is not None:
@@ -182,14 +187,10 @@ class AscendObservation:
                        or api.record["args"]["id"] in self.trace.host_waits | {"aclrtMemcpy", "aclrtMemcpyAsync"} for api in apis):
                 continue
             resource = self.resource("thread", dequeue.thread, "native")
-            key = resource, scope
-            if pending is not None and pending[0] == key:
-                span = pending[1]
-                self.spans[span]["end"] = dequeue.end
-            else:
-                span = self.span(scope, resource, dequeue.begin, dequeue.end, "host")
-                self.edge(self.host_anchor(enqueue), self.endpoint(span, "begin"), "submission")
-                pending = key, span
+
+            # Each take has its own producer, even when adjacent commands belong to the same scope.
+            span = self.span(scope, resource, dequeue.begin, dequeue.end, "host")
+            self.edge(self.host_anchor(enqueue), self.endpoint(span, "begin"), "submission")
 
         for native in self.trace.runtime:
             if native.record["api"] != "aclrtMemcpy" or native.record["bytes"] == 0:
@@ -327,7 +328,9 @@ class AscendObservation:
                 continue
             raw = self.raw["scopes"][scope]
             exchange = raw.get("communication")
-            if not exchange or exchange["required"] != exchange["members"] or raw.get("asynchronous", False):
+            if not exchange or (exchange["required"] != exchange["members"] and "peer_rows" not in raw):
+                continue
+            if raw.get("asynchronous", False) and exchange["operation"] != "transfer":
                 continue
             groups[scope].setdefault(queue.record["args"]["correlation_id"], []).append(task)
 
@@ -554,18 +557,27 @@ class AscendObservation:
                     "finish": self.endpoint(spans[scope], "end"),
                 })
 
-    def submission(self, task: StreamCommand) -> None:
+    def posting(self, task: StreamCommand, *, closed: bool = False) -> tuple[Interval, int]:
         source = task.source
         api = source.api if isinstance(source, NativeStreamCall) else self.trace.apis[source.record["args"]["connection_id"]]
-        origin = self.trace.origin(api)
-        side = "end" if isinstance(source, NativeStreamCall) or source.record["args"]["Task Type"] == "EVENT_RECORD" else "begin"
-
         if isinstance(source, NativeStreamCall) and not self.trace.tasks.get(api.record["args"]["connection_id"]):
 
             # A runtime-elided wait retains its logical condition without inventing a driver submission.
-            begin = source.native.begin
-        else:
+            return api, source.native.begin
+        if closed:
             begin, _ = self.trace.queues.window(api, task.stream)
+            return api, begin
+
+        posts = self.trace.queues.inside(api, task.stream)
+        if len(posts) != 1:
+            raise ValueError(f"device command on stream {task.stream} needs a unique driver release: {api.record['name']}")
+        return api, posts[0].begin
+
+    def submission(self, task: StreamCommand, posting: tuple[Interval, int] | None = None) -> None:
+        api, begin = self.posting(task) if posting is None else posting
+        origin = self.trace.origin(api)
+        source = task.source
+        side = "end" if isinstance(source, NativeStreamCall) or source.record["args"]["Task Type"] == "EVENT_RECORD" else "begin"
 
         # Queue entry follows any CPU preparation inside the API; its outer entry is not a launch witness.
         launched = self.host_anchor(Interval(begin, begin, api.thread, {}))
@@ -575,34 +587,50 @@ class AscendObservation:
             self.edge(self.host_anchor(origin), launched, "submission")
         self.edge(launched, self.task_anchor(task, side), "submission")
 
+    def submission_tail(self, task: StreamCommand) -> None:
+        at = self.task_anchor(task)
+        span = self.spans[at["span"]]
+
+        # Charge up to native payload completion, excluding the next command's queue residence.
+        self.span(span["scope"], span["resource"], task.end, task.end, "boundary")
+
     def submissions(self) -> None:
         cuts: dict[int, set[int]] = defaultdict(set)
         for span in self.spans:
             if self.resources[span["resource"]]["kind"] == "stream":
                 cuts[span["resource"]].update((span["begin"], span["end"]))
-        for dependency in self.dependencies:
-            for side in ("source", "target"):
-                at = dependency[side]
-                resource = self.spans[at["span"]]["resource"]
-                if resource in cuts:
-                    cuts[resource].add(at["order"])
+        for at in ObservationReferences({"scopes": self.scopes, "dependencies": self.dependencies}):
+            resource = self.spans[at["span"]]["resource"]
+            if resource in cuts:
+                cuts[resource].add(at["order"])
         ordered = {resource: sorted(positions) for resource, positions in cuts.items()}
-        groups = {}
-        for task in self.payload:
-            resource = self.resource_ids["stream", task.stream]
-            key = resource, bisect_right(ordered[resource], task.begin) - 1
-            if key not in groups:
-                groups[key] = task, task
-            else:
-                first, last = groups[key]
-                groups[key] = min(first, task, key=lambda value: value.begin), max(last, task, key=lambda value: value.end)
-        for (resource, _), (first, last) in groups.items():
-            self.submission(first)
-            at = self.task_anchor(last)
-            scope = self.spans[at["span"]]["scope"]
 
-            # Device work ends at native payload, without a dependency on the observer's later return marker.
-            self.span(scope, resource, last.end, last.end, "boundary")
+        prior, last = None, None
+        for task in self.payload:
+            enclosing = self.device_index.enclosing(Interval(task.begin, task.end, task.stream, {}))
+            owner = enclosing.record["span"]
+            span = self.spans[owner]
+            resource = span["resource"]
+            region = bisect_right(ordered[resource], task.begin) - 1
+
+            # Closed collectives own their internal progress. Other work can start only at its actual queue post.
+            closed = span["kind"] == "collective"
+            if closed:
+                release = ("collective", owner)
+                posting = None
+            else:
+                posting = self.posting(task)
+                release = ("driver", posting[0].thread, posting[1])
+            key = resource, region, release
+            if key != prior:
+                if last is not None:
+                    self.submission_tail(last)
+                self.submission(task, self.posting(task, closed=True) if closed else posting)
+                prior = key
+            last = task
+
+        if last is not None:
+            self.submission_tail(last)
 
     def synchronization(self) -> None:
         syncs, waits = self.trace.host_waits, self.trace.stream_waits
@@ -639,7 +667,13 @@ class AscendObservation:
             owner = self.trace.owner(origin)
             if owner is None or owner in self.trace.closed_scopes or self.trace.excluded_ranges.enclosing(origin) is not None:
                 continue
-            host = self.host_anchor(api, "end")
+            if stream_wait:
+                waiting = self.streams.stream_calls[api.record["args"]["connection_id"]]
+                completion = self.task_anchor(waiting)
+                self.submission(waiting)
+            else:
+                completion = self.host_anchor(native, "end")
+
             signal = None
             if "Event" in row["api"]:
                 previous_wait = None
@@ -652,15 +686,15 @@ class AscendObservation:
                 stream = None if row["api"] == "aclrtSynchronizeDeviceWithTimeout" else row["stream"]
                 if stream is not None and row["stream_status"] != 0:
                     raise ValueError("required stream synchronization has no native stream identity")
-                tasks = self.streams.submitted(api.begin, stream)
+                tasks = self.streams.submitted(native.begin, stream)
 
                 # Keep the first target-frontier wait; repeated fences without new work add only CPU overhead.
-                resource = self.spans[host["span"]]["resource"]
+                resource = self.spans[completion["span"]]["resource"]
                 frontier = tuple(sorted((task.stream, task.end) for task in tasks))
                 caller = self.host_anchor(origin)
                 caller_resource = self.spans[caller["span"]]["resource"]
-                region = bisect_right(regions[resource], api.begin), bisect_right(regions[caller_resource], origin.begin)
-                key = owner, host["span"], caller["span"], stream, region, frontier
+                region = bisect_right(regions[resource], native.begin), bisect_right(regions[caller_resource], origin.begin)
+                key = owner, completion["span"], caller["span"], stream, region, frontier
                 if key == previous_wait:
                     continue
                 previous_wait = key
@@ -672,21 +706,17 @@ class AscendObservation:
                 for peer in peers:
                     self.scopes[owner]["ports"].append({
                         "name": f"stream.wait/{wait_names[owner]}", "direction": "input", "use": "control",
-                        "relation": "signal", "at": host,
-                        "wait": {"resource": peer, "begin": self.host_anchor(api)},
+                        "relation": "signal", "at": completion,
+                        "wait": {"resource": peer, "begin": self.host_anchor(native)},
                     })
                     wait_names[owner] += 1
             if not stream_wait:
-                resource = self.spans[host["span"]]["resource"]
-                self.span(owner, resource, api.begin, api.end, "wait")
-            if stream_wait:
-                waiting = self.streams.stream_calls[api.record["args"]["connection_id"]]
-                host = self.task_anchor(waiting)
-                self.submission(waiting)
+                resource = self.spans[completion["span"]]["resource"]
+                self.span(owner, resource, native.begin, native.end, "wait")
             if (owner, signal) in self.signal_inputs:
                 self.scopes[owner]["ports"].append({
                     "name": self.signal_inputs.pop((owner, signal)), "direction": "input", "use": "signal", "relation": "signal",
-                    "signal": f"event/{signal}", "at": host,
+                    "signal": f"event/{signal}", "at": completion,
                 })
             tails = {}
             for task in tasks:
@@ -698,7 +728,7 @@ class AscendObservation:
                 # Payload submission belongs to its coarse interval, not to the fence's last internal kernel.
                 if "Event" in row["api"]:
                     self.submission(task)
-                self.edge(self.task_anchor(task), host, "signal")
+                self.edge(self.task_anchor(task), completion, "signal")
 
         if self.signal_inputs:
             raise ValueError(f"declared event waits have no native synchronization evidence: {self.signal_inputs}")
@@ -766,6 +796,51 @@ class AscendObservation:
             anchor["span"] = positions[anchor["span"]]
         result["spans"] = [span for index, span in enumerate(self.spans) if index not in discarded]
 
+    def host_service_positions(self, coordinates):
+        trace = self.trace
+
+        def wall_interval(interval):
+            identity = f"thread/{interval.thread}"
+            return interval.thread, trace.host_times[identity, interval.begin], trace.host_times[identity, interval.end]
+
+        excluded = [wall_interval(interval) for interval in trace.excluded]
+        for interval in trace.runtime:
+            call = interval.record
+            if call["api"] in trace.host_waits or (call["api"] == "aclrtMemcpy" and call["bytes"]):
+                excluded.append(wall_interval(interval))
+        dequeues = []
+        for correlation, dequeue in trace.dequeue.items():
+            enqueue = trace.enqueue[correlation]
+            destination = excluded if trace.excluded_ranges.enclosing(enqueue) is not None else dequeues
+            destination.append(wall_interval(dequeue))
+
+        with self.activity_path.open() as lines:
+            service = ThreadService((json.loads(line) for line in lines), dequeues, excluded)
+        positions = defaultdict(list)
+        for row in coordinates:
+            lane = row["resource"]
+            resource = self.resources[lane]
+            if resource["kind"] != "thread":
+                continue
+            thread = int(resource["identity"].split("/")[1])
+            observed = service.activity.get(thread)
+            if observed is not None and observed[0] <= row["time_ns"] <= observed[1]:
+                positions[lane, thread].append((row["order"], row["time_ns"]))
+
+        # Differences of the prefix give the occupied service at any retained cut on the same thread.
+        result = []
+        for (lane, thread), cuts in positions.items():
+            total = 0
+            before = cuts[0][1]
+            for order, timestamp in cuts:
+                if timestamp < before:
+                    raise ValueError("raw host cuts reverse execution order")
+                if timestamp > before:
+                    total += service.duration(thread, before, timestamp, thread not in self.control_threads)
+                result.append([lane, order, total])
+                before = timestamp
+        return result
+
     def document(self, measurements: bool = False) -> dict[str, Any]:
         self.host_spans()
         self.service_spans()
@@ -800,12 +875,17 @@ class AscendObservation:
         self.normalize_device_spans(result)
         if measurements:
             result["measurements"] = self.streams.measurements(result)
+            if self.activity_path is not None:
+                result["measurements"]["host_service_positions"] = self.host_service_positions(result["measurements"]["coordinates"])
             payloads = self.trace.collective_payloads({scope: row[-1] for scope, row in self.collectives.items()})
             result["measurements"]["collectives"] = [
                 [scope, resource, begin, end, payloads.get(scope)]
                 for scope, (resource, begin, end, _) in self.collectives.items()
             ]
-            result["measurements"]["device_clock_radius_ns"] = self.trace.clock.radius_ns
+            result["measurements"]["collective_peer_rows"] = {
+                scope: self.raw["scopes"][scope]["peer_rows"] for scope in self.collectives
+                if "peer_rows" in self.raw["scopes"][scope]
+            }
             result["measurements"]["synchronous_transfers"] = self.transfer_times()
             result["native_effects"] = self.streams.evidence(self.resource_ids)
         return result

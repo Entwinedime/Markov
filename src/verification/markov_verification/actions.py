@@ -3,7 +3,7 @@
 import json
 from collections import Counter, defaultdict
 
-from markov_adapters.sglang.resources import ResourceInputs
+from markov_collection.adapters.frameworks.sglang.source_scopes import SGLangSourceScopes
 
 
 class QueryResults:
@@ -196,7 +196,7 @@ class ActionScopes:
     def validate_source(self, raw, rank):
         if raw["environment"]["parallel"]["rank"] != rank or self.graph["environment"] != raw["environment"]:
             raise ValueError("graph and recording belong to different worker environments")
-        raw = {**raw, "scopes": ResourceInputs.scopes(raw["scopes"], raw["environment"])}
+        raw = {**raw, "scopes": SGLangSourceScopes(raw["environment"]).lower(raw["scopes"])}
         self.source_ids = {}
         for index, scope in enumerate(self.graph["scopes"]):
             origins = scope["bindings"]["source_scopes"]
@@ -215,7 +215,7 @@ class ActionScopes:
             origins = scope["bindings"]["source_scopes"]
             observed = raw["scopes"][origins[0]]
             if "required_peers" in observed["bindings"]:
-                group, counts = observed["communication"], observed["expert_exchange"]
+                group, counts = observed["communication"], observed["peer_rows"]
                 sent, received = counts["send"], counts["receive"]
                 if (len(sent) != len(group["members"]) or len(received) != len(sent)
                         or any(type(value) is not int or value < 0 for value in sent + received)):
@@ -227,8 +227,9 @@ class ActionScopes:
                 parent = raw["scopes"][observed["parent"]]
                 topk, = [port["tensor"]["shape"][1] for port in parent["ports"] if port["name"] == "topk_ids"]
 
-                if (group["operation"] != "combine" or group["required"] != required
-                        or sum(sent) != tensors["input"]["shape"][0] or sum(received) != tensors["output"]["shape"][0] * topk):
+                before, after = (tensors[edge]["shape"][0] for edge in ("input", "output"))
+                geometry = {"dispatch": (before * topk, after), "combine": (before, after * topk)}
+                if group["required"] != required or (sum(sent), sum(received)) != geometry[group["operation"]]:
                     raise ValueError("native expert exchange prerequisites disagree with its observed traffic")
 
             bindings = dict(observed["bindings"])

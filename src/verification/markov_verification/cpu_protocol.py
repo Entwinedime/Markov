@@ -4,7 +4,7 @@ import json
 from collections import Counter, defaultdict
 from math import prod
 
-from dependencies import CausalGraph
+from .dependencies import CausalGraph
 
 
 class CpuProtocolEvidence:

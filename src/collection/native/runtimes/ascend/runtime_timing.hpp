@@ -8,6 +8,7 @@ namespace markov::ascend {
 
 enum class Observation { Off, Structure, Timing };
 extern std::atomic<Observation> observation;
+extern std::atomic_bool host_activity;
 
 class RuntimeSample {
 public:

@@ -358,7 +358,8 @@ void CoarseGraph::validate() const {
             throw std::invalid_argument("work interval is owned by an unrelated semantic scope");
         if (piece.kind == WorkKind::Collective) {
             const auto & group = scopes[piece.scope].communication;
-            if (!group || group->required != group->members || resources[piece.resource].kind == ResourceKind::Service
+            if (!group || std::ranges::find(group->required, group->rank) == group->required.end()
+                || resources[piece.resource].kind == ResourceKind::Service
                 || resources[piece.resource].rank != group->rank || !collective_scopes.insert(piece.scope).second)
                 throw std::invalid_argument("collective work requires one thread or stream interval per participating scope");
         }

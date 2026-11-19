@@ -15,6 +15,10 @@ class NativeContent:
             native: request["id"]
             for native, request in zip(description["source_requests"], source["requests"], strict=True)
         }
+        self.execution_aliases = self.aliases
+        if description["representative_warmup"]:
+            warmup = {native: request["id"] for native, request in zip(description["warmup_requests"], source["requests"], strict=True)}
+            self.execution_aliases = self.aliases | warmup
         self.auxiliary = auxiliary
         self.tokens = None
         self.routing = None
@@ -35,8 +39,8 @@ class NativeContent:
 
     def request(self, original, req, *args, **kwargs):
         original(req, *args, **kwargs)
-        if req.rid in self.aliases:
-            req.extra_key = self.aliases[req.rid]
+        if req.rid in self.execution_aliases:
+            req.extra_key = self.execution_aliases[req.rid]
 
     def cache_key(self, original, key, token_ids, extra_key=None, is_bigram=False, limit=None):
         if extra_key is not None:
@@ -46,11 +50,8 @@ class NativeContent:
 
     def run_batch(self, original, scheduler, batch, *args, **kwargs):
         previous = self.tokens
-        self.tokens = (
-            [self.content.output_token(self.aliases[req.rid]) for req in batch.reqs]
-            if batch.reqs and batch.reqs[0].rid in self.aliases
-            else None
-        )
+        aliases = self.execution_aliases
+        self.tokens = [self.content.output_token(aliases[req.rid]) for req in batch.reqs] if batch.reqs and batch.reqs[0].rid in aliases else None
         try:
             return original(scheduler, batch, *args, **kwargs)
         finally:

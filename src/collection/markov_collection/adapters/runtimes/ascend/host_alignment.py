@@ -20,10 +20,10 @@ def merged(ranges):
 
 
 class ThreadService:
-    def __init__(self, rows, commands, calls, auxiliary, waits):
+    def __init__(self, rows, dequeues, excluded):
         self.activity = {}
-        self.excluded = defaultdict(list)
-        self.dequeues = defaultdict(list)
+        self.excluded = self.by_thread(excluded)
+        self.dequeues = self.by_thread(dequeues)
         self.loss = []
         for row in rows:
             thread = row["thread"]
@@ -49,19 +49,12 @@ class ThreadService:
                 intervals.append((cursor, end))
             self.activity[thread] = (begin, end, intervals)
 
-        for _, _, (thread, begin, end) in commands:
-            self.dequeues[thread].append((begin, end))
-        for row in calls:
-            thread = row["thread"]
-            begin, end = row["begin_raw_ns"], row["end_raw_ns"]
-            if row["api"] in waits or (row["api"] == "aclrtMemcpy" and row["bytes"]):
-                self.excluded[thread].append((row["before_raw_ns"], row["after_raw_ns"]))
-            else:
-                self.excluded[thread].extend(((row["before_raw_ns"], begin), (end, row["after_raw_ns"])))
-        for thread, begin, end in auxiliary:
-            self.excluded[thread].append((begin, end))
-        self.excluded = {thread: merged(ranges) for thread, ranges in self.excluded.items()}
-        self.dequeues = {thread: merged(ranges) for thread, ranges in self.dequeues.items()}
+    @staticmethod
+    def by_thread(intervals):
+        ranges = defaultdict(list)
+        for thread, begin, end in intervals:
+            ranges[thread].append((begin, end))
+        return {thread: merged(values) for thread, values in ranges.items()}
 
     @staticmethod
     def intersect(first, second):
@@ -82,13 +75,18 @@ class ThreadService:
         last = bisect_right(intervals, end - 1, lo=first, key=lambda interval: interval[0])
         return intervals[first:last]
 
-    def duration(self, thread, begin, end, submission):
+    def running_intervals(self, thread, begin, end):
         if thread not in self.activity or end <= begin:
             return None
         opened, closed, active = self.activity[thread]
         if not opened <= begin < end <= closed:
             return None
-        covered = self.intersect(self.within(active, begin, end), [(begin, end)])
+        return self.intersect(self.within(active, begin, end), [(begin, end)])
+
+    def duration(self, thread, begin, end, submission):
+        covered = self.running_intervals(thread, begin, end)
+        if covered is None:
+            return None
         if submission:
 
             # An idle or spinning submission thread between two queue commands performs no modeled work.
@@ -119,9 +117,15 @@ class AscendHostAlignment:
                 auxiliary.append(Interval(dequeue[1], dequeue[2], dequeue[0], {}))
             else:
                 filtered.append(command)
-        self.service = ThreadService(
-            activity, filtered, runtime, [(row.thread, row.begin, row.end) for row in auxiliary], trace.host_waits,
-        )
+        excluded_time = [(row.thread, row.begin, row.end) for row in auxiliary]
+        for row in runtime:
+            thread = row["thread"]
+            before, after = row["before_raw_ns"], row["after_raw_ns"]
+            if row["api"] in trace.host_waits or (row["api"] == "aclrtMemcpy" and row["bytes"]):
+                excluded_time.append((thread, before, after))
+            else:
+                excluded_time.extend(((thread, before, row["begin_raw_ns"]), (thread, row["end_raw_ns"], after)))
+        self.service = ThreadService(activity, (dequeue for _, _, dequeue in filtered), excluded_time)
         runtime_intervals = []
         for row in runtime:
             call = Interval(row["begin_raw_ns"], row["end_raw_ns"], row["thread"], row)
@@ -170,9 +174,6 @@ class AscendHostAlignment:
             new = [row for row, key in zip(new, measured, strict=True) if key in shared]
         for previous, current in zip(old, new, strict=True):
             self.anchors(previous, current)
-            if previous.record["api"] in self.trace.host_waits | self.trace.stream_waits:
-                profiling = self.trace.native_api(previous)
-                self.anchors(profiling, current)
 
     def align_scopes(self, parts, owners, commands):
         previous, current = defaultdict(list), defaultdict(list)

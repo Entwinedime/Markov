@@ -6,6 +6,7 @@ from pathlib import Path
 from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
 from markov_adapters.artifacts import write_json
+from markov_collection.adapters.runtimes.ascend.thread_activity import AscendThreadActivity
 
 
 class AscendSpecializations:
@@ -40,13 +41,8 @@ class AscendHostProfile:
         self.directory = directory
         self.started = False
         self.specializations = AscendSpecializations()
+        self.activity = AscendThreadActivity()
         bridge = ctypes.PyDLL(None)
-        self.open_activity = bridge.markov_thread_activity_start
-        self.open_activity.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_size_t]
-        self.open_activity.restype = ctypes.c_void_p
-        self.close_activity = bridge.markov_thread_activity_stop
-        self.close_activity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.close_activity.restype = ctypes.c_int
         self.start_runtime = bridge.markov_runtime_timing_start
         self.start_runtime.argtypes = []
         self.start_runtime.restype = None
@@ -75,11 +71,7 @@ class AscendHostProfile:
 
         # The SDK still emits queue marks with ATen range callbacks disabled.
         _enable_record_function(False)
-        tids = [int(thread.name) for thread in Path("/proc/self/task").iterdir()]
-        threads = (ctypes.c_int * len(tids))(*tids)
-        self.activity = self.open_activity(threads, len(tids))
-        if not self.activity:
-            raise RuntimeError("cannot open CPU activity observation for the native worker")
+        self.activity.start()
         self.specializations.start()
         self.start_runtime()
         self.started = True
@@ -91,12 +83,14 @@ class AscendHostProfile:
         runtime = self.directory / "runtime-timing.jsonl"
         activity = self.directory / "thread-activity.jsonl"
         runtime_status = self.stop_runtime(os.fsencode(runtime))
-        activity_status = self.close_activity(self.activity, os.fsencode(activity))
         try:
-            self.profiler.stop()
+            self.activity.finish(activity)
         finally:
-            _enable_record_function(True)
-        if runtime_status or activity_status:
+            try:
+                self.profiler.stop()
+            finally:
+                _enable_record_function(True)
+        if runtime_status:
             raise RuntimeError("cannot publish native CPU timing evidence")
         profile, = (self.directory / "host-profile").glob("*_ascend_pt")
         queues = self.directory / "host-queues.json"

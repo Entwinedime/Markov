@@ -3,7 +3,7 @@
 import json
 from collections import defaultdict
 
-from actions import ActionIdentity
+from .actions import ActionIdentity
 
 
 class IngressEvidence:

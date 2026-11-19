@@ -42,6 +42,11 @@ class SGLangObservation:
         self.native(0)
         self.selected = True
         self.active = False
+        self.specializations = None
+        if description["service_reference"]:
+            from markov_collection.adapters.runtimes.ascend.host_profile import AscendSpecializations
+
+            self.specializations = AscendSpecializations()
         self.resource_history = None
         if description["resource_trace"]:
             from markov_collection.adapters.frameworks.sglang.resource_history import NativeResourceHistory
@@ -52,7 +57,8 @@ class SGLangObservation:
         if "ep" in description["serving_input"]["configuration"]:
             from markov_collection.adapters.frameworks.sglang.native_routes import NativeExpertRoutes
 
-            self.routing = NativeExpertRoutes(self.tensors, description)
+            self.routing = NativeExpertRoutes(description, self.content.execution_aliases, metadata=self.tensors.metadata,
+                                             auxiliary=self.tensors.auxiliary)
 
     @contextmanager
     def call(self, role: str, original: Any, *, parameters=None, arguments=None, work=None, device=False, stream=None):
@@ -169,7 +175,11 @@ class SGLangObservation:
     def request(self, original: Any, scheduler: Any, request: Any) -> Any:
         self.window.begin(request.rid)
         if self.window.phase == "source" and self.selected and not self.active:
-            self.window_scope = self.capture.runtime.window()
+            activity = None
+            if self.specializations is not None:
+                activity = self.directory / f"rank-{self.parallel['rank']}-thread-activity.jsonl"
+                self.specializations.start()
+            self.window_scope = self.capture.runtime.window(activity)
             self.window_scope.__enter__()
             self.active = True
             self.native(1)
@@ -314,10 +324,10 @@ class SGLangObservation:
         if self.active:
             self.window_scope.__exit__(None, None, None)
             self.active = False
+            if self.specializations is not None:
+                self.specializations.finish()
             if self.resource_history is not None:
                 self.resource_history.close()
-            if self.description["pp_size"] > 1:
-                self.pipeline.signals.enabled = False
         self.window.drain(self.parallel["rank"])
 
     def flush(self, original: Any, scheduler: Any, empty_cache: bool = True) -> Any:
@@ -355,6 +365,8 @@ class SGLangObservation:
                 recording["request_receipts"] = self.window.receipts
                 recording["device_clock"] = self.capture.runtime.clock_samples
                 recording["host_observation"] = self.capture.runtime.host_observation()
+                if self.specializations is not None:
+                    recording["specialization_loads"] = self.specializations.loads
                 recording["request_receive_rounds"] = self.window.receive_rounds
                 recording["request_ingress"] = self.window.ingress
                 recording["state_queries"] = self.calls.queries

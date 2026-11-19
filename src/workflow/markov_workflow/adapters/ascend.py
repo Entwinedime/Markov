@@ -28,11 +28,14 @@ class AscendDeployment:
             self.environment["ASCEND_MF_STORE_URL"] = source["store_url"]
             self.environment["ASCEND_MF_TRANSFER_PROTOCOL"] = protocol
 
-    def options(self) -> list[str]:
+    def options(self, *, detailed_timing=False) -> list[str]:
         arguments = ["--runtime", "ascend", "--privileged", "--ipc", "host", "--network", "host"]
         for path in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
             source = Path(path).resolve(strict=True)
             arguments.extend(["--mount", f"type=bind,src={source},dst={path},readonly"])
+        trace_events = Path("/sys/kernel/tracing/events")
+        if detailed_timing and trace_events.is_dir():
+            arguments.extend(["--mount", f"type=bind,src={trace_events},dst=/opt/markov/trace-events,readonly"])
         for name, value in self.environment.items():
             arguments.extend(["--env", f"{name}={value}"])
         return arguments

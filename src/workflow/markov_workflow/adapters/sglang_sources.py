@@ -121,15 +121,31 @@ class RepresentativeSources:
                 prefix = parent
         return pages
 
-    def reduce_requests(self, instances, workload, required):
+    @staticmethod
+    def lengths(workload):
+        requests = workload["requests"]
+        return {
+            "prompt": {request["prompt_tokens"] for request in requests},
+            "decode_context": {request["prompt_tokens"] + request["output_tokens"] - 2
+                               for request in requests if request["output_tokens"] > 1},
+        }
+
+    @classmethod
+    def length_evidence(cls, workload, bounds):
+        if not bounds:
+            return set()
+        observed = cls.lengths(workload)
+        return {f"length/{axis}/{point}" for axis, points in bounds.items() for point in observed[axis] & points}
+
+    def reduce_requests(self, instances, workload, required, bounds):
         reduced = workload
         minimum = 1
         for instance in instances:
             config = instance.configuration.values
+            resident = min(config["max_running_requests"], config["pp"] * NativeConfiguration.batch_capacity(config))
+            if bounds:
+                minimum = max(minimum, min(len(workload["requests"]), resident))
             if instance.mode == "null" and config["mixed_batches"] and "decode" in required:
-
-                # Preserve competing work beyond the resident PP/batch window, rather than trimming away mixed execution.
-                resident = min(config["max_running_requests"], config["pp"] * NativeConfiguration.batch_capacity(config))
                 minimum = max(minimum, min(len(workload["requests"]), resident + 1))
 
         ordered = sorted(workload["requests"], key=lambda row: (row["prompt_tokens"] + row["output_tokens"], row["id"]), reverse=True)
@@ -142,8 +158,8 @@ class RepresentativeSources:
                     entry for entry in route["assignments"] if entry["request"] != request["id"]
                 ]} for name, route in reduced["ep_routes"].items()}
 
-            # Keep whole requests and original arrival/route intervals; only redundant input opportunities disappear.
-            if required <= self.conditions(instances, candidate):
+            # A request can be structurally redundant and still establish a necessary measured length.
+            if required <= self.conditions(instances, candidate) | self.length_evidence(candidate, bounds):
                 reduced = candidate
         return reduced
 
@@ -253,7 +269,7 @@ class RepresentativeSources:
             workload["ep_routes"] = routes
         return workload, groups
 
-    def select(self, candidates: list[tuple[str, str, ServingInput]]) -> list[tuple[dict, dict, list[list[str]], set[tuple[str, str]]]]:
+    def select(self, candidates: list[tuple[str, str, ServingInput]], *, service_evidence=False):
         groups, instances = {}, {}
         for configuration, name, serving in candidates:
             instances[configuration] = serving.instances
@@ -261,10 +277,24 @@ class RepresentativeSources:
                 "name": name, "conditions": self.conditions(serving.instances, self.workloads[name]),
                 "cost": self.cost(serving.workload, serving.instances),
             })
-        targets = {(configuration, name): self.conditions(serving.instances, self.workloads[name])
-                   for configuration, name, serving in candidates}
+        geometry = {}
+        if service_evidence:
+            for (configuration, padding), remaining in groups.items():
+                lengths = [self.lengths(self.workloads[item["name"]]) for item in remaining]
+                bounds = {}
+                for axis in lengths[0]:
+                    points = set().union(*(row[axis] for row in lengths))
+                    if points:
+                        bounds[axis] = {min(points), max(points)}
+                geometry[configuration, padding] = bounds
+                for item in remaining:
+                    item["conditions"].update(self.length_evidence(self.workloads[item["name"]], bounds))
+
+        targets = {(configuration, item["name"]): item["conditions"]
+                   for (configuration, _), remaining in groups.items() for item in remaining}
         choices = []
         for (configuration, padding), remaining in groups.items():
+            bounds = geometry.get((configuration, padding), {})
             selected, covered = [], set()
             while remaining:
                 useful = [item for item in remaining if item["conditions"] - covered]
@@ -296,15 +326,15 @@ class RepresentativeSources:
             for item in selected:
                 name, conditions = item["name"], item["conditions"]
                 original = self.workloads[name]
-                normalized[name] = self.reduce_requests(instances[configuration], original, conditions)
+                normalized[name] = self.reduce_requests(instances[configuration], original, conditions, bounds)
 
                 # Fixed arrival gaps cannot be rescaled without knowing native execution time.
                 if "later_arrival" not in conditions:
                     shortened = probes.normalize(normalized[name])
-                    shortened_conditions = self.conditions(instances[configuration], shortened)
+                    shortened_conditions = self.conditions(instances[configuration], shortened) | self.length_evidence(shortened, bounds)
                     if conditions <= shortened_conditions:
                         normalized[name] = shortened
-                covered.update(self.conditions(instances[configuration], normalized[name]))
+                covered.update(self.conditions(instances[configuration], normalized[name]) | self.length_evidence(normalized[name], bounds))
             workload, submissions = self.combine(names, topologies, normalized)
             single_model = any(self.model_coverage(instance.mode, instance.configuration.values, covered)
                                for instance in instances[configuration])

@@ -3,8 +3,8 @@
 from bisect import bisect_right
 from collections import Counter, defaultdict
 
-from actions import ActionIdentity
-from lifetimes import StateLifetimes
+from .actions import ActionIdentity
+from .lifetimes import StateLifetimes
 
 
 class NativePoolHistory:

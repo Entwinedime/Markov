@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 from markov_adapters.sglang.batches import BatchTensors
+from markov_adapters.sglang.configuration import NativeConfiguration
 from markov_adapters.sglang.experts import ExpertBatch
 from markov_adapters.sglang.pipeline import PipelineABI, PipelineMessages
 from markov_adapters.sglang.state_calls import RequestStateCalls
@@ -136,7 +137,7 @@ class NativeScheduler(Scheduler):
             self.pd.install_calls()
 
         if source["pp"] > 1:
-            self.pipeline_messages = PipelineMessages(self.calls)
+            self.pipeline_messages = PipelineMessages(self.calls, wire_device=NativeConfiguration.accelerator_device)
             self.signals.install()
 
     def handle_generate_request(self, request):

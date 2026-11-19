@@ -1,11 +1,12 @@
 """Check shared device clocks using only independently observed calibration knots."""
 
-from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations
 from math import ceil, floor
+
+from markov_collection.adapters.runtimes.ascend.clock import DeviceCalibration
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,27 +17,19 @@ class CounterPoint:
 
 
 class ClockSegment:
-    def __init__(self, first, last):
+    def __init__(self, calibration, index):
+        first, last = calibration.samples[index:index + 2]
+        origin, finish = calibration.midpoints[index:index + 2]
         self.first_counter = first["counter"]
         self.counts = last["counter"] - first["counter"]
-        self.origin, finish = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in (first, last)]
-        self.duration = finish - self.origin
-        lower = [sample["begin_raw_ns"] - midpoint for sample, midpoint in zip((first, last), (self.origin, finish), strict=True)]
-        upper = [sample["end_raw_ns"] - midpoint for sample, midpoint in zip((first, last), (self.origin, finish), strict=True)]
+        self.origin, self.duration = origin, finish - origin
+        lower = first["begin_raw_ns"] - origin, last["begin_raw_ns"] - finish
+        upper = first["end_raw_ns"] - origin, last["end_raw_ns"] - finish
         self.region = [(Fraction(x), Fraction(y)) for x, y in (
             (lower[0], lower[1]), (upper[0], lower[1]), (upper[0], upper[1]), (lower[0], upper[1]),
         )]
         self.causes = [None] * len(self.region)
         self.conflict = None
-
-    def point(self, timestamp, segment):
-
-        # Invert the producer's integer floor exactly; a rounded timestamp must identify one actual counter.
-        lower = -(-((timestamp - self.origin) * self.counts) // self.duration)
-        upper = -(-((timestamp + 1 - self.origin) * self.counts) // self.duration) - 1
-        if lower != upper or not 0 <= lower <= self.counts:
-            raise ValueError("device timestamp does not identify one counter inside its sampled clock segment")
-        return self.at_counter(self.first_counter + lower, segment)
 
     def at_counter(self, counter, segment):
         position = Fraction(counter - self.first_counter, self.counts)
@@ -76,19 +69,10 @@ class ClockSegment:
             self.clip(axis - 1, -axis, -interval[0], None)
 
 
-class ClockConstraints:
+class ClockConstraints(DeviceCalibration):
     def __init__(self, graph, samples):
-        if len(samples) < 2:
-            raise ValueError("device clock requires at least two independent samples")
-        self.device_id = samples[0]["device"]
-        if (any(sample["device"] != self.device_id or sample["begin_raw_ns"] > sample["end_raw_ns"] for sample in samples)
-                or any(left["counter"] >= right["counter"] or left["end_raw_ns"] >= right["begin_raw_ns"]
-                       for left, right in zip(samples, samples[1:]))):
-            raise ValueError("device clock requires advancing, separated calibration intervals from one device")
-        self.samples = samples
-        self.counters = [sample["counter"] for sample in samples]
-        self.midpoints = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
-        self.segments = [ClockSegment(first, last) for first, last in zip(samples, samples[1:])]
+        super().__init__(samples)
+        self.segments = [ClockSegment(self, index) for index in range(len(samples) - 1)]
         self.device = [graph["resources"][event["resource"]]["kind"] == "stream" for event in graph["events"]]
         self.points = [self.point(measured["time_ns"], device)
                        for measured, device in zip(graph["evidence"]["events"], self.device, strict=True)]
@@ -98,13 +82,13 @@ class ClockConstraints:
     def point(self, timestamp, device):
         if timestamp is None or not device:
             return timestamp
-        index = min(max(bisect_right(self.midpoints, timestamp) - 1, 0), len(self.segments) - 1)
-        return self.segments[index].point(timestamp, index)
+        index, counter = self.counter_at(timestamp)
+        return self.segments[index].at_counter(counter, index)
 
     def at_counter(self, counter):
         if not self.counters[0] <= counter <= self.counters[-1]:
             raise ValueError("clock realization cannot extrapolate outside observed device counters")
-        index = min(bisect_right(self.counters, counter) - 1, len(self.segments) - 1)
+        index = self.counter_segment(counter)
         return self.segments[index].at_counter(counter, index)
 
     @staticmethod
@@ -385,7 +369,13 @@ class ClockRealization:
         return self
 
     def timestamp(self, rank, event):
-        point = self.clocks[rank].points[event]
+        return self.raw_time(rank, self.clocks[rank].points[event])
+
+    def device_duration(self, rank, begin, end):
+        clock = self.clocks[rank]
+        return self.raw_time(rank, clock.point(end, True)) - self.raw_time(rank, clock.point(begin, True))
+
+    def raw_time(self, rank, point):
         if point is None or not isinstance(point, CounterPoint):
             return point
         a, b, constant = self.clocks[rank].form(point)

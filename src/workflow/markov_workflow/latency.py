@@ -10,17 +10,19 @@ def percentile95(values):
     return ordered[ceil(len(ordered) * 0.95) - 1]
 
 
-class PredictedLatency:
-    def __init__(self, result, requests):
-        self.result, self.requests = result, requests
+class RequestLatency:
+    def __init__(self, outputs, requests):
+        self.outputs, self.requests = outputs, requests
+
+    @classmethod
+    def predicted(cls, result, requests):
+        if result["duration_basis"] != "independent_service_costs" or result["requests"] != len(requests):
+            raise ValueError("latency metrics require complete predictions driven by independent costs")
+        return cls(result["outputs"], requests)
 
     def report(self):
-        result = self.result
-        if result["duration_basis"] != "independent_service_costs" or result["requests"] != len(self.requests):
-            raise ValueError("latency metrics require complete predictions driven by independent costs")
-
         published = defaultdict(list)
-        for token in result["outputs"]:
+        for token in self.outputs:
             published[token["request"]].append(token)
         if set(published) != {row["id"] for row in self.requests}:
             raise ValueError("prediction output contains a different request set")

@@ -15,7 +15,7 @@ from markov_workflow.containers import OwnedContainers
 from markov_workflow.limits import OperationLimit
 from markov_workflow.source_productions import SourceProductions
 
-from run import WorkflowCommands
+from run import TaskCommands
 
 
 class MatrixRun:
@@ -32,7 +32,7 @@ class MatrixRun:
         if (not domains or not cases or len(set(domains)) != len(domains) or len(set(cases)) != len(cases)
                 or any(re.fullmatch("[a-z0-9][a-z0-9-]*", name) is None for name in [self.name, *domains, *cases])):
             raise ValueError("matrix needs unique domain/case identifiers containing lowercase letters, digits and hyphens")
-        self.commands = WorkflowCommands(self.repository, self.images)
+        self.commands = TaskCommands(self.repository, self.images)
         self.logs = self.root / "logs/independent"
         self.steps = self.logs / self.name
         self.steps.mkdir(parents=True, exist_ok=True)
@@ -111,17 +111,6 @@ class MatrixRun:
         # Reserve coordinator shutdown too; the child's declared work allowance remains unchanged.
         return self.step(name, command, {"processing_seconds": allowance + 60}, allowance + 60)
 
-    def evaluate(self, name, script, *arguments):
-        command = [
-            "docker", "run", "--rm", "--init", "--runtime", "runc", "--network", "none",
-            "--mount", f"type=bind,src={self.repository},dst={self.repository}",
-            "--env", f"PYTHONPATH={self.repository}/src/collection:{self.repository}/src/adapters",
-            "--workdir", str(self.repository), "--entrypoint", "timeout", self.images["control"],
-            "--signal=KILL", str(self.budget["operation_seconds"]), "python3",
-            str(self.repository / "example/coarse_graph" / script), *map(str, arguments),
-        ]
-        return self.process(name, command)
-
     @staticmethod
     def mapped(report):
         return (bool(report["ranks"]) and report["native_case"]["status"] in {"consistent", "incomplete"}
@@ -137,7 +126,7 @@ class MatrixRun:
             return {"id": name, "collection": str(collection), "source_kind": "fixed_library"} | self.source_evidence(name, collection)
         plan = self.root / "assets" / self.name / name / "plan"
         code = self.process(f"{name}/plan", self.commands.command(
-            "plan-sources", "--input", self.root / domain["exploration"], "--output", plan,
+            "markov_workflow", "plan-sources", "--input", self.root / domain["exploration"], "--output", plan,
         ))
         result = {"id": name, "plan_exit": code, "plan": str(plan)}
         if code:
@@ -149,7 +138,7 @@ class MatrixRun:
         collection = self.root / "sources" / self.name / name
         model = json.loads((self.root / domain["exploration"]).read_text())["model"]["path"]
         command = self.commands.command(
-            "acquire-sources", "--plan", plan, "--deployment", self.root / domain["deployment"], "--output", collection,
+            "markov_workflow", "acquire-sources", "--plan", plan, "--deployment", self.root / domain["deployment"], "--output", collection,
             "--binary", self.binary, "--source-image", self.images["source"], "--modeling-image", self.images["modeling"],
             "--timeout", self.budget["task_seconds"], "--native-budget-seconds", native,
             "--postprocessing-budget-seconds", processing, "--attempt-limit", jobs,
@@ -171,8 +160,15 @@ class MatrixRun:
             identity = job["id"]
             observation = CaptureProcess.published(published.captures[identity], published.jobs[str(identity)])
             output = self.results / "sources" / name / str(identity)
-            self.evaluate(f"{name}/source-evidence-{identity}", "source_evidence.py",
-                          "--production", published.paths[identity], "--capture", observation, "--output", output)
+            command = [
+                "docker", "run", "--rm", "--init", "--runtime", "runc", "--network", "none",
+                "--mount", f"type=bind,src={self.repository},dst={self.repository}",
+                "--env", "PYTHONPATH=src/verification:src/collection:src/adapters:src/workload",
+                "--workdir", str(self.repository), "--entrypoint", "timeout", self.images["control"],
+                "--signal=KILL", str(self.budget["operation_seconds"]), "python3", "-m", "markov_verification.source_evidence",
+                "--production", str(published.paths[identity]), "--capture", str(observation), "--output", str(output),
+            ]
+            self.process(f"{name}/source-evidence-{identity}", command)
             path = output / "source-evidence.json"
             report = json.loads(path.read_text()) if path.exists() else None
             checks.append({"job": identity, "report": str(path), "mapped": report is not None and self.mapped(report),
@@ -219,7 +215,7 @@ class MatrixRun:
         else:
             output = directory / "native"
             command = self.commands.command(
-                "capture", "--input", task, "--deployment", self.root / domain["deployment"], "--output", output,
+                "markov_workflow", "capture", "--input", task, "--deployment", self.root / domain["deployment"], "--output", output,
                 "--source-image", self.images["source"], "--timeout", self.budget["task_seconds"],
                 "--budget-seconds", self.budget["task_seconds"], "--attempt-limit", 1, "--resource-trace",
                 model=json.loads(task.read_text())["model"]["path"],
@@ -234,64 +230,37 @@ class MatrixRun:
         native = CaptureProcess.published(output, json.loads(task.read_text()))
         production = directory / "structure"
         code = self.process(f"{name}/produce", self.commands.command(
-            "produce", "--capture", native, "--product", "graphs", "--output", production, "--binary", self.binary,
+            "markov_workflow", "produce", "--capture", native, "--product", "graphs", "--output", production, "--binary", self.binary,
             "--source-image", self.images["source"], "--modeling-image", self.images["modeling"],
             "--budget-seconds", self.budget["operation_seconds"], "--keep-intermediates",
         ))
         result.update(native=str(native), production=str(production), production_exit=code)
-        if code:
-            return result | {"status": "target-production-failed"}
-        output = self.results / name / "source-evidence"
-        result["evidence_exit"] = self.evaluate(f"{name}/source-evidence", "source_evidence.py",
-                                               "--production", production, "--capture", native, "--output", output)
-        path = output / "source-evidence.json"
-        if not path.exists():
-            return result | {"status": "source-evaluation-error"}
-        report = json.loads(path.read_text())
+        return result | {"status": "target-production-failed" if code else "produced"}
 
-        # Representative sources may omit peers; a complete target requires the public check's full qualification.
-        return result | {"status": "mapped" if result["evidence_exit"] == 0 else "target-evidence-unqualified",
-                         "native_group_status": report["native_case"]["status"], "source_evidence": str(path)}
-
-    def compare(self, domain, case, source, target):
+    def compare(self, case, source, target):
         name = case["id"]
         result = {"id": name, "source_status": source["status"], "target_status": target["status"]}
-        if target["status"] != "mapped":
+        if target["status"] != "produced":
             return result | {"status": "target-prerequisite-unqualified"}
-        native, production = Path(target["native"]), Path(target["production"])
-        output = self.results / name
-
-        # Independent target facts supply only explicit time conditions, never source bodies or shape answers.
-        self.evaluate(f"{name}/timing", "execution_inputs.py", "--capture", native, "--graphs", production / "work",
-                      "--output", output / "timing")
-        path = output / "timing/execution-inputs-report.json"
-        result["timing_status"] = json.loads(path.read_text())["status"] if path.exists() else "evaluation-error"
-        if result["timing_status"] != "extracted":
-            return result | {"status": "timing-unavailable"}
         if source["status"] != "ready":
             return result | {"status": "source-prerequisite-unqualified"}
 
-        prediction = self.root / "targets" / self.name / name / "prediction"
+        output = self.results / "cases" / name
+        layouts = ["--layouts", self.root / case["layouts"]] if "layouts" in case else []
         command = self.commands.command(
-            "predict", "--production", source["collection"], "--input", self.root / case["prediction_input"], "--output", prediction,
+            "markov_verification.structure", "--capture", target["native"], "--reference", target["production"],
+            "--production", source["collection"], "--input", self.root / case["prediction_input"], "--output", output,
             "--binary", self.binary, "--modeling-image", self.images["modeling"], "--control-image", self.images["control"],
-            "--timeout", self.budget["task_seconds"], "--execution-trace", "--execution-inputs", output / "timing/execution-inputs.json",
+            "--timeout", self.budget["task_seconds"], *layouts,
         )
-        code = self.process(f"{name}/predict", command)
-        result["prediction_exit"] = code
-        execution = prediction / ("execution.jsonl" if code == 0 else "execution.partial.jsonl")
-        if not execution.exists():
-            return result | {"status": "prediction-no-trace"}
-        result["execution_trace"] = str(execution)
-        result["comparison_exit"] = self.evaluate(f"{name}/compare", "compare_actions.py", "--capture", native,
-                                                  "--graphs", production / "work", "--execution", execution,
-                                                  "--output", output / "comparison")
-        path = output / "comparison/actions.json"
+
+        # One process holds the checked native case through extraction, prediction and comparison.
+        allowance = 3 * self.budget["operation_seconds"] + self.budget["task_seconds"] + 60
+        result["verification_exit"] = self.step(f"{name}/verify", command, {"processing_seconds": allowance}, allowance)
+        path = output / "result.json"
         if not path.exists():
-            return result | {"status": "comparison-error"}
-        report = json.loads(path.read_text())
-        return result | {"status": "compared", "comparison": report["status"], "coverage": report["coverage"],
-                         "counts": report["counts"], "actions_compared": report["actions_compared"], "report": str(path)}
+            return result | {"status": "verification-error"}
+        return result | json.loads(path.read_text()) | {"report": str(path)}
 
     def run(self, phase, domain_name):
         if self.matrix["status"] != "frozen":
@@ -334,7 +303,7 @@ class MatrixRun:
                         else:
                             source = sources.get(domain["id"], {"status": "not-executed"})
                             target = targets.get(case["id"], {"status": "not-executed"})
-                            result = self.compare(domain, case, source, target)
+                            result = self.compare(case, source, target)
                     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
 
                         # Bad artifacts have a terminal finding; unresolved processes still stop above.

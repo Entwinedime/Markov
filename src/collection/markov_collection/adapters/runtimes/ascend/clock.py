@@ -9,7 +9,55 @@ from decimal import Decimal
 from pathlib import Path
 
 
-class AscendClock:
+class DeviceCalibration:
+    """Map device counter ticks between independently bracketed RAW snapshots."""
+
+    def __init__(self, samples: list[dict]) -> None:
+        if len(samples) < 2:
+            raise ValueError("device clock requires at least two independent samples")
+        self.device_id = samples[0]["device"]
+        if (any(sample["device"] != self.device_id or sample["begin_raw_ns"] > sample["end_raw_ns"] for sample in samples)
+                or any(left["counter"] >= right["counter"] or left["end_raw_ns"] >= right["begin_raw_ns"]
+                       for left, right in zip(samples, samples[1:]))):
+            raise ValueError("device clock requires advancing, separated calibration intervals from one device")
+        self.samples = samples
+        self.counters = [sample["counter"] for sample in samples]
+        self.midpoints = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
+
+    def counter_segment(self, counter: int) -> int:
+        return min(max(bisect_right(self.counters, counter) - 1, 0), len(self.counters) - 2)
+
+    def raw_timestamp(self, counter: int) -> int:
+        index = self.counter_segment(counter)
+        begin, end = self.counters[index:index + 2]
+        start, finish = self.midpoints[index:index + 2]
+        return start + (counter - begin) * (finish - start) // (end - begin)
+
+    def counter_at(self, timestamp: int) -> tuple[int, int]:
+        index = min(max(bisect_right(self.midpoints, timestamp) - 1, 0), len(self.midpoints) - 2)
+        start, finish = self.midpoints[index:index + 2]
+        begin, end = self.counters[index:index + 2]
+        counts, duration = end - begin, finish - start
+
+        # Invert the integer floor exactly so a recorded endpoint identifies one physical tick.
+        first = -((start - timestamp) * counts // duration)
+        last = -((start - timestamp - 1) * counts // duration) - 1
+        if first != last or not 0 <= first <= counts:
+            raise ValueError("device timestamp does not identify one counter inside its sampled clock segment")
+        return index, begin + first
+
+    def bounds(self, timestamp: int) -> tuple[int, int]:
+        index, counter = self.counter_at(timestamp)
+        first, last = self.samples[index:index + 2]
+        offset, counts = counter - first["counter"], last["counter"] - first["counter"]
+        start, finish = first["begin_raw_ns"], last["begin_raw_ns"]
+        lower = start + offset * (finish - start) // counts
+        start, finish = first["end_raw_ns"], last["end_raw_ns"]
+        upper = start - (offset * (start - finish) // counts)
+        return lower, upper
+
+
+class AscendClock(DeviceCalibration):
     @staticmethod
     def sample(user_device: int) -> dict:
         acl = ctypes.CDLL("libascendcl.so")
@@ -34,19 +82,11 @@ class AscendClock:
         return {"device": device.value, "counter": counter, "begin_raw_ns": begin, "end_raw_ns": end}
 
     def __init__(self, device: Path, samples: list[dict]) -> None:
-        if len(samples) < 2:
-            raise ValueError("device clock requires at least two independent samples")
+        super().__init__(samples)
         physical = device.name.removeprefix("device_")
-        for sample in samples:
-            if sample["device"] != int(physical) or sample["begin_raw_ns"] > sample["end_raw_ns"]:
-                raise ValueError("device clock calibration has a different device or reversed host interval")
-        if any(left["counter"] >= right["counter"] or left["end_raw_ns"] >= right["begin_raw_ns"]
-               for left, right in zip(samples, samples[1:])):
-            raise ValueError("device clock calibration requires advancing, separated counter samples")
-        self.counters = [sample["counter"] for sample in samples]
-        self.midpoints = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
+        if self.device_id != int(physical):
+            raise ValueError("device clock calibration has a different device from the SDK profile")
         self.begin_ns, self.end_ns = self.midpoints[0], self.midpoints[-1]
-        self.radius_ns = max((sample["end_raw_ns"] - sample["begin_raw_ns"] + 1) // 2 for sample in samples) + 1
 
         # Keep the epoch offset exact; float-to-string conversion can lose several device counter ticks.
         start = json.loads((device / f"start_info.{physical}").read_text())
@@ -69,10 +109,7 @@ class AscendClock:
         counter = self.counter_anchor + round((raw - self.host_anchor) * self.frequency / 1_000_000_000)
 
         # Extrapolated SDK setup/teardown records are filtered outside the valid observation window.
-        index = min(max(bisect_right(self.counters, counter) - 1, 0), len(self.counters) - 2)
-        begin, end = self.counters[index:index + 2]
-        start, finish = self.midpoints[index:index + 2]
-        return start + (counter - begin) * (finish - start) // (end - begin)
+        return self.raw_timestamp(counter)
 
     def interval(self, record: dict) -> tuple[int, int]:
         begin = Decimal(str(record["ts"]))

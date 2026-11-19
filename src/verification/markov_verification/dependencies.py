@@ -3,7 +3,7 @@
 from collections import Counter, defaultdict
 from types import SimpleNamespace
 
-from actions import ActionIdentity
+from .actions import ActionIdentity
 
 
 class ActionBoundaries:

@@ -9,9 +9,9 @@ from pathlib import Path
 
 from markov_adapters.sglang.pipeline import PipelineABI
 
-from actions import ActionScopes
-from native_case import NativeCase
-from source_effects import NativeEffectEvidence
+from .actions import ActionScopes
+from .native_case import NativeCase
+from .source_effects import NativeEffectEvidence
 
 
 class SourceEvidence:
@@ -237,10 +237,9 @@ class ProductionEvidence:
     def __init__(self, production, capture, output, details):
         self.production, self.capture, self.output, self.details = production, capture, output, details
 
-    def observe_rank(self, native_case, rank):
+    def observe_rank(self, native_case, rank, facts, retain_measurements):
 
-        # SDK/facts belong to this rank; the case retains only graph, clock and validated logical coordinates.
-        facts = json.loads((self.production / f"work/{rank}-facts.json").read_text())
+        # SDK/facts belong to this rank; verification can retain the independently checked service evidence.
         graph = json.loads((self.production / f"work/{rank}-graph.json").read_text())
         native = json.loads((self.capture / f"rank-{rank}.json").read_text())
         SourceEvidence.require(native["environment"] == facts["environment"], "clock source environment differs")
@@ -248,14 +247,18 @@ class ProductionEvidence:
             self.capture, rank, native, facts, self.production / f"work/{rank}-sdk/trace.json",
         )
         effects = native_evidence.inspect(graph)
+        host_fences = native_evidence.inspect_host_fences(graph)
+        effects["host_fences"] = len(host_fences)
         contents = native_case.observe(rank, graph, native, logical_coordinates=native_evidence.logical_coordinates)
         measurements = native_evidence.inspect_measurements()
         measurements["checked_device_measurements"] = effects["device_measurements"]
         device_intervals = native_evidence.device_intervals()
         boundaries = native_evidence.inspect_boundaries(graph, device_intervals)
         services, private_streams = native_evidence.inspect_services()
-        payload = native_evidence.inspect_payload(graph, private_streams, device_intervals)
-        submissions = native_evidence.inspect_submissions()
+        submissions, links = native_evidence.inspect_submissions()
+        launches = {} if retain_measurements else None
+        payload_times = defaultdict(list) if retain_measurements else None
+        payload = native_evidence.inspect_payload(graph, private_streams, device_intervals, links, launches, payload_times)
         generations = native_evidence.event_generations()
         signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank], generations)
         stream_roles = native_evidence.inspect_stream_roles(*PipelineABI.stream_declarations(native), generations[1])
@@ -270,9 +273,30 @@ class ProductionEvidence:
         report["native_services"] = services
         report["native_submissions"] = submissions
         report["native_signals"] = signals
+        if retain_measurements:
+            from .fixed_context import FixedHostContext
+
+            records = {key: facts[key] for key in ("resources", "environment", "measurements")}
+            context = FixedHostContext(self.capture, rank, native_evidence)
+            delays, resumptions, queues = context.project(graph, self.details)
+            report["native_host_queues"] = queues
+            records["fixed_host_delays"] = delays
+            records["host_fence_service"] = {pair: context.fence_service(call, sdk_entry)
+                                             for pair, (call, sdk_entry) in host_fences.items()}
+            records["device_releases"] = native_evidence.sdk.release_evidence(graph, launches)
+            records["device_payload_times"] = payload_times
+            records["fixed_queue_resumptions"] = resumptions
+            records["unbound_queue_notifications"] = queues["queue_completion_notifications"] - queues["bound_to_fixed_work"]
+
+            # Timed work and published physical signals retain their actual measured endpoints.
+            timed = {piece[side] for piece in graph["work"] for side in ("start", "finish")}
+            timed.update(port["event"] for scope in graph["scopes"] for port in scope["ports"]
+                         if port["use"] == "signal" and port["signal"].startswith("event/"))
+            records["observer_joins"] = native_evidence.observer_joins - timed
+            native_case.measurements[rank] = records
         return report
 
-    def run(self):
+    def inspect(self, *, retain_measurements=False):
         publication = json.loads((self.production / "result.json").read_text())
         capture = json.loads((self.capture / "capture.json").read_text())
         ranks = [rank for instance in capture["instances"] for rank in instance["observed_roles"]]
@@ -281,7 +305,8 @@ class ProductionEvidence:
         reports = []
         for rank in publication["observed_roles"]:
             try:
-                report = self.observe_rank(native_case, rank)
+                facts = json.loads((native_case.graphs / f"{rank}-facts.json").read_text())
+                report = self.observe_rank(native_case, rank, facts, retain_measurements)
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
 
                 # A malformed or absent source is a finding; continue the remaining independent ranks.
@@ -295,64 +320,91 @@ class ProductionEvidence:
                 case_report = native_case.report(self.details)
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
                 case_report = {"status": "unverified", "error": str(error)}
-        self.output.mkdir(parents=True)
         document = {"production": str(self.production.resolve()), "capture": str(self.capture.resolve()),
                     "ranks": reports, "native_case": case_report}
+        return native_case, document
+
+    def publish(self, document):
+        reports, case_report = document["ranks"], document["native_case"]
+        self.output.mkdir(parents=True)
         (self.output / "source-evidence.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
         lines = [
-            "# 来源证据检查", "", "本检查核对原始声明、解释结果与粗图的环境、调用层级与上下文、通信声明、规则保留、完整工作/顺序区间、边界及其语义归属、几何、依赖和状态访问，以及实测时间是否满足图中因果；工作区间不能遗漏或重复，等待和无载荷区间保留顺序而不计为工作。不证明原生插桩完整、规则对目标配置成立、模板泛化或目标预测正确。",
-            "", "原生作用检查直接读取同次运行的SDK API、设备任务、runtime及队列生命周期。真实设备工作由SDK或相同实际提交组关联；缺SDK任务的拷贝必须有原缓冲区同步driver传输见证，费用在调用方，不生成stream命令。显式同步拷贝也核对调用方传输区间，完成关系连到真实的调用返回fence。",
-            "", "| rank | 来源映射 | 异步拷贝 / 同步拷贝 / 流等待 | 校准约束 | 名义时间倒置数 | 最大名义倒置/ns |", "| --- | --- | ---: | --- | ---: | ---: |",
+            "# Source Evidence Check", "",
+            "This check compares raw declarations, interpreted records, and the coarse graph. It covers the execution environment, "
+            "call hierarchy and context, communication, retained rules, work and ordering intervals, boundary ownership, geometry, "
+            "dependencies, state access, and agreement between measured time and graph causality. Each work interval must appear "
+            "exactly once. Waits and payload-free intervals contribute ordering only. Instrumentation completeness, applicability "
+            "to target configurations, template generalization, and target predictions require separate evidence.", "",
+            "Native effects are checked against SDK calls, device tasks, runtime records, and queue lifecycles from the same run. "
+            "SDK records or a shared native submission group identify device work. A copy without an SDK task requires evidence of a "
+            "synchronous driver transfer on the original buffer and contributes only a caller interval. Explicit synchronous copies also require a "
+            "measured caller interval and a dependency on the actual return fence.", "",
+            "| Rank | Source mapping | Async copies / sync copies / stream waits | Clock calibration | Nominal time inversions | "
+            "Largest nominal inversion (ns) |", "| --- | --- | ---: | --- | ---: | ---: |",
         ]
-        labels = {"consistent": "一致", "compatible": "校准范围内相容", "inconsistent": "不存在共同校准", "incomplete": "缺少测量", "unverified": "未能核对"}
+        labels = {
+            "consistent": "Consistent", "compatible": "Compatible within calibration bounds",
+            "inconsistent": "No shared calibration", "incomplete": "Missing measurements", "unverified": "Unverified",
+        }
         for report in reports:
             effects = report.get("native_effects")
-            native_counts = f"{effects.get('copies', 0)} / {effects.get('synchronous_copies', 0)} / {effects.get('stream_waits', 0)}" if effects is not None else "—"
+            native_counts = f"{effects.get('copies', 0)} / {effects.get('synchronous_copies', 0)} / {effects.get('stream_waits', 0)}" if effects is not None else "-"
             lines.append(
                 f"| {report['rank']} | {labels[report['mapping']]} | {native_counts} | {labels[report['timing']['status']]} | "
-                f"{report.get('counts', {}).get('time_inversion', '—')} | {report.get('maximum_inversion_ns', '—')} |"
+                f"{report.get('counts', {}).get('time_inversion', '-')} | {report.get('maximum_inversion_ns', '-')} |"
             )
         for report in reports:
             if "error" in report:
-                lines.extend(["", f"rank {report['rank']} 无法完成检查：{report['error']}", ""])
+                lines.extend(["", f"Rank {report['rank']} could not be checked. {report['error']}", ""])
             elif "native_boundaries" in report:
                 boundaries, signals = report["native_boundaries"], report["native_signals"]
                 measurements = report["native_measurements"]
                 services = report["native_services"]
                 streams, payload = report["native_stream_roles"], report["native_payload"]
                 lines.extend([
-                    "", f"rank {report['rank']}：从原始记录核对主机时间点 {measurements['checked_host_measurements']} 个；"
-                    f"缺少测量的stream边界 {measurements['unmeasured_device_endpoints']} 个，"
-                    f"无实际下发的逻辑等待边界 {measurements['logical_wait_boundaries']} 个；同步传输保留driver主机时间，设备返回fence保留真实SDK时间。"
-                    f"另逐项核对{measurements['checked_device_measurements']}个设备测量端点，"
-                    f"{streams['named_streams']}条具名逻辑流；保留SDK负载{payload.get('retained_payload_tasks', 0)}项，"
-                    f"封闭服务队列内负载{payload.get('opaque_service_tasks', 0)}项。"
-                    f"核对原始主机区间 {boundaries.get('host_intervals', 0)} 个、"
-                    f"服务区间 {boundaries.get('service_intervals', 0)} 个、原始声明的状态访问 {boundaries.get('declared_state_accesses', 0)} 项；"
-                    f"闭合服务 {services['synchronous_services']} 个、私有队列 {services['private_queues']} 条、原始下发任务 {services['submitted_tasks']} 项；"
-                    f"SDK 完成导出 {signals.get('exported_completions', 0)} 处、实际等待 {signals.get('signal_waits', 0)} 处、"
-                    f"返回 true 的完成读取 {signals.get('true_completion_reads', 0)} 处。"
-                    f"地址派生的 PD 状态访问 {boundaries.get('derived_state_accesses', 0)} 项需由池/传输证据另行核对。",
+                    "", f"### Rank {report['rank']}", "",
+                    f"Checked {measurements['checked_host_measurements']} host timestamps and "
+                    f"{measurements['checked_device_measurements']} device endpoints against raw records. "
+                    f"{measurements['unmeasured_device_endpoints']} stream boundaries lack measurements, and "
+                    f"{measurements['logical_wait_boundaries']} logical wait boundaries have no device submission. "
+                    "Synchronous transfers retain the driver's host timestamps, and device return fences retain SDK timestamps.", "",
+                    f"Checked {streams['named_streams']} named streams, {payload.get('retained_payload_tasks', 0)} retained SDK payload tasks, "
+                    f"and {payload.get('opaque_service_tasks', 0)} tasks in private service queues. "
+                    f"Checked {boundaries.get('host_intervals', 0)} raw host intervals, {boundaries.get('service_intervals', 0)} service intervals, "
+                    f"and {boundaries.get('declared_state_accesses', 0)} declared state accesses.", "",
+                    f"Observed {services['synchronous_services']} synchronous services, {services['private_queues']} private queues, "
+                    f"and {services['submitted_tasks']} native submissions. The SDK evidence includes "
+                    f"{signals.get('exported_completions', 0)} exported completions, {signals.get('signal_waits', 0)} waits, "
+                    f"and {signals.get('true_completion_reads', 0)} completion queries that returned true. "
+                    f"The {boundaries.get('derived_state_accesses', 0)} address-derived PD state accesses require pool and transfer evidence.",
                 ])
-        lines.extend(["", f"原生整组检查：{case_report['status']}。"])
+        lines.extend(["", f"Native group result `{case_report['status']}`."])
         if "error" in case_report:
             lines.extend(["", case_report["error"]])
         else:
             model = case_report["model_communication"]
             payload = case_report["pd_payload"]
             lines.extend([
-                "", f"模型通信 {model['communication_exchanges']} 轮、跨rank关系 {case_report['model_links']} 条，"
-                f"PD必要关系 {case_report['pd_links']} 条；原生CPU协议完整：{case_report['cpu_protocol']['complete']}。"
-                f"已观察物理请求绑定 {case_report['physical_bindings']['observed_request_bindings']} 项。",
-                "", f"PD 载荷范围：核对 {payload.get('scopes_checked', 0)} 个传输组、"
-                f"{payload.get('kv_accesses_checked', 0)} 项 KV 访问和 {payload.get('metadata_accesses_checked', 0)} 项元数据访问；"
-                "依据注册缓冲区、真实复制字节及请求页表，同时检查复制前后的模型层和K/V成分；不证明数值内容或重复复制次数。",
+                "", f"Checked {model['communication_exchanges']} model communication rounds, {case_report['model_links']} cross-rank "
+                f"relations, and {case_report['pd_links']} required PD relations. CPU protocol completeness is "
+                f"`{case_report['cpu_protocol']['complete']}`. Observed {case_report['physical_bindings']['observed_request_bindings']} physical request bindings.",
+                "", f"PD payload checks cover {payload.get('scopes_checked', 0)} transfer scopes, {payload.get('kv_accesses_checked', 0)} KV "
+                f"accesses, and {payload.get('metadata_accesses_checked', 0)} metadata accesses. Registered buffers, copied bytes, and "
+                "request page tables establish the model layer and K/V component at each end. Tensor values and repeated copy counts "
+                "require separate evidence.",
             ])
             for finding in case_report["findings"]:
-                lines.extend(["", f"{finding['category']}：{finding.get('reason', finding['kind'])}"])
+                lines.extend(["", f"`{finding['category']}` {finding.get('reason', finding['kind'])}"])
         lines.extend([
-            "", "名义倒置按原始中点时间统计；校准约束使用同一rank全部实测关系及穿过逻辑等待的传递路径，不能逐边选择不同的时钟。逻辑等待须由原始API、无SDK任务及无driver下发共同证明，不拥有工作、数据或状态，不提供假设备时间；实体工作及对外完成仍需实测。相容不证明精确偏移、插桩完整或SDK关联正确，原始时间和图保持不变。unknown_time仍是缺少必要测量。",
-            "", "只有各rank映射、原生整组检查一致，必要测量完整、纯逻辑条件有独立依据且存在共同校准才返回 0；其余返回 1。整组检查不需要预测结果；参与者、CPU协议或绑定证据不足不会被弱图替代。默认 JSON 每类仅列前三个名义时间问题，--details 输出全部位置。", "",
+            "", "Nominal inversions use original midpoint timestamps. Each rank uses one calibration across all measured relations, "
+            "including paths through logical waits. The original API and the absence of SDK tasks and driver submissions identify "
+            "pure logical waits, which carry ordering only. Physical work and externally visible completions require measured times. "
+            "Compatibility establishes a feasible calibration on the original graph and timestamps. Exact offsets, capture completeness, "
+            "and SDK attribution require their own evidence. `unknown_time` marks a required measurement gap.",
+            "", "Exit status 0 requires consistent mappings for every rank, consistent native group evidence, all required measurements, "
+            "independently supported logical waits, and a feasible shared calibration. Other outcomes return 1. The group check uses "
+            "native records for participant, CPU protocol, and binding evidence. The default JSON lists up to three nominal timing "
+            "findings per category. `--details` includes every location.", "",
         ])
         (self.output / "source-evidence.md").write_text("\n".join(lines))
         return 0 if reports and case_report["status"] == "consistent" and all(report["mapping"] == "consistent" and report["timing"]["status"] == "compatible"
@@ -366,7 +418,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="new report directory")
     parser.add_argument("--details", action="store_true", help="include all timing findings")
     arguments = parser.parse_args()
-    raise SystemExit(ProductionEvidence(arguments.production, arguments.capture, arguments.output, arguments.details).run())
+    check = ProductionEvidence(arguments.production, arguments.capture, arguments.output, arguments.details)
+    _, document = check.inspect()
+    raise SystemExit(check.publish(document))
 
 
 if __name__ == "__main__":

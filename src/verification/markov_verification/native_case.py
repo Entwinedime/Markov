@@ -2,22 +2,37 @@
 
 import json
 from collections import Counter, defaultdict
+from functools import cached_property
 
-from actions import ActionIdentity
-from bindings import BindingComparison
-from connections import Connections
-from contents import GraphContents
-from cpu_protocol import CpuProtocolEvidence
-from dependencies import CausalGraph
-from pd_payload import PdPayloadEvidence
-from protocol_reads import PdStateEvidence
-from resource_effects import ResourceEffectComparison
-from source_clock import ClockConstraints
-from source_effects import NativeEffectEvidence
+from markov_adapters.sglang.configuration import ServingInput
+
+from .actions import ActionIdentity
+from .bindings import BindingComparison
+from .connections import Connections
+from .contents import GraphContents
+from .cpu_protocol import CpuProtocolEvidence
+from .dependencies import CausalGraph
+from .pd_payload import PdPayloadEvidence
+from .protocol_reads import PdStateEvidence
+from .resource_effects import ResourceEffectComparison
+from .source_clock import ClockConstraints
+from .source_effects import NativeEffectEvidence
 
 
 class NativeCase:
     evidence_categories = frozenset({"native_evidence", "binding_evidence", "cpu_protocol_evidence", "missing_native_identity"})
+
+    @classmethod
+    def read(cls, capture, graphs):
+        manifest = json.loads((capture / "capture.json").read_text())
+        case = cls(capture, manifest, graphs)
+        for instance in manifest["instances"]:
+            for rank in instance["observed_roles"]:
+                graph = json.loads((graphs / f"{rank}-graph.json").read_text())
+                raw = json.loads((capture / f"rank-{rank}.json").read_text())
+                case.observe(rank, graph, raw)
+        case.finish()
+        return case
 
     def __init__(self, capture, manifest, graphs):
         self.capture, self.manifest, self.graphs = capture, manifest, graphs
@@ -31,12 +46,36 @@ class NativeCase:
 
         self.sources, self.dependencies, self.clocks = {}, {}, {}
         self.logical = {}
+        self.measurements = {}
         self.connections = Connections()
         self.cpu = CpuProtocolEvidence(capture, manifest["instances"])
         self.protocol = PdStateEvidence()
         self.control_declarations = defaultdict(set)
         self.findings = []
         self.observed_actions = 0
+
+    @cached_property
+    def sessions(self):
+        return [json.loads((self.capture / "instances" / str(index) / "session.json").read_text())
+                for index, _ in enumerate(self.manifest["instances"])]
+
+    def input_difference(self, source):
+        target = ServingInput(source)
+        for _, raw, _ in self.sources.values():
+            native = raw["environment"]["implementation"]
+            if target.model != {"path": native["model"]["_name_or_path"], "dtype": native["dtype"].removeprefix("torch.")}:
+                return "model"
+        instances = self.manifest["instances"]
+        if len(instances) != len(target.instances):
+            return "instances"
+        for observed, session, instance in zip(instances, self.sessions, target.instances, strict=True):
+            captured = dict(session["serving_input"])
+            configuration = captured.pop("configuration")
+            if observed["id"] != instance.identity or observed["mode"] != instance.mode or configuration != instance.configuration.values:
+                return f"instance:{instance.identity}"
+            if captured != target.workload:
+                return "workload"
+        return None
 
     def observe(self, rank, graph, raw, logical_coordinates=None):
         if rank not in self.observed_roles or rank in self.sources:
@@ -135,9 +174,10 @@ class NativeCase:
                 times[event] = max(inputs)
         return times
 
-    def measured_service_pairs(self, rank, graph, raw):
-        facts = json.loads((self.graphs / f"{rank}-facts.json").read_text())
-        payload = [{tuple(row) for row in lane["payload"]} for lane in facts["resources"]]
+    def measured_service_pairs(self, rank, graph, raw, *, resources=None):
+        if resources is None:
+            resources = json.loads((self.graphs / f"{rank}-facts.json").read_text())["resources"]
+        payload = [{tuple(row) for row in lane["payload"]} for lane in resources]
         queries = {(raw["scopes"][read["scope"]]["thread"], read["begin_counter"], read["end_counter"])
                    for read in raw["state_queries"]}
         events = graph["evidence"]["events"]

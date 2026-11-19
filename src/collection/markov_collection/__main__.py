@@ -15,6 +15,7 @@ def main() -> None:
     capture.add_argument("--output", type=Path, required=True)
     observation = capture.add_mutually_exclusive_group()
     observation.add_argument("--resource-trace", action="store_true", help="observe resources and input reads for independent comparison")
+    observation.add_argument("--service-reference", action="store_true", help="observe structure, resources and same-run CPU activity")
     observation.add_argument("--latency-only", action="store_true", help="record scheduler ingress and token publication only")
     observation.add_argument("--host-timing", action="store_true", help="sample native call cuts and CPU-only queue activity")
     interpret = commands.add_parser("interpret", help="interpret an SDK-exported worker recording")
@@ -32,7 +33,7 @@ def main() -> None:
         NativeServingSession(
             json.loads(arguments.input.read_text()), arguments.output,
             resource_trace=arguments.resource_trace, latency_only=arguments.latency_only,
-            host_timing=arguments.host_timing,
+            host_timing=arguments.host_timing, service_reference=arguments.service_reference,
         ).run()
     elif arguments.command == "export":
         from markov_collection.adapters.runtimes.ascend.export import AscendExport
@@ -40,13 +41,13 @@ def main() -> None:
         AscendExport.run(arguments.input, arguments.rank, arguments.output)
     else:
         from markov_adapters.sglang.pipeline import PipelineABI
-        from markov_adapters.sglang.resources import ResourceInputs
         from markov_collection.adapters.frameworks.sglang.kv_facts import NativeKvFacts
+        from markov_collection.adapters.frameworks.sglang.source_scopes import SGLangSourceScopes
         from markov_collection.adapters.runtimes.ascend.observation import AscendObservation
 
         native = NativeKvFacts(arguments.input, arguments.rank)
         recording = native.document()
-        recording["scopes"] = ResourceInputs.scopes(recording["scopes"], recording["environment"])
+        recording["scopes"] = SGLangSourceScopes(recording["environment"]).lower(recording["scopes"])
 
         # Framework closure rules stay separate from runtime interpretation and the common graph projection.
         observation = AscendObservation(arguments.input, arguments.rank, recording, arguments.trace)

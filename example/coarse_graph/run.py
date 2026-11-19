@@ -7,17 +7,17 @@ import subprocess
 from pathlib import Path
 
 
-class WorkflowCommands:
-    """Call the formal task CLI from a coordinator sharing the host daemon's paths."""
+class TaskCommands:
+    """Call a task module from a coordinator sharing the host daemon's paths."""
 
     def __init__(self, repository, images):
         self.repository, self.images = repository, images
 
-    def command(self, action, *arguments, model=None, files=()):
+    def command(self, module, *arguments, model=None, files=()):
 
         # The coordinator and host daemon must see the same absolute paths for child mounts.
         mounts = [(self.repository, self.repository, False)]
-        if model is not None and action in {"capture", "acquire-sources", "explore"}:
+        if model is not None:
             destination = Path(model).absolute()
             mounts.append((destination.resolve(strict=True), destination, True))
             for name in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
@@ -32,8 +32,8 @@ class WorkflowCommands:
             command.extend(["--mount", f"type=bind,src={source},dst={destination}" + (",readonly" if readonly else "")])
         command.extend([
             "--workdir", str(self.repository),
-            "--env", "PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload",
-            "--entrypoint", "python3", self.images["control"], "-m", "markov_workflow", action,
+            "--env", "PYTHONPATH=src/workflow:src/verification:src/adapters:src/collection:src/workload",
+            "--entrypoint", "python3", self.images["control"], "-m", module,
         ])
         return command + [str(value) for value in arguments]
 
@@ -51,9 +51,9 @@ def main():
     parser.add_argument("--control-image", default="markov-next-control:ubuntu22.04")
     options, remaining = parser.parse_known_args()
     images = {role: getattr(options, f"{role}_image") for role in ("source", "control", "modeling")}
-    commands = WorkflowCommands(repository, images)
+    commands = TaskCommands(repository, images)
     if "--help" in remaining or "-h" in remaining:
-        raise SystemExit(subprocess.call(commands.command("explore", "--help", model=None)))
+        raise SystemExit(subprocess.call(commands.command("markov_workflow", "explore", "--help")))
     if options.deployment is None:
         parser.error("--deployment is required")
 
@@ -71,7 +71,7 @@ def main():
     model = json.loads(options.input.read_text())["model"]["path"]
     for role, image in images.items():
         arguments.extend(("--" + role + "-image", image))
-    command = commands.command("explore", *arguments, *remaining, model=model, files=files.items())
+    command = commands.command("markov_workflow", "explore", *arguments, *remaining, model=model, files=files.items())
     raise SystemExit(subprocess.call(command))
 
 

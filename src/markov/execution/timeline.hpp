@@ -29,9 +29,18 @@ struct ExecutionInput {
     Relation relation;
 };
 
+struct TimedDependency {
+    std::size_t source;
+    std::size_t target;
+    std::int64_t delay_ns;
+};
+
 class Timeline {
 public:
     explicit Timeline(std::vector<Resource> resources, ExecutionObserver * observer = nullptr);
+
+    // All queue, rendezvous and control decisions are already edges in a fixed execution.
+    static std::vector<std::int64_t> replay(std::span<const std::int64_t> releases_ns, std::span<const TimedDependency> dependencies);
 
     // Accept a validated graph and bound input readiness; check execution resources, durations and boundary times here.
     std::vector<std::size_t> insert(const CoarseGraph & graph, std::span<const ServiceDuration> work_ns, std::span<const ExecutionInput> inputs,

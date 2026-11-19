@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdint>
@@ -8,8 +9,10 @@
 #include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <linux/perf_event.h>
@@ -18,6 +21,10 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#include "runtime_timing.hpp"
+
+std::atomic_bool markov::ascend::host_activity{ false };
 
 namespace {
 
@@ -31,27 +38,49 @@ std::uint64_t raw_ns() {
     throw std::system_error(errno, std::generic_category(), operation);
 }
 
-struct Switch {
+struct TimedRecord {
     perf_event_header header;
     std::uint32_t pid;
     std::uint32_t tid;
     std::uint64_t time;
 };
 
+enum class TraceKind { SwitchOut, Wake, FutexEnter, FutexExit };
+
+struct TraceLayout {
+    std::uint32_t id;
+    std::uint32_t first;
+    std::uint32_t second;
+};
+
+struct TraceSample {
+    TraceKind kind;
+    std::uint64_t time;
+    std::uint64_t first;
+    std::uint64_t second;
+};
+
+constexpr std::array<std::string_view, 4> trace_names{ "switch_out", "wake", "futex_enter", "futex_exit" };
+
+perf_event_attr event_options() {
+    perf_event_attr options{};
+    options.size = sizeof(options);
+    options.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    options.disabled = 1;
+    options.use_clockid = 1;
+    options.clockid = CLOCK_MONOTONIC_RAW;
+    return options;
+}
+
 class ThreadActivity {
 public:
     explicit ThreadActivity(pid_t thread) : thread_(thread) {
         const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-        perf_event_attr options{};
+        auto options = event_options();
         options.type = PERF_TYPE_SOFTWARE;
-        options.size = sizeof(options);
         options.config = PERF_COUNT_SW_DUMMY;
-        options.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
-        options.disabled = 1;
         options.sample_id_all = 1;
         options.context_switch = 1;
-        options.use_clockid = 1;
-        options.clockid = CLOCK_MONOTONIC_RAW;
         options.watermark = 1;
         options.wakeup_watermark = static_cast<std::uint32_t>(page * 16);
         fd_ = static_cast<int>(syscall(SYS_perf_event_open, &options, thread, -1, -1, PERF_FLAG_FD_CLOEXEC));
@@ -73,12 +102,35 @@ public:
     ThreadActivity & operator=(const ThreadActivity &) = delete;
 
     ~ThreadActivity() {
+        for (const auto descriptor : traces_) close(descriptor);
         munmap(ring_, mapping_size_);
         close(fd_);
     }
 
+    void attach(const TraceLayout * layouts) {
+        if (layouts == nullptr) return;
+        std::copy_n(layouts, layouts_.size(), layouts_.begin());
+        traces_.reserve(layouts_.size());
+        auto options = event_options();
+        options.type = PERF_TYPE_TRACEPOINT;
+        options.sample_type |= PERF_SAMPLE_RAW;
+        options.sample_period = 1;
+        for (const auto & layout : layouts_) {
+            options.config = layout.id;
+            const auto descriptor = static_cast<int>(syscall(SYS_perf_event_open, &options, thread_, -1, -1, PERF_FLAG_FD_CLOEXEC));
+            if (descriptor < 0) fail("observe native scheduler tracepoint");
+            traces_.push_back(descriptor);
+
+            // Both tracepoint and switch records use the same thread buffer and RAW clock.
+            if (ioctl(descriptor, PERF_EVENT_IOC_SET_OUTPUT, fd_) != 0) fail("share worker thread switch buffer");
+        }
+    }
+
     void start() {
         if (ioctl(fd_, PERF_EVENT_IOC_ENABLE, 0) != 0) fail("start worker thread observation");
+        for (const auto descriptor : traces_) {
+            if (ioctl(descriptor, PERF_EVENT_IOC_ENABLE, 0) != 0) fail("start worker scheduler tracepoint observation");
+        }
         begin_ = raw_ns();
     }
 
@@ -93,9 +145,10 @@ public:
                 throw std::runtime_error("worker thread switch buffer has an incomplete record");
             if (header.type == PERF_RECORD_LOST || header.type == PERF_RECORD_LOST_SAMPLES) lost_ = true;
             if (header.type == PERF_RECORD_SWITCH) {
-                if (header.size != sizeof(Switch)) throw std::runtime_error("unexpected worker switch record layout");
-                switches_.push_back(read<Switch>(position));
+                if (header.size != sizeof(TimedRecord)) throw std::runtime_error("unexpected worker switch record layout");
+                switches_.push_back(read<TimedRecord>(position));
             }
+            if (header.type == PERF_RECORD_SAMPLE) record_trace(position, header);
             position += header.size;
         }
         __atomic_store_n(&ring_->data_tail, head, __ATOMIC_RELEASE);
@@ -103,6 +156,9 @@ public:
 
     void stop(std::ofstream & output) {
         const auto end = raw_ns();
+        for (const auto descriptor : traces_) {
+            if (ioctl(descriptor, PERF_EVENT_IOC_DISABLE, 0) != 0) fail("stop worker scheduler tracepoint observation");
+        }
         if (ioctl(fd_, PERF_EVENT_IOC_DISABLE, 0) != 0) fail("stop worker thread observation");
         drain();
         output << "{\"thread\":" << thread_ << ",\"window_ns\":[" << begin_ << ',' << end
@@ -114,10 +170,61 @@ public:
             const bool running = (event.header.misc & PERF_RECORD_MISC_SWITCH_OUT) == 0;
             output << '[' << event.time << ',' << (running ? "true" : "false") << ']';
         }
-        output << "]}\n";
+        output << "],\"preemptions\":[";
+        first = true;
+        for (std::size_t index = 1; index < switches_.size(); ++index) {
+            const auto & out = switches_[index - 1];
+            const auto & in = switches_[index];
+            if (!(out.header.misc & PERF_RECORD_MISC_SWITCH_OUT_PREEMPT) || (in.header.misc & PERF_RECORD_MISC_SWITCH_OUT)) continue;
+            if (!first) output << ',';
+            first = false;
+            output << '[' << out.time << ',' << in.time << ']';
+        }
+        output << ']';
+        if (!traces_.empty()) {
+            output << ",\"kernel_events\":[";
+            first = true;
+            for (const auto & item : kernel_) {
+                if (item.time < begin_ || end < item.time) continue;
+                if (!first) output << ',';
+                first = false;
+                output << "[\"" << trace_names[static_cast<std::size_t>(item.kind)] << "\"," << item.time << ',';
+                if (item.kind == TraceKind::FutexExit) output << static_cast<std::int64_t>(item.first);
+                else output << item.first;
+                if (item.kind == TraceKind::SwitchOut || item.kind == TraceKind::FutexEnter) output << ',' << item.second;
+                output << ']';
+            }
+            output << ']';
+        }
+        output << "}\n";
     }
 
 private:
+    void record_trace(std::uint64_t position, const perf_event_header & header) {
+        constexpr auto prefix = sizeof(TimedRecord) + sizeof(std::uint32_t);
+        if (header.size < prefix) throw std::runtime_error("worker tracepoint sample omits its RAW payload");
+        const auto size = read<std::uint32_t>(position + sizeof(TimedRecord));
+        if (size > header.size - prefix) throw std::runtime_error("worker tracepoint RAW payload exceeds its record");
+        const auto raw = position + prefix;
+        const auto id = trace_field<std::uint16_t>(raw, size, 0);
+        const auto layout = std::ranges::find(layouts_, id, &TraceLayout::id);
+        if (layout == layouts_.end()) throw std::runtime_error("unexpected worker tracepoint identity");
+        const auto kind = static_cast<TraceKind>(layout - layouts_.begin());
+        const auto time = read<TimedRecord>(position).time;
+        const auto pid_field = kind == TraceKind::SwitchOut || kind == TraceKind::Wake;
+        const auto first = pid_field ? trace_field<std::uint32_t>(raw, size, layout->first)
+                                     : trace_field<std::uint64_t>(raw, size, layout->first);
+        const auto second = kind == TraceKind::SwitchOut || kind == TraceKind::FutexEnter
+            ? trace_field<std::uint64_t>(raw, size, layout->second) : 0;
+        kernel_.push_back({kind, time, first, second});
+    }
+
+    template <class T> T trace_field(std::uint64_t raw, std::uint32_t size, std::uint32_t offset) const {
+        if (static_cast<std::uint64_t>(offset) + sizeof(T) > size)
+            throw std::runtime_error("worker tracepoint layout exceeds its RAW payload");
+        return read<T>(raw + offset);
+    }
+
     template <class Record> Record read(std::uint64_t position) const {
         Record record{};
         const auto * data = reinterpret_cast<const char *>(ring_) + ring_->data_offset;
@@ -134,15 +241,20 @@ private:
     perf_event_mmap_page * ring_;
     std::uint64_t begin_{};
     bool lost_ = false;
-    std::vector<Switch> switches_;
+    std::vector<TimedRecord> switches_;
+    std::array<TraceLayout, trace_names.size()> layouts_{};
+    std::vector<int> traces_;
+    std::vector<TraceSample> kernel_;
 };
 
 class Activity {
 public:
-    Activity(const pid_t * threads, std::size_t count) {
+    Activity(const pid_t * threads, std::size_t count, const TraceLayout * layouts) {
         for (std::size_t index = 0; index < count; ++index) {
             try {
-                threads_.push_back(std::make_unique<ThreadActivity>(threads[index]));
+                auto thread = std::make_unique<ThreadActivity>(threads[index]);
+                thread->attach(layouts);
+                threads_.push_back(std::move(thread));
             } catch (const std::system_error & error) {
                 if (error.code().value() != ESRCH) throw;
             }
@@ -186,9 +298,11 @@ private:
 
 } // namespace
 
-extern "C" void * markov_thread_activity_start(const pid_t * threads, std::size_t count) {
+extern "C" void * markov_thread_activity_start(const pid_t * threads, std::size_t count, const TraceLayout * layouts) {
     try {
-        return std::make_unique<Activity>(threads, count).release();
+        auto activity = std::make_unique<Activity>(threads, count, layouts);
+        markov::ascend::host_activity.store(true, std::memory_order_relaxed);
+        return activity.release();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "markov: %s\n", error.what());
         return nullptr;
@@ -197,6 +311,7 @@ extern "C" void * markov_thread_activity_start(const pid_t * threads, std::size_
 
 extern "C" int markov_thread_activity_stop(void * handle, const char * path) {
     const std::unique_ptr<Activity> activity(static_cast<Activity *>(handle));
+    markov::ascend::host_activity.store(false, std::memory_order_relaxed);
     try {
         activity->stop(path);
         return 0;
