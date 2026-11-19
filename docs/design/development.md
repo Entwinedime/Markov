@@ -180,13 +180,15 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
-普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。评价时核对 `specialization_loads` 以及 request-delivery 中的实际提交偏差与顺序。图与模板生产要求原生图观测。
+普通 dense TP、PP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。结果清单的 `latency` 指向汇总记录。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
 
 用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
-CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配器声明，Ascend 观测器记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同一配置和 workload 的结构观测对齐切点，将取得完整证据的 CPU 服务发布为成本样本。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
+普通 dense TP、PP1 的 CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配器声明，结构观测与主机采样共用设备通信切点。Ascend 观测器按 rank 记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同一配置和 workload 的结构观测对齐作用域和实际组批。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
 
-成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples` 读取同次观测的事实、粗图和工作身份，发布设备与同步搬运标签。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。用 `fit-costs --samples` 从合格样本发布资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
+成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples --production <保留中间事实的生产目录> --rank <rank> --work-identities <工作身份文件> --output <样本文件>` 读取同一次原生采集的粗图和测量，发布设备、同步搬运及得到共同证据的 collective 样本。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。用 `fit-costs --samples` 发布成本资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
+
+Ascend 从同一次 HCCL 提交队列识别设备通信区间，独立保留本地整理工作。采样核对同一原生调用的全体参与者、算法、dtype 和元素数。跨设备校准能确定最后就绪者时，使用其同设备区间估计共同服务。执行使用所有参与者的就绪时间和该服务成本推导通信完成，调用输出继续受本地整理及原有依赖约束。无法确定对端或负载的观察保留为缺测。
 
 成本资产按 `domains` 保存各实现域的规范定义和模型。`fit-costs` 可以读取多个实现域的样本，每域独立拟合。正式预测按已选模板库的实际实现域为各参与者装配成本。CPU 协议本地服务用各自角色的成本，线传输用发送角色的成本。它们与动作图共用成本查询，协议工作身份保留操作、逻辑通道、源/目标和 dtype，实际元素数量与元素字节数作为查询特征。
 
