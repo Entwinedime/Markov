@@ -199,3 +199,233 @@
 **验证** 冷任务两次详细采集、三次主机采样，共用时 625.76 秒，来源与成本后处理 54.94 秒，最终保留约 58 MiB。预热后的首个来源六个批次全匹配，缺测主机区间从 166 降到零。12,628 个已观测区间均可查询，四个配置×workload 组合完成自主预测。替换请求 ID、把到达移至 5/12 毫秒后，复用同一资产再次完成四项，采集与后处理均为零。重开已完成目录保持原结果。核对 C++23 构建、调用方、预算记录、排序和数据引用。[冷任务](../../../data/20261119T122453.716218Z_exploration/result.json) · [复用任务](../../../data/20261119T124125.641276Z_exploration/result.json)
 
 **结论与限制** S5 开发验收完成。两档容量在当前小 workload 的指标并列。复用对照改变了请求身份与到达时间，长度和输出数量仍在原实测范围。S4–S5 累计七次采集、903.11 秒原生用时，S6 接续多卡测量及归因。
+
+## 2026-11-19 — S6 启动 · TP8 全参与者成本观察
+
+**范围** 已核对 S5 远端 `326986a`。从 Qwen3-8B BF16 dummy、TP8、32 token 页的两个新短 workload 开始，沿用已登记原生拓扑。
+
+**改动** 性能来源计划由 SGLang 适配器声明代表请求预热及多 rank 观测。通信服务按所有实际参与者的就绪和载荷取证。结构规划保持代表角色观测。PP 与 EP 的轻量观测还需补齐消息和输出边界。
+
+**验证** 静态核对两份 TP8 来源作业均保留八 rank，并分别声明模型批次与批次数组操作。八张卡预检空闲，首个原生源已启动。此任务上限为六次原生尝试、3,600 秒原生、1,800 秒后处理和 32 GiB，沿用 S6–S7 共用额度。[目标输入](../../../data/20261119T090556.273460Z_project-delivery/inputs/s6-tp8-input.json) · [当前来源计划](../../../data/20261119T124829.621439Z_exploration/plan/plan.md)
+
+**结论与限制** 当前取得计划和启动证据，TP8 成本发布、预测及独立原生评分待完成。
+
+## 2026-11-19 — S6 多 rank 设备通信和原生评分边界
+
+**范围** 核对 TP8 的实际参与者和载荷，并沿 PP 的设备传输、CPU 消息及请求发布检查计时职责。
+
+**改动** PP 设备传输按原生通道顺序配对，并核对收发载荷。原生轻量评分合并各 worker 的真实请求接收和 token 发布，EP 轻量观测复用详细采集的给定路由。CPU 消息的 post 和 wait 复用同一观测切点，主机成本只计线程实际运行时间，跨 rank 就绪单独取证。
+
+**验证** TP8 两次详细采集耗时 274.69 秒，来源后处理 462.18 秒。首份来源每个 rank 有 444 个带实际载荷的通信区间，其中各有 440 个取得服务样本。首份主机测量用时 137.87 秒，八个 rank 的六批各自全部匹配。第二份主机测量在原生初始化阶段用尽 600 秒限额，正式流程保留失败并继续剩余配方。复用已有 PP3 训练来源作离线验证，三 rank 共 224 个设备发送和接收端点都取得载荷，222 个端点取得配对设备服务样本。[TP8 详细来源](../../../data/20261119T124829.621439Z_exploration/collection/result.json) · [TP8 主机测量尝试](../../../data/20261119T124829.621439Z_exploration/assets/sources/1/observed-submission/execution.json) · [PP3 设备成本检查](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pp-device-evidence/coverage.json)
+
+**结论与限制** TP8 正在准备独立成本资产。PP3 的局部设备证据尚未涵盖主机侧服务和完整预测。PP、EP 新增的原生评分入口仍待实测。
+
+## 2026-11-19 — S6 TP8 开发评分与 PP、EP 成本链
+
+**范围** 完成 TP8 的两组预测及原生评分。用 Mistral 7B 的三请求案例连接 PP3 主机采样。沿 EP4 的实际调用区分路由元数据交换与各方向的设备数据搬运。
+
+**改动** PP 的详细和轻量观测共用原生微批、流等待、信号及张量收发切点。Gloo 需求由匹配的实测消息归并。主机 post 和 wait 从线程实占时间取样，同机传输使用相同 Gloo 后端与实测数据类型及长度测量，以已开始等待的接收者观察完成。EP Dispatch 中的全组元数据交换拥有独立切点。Dispatch 和 Combine 的数据交换按真实行数配对，只对声明的必要参与者计等待。
+
+**验证** TP8 两组各产生 3 和 5 个 token，TTFT MAPE 为 14.46% 和 20.15%，TPOT MAPE 为 6.22% 和 4.62%。两个原生评分均无观测窗口内新增特化，合计用时 242.45 秒。五次建库及成本尝试合计 1,139.19 秒，后处理 644.08 秒，训练需求报告仍有 144 个未覆盖坐标。PP3 三请求原生评分入口成功输出 9 个 token，窗口内记录 3 次特化，后续同目标按代表请求预热重核。正式 PP3 任务的两份详细来源共用时 270.67 秒，已进入主机采样。历史 EP4 训练来源 rank 0 的每次 Dispatch 均有 AllGather 和 AllToAllV，Combine 均有 AllToAllV，三类各 528 条且 SDK 载荷齐全。C++23 Release 编译与 Python 名称检查通过。[TP8 开发评分](../../../data/20261119T090556.273460Z_project-delivery/results/s6-tp8-development-performance.json) · [PP3 原生时延](../../../data/20261119T090556.273460Z_project-delivery/results/s6-pp3-native-latency.json) · [PP3 任务](../../../data/20261119T133702Z_exploration/plan/plan.md) · [EP4 设备事实](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep-device-evidence.json)
+
+**结论与限制** 两个具名 TP8 目标的执行和采样链已跑通，首 token 准确性仍需正式留出检验。PP3 首轮主机采样已匹配每 rank 的 6 个批次。14 种已观测 Gloo 路由及载荷组合取得 70 条测量，仍有 6 个主机提交区间缺测，完整预测待运行。EP4 的新切点尚待原生验证。跨设备时间用于计算变量载荷服务的校准区间，只有正下界才纳入拟合。[PP3 传输测量](../../../data/20261119T133702Z_exploration/assets/sources/0/observed-submission/attempts/1/source/instances/0/cpu-transports.json)
+
+## 2026-11-19 — S6 PP3 消息格式与长度覆盖
+
+**范围** 对比 PP3 真实采样和目标控制路径，用给定耗时执行一次完整目标，核对消息几何和来源工作负载。
+
+**改动** 设备外控制在 PP 消息中保留原生设备描述，接收后转换为本地符号张量。性能来源选择保留候选 workload 的 prompt 及 Decode 上下文长度端点，并在已声明的并发容量内保留组批机会。
+
+**验证** PP3 四次原生采集用时 544.95 秒，后处理 145.63 秒。首次自主预测在 218 字节的元数据接收处停止，原生范围上界为 216。给定耗时流程输出 9 个 token，发现三条通道共有 15 个 CPU 形状坐标超出采样区间。修正传输设备描述后复用同一资产，预测越过元数据首缺，停在 `ChunkCache.match_prefix` 的 64-token 输入。旧代表作业实际保留 31、33、33 的 prompt，修订后的性能代表作业保留 31、33、65、33，计划作业数保持两次。EP4 首个四 rank 原生来源已完成。各 rank 分别记录 480 条布局 AllGather、480 条 Dispatch 及 480 条 Combine。[PP3 首次结果](../../../data/20261119T133702Z_exploration/summary.md) · [完整协议运行](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-pp3-protocol-demand/result.json) · [修正后首缺](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-pp3-modeled-native-metadata/cost-gap.json) · [EP4 首份来源](../../../data/20261119T135050Z_exploration/collection/sources/0/result.json)
+
+**结论与限制** PP3 已区分虚拟协议字节偏差与来源缺少长请求两个原因。已规划长度范围经静态检查，仍需补齐原生训练证据并完成自主预测。EP4 按现有任务完成建库和成本发布，再评估其带必要 peer 依赖的执行。
+
+## 2026-11-20 — S6 确立三条验证路径与重构边界
+
+**范围** 复核原生参考、实测结构验证、自主预测成本装配与评分的交接。以 TP8 代表 rank 的成本选择说明下一批必须解决的装配问题。
+
+**改动** S6 先按正式入口收口角色成本和通用验证，之后扩大拓扑。把固定真实图、先核对实测基线、再只替换工作服务成本和逐组归因纳入正式验证。冻结阶段分别验收结构、固定图和自主结果。更新架构归属、操作指南和自顶向下的修改纪律。
+
+**验证** 复核原有四组 TP1 全节点独立报告、S3 同源开发报告和 TP8 成本装配。此前的 TP8 离线诊断把各实际 rank 绑定到已有分角色样本，两组预测 P95 TTFT 分别从 768.9、769.3 毫秒变为 896.4、898.0 毫秒，原生为 898.9、963.5 毫秒。诊断改变了结构等价模板的装配，尚非正式固定图验证。本批只检查文档、命令及已有证据。[TP1 结构结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/heldout-results.json) · [TP8 原开发评分](../../../data/20261119T090556.273460Z_project-delivery/results/s6-tp8-development-performance.json)
+
+**结论与限制** S6 保持暂停。结构验证已有具名范围的完整证据，固定图验证和正式成本绑定修复待实现。TP8 剩余差距的来源仍需用受控验证定位。
+
+## 2026-11-20 — S6 实际角色成本与正式结构验证
+
+**范围** 恢复 S6，从自主预测和单案例结构验证两个公开入口核对装配、参考、时间条件和结果。复用保留的 TP8 和 TP1 原生记录。
+
+**改动** 从实际参与者的实现环境选择成本域，将模板库仅作为工作的结构定义来源。通用验证和局部构图工具迁至 `src/verification`，移除 `example` 中对应实现。单案例入口校验目标输入并复用一份原生参考进行时间提取和结构对照，矩阵仅装配案例和预算。
+
+**验证** C++23 Release 构建及 Python 3.10 语法检查通过。TP8 两组沿用原模板和成本资产，动作计数及 59,518、60,094 项工作数保持一致。P95 TTFT 分别从 768.9、769.3 毫秒变为 896.4、898.0 毫秒，原生为 898.9、963.5 毫秒。TP1 的单案例入口与同源矩阵均匹配 150 次调用，全部时间条件消费，改变 KV 容量会触发输入差异。两份旧来源因 SDK 导出缺失或信号测量依据变化未取得矩阵资格，失败保留。矩阵回归只重建已有观测的派生产物，原生尝试为零。[TP8 单请求](../../../data/20261119T090556.273460Z_project-delivery/work/s6-worker-cost-binding/tp8-singular/score.json) · [TP8 并发](../../../data/20261119T090556.273460Z_project-delivery/work/s6-worker-cost-binding/tp8-concurrent/score.json) · [TP1 矩阵回归](../../../data/20261119T090556.273460Z_project-delivery/work/s6-structure-verification/matrix-current/results/s6-dev/comparisons.json)
+
+**结论与限制** 角色成本绑定的修复进入正式路径。固定图性能验证仍需取得可用于基线的自身服务时长，接通同一成本查询与时间线后再定位误差。本批是开发回归，未扩展正式支持及精度范围。
+
+## 2026-11-20 — 调整验证分工、S7 范围与 M4 入口
+
+**范围** 明确 Python 和 C++23 的验证职责，按固定输出及给定路由合同复核 S7 交付范围。
+
+**改动** Python 持有单案例证据、对照与归因，C++23 持有共享成本和时序计算。S7 聚焦调度与缓存实际触发的工作，真实 checkpoint 转为可选兼容性试跑。S8 第二框架适配暂缓，S7 交付后进入 M4 的 S9。
+
+**验证** 静态核对 D4、M3 主线、冻结范围和阶段状态，确认三条验收路径及 S11 精度目标在现行范围下有明确入口。
+
+**结论与限制** 本次调整交付计划，Goal 暂停于 S6。
+
+## 2026-11-20 — S6 统一成本查询与固定图取证排查
+
+**范围** 恢复 S6，沿工作定义、实现域和特征核对拟合、补采、固定图和正式预测的查询边界。
+
+**改动** C++23 的同一成本实现处理图间隔、协议工作及批量特征点的覆盖和耗时。Python 拟合和计划消费其结果，删除对发布模型的重复匹配和插值。补采沿用累计后处理预算，验证与拟合共用无设备建模命令装配。
+
+**验证** Docker C++23 Release 构建和 Python 3.10 静态检查通过。复用 TP1 真实粗图，批量需求与图查询的 3,976 项耗时逐项相同。旧 PP3 的超界和 EP4 的缺模型分类保留。PP3 零原生额度回归从已有样本覆盖 29,729 项工作，后处理 9.21 秒。隔离的实测设备例重放结果与原记录相同。[需求查询](../../../data/20261119T090556.273460Z_project-delivery/work/s6-shared-cost-query/fitted-costs.json) · [补采回归](../../../data/20261119T090556.273460Z_project-delivery/work/s6-shared-cost-acquisition/costs.json) · [局部重放](../../../data/20261119T090556.273460Z_project-delivery/work/s6-shared-cost-query/isolated-device-replay.json)
+
+长请求 PP3 来源沿用已有样本，零原生额度核对 36,250 项已知工作需求。33,775 项已覆盖，2,475 项落在范围外，归并为 571 个不同的主机工作特征点，均已映射主机测量配方。此步后处理 18.00 秒。[长请求成本需求](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pp3-long-source-cost-demand/costs.json)
+
+**结论与限制** 当前详细图的事实包含工作端点和设备测量，原生线程活动出自独立的低开销主机计时模式。完整固定图基线需要同次运行的主机自身服务证据。以上为开发回归，原生尝试为零。
+
+## 2026-11-20 — S6 PP3 开发闭环和固定图同次 CPU 取证
+
+**范围** PP3 复用两份既有来源补齐主机成本，以同请求预热的原生运行评分。TP1 复用两请求配置取同次粗图、线程切换和设备服务证据。
+
+**改动** 增加详细 `--service-reference` 模式，复用线程切换记录器及 CPU 占用计算。按原生 RAW 坐标为图切口记录可计服务前缀，固定图消费同次占用证据。线程运行、观察活动、同步等待及搬运按各自的原生边界取证。
+
+**验证** PP3 一次主机采样 138.28 秒，后处理 32.75 秒，覆盖全部 571 个已知缺口。自主预测执行 11,857 项工作并输出九个 token。一次相同请求预热的评分采集耗时 117.72 秒，窗口无新增特化，TTFT MAPE 0.31%，TPOT MAPE 1.66%。TP1 一次详细采集 123.19 秒，全 3,976 项工作有同次服务。初始重放提前 1.97 毫秒，另有 `alloc_for_extend` 的内部端点距已有就绪和服务约束相差 2.68 秒。三次新原生尝试合计 379.19 秒，已登记的 S6 累计为 20 次和约 3,243 秒，新增保留数据约 60 MiB。[PP3 成本](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pp3-long-host-costs/costs.json) · [PP3 评分](../../../data/20261119T090556.273460Z_project-delivery/results/s6-pp3-warmed-performance.json) · [TP1 实测重放](../../../data/20261119T090556.273460Z_project-delivery/work/s6-service-reference/fixed-graph/result.json)
+
+**结论与限制** PP3 完成具名开发例，留出精度在 S11 检验。TP1 已解决同次服务缺测，实测基线需要补充独立的起点与等待事实。EP4 同次记录包含所有参与者的调度 AllGather，现有样本配对丢弃了缺少模型批次标识的调用。
+
+## 2026-11-20 — S6 按原生通道配对通信样本
+
+**范围** 使用 EP4 两份原生记录定位调度 AllGather 的资格缺口，检查同次通信序列、载荷和时钟约束。
+
+**改动** 按通道和同一提交线程的实际入场序列对齐完整的参与者操作，再筛选具备载荷、端点和就绪证据的工作。删除按父批次身份和单独传输位置配对的旧规则。
+
+**验证** 零原生额度重建八份 rank 设备样本，后处理 127.82 秒，首个调度 AllGather 成本缺口已覆盖。复核一份 PP3 留存数据，836 条主机样本记录及设备侧 629 个计算、428 个搬运、38 个 collective 测量与原产物相同。EP4 自主预测推进到三请求、513 query token 的 AllReduce。[新成本资产](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep4-protocol-paired-costs/costs.json) · [EP4 后继缺口](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-ep4-protocol-paired/cost-gap.json)
+
+**结论与限制** AllReduce 的实际通信已对应。两个可能最晚就绪的 rank，开始时刻的估计相距约 236 微秒，时钟不确定性半径分别约为 364 和 21 微秒。EP4 的开发闭环与 TP1 固定图基线仍待通过。
+
+## 2026-11-20 — S6 分段通信校时与组合拓扑取证
+
+**范围** 复用 EP4 两份原始记录核对 AllReduce 就绪。核对 TP2×PP3 六 rank 旧来源的测量资格，以及 TP1 固定图重放所缺的条件。
+
+**改动** Ascend 导出、通信成本样本和独立验证共用设备计数与 RAW 坐标的换算。通信按事件所在时段的原始快照判断跨 rank 就绪，保留同时容许多种顺序时的缺测。移除投影事实中的全窗最大校准半径。
+
+**验证** 核对四个 EP rank 的 264 个真实时钟插值点。旧方法把 rank 0 在后段的一次宽校准套到首批；按首批两端快照，rank 0 的就绪区间上、下界约距中点 20 微秒，能确认其最晚就绪。保留原始来源，以零原生额度在 144.07 秒内重建成本。原 AllReduce 缺口已覆盖，正式预测以独立成本完成 211,002 项工作，三个请求输出 11 个 token。[EP4 成本](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep4-local-clock-costs/costs.json) · [EP4 预测](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-ep4-local-clock/result.json)
+
+TP2×PP3 的旧六 rank 来源保留结构证据，旧主来源最长 prompt 为 49，当前为 65，旧投影也未按工作发布设备自身服务。使用当前采集器镜像启动代表请求和合并、过滤两项来源，连同主机测量上限为四次尝试、1,680 秒原生、2,700 秒后处理及 24 GiB。[采集计划](../../../data/20261119T090556.273460Z_project-delivery/work/s6-tp2-pp3-planning/plan.md)
+
+**结论与限制** EP4 待同口径原生评分。TP1 固定图只有一个图根，位于观测窗口打开后 1.97 毫秒。`alloc_for_extend` 的控制线程有约 2.68 秒未运行，提交线程在相关工作区间连续未运行约 2.78 秒，两个区间都未发现 SDK 同步等待。当前记录无法关联具体唤醒源，不能凭墙钟差给等待计费。[TP1 参考证据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-service-reference/reference/production.json)
+
+## 2026-11-20 — S6 固定图入口与组合拓扑建库
+
+**改动** 固定图以经核对的因果图中无前驱、具有直接 RAW 观测的主机入口作为释放条件。内部边界仍由依赖和服务重算。详细参考复用轻量采样的 Triton 特化观测。新加载及未观测都不能取得固定图误差归因资格。
+
+**验证** 用同一 TP1 原始记录运行来源核查及固定图入口。来源通过 14,996 条实测约束，图根与原生入口一致。最早的内部差异为 69.24 微秒，对应采集器调用包装与实际 `perf_counter` 读取之间的独立标记。基线还有 5,777 个内部边界提前。TP2×PP3 两次详细采集和首轮主机测量共用时 430.26 秒，六 rank 的 10 个批次各自全部配对。S6 已完成的原生尝试累计为 23 次，约 3,673 秒，第二轮主机测量在运行。[固定图报告](../../../data/20261119T090556.273460Z_project-delivery/work/s6-service-reference/entry-release-replay/result.json) · [组合拓扑建库](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-tp2-pp3-exploration/collection/result.json)
+
+**结论与限制** `alloc_for_extend` 的长离 CPU 区间在对应内核入队前。旧记录未直接观测该次特化，原因保持未知。详细参考的新特化记录仅做静态检查，待与剩余观察开销、环境等待和内部依赖取证一并核对。EP4 的同 workload 原生评分已排队，和组合拓扑任务串行占用设备。
+
+## 2026-11-20 — S6 组合开发闭环与稳态固定图取证
+
+**改动** 固定图从经核对的原始记录提取工作之外的 CPU 活动、采集器开销和实际运行中可识别的抢占。按同一资源相邻切口绑定固定时长，C++23 在基线和其他场景共用该输入，内部等待仍由依赖推进。
+
+**验证** EP4 两份来源复用后完成自主预测及同 workload 轻量原生评分，TTFT/TPOT MAPE 为 2.69%/9.75%。六 rank 的 TP2×PP3 自主预测输出九个 token，原生评分为 5.49%/5.91%。两例均未记录新特化。核心和采集桥集中构建通过。[EP4 评分](../../../data/20261119T090556.273460Z_project-delivery/results/s6-ep4-warmed-performance.json) · [组合预测](../../../data/20261119T090556.273460Z_project-delivery/targets/s6-tp2-pp3-exploration/result.json) · [组合评分](../../../data/20261119T090556.273460Z_project-delivery/results/s6-tp2-pp3-warmed-performance.json)
+
+TP1 用一次同 workload 预热参考覆盖 3,976 项工作，74 个线程记录中有 28 次可识别抢占，无丢记录或新增特化。旧参考的秒级分配等待未复现。基线前部对齐后，最早差异发生在控制线程入队到提交线程取队之间，提前 14.37 微秒。逐端点用原生前驱上界及独立时长核对后，提交线程、控制线程和设备流分别仍有 755、907、1,117 个局部正间隙。原生与后处理分别用时 114.99 秒、18.27 秒。S6 累计 27 次原生尝试，约 4,202 秒，S6–S7 共用 30 次额度仍有三次。[固定图结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-service-warmed-reference/fixed-graph/result.json) · [局部间隙](../../../data/20261119T090556.273460Z_project-delivery/work/s6-service-warmed-reference/fixed-graph/local-gap-evidence.json)
+
+**结论与限制** 多卡结果完成开发闭环，正式精度留待 S11。TP1 的一个设备工作包含七个真实任务，自身服务约 0.123 毫秒，实际首尾相距 3.86 毫秒。最后一项在首项开始后约 3.76 毫秒才由主机入队，而当前粗图只向该段首项接入提交前驱。下一批沿入队、取队和设备提交保留影响后续工作的释放依赖，并核对可继续聚合的服务范围。复用这次预热参考，保留全部比较约束。
+
+## 2026-11-20 — S6 保留设备工作的独立释放条件
+
+**改动** 按原生入队与实际取队配对主机提交。普通设备工作仅合并同一语义区间内共享 driver 释放的连续任务，封闭 collective 保留其完成合同。独立核验从原始载荷查回生效的图依赖。固定参考将同次无前序命令占用的跨线程交接时长绑定到提交边。零原生额度可用于正式来源重建。
+
+**验证** 复用同一预热 TP1 记录，旧投影被拒绝，原因为设备工作可早于实际 driver 提交。新建库成功，1,788 项设备释放全部通过核验，图从 5,778 个端点变为 12,962 个端点，8,712 项工作均有同次服务。EP4 rank 0 和 TP2×PP3 rank 2 分别核对了投影，原有 2,432 和 302 项 collective 工作均保留。新增原生尝试为零。[旧图核验](../../../data/20261119T090556.273460Z_project-delivery/work/s6-native-release-projection/old-source-check/source-evidence.json) · [新版核验](../../../data/20261119T090556.273460Z_project-delivery/work/s6-native-release-projection/tp1/fixed-handoff/source-evidence/source-evidence.json)
+
+**结论与限制** TP1 重放的首差移到 `prepare_for_extend` 的主机工作转入等待处，提前 138.45 微秒。TP2×PP3 离线建库在流水线输出准备处发现两种实际提交形态，单请求批比多请求批多一次广播，决定该变化的运行时输入条件仍待确认。完整多卡新版成本及预测尚待重建，此前评分仍对应此前投影。[新版固定图重放](../../../data/20261119T090556.273460Z_project-delivery/work/s6-native-release-projection/tp1/fixed-handoff/result.json) · [组合建库日志](../../../data/20261119T090556.273460Z_project-delivery/work/s6-native-release-projection/tp2-pp3/collection/assets/0/logs/004-0-templates.log)
+
+## 2026-11-20 — S6 张量布局候选与主机队列排空
+
+**范围** 用 TP2×PP3 两份六卡来源检查新版投影的候选冲突。追踪预热 TP1 固定图的第一处时间差。
+
+**改动** 框架解释层从已绑定的张量端口生成单元素和多元素的模板条件，覆盖流水线和模型步骤的 token 写入、Decode 槽位写入以及 Llama 首个本地解码层的 RoPE 布局整理。使用现有 C++23 表达式和选择器。单独补流水线时仍能观察到模型执行及分配的候选冲突，集中核对后统一改动。[候选审查](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pipeline-relay-layout/source-selection-audit.json) · [PyTorch 索引赋值实现](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/csrc/autograd/python_variable_indexing.cpp)
+
+**验证** 在镜像内核对索引赋值和连续布局的单元素/多元素行为，复用原始记录完成两份六 rank 正式建库及链接，共 297,612 个事件，建库后处理 287.41 秒，保留约 471 MiB。与新版结构重新绑定后，留存 CPU 样本匹配 154,478 项工作，16 项无对应标签。正式自主预测完成 64,680 项工作、9 个 token，原预热目标的 TTFT/TPOT MAPE 为 5.49%/6.50%，仅供开发。新增原生尝试为零。[建库结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pipeline-relay-layout/guarded-collection/result.json) · [开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pipeline-relay-layout/score.json)
+
+**结论与限制** TP1 首差的 138.45 微秒中，137.28 微秒为控制线程离 CPU。与其同次复制对应的提交线程在控制线程恢复前 8.83 微秒结束取队工作，随后控制线程进入 ACL 流同步。共找到 14 个同样的复制队列链，直接唤醒时刻仍缺。固定图基线仍未通过，软件提交队列的排空和设备 fence 需要各自的就绪依据。[主机队列证据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-native-release-projection/tp1/host-queue-drain-evidence.json) · [镜像所用 TorchNPU 的流与队列实现](https://gitcode.com/Ascend/pytorch/blob/94f8a8e6b523d7ba553e1b80d5b5248478391526/torch_npu/csrc/core/npu/NPUStream.cpp)
+
+## 2026-11-20 — S6 软件队列通知取证及 EP4 新版回归
+
+**范围** 对预热 TP1 的实际软件队列等待获取直接通知，复用两份 EP4 原始来源及主机测量核对新版投影。
+
+**改动** 详细参考模式采集 TorchNPU 的事件描述符读写。独立验证按同一描述符、非抢占的离 CPU 区间及实际队列工作核对一次通知。投影与验证共用原生作用域声明解释，修复新增张量条件在来源校验端未同步的问题。为降低观察干扰，将动态库执行段查询移至采集开启前。[队列实现](https://gitcode.com/Ascend/pytorch/blob/94f8a8e6b523d7ba553e1b80d5b5248478391526/torch_npu/csrc/core/npu/NPUQueue.cpp)
+
+**验证** 原生 TP1 一次，116.33 秒，零新增特化。重建后独立核对 91 次软件队列通知，其中 86 次的 SDK 标记在开始等待前已结束。首版探针对八处实际通知调用的符号查询为 78.40–78.91 微秒中位数，优化镜像已编译并用无设备的跨线程通知通过自检。TP1 首版记录只用于因果取证。S6–S7 累计 28 次、约 4,318 秒原生，余两次。[取证结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-notifications/source-evidence/source-evidence.json) · [探针开销](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/notification-probe-overhead.json)
+
+EP4 新版两份四卡来源建库用时 625.00 秒，建库数据约 1.79 GiB。旧成本观测重新绑定后，自主预测完成 382,038 项工作、11 个 token，原预热目标的 TTFT/TPOT MAPE 为 2.75%/9.76%。该证据用于开发，原生新增尝试为零。[EP4 建库](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep4-release-layout/collection/result.json) · [开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep4-release-layout/score.json)
+
+**结论与限制** 新版 EP4 通过开发闭环。TP1 的通知取证揭示了 SDK 标记与实际队列可继续之间的缺口。还需补齐时间线中的软件队列前驱、恢复及测量合同，再核验固定图实测基线。[当前重算](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-notifications/result.json)
+
+## 2026-11-20 — S6 固定图重算软件队列恢复
+
+**范围** 复用已配对的 TP1 预热参考和现有 C++23 重算入口，核验软件提交队列对同一执行图的影响。
+
+**改动** 用实际通知线程的 SDK 取队坐标和消费者的离 CPU 区间绑定恢复依赖。固定实验在等待处拆分宿主自身服务，成本替换时保留该次实测的进度比例。保留原图端点作为比较对象。
+
+**验证** 91 次通知全部通过绑定，每次被拆分的宿主服务总量都与同次独立测量一致。用原有 12,962 个端点核对，首个端点的提前量从 168.56 微秒降至 1.54 微秒。连续两次等待的局部自检确认换入前后的分段之和均保持自身总成本。无新增原生尝试。[重算结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-resumptions/result.json) · [队列取证](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-resumptions/source-evidence/source-evidence.json)
+
+**结论与限制** 已证实等待依赖解释首处差异的 167.02 微秒。全图仍有 12,822 个端点提前，基线和成本替换归因尚待通过。此轮参考仍限因果开发。S6–S7 原生额度余两次。
+
+## 2026-11-20 — S6 核对固定图端点的时间依据
+
+**范围** 复用 TP1 预热参考，逐端点用原始前驱上界和已测服务区分局部缺口与误差传播。
+
+**改动** 用原始采集标记、实际工作边界及原生读取识别纯逻辑的设备端口。端口依照经核对的前驱就绪，原始标记时间保留为上界。固定图失败时一并报告各角色独立存在的局部时间差。
+
+**验证** 12,962 个端点继续参与核对，其中 123 个是经原始证据确认的逻辑端口，均满足原始前驱确定的就绪条件。设备局部缺口从 1,899 个降至 1,776 个，最大下界从 2.967 毫秒降至 0.233 毫秒。全部 1,788 项设备工作对应原始 driver 提交，其中 1,656 项可确认提交入口时原设备流已空闲，依赖为提交与流次序。原生新增尝试为零。[固定图报告](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-observer-joins/result.json) · [原口径局部核查](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-resumptions/causal-audit.json) · [实际提交与设备开始](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-observer-joins/dispatch-evidence.json)
+
+**结论与限制** 固定图基线未通过。424 个图上同步调用均配对到原始 runtime 记录。首差的 1.54 微秒正好是同步 API 的原生入口到 SDK 标记入口之间的距离，当前服务扣除与图端点使用了不同边界。设备侧仅用采样校时包络，有 8 项能确认设备开始晚于 driver 返回，余下需按实际前驱及联合校时核对。[同步边界取证](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-observer-joins/host-fence-boundaries.json)
+
+## 2026-11-20 — S6 统一主机同步并绑定实测设备派发
+
+**范围** 复用同一 TP1 参考和 TP2×PP3 的一个 rank，核对宿主同步入口、返回和物理设备任务启动。
+
+**改动** 采集解释、主机样本和原始证据以 runtime 入口及返回为宿主同步边界，设备事件等待保留实际流完成。固定图给设备前驱已就绪且调用期间连续运行的主机同步计入实测服务。设备派发按实际驱动提交、前一个任务结束及其他前驱的就绪证据选择交接起点，使用同一校时重算。
+
+**验证** TP1 重建后独立核对 424 次同步，实测调用服务合计 4.942 毫秒。1,788 项设备工作中 1,779 项取得派发时长，其中 1,776 项在空闲流上提交，3 项在上一任务完成前已经提交。用原始前驱核对，控制侧局部缺口从 1,083 降至 105，设备侧从 1,776 降至 5。流水线 rank 的 473 项主机同步、634 项设备流等待及 80 对声明信号通过各自的原始边界核对。复用留存原始 SDK 数据，零新增原生尝试。[TP1 固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-dispatch/result.json) · [流水线 rank 核对](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-dispatch/pipeline-fence-regression.json)
+
+**结论与限制** 基线首差移至 `alloc_for_extend` 中的 53.89 微秒离 CPU 区间。提交线程最大局部缺口中可见真实的队列读与通知，当前恢复规则尚需覆盖其通知方向和取队阶段。继续按剩余的原始线程及设备证据核对，同次重放尚未达到正式成本归因资格。
+
+## 2026-11-20 — S6 核对双向队列交接及取队之间的活动
+
+**范围** 复用 TP1 的实际通知与 CPU 调度记录，按原始前驱和实测服务核对提交线程的 42 处局部缺口。
+
+**改动** 固定图的入队和取队交接由同一观察模块处理。阻塞读取对应到真实通知及下一条取队的原始关联。下一条命令已入队时，按提交线程在两次取队之间的实测连续活动计算时长。
+
+**验证** TP1 正式固定图入口在全部 12,962 个端点上将提交侧局部缺口从 42 降至 2，其中 37 处对应实测取队间活动，3 处对应命令发布后的唤醒。另以纯 CPU 进程核对内核切出状态、唤醒和 futex 事件，使用线程现有的 perf 缓冲配对了 40 个精确切出记录。镜像可通过只读挂载取得事件格式。零新增原生尝试。[队列重算](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-queue-turns/result.json) · [剩余差异的原始依据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-dispatch/remaining-timing-evidence.json) · [共享缓冲取证实测](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-queue-turns/scheduler-buffer-feasibility.json)
+
+**结论与限制** 105 处剩余控制侧局部差异都有离 CPU 记录，缺少相应切出状态及唤醒依据。提交侧 2 处的入队与前一条取队标记重叠，设备侧 5 处尚无可确认的派发起点。固定图基线仍未通过。
+
+## 2026-11-20 — S6 接入线程状态并核对新的 TP1 参考
+
+**改动** 详细参考采集复用每线程 perf 缓冲，记录内核切出、唤醒及 futex 调用。固定图将可独立确认的可运行切出作为抢占处理。普通性能采样沿用线程占用记录。
+
+**验证** 纯 CPU 握手自检的额外耗时中位数约为 0.37 微秒。双请求 TP1 原生详采用时 115.32 秒，后处理 19.02 秒。74 个线程均未报告丢失，无新增特化。来源图通过核验，8,712 项工作均有同次服务测量，1,788 项设备工作中 1,766 项取得派发时长。S6–S7 已用 29 次原生尝试，累计约 4,433 秒，余一次为 S7 保留。[CPU 自检](../../../data/20261119T090556.273460Z_project-delivery/work/s6-host-queue-reference/fixed-queue-turns/scheduler-bridge-cpu.json) · [线程记录摘要](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/scheduler-evidence.json) · [正式固定图结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed/result.json)
+
+**结论与限制** 一次 13.19 微秒的主机流同步全程在 CPU 上运行，设备前驱的校准上界比调用入口晚 88 纳秒。现有证据无法确认进入时设备已就绪，正式基线因此停在测量资格检查。逐端点离线核查在 12,962 个端点中发现 8 处尚无解释的控制线程局部间隙，最大 137.86 微秒。后续先用留存记录核对同步就绪和控制线程阻塞的来源。[局部时间证据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/scheduler-local-conditions.json)
+
+## 2026-11-20 — S6 完成 TP1 固定图基线和成本替换
+
+**范围** 复用双请求 TP1 原始参考、另一轮详细采集和一轮轻量主机采样，核对固定图证据资格及独立成本替换。
+
+**改动** 固定图保留显式标记的采集和输入注入时长，用实际内核唤醒配对重叠的队列读写。SDK 同步入口的记录证明设备已就绪，以该入口分开主机准备和处理。设备派发在提交和流前序共同就绪后计时，派发与载荷共用同一校时。[线程切出证据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/control-local-gap-detail.json) · [派发证据](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed-observation-intervals/device-release-evidence.json)
+
+**验证** 424 次同步、85 次队列恢复及 1,788 次设备派发取得资格，全部 12,962 个端点通过重算对照。独立成本覆盖 6,500 项主机工作及 2,212 项设备或搬运工作。历史单 rank 主机样本只显式补齐记录已有的 rank 和路径索引，原记录保持可复核。新增原生尝试为零。[固定图结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed-independent-costs/result.json) · [主机来源转换](../../../data/20261119T090556.273460Z_project-delivery/work/s6-fixed-training/lightweight-input/source-capture.json)
+
+**结论与限制** 固定图性能验证已走通。恢复实测 CPU 服务后，TTFT 和 TPOT 的偏差从提前约 331 和 212 毫秒变为延后约 1.94 和 0.48 毫秒。该结果定位到详细参考与成本样本的 CPU 服务差距，测量介入影响仍须与成本模型误差区分。
+
+## 2026-11-20 — S6 阶段验收
+
+**范围** 从 S5 的交付提交 `326986a` 审查多 rank 成本绑定、单案例验证和单机并行结果。
+
+**改动** 正式单案例证据与评分由验证模块负责，示例调用正式入口编排实验。C++23 的同一成本查询供补采规划、固定图和自主预测消费。核对了相关目录、命令、依赖和文档。较 S5，`src` 净增 10,519 行，`example` 净减 8,061 行，含搬迁的验证代码、空行和注释。
+
+**验证** 同一 TP1 用例的结构旁路通过 150 个动作、8,712 项工作和 12,858 个动作内端点，固定图通过 12,962 个端点且完成成本替换，自主预测完成 8,712 项工作和四个 token。核对了 TP8、PP3、EP4、TP2×PP3 的开发评分、C++23 容器构建和 Python 源码语法。阶段产物约 6.7 GiB，原生尝试累计 29 次，原始事实、必要失败和正式结果均保留。[结构对照](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/verification-inputs/structure-timed/comparison/actions.md) · [固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed-independent-costs/result.json) · [自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/verification-inputs/autonomous/result.json)
+
+**结论与限制** S6 的开发验收成立。同配置不同原生运行分开用于建库、拟合和 TP1 对照。跨场景泛化和 6% 精度由冻结留出验收。S7 可使用本批已验证的入口和留存资产。
