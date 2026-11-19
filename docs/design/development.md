@@ -180,13 +180,13 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
-普通 dense TP、PP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。结果清单的 `latency` 指向汇总记录。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
+单实例或一对 PD 实例的 dense TP、PP1 单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。PD 以 Prefill 的实际提交为延迟起点，以 Decode 的实际发布为输出。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
 
 用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
-普通 dense TP、PP1 的 CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配器声明，结构观测与主机采样共用设备通信切点。Ascend 观测器按 rank 记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同一配置和 workload 的结构观测对齐作用域和实际组批。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
+单实例或一对 PD 实例的 dense TP、PP1 CPU 成本采样使用 `capture --host-timing`。结构观测与主机采样共用原生调用切点。Ascend 观测器按 rank 记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同配置和 workload 的结构观测按实际批次几何、局部调用及子调用边界配对，报告未配对的工作和排除的冷批次。主机采样可采用不同提交分组，实际组批和参数仍由原生观测决定。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
 
-成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples --production <保留中间事实的生产目录> --rank <rank> --work-identities <工作身份文件> --output <样本文件>` 读取同一次原生采集的粗图和测量，发布设备、同步搬运及得到共同证据的 collective 样本。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。用 `fit-costs --samples` 发布成本资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
+成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples --production <保留中间事实的生产目录> --rank <rank> --work-identities <工作身份文件> --output <样本文件>` 读取同一次原生采集的粗图和测量，发布设备、同步搬运、设备 collective 和 PD 通知样本。PD 按实际发送、逐条接收、整组就绪、传输完成和状态更新计量相邻因果边界，并保留观测区间。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。CPU collective 按实际参与组配对，从所有参与者就绪量到本 rank 返回。用 `fit-costs --samples` 发布成本资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
 
 Ascend 从同一次 HCCL 提交队列识别设备通信区间，独立保留本地整理工作。采样核对同一原生调用的全体参与者、算法、dtype 和元素数。跨设备校准能确定最后就绪者时，使用其同设备区间估计共同服务。执行使用所有参与者的就绪时间和该服务成本推导通信完成，调用输出继续受本地整理及原有依赖约束。无法确定对端或负载的观察保留为缺测。
 
@@ -396,7 +396,9 @@ rank 事实统一保存 `state_queries`，每项包含 `kind`（event / transpor
 
 Event 查询在每次运行内核对返回值、完成状态及所读对象：原生 state_queries.point 对应已导出的事件代次，目标 completion_read.signal 对应实际生产者。当前请求进度不能唯一标识一次可重复就绪读取，因此查询不因仅观察一次便取得跨运行调用对应；其共同内容、运行内读值与因果仍检查，逐次对应保持未覆盖。等待另要求完成依赖，非阻塞查询不要求该边；不能因为两个不同信号都已完成就认为读取一致。
 
-协议观察的 session 使用 `protocol_requests` 保存实际提交的预约编号到 workload 请求的映射，预热编号不进入该映射。rank 记录的 `protocol_states` 保存原生状态更新前后值及 RAW 时间区间；状态由原生维护，观察无需等待 profiler 激活或元数据行分配。独立检查按原生非失败状态的单调性核对就绪和成功区间，同一次变化的重叠观察取交集；缺少就绪写入保持缺失，不由首次查询推算。旧的仅成功状态记录不自动作为当前合同输入。预约发送另保留原生目标 endpoint、拓扑对端位置及 RAW 调用区间，kv_reservation 是独立 CPU 动作，reservation.ready 导出调用入口而非发送返回；该信号仅表示因果下界。kv_ready 通知合并实际发布者的信号，对应 Prefill 的完整预约可见；Decode 自身初始化的 WaitingForInput 不生成同名远端通知。独立工具用实际传输 session 反向核对预约参与者、发送与状态写入顺序，再核对目标执行边；缺少发送记录单列为 missing_publications。
+协议观察的 session 使用 `protocol_requests` 保存实际提交的预约编号到 workload 请求的映射。rank 记录的 `protocol_states` 保存原生状态更新前后值及 RAW 时间区间。独立检查按原生非失败状态的单调性核对就绪和成功区间，同一次变化的重叠观察取交集。区间资格以实际状态写入为准。
+
+`kv_reservation` 记录向套接字发送的 CPU 动作，`reservation.ready` 标记调用入口。`reservation_receipts` 记录 Prefill 解析每条预约后的 RAW 时间及发送方 session，接收次序决定原生传输的目的地顺序。`kv_ready` 等齐所需收件后更新状态。实测旁路只提供收件和状态更新时间，构图使用本次调度收到的预约。独立工具核对每条发送、收件、状态写入和目标执行边，缺少观测分别记录在 `missing_publications` 和 `missing_reservation_receipts`。
 
 初始化注册覆盖全部真实参与者，代表来源的设备图只覆盖选定rank，两者分别维护。预约指向已注册但未观察的peer时，以unobserved_transfer_peers保留无法核对的传输，不伪造发送或判成已观察peer不匹配；重复预约、未知endpoint及已观察peer的错误匹配仍拒绝。该缺口阻止全组完整资格，完整真实目标及对照必须没有此项；代表来源只能取得已观察范围的资格。
 

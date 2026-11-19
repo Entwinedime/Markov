@@ -12,6 +12,8 @@
 
 独立成本已接入 SGLang/Ascend 的 Qwen3-8B BF16 单实例 TP1 serving，实测使用 dummy 权重、16 token 页与两档并发。原四组真实流量组合取得全节点结构证据，新四组完成了自主预测与独立轻量实测，TTFT、TPOT 的等权 MAPE 均低于 6%。 [独立性能报告](../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-independent-performance/independent-results.json)
 
+多角色计时已在同模型的 TP2 和非对称 PD 开发例闭环。CPU 与设备 collective 在对端就绪后计费，PD 预约按实际到达推进，两个案例均可使用独立成本预测。 [TP2 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s2-tp2-performance.json) · [PD 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s3-pd-performance.json)
+
 历史实现主要在同一来源域内复用请求长度、成员、到达、并发及 KV 容量变化；模型、并行拓扑、dtype、backend 和 page_size 变化分别取得来源。新的支持边界须重新说明并验证，不将未实现变换写成理论上不可能。
 
 下列记录保存已结束工作的实际结果、失败与限制，各条目注明证据保留情况。原运行数据已删除的条目只作为历史结论，不能据文字恢复运行资格。

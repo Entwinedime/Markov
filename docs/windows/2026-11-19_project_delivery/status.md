@@ -1,6 +1,6 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-19。**S0–S2 已完成阶段验收。** 下一阶段以双卡性能交付为基线，推进非对称 PD。
+更新日期为 2026-11-19。**S0–S3 已验收。S4 从多角色计时的交付提交启动。**
 
 ## 进入窗口时已有证据
 
@@ -13,8 +13,8 @@
 | 里程碑 | 阶段 | 状态 |
 | --- | --- | --- |
 | M0 交付基线 | S0 | 已验收，具名场景和本机环境已登记 |
-| M1 多角色计时 | S1–S3 | S1、S2 已验收，S3 验证 Prefill TP1 与 Decode TP2 的跨实例耗时 |
-| M2 配置集探索 | S4–S5 | 待启动，依赖 M1 |
+| M1 多角色计时 | S1–S3 | 已验收，TP2 与非对称 PD 均完成开发闭环 |
+| M2 配置集探索 | S4–S5 | S4 待启动，先把需求识别、合格样本复用与有限原生采样接起来 |
 | M3 正式支持范围 | S6–S8 | 待启动，依赖 M2 |
 | M4 独立验收与交付 | S9–S12 | 待启动，依赖 M3 |
 
@@ -27,3 +27,5 @@
 S1 已统一动作、CPU 服务和传输查询，单卡三种时间模式及 PP3 的给定时长协议均已走通。三实现域的覆盖验证到达首个未训练工作。历史 PP 原生端点与当前观测合同不符，当前只取得协议给定时长证据。S2 开始采集当前环境的 TP2 工作和通信用时，S3 延续 CPU 协议和传输的测量资格。[S1 回归证据](../../../data/20261119T090556.273460Z_project-delivery/results/s1-regression.json)
 
 S2 已完成 Qwen3-8B TP2 两 rank 的模板、CPU 与设备成本装配。两请求开发例的给定耗时和自主预测均完成 23,950 个区间及七个输出 token。自主预测的 TTFT MAPE 为 8.20%，TPOT MAPE 为 4.13%；两项指标的正式精度资格由留出验证决定。TP1 三请求回归的全部输出时刻与 S1 相同。[双卡成本](../../../data/20261119T090556.273460Z_project-delivery/assets/s2-tp2-costs.json) · [原生对照](../../../data/20261119T090556.273460Z_project-delivery/results/s2-tp2-performance.json) · [通信计时核对](../../../data/20261119T090556.273460Z_project-delivery/results/s2-collective-timeline.json)
+
+S3 的 Prefill TP1、Decode TP2 开发例取得全节点结构对照。三个请求核对 38,500 个工作区间、64,275 个端点和 18 条收件或状态通知。自主预测覆盖三域，完成八个 token，预测吞吐 3.99 token/s，原生测得 4.05 token/s。TTFT MAPE 1.75%，TPOT MAPE 15.08%。该评分用于开发，正式精度走全新留出。组批合并和过滤的测量按相同定义与特征显式复用自 TP2，自动复用和采样需求生产由 S4 交付。[独立结构对照](../../../data/20261119T090556.273460Z_project-delivery/targets/s3-pd-transport-structure/comparison/actions.md) · [三域成本](../../../data/20261119T090556.273460Z_project-delivery/assets/s3-pd-qualified-costs.json) · [原生与预测评分](../../../data/20261119T090556.273460Z_project-delivery/results/s3-pd-performance.json)
