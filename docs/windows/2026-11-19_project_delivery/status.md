@@ -1,6 +1,6 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-20。**S0–S6 已验收。单机代表拓扑完成开发验证，TP1 同一用例跑通结构旁路、固定图和自主预测。下一阶段为 S7 调度与缓存。**
+更新日期为 2026-11-20。**S0–S7 已完成阶段验收。代表单机拓扑和四项调度、缓存机制均完成开发闭环，下一阶段是 S9 功能收口与冻结。**
 
 ## 进入窗口时已有证据
 
@@ -15,8 +15,8 @@
 | M0 交付基线 | S0 | 已验收，具名场景和本机环境已登记 |
 | M1 多角色计时 | S1–S3 | 已验收，TP2 与非对称 PD 均完成开发闭环 |
 | M2 配置集探索 | S4–S5 | 已验收，冷资产创建与换请求后复用均完成 |
-| M3 正式支持范围 | S6–S7 | S6 已验收，实际 rank 成本绑定和单机拓扑完成开发验证，TP1 的三条正式验证路径均有同例证据。S7 待启动 |
-| M4 独立验收与交付 | S9–S12 | 待启动，S7 交付后进入 S9 |
+| M3 正式支持范围 | S6–S7 | 开发验收完成。代表单机并行、分块、混合组批、前缀命中和淘汰均能用独立成本完成具名请求 |
+| M4 独立验收与交付 | S9–S12 | 待启动，以 S7 交付为 S9 的冻结准备基线 |
 
 ## 基线、当前能力与下一步
 
@@ -43,6 +43,8 @@ S5 正式入口用两个单卡池容量与两组短请求完成四项自主预�
 - TP2×PP3 的两份留存来源共 12 个 worker 图通过建库。用重建成本完成 64,680 项工作、9 个 token，开发评分的 TTFT/TPOT MAPE 为 5.49%/6.50%。EP4 复用两份四卡来源，重建图和成本后自主预测 382,038 项工作、11 个 token，开发评分为 2.75%/9.76%。[组合评分](../../../data/20261119T090556.273460Z_project-delivery/work/s6-pipeline-relay-layout/score.json) · [EP4 评分](../../../data/20261119T090556.273460Z_project-delivery/work/s6-ep4-release-layout/score.json)
 - TP1 双请求固定图以原始实测服务重算通过全部 12,962 个端点，4 个 token 的发布时刻与原生记录一致。用另两份原生运行重建成本后，8,712 项工作均可替换。只恢复实测 CPU 服务，TTFT 的偏差由提前约 331 毫秒变为延后约 1.94 毫秒，表明该固定案例的偏差集中在 CPU 服务。详细观察与轻量采样的测量差异仍需保留和核对，留出精度在 S11 验收。[固定图替换结果](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed-independent-costs/result.json) · [成本来源](../../../data/20261119T090556.273460Z_project-delivery/work/s6-fixed-training/costs.json)
 
-## S7 起点
+## S7 交付证据
 
-S6–S7 共用的 30 次原生尝试已用 29 次。S7 优先盘点留存的模板、成本和实际触发证据，再按剩余额度选择能覆盖多项机制的具名采集。真实权重兼容性仍为可选范围。[S6 最后一次原生参考](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/capture/result.json)
+- Qwen3-8B TP2 的分块混合用例完成 13 请求、45 token 和 212,994 项工作。原生和预测均有 12 条请求分多批 Prefill，16 个混合批的成员数、Query token 数和上下文 token 数按次对应。[批次对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-mechanisms.json) · [自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-prediction/result.json)
+- 同模型 TP2 的缓存压力用例完成 18 请求、27 token 和 104,512 项工作。原生和预测均有 20 次非空命中及一次淘汰。预测在 rank 0 也展开了一次查找拆分和一次插入拆分。更大的 40 请求历史用例用于确认原生压力范围，包含当前 8 字节索引释放样本之外的 288 token 释放。[缓存开发对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-pressure-score.json) · [40 请求原生记录](../../../data/20261116T035124.971560Z_execution-structure-independent/targets/independent-b4/b4-s02/native/attempts/1/source/resources/rank-0.json)
+- 两案例的独立成本预测已完成。采用详细采集的原生发布边界评分，分块混合的 TTFT/TPOT MAPE 为 79.25%/86.67%，缓存压力为 73.01%/58.49%。该对照用于开发，采集介入与成本误差的归因及 6% 的正式留出验收在 M4 完成。S6–S7 累计 34 次、约 5,162 秒原生，使用了从暂缓 S8 调拨的四个尝试名额。[分块开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-score.json)

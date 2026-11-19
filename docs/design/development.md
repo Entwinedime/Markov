@@ -151,6 +151,8 @@ deployment 的 physical_devices 是按升序排列的不重复非负物理卡号
 
 --resource-trace 可选，默认关闭；开启后，选定观察的 worker 额外发布 source/resources/rank-<rank>.json，记录原生槽位/页分配与释放、前缀匹配/插入/锁/淘汰接口的实际结果及当时容量。操作关联原生语义调用，包含本地单调时钟区间；页、token 位置和槽位减去 SGLang 的保留区后使用零起点，缓存节点号仍是本次原生树的局部身份。初始化保留空闲队列，窗口结束在 flush 前保存最终容量。
 
+一级前缀缓存的匹配和插入有各自的图调用边界。原生采集记录实际匹配长度、插入前已存在的长度和树节点拆分的两段长度。预测由核心持有的树返回同样的事实，使模板能够选择索引连接、后缀复制和拆分复制。请求的受保护长度取自该请求，即时页释放使用实际入参的索引宽度。
+
 固定图开发与独立取证使用 `capture --service-reference`，在所有原生 worker 的详细图窗口内记录资源、线程切换及预热后加载的 Triton 特化。用 `produce --product graphs --keep-intermediates` 把同次 RAW 时钟活动绑定到粗图的主机工作切口。固定图比较使用实际占用 CPU 的可计服务，排除已记录的观察器活动、设备同步等待和同步搬运，运行在设备提交线程上的工作按实际队列执行区间核算。验证器从原始标记和同次线程记录提取工作之外的 CPU 活动、可单独计量的采集器开销及抢占，作为固定参考条件交由 C++23 重放。固定图误差归因要求原生窗口有特化观测且没有新增加载。以报告的服务覆盖与实测基线为准，低开销训练仍通过 `--host-timing` 采样。
 
 同一文件的 `reads` 单独保存原生实际容量读取，包含 scope、线程、RAW 起止区间、资源项和规范单位后的标量结果；页容量在边界从token转成页，原生调用仍获得原样结果。`capacity` 的资源项为 slots、pages、evictable_tokens、protected_tokens，独立字段池使用 `{kind: state_slots, field, operation: available}`。初末态及变更后快照直接调用保存的原始读取方法，不混入实际读取列表。读取只是可选验证事实，不新增图节点、成本或资源状态。
@@ -182,6 +184,8 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 在 workflow 的 `PYTHONPATH` 中加入 `src/verification`，用 `python3 -m markov_verification.latency_metrics` 计算逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
 单实例或一对 PD 实例的 dense TP、PP1 CPU 成本采样使用 `capture --host-timing`。结构观测与主机采样共用原生调用切点。Ascend 观测器按 rank 记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同配置和 workload 的结构观测按实际批次几何、局部调用及子调用边界配对，报告未配对的工作和排除的冷批次。主机采样可采用不同提交分组，实际组批和参数仍由原生观测决定。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
+
+混合组批的性能采样保留已选代表 workload 内的到达顺序和请求量。重复长度的请求可能与后续 Prefill 分块同时留在批内，改变 Attention 实际上下文范围。样本覆盖用原生观察到的批次和实际展开的工作核对。
 
 成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples --production <保留中间事实的生产目录> --rank <rank> --work-identities <工作身份文件> --output <样本文件>` 读取同一次原生采集的粗图和测量，发布设备、同步搬运、设备 collective 和 PD 通知样本。设备 collective 根据生产记录找到原始采集，按事件所在时段的两个校准快照计算 RAW 时间区间。以这些区间判断参与者就绪，并保留无法确认服务的缺测。PD 按实际发送、逐条接收、整组就绪、传输完成和状态更新计量相邻因果边界，并保留观测区间。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。CPU collective 按实际参与组配对，从所有参与者就绪量到本 rank 返回。
 

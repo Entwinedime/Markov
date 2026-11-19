@@ -429,3 +429,43 @@ EP4 新版两份四卡来源建库用时 625.00 秒，建库数据约 1.79 GiB�
 **验证** 同一 TP1 用例的结构旁路通过 150 个动作、8,712 项工作和 12,858 个动作内端点，固定图通过 12,962 个端点且完成成本替换，自主预测完成 8,712 项工作和四个 token。核对了 TP8、PP3、EP4、TP2×PP3 的开发评分、C++23 容器构建和 Python 源码语法。阶段产物约 6.7 GiB，原生尝试累计 29 次，原始事实、必要失败和正式结果均保留。[结构对照](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/verification-inputs/structure-timed/comparison/actions.md) · [固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/fixed-independent-costs/result.json) · [自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s6-scheduler-reference/verification-inputs/autonomous/result.json)
 
 **结论与限制** S6 的开发验收成立。同配置不同原生运行分开用于建库、拟合和 TP1 对照。跨场景泛化和 6% 精度由冻结留出验收。S7 可使用本批已验证的入口和留存资产。
+
+## 2026-11-20 — S7 核对分块、混合组批及缓存证据
+
+**范围** 从已推送的 `c41c7da` 开始，先审计两份留存的 Qwen3-8B TP2 记录，再选择最后一次原生额度的用途。
+
+**改动** 核对原生 Prefill 的 Q/K reshape。单个 token 的切片可直接作为视图，多 token 需复制跨行的步幅。适配器在解码层声明这一几何条件，由原有模板选择器处理局部实现。
+
+**验证** 原生分块混合目标有 12 条请求分批 Prefill，产生 16 个混合批。缓存目标有 55 次非空前缀匹配、9 次非零淘汰。首次分块建库发现布局歧义。核对了原始 SDK 的两个复制任务和 36 层对应的分支，更新镜像后从同一来源重新建库，两 rank 都通过。后处理用时 122.08 秒，新增原生尝试为零。[原始任务对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-layer-variants.json) · [新版建库](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-primary-layout/result.json)
+
+**结论与限制** 缓存结束段仍有候选歧义。核对 21 个原生插入，5 次完整命中只有基础拷贝，16 次补入新尾部另有一次设备复制。需要用插入时的树状态描述后者。分块场景的设备成本已提取，主机成本和正式预测待完成，余一次原生尝试。[缓存插入核查](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-insertion-variants.json) · [分块样本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-device-labels/coverage.json)
+
+## 2026-11-20 — S7 将前缀结构变更绑定到原生缓存调用
+
+**范围** 原始记录显示，匹配和插入都可能拆分树节点，插入还可能复制新后缀。从暂缓的 S8 调拨两次尝试给 S7，S6–S7 的尝试上限调整为 32 次，沿用 36,000 秒原生、30,000 秒后处理和整窗 106 次上限。
+
+**改动** 框架适配器单独捕获缓存插入，匹配和插入的模板条件使用实际拆分范围及命中或插入结果。核心从现有的树查询返回拆分范围，继续独占模拟 KV 状态。缓存调用的受保护长度直接读取请求，删除利用此前匹配结果推断该长度的逻辑。
+
+**验证** 集中完成 C++23 构建、Python 语法检查及推理采集和控制镜像更新。最后一次原分配额度用于在相同部署上采分块混合来源的轻量 CPU 区间，结构和设备成本复用留存来源。[轻量采样任务](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-host/execution.json)
+
+**结论与限制** 新缓存调用边界需要一次详细来源及对应的轻量样本。原缓存目标保留作为机制触发及开发对照的原生事实。[缓存来源任务](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/inputs/prefix-training.json)
+
+## 2026-11-20 — S7 保留混合请求的性能输入并核对释放索引
+
+**范围** 分块来源的轻量采样耗时 130.74 秒，两个 rank 共覆盖全部 142,094 项来源图工作。13 请求目标预测首缺为 Attention 的混合批，实际目标同样出现 601 个上下文 token，缩减来源只覆盖到 474。用暂缓 S8 的另两次额度补完整代表来源的设备和 CPU 样本，S6–S7 尝试上限为 34 次，整窗上限 106 次。
+
+**改动** 性能采样保留已选混合 workload 的请求、顺序和到达，避免删除推动实际重叠的重复长度请求。核对缓存来源的释放歧义来自即时释放入参的实际索引宽度。适配器记录该宽度，从保留的原生 D2H 传输重建两个 rank 的派生输入。Qwen3 的 Decode 首层和 Llama 一样按 RoPE 缓冲的 token 轴区分视图与复制。
+
+**验证** 缓存详采和轻量 CPU 采样用时 159.34、144.12 秒。每 rank 有 26 次插入、28 次匹配，其中各有一次拆分，并触发一次淘汰。每 rank 用原始传输核对 20 个 4 字节和 4 个 8 字节即时释放，保留原始文件。评分已从原生发布边界读得分块和缓存目标的 45 和 131 个 token。[来源成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-device-labels/combined-costs.json) · [目标缺口](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-target-prediction/cost-gap.json) · [索引证据](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-index-layout-evidence/derived-from.json)
+
+**结论与限制** 混合组批的成本缺口有实际批次证据，源配置和预测成本边界继续由正式合同核对。缓存图和完整目标预测待按新参数验证，原生参考评分记录的输出边界来自详细采集，可用于开发对照。
+
+## 2026-11-20 — S7 阶段验收
+
+**范围** 从 S6 交付提交 `c41c7da` 审查 Qwen3-8B TP2 的调度及一级前缀缓存闭环。选择同时发生前缀命中、树拆分和淘汰的 18 请求开发例，另保留 40 请求原生压力证据。
+
+**改动** 原生 KV 状态的拆分和插入结果从原生观察或核心树交接，缓存请求的受保护状态由请求持有，索引类型来自释放实参。混合代表来源保留请求拥挤关系。详细观测评分根据实际输出发布记录选取 rank。按切点、资源、采样及评分审查直接调用方，删除旧保护长度推断。较 S6，`src` 净增 56 行，`example` 无变动。
+
+**验证** C++23 构建通过。分块混合和缓存正式来源分别覆盖 249,988、183,952 项工作。独立成本预测分别完成 13 请求、45 token 与 18 请求、27 token。分块的 16 个混合批、12 条分块请求对应原生，缓存有 20 次命中和一次淘汰。分块补充两次采样为 156.96、138.28 秒，S7 共 5 次、729.44 秒，两份最终来源后处理合计 370.12 秒。已核对镜像、源码、文档和产物引用，原始采集及必要失败保留。[分块成本](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-collection-costs/costs.json) · [缓存成本](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-ready-collection-costs/costs.json) · [混合批对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-mechanisms.json)
+
+**结论与限制** S7 开发验收成立。详细原生观测的评分偏差较大，分别保留两组评分和测量口径。40 请求压力的 288 token 淘汰叶超出当前同类释放样本。下一阶段从公开入口核对能力、速度、证据资格及冻结清单，正式泛化在冻结后评估。[分块开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-score.json) · [缓存开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-pressure-score.json)
