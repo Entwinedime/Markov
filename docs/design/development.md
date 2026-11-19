@@ -180,11 +180,13 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
-普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。评估稳态时核对 `specialization_loads` 及 request-delivery 的提交偏差。图与模板生产要求原生图观测。
+普通 dense TP1 的单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。调度器记录实际拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，结果清单的 `latency` 指向该记录。评价时核对 `specialization_loads` 以及 request-delivery 中的实际提交偏差与顺序。图与模板生产要求原生图观测。
 
 用 `example/coarse_graph/latency_metrics.py` 生成逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
 CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配器声明，Ascend 观测器记录 SDK 队列、驱动调用和线程活动，并用同次运行的独立 RAW 读数校准。`host-cost-samples` 使用同一配置和 workload 的结构观测对齐切点，将取得完整证据的 CPU 服务发布为成本样本。采集作业可用 `warmup` 指定预热 workload，完全相同的 workload 复用提交分组，正式观测从预热排空和缓存重置后开始。
+
+成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples` 读取同次观测的事实、粗图和工作身份，发布设备与同步搬运标签。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。用 `fit-costs --samples` 从合格样本发布资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
 
 采样和在线查询采用同一特征提取。数据端口及局部 guard 提供工作形状，局部 KV 读取决定是否使用序列上下文与计算量。KV backing 张量的容量是元数据。实际参与 Attention 的长度来自已绑定的请求成员。
 
@@ -250,28 +252,28 @@ SDK的任务编号及关联字段不是全局发生实例，编号复用不能�
 
 ## 单任务纯预测入口
 
-外围入口接受模型、实例配置、请求和给定耗时，依据已提供模板库自动生成 worker 环境与代表映射。预测不加载模型权重，model.path 用于核对来源模型身份。输入包含四项：
+外围入口依据模型、实例配置、请求和已发布模板生成 worker 环境与代表映射。`model.path` 用于核对来源模型身份。共同输入字段如下。
 
 - model：path、dtype，与来源使用相同声明。
 - instances：每项包含唯一 id、mode（null/prefill/decode）、configuration；配置字段与采集共用，包含拓扑、backend、页/容量及可选 chunk/mixed/prefix_cache。
 - workload：requests、可选 prefixes/ep_routes 和 id；不包含原生 batch 或完成时间。
-- given_work_ns：每工作给定的非负整数纳秒，仅用于结构开发，不是实测或精度结果。
 
-一个任务为一个普通实例或一对 P/D 实例。微批次容量 microbatch_requests 可选；未指定时由原生调度器计算。该入口完成单次预测装配，配置集合的来源规划、完整任务恢复与独立评价仍在开发。
+自主预测使用这三个字段，命令加 `--costs`。给定耗时模式在 JSON 增加 `given_work_ns`，单位为非负整数纳秒。实测结构对照沿用该四字段输入，命令加 `--execution-inputs`，实测条件按工作和端点进入执行。一个任务对应一个普通实例或一对 P/D 实例，微批次容量缺省时由原生调度器计算。
 
 ```bash
 PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow predict \
   --production <已发布的来源集合目录> --input <prediction.json> \
-  --binary <modeling构建的markov> --output <新的输出目录> --timeout 180
+  --binary <modeling构建的markov> --costs <成本资产.json> \
+  --output <新的输出目录> --timeout 180
 ```
 
 --production 指定一份已由acquire-sources完整发布的来源集合。入口读取集合固定计划及生产索引，根据目标实施域和输入机会自动选完整来源及它的局部供体；未知输入仍由实际模板合同核对，不把规划机会标签变成额外支持门槛。模型专家数来自规划发布的元数据，纯预测不重新打开模型目录。模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
 
-正常性能预测用只含 `model`、`instances` 和 `workload` 的输入，并指定 `predict --costs <成本资产.json>`。核心进程按每次实例化得到的归一化工作及其实际参数查询服务时长。在首个无模型或超出样本范围的工作处报告 `cost-gap.json`。预测完成后可用 `example/coarse_graph/latency_metrics.py --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
+性能查询使用每次实例化得到的归一化工作及其实际参数。首个缺模型或超出样本范围的工作通过 `cost-gap.json` 报告。预测完成后可用 `example/coarse_graph/latency_metrics.py --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
 
 PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；正式预测入口负责来源选择，示例不维护第二套装配规则。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
 
-外围入口管理 modeling/control 两个容器，无网络、不挂载设备或模型权重。--modeling-image 和 --control-image 接受稳定标签或 ID，启动前统一解析为实际 ID；core.log/control.log 首行记录对应容器的完整命令。只给 modeling 挂载程序、模板、生成的内部任务和输出目录。输出目录必须不存在；仅两端成功退出且本次容器清理完成后发布 result.json，保留日志，删除临时内部任务和未发布结果。协调器与两个容器各自持有期限，容器使用 --init 回收子进程；超时或失败只清理本次专属容器，并回收 Docker 客户端。协调器被强杀时不保证临时任务文件被删除，但子容器仍受自身期限限制，临时文件不能视为已发布结果，不自动重跑。
+外围入口管理 modeling/control 两个无网络的容器。`--modeling-image` 和 `--control-image` 接受稳定标签或 ID，启动前解析为实际 ID。`core.log` 和 `control.log` 首行记录各自的完整命令。modeling 挂载程序、模板、内部任务、输出目录及所选时间资产。输出目录由本任务创建。两端成功退出且容器清理完成后发布 `result.json`，保留日志并释放临时文件。协调器与两个容器各自持有期限，容器使用 `--init` 回收子进程。超时或失败时清理本任务拥有的容器及 Docker 客户端。协调器被强杀时，子容器继续受自身期限约束，临时结果待清理，重跑由调用方发起。
 
 正常请求仍走原生接收与控制逻辑。最终退出先由核心核对全部请求清理、执行图与调用返回排空，以及各worker在最后动作后的idle；落后的实例继续原生空轮转完成清理，不固定轮数。broker确认全体停驻且没有未完成业务调用后，结束私有CPU元数据等待并使worker退出；不向共享PP/PD消息流插入退出对象，也不取消模型工作或伪造通信完成。
 
@@ -311,7 +313,7 @@ predict 可选 --execution-trace，以同一次模拟增量写出 execution.json
 
 原生边界记录的host张量输入可通过`CapturedCall.port(..., at_return=True)`声明阻塞读取在调用返回前完成；普通输入不设置该字段。该声明仅允许host input，解释器将其接到同一调用的CPU返回，投影后的共同图只保留普通data端口及实际事件。SGLang的共享HostReads在结果入口登记具名输入对象，只在该对象实际调用`Tensor.tolist`时产生独立`host_read`动作；采集保留真实等待，控制在使用返回值前完成同一动作。普通结果片段不声明已完成物化，也不按片段位置推断是否纯CPU；其他tolist不被接管，未发生的读取没有动作。未知别名或其他物化API须由相应adapter明确声明，不能猜测读取位置。模型／PP输出仍按实际生产资源发布，独立来源检查核对返回别名及读取所属调用。改变这项声明需要新的原生观察，不能把旧端口改写后作为实测事实发布。
 
-`markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] [--execution-inputs <conditions.json>]` 是应用内部的核心入口，标准输入输出保留给控制协议。内部任务包含 settings/control、参与者环境及模板索引，template_sources列出所有显式提供的来源库，模板目录按索引放置0.json、1.json等库；用户通过外围入口生成，不手工维护这些重复事实。时间条件单独只读挂载，由核心读取一次，任务不嵌入整份条件；actor步骤借用这份不可变文档，生命周期覆盖整个Serving调用。预测准备和执行共用一次期限，准备不重新取得执行额度；临时任务由外围负责清理。核心仍核对资产域、参与者和资源绑定。来源集合选择的主作业负责完整原生任务；计划明确授权的供体只提供局部动作复用，不拼接PD两侧。结果template_imports记录导入候选的source/source_entry和recipient/entry，库索引先主来源、后各局部来源，按各发布清单顺序展开；这不是实际执行次数。
+`markov serve <templates-directory> <task.json> <result.json> [--trace <execution.jsonl>] [--execution-inputs <conditions.json> | --costs <资产.json>]` 是应用内部的核心入口，标准输入输出保留给控制协议。内部任务包含 settings/control、参与者环境及模板索引，template_sources列出所有显式提供的来源库，模板目录按索引放置0.json、1.json等库；用户通过外围入口生成，不手工维护这些重复事实。时间条件单独只读挂载，由核心读取一次，任务不嵌入整份条件；actor步骤借用这份不可变文档，生命周期覆盖整个Serving调用。预测准备和执行共用一次期限，准备不重新取得执行额度；临时任务由外围负责清理。核心仍核对资产域、参与者和资源绑定。来源集合选择的主作业负责完整原生任务；计划明确授权的供体只提供局部动作复用，不拼接PD两侧。结果template_imports记录导入候选的source/source_entry和recipient/entry，库索引先主来源、后各局部来源，按各发布清单顺序展开；这不是实际执行次数。
 
 单图实例化的 signals 按端口名绑定目标信号，pools 明确提供池绑定；动态 serving 由原生句柄维护信号代次，并将 local 绑定到当前参与者、远端绑定到相应资源所有者。独立 execute 的 initial_inputs=ready 仍是显式假设，不能作为跨动作等待正确性证据。现存旧来源缺少新机制字段时保持历史用途，不补造运行资格。
 
