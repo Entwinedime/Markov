@@ -188,6 +188,10 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples --production <保留中间事实的生产目录> --rank <rank> --work-identities <工作身份文件> --output <样本文件>` 读取同一次原生采集的粗图和测量，发布设备、同步搬运、设备 collective 和 PD 通知样本。PD 按实际发送、逐条接收、整组就绪、传输完成和状态更新计量相邻因果边界，并保留观测区间。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。CPU collective 按实际参与组配对，从所有参与者就绪量到本 rank 返回。用 `fit-costs --samples` 发布成本资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
 
+`acquire-costs` 使用一个或多个带 `--keep-intermediates` 的训练来源集合，产物 `costs.json` 可直接交给 `predict --costs`。除训练来源观察到的工作，可重复传入 `--demand <粗图> <工作身份文件>` 或 `--gap <预测目录/cost-gap.json>`；它们只声明需求。用 `--samples` 提供已经资格检查的训练样本。相同执行域优先查已有样本。SGLang 可将运行环境、局部调用及特征一致的闭合批次数组操作的主机实测复用于其他角色，资产保留原样本位置。
+
+补采按训练来源的原提交分组或逐请求分组，继续走原生 Engine。采样计划由需求去重后选取，采到的实际批次和调用须与详细来源匹配才进入模型。`--timeout`、`--native-budget-seconds`、`--postprocessing-budget-seconds`、`--attempt-limit` 和 `--storage-bytes` 约束该任务。报告区分预算停止、可观察但没有合格实测和无已知配方。每份在线缺口只记录停止位置的工作，后续未展开路径的需求仍未知。
+
 Ascend 从同一次 HCCL 提交队列识别设备通信区间，独立保留本地整理工作。采样核对同一原生调用的全体参与者、算法、dtype 和元素数。跨设备校准能确定最后就绪者时，使用其同设备区间估计共同服务。执行使用所有参与者的就绪时间和该服务成本推导通信完成，调用输出继续受本地整理及原有依赖约束。无法确定对端或负载的观察保留为缺测。
 
 成本资产按 `domains` 保存各实现域的规范定义和模型。`fit-costs` 可以读取多个实现域的样本，每域独立拟合。正式预测按已选模板库的实际实现域为各参与者装配成本。CPU 协议本地服务用各自角色的成本，线传输用发送角色的成本。它们与动作图共用成本查询，协议工作身份保留操作、逻辑通道、源/目标和 dtype，实际元素数量与元素字节数作为查询特征。
