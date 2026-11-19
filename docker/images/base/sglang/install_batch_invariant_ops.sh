@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# 安装 SGLang #21197 所需的 Ascend NPU batch_invariant_ops。
+# Install the Ascend NPU batch_invariant_ops required by SGLang #21197.
 #
-# 该脚本只服务于固定的 910b/aarch64 Docker base 镜像，因此不保留 vLLM-Ascend
-# 安装脚本中的平台分支和自动识别逻辑。
+# The pinned 910B AArch64 base image determines the platform.
 set -euo pipefail
 
 readonly WORK_DIR="/tmp/batch-invariant-ops"
@@ -11,14 +10,14 @@ readonly RUN_URL="https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-asce
 readonly EXTENSION_ZIP="batch_invariant-torch_ops_extension-1.0.0.zip"
 readonly EXTENSION_URL="https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${EXTENSION_ZIP}"
 
-# 加载固定镜像的 CANN 环境，清除可能干扰安装的自定义路径。
+# Use the image's CANN environment and clear any custom operator path.
 set +u
 # shellcheck disable=SC1091
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -u
 unset ASCEND_CUSTOM_OPP_PATH
 
-# 从 CANN 环境取得 vendor 路径。
+# Resolve the operator's vendor directory from the CANN environment.
 if [ -z "${ASCEND_OPP_PATH:-}" ]; then
     echo "ASCEND_OPP_PATH is not set by CANN set_env.sh" >&2
     exit 1
@@ -31,7 +30,7 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
 
-# 安装 AscendC 算子及其 torch extension。
+# Install the AscendC operators and their PyTorch extension.
 printf '[batch_invariant_ops] Installing AscendC custom ops\n'
 curl -fsSL -O "$RUN_URL"
 chmod +x "$RUN_PACKAGE"
@@ -47,7 +46,7 @@ USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py build_ext
 USE_NINJA=1 MAX_JOBS="$(nproc)" python3 setup.py bdist_wheel
 python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl
 
-# 分别核对 torch 注册与独立加载的 AscendC 符号。
+# Verify the PyTorch registrations and the AscendC library exports separately.
 printf '[batch_invariant_ops] Verifying torch.ops symbols\n'
 python3 - <<'PY'
 import batch_invariant_ops  # noqa: F401
