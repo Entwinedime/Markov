@@ -206,7 +206,7 @@ class NativeCase:
         findings = [*self.findings, *self.connections.findings, *self.bindings.findings, *self.cpu.findings]
         counts = Counter(category for category, _, _ in findings)
         missing_pd = {name: len(self.readiness[name]) for name in (
-            "missing_publications", "missing_reservation_updates", "missing_completion_updates", "missing_success_reads",
+            "missing_publications", "missing_reservation_receipts", "missing_reservation_updates", "missing_completion_updates", "missing_success_reads",
             "unobserved_transfer_peers",
         )}
         metadata_unknown = self.connections.counts.get("native_metadata_unobserved", 0)

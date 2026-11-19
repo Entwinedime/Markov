@@ -220,6 +220,13 @@ class NativeInputs:
                 for name, field in (("kv_ready", "reservation_update"), ("kv_success", "completion_update"))
                 if row[field] is not None and (name != "kv_ready" or row["remote_reservation"])
             ]
+            for row in evidence.readiness["reservation_receipts"]:
+                group, time = row["recipient"], row["raw_ns"]
+                notifications.append({
+                    "identity": {"group": group, "name": "kv_reservation_received",
+                                 "work": {"request": row["request"], "publisher": row["publisher"]}},
+                    "window": self.window(time, time, self.origins[group]),
+                })
             document = {"context_values": self.contexts.values, "actors": actors, "ingress": self.ingress,
                         "notifications": notifications, "transfers": self.transfers()}
             if self.layouts is not None:

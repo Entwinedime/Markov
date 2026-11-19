@@ -14,6 +14,7 @@ class PdStateEvidence:
         self.states = defaultdict(list)
         self.admission_members = {}
         self.addresses, self.publications = {}, {}
+        self.receipts = {}
 
     def register(self, registrations, groups):
         for session, recording in registrations.items():
@@ -45,6 +46,11 @@ class PdStateEvidence:
 
         for update in raw["protocol_states"]:
             self.states[group, update["request"]].append(update)
+        for receipt in raw.get("reservation_receipts", ()):
+            key = group, receipt["request"], receipt["session"]
+            if key in self.receipts:
+                raise ValueError(f"native reservation received twice at {key}")
+            self.receipts[key] = receipt["received_raw_ns"]
         for query in raw["state_queries"]:
             if query["kind"] != "transport":
                 continue
@@ -195,7 +201,7 @@ class PdStateEvidence:
         windows = {key: self.state_windows(key, records) for key, records in self.states.items()}
         updates = {key: values[4] for key, values in windows.items() if 4 in values}
 
-        publications, published, unobserved_peers = [], set(), []
+        publications, published, unobserved_peers = [], {}, []
         required_publications = {
             (self.sessions[session], request, sender)
             for (sender, request), service in self.services.items() for session in service["metadata"]
@@ -209,13 +215,25 @@ class PdStateEvidence:
             # Registered peers can lack a selected source profile; their transfers remain unverified, not mismatched.
             if recipient not in self.peer_counts:
                 unobserved_peers.append({"publisher": publisher, "request": request, "recipient": recipient})
-            published.add(edge)
+            published[edge] = publication["begin_raw_ns"]
             ready = windows.get((recipient, request), {}).get(2)
 
             # The remote write may precede send return, but cannot precede invocation of any required send.
             if ready is not None and ready["end_raw_ns"] < publication["begin_raw_ns"]:
                 raise ValueError(f"PD readiness precedes its reservation submission: {edge}")
             publications.append({"publisher": publisher, "request": request, "recipient": recipient, "peer": peer})
+
+        receipts, received = [], set()
+        for (recipient, request, session), time in self.receipts.items():
+            publisher = self.sessions[session]
+            edge = publisher, request, recipient
+            if edge not in required_publications or (edge in published and time < published[edge]):
+                raise ValueError(f"native reservation receipt has no causal send at {edge}")
+            ready = windows.get((recipient, request), {}).get(2)
+            if ready is not None and ready["end_raw_ns"] < time:
+                raise ValueError(f"PD readiness precedes its reservation receipt: {edge}")
+            receipts.append({"publisher": publisher, "request": request, "recipient": recipient, "raw_ns": time})
+            received.add(edge)
 
         endpoints = []
 
@@ -262,10 +280,12 @@ class PdStateEvidence:
             })
         return {
             "status": "observed_bounds_consistent" if endpoints else "not_applicable", "endpoints": endpoints,
-            "reservations": publications,
+            "reservations": publications, "reservation_receipts": receipts,
             "unobserved_transfer_peers": unobserved_peers,
             "missing_publications": [{"publisher": publisher, "request": request, "recipient": recipient}
-                                     for publisher, request, recipient in sorted(required_publications - published)],
+                                     for publisher, request, recipient in sorted(required_publications - published.keys())],
+            "missing_reservation_receipts": [{"publisher": publisher, "request": request, "recipient": recipient}
+                                             for publisher, request, recipient in sorted(required_publications - received)],
             "completion_updates_checked": sum(row["completion_update"] is not None for row in endpoints),
             "state_writes_checked": sum(len(records) for records in self.states.values()),
             "reservation_updates_checked": sum(row["reservation_update"] is not None for row in endpoints),
@@ -482,35 +502,47 @@ class PdPredictionEvidence:
             for name, field in (("kv_ready", "reservation_update"), ("kv_success", "completion_update"))
             if row[field] is not None and (name != "kv_ready" or row["remote_reservation"])
         }
+        for row in readiness["reservation_receipts"]:
+            time = row["raw_ns"] - origin_ns
+            self.bounds[row["recipient"], row["request"], "kv_reservation_received", row["publisher"]] = (time, time)
         self.reads = 0
         self.polls = 0
         self.successes = 0
         self.last_states = {}
         self.polling = PdPollingEvidence(source.admission_members)
 
+    @staticmethod
+    def notification_key(identity):
+        work = identity["work"]
+        key = (identity["group"], work["request"], identity["name"])
+        return (*key, work["publisher"]) if "publisher" in work else key
+
     def observe(self, record, query, queries):
         self.polling.observe(record, query, queries.groups)
         if record["kind"] == "graph":
             self.graph(record, queries.groups)
         elif record["kind"] == "notification_declared":
-            identity = record["identity"]
-            self.declarations[record["event"]] = identity["group"], identity["work"]["request"], identity["name"]
+            self.declarations[record["event"]] = self.notification_key(record["identity"])
         elif record["kind"] == "boundary_time" and record["event"] in self.declarations:
             key = self.declarations[record["event"]]
             if key not in self.bounds or (record["begin_ns"], record["end_ns"]) != self.bounds[key]:
-                raise ValueError("PD timing input differs from the independently observed state-write interval")
+                raise ValueError("PD timing input differs from the independently observed transport boundary")
             self.timed.add(record["event"])
         elif record["kind"] == "notification_ready":
             identity = record["identity"]
-            key = identity["group"], identity["work"]["request"]
-            notice = (*key, identity["name"])
+            notice = self.notification_key(identity)
+            key = notice[:2]
             if key not in self.required or notice in self.notifications:
                 raise ValueError("PD notification has an unknown or repeated endpoint identity")
             events = set(record["prerequisites"])
-            if identity["name"] == "kv_ready":
+            if identity["name"] == "kv_reservation_received":
+                publisher = identity["work"]["publisher"]
+                if events != {self.reservation_events[publisher, key[1], key[0]]}:
+                    raise ValueError("PD receipt lacks its actual native send")
+            elif identity["name"] == "kv_ready":
                 if key not in self.targets:
                     raise ValueError("remote reservation readiness belongs to a Prefill endpoint")
-                expected = {self.reservation_events[publisher, key[1], key[0]] for publisher in self.targets[key]}
+                expected = {self.notifications[(*key, "kv_reservation_received", publisher)]["event"] for publisher in self.targets[key]}
                 if events != expected:
                     raise ValueError("PD readiness lacks the actual native reservation publishers")
             elif identity["name"] == "kv_success":
@@ -647,8 +679,9 @@ class PdPredictionEvidence:
             "completion_reads_checked": self.reads, "protocol_polls_checked": self.polls, "successful_polls_checked": self.successes,
             "final_notifications_checked": sum(key[2] == "kv_success" for key in self.notifications),
             "reservation_notifications_checked": sum(key[2] == "kv_ready" for key in self.notifications),
+            "reservation_receipts_checked": sum(key[2] == "kv_reservation_received" for key in self.notifications),
             "reservation_submissions_checked": len(self.reservation_events),
             "notification_intervals_checked": len(self.timed),
             "successful_endpoints": sum(state == 4 for state in self.last_states.values()),
-            "scope": "Prefill readiness joins the send-entry signals of its actual native reservation publishers. Success publication follows all native-cohort transfers; each receiver visibility event depends on its actual sender publications. Every transport poll is checked against visible readiness/Success transitions and nondecreasing per-worker return values. The target read interval starts after its graph return and ends at its result observation; an overlapping or same-time transition does not impose an invented time order. Intermediate transition times and exact polling occurrence times remain unqualified. Success reads and Decode admission follow their own visibility and metadata gates. Supplied notification intervals are independently checked against native writes; a feasible realization is not an exact arrival time or proof of every polling decision, payload value or query occurrence match.",
+            "scope": "Each reservation receipt follows its native send entry, and Prefill readiness follows all receipts for the request. Success publication follows all native-cohort transfers; each receiver visibility event depends on its actual sender publications. Transport polls follow the visibility gates and nondecreasing worker states. Success reads and Decode admission follow their own visibility and metadata gates. Supplied times are checked independently against native receipt and state-write observations; overlapping intervals only qualify the causal order they establish.",
         }
