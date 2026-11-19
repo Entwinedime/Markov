@@ -1,6 +1,6 @@
 # 真实流量性能预测窗口状态
 
-更新日期为 2026-11-19。S0–S6 已完成阶段交付。S7 处理独立成本覆盖、请求投递顺序和性能差异归因。
+更新日期为 2026-11-19。S0–S6 已完成阶段交付。S7 四组自主预测及稳态开发回归已完成，独立精度待新片段复核。 [成本资产](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s7/assignment.json) · [开发交付](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-development/delivery.json)
 
 Qwen3-8B BF16、单实例 TP1、dummy 权重。开发片段为 Azure 会话 trace 的前 200 条，两段互不重叠的留出各 48 条。两档测速固定并发 8 和给定 100 μs。 [固定输入与留出](../../../data/20261118T172915.294780940Z_real-workload-performance/inputs/workload-selection.json) · [正式来源](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s1-allocator-coverage/result.json)
 
@@ -26,3 +26,5 @@ S6 以 `759fe37` 为冻结基线。四组均通过全节点结构对照。三组
 | 突发并发 4 | [通过](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure-evaluated/comparison/actions.md) | 完成 48 条、5,344 token | [TTFT MAPE 5.19%，TPOT MAPE 8.22%](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/latency-metrics.json) |
 
 冻结口径下只取得突发并发 4 的预测评分，四组合精度和预测排序尚未取得。突发流量的两档单次实测分别显示并发 8 降低 P95 TTFT、提高吞吐，并发 4 缩短平均 TPOT。四组实际提交最晚偏差低于 2 毫秒，其中三组仍出现请求顺序互换。 [矩阵指标及投递记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/heldout-results.json)
+
+S7 扩展长分配成本后，四组各完成 48 条请求。常态并发 8 补测通过稳态资格。四组合开发 TTFT、TPOT 等权 MAPE 为 2.68% 和 4.30%。两类流量均呈现并发 8 首 token 较快、吞吐较高，并发 4 平均 TPOT 较短，原生单次实测与预测排序一致。 [开发回归指标](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-development/delivery.json)

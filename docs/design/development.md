@@ -360,7 +360,7 @@ markov_local_graphs expand <source-libraries.json> <action-inputs.json> <local-g
 
 ## Serving 的受控执行输入
 
-公开 `markov_workflow predict` 可附加 `--execution-inputs <execution-inputs.json>`。文件由 `actors`、`ingress`、`notifications`、`transfers` 和 `context_values` 组成，提供时间、可见性及显式原生调用绑定。组批、查询返回值、资源分配及图体仍由实际执行产生。未提供时使用任务显式给定的工作耗时及原生适配器当前收到的调用绑定。提供后，流程内缺记录、操作或工作不符、结束时未消费完均失败。
+公开 `markov_workflow predict` 通过 `--execution-inputs <execution-inputs.json>` 接入结构验证用的目标时间。文件由 `actors`、`ingress`、`notifications`、`transfers` 和 `context_values` 组成，提供时间、可见性及显式原生调用绑定。组批、查询返回值、资源分配及图体由实际执行产生。提供时间条件后，缺记录、操作或工作不符、结束时有条件未消费均失败。自主预测选用 `--costs`，开发时也可显式声明 `given_work_ns`。一次运行使用一种时间来源。
 
 全节点对照增加 `layouts`，在独立生成实际图后按作用域、资源职责、端口和工作区间匹配实测起止。用 `markov action-layouts <带证据粗图> <rank-layouts.json>` 取得动作切图的来源映射，再用 `example/coarse_graph/execution_inputs.py --layouts <目录>` 生成时间事实。工作区间若有独立切出的服务边界，服务时间一并交给时间线。原生 API 和 SDK 证据共同确认无设备提交的逻辑等待可由前驱实测时刻确定。缺少实体工作端点时报告首个位置，不能用后继上界取得全节点资格。此方式由本次仿真动作提供构图绑定，目前覆盖无需 CPU 消息收发的执行。独立对照核对真实时间的消费、工作、必要边和状态。
 
