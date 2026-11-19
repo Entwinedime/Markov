@@ -8,19 +8,29 @@ import time
 from contextlib import ExitStack
 from uuid import uuid4
 
+from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers
+from markov_workflow.limits import OperationLimit
 from markov_workflow.source_productions import SourceProductions
 
 
 class PredictionProcess:
-    def __init__(self, arguments) -> None:
+    def __init__(self, arguments, limit=None) -> None:
         self.arguments = arguments
+        self.limit = limit if limit is not None else OperationLimit()
+
+    @staticmethod
+    def recover(output):
+        path = output / "containers.json"
+        if path.exists():
+            OwnedContainers(json.loads(path.read_text())).close()
 
     def run(self) -> None:
         args = self.arguments
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("Prediction timeout must be positive")
+        self.limit.check()
         deadline = time.monotonic() + args.timeout
         source = json.loads(args.input.read_text())
         templates, primary, document = SourceProductions(args.production).prepare(source, modeled=args.costs is not None)
@@ -45,6 +55,7 @@ class PredictionProcess:
         task = output / ".task.json"
         stem = f"markov-serve-{uuid4().hex}"
         names = [f"{stem}-core", f"{stem}-control"]
+        write_json(output / "containers.json", names, replace=False)
         try:
             with task.open("x") as stream:
                 json.dump(document, stream)
@@ -75,6 +86,7 @@ class PredictionProcess:
                 ],
             ]
             self.execute(commands, names, output, deadline)
+            self.limit.check()
 
             # Both endpoints and their owned containers must close before the result becomes consumable.
             if args.execution_trace:
@@ -105,7 +117,7 @@ class PredictionProcess:
                     processes.append(subprocess.Popen(command, stdin=reader, stdout=writer, stderr=log))
                 pipes.close()
                 for process, name in zip(processes, names):
-                    code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    code = self.limit.wait(process, deadline)
                     if code:
                         raise RuntimeError(f"{name} exited with {code}; inspect {output}")
 

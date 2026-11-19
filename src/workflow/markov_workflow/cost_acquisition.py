@@ -19,7 +19,7 @@ from markov_workflow.containers import OwnedContainers
 from markov_workflow.cost_requirements import CostRequirements
 from markov_workflow.cost_samples import WorkCatalog
 from markov_workflow.fit_costs import FittedCosts
-from markov_workflow.limits import OperationLimit
+from markov_workflow.limits import AllowanceExhausted, OperationLimit
 from markov_workflow.source_productions import SourceProductions
 
 
@@ -33,23 +33,24 @@ class CostSource:
         CaptureProcess.published(capture, job)
         self.deployment = read(capture / "execution.json")["inputs"]["deployment"]
         self.ranks = read(production / "result.json")["observed_roles"]
-        self.recipes = dict(HostCostSamples.recipes(job))
+        self.recipes = {recipe.name: recipe for recipe in HostCostSamples.recipes(job)}
         self.host_points = set()
+        self.cold = False
 
 
 class CostAcquisition:
-    def __init__(self, args):
+    def __init__(self, args, limit=None):
         self.args = args
         self.output = args.output.resolve()
         self.binary = args.binary.resolve(strict=True)
-        values = (args.timeout, args.native_budget_seconds, args.postprocessing_budget_seconds)
-        if any(not math.isfinite(value) or value < 1e-9 for value in values):
+        if any(not math.isfinite(value) or value < 1e-9 for value in (args.timeout, args.postprocessing_budget_seconds)):
             raise ValueError("cost acquisition needs positive finite time allowances")
-        if args.attempt_limit <= 0 or args.storage_bytes <= 0:
-            raise ValueError("cost acquisition needs positive attempt and storage allowances")
+        if (not math.isfinite(args.native_budget_seconds) or args.native_budget_seconds < 0
+                or args.attempt_limit < 0 or args.storage_bytes <= 0):
+            raise ValueError("cost acquisition needs nonnegative native allowances and positive storage")
         self.native_ns = int(args.native_budget_seconds * 1e9)
         self.postprocessing_ns = int(args.postprocessing_budget_seconds * 1e9)
-        self.limit = OperationLimit(self.output, args.storage_bytes)
+        self.limit = limit if limit is not None else OperationLimit(self.output, args.storage_bytes)
         self.images = {
             role: subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
             for role, image in (("source", args.source_image), ("modeling", args.modeling_image))
@@ -107,7 +108,7 @@ class CostAcquisition:
         spent = self.state["postprocessing_ns"]
         remaining = self.postprocessing_ns - spent
         if remaining <= 0:
-            raise RuntimeError("cumulative cost postprocessing allowance exhausted")
+            raise AllowanceExhausted("cost postprocessing allowance exhausted")
 
         # Reserve before launch so interruption cannot make unfinished work free.
         self.state.update(postprocessing_ns=self.postprocessing_ns, container=container)
@@ -118,7 +119,7 @@ class CostAcquisition:
             yield remaining / 1e9
             self.limit.check()
             if time.monotonic_ns() - started > remaining:
-                raise TimeoutError("cumulative cost postprocessing allowance exhausted")
+                raise AllowanceExhausted("cost postprocessing allowance exhausted")
         finally:
             if container is not None:
                 OwnedContainers([container]).close()
@@ -149,7 +150,9 @@ class CostAcquisition:
         for name, value in {**inputs, "output": output}.items():
             command.extend(("--" + name.replace("_", "-"), str(value)))
         self.command(output, command)
-        self.samples[output] = read(output)
+        sample = read(output)
+        self.samples[output] = sample
+        return sample
 
     def inspect(self, source):
         for rank in source.ranks:
@@ -181,10 +184,15 @@ class CostAcquisition:
                     for attempt in self.attempts(source.output / recipe)]
         return sum(attempt["charged_ns"] for attempt in attempts), len(attempts)
 
+    def spending(self):
+        spent, attempts = self.usage()
+        return {"native_charged_ns": spent, "native_attempts": attempts,
+                "postprocessing_ns": self.state["postprocessing_ns"]}
+
     def measure(self, source, recipe, allowance_ns):
         output = source.output / recipe
         job_path, deployment_path = source.output / f"{recipe}-input.json", source.output / "deployment.json"
-        write_json(job_path, source.recipes[recipe])
+        write_json(job_path, source.recipes[recipe].job)
         write_json(deployment_path, source.deployment)
         CaptureProcess(SimpleNamespace(
             input=job_path, deployment=deployment_path, output=output, timeout=self.args.timeout,
@@ -192,9 +200,12 @@ class CostAcquisition:
         ), self.limit, host_timing=True).run()
         for rank in source.ranks:
             work = source.production / "work"
-            self.samples_from(source.output / f"{recipe}-{rank}-host.json", "host-cost-samples", detailed=source.capture, host=output,
-                              facts=work / f"{rank}-facts.json", trace=work / f"{rank}-sdk/trace.json",
-                              graph=work / f"{rank}-graph.json", work_identities=source.output / f"{rank}-work.json")
+            sample = self.samples_from(
+                source.output / f"{recipe}-{rank}-host.json", "host-cost-samples", detailed=source.capture, host=output,
+                facts=work / f"{rank}-facts.json", trace=work / f"{rank}-sdk/trace.json",
+                graph=work / f"{rank}-graph.json", work_identities=source.output / f"{rank}-work.json",
+            )
+            source.cold |= bool(sample["qualification"]["excluded_cold_scopes"])
 
     def fit(self):
         with self.processing():
@@ -214,12 +225,13 @@ class CostAcquisition:
                       for source in self.sources for recipe in source.recipes}
         fitted, reused, counts, missing = self.fit()
         evidence = []
-        budget_stop = False
+        deferred = set()
         while candidates and missing:
 
             # A single native session can cover work required by multiple targets and ranks.
             requested = {source: len(source.host_points & missing.keys()) for source in self.sources}
-            applicable = [key for key in candidates if requested[key[0]]]
+            applicable = [(source, recipe) for source, recipe in candidates if requested[source]
+                          and (source.cold or not source.recipes[recipe].requires_cold)]
             if not applicable:
                 break
             source, recipe = max(applicable, key=lambda key: (bool(candidates[key]), requested[key[0]]))
@@ -228,7 +240,7 @@ class CostAcquisition:
             spent, attempts = self.usage()
             allowance = max(0, self.native_ns - spent)
             if not previous and (not allowance or attempts >= self.args.attempt_limit):
-                budget_stop = True
+                deferred.update(*(candidate.host_points for candidate, _ in applicable))
                 break
 
             del candidates[source, recipe]
@@ -249,9 +261,7 @@ class CostAcquisition:
             fitted, reused, counts, missing = self.fit()
             row.update(status="measured", additional_points=len(before.keys() - missing.keys()))
 
-        spent, attempts = self.usage()
         observed = set().union(*(source.host_points for source in self.sources))
-        deferred = set().union(*(source.host_points for source, _ in candidates)) if budget_stop else set()
         reasons = {
             point: ("native_budget_exhausted" if point in deferred else
                     "no_qualified_measurement" if point in observed else "no_observed_recipe")
@@ -260,9 +270,8 @@ class CostAcquisition:
         return {
             "domains": fitted.document(), "sources": [str(path) for path in self.samples], "reused": reused,
             "demand": self.demand.report(counts, missing, reasons), "recipes": evidence,
-            "native_charged_ns": spent, "native_attempts": attempts,
-            "postprocessing_ns": self.state["postprocessing_ns"], "retained_bytes": self.limit.bytes_used(),
-            "status": "covered" if not missing else "native_budget_exhausted" if budget_stop else "uncovered",
+            **self.spending(), "retained_bytes": self.limit.bytes_used(),
+            "status": "covered" if not missing else "native_budget_exhausted" if deferred else "uncovered",
         }
 
     def run(self):
@@ -271,6 +280,9 @@ class CostAcquisition:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.prepare()
             result = self.output / "costs.json"
-            if not result.is_file():
-                write_json(result, self.acquire(), replace=False)
+            try:
+                if not result.is_file():
+                    write_json(result, self.acquire(), replace=False)
+            finally:
+                write_json(self.output / "status.json", self.spending(), indent=2)
         print(f"Created {result}")

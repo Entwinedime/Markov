@@ -1,6 +1,7 @@
 """Match independently timed native CPU fragments to complete coarse work intervals."""
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 import json
 
 from markov_adapters.artifacts import write_json
@@ -9,6 +10,13 @@ from markov_collection.adapters.runtimes.ascend.host_alignment import AscendHost
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.cost_samples import ServiceSamples, WorkCatalog
+
+
+@dataclass(frozen=True, slots=True)
+class HostRecipe:
+    name: str
+    job: dict
+    requires_cold: bool = False
 
 
 class HostCostSamples:
@@ -28,10 +36,12 @@ class HostCostSamples:
     @staticmethod
     def recipes(job):
         capture = CaptureInput(job)
-        yield "observed-submission", job
+        yield HostRecipe("observed-submission", job)
+        if capture.warmup != capture.workload:
+            yield HostRecipe("primed-submission", {**job, "warmup": job["workload"]}, requires_cold=True)
         groups = [[request["id"]] for request in capture.workload["requests"]]
         if not all(len(group) == 1 for group in capture.submission_groups):
-            yield "individual-requests", {**job, "submission_groups": groups}
+            yield HostRecipe("individual-requests", {**job, "submission_groups": groups, "warmup": job["workload"]})
 
     @staticmethod
     def supports(work, resource):
@@ -93,15 +103,17 @@ class HostCostSamples:
         return pairs
 
     @staticmethod
-    def cold_batches(probe):
-        batches = [scope for scope in probe["scopes"] if scope["role"] == "run_batch"]
+    def cold_scopes(probe):
         excluded = set()
         for load in probe["timing"]["specialization_loads"]:
             time = load["raw_ns"]
-            owner = [scope["id"] for scope in batches if scope["raw_interval"][0] <= time <= scope["raw_interval"][1]]
-            if len(owner) != 1:
-                raise ValueError("cannot isolate a post-warmup specialization to its native batch")
-            excluded.update(owner)
+            active = {scope["id"]: scope["parent"] for scope in probe["scopes"][1:]
+                      if scope["raw_interval"][0] <= time < scope["raw_interval"][1]}
+            if not active:
+                raise ValueError("post-warmup specialization lies outside the observed native calls")
+
+            # A parent interval may include the load even when the allocator runs before model execution.
+            excluded.update(scope for scope, parent in active.items() if parent not in active)
         return excluded
 
     def collectives(self, records, rank):
@@ -165,7 +177,7 @@ class HostCostSamples:
                                           for actor, record in records.items()):
             raise ValueError("host samples do not match their declared measurement")
 
-        excluded = self.cold_batches(probe)
+        excluded = self.cold_scopes(probe)
         pairs = self.match(original["scopes"], probe["scopes"], excluded)
         collectives = self.collectives(records, rank)
         timing = probe["timing"]
@@ -212,7 +224,7 @@ class HostCostSamples:
         batches["host"] = sum(scope["role"] == "run_batch" for scope in probe["scopes"])
         report["qualification"] = {
             "native_batches": batches,
-            "excluded_cold_batches": sorted(excluded),
+            "excluded_cold_scopes": sorted(excluded),
             "queue_correction_ns": queues["raw_correction_ns"],
             "measured": dict(measured), "missing": dict(missing),
             "alignment": dict(self.qualification + alignment.misses), "lost_threads": alignment.service.loss,

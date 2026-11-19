@@ -46,14 +46,15 @@ class SourcePlanning:
         return result
 
     @staticmethod
-    def primary(plan, source):
+    def primary(plan, source, *, available):
         serving = ServingInput(source)
         structure = SourceDomain.requested(serving)
         opportunities = RepresentativeSources({}, plan["expert_count"])
         required = opportunities.conditions(serving.instances, serving.workload)
-        candidates = [job for job in plan["sources"] if job["structure"] == structure and job["configurations"]]
+        candidates = [job for job in plan["sources"] if job["id"] in available
+                      and job["structure"] == structure and job["configurations"]]
         if not candidates:
-            raise ValueError("target implementation has no planned primary source")
+            return None
 
         # This chooses input evidence, not support: unseen targets still face the actual template contracts and guards.
         return min(candidates, key=lambda job: (

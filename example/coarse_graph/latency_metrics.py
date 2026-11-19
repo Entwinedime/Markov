@@ -1,13 +1,12 @@
 """Compare independent predictions with native request submission and output times."""
 
 import argparse
-from collections import defaultdict
 import json
-from math import ceil
 from pathlib import Path
 from statistics import mean
 
 from markov_adapters.artifacts import write_json
+from markov_workflow.latency import PredictedLatency, percentile95
 
 
 class NativeLatencyMetrics:
@@ -120,11 +119,6 @@ class NativeLatencyMetrics:
                 "specialization_loads": self.specializations}
 
 
-def percentile95(values):
-    ordered = sorted(values)
-    return ordered[ceil(len(ordered) * 0.95) - 1]
-
-
 class LatencyComparison:
     def __init__(self, native, prediction):
         self.native = native
@@ -133,38 +127,16 @@ class LatencyComparison:
 
     def report(self):
         result = self.result
-        if result["duration_basis"] != "independent_service_costs" or result["requests"] != len(self.native["requests"]):
-            raise ValueError("performance comparison needs complete predictions driven by independent costs")
-        produced = defaultdict(list)
-        for token in result["outputs"]:
-            produced[token["request"]].append(token)
-        if set(produced) != {row["id"] for row in self.native["requests"]}:
-            raise ValueError("native and predicted requests differ")
-
-        requests = []
-        for truth in self.native["requests"]:
-            identity = truth["id"]
-            tokens = produced[identity]
-            count = truth["output_tokens"]
-            times = [token["time_ns"] for token in tokens]
-            if (len(times) != count or times != sorted(times) or times[0] < truth["declared_ns"]
-                    or any(row["generated_tokens"] != number or row["finished"] != (number == count)
-                           for number, row in enumerate(tokens, 1))):
-                raise ValueError(f"prediction has incomplete or unordered token publication for {identity}")
-            requests.append({
-                "id": identity, "ttft_ns": times[0] - truth["declared_ns"], "last_publication_ns": times[-1],
-                "tpot_ns": (times[-1] - times[0]) / (count - 1) if count > 1 else None,
-            })
-        elapsed = max(row["last_publication_ns"] for row in requests)
+        workload = [{**truth, "arrival_ns": truth["declared_ns"]} for truth in self.native["requests"]]
+        prediction = PredictedLatency(result, workload).report()
+        requests = prediction["requests"]
         accuracy = {}
         for metric in ("ttft_ns", "tpot_ns"):
             actual = [row[metric] for row in self.native["requests"]]
             errors = [abs(row[metric] - observed) / observed for row, observed in zip(requests, actual, strict=True) if observed]
             accuracy[metric] = {"mape_percent": mean(errors) * 100 if errors else None,
                                 "requests": len(errors), "zero_denominators": actual.count(0)}
-        return {"result": str(self.path), "requests": requests, "accuracy": accuracy,
-                "p95_ttft_ns": percentile95(row["ttft_ns"] for row in requests),
-                "tokens_per_second": self.native["output_tokens"] * 1e9 / elapsed if elapsed else None,
+        return {"result": str(self.path), **prediction, "accuracy": accuracy,
                 "cost_queries": result["cost_queries"], "cost_query_ns": result["cost_query_ns"]}
 
 

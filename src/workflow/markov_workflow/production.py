@@ -12,7 +12,7 @@ from markov_adapters.artifacts import write_json
 from markov_collection.adapters.runtimes.ascend.export import AscendExport
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers
-from markov_workflow.limits import OperationLimit
+from markov_workflow.limits import AllowanceExhausted, OperationLimit
 
 
 class CaptureProduction:
@@ -44,12 +44,19 @@ class CaptureProduction:
     def publish_state(self) -> None:
         write_json(self.output / "production.json", self.state, indent=2)
 
-    def discard(self, output: str) -> None:
-        path = self.output / output
+    @staticmethod
+    def discard(path) -> None:
         if path.is_dir():
             shutil.rmtree(path)
         else:
             path.unlink(missing_ok=True)
+
+    @classmethod
+    def trim(cls, output, ranks, product):
+        discarded = ("sdk", "facts.json", "graph.json", "templates.json") if product == "templates" else ("sdk", "facts.json")
+        for rank in ranks:
+            for suffix in discarded:
+                cls.discard(output / "work" / f"{rank}-{suffix}")
 
     def prepare(self) -> None:
         state = self.output / "production.json"
@@ -63,7 +70,7 @@ class CaptureProduction:
                 # A killed client may leave its container alive; recover only the recorded invocation.
                 running = self.state["running"]
                 OwnedContainers([running["container"]]).close()
-                self.discard(running["output"])
+                self.discard(self.output / running["output"])
                 self.state["running"] = None
                 self.state["error"] = "interrupted operation charged its reserved remaining budget"
                 self.publish_state()
@@ -91,7 +98,7 @@ class CaptureProduction:
         if remaining_ns <= 0:
             self.state["error"] = "cumulative postprocessing budget exhausted; completed steps remain reusable"
             self.publish_state()
-            raise RuntimeError(self.state["error"])
+            raise AllowanceExhausted(self.state["error"])
         self.operation_limit.check()
         container = f"markov-produce-{uuid4().hex}"
         self.state["attempts"] += 1
@@ -128,7 +135,7 @@ class CaptureProduction:
         finally:
             OwnedContainers([container]).close()
             if name not in self.state["completed"]:
-                self.discard(output)
+                self.discard(self.output / output)
             self.state["spent_ns"] = previous_ns + time.monotonic_ns() - started_ns
             self.state["running"] = None
             self.publish_state()
@@ -166,10 +173,7 @@ class CaptureProduction:
                     "/production/inputs/markov", "link-templates", "/production/inputs/templates.json", "/production/assets",
                 ])
             if not self.arguments.keep_intermediates:
-                discarded = ("sdk", "facts.json", "graph.json", "templates.json") if templates else ("sdk", "facts.json")
-                for rank in self.ranks:
-                    for suffix in discarded:
-                        self.discard(f"work/{rank}-{suffix}")
+                self.trim(self.output, self.ranks, self.arguments.product)
 
             # Publish only when every observed worker has its requested product; graphs cannot be consumed as templates.
             write_json(self.output / "result.json", {

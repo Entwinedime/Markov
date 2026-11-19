@@ -15,12 +15,12 @@ from markov_workflow.adapters.ascend import AscendDeployment
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.adapters.sglang_local_sources import LocalSources
 from markov_workflow.capture import CaptureProcess
-from markov_workflow.limits import OperationLimit
+from markov_workflow.limits import AllowanceExhausted, OperationLimit
 from markov_workflow.production import CaptureProduction
 
 
 class SourceAcquisition:
-    def __init__(self, arguments):
+    def __init__(self, arguments, limit=None):
         self.arguments = arguments
         self.output = arguments.output.resolve()
         plan_root = arguments.plan.resolve(strict=True)
@@ -72,7 +72,7 @@ class SourceAcquisition:
         placement.options()
         self.native_ns = int(arguments.native_budget_seconds * 1_000_000_000)
         self.production_ns = int(arguments.postprocessing_budget_seconds * 1_000_000_000)
-        self.limit = OperationLimit(self.output, arguments.storage_bytes)
+        self.limit = limit if limit is not None else OperationLimit(self.output, arguments.storage_bytes)
         images = {role: subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
                   for role, image in (("source", arguments.source_image), ("modeling", arguments.modeling_image))}
         self.inputs = {"plan": plan, "jobs": {str(key): value for key, value in self.jobs.items()},
@@ -127,7 +127,7 @@ class SourceAcquisition:
         native, production, attempts = self.usage()
         production_allowance = production[identity] + max(0, self.production_ns - sum(production.values()))
         if production_allowance <= 0:
-            raise RuntimeError("source collection cumulative allowance exhausted")
+            raise AllowanceExhausted("source collection postprocessing allowance exhausted")
         source = self.sources[identity]
         assets = self.output / "assets" / str(identity)
 
@@ -136,7 +136,7 @@ class SourceAcquisition:
             native_allowance = native[identity] + max(0, self.native_ns - sum(native.values()))
             attempt_allowance = attempts[identity] + max(0, self.arguments.attempt_limit - sum(attempts.values()))
             if min(native_allowance, attempt_allowance) <= 0:
-                raise RuntimeError("source collection cumulative allowance exhausted")
+                raise AllowanceExhausted("source collection native allowance exhausted")
 
             job_path, deployment_path = self.output / ".capture-input.json", self.output / ".deployment.json"
             write_json(job_path, self.jobs[identity])
@@ -164,20 +164,35 @@ class SourceAcquisition:
             raise ValueError(f"source {identity} initialized a different expert count from its plan")
         LocalSources.check(libraries, self.descriptions[identity]["required_local_coverage"])
 
-    def run(self):
+    def run(self, *, allow_incomplete=False):
         self.output.mkdir(parents=True, exist_ok=True)
         with (self.output / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.prepare()
             error = None
             try:
+                available, unavailable = [], {}
                 for identity in self.jobs:
-                    self.acquire(identity)
+                    try:
+                        self.acquire(identity)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, RuntimeError) as failure:
+                        if not allow_incomplete:
+                            raise
+                        self.limit.check()
+                        if isinstance(failure, AllowanceExhausted):
+                            status = "budget_exhausted"
+                        else:
+                            recorded = (self.sources[identity] / "result.json").is_file()
+                            status = "source_failed" if recorded else "native_unavailable"
+                        unavailable[str(identity)] = {"status": status, "message": str(failure)}
+                    else:
+                        available.append(identity)
                 self.limit.check()
                 write_json(self.output / "result.json", {
-                    "productions": [f"assets/{identity}" for identity in self.jobs],
-                    "captures": [str(self.sources[identity]) for identity in self.jobs],
-                    "qualification": "compiled_initial_sources",
+                    "productions": [f"assets/{identity}" for identity in available],
+                    "captures": [str(self.sources[identity]) for identity in available],
+                    "unavailable": unavailable,
+                    "qualification": "partial_sources" if unavailable else "compiled_initial_sources",
                     "limits": self.inputs["plan"]["limits"],
                 }, indent=2)
             except BaseException as failure:

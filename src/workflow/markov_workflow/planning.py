@@ -7,8 +7,9 @@ from markov_workflow.adapters.sglang_planning import SourcePlanning
 
 
 class PlanningProcess:
-    def __init__(self, arguments):
+    def __init__(self, arguments, *, prewarm=False):
         self.arguments = arguments
+        self.prewarm = prewarm
 
     def run(self):
         source = json.loads(self.arguments.input.read_text())
@@ -29,7 +30,10 @@ class PlanningProcess:
         for job in plan["sources"]:
             selected = job["source"]
             cost = selected["input_cost"]
-            write_json(output / selected["input"], planner.capture_inputs[job["id"]], indent=2, replace=False)
+            capture = planner.capture_inputs[job["id"]]
+            if self.prewarm:
+                capture = {**capture, "warmup": capture["workload"]}
+            write_json(output / selected["input"], capture, indent=2, replace=False)
             lines.append(f"| {job['id']} | {selected['configuration']} / {', '.join(selected['workloads'])} | {cost['requests']} / {selected['submission_group_count']} | "
                          f"{cost['prompt_tokens']} / {cost['decode_tokens']} | {selected['original_tokens']} | {job['native_workers']} |")
         for job in plan["sources"]:

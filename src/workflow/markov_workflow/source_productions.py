@@ -14,19 +14,33 @@ class SourceProductions:
         inputs = json.loads((collection / "input.json").read_text())
         self.plan, self.jobs = inputs["plan"], inputs["jobs"]
         publication = json.loads((collection / "result.json").read_text())
-        jobs = self.plan["sources"]
+        self.unavailable = publication.get("unavailable", {})
+        planned = {str(job["id"]) for job in self.plan["sources"]}
+        jobs = [job for job in self.plan["sources"] if str(job["id"]) not in self.unavailable]
         if (not len(jobs) == len(publication["productions"]) == len(publication["captures"])
-                or self.jobs.keys() != {str(job["id"]) for job in jobs}):
+                or self.jobs.keys() != planned or self.unavailable.keys() - planned):
             raise ValueError("source publication does not match the planned source jobs")
         self.paths = {job["id"]: collection / name for job, name in zip(jobs, publication["productions"], strict=True)}
 
         # Explicit observations keep their original owners, which may live outside this collection.
         self.captures = {job["id"]: collection / name for job, name in zip(jobs, publication["captures"], strict=True)}
 
+    def select(self, source):
+        return SourcePlanning.primary(self.plan, source, available=self.paths)
+
+    def failure(self, source):
+        primary = SourcePlanning.primary(self.plan, source, available={int(key) for key in self.unavailable})
+        if primary is None:
+            return {"status": "source_missing", "message": "target implementation has no planned primary source"}
+        return {"job": primary, **self.unavailable[str(primary)]}
+
     def prepare(self, source, *, modeled=False):
-        primary = SourcePlanning.primary(self.plan, source)
+        primary = self.select(source)
+        if primary is None:
+            raise ValueError("target implementation has no published primary source")
         local_sources = [job["id"] for job in self.plan["sources"]
-                         if any(consumer["source"] == primary for consumer in job.get("local_consumers", []))]
+                         if job["id"] in self.paths
+                         and any(consumer["source"] == primary for consumer in job.get("local_consumers", []))]
         templates = []
         productions = []
         for identity in [primary, *local_sources]:

@@ -5,6 +5,10 @@ import subprocess
 import time
 
 
+class AllowanceExhausted(RuntimeError):
+    pass
+
+
 class OperationLimit:
     def __init__(self, root=None, storage_bytes=None):
         self.root, self.storage_bytes = root, storage_bytes
@@ -23,21 +27,25 @@ class OperationLimit:
 
     def check(self):
         if self.root is not None and self.bytes_used() > self.storage_bytes:
-            raise RuntimeError("collection storage allowance exhausted")
+            raise AllowanceExhausted("storage allowance exhausted")
+
+    def wait(self, process, deadline):
+        timeout = max(0, deadline - time.monotonic())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            try:
+                return process.wait(timeout=min(1, remaining) if self.root is not None else remaining)
+            except subprocess.TimeoutExpired:
+                self.check()
 
     def run(self, command, log, timeout):
         self.check()
         deadline = time.monotonic() + timeout
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
-                try:
-                    return process.wait(timeout=min(1, remaining) if self.root is not None else remaining)
-                except subprocess.TimeoutExpired:
-                    self.check()
+            return self.wait(process, deadline)
         finally:
             if process.poll() is None:
                 process.kill()

@@ -62,7 +62,14 @@ def main() -> None:
     acquisition.add_argument("--deployment", type=Path, required=True)
     acquisition.add_argument("--keep-intermediates", action="store_true")
     acquisition.add_argument("--resource-trace", action="store_true", help="record optional resource and input-read evidence")
-    for command in (acquisition, sampling):
+    exploration = commands.add_parser("explore", help="prepare assets and predict a configuration/workload set")
+    exploration.add_argument("--input", type=Path, required=True)
+    exploration.add_argument("--deployment", type=Path, required=True)
+    exploration.add_argument("--output", type=Path, help="task directory, defaults to a new UTC-stamped data directory")
+    exploration.add_argument("--reuse", type=Path, help="published prior exploration task")
+    exploration.add_argument("--details", action="store_true", help="retain source intermediates and emit target execution traces")
+    exploration.add_argument("--control-image", default="markov-next-control:ubuntu22.04")
+    for command in (acquisition, sampling, exploration):
         command.add_argument("--timeout", type=float, required=True, help="maximum seconds per native attempt")
         command.add_argument("--native-budget-seconds", type=float, required=True)
         command.add_argument("--postprocessing-budget-seconds", type=float, required=True)
@@ -71,6 +78,7 @@ def main() -> None:
         command.add_argument("--source-image", default="markov-next-sglang:ubuntu22.04")
     for command in (production, prediction, acquisition, sampling):
         command.add_argument("--output", type=Path, required=True)
+    for command in (production, prediction, acquisition, sampling, exploration):
         command.add_argument("--binary", type=Path, required=True)
         command.add_argument("--modeling-image", default="markov-next-modeling:ubuntu24.04")
     arguments = parser.parse_args()
@@ -106,6 +114,11 @@ def main() -> None:
         from markov_workflow.cost_acquisition import CostAcquisition
 
         CostAcquisition(arguments).run()
+    elif arguments.command == "explore":
+        from markov_workflow.exploration import ExplorationTask
+
+        if not ExplorationTask(arguments).run():
+            raise SystemExit(1)
     else:
         from markov_workflow.prediction import PredictionProcess
 

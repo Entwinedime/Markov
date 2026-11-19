@@ -13,7 +13,7 @@ from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.ascend import AscendDeployment
 from markov_workflow.adapters.sglang import SourceDomain
 from markov_workflow.containers import OwnedContainers
-from markov_workflow.limits import OperationLimit
+from markov_workflow.limits import AllowanceExhausted, OperationLimit
 
 
 class CaptureProcess:
@@ -155,7 +155,7 @@ class CaptureProcess:
             spent_ns = sum(attempt["charged_ns"] for attempt in attempts)
             if not attempts or attempts[-1]["status"] != "exited":
                 if len(attempts) >= self.arguments.attempt_limit or spent_ns >= self.limit_ns:
-                    raise RuntimeError("cumulative native time or attempt allowance exhausted")
+                    raise AllowanceExhausted("cumulative native time or attempt allowance exhausted")
                 self.operation_limit.check()
                 self.capture(min(self.timeout_ns, self.limit_ns - spent_ns))
 
