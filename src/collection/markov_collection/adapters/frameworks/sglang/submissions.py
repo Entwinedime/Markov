@@ -76,7 +76,11 @@ class EngineSubmissions:
             offset_ns = clock.origin.value - origin_ns
             for _, record in group:
                 record["scheduled_ns"] = offset_ns + record["arrival_ns"]
-            tasks = [asyncio.create_task(self.submit_at(endpoint, payload, record, origin_ns)) for payload, record in group]
+            submission_order = asyncio.Lock()
+            tasks = [
+                asyncio.create_task(self.submit_at(endpoint, payload, record, origin_ns, submission_order))
+                for payload, record in group
+            ]
             try:
                 responses = await asyncio.gather(*tasks)
             except BaseException:
@@ -87,14 +91,23 @@ class EngineSubmissions:
             indices = [request for _, record in group for request in record["requests"]]
             self.check_responses(self.prefix, [row for response in responses for row in response], indices)
 
-    async def submit_at(self, endpoint: Any, payload: dict, record: dict, started_ns: int) -> list[dict]:
+    async def submit_at(
+        self, endpoint: Any, payload: dict, record: dict, started_ns: int, submission_order: asyncio.Lock,
+    ) -> list[dict]:
         deadline_ns = started_ns + record["scheduled_ns"]
 
-        # Event-loop timers may wake early; release only after the shared workload clock reaches arrival.
-        while (remaining_ns := deadline_ns - time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)) > 0:
-            await asyncio.sleep(remaining_ns / 1e9)
-        record["submitted_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - started_ns
-        return await self.send(endpoint, payload)
+        # A FIFO lock orders the deadlines and Engine calls even when timer wakeups bunch together.
+        async with submission_order:
+            while (remaining_ns := deadline_ns - time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)) > 0:
+                await asyncio.sleep(remaining_ns / 1e9)
+            record["submitted_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - started_ns
+            responses = await endpoint.async_generate(**payload)
+
+        rows = []
+        async for row in responses:
+            if row["meta_info"]["finish_reason"] is not None:
+                rows.append(row)
+        return rows
 
     def check_responses(self, prefix: str, rows: list[dict], indices: list[int]) -> None:
         expected = {
@@ -119,13 +132,3 @@ class EngineSubmissions:
             completed.add(identity)
         if completed != expected.keys():
             raise RuntimeError(f"native responses omitted requests: {sorted(expected.keys() - completed)}")
-
-    @staticmethod
-    async def send(endpoint: Any, payload: dict) -> list[dict]:
-        rows = []
-
-        # Keep native streaming semantics while retaining only terminal responses.
-        async for row in await endpoint.async_generate(**payload):
-            if row["meta_info"]["finish_reason"] is not None:
-                rows.append(row)
-        return rows
