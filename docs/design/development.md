@@ -188,6 +188,8 @@ CPU 成本采样使用 `capture --host-timing`。作用域由原生框架适配�
 
 成本样本的工作身份由 `markov work-identities <粗图> <工作身份文件>` 生成。`cost-samples` 读取同次观测的事实、粗图和工作身份，发布设备与同步搬运标签。`host-cost-samples` 的 `--detailed` 和 `--host` 指向各自包含 `execution.json` 和 `result.json` 的采集任务目录。用 `fit-costs --samples` 从合格样本发布资产，可通过 `--check` 指定独立检查样本，或通过 `--demand <粗图> <工作身份文件>` 检查需求覆盖。
 
+成本资产按 `domains` 保存各实现域的规范定义和模型。`fit-costs` 可以读取多个实现域的样本，每域独立拟合。正式预测按已选模板库的实际实现域为各参与者装配成本。CPU 协议本地服务用各自角色的成本，线传输用发送角色的成本。它们与动作图共用成本查询，协议工作身份保留操作、逻辑通道、源/目标和 dtype，实际元素数量与元素字节数作为查询特征。
+
 采样和在线查询采用同一特征提取。数据端口及局部 guard 提供工作形状，局部 KV 读取决定是否使用序列上下文与计算量。KV backing 张量的容量是元数据。实际参与 Attention 的长度来自已绑定的请求成员。
 
 这些转换只还原导出的坐标，不校准设备计数器频率，不消除 SDK 设备/主机测量本身的因果矛盾，也不代表跨机时钟同步。校准需要独立依据，不能按目标误差、等待边或首次失败位置拟合偏移/倍率；来源冲突继续报告，不能改图或截断时间求通过。
@@ -384,7 +386,7 @@ SGLang的schedule/forward/copy职责来自原生事件及等待声明，由Ascen
 
 在CPU control环境运行 `python3 example/coarse_graph/execution_inputs.py --capture <closed-native-case> --graphs <projected-graphs> --output <new-directory>`。全部实际参与者必须有原始记录和带evidence的粗图，只读真实事实，不读模板或预测。使用镜像已有的SciPy稀疏优化器提供候选基，再由SymPy以有理数重建并精确认证原始查询区间、全rank必要因果及严格取整单元。时钟只按真实独立快照分段，同物理设备的多个记录在重合区间保持同一映射；数值求解成功本身不取得资格，不能证明时明确未核对。CPU入口/返回保持直接RAW时间，设备具名端口按所选映射向上取整到纳秒，交给既有核心完成接口。输出execution-inputs-report.json记录所选实现和原始校准不确定性；全部必要事实齐全才发布execution-inputs.json。所选实现不是唯一精确测量，也不代表成本预测。
 
-没有实测时间的必要端口或工作完成保留缺口报告，只有完整匹配后才发布全节点条件。CPU 消息 wire 和状态通知各保留独立的时间依据。结果以 `checked_causal_execution_inputs` 表示局部条件，以 `fully_matched_native_endpoints` 表示全节点条件。执行器统计插入图的全部工作，协议就绪事件另计。
+没有实测时间的必要端口或工作完成保留缺口报告。动作逐端点条件可与 CPU 消息的进入、返回和线传输区间共用。结果以 `checked_causal_execution_inputs` 表示局部条件，以 `fully_matched_native_endpoints` 表示全节点条件。含 CPU 协议范围约束的逐端点动作对照以 `measured_action_endpoints_and_checked_cpu_protocol_bounds` 说明证据边界。执行器统计插入图的全部工作，协议就绪事件另计。
 
 批次变换的上下文保留左右请求进度及结果成员，实际工作和父片段快照分别维护。PP 模型与结果的实际流水线位置记录在 `observation_context`。旁路验证以固定案例实际观察的时间为依据，每次运行需匹配自己的端点。
 
