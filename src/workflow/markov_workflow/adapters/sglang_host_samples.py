@@ -87,22 +87,24 @@ class HostCostSamples:
             raise ValueError("host cost capture changes the measured native workload or configuration")
         source_root = CaptureProcess.published(detailed, source["job"])
         host_root = CaptureProcess.published(lightweight, host["job"])
-        instance, = self.read(lightweight / "result.json")["instances"]
-        rank, = instance["native_participants"]
-        probe = self.read(host_root / instance["host_samples"])
         catalog = WorkCatalog(self.arguments.graph, self.arguments.work_identities)
         graph = catalog.graph
+        rank = graph["environment"]["parallel"]["rank"]
+        instance, = (candidate for candidate in self.read(lightweight / "result.json")["instances"]
+                     if rank in candidate["native_participants"])
+        path = host_root / instance["host_samples"][str(rank)]
+        probe = self.read(path)
         facts = self.read(self.arguments.facts)
         original = self.read(source_root / f"rank-{rank}.json")
         if (facts["measurements"]["window_ns"] != catalog.window
                 or facts["environment"] != graph["environment"] or original["environment"] != graph["environment"]):
             raise ValueError("host measurement uses a graph from a different native capture")
-        if probe["clock"] != "monotonic_raw_ns" or not host["host_timing"]:
+        if probe["rank"] != rank or probe["clock"] != "monotonic_raw_ns" or not host["host_timing"]:
             raise ValueError("host samples do not match their declared measurement")
 
         pairs, batches = self.match(original["scopes"], probe["scopes"])
         timing = probe["timing"]
-        directory = (host_root / instance["host_samples"]).parent
+        directory = path.parent
         queues = self.read(directory / timing["queues"])
         if queues["clock"] != "monotonic_raw_ns" or queues["unpaired"]:
             raise ValueError("native CPU timing requires paired queue evidence on the RAW clock")

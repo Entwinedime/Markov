@@ -1,4 +1,4 @@
-"""Report native scheduler latency and compare independent predictions for ordinary TP1."""
+"""Report native scheduler latency and compare independent predictions for ordinary serving."""
 
 import argparse
 from collections import defaultdict
@@ -14,9 +14,8 @@ class NativeLatencyMetrics:
     def __init__(self, source):
         self.source = source
         instance, = self.read(source / "capture.json")["instances"]
-        rank, = instance["native_participants"]
         if instance["mode"] != "null":
-            raise ValueError("native latency reporting requires one ordinary worker")
+            raise ValueError("native latency reporting requires one ordinary instance")
         directory = source / "instances/0"
         session = self.read(directory / "session.json")
         self.requests = session["content"]["requests"]
@@ -34,6 +33,7 @@ class NativeLatencyMetrics:
             self.specializations = measurements.get("specialization_loads")
             self.basis = "scheduler_send_return"
         else:
+            rank, = instance["native_participants"]
             raw = self.read(source / f"rank-{rank}.json")
             aliases = dict(zip(session["source_requests"], (request["id"] for request in self.requests), strict=True))
             self.rows = self.observed_publications(raw, aliases)

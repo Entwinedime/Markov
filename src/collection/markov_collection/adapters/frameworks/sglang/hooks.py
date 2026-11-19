@@ -423,8 +423,8 @@ def install() -> None:
         return
     description = json.loads(Path(path).read_text())
     if description["latency_only"]:
-        from markov_collection.adapters.frameworks.sglang.latency import NativeLatency
+        from markov_collection.adapters.frameworks.sglang.timing import NativeTiming
 
-        NativeLatency(description).install()
+        NativeTiming(description).install()
     else:
         SGLangObservation(description).install()

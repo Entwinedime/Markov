@@ -7,21 +7,27 @@ from threading import get_native_id
 from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
 from markov_adapters.sglang.state_calls import RequestStateCalls
+from markov_collection.adapters.frameworks.sglang.communications import DeviceCollectiveCuts
 from markov_collection.adapters.frameworks.sglang.flow_scopes import ServingCuts
 from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
 from markov_collection.adapters.runtimes.ascend.host_profile import AscendHostProfile
 
 
 class NativeHostSamples(ServingCuts):
-    def __init__(self, aliases, rank, directory):
+    def __init__(self, aliases):
         super().__init__(aliases)
-        self.rank = rank
         self.enabled = False
         self.request_state = RequestStateCalls(observe=False)
         self.parent = ContextVar("timed_host_scope", default=0)
         self.scopes = [{"id": 0, "parent": None, "role": "window", "site": "", "implementation": "", "work": {}, "bindings": {}}]
         self.auxiliary_intervals = []
+        self.profile = None
+
+    def start(self, scheduler, rank, directory):
+        self.scheduler = scheduler
+        self.rank = rank
         self.profile = AscendHostProfile(directory)
+        self.profile.start()
 
     @contextmanager
     def scope(self, role, site, implementation, *, work=None, condition=None):
@@ -41,6 +47,14 @@ class NativeHostSamples(ServingCuts):
 
     def native_call(self, role, original, **facts):
         return self.scope(role, original.__qualname__, f"{original.__module__}.{original.__qualname__}", **facts)
+
+    @property
+    def collective_at_root(self):
+        return self.parent.get() == 0
+
+    def device_collective(self, original, role, group, root_rank, gather, run):
+        with self.native_call(role, original):
+            return run()
 
     def enclosing(self, frame):
         return self.native_call("invocation", frame.original, work=frame.work)
@@ -110,6 +124,7 @@ class NativeHostSamples(ServingCuts):
     def install(self):
         super().install()
         ModelScopes.install_engine_hooks(self)
+        DeviceCollectiveCuts(self).install()
 
     def document(self):
         return {

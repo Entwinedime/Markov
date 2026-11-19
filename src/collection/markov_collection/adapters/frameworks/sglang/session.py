@@ -52,9 +52,9 @@ class NativeServingSession:
             )
             self.instances.append(instance)
             offset += len(instance.roles)
-        if latency_only and (resource_trace or len(self.instances) != 1 or offset != 1
+        if latency_only and (resource_trace or len(self.instances) != 1 or self.instances[0].pp != 1
                              or "ep" in self.instances[0].configuration):
-            raise ValueError("light observation requires a single ordinary dense TP1 worker")
+            raise ValueError("light observation requires a single ordinary dense instance without pipeline parallelism")
         if latency_only and not host_timing and len(serving.submission_groups) != 1:
             raise ValueError("latency-only measurement requires one submission group")
 

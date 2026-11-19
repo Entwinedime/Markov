@@ -65,13 +65,23 @@ class NativeServingInstance:
     def reset(self, engine: Any, phase: str) -> None:
 
         # End observed serving at native idle before sending the driver's administrative reset.
-        if not self.latency_only:
-            ObservationWindow.wait(self.output, self.roles, phase, "drained")
+        ObservationWindow.wait(self.output, self.roles, phase, "drained")
         result = engine.loop.run_until_complete(engine.tokenizer_manager.flush_cache(timeout_s=30))
         if not result.success:
             raise RuntimeError(f"native cache reset failed: {result.message}")
-        if not self.latency_only:
-            ObservationWindow.wait(self.output, self.roles, phase, "complete")
+        ObservationWindow.wait(self.output, self.roles, phase, "complete")
+
+    def timing_metrics(self):
+        records = {str(rank): self.directory / "timing" / f"rank-{rank}" / "record.json" for rank in self.roles}
+        if self.host_timing:
+            return {"host_samples": {rank: str(path.relative_to(self.output)) for rank, path in records.items()}}
+
+        measurements = [json.loads(path.read_text()) for path in records.values()]
+        requests, = (record["requests"] for record in measurements if record["requests"])
+        loads = [{"rank": record["rank"], **event} for record in measurements for event in record["specialization_loads"]]
+        path = self.directory / "latency.json"
+        write_json(path, {"clock": "monotonic_raw_ns", "requests": requests, "specialization_loads": loads}, replace=False)
+        return {"latency": str(path.relative_to(self.output))}
 
     def observe(self, engine, capture, clock, barrier) -> tuple[int, ...]:
         engine.start_profile(output_dir=str(self.output / "native"), activities=["CPU", "GPU"], record_shapes=False, with_stack=False)
@@ -174,17 +184,7 @@ class NativeServingInstance:
                 self.generate(engine, "capture", capture, clock, barrier)
                 self.reset(engine, "source")
                 selected = ()
-
-                # Flush and publication are ordered on the same scheduler, so its report is now visible.
-                report = self.directory / "latency.json"
-                if not report.is_file():
-                    raise RuntimeError("native scheduler did not publish complete request latencies")
-                metrics["latency"] = str(report.relative_to(self.output))
-                if self.host_timing:
-                    samples = self.directory / "host-samples.json"
-                    if not samples.is_file():
-                        raise RuntimeError("native scheduler did not publish host service samples")
-                    metrics["host_samples"] = str(samples.relative_to(self.output))
+                metrics = self.timing_metrics()
             else:
                 selected = self.observe(engine, capture, clock, barrier)
             captured_ns = time.monotonic_ns()
