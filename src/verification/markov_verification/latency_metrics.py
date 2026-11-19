@@ -47,10 +47,8 @@ class NativeLatencyMetrics:
         else:
             if instance["mode"] != "null":
                 raise ValueError("PD latency reporting requires a latency-only capture for both instances")
-            rank, = instance["native_participants"]
-            raw = self.read(self.source / f"rank-{rank}.json")
             aliases = dict(zip(session["source_requests"], (request["id"] for request in requests), strict=True))
-            rows = self.observed_publications(raw, aliases)
+            rows = self.detailed_publications(instance["observed_roles"], aliases)
             basis = "detailed_scheduler_send_bracket_end"
         return {
             "workload": requests, "origin_ns": delivery["origin_ns"], "submissions": submissions,
@@ -60,6 +58,19 @@ class NativeLatencyMetrics:
     @staticmethod
     def read(path):
         return json.loads(path.read_text())
+
+    def detailed_publications(self, ranks, aliases):
+        rows = None
+        for rank in ranks:
+            raw = self.read(self.source / f"rank-{rank}.json")
+            if not any(scope.get("publication") for scope in raw["scopes"]):
+                continue
+            if rows is not None:
+                raise ValueError("detailed serving records have more than one observed output publisher")
+            rows = self.observed_publications(raw, aliases)
+        if rows is None:
+            raise ValueError("detailed serving records do not include an output publisher")
+        return rows
 
     @staticmethod
     def observed_publications(raw, aliases):
