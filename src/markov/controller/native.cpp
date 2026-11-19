@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "markov/performance/work_features.hpp"
 #include "markov/serving/service_times.hpp"
 
 namespace markov {
@@ -17,7 +18,7 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
     : requests_(std::move(requests)),
       peer_(peer),
       timeline_(timeline),
-      execution_inputs_(times.conditions()),
+      times_(times),
       observer_(observer),
       control_observer_(control_observer),
       cpu_(timeline, times, control_observer) {
@@ -52,10 +53,10 @@ NativeController::NativeController(std::vector<Request> requests, std::span<cons
              { "microbatch_requests", instance.microbatch_requests ? nlohmann::json(*instance.microbatch_requests) : nlohmann::json(nullptr) } }   }
         });
     }
-    if (execution_inputs_) {
+    if (auto * observed = times_.conditions()) {
         std::vector<std::string> names;
         for (const auto & [name, _] : groups_) names.push_back(name);
-        execution_inputs_->bind(names);
+        observed->bind(names);
     }
     auto content = nlohmann::json::array();
     for (const auto & request : requests_) {
@@ -261,7 +262,8 @@ std::optional<ServingAction> NativeController::plan(std::int64_t now_ns) {
 
             // Equal empty queues before and after a workload are different read states; reuse the delivery owner's history.
             input.identity = { { "instance", instances_.at(name) }, { "context", context }, { "received", received } };
-            const auto condition = execution_inputs_ ? execution_inputs_->input(name, input.identity, input.in_flow) : std::nullopt;
+            auto * observed = times_.conditions();
+            const auto condition = observed ? observed->input(name, input.identity, input.in_flow) : std::nullopt;
             if (condition) {
                 input.return_ns = std::max(now_ns, condition->begin_ns);
                 if (*input.return_ns > condition->end_ns) throw std::invalid_argument("native input entered after its supplied return window: " + input.identity.dump());
@@ -436,8 +438,15 @@ void NativeController::resolve_notifications() {
 
         // Bind when graph producers exist, before advancing time or waiting for the enclosing CPU return.
         notice.prerequisites.assign(prerequisites.begin(), prerequisites.end());
-        timeline_.resolve(*pending, notice.prerequisites, Relation::Signal,
-                          execution_inputs_ ? std::optional(execution_inputs_->notification(notice.identity)) : std::nullopt);
+        if (auto * observed = times_.conditions()) {
+            timeline_.resolve(*pending, notice.prerequisites, Relation::Signal,
+                              observed->notification(notice.identity), std::nullopt);
+        } else {
+            const nlohmann::json work{{ "operation", notice.identity.at("name") }};
+            const WorkFeatures features(Parameters{{ "dependencies", static_cast<std::int64_t>(prerequisites.size()) }});
+            const auto ns = times_.external(notice.identity.at("group").get_ref<const std::string &>(), work, WorkKind::Transfer, features);
+            timeline_.resolve(*pending, notice.prerequisites, Relation::Signal, std::nullopt, ns);
+        }
         notice.signals.clear();
         pending = pending_notices_.erase(pending);
     }

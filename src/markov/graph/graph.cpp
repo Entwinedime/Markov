@@ -4,6 +4,7 @@
 #include <compare>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -145,33 +146,66 @@ bool CoarseGraph::contains(std::size_t scope, std::size_t descendant) const {
 ActionLayout CoarseGraph::action_layout() const {
     std::vector<std::vector<std::size_t>> children(scopes.size()), owned(scopes.size());
     for (std::size_t scope = 1; scope < scopes.size(); ++scope) children[*scopes[scope].info.parent].push_back(scope);
-
-    using Lane = std::tuple<ResourceKind, std::int64_t, std::string_view, bool>;
-    std::map<Lane, std::size_t> lanes;
-    for (std::size_t event = 0; event < events.size(); ++event) {
-        const auto [scope, resource] = events[event];
-        owned[scope].push_back(event);
-        const auto & lane = resources[resource];
-        const auto [found, inserted] = lanes.try_emplace({lane.kind, lane.rank, lane.role, lane.serial}, resource);
-        if (!inserted && found->second != resource) throw std::invalid_argument("action timing has ambiguous logical resources");
-    }
-    auto logical_resources = nlohmann::json::array();
-    std::vector<std::size_t> resource_ids(resources.size());
-    for (const auto & [lane, resource] : lanes) {
-        const auto & [kind, rank, role, serial] = lane;
-        resource_ids[resource] = logical_resources.size();
-        logical_resources.push_back({resource_name(kind), rank, role, serial});
-    }
-
-    // Keep the template's within-scope boundary order on each logical lane. Raw graph IDs never cross runs.
-    ActionLayout result;
-    std::vector<std::size_t> order{0}, scope_ids(scopes.size()), event_ids(events.size());
+    std::vector<std::size_t> order{0}, scope_ids(scopes.size());
     order.reserve(scopes.size());
-    auto declarations = nlohmann::json::array();
     for (std::size_t position = 0; position < order.size(); ++position) {
         const auto scope = order[position];
         scope_ids[scope] = position;
         for (const auto child : children[scope]) order.push_back(child);
+    }
+    for (std::size_t event = 0; event < events.size(); ++event) owned[events[event].scope].push_back(event);
+
+    // Equal resource roles can occur in one action. Their uses distinguish the lanes without native IDs.
+    struct LaneUse {
+        std::vector<std::size_t> owners;
+        std::vector<std::tuple<std::size_t, Direction, std::string_view>> ports;
+        std::vector<std::pair<std::size_t, WorkKind>> work;
+        auto operator<=>(const LaneUse &) const = default;
+    };
+    const auto internal_resource_port = [](std::size_t scope, const auto & port) {
+        return scope == 0 && (port.name.starts_with("resource.enter/") || port.name.starts_with("resource.exit/"));
+    };
+    std::vector<LaneUse> uses(resources.size());
+    for (const auto scope : order) {
+        for (const auto event : owned[scope]) uses[events[event].resource].owners.push_back(scope_ids[scope]);
+        for (const auto & port : scopes[scope].ports) {
+            if (!internal_resource_port(scope, port))
+                uses[events[port.event].resource].ports.emplace_back(scope_ids[scope], port.direction, port.name);
+        }
+    }
+    for (const auto & piece : work) uses[piece.resource].work.emplace_back(scope_ids[piece.scope], piece.kind);
+
+    using Lane = std::tuple<ResourceKind, std::int64_t, std::string_view, bool>;
+    std::map<Lane, std::vector<std::size_t>> lanes;
+    for (std::size_t resource = 0; resource < resources.size(); ++resource) {
+        if (uses[resource].owners.empty()) continue;
+        const auto & lane = resources[resource];
+        lanes[{lane.kind, lane.rank, lane.role, lane.serial}].push_back(resource);
+    }
+    auto logical_resources = nlohmann::json::array();
+    std::vector<std::size_t> resource_ids(resources.size());
+    for (auto & [lane, group] : lanes) {
+        const auto & [kind, rank, role, serial] = lane;
+        if (group.size() > 1) {
+            for (const auto resource : group) {
+                std::ranges::sort(uses[resource].ports);
+                std::ranges::sort(uses[resource].work);
+            }
+            std::ranges::sort(group, std::less{}, [&](auto resource) -> const LaneUse & { return uses[resource]; });
+            if (std::ranges::adjacent_find(group, std::equal_to{}, [&](auto resource) -> const LaneUse & { return uses[resource]; }) != group.end())
+                throw std::invalid_argument("action timing has indistinguishable uses of resource role " + std::string(role));
+        }
+        for (const auto resource : group) {
+            resource_ids[resource] = logical_resources.size();
+            logical_resources.push_back({resource_name(kind), rank, role, serial});
+        }
+    }
+
+    // Keep the template's within-scope boundary order on each logical lane. Raw graph IDs never cross runs.
+    ActionLayout result;
+    std::vector<std::size_t> event_ids(events.size());
+    auto declarations = nlohmann::json::array();
+    for (const auto scope : order) {
         auto & local = owned[scope];
         std::stable_sort(local.begin(), local.end(), [&](auto left, auto right) {
             return resource_ids[events[left].resource] < resource_ids[events[right].resource];
@@ -190,7 +224,7 @@ ActionLayout CoarseGraph::action_layout() const {
     auto interfaces = nlohmann::json::array();
     for (const auto scope : order) {
         for (const auto & port : scopes[scope].ports) {
-            if (scope == 0 && (port.name.starts_with("resource.enter/") || port.name.starts_with("resource.exit/"))) continue;
+            if (internal_resource_port(scope, port)) continue;
             const nlohmann::json wait = port.wait ? nlohmann::json(event_ids[port.wait->begin]) : nullptr;
             const nlohmann::json rendezvous = port.rendezvous ? nlohmann::json(event_ids[*port.rendezvous]) : nullptr;
             interfaces.push_back({scope_ids[scope], port.name, direction_name(port.direction), event_ids[port.event], wait, rendezvous});
@@ -324,9 +358,9 @@ void CoarseGraph::validate() const {
             throw std::invalid_argument("work interval is owned by an unrelated semantic scope");
         if (piece.kind == WorkKind::Collective) {
             const auto & group = scopes[piece.scope].communication;
-            if (!group || group->required != group->members || resources[piece.resource].kind != ResourceKind::Stream
+            if (!group || group->required != group->members || resources[piece.resource].kind == ResourceKind::Service
                 || resources[piece.resource].rank != group->rank || !collective_scopes.insert(piece.scope).second)
-                throw std::invalid_argument("collective work requires one stream interval per participating scope");
+                throw std::invalid_argument("collective work requires one thread or stream interval per participating scope");
         }
         if (work_finish[piece.start]) throw std::invalid_argument("coarse work is charged twice at one entry boundary");
         work_finish[piece.start] = piece.finish;

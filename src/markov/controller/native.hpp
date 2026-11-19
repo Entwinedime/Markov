@@ -121,7 +121,7 @@ private:
     std::map<std::string, std::string> instances_;
     ControlPeer & peer_;
     Timeline & timeline_;
-    ExecutionInputs * execution_inputs_;
+    ServiceTimes & times_;
     ResourceObserver * observer_;
     ControlObserver * control_observer_;
     CpuMessages cpu_;
