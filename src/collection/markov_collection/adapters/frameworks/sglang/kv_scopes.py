@@ -3,6 +3,7 @@
 import inspect
 from contextvars import ContextVar, copy_context
 from functools import partial
+from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
 
 class ObservedExecutor:
@@ -16,32 +17,16 @@ class ObservedExecutor:
 
 
 class ReservationSocket:
-    def __init__(self, observation, socket, receiver, peer) -> None:
-        self.observation, self.socket, self.receiver, self.peer = observation, socket, receiver, peer
+    def __init__(self, owner, socket, receiver, peer) -> None:
+        self.owner, self.socket, self.receiver, self.peer = owner, socket, receiver, peer
 
     def send_multipart(self, *args, **kwargs):
-        owner, receiver = self.observation, self.receiver
-        work = owner.calls.request_work(receiver._markov_request)
-        work["context"]["reservation_peer"] = receiver.bootstrap_infos.index(self.peer)
-        with owner.calls.separate("kv_reservation", work), owner.call(
-            "kv_reservation", self.socket.send_multipart, parameters={}, work=work,
-        ) as call:
-            scope = call.record
-            scope["bindings"]["action"] = True
-
-            # The payload exists on entry; remote visibility can occur before this local send returns.
-            scope["ports"].append({"name": "reservation.ready", "direction": "output", "use": "signal",
-                                   "boundary": {"scope": scope["id"], "interval": "call", "side": "begin"}})
-            scope["reservation_publication"] = {
-                "request": work["context"]["request"]["id"],
-                "target": [self.peer["rank_ip"], self.peer["rank_port"]],
-            }
-            with owner.capture.runtime.service_scope(scope["reservation_publication"]):
-                return self.socket.send_multipart(*args, **kwargs)
+        return self.owner.send_reservation(self.socket.send_multipart, self.receiver, self.peer, args, kwargs)
 
 
 class NativeKvScopes:
-    def __init__(self, observation) -> None:
+    def __init__(self, calls, observation=None) -> None:
+        self.calls = calls
         self.observation = observation
         self.chunk = ContextVar("native_kv_chunk", default=None)
         self.service = ContextVar("native_kv_service", default=None)
@@ -49,12 +34,12 @@ class NativeKvScopes:
         self.reservation = ContextVar("native_kv_reservation", default=None)
         self.manager = None
         self.reservations = {}
-        self.requests = observation.description["protocol_requests"]
+        self.receipts = []
         self.states = []
 
     def update_status(self, original, manager, bootstrap_room, status):
         owner = self.observation
-        request = self.requests.get(str(bootstrap_room))
+        request = owner.description["protocol_requests"].get(str(bootstrap_room))
         if not owner.selected or request is None:
             return original(manager, bootstrap_room, status)
 
@@ -71,35 +56,64 @@ class NativeKvScopes:
         socket, lock = original(cls, peer)
         receiver = self.reservation.get()
         if receiver is not None:
-            socket = ReservationSocket(self.observation, socket, receiver, peer)
+            socket = ReservationSocket(self, socket, receiver, peer)
         return socket, lock
 
-    def poll(self, original, transport):
+    def receive_reservation(self, original, cls, message):
+        result = original(cls, message)
         owner = self.observation
-        if not owner.active or not owner.selected:
-            return original(transport)
-        req = transport._markov_request
+        request = owner.description["protocol_requests"].get(str(result.room))
+        if owner.selected and request is not None:
 
-        work = owner.calls.request_work(req)
-        with owner.calls.read("transport", original, work) as query:
+            # The receiver inserts the parsed contribution before reading the next reservation.
+            self.receipts.append({"request": request, "session": result.mooncake_session_id,
+                                  "received_raw_ns": clock_gettime_ns(CLOCK_MONOTONIC_RAW)})
+        return result
+
+    def send_reservation(self, original, receiver, peer, args, kwargs):
+        work = self.calls.request_work(receiver._markov_request)
+        work["context"]["reservation_peer"] = receiver.bootstrap_infos.index(peer)
+        owner = self.observation
+        with self.calls.separate("kv_reservation", work):
+            if owner is None:
+                with self.calls.native_call("kv_reservation", original, work=work):
+                    return original(*args, **kwargs)
+
+            with owner.call("kv_reservation", original, parameters={}, work=work) as call:
+                scope = call.record
+                scope["bindings"]["action"] = True
+
+                # Remote visibility can begin as soon as the complete payload is handed to the socket.
+                scope["ports"].append({"name": "reservation.ready", "direction": "output", "use": "signal",
+                                       "boundary": {"scope": scope["id"], "interval": "call", "side": "begin"}})
+                publication = {"request": work["context"]["request"]["id"], "target": [peer["rank_ip"], peer["rank_port"]]}
+                scope["reservation_publication"] = publication
+                with owner.capture.runtime.service_scope(publication):
+                    return original(*args, **kwargs)
+
+    def poll(self, original, transport):
+        if not self.calls.enabled:
+            return original(transport)
+
+        work = self.calls.request_work(transport._markov_request)
+        with self.calls.read("transport", original, work) as query:
             result = original(transport)
             query["result"] = result
         return result
 
     def reserve(self, original, receiver, kv_indices, aux_index=None, state_indices=None, decode_prefix_len=None):
         owner = self.observation
-        room = receiver.bootstrap_room
         request = receiver._markov_request
-        if owner.resource_history is not None:
-            owner.resource_history.state_binding("metadata", request, aux_index)
-        if request.rid in owner.content.aliases:
-            self.reservations[str(room)] = {"request": owner.content.aliases[request.rid], "index": aux_index}
-        if not owner.active or not owner.selected:
+        if owner is not None:
+            if owner.resource_history is not None:
+                owner.resource_history.state_binding("metadata", request, aux_index)
+            if request.rid in self.calls.aliases:
+                self.reservations[str(receiver.bootstrap_room)] = {"request": self.calls.request_id(request.rid), "index": aux_index}
+        if not self.calls.enabled:
             return original(receiver, kv_indices, aux_index, state_indices, decode_prefix_len)
 
-        work = owner.calls.work(None)
-        work["context"] = {"request": owner.calls.progress((request,))[0]}
-        with owner.calls.call("kv_reserve", original, parameters={"transfer_pages": len(kv_indices)}, work=work):
+        work = {"context": {"request": self.calls.progress((request,))[0]}}
+        with self.calls.call("kv_reserve", original, parameters={"transfer_pages": len(kv_indices)}, work=work):
             previous = self.reservation.set(receiver)
             try:
                 return original(receiver, kv_indices, aux_index, state_indices, decode_prefix_len)
@@ -116,9 +130,10 @@ class NativeKvScopes:
 
     def metadata_allocator(self, original, allocator, size):
         original(allocator, size)
-        if self.observation.resource_history is not None:
-            self.observation.resource_history.bind_field("metadata", allocator)
-        self.observation.calls.resources.bind_field("metadata", allocator)
+        owner = self.observation
+        if owner is not None and owner.resource_history is not None:
+            owner.resource_history.bind_field("metadata", allocator)
+        self.calls.resources.bind_field("metadata", allocator)
 
     def manager_init(self, original, manager, *args, **kwargs):
         result = original(manager, *args, **kwargs)
@@ -136,29 +151,30 @@ class NativeKvScopes:
         from sglang.srt.disaggregation.common.utils import TransferKVChunk
 
         owner = self.observation
-        if not owner.active or not owner.selected or not isinstance(item, TransferKVChunk):
+        if not self.calls.enabled or not isinstance(item, TransferKVChunk):
             return original(queue, item)
         request, page_size = self.request.get()
         begin = request.start_send_idx // page_size * page_size
         end = min(begin + len(item.prefill_kv_indices) * page_size, len(request.origin_input_ids))
-        work = owner.calls.request_work(request, begin, end)
+        work = self.calls.request_work(request, begin, end)
         parameters = {"transfer_pages": len(item.prefill_kv_indices), "transfer_tokens": end - begin, "last_chunk": int(item.is_last_chunk)}
 
         # FastQueue uses a reentrant condition: publish the completed marker before a consumer can take the task.
         with queue._cond:
-            with owner.calls.call(
+            with self.calls.call(
                 "kv_enqueue", original, parameters=parameters, work=work,
                 guards=(
                     ["eq", "last_chunk", parameters["last_chunk"]],
                     ["lt", 0, "transfer_pages"] if len(item.prefill_kv_indices) else ["eq", "transfer_pages", 0],
                 ),
             ):
-                call = owner.capture.scopes[owner.capture.current.get()]
-                item._markov_submission = call["id"]
-                call["native_kv_chunk"] = {
-                    "room": item.room, "source_pages": item.prefill_kv_indices.tolist(),
-                    "metadata_index": item.prefill_aux_index, "request_slot": int(request.req_pool_idx) - 1,
-                }
+                if owner is not None:
+                    call = owner.capture.scopes[owner.capture.current.get()]
+                    item._markov_submission = call["id"]
+                    call["native_kv_chunk"] = {
+                        "room": item.room, "source_pages": item.prefill_kv_indices.tolist(),
+                        "metadata_index": item.prefill_aux_index, "request_slot": int(request.req_pool_idx) - 1,
+                    }
                 return original(queue, item)
 
     def dequeue(self, original, queue):
@@ -205,9 +221,31 @@ class NativeKvScopes:
                 result = original(*arguments.args, **arguments.kwargs)
                 if result != 0:
                     raise RuntimeError(f"native KV service failed: {original.__qualname__}: {result}")
-                return result
             finally:
                 self.service.reset(previous)
+
+        # Publish observed geometry after the measured service returns so processing the evidence adds no cost.
+        self.payload(call.record)
+        return result
+
+    @staticmethod
+    def payload(scope):
+        transfer = scope["native_transfer"]
+        transferred_bytes = sum(length for _, _, length in transfer["blocks"])
+        scope["service"]["payload"] = {"bytes": transferred_bytes, "direction": "peer_device"}
+        scope["parameters"] = {"transfer_bytes": transferred_bytes}
+
+        # State is indexed by logical tokens; the physical transport sends full pages or fixed metadata rows.
+        pages = len(transfer.get("source_pages", ()))
+        if pages:
+            page_bytes, tail = divmod(transferred_bytes, pages)
+            if tail or not page_bytes:
+                raise ValueError("native KV transport has no complete per-page byte extent")
+            scope["arguments"] = {"transfer_bytes": ["mul", "transfer_pages", page_bytes]}
+            scope["constants"] = {}
+        else:
+            scope["arguments"] = {}
+            scope["constants"] = {"transfer_bytes": transferred_bytes}
 
     def transfer_data(self, original, engine, session_id, buffers, peer_buffer_addresses, lengths):
         call = self.service.get()
@@ -243,20 +281,28 @@ class NativeKvScopes:
 
     def install(self):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-        from sglang.srt.disaggregation.ascend.conn import AscendKVManager
-        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 
         for target, hook in (
             ("sglang.srt.disaggregation.utils.ReqToMetadataIdxAllocator.__init__", self.metadata_allocator),
-            ("sglang.srt.disaggregation.common.conn.CommonKVManager.update_status", self.update_status),
             ("sglang.srt.disaggregation.common.conn.CommonKVReceiver._connect_to_bootstrap_server", self.connect_reservation),
             ("sglang.srt.disaggregation.mooncake.conn.MooncakeKVSender.poll", self.poll),
             ("sglang.srt.disaggregation.mooncake.conn.MooncakeKVReceiver.poll", self.poll),
             ("sglang.srt.managers.scheduler.Scheduler.send_kv_chunk", self.send_chunk),
-            ("sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__", self.manager_init),
             ("sglang.srt.disaggregation.mooncake.conn.MooncakeKVReceiver.send_metadata", self.reserve),
-            ("sglang.srt.disaggregation.utils.MetadataBuffers.set_buf", self.metadata),
             ("sglang.srt.disaggregation.common.utils.FastQueue.put", self.enqueue),
+        ):
+            HookRegistry.register(target, hook, HookType.AROUND)
+        if self.observation is None:
+            return
+
+        from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        for target, hook in (
+            ("sglang.srt.disaggregation.common.conn.CommonKVManager.update_status", self.update_status),
+            ("sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__", self.manager_init),
+            ("sglang.srt.disaggregation.mooncake.conn.TransferInfo.from_zmq", self.receive_reservation),
+            ("sglang.srt.disaggregation.utils.MetadataBuffers.set_buf", self.metadata),
             ("sglang.srt.disaggregation.common.utils.FastQueue.get", self.dequeue),
             ("sglang.srt.distributed.device_communicators.mooncake_transfer_engine.MooncakeTransferEngine.batch_transfer_sync", self.transfer_data),
         ):

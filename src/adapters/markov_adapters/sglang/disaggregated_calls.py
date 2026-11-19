@@ -6,6 +6,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from markov_adapters.sglang.batches import BatchTensors
+from markov_adapters.sglang.calls import ActionCall
 
 
 class MetadataCalls(TorchFunctionMode):
@@ -65,14 +66,12 @@ class DisaggregatedCalls:
     def queue(self, operation, original, owner, *args, host_only=False, **kwargs):
         if not self.calls.enabled:
             return original(owner, *args, **kwargs)
-        with self.calls.call(operation, original, parameters={}, work=self.calls.scheduler_work(), host_only=host_only) as frame:
+        with self.calls.call(operation, original, parameters={}, work=self.calls.scheduler_work(), inputs=owner,
+                             host_only=host_only) as frame:
             result = original(owner, *args, **kwargs)
             if operation == "prefill_finish":
                 frame.outputs = self.calls.completed(result)
             return result
-
-    def select(self, original, scheduler, *args, **kwargs):
-        return self.calls.select(original, scheduler, *args, **kwargs)
 
     def poll(self, original, pollers, *args, **kwargs):
         calls = self.calls
@@ -111,6 +110,22 @@ class DisaggregatedCalls:
             guards=(["lt", 0, "prefix_tokens"] if prefix else ["eq", "prefix_tokens", 0],),
         ):
             return original(queue, req, prefix_indices, prefix_len, total_prefix_len)
+
+    def read_reservation_indices(self, original, tensor, *args, **kwargs):
+        calls = self.calls
+        frame = calls.current.get()
+        if not calls.enabled or frame is None or frame.operation != "decode_reserve":
+            return original(tensor, *args, **kwargs)
+        slots = frame.inputs.req_to_token_pool.req_to_token
+        if tensor.untyped_storage()._cdata != slots.untyped_storage()._cdata:
+            return original(tensor, *args, **kwargs)
+
+        # Native serving copies this slice to the host; device-free control sees the same slice in its CPU view.
+        work = dict(frame.work)
+        parameters = {"elements": tensor.numel(), "element_bytes": tensor.element_size()}
+        boundary = ActionCall("reservation_indices", parameters, work, input_use="host")
+        with calls.separate(boundary.operation, work), calls.boundary(self.read_reservation_indices, boundary):
+            return original(tensor, *args, **kwargs)
 
     def receive(self, original, queue, decode_req):
         if not self.calls.enabled:
@@ -187,7 +202,7 @@ class DisaggregatedCalls:
 
                 # Preparation, cache, batch transforms and KV submission are separate child actions.
                 (scheduler + "get_next_disagg_prefill_batch_to_run", partial(self.queue, "prefill_select", host_only=True)),
-                (scheduler + "get_new_batch_prefill", self.select),
+                (scheduler + "get_new_batch_prefill", self.calls.selection.select),
                 (scheduler + "process_prefill_chunk", partial(self.queue, "prefill_chunk", host_only=True)),
 
                 # Resource releases and publication are child actions; the remaining loop is CPU work.
@@ -198,7 +213,7 @@ class DisaggregatedCalls:
             hooks = (
                 ("sglang.srt.disaggregation.decode.DecodePreallocQueue._create_receiver_and_enqueue", self.create_receiver),
                 (scheduler + "get_next_disagg_decode_batch_to_run", partial(self.queue, "decode_select", host_only=True)),
-                (scheduler + "update_running_batch", self.select),
+                (scheduler + "update_running_batch", self.calls.selection.select),
                 (scheduler + "process_decode_queue", partial(self.queue, "decode_queue")),
 
                 # Cache matching, tensor preparation and commit are child actions; admission only selects requests.
@@ -206,6 +221,7 @@ class DisaggregatedCalls:
                 ("sglang.srt.disaggregation.decode.DecodePreallocQueue.pop_preallocated", partial(self.queue, "decode_reserve")),
                 ("sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred", self.transferred),
                 ("sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc", self.preallocate),
+                ("torch.Tensor.cpu", self.read_reservation_indices),
                 ("sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req", self.receive),
                 ("sglang.srt.managers.schedule_batch.ScheduleBatch.prepare_for_prebuilt", self.prepare),
                 ("sglang.srt.managers.schedule_batch.ScheduleBatch.process_prebuilt", self.commit),

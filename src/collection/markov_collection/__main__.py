@@ -53,6 +53,8 @@ def main() -> None:
         observation.name_streams(*PipelineABI.stream_declarations(recording))
         facts = observation.document(arguments.evidence)
         native.connect_metadata(facts)
+        if arguments.evidence and (timing := native.protocol_timings()) is not None:
+            facts["measurements"]["pd_protocol"] = timing
         write_json(arguments.output, facts, replace=False)
 
 

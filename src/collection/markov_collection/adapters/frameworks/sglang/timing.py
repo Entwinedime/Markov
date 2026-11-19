@@ -17,7 +17,9 @@ class NativeTiming:
         self.rank_offset = description["rank_offset"]
         self.window = ObservationWindow(Path(description["output"]), description)
         self.content = NativeContent(description)
-        self.host = NativeHostSamples(self.content.aliases) if description["host_timing"] else None
+        self.host = None
+        if description["host_timing"]:
+            self.host = NativeHostSamples(self.content.aliases, description["mode"], self.rank_offset)
         if self.host is not None:
             self.content.auxiliary = self.host.auxiliary
         else:

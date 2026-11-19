@@ -6,16 +6,19 @@ from functools import partial, update_wrapper
 from threading import get_native_id
 from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
+from markov_adapters.sglang.groups import ParallelGroups
 from markov_adapters.sglang.state_calls import RequestStateCalls
 from markov_collection.adapters.frameworks.sglang.communications import DeviceCollectiveCuts
 from markov_collection.adapters.frameworks.sglang.flow_scopes import ServingCuts
+from markov_collection.adapters.frameworks.sglang.kv_scopes import NativeKvScopes
 from markov_collection.adapters.frameworks.sglang.module_scopes import ModelScopes
 from markov_collection.adapters.runtimes.ascend.host_profile import AscendHostProfile
 
 
 class NativeHostSamples(ServingCuts):
-    def __init__(self, aliases):
-        super().__init__(aliases)
+    def __init__(self, aliases, mode, rank_offset):
+        super().__init__(aliases, mode)
+        self.rank_offset = rank_offset
         self.enabled = False
         self.request_state = RequestStateCalls(observe=False)
         self.parent = ContextVar("timed_host_scope", default=0)
@@ -26,6 +29,8 @@ class NativeHostSamples(ServingCuts):
     def start(self, scheduler, rank, directory):
         self.scheduler = scheduler
         self.rank = rank
+        self.groups = ParallelGroups()
+        self.collective_groups = self.groups.document(self.rank_offset)
         self.profile = AscendHostProfile(directory)
         self.profile.start()
 
@@ -52,9 +57,16 @@ class NativeHostSamples(ServingCuts):
     def collective_at_root(self):
         return self.parent.get() == 0
 
-    def device_collective(self, original, role, group, root_rank, gather, run):
+    def observe_exchange(self, original, role, group, root_rank, gather, run):
         with self.native_call(role, original):
             return run()
+
+    def collective(self, original, boundary, arguments):
+        role = boundary.condition["collective"]["group"]
+        with self.native_call(boundary.operation, original, work=boundary.work, condition=boundary.condition) as scope:
+            scope["group"] = self.collective_groups[role]
+            scope["parameters"] = boundary.parameters
+            return original(**arguments)
 
     def enclosing(self, frame):
         return self.native_call("invocation", frame.original, work=frame.work)
@@ -70,6 +82,7 @@ class NativeHostSamples(ServingCuts):
         with self.native_call(boundary.operation, original, work=boundary.work) as occurrence:
             yield
         occurrence["work"]["context"] = boundary.work["context"]
+        occurrence["parameters"] = boundary.parameters
 
     @contextmanager
     def read_boundary(self, kind, original, work, condition):
@@ -122,9 +135,11 @@ class NativeHostSamples(ServingCuts):
             self.auxiliary_intervals.append([get_native_id(), begin, clock_gettime_ns(CLOCK_MONOTONIC_RAW)])
 
     def install(self):
-        super().install()
         ModelScopes.install_engine_hooks(self)
         DeviceCollectiveCuts(self).install()
+        if self.mode != "null":
+            NativeKvScopes(self).install()
+        super().install()
 
     def document(self):
         return {

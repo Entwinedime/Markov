@@ -93,9 +93,6 @@ class FlowExecution(CallSegments):
             for req in requests
         ]
 
-    def select(self, original, scheduler, *args, **kwargs):
-        return self.selection.select(original, scheduler, *args, **kwargs)
-
     def collective(self, original, boundary, arguments):
 
         # Inputs are available at graph entry; consuming a result must not wait for peers' graph returns.

@@ -148,10 +148,11 @@ class AscendObservation:
             resource = self.resource("thread", interval.thread, "native")
             raw = self.raw["scopes"][scope]
             kind = "wait" if "service" in raw else "boundary" if raw.get("envelope", False) else "host"
-            if "communication" in raw and "device_entry" not in raw:
+            exchange = raw.get("communication")
+            if exchange is not None and "device_entry" not in raw:
 
-                # A blocking CPU collective is communication work, not host compute plus a second copy of its wait.
-                kind = "communication"
+                # Charge all-peer service after rendezvous; asymmetric calls retain their own completion rules.
+                kind = "collective" if exchange["required"] == exchange["members"] else "communication"
                 if interval.begin < interval.end:
                     self.resources[resource]["payload"].append([interval.begin, interval.end])
             self.host[scope] = self.span(scope, resource, interval.begin, interval.end, kind)
@@ -227,6 +228,25 @@ class AscendObservation:
             if "submitted_by" in raw:
                 producer = self.host[raw["submitted_by"]]
                 self.edge(self.endpoint(producer, "end"), self.endpoint(span, "begin"), "submission")
+
+    def transfer_times(self) -> list:
+        samples = [
+            [self.spans[span]["resource"], interval.begin, interval.end,
+             interval.record["end_raw_ns"] - interval.record["begin_raw_ns"], interval.record["bytes"], direction]
+            for _, span, interval, direction in self.host_copies
+        ]
+        for scope, identity in self.services.items():
+            raw = self.raw["scopes"][scope]
+            service = raw["service"]
+            payload = service.get("payload")
+            if not payload or not payload["bytes"] or not service["executions"]:
+                continue
+            span, stamps = self.spans[identity], raw["host_interval"]
+
+            # Queue attribution already checked the private submissions. Its synchronous return joins the workers.
+            samples.append([span["resource"], span["begin"], span["end"], stamps["end_raw_ns"] - stamps["begin_raw_ns"],
+                            payload["bytes"], payload["direction"]])
+        return samples
 
     def device_spans(self) -> None:
         points = self.trace.device_points
@@ -786,10 +806,6 @@ class AscendObservation:
                 for scope, (resource, begin, end, _) in self.collectives.items()
             ]
             result["measurements"]["device_clock_radius_ns"] = self.trace.clock.radius_ns
-            result["measurements"]["synchronous_copies"] = [
-                [self.spans[span]["resource"], interval.begin, interval.end,
-                 interval.record["end_raw_ns"] - interval.record["begin_raw_ns"], interval.record["bytes"], direction]
-                for _, span, interval, direction in self.host_copies
-            ]
+            result["measurements"]["synchronous_transfers"] = self.transfer_times()
             result["native_effects"] = self.streams.evidence(self.resource_ids)
         return result

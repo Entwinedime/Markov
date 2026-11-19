@@ -37,7 +37,7 @@ class DeviceCollectiveCuts:
             gather = group, arguments.arguments["input_"], arguments.arguments["dim"]
         role = "gather" if gather is not None and self.scopes.collective_at_root else "communication"
         with self.outer():
-            return self.scopes.device_collective(
+            return self.scopes.observe_exchange(
                 original, role, group.device_group, root_rank, gather, partial(original, group, *args, **kwargs),
             )
 
@@ -63,7 +63,7 @@ class DeviceCollectiveCuts:
         if arguments.arguments.get("group_src") is not None:
             root_rank = distributed.get_global_rank(group, arguments.arguments["group_src"])
         with self.outer():
-            return self.scopes.device_collective(
+            return self.scopes.observe_exchange(
                 original, "communication", group, root_rank, None, partial(original, *args, **kwargs),
             )
 
@@ -105,7 +105,7 @@ class NativeCommunications:
     def collective_at_root(self):
         return self.observation.capture.current.get() == 0
 
-    def device_collective(self, original, role, group, root_rank, gather, run):
+    def observe_exchange(self, original, role, group, root_rank, gather, run):
         owner = self.observation
         standalone = role == "gather"
         parameters, relations, shape = None, None, None

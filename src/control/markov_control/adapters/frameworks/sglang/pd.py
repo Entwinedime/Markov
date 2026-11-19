@@ -67,6 +67,10 @@ class NativePdBackend:
     def reservation_signal(publisher, request, recipient):
         return f"{publisher}/pd-reservation/{request}/{recipient}"
 
+    @staticmethod
+    def reservation_receipt(publisher, request, recipient):
+        return {"group": recipient, "name": "kv_reservation_received", "work": {"request": request, "publisher": publisher}}
+
     def waiting(self):
         transports = (*self.senders.values(), *self.receivers.values())
 
@@ -312,23 +316,24 @@ class NativeKvReceiver(NativeKvPolling, MooncakeKVReceiver):
             for index, (peer, target) in enumerate(backend.topology.peers.items()):
                 signal = backend.reservation_signal(scheduler.group, request, target["group"])
                 self.signals.add(signal)
-                packets = [{"target": peer, "value": {
+                packet = {"target": peer, "value": {
                     "kind": "reservation", "room": self.bootstrap_room, "pages": pages, "prefix": decode_prefix_len or 0,
-                }}]
-                completion = None
+                }}
+                backend.exchange([packet], completion={
+                    "request": int(self._markov_request.rid),
+                    "notification": backend.reservation_receipt(scheduler.group, request, target["group"]),
+                    "signals": [signal], "after": [],
+                })
                 if scheduler.group == target["publishers"][0]:
 
-                    # One publisher declares the shared gate; every actual publisher supplies its own graph signal.
-                    packets.append({"target": peer, "value": {"kind": "reservation_visible", "room": self.bootstrap_room}})
-                    completion = {
+                    # The destination consumes reservations in delivery order and enters readiness after the whole group.
+                    backend.exchange([{"target": peer, "value": {"kind": "reservation_visible", "room": self.bootstrap_room}}], completion={
                         "request": int(self._markov_request.rid),
                         "notification": {"group": target["group"], "name": "kv_ready", "work": {"request": request}},
-                        "signals": [backend.reservation_signal(publisher, request, target["group"])
-                                    for publisher in target["publishers"]], "after": [],
-                    }
+                        "signals": [], "after": [backend.reservation_receipt(publisher, request, target["group"])
+                                                  for publisher in target["publishers"]],
+                    })
 
-                # Payloads can be queued early, but the sender cannot use them until the causal gate is visible.
-                backend.exchange(packets, completion=completion)
                 publication = calls.request_work(self._markov_request)
                 publication["context"]["reservation_peer"] = index
                 publication["signals"] = {"reservation.ready": signal}

@@ -359,6 +359,7 @@ class SGLangObservation:
                 recording["request_ingress"] = self.window.ingress
                 recording["state_queries"] = self.calls.queries
                 recording["protocol_states"] = self.kv_transfers.states
+                recording["reservation_receipts"] = self.kv_transfers.receipts
                 recording["kv_session"] = None if registration is None else registration["session"]
                 recording["kv_endpoint"] = None if registration is None else registration["control_endpoint"]
                 if self.resource_history is not None:
@@ -401,7 +402,7 @@ class SGLangObservation:
         self.calls = FlowScopes(self)
         NativeProfiles(self).install()
         NativeCommunications(self).install()
-        self.kv_transfers = NativeKvScopes(self)
+        self.kv_transfers = NativeKvScopes(self.calls, self)
         self.kv_transfers.install()
         self.calls.install()
         if self.description["pp_size"] > 1:

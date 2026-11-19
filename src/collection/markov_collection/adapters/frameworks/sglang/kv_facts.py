@@ -210,3 +210,26 @@ class NativeKvFacts:
                 "boundary": {"scope": services[-1]["id"], "interval": "service", "side": "end"},
             })
         return self.recording
+
+    def protocol_timings(self):
+        recording = self.recording
+        if recording["kv_session"] is None:
+            return None
+
+        reservations, transfers = [], []
+        for scope in recording["scopes"]:
+            if "reservation_publication" in scope:
+                reservations.append(scope["reservation_publication"])
+            if "native_transfer" in scope:
+                parent = scope["submitted_by"]
+                member, = recording["scopes"][parent]["work"]["members"]
+                transfer = scope["native_transfer"]
+                transfers.append({
+                    "request": member["id"], "chunk": parent, "kind": transfer["kind"],
+                    "destination": transfer["session"], "end_raw_ns": scope["host_interval"]["end_raw_ns"],
+                })
+        return {
+            "session": recording["kv_session"], "endpoint": recording["kv_endpoint"],
+            "states": recording["protocol_states"], "reservations": reservations, "transfers": transfers,
+            "receipts": recording["reservation_receipts"],
+        }

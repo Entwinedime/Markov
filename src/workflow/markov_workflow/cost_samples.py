@@ -36,7 +36,9 @@ class WorkCatalog:
 class ServiceSamples:
     def __init__(self, catalog):
         self.catalog = catalog
+        self.definitions = list(catalog.definitions)
         self.rows = {}
+        self.external = {}
 
     def add(self, definition, interval, features, duration_ns, copy=None, collective=None):
         key = definition, interval, json.dumps([features, copy, collective], sort_keys=True)
@@ -49,9 +51,16 @@ class ServiceSamples:
             row["collective"] = {"dtype": collective[0], "algorithm": collective[1], "elements": collective[2]}
         row["observations_ns"].append(duration_ns)
 
+    def add_external(self, identity, kind, features, duration_ns):
+        key = json.dumps(identity, sort_keys=True)
+        if key not in self.external:
+            self.external[key] = len(self.definitions)
+            self.definitions.append({"external": identity, "work": [{"kind": kind}]})
+        self.add(self.external[key], 0, features, duration_ns)
+
     def document(self, unmeasured):
         return {
-            "domain": self.catalog.domain, "definitions": self.catalog.definitions,
+            "domain": self.catalog.domain, "definitions": self.definitions,
             "samples": list(self.rows.values()), "unmeasured": dict(unmeasured),
         }
 
@@ -130,21 +139,29 @@ class CostSamples:
             raise ValueError("cost measurements and coarse graph come from different native observations")
 
         self.collectives = {}
-        if measurement["collectives"]:
+        self.notifications = []
+        peers = {}
+        if measurement["collectives"] or "pd_protocol" in measurement:
             peers = {actor: facts if actor == rank else json.loads((work / f"{actor}-facts.json").read_text())
                      for actor in ranks}
+        if measurement["collectives"]:
             self.collectives = CollectiveServices(peers, rank).samples
+        if "pd_protocol" in measurement:
+            from markov_workflow.adapters.sglang_pd_samples import PdNotificationSamples
+
+            protocol = {actor: body["measurements"]["pd_protocol"] for actor, body in peers.items()}
+            self.notifications = list(PdNotificationSamples(protocol).intervals(rank))
 
         self.services = defaultdict(dict)
         for lane, begin, end, duration_ns in measurement["device_services"]:
             if duration_ns < 0 or (begin, end) in self.services[lane]:
                 raise ValueError("physical service has a negative duration or repeated position")
             self.services[lane][begin, end] = duration_ns
-        self.copies = {}
-        for lane, begin, end, duration_ns, size, direction in measurement["synchronous_copies"]:
-            if duration_ns < 0 or size <= 0 or (lane, begin, end) in self.copies:
-                raise ValueError("synchronous copy has invalid or repeated service evidence")
-            self.copies[lane, begin, end] = duration_ns, size, direction
+        self.transfers = {}
+        for lane, begin, end, duration_ns, size, direction in measurement["synchronous_transfers"]:
+            if duration_ns < 0 or size <= 0 or (lane, begin, end) in self.transfers:
+                raise ValueError("synchronous transfer has invalid or repeated service evidence")
+            self.transfers[lane, begin, end] = duration_ns, size, direction
         self.payload = [resource["payload"] for resource in facts["resources"]]
         self.positions = [[begin for begin, _ in ranges] for ranges in self.payload]
 
@@ -160,7 +177,7 @@ class CostSamples:
         if self.graph["resources"][lane]["kind"] != "stream":
             if piece["kind"] != "transfer":
                 return None, None, None
-            copy = self.copies.get((lane, begin, end))
+            copy = self.transfers.get((lane, begin, end))
             return (copy[0], [copy[1], copy[2]], None) if copy is not None else (None, None, None)
 
         positions, payload = self.positions[lane], self.payload[lane]
@@ -180,4 +197,15 @@ class CostSamples:
 
             # Source request and physical resource IDs locate the observation only.
             samples.add(definition, interval, features, duration_ns, copy, collective)
-        write_json(self.output, samples.document(absent), replace=False)
+        for measured in self.notifications:
+            span = measured["duration_bounds_ns"]
+            if span is None:
+                absent["notification"] += 1
+                continue
+            features = {"phase": "", "axes": {"parameter.dependencies": measured["dependencies"]}}
+            samples.add_external({"operation": measured["operation"]}, "transfer", features, sum(span) // 2)
+
+        report = samples.document(absent)
+        if self.notifications:
+            report["notification_measurements"] = self.notifications
+        write_json(self.output, report, replace=False)

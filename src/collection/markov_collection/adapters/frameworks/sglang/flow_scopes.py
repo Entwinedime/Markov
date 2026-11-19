@@ -17,9 +17,10 @@ from markov_adapters.sglang.selection import BatchSelection
 class ServingCuts(CallSegments):
     """Use the native scheduler's same cut points for structure and CPU timing."""
 
-    def __init__(self, aliases, *, effects=False) -> None:
+    def __init__(self, aliases, mode, *, effects=False) -> None:
         super().__init__()
         self.aliases = aliases
+        self.mode = mode
         self.effects = effects
         self.resources = ResourceCalls(self)
         self.selection = BatchSelection(self)
@@ -38,6 +39,12 @@ class ServingCuts(CallSegments):
 
     def batch_work(self, batch):
         return self.work(batch, BatchTensors.members(batch), phase=BatchTensors.phase(batch))
+
+    def completed(self, requests):
+        return [
+            {"id": self.request_id(req.rid), "generated_tokens": len(req.output_ids), "finished": req.finished()}
+            for req in requests
+        ]
 
     def result(self, original, scheduler, batch, output):
         if not self.enabled:
@@ -93,11 +100,14 @@ class ServingCuts(CallSegments):
         self.resources.install()
         DecisionClocks(self).install()
         HostReads(self).install()
+        MetadataCollectives(self).install()
+        if self.mode != "null":
+            DisaggregatedCalls(self).install(self.mode)
 
 
 class FlowScopes(ServingCuts):
     def __init__(self, observation) -> None:
-        super().__init__(observation.content.aliases, effects=True)
+        super().__init__(observation.content.aliases, observation.description["mode"], effects=True)
         self.observation = observation
         self.request_state = observation.request_state
         self.queries = []
@@ -124,12 +134,6 @@ class FlowScopes(ServingCuts):
     @property
     def rank(self):
         return self.observation.parallel["rank"]
-
-    def completed(self, requests):
-        return [
-            {"id": self.request_id(req.rid), "generated_tokens": len(req.output_ids), "finished": req.finished()}
-            for req in requests
-        ]
 
     @contextmanager
     def read_boundary(self, kind, original, work, condition):
@@ -244,9 +248,3 @@ class FlowScopes(ServingCuts):
         self.observation.prepare_roles()
         if self.observation.resource_history is not None:
             self.observation.resource_history.bind(result.tree_cache, allocator, result.req_to_token_pool)
-
-    def install(self) -> None:
-        super().install()
-        MetadataCollectives(self).install()
-        if self.observation.description["mode"] != "null":
-            DisaggregatedCalls(self).install(self.observation.description["mode"])
