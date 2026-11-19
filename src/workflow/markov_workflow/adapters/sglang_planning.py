@@ -111,7 +111,7 @@ class SourcePlanning:
                        "selected workloads run sequentially after all-worker native idle; cache persists between groups",
                        "redundant whole requests are removed only while declared input opportunities remain; retained arrivals and expert routes are unchanged",
                 "performance sources preserve prompt and final Decode context endpoints and retain work up to native resident batch capacity",
-                       "mixed source inputs preserve competing requests beyond the resident PP/batch window when available; actual mixing still requires observation",
+                       "selected mixed-batch workloads preserve their arriving requests for performance sampling; actual mixing still requires observation",
                        "representative lengths preserve prefix, page/chunk remainders and route transitions; padding is unchanged",
                        "cached local output1/2 pairs shorten Prefill below one page when possible; request routes shift at the Prefill/Decode boundary",
                        "fixed arrival gaps keep original lengths; other shortening must preserve declared input conditions",

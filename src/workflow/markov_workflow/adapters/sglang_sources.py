@@ -323,18 +323,26 @@ class RepresentativeSources:
             probes = LifecycleProbes(instances[configuration], topologies)
             normalized = {}
             covered = set()
+            mixed_service = service_evidence and any(
+                instance.configuration.values["mixed_batches"] for instance in instances[configuration]
+            )
             for item in selected:
                 name, conditions = item["name"], item["conditions"]
                 original = self.workloads[name]
-                normalized[name] = self.reduce_requests(instances[configuration], original, conditions, bounds)
+                representative = original
+                if not mixed_service:
+                    representative = self.reduce_requests(instances[configuration], original, conditions, bounds)
 
-                # Fixed arrival gaps cannot be rescaled without knowing native execution time.
-                if "later_arrival" not in conditions:
-                    shortened = probes.normalize(normalized[name])
-                    shortened_conditions = self.conditions(instances[configuration], shortened) | self.length_evidence(shortened, bounds)
-                    if conditions <= shortened_conditions:
-                        normalized[name] = shortened
-                covered.update(self.conditions(instances[configuration], normalized[name]) | self.length_evidence(normalized[name], bounds))
+                    # Fixed arrival gaps cannot be rescaled without knowing native execution time.
+                    if "later_arrival" not in conditions:
+                        shortened = probes.normalize(representative)
+                        shortened_conditions = self.conditions(instances[configuration], shortened) | self.length_evidence(shortened, bounds)
+                        if conditions <= shortened_conditions:
+                            representative = shortened
+
+                # Repeated requests can coexist with later chunks even when their individual lengths are redundant.
+                normalized[name] = representative
+                covered.update(self.conditions(instances[configuration], representative) | self.length_evidence(representative, bounds))
             workload, submissions = self.combine(names, topologies, normalized)
             single_model = any(self.model_coverage(instance.mode, instance.configuration.values, covered)
                                for instance in instances[configuration])
