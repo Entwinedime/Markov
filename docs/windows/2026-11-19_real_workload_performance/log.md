@@ -301,3 +301,145 @@
 **验证：** 两档各完成全部 100 条、10,483 token，逐请求核对生成步和结束标记。并发 8 墙钟为 270.04 秒，S2 同配置给定时长为 268.16 秒，两次分别处理 166.49 万和 172.79 万项工作。两档查时累计 2.82 和 1.75 秒，占墙钟 0.82% 和 0.65%。独立两请求图的 616 项设备和 424 项同步搬运均有成本，逐特征点相对误差中位数为 2.00% 和 4.65%。 [阶段证据](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s5-development-closure.json)
 
 **结论与限制：** 并发 8 的开发 TTFT、TPOT MAPE 为 3.93% 和 4.65%，各 100 条。实测和预测吞吐分别为 60.22 和 57.84 token/s。阶段审查覆盖原生采样、模板身份、模型装载、时间线前查询、输出发布及外围评价，业务变更净增 1,110 行，示例净增 62 行。发布保留复现输入、证据及开发失败，数据留在 Git 之外。性能正常路径的验证范围是单实例 dense TP1，独立留出与全窗口验收进入下一阶段。
+
+## 2026-11-19 — S6 开始：冻结四个留出组合
+
+**范围：** 核对远端交付 `759fe37`。常态和突发流量各 48 条，分别验证并发 4 和 8。详细采集与轻量时延各一次每例，预算为 1,800 和 1,200 秒每例，使用设备 4，保留空间上限 128 GiB。 [冻结清单](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/freeze.json)
+
+**改动：** 登记程序、镜像、两份模板、成本、输入和评价代码的摘要。原生同例预热并清空业务 KV 后采集，独立成本预测仅挂载冻结的必要输入。外围启动检查先行创建了预测输出目录，公开入口在起步即拒绝。修正挂载至输出父目录，保留启动检查记录。
+
+**验证：** 复核留出与开发段无重叠，且原生详细采集和独立预测均进入首批实际运行。首个正常预测结束于常态并发 8 的分配工作。请求合计 7,419 token，当前对应模型的样本上限为 7,207。 [采集账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-detailed/execution.json) · [成本缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/cost/prediction/cost-gap.json)
+
+**结论与限制：** 首个失败是冻结成本覆盖差距，结构分支和其余组合仍在收集。完整矩阵前保留冻结资产和既有结论。
+
+## 2026-11-19 — S6：收齐冻结成本预测分支
+
+**范围：** 四组独立成本运行分别发布成功结果或首处缺口。继续在同一卡上完成详细原生采集。
+
+**改动：** 汇总四组冻结结果，准备复用原生投影、逐端点计时和独立对照入口的结构评估脚本。冻结业务和评价代码。
+
+**验证：** 突发并发 4 完成 48 条请求与 5,344 token，逐请求校验生成步及结束标记，墙钟 179.96 秒。常态并发 4、常态并发 8 与突发并发 8 的首处缺口均为相同的原生分配工作，实际输入分别为 7,404、7,419 与 7,850 token，样本上限为 7,207。 [四组成本结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/cost-results.json)
+
+**结论与限制：** 三处均已选择对应结构模板，差距在该成本定义的实测长度范围。原生及结构对照尚未收齐，四组精度和配置排序待核对。
+
+## 2026-11-19 — S6：封存首组详细原生记录
+
+**范围：** 常态并发 8 完成一次详细采集，预热 188.03 秒、正式观测与收尾 634.25 秒，共 888.68 秒。常态并发 4 开始原生运行。 [首组采集结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-detailed/result.json)
+
+**改动：** 由采集逐例发布触发粗图和全节点检查。检查器在冻结的控制镜像内求解时钟，修正外围输出目录的写入挂载。轻量采集结束后复用冻结评估器汇总请求数、提交偏差、特化加载、误差和配置排序。
+
+**验证：** 首份原始记录约 2.4 GiB，已完成 SDK 导出并进入解释阶段。复核同一分配器的样本按完整工作定义归属，8,176 token 已测的是 50 个工作区间的变体，三组预测缺口对应 80 个工作区间的变体，最长合格样本 7,207 token。 [冻结成本资产](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/data-port-geometry/assignment.json) · [解释日志](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure/observed/logs/002-0-interpret.log)
+
+**结论与限制：** 已发布的详细记录可供独立检验。全节点资格需等待时钟校准和结构对照结果。
+
+## 2026-11-19 — S6：核对大批次分配的采样来源
+
+**范围** 常态并发 4 的详细采集在 1,168.53 秒后发布，突发并发 8 开始。常态并发 8 的粗图已发布，进入来源证据检查。 [并发 4 采集账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/detailed-run.json) · [首组粗图账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure/observed/result.json)
+
+**改动** 在首份粗图上使用正式工作身份导出与需求扫描，离线检查原生组批产生的各类工作能否查询冻结成本，后处理额度 1,800 秒。
+
+**证据** 独立开发配方尝试同时提交八条 1,022 token 请求。页面为 16，向上取整后合计正好 8,192 token。原生在批次已有请求时拒绝触及该上限的候选，粗图只观察到七条一组、合计 7,154 token 的长分配。上限样本中的 8,176 token 来自整页分配。三组首处缺口对应同一实现中同时写完整页与末尾部分页的成员。 [采样配方](../../../data/20261118T172915.294780940Z_real-workload-performance/sources/s5-cohort-coverage/scope.json) · [原生准入](../../../third_party/sglang/python/sglang/srt/managers/schedule_policy.py#L919)
+
+**验证** 常态并发 8 的粗图共扫描 1,267,071 项工作，CPU 946,773 项、搬运 95,015 项、设备 225,283 项均在冻结成本范围内。使用相同独立样本重算得到的定义和模型与冻结资产一致。该结论只覆盖这次详细观测实际产生的组批。自主预测在合计 7,419 token 的分配批次早停，仍需覆盖该路径可产生的工作。 [观测需求报告](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/cost/observed-demand/coverage.json) · [自主预测缺口](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/cost/prediction/cost-gap.json)
+
+**结论与限制** 采样需按原生实际组批及成员分支核对可达范围。在另一份独立来源中，同一批内 3,199 和 29 token 的两个成员命中同一 80 区间定义，并共享整批特征坐标。原生循环按单成员计算写入范围，后续需核对子区间成本与成员实际写入长度的关系，再决定补采和特征修正。冻结资产及结果口径未变。 [来源工作身份](../../../data/20261118T172915.294780940Z_real-workload-performance/costs/s5/data-port-geometry/source-0-work.json) · [原生分配循环](../../../third_party/sglang/python/sglang/srt/mem_cache/allocator/paged.py#L65)
+
+## 2026-11-19 — S6：并行处理已封存的来源
+
+**改动** 常态并发 4 开始后处理，两个突发案例在各自采集封存后即可开始。外围编排按例互斥并复用已发布结论。设备采集保持顺序，轻量性能测量仍在结构后处理完结后启动。 [并发 4 后处理](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure/produce.log)
+
+**验证** 两组常态详细采集各提交全部 48 条。计划到达时刻与输入逐条一致，并发 4 和并发 8 的最大提交偏差分别为 1.50 和 5.83 毫秒。 [并发 4 提交记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/native-detailed/attempts/1/source/instances/0/request-delivery.json) · [并发 8 提交记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-detailed/attempts/1/source/instances/0/request-delivery.json)
+
+**结果** 突发并发 8 详细采集在 848.80 秒后发布，离线后处理已启动。首组来源检查覆盖 1,267,071 项工作和 1,829,199 个事件，原生整组一致。在 413 个时钟校准样本下检查 4,812,204 条因果时间约束，报告为相容且无时间缺测约束。动作布局已导出，回放的条件提取和实际消费仍待核对。 [首组来源检查](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure/source-evidence/source-evidence.json) · [突发并发 8 采集](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/detailed-run.json)
+
+**执行调整** 首组时间条件提取的原建模镜像缺少求解依赖。核对两份冻结镜像后，结束该提取进程，保留 275.24 秒消耗与原始状态。控制镜像重新提取时直接复用已通过的来源检查、粗图及动作布局。 [镜像检查](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure/clock-environment.json) · [原执行记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure/qualification.json)
+
+## 2026-11-19 — S6：首组工作时间条件提取完成
+
+**结果** 常态并发 8 提取了 33,166 个控制步骤及 1,267,071 项工作的实测时间条件，工作结束缺测为零。1,805,298 个实测端点中有 494,482 个保留校准不确定性。以实测校准点为依据取得一套满足全图因果的可行时钟映射。正式仿真已启动，仍需独立核对条件消费和结构。 [提取报告](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure-evaluated/timing/execution-inputs-report.json)
+
+**执行调整** 常态并发 4 的 SDK 跟踪约 4.90 GiB，首组约 3.44 GiB 的跟踪形成粗图实耗 1,348.87 秒。根据这个规模增幅，突发并发 4 尚未启动的离线投影累计额度由 1,800 秒提高到 2,700 秒，用于完成 SDK 导出、解释和投影。已启动的各步继续按原额度运行。
+
+## 2026-11-19 — S6：详细采集封存及首组回放完成
+
+**范围** 突发并发 4 的详细原生采集在 1,141.67 秒后发布，离线投影按 2,700 秒额度启动。四组各一次详细采集，合计墙钟 67.46 分钟。逐例核对发布来源、请求长度和声明到达，最大提交偏差为 5.83 毫秒。 [末组详细采集](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/detailed-run.json)
+
+**验证** 常态并发 8 的实测时间回放完成 48 条请求、4,953 个输出 token，逐请求核对生成位置及结束标记。回放消费 31,990 个调用条件与 1,176 次输入读取条件，共执行 1,267,071 项工作和 1,805,298 个事件。独立评估器开始核对时间消费、必要依赖和资源效果。 [首组回放结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure-evaluated/core/prediction/result.json)
+
+**执行调整** 常态并发 4 生成粗图时在解释步骤耗尽原 1,800 秒额度。保留失败结论及实耗 1,803.19 秒，使用已有 SDK 导出，从解释步骤续跑。累计额度调整为 3,300 秒，已耗时间继续计入。 [首次结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure/qualification.json) · [续跑账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure/produce-resume.log)
+
+**覆盖诊断** 突发并发 8 的 1,180,757 项实测工作中有 480 项超出冻结成本范围。缺口全部来自实测的同一个包含 7 条请求、合计 7,850 token 的分配批次。六个成员各产生对应的 80 项工作，CPU、搬运和设备分别缺 324、84 和 72 项。比对完整模板定义确认与自主预测的首处缺口同源。 [突发工作覆盖](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/cost/observed-demand/coverage.json)
+
+**验证** 突发并发 8 的原生粗图来源检查通过，核对了 1,180,757 项工作、1,704,511 个事件及 4,483,635 条有测量依据的因果时间约束。385 个时钟校准样本的约束相容。突发并发 4 已完成 SDK 导出，跟踪约 4.63 GiB。 [突发并发 8 来源检查](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/structure/source-evidence/source-evidence.json) · [突发并发 4 离线处理](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/observed/production.json)
+
+**评估额度** 首组独立对照运行 14 分 29 秒时读过约三分之一的 1.41 GB 轨迹。新启动的结构核对进程将独立对照额度设为 3,600 秒，以覆盖轨迹读取和后续依赖、状态检查。原生采集及已启动进程按现有额度执行。
+
+## 2026-11-19 — S6：启动独立轻量时延测量
+
+**执行调整** 四组详细采集已经结束，设备 4 无活跃进程。主机抽样 CPU 空闲率为 93%–94%，离线处理可与原生测量并行。轻量采集仍在同一卡上逐组执行，每组一次、1,200 秒额度。正式入口检查到首组已启用轻量模式。采集程序复用已封存结果，最终汇总等待结构与时延结果齐备。 [首组轻量采集账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-latency/execution.json)
+
+## 2026-11-19 — S6：首组全节点结构对照通过
+
+**验证** 常态并发 8 的 31,990 次调用逐项对应，内容与依赖全部匹配，双方未配对调用数为零。独立评估确认 1,267,071 项工作和 1,805,298 个执行事件的实测时间条件完整消费，89 项在途状态冲突均有依赖保护。结果覆盖该组 48 条请求的约定粗图及执行范围。 [独立对照](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure-evaluated/comparison/actions.json)
+
+**用时** 实测时间提取 595.17 秒，回放 248.41 秒，独立对照 1,551.13 秒。该组的自主预测性能结论仍受冻结成本覆盖限制。 [步骤账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/structure-evaluated/qualification.json)
+
+**其余组合** 突发并发 8 完成 1,180,757 项工作的时间条件提取，工作结束缺测为零，回放已启动。常态并发 4 复用原 SDK 导出完成粗图，累计离线投影耗时 2,944.16 秒，进入来源核对和工作成本覆盖扫描。 [突发提取报告](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/structure/timing/execution-inputs-report.json) · [常态粗图账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure/observed/result.json)
+
+**轻量真值** 常态并发 8 轻量实测完成 48 条及 4,953 个输出 token，墙钟 367.63 秒，最大提交偏差 1.23 毫秒。正式观测内加载了一项 `alloc_extend_kernel` Triton 特化，按冻结口径记为稳态资格未通过。其原始 P95 TTFT 为 64.12 秒、平均 TPOT 为 133.53 毫秒，保留用于后续归因。常态并发 4 已开始轻量测量。 [轻量时延及特化记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-latency/attempts/1/source/instances/0/latency.json)
+
+## 2026-11-19 — S6：封存四组粗图及第二次回放
+
+**验证** 突发并发 4 的离线投影在 1,894.54 秒后完成，四组粗图均已发布。突发并发 8 逐请求核对了 48 条及 5,344 个输出 token 的完成与结束标记，回放使用了 1,180,757 项工作的实测时间条件。独立结构对照正在运行。 [突发并发 4 粗图账目](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/observed/result.json) · [突发并发 8 回放结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/structure/core/prediction/result.json)
+
+**覆盖诊断** 常态并发 4 的 1,811,188 项原生工作中有 160 项超出冻结成本范围。同一组 2 条请求、合计 7,404 token 的分配产生了这些工作。完整模板定义与突发并发 8 的 480 项以及三组自主预测首处报告的缺口一致。 [常态并发 4 覆盖](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/cost/observed-demand/coverage.json)
+
+**预热证据** 常态并发 8 的预热与实测共用同一份请求及到达时间。原生组批仍根据当时的队列与完成状态决策。分配算子的特化取决于实际批次成员数、页宽和扩展 token 数，观测在正式窗口开启后 66.40 秒记录到新的特化。现有轻量观测记录到加载时刻，具体开销及预热对该特化的命中情况仍待归因。 [原生特化参数](../../../third_party/sglang/python/sglang/srt/hardware_backend/npu/allocator_npu.py#L57) · [正式窗口测量](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-8/native-latency/attempts/1/source/instances/0/latency.json)
+
+**轻量真值** 常态并发 4 实耗 441.48 秒，完成 48 条及 4,953 个输出 token。正式窗口无新增 Triton 特化，最大提交偏差 1.28 毫秒，原生 P95 TTFT 为 105.82 秒、平均 TPOT 为 95.82 毫秒、输出吞吐为 32.07 token/s。其稳态真值合格，冻结成本预测还缺少完整输出。突发并发 8 已开始测量。 [常态并发 4 原生时延](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/native-latency/attempts/1/source/instances/0/latency.json)
+
+**轻量真值** 突发并发 8 实耗 359.63 秒，完成 48 条及 5,344 个输出 token，正式窗口无新增 Triton 特化。原生 P95 TTFT 为 61.97 秒、平均 TPOT 为 128.44 毫秒、输出吞吐为 47.19 token/s，最大提交偏差 1.98 毫秒。突发并发 4 已开始测量。 [突发并发 8 原生时延](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/native-latency/attempts/1/source/instances/0/latency.json)
+
+**覆盖诊断** 突发并发 4 的 1,705,966 项原生工作均可查询冻结成本。四组原生粗图的覆盖扫描全部完成，所见 640 项缺口来自同一个长分配模板定义。汇总程序一并记录原生实际组批的覆盖和自主预测的覆盖。 [突发并发 4 覆盖](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/cost/observed-demand/coverage.json)
+
+## 2026-11-19 — S6：封存轻量测量和首次留出评分
+
+**范围** 四组轻量测量各完成 48 条，合计运行墙钟 1,598.79 秒。突发并发 4 实耗 430.05 秒，测量窗口无新增 Triton 特化，最大提交偏差 1.78 毫秒。四份逐请求时延报告已发布，三组实测通过稳态检查。 [突发并发 4 时延报告](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/latency-metrics.json)
+
+**验证** 突发并发 4 是本轮唯一具备合格真值和完整自主预测的组合。48 条请求的 TTFT 和 TPOT MAPE 分别为 5.19% 和 8.22%，无零分母。TTFT 在 48 条上均为高估。TPOT 的绝对误差中位数为 5.21%，输出仅 5、9、11 token 的三条请求贡献了约 42.7% 的绝对相对误差总和。均值误差不足以描述逐请求差异。四组汇总评分仍缺三个有效对照。 [逐请求对照](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/latency-metrics.json)
+
+**偏差切口** 这三条请求的首末 token 发布区间内，其他请求的首发或结束与预测均有差异。例如 5 token 请求的实测首末间隔为 1.025 秒，其间另一条请求发布了首 token。预测间隔为 0.310 秒，其间没有其他请求首发。当前证据定位到发布次序，仍需核对组批、排队和服务耗时各自的贡献。 [逐请求对照](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/latency-metrics.json)
+
+**配置比较** 突发流量下，并发 8 的原生 P95 TTFT 更低，输出吞吐更高，并发 4 的平均 TPOT 更低。自主预测的双配置比较仍缺并发 8 的完整输出。 [并发 8 实测](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/latency-metrics.json) · [并发 4 实测和预测](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/latency-metrics.json)
+
+**结构证据** 两个并发 4 案例均通过来源检查。常态和突发分别核对 1,811,188 和 1,705,966 项工作，因果时间约束无缺测且与时钟校准相容。四组原生粗图至此都通过来源检查。 [常态并发 4 来源检查](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure-evaluated/source-evidence/source-evidence.json) · [突发并发 4 来源检查](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/source-evidence/source-evidence.json)
+
+**独立对照** 突发并发 8 通过全节点结构对照，29,879 个动作的内容与依赖逐项匹配。1,180,757 项工作和 1,682,211 个执行事件的实测条件完整消费。独立对照实耗 1,393.23 秒，目前两组并发 8 均已通过。 [突发并发 8 全节点对照](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-8/structure/comparison/actions.md)
+
+**代码核对** 两个分配问题出现在不同的原生分支。新分配页数达到 200 时进入长分配，其工作定义出现成本样本范围缺口。新页少于 200 时调用 Triton 分配核，实测窗口内加载的特化属于这一路。当前页宽为 16、预填充预算为 8,192，多请求预填充的按页需求上限为 8,176 token。对无前缀命中的采样批次，若至少一个成员还需写末尾部分页，整批原始 token 数最多为 8,175。单请求在预算检查中有独立准入路径。上述边界来自原生代码，采样仍需核对实际组批和工作。 [原生分配](../../../third_party/sglang/python/sglang/srt/hardware_backend/npu/allocator_npu.py#L43) · [原生准入](../../../third_party/sglang/python/sglang/srt/managers/schedule_policy.py#L920)
+
+**时间证据** 常态并发 4 提取了 46,724 个控制步骤、2,580,411 个端点和 1,811,188 项工作的实测时间条件，工作结束缺测为零。正式回放已启动。突发并发 4 正在提取时间条件。 [常态并发 4 提取报告](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure-evaluated/timing/execution-inputs-report.json)
+
+## 2026-11-19 — S6：四组实测时间条件齐备
+
+**验证** 常态并发 4 的回放完成 48 条及 4,953 个输出 token，逐请求核对生成位置和结束标记。独立对照已按 3,600 秒额度启动。突发并发 4 提取了 44,112 个控制步骤、2,430,568 个端点及 1,705,966 项工作的实测时间条件，工作结束缺测为零，回放正在运行。 [常态回放结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/normal/concurrency-4/structure-evaluated/core/prediction/result.json) · [突发时间条件](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/timing/execution-inputs-report.json)
+
+**评估额度** 以已完成两组的对照耗时按工作量估算，突发并发 4 的独立对照约需 2,013–2,088 秒。外围编排已安排回放完成后接续 3,600 秒对照，直接使用原生图和已发布的执行轨迹。矩阵汇总等待该对照结束。
+
+**回放封存** 突发并发 4 完成全部 48 条请求及 5,344 个输出 token，逐请求生成位置和结束标记均相符。独立对照由原 1,800 秒进程在启动后 0.53 秒交接，3,600 秒对照已经运行。命令核对确认仅更改额度及输出路径，原生粗图、回放轨迹、程序和镜像按冻结范围复用。 [回放结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/core/prediction/result.json) · [额度交接记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/structure/comparison-budget.json)
+
+**墙钟账目** 矩阵汇总累计离线各步骤实际用时，包含中断后续跑的已付开销，复用的步骤只计一次。对照已封存账目，常态、突发并发 8 的离线结构步骤分别累计 4,696.93 和 4,413.16 秒。两组现场采集及自主预测分别记录。
+
+## 2026-11-19 — S6：核对实际请求顺序
+
+**验证** 四组轻量记录中有三组出现实际提交反序。突发并发 4 的 `azure-67607` 按输入应早 161 微秒提交，实际晚了 339 微秒。两条被原生调度器同轮取入，首 token 发布顺序与预测相反。这也是两边首末发布记录的第一处顺序差异。汇总已用四组实测核对反序报告。 [请求投递记录](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/burst/concurrency-4/native-latency/attempts/1/source/instances/0/request-delivery.json) · [发布顺序分析](../../../data/20261118T172915.294780940Z_real-workload-performance/results/s7-burst-c4-publications.json)
+
+**归因边界** 原生驱动为各次提交独立等待，到达间隔小于调度抖动时允许反序。首末 token 之间出现不同发布事件的 11 条请求，TPOT MAPE 为 20.16%，其余 37 条为 4.68%。轻量记录只保留首末发布，批次与单项服务误差仍需独立证据。 [投递驱动](../../../src/collection/markov_collection/adapters/frameworks/sglang/submissions.py#L76)
+
+## 2026-11-19 — S6 收尾：封存四组独立对照
+
+**验证** 四组共完成 149,422 次调用、5,964,982 项工作和 8,498,488 个事件的全节点独立对照。逐请求回放均取得预期 token 数和结束标记，工作证据与消费记录全部核对。两份并发 4 对照各耗 1,916.10 和 1,805.91 秒。 [矩阵结果](../../../data/20261118T172915.294780940Z_real-workload-performance/targets/s6-heldout-matrix/heldout-results.json)
+
+**收尾检查** 冻结的程序、二进制、模板、成本、评价文件及输入均经校验。四组各有一次详细采集和一次轻量原生测量，保留首次运行及续跑账目。约 43 GiB 原生、回放和评价证据用于复核与归因。
+
+**结论与限制** 四组结构均通过。自主预测仍有三个长分配成本缺口，只有突发并发 4 取得一次评分，分别为 5.19% 和 8.22%。常态并发 8 的窗口内特化加载及三个组合的提交反序均记入汇总。S7 的修复和重新评价作为开发证据。
