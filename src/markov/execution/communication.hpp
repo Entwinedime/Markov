@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "markov/execution/timeline.hpp"
+#include "markov/execution/timing.hpp"
 #include "markov/graph/types.hpp"
 
 namespace markov {
@@ -21,22 +22,30 @@ namespace markov {
 // Ordered communication channels are independent of native control-message transport.
 class CommunicationLinks {
 public:
-    void insert(const CoarseGraph & graph, std::span<const std::size_t> events, Timeline & timeline);
+    void insert(const CoarseGraph & graph, std::span<const std::size_t> events,
+                std::span<const ServiceDuration> durations, Timeline & timeline);
     bool empty() const;
     std::set<std::size_t> retained_events() const;
     nlohmann::json payload_coverage() const;
 
 private:
+    struct Collective {
+        std::size_t ready;
+        std::size_t finish;
+        std::int64_t service_ns;
+    };
     struct Endpoint {
         std::size_t ready;
         std::size_t completion;
         std::vector<std::int64_t> required;
+        std::optional<Collective> collective;
         bool connected = false;
     };
     struct Exchange {
         std::string operation;
         std::vector<std::int64_t> members;
         std::map<std::tuple<Direction, std::string, bool>, TensorLayout> payload;
+        bool collective;
         std::map<std::int64_t, Endpoint> endpoints;
     };
 

@@ -12,14 +12,17 @@ from markov_workflow.cost_samples import WorkCatalog
 class ServiceCurve:
     def __init__(self, rows):
         groups = defaultdict(list)
-        copies = defaultdict(set)
+        payloads = defaultdict(set)
         for row in rows:
             point = tuple(sorted(row["features"]["axes"].items()))
             groups[point].extend(row["observations_ns"])
             if "copy" in row:
-                copies[point].add((row["copy"]["bytes"], row["copy"]["direction"]))
-        self.ambiguous_copies = sum(len(values) > 1 for values in copies.values())
-        points = [(dict(point), median(values)) for point, values in groups.items() if len(copies[point]) <= 1]
+                payloads[point].add(("copy", row["copy"]["bytes"], row["copy"]["direction"]))
+            if "collective" in row:
+                collective = row["collective"]
+                payloads[point].add(("collective", collective["dtype"], collective["algorithm"], collective["elements"]))
+        self.ambiguous_payloads = sum(len(values) > 1 for values in payloads.values())
+        points = [(dict(point), median(values)) for point, values in groups.items() if len(payloads[point]) <= 1]
         if not points:
             raise ValueError("no usable feature points for service work")
         axes = tuple(points[0][0])
@@ -66,7 +69,7 @@ class ServiceCurve:
 
     def document(self):
         return {"bounds": self.bounds, "axis": self.axis, "knots": self.knots, "points": self.points,
-                "ambiguous_copy_points": self.ambiguous_copies}
+                "ambiguous_payload_points": self.ambiguous_payloads}
 
     @classmethod
     def estimate(cls, curve, axes):

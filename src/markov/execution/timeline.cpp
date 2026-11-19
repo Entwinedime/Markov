@@ -116,9 +116,14 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     for (std::size_t index = 0; index < graph.work.size(); ++index) {
         const auto & work = graph.work[index];
 
-        // A conditioned work retains only causal order here; its finish window supplies time, not a zero service estimate.
-        if (const auto duration = work_ns[index]) connect(offset + work.start, offset + work.finish, *duration, Relation::Order);
-        else connect(offset + work.start, offset + work.finish, 0, Relation::Order);
+        // The communication channel charges collective service after all participants are ready.
+        if (work.kind == WorkKind::Collective) {
+            auto & finish = events_.at(offset + work.finish);
+            ++finish.pending;
+            ++finish.holds;
+        } else {
+            connect(offset + work.start, offset + work.finish, work_ns[index].value_or(0), Relation::Order);
+        }
         has_previous[work.finish] = true;
         has_next[work.start] = true;
     }

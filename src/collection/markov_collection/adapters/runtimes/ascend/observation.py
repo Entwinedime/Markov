@@ -32,6 +32,7 @@ class AscendObservation:
         self.device = {}
         self.services = {}
         self.payload = []
+        self.collectives = {}
         self.host_copies = []
         self.signal_inputs = {}
         self.work_completions = {}
@@ -291,6 +292,54 @@ class AscendObservation:
                 raise ValueError(f"native payload has no semantic stream coverage: stream {stream} at {task.begin}")
             self.payload.append(task)
             self.resources[resource]["payload"].append([task.begin, task.end])
+
+    def collective_spans(self) -> None:
+        groups = defaultdict(dict)
+        for task in self.payload:
+            api = self.trace.apis.get(task.source.record["args"]["connection_id"])
+            if api is None:
+                continue
+            queue = self.trace.dequeue_ranges.enclosing(api)
+            if queue is None or not queue.record["name"].startswith("Dequeue@Hccl"):
+                continue
+            scope = self.trace.owner(self.trace.origin(api))
+            if scope is None:
+                continue
+            raw = self.raw["scopes"][scope]
+            exchange = raw.get("communication")
+            if not exchange or exchange["required"] != exchange["members"] or raw.get("asynchronous", False):
+                continue
+            groups[scope].setdefault(queue.record["args"]["correlation_id"], []).append(task)
+
+        spans = defaultdict(list)
+        for span in self.spans:
+            if span["kind"] == "communication" and self.resources[span["resource"]]["kind"] == "stream":
+                spans[span["scope"]].append(span)
+        for scope, calls in groups.items():
+            if len(calls) != 1:
+                continue
+            (correlation, tasks), = calls.items()
+            stream = tasks[0].stream
+            if any(task.stream != stream for task in tasks):
+                continue
+            begin, end = tasks[0].begin, tasks[-1].end
+            limit = self.device_index.enclosing(Interval(begin, end, stream, {}))
+            if limit is None:
+                continue
+            enclosing = self.spans[limit.record["span"]]
+            if enclosing["scope"] != scope or enclosing["kind"] != "communication":
+                continue
+
+            # Keep caller-stream work such as the gather transpose outside the peer-gated service.
+            for span in spans[scope]:
+                span["kind"] = "device"
+            resource = enclosing["resource"]
+            if (enclosing["begin"], enclosing["end"]) == (begin, end):
+                enclosing["kind"] = "collective"
+            else:
+                self.span(scope, resource, begin, end, "collective")
+            self.collectives[scope] = (resource, begin, end, self.trace.dequeue[correlation])
+        self.device_index = self.span_index("stream")
 
     def auxiliary_stream_spans(self) -> None:
         pending = None
@@ -701,6 +750,7 @@ class AscendObservation:
         self.host_spans()
         self.service_spans()
         self.device_spans()
+        self.collective_spans()
         self.call_ports()
         self.state_accesses()
         self.synchronization()
@@ -730,6 +780,12 @@ class AscendObservation:
         self.normalize_device_spans(result)
         if measurements:
             result["measurements"] = self.streams.measurements(result)
+            payloads = self.trace.collective_payloads({scope: row[-1] for scope, row in self.collectives.items()})
+            result["measurements"]["collectives"] = [
+                [scope, resource, begin, end, payloads.get(scope)]
+                for scope, (resource, begin, end, _) in self.collectives.items()
+            ]
+            result["measurements"]["device_clock_radius_ns"] = self.trace.clock.radius_ns
             result["measurements"]["synchronous_copies"] = [
                 [self.spans[span]["resource"], interval.begin, interval.end,
                  interval.record["end_raw_ns"] - interval.record["begin_raw_ns"], interval.record["bytes"], direction]

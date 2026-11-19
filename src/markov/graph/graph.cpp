@@ -313,6 +313,7 @@ void CoarseGraph::validate() const {
     std::vector<std::set<std::size_t>> successors(events.size());
     std::vector<std::size_t> remaining(events.size());
     std::vector<std::optional<std::size_t>> work_finish(events.size());
+    std::set<std::size_t> collective_scopes;
     for (const auto & piece : work) {
         if (piece.scope >= scopes.size() || piece.resource >= resources.size() || piece.start >= events.size() || piece.finish >= events.size()
             || piece.start == piece.finish || piece.kind == WorkKind::Wait || piece.kind == WorkKind::Boundary)
@@ -321,6 +322,12 @@ void CoarseGraph::validate() const {
             throw std::invalid_argument("work interval changes resource between entry and completion");
         if (!contains(events[piece.start].scope, piece.scope) || !contains(events[piece.finish].scope, piece.scope))
             throw std::invalid_argument("work interval is owned by an unrelated semantic scope");
+        if (piece.kind == WorkKind::Collective) {
+            const auto & group = scopes[piece.scope].communication;
+            if (!group || group->required != group->members || resources[piece.resource].kind != ResourceKind::Stream
+                || resources[piece.resource].rank != group->rank || !collective_scopes.insert(piece.scope).second)
+                throw std::invalid_argument("collective work requires one stream interval per participating scope");
+        }
         if (work_finish[piece.start]) throw std::invalid_argument("coarse work is charged twice at one entry boundary");
         work_finish[piece.start] = piece.finish;
         successors[piece.start].insert(piece.finish);

@@ -2,6 +2,7 @@
 
 from bisect import bisect_left
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 import json
 
 from markov_adapters.artifacts import write_json
@@ -37,13 +38,15 @@ class ServiceSamples:
         self.catalog = catalog
         self.rows = {}
 
-    def add(self, definition, interval, features, duration_ns, copy=None):
-        key = definition, interval, json.dumps([features, copy], sort_keys=True)
+    def add(self, definition, interval, features, duration_ns, copy=None, collective=None):
+        key = definition, interval, json.dumps([features, copy, collective], sort_keys=True)
         row = self.rows.setdefault(key, {
             "definition": definition, "interval": interval, "features": features, "observations_ns": [],
         })
         if copy is not None:
             row["copy"] = {"bytes": copy[0], "direction": copy[1]}
+        if collective is not None:
+            row["collective"] = {"dtype": collective[0], "algorithm": collective[1], "elements": collective[2]}
         row["observations_ns"].append(duration_ns)
 
     def document(self, unmeasured):
@@ -53,16 +56,84 @@ class ServiceSamples:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CollectiveInterval:
+    position: tuple[int, int, int]
+    payload: list[int] | None
+    start_ns: int | None
+    finish_ns: int | None
+    radius_ns: int
+
+
+class CollectiveServices:
+    """Match measured peers within one native production and use the last participant's device-local interval."""
+
+    def __init__(self, facts, rank):
+        calls = defaultdict(lambda: defaultdict(list))
+        for actor, document in facts.items():
+            measurement = document["measurements"]
+            points = {(row["resource"], row["order"]): row["time_ns"] for row in measurement["coordinates"]}
+            radius = measurement["device_clock_radius_ns"]
+            for scope, resource, begin, end, payload in measurement["collectives"]:
+                key = self.identity(document["scopes"], scope)
+                if key is None:
+                    continue
+                position = resource, begin, end
+                start, finish = points[resource, begin], points[resource, end]
+                calls[key][actor].append(CollectiveInterval(position, payload, start, finish, radius))
+
+        self.samples = {}
+        for key, actors in calls.items():
+            members = key[1]
+            if rank not in actors or actors.keys() != set(members) or any(len(rows) != 1 for rows in actors.values()):
+                continue
+            own, = actors[rank]
+            peers = [rows[0] for rows in actors.values()]
+            if own.payload is None or any(peer.payload != own.payload or peer.start_ns is None or peer.finish_ns is None
+                                          for peer in peers):
+                continue
+
+            # Calibration is used to establish order only. The duration stays on a single device clock.
+            last = max(peers, key=lambda row: row.start_ns)
+            if any(last.start_ns - last.radius_ns <= peer.start_ns + peer.radius_ns for peer in peers if peer is not last):
+                continue
+            self.samples[own.position] = last.finish_ns - last.start_ns, own.payload
+
+    @staticmethod
+    def identity(scopes, identity):
+        exchange = scopes[identity]["communication"]
+        while identity is not None:
+            scope = scopes[identity]
+            work = scope["work"]
+            if "phase" in work and "members" in work:
+                batch = tuple((row["id"], row["context_tokens"], row["new_tokens"]) for row in work["members"])
+                return exchange["channel"], tuple(exchange["members"]), exchange["operation"], exchange["order"], work["phase"], batch
+            identity = scope["parent"]
+        return None
+
+
 class CostSamples:
     def __init__(self, arguments):
         self.output = arguments.output
-        self.catalog = WorkCatalog(arguments.graph, arguments.work_identities)
+        root = arguments.production
+        rank = arguments.rank
+        ranks = json.loads((root / "result.json").read_text())["observed_roles"]
+        if rank not in ranks:
+            raise ValueError("cost samples require an observed production rank")
+        work = root / "work"
+        self.catalog = WorkCatalog(work / f"{rank}-graph.json", arguments.work_identities)
         self.graph = self.catalog.graph
-        facts = json.loads(arguments.facts.read_text())
+        facts = json.loads((work / f"{rank}-facts.json").read_text())
         measurement = facts["measurements"]
         if (self.graph["environment"] != facts["environment"]
                 or self.catalog.window != measurement["window_ns"]):
             raise ValueError("cost measurements and coarse graph come from different native observations")
+
+        self.collectives = {}
+        if measurement["collectives"]:
+            peers = {actor: facts if actor == rank else json.loads((work / f"{actor}-facts.json").read_text())
+                     for actor in ranks}
+            self.collectives = CollectiveServices(peers, rank).samples
 
         self.services = defaultdict(dict)
         for lane, begin, end, duration_ns in measurement["device_services"]:
@@ -81,27 +152,32 @@ class CostSamples:
         lane = piece["resource"]
         evidence = self.graph["evidence"]["events"]
         begin, end = (evidence[piece[side]]["order"] for side in ("start", "finish"))
+        if piece["kind"] == "collective":
+            duration, payload = self.collectives.get((lane, begin, end), (None, None))
+            return duration, None, payload
+        if piece["kind"] == "communication":
+            return None, None, None
         if self.graph["resources"][lane]["kind"] != "stream":
             if piece["kind"] != "transfer":
-                return None, None
+                return None, None, None
             copy = self.copies.get((lane, begin, end))
-            return (copy[0], [copy[1], copy[2]]) if copy is not None else (None, None)
+            return (copy[0], [copy[1], copy[2]], None) if copy is not None else (None, None, None)
 
         positions, payload = self.positions[lane], self.payload[lane]
         first = bisect_left(positions, begin)
         last = bisect_left(positions, end, lo=first)
         if first == last or (first and payload[first - 1][1] > begin) or payload[last - 1][1] > end:
             raise ValueError("device work does not enclose complete native payload")
-        return sum(self.services[lane][start, finish] for start, finish in payload[first:last]), None
+        return sum(self.services[lane][start, finish] for start, finish in payload[first:last]), None, None
 
     def run(self):
         samples, absent = ServiceSamples(self.catalog), Counter()
         for piece, definition, interval, features in self.catalog:
-            duration_ns, copy = self.service(piece)
+            duration_ns, copy, collective = self.service(piece)
             if duration_ns is None:
                 absent[piece["kind"]] += 1
                 continue
 
             # Source request and physical resource IDs locate the observation only.
-            samples.add(definition, interval, features, duration_ns, copy)
+            samples.add(definition, interval, features, duration_ns, copy, collective)
         write_json(self.output, samples.document(absent), replace=False)

@@ -119,7 +119,8 @@ class AscendTrace:
 
         # Host counters and stream ordinals establish order; both native and SDK times reach the common RAW clock.
         counter = HostCounter(profile)
-        device, = profile.glob("PROF_*/device_*")
+        self.cann, = profile.glob("PROF_*")
+        device, = self.cann.glob("device_*")
         self.clock = AscendClock(device, raw["device_clock"])
         rows = json.loads(trace.read_text(), parse_float=Decimal)
         flips = self.task_flips(profile)
@@ -249,6 +250,28 @@ class AscendTrace:
     def device_interval(self, record: dict) -> Interval:
         begin, end = self.clock.interval(record)
         return Interval(begin, end, int(record["tid"]), record)
+
+    def collective_payloads(self, queues: dict[int, Interval]) -> dict[int, list[int]]:
+        if not queues:
+            return {}
+        calls = ThreadIntervals([Interval(queue.begin, queue.end, queue.thread, {"scope": scope})
+                                 for scope, queue in queues.items()])
+        records = defaultdict(list)
+
+        # Match the SDK compact HCCL op record to its own worker-thread dequeue interval.
+        layout = struct.Struct("=HHIIIQBBQQQ14x")
+        for family in ("aging", "unaging"):
+            paths = (self.cann / "host/data").glob(f"{family}.compact.hccl_op_info.slice_*")
+            slices = sorted((path for path in paths if path.name.rsplit("_", 1)[-1].isdigit()),
+                            key=lambda path: int(path.name.rsplit("_", 1)[1]))
+            data = b"".join(path.read_bytes() for path in slices)
+            for magic, _, _, thread, _, stamp, _, dtype, algorithm, count, _ in layout.iter_unpack(data[len(data) % layout.size:]):
+                if magic != 0x5A5A:
+                    raise ValueError("invalid SDK HCCL op record")
+                owner = calls.enclosing(Interval(stamp, stamp, thread, {}))
+                if owner is not None:
+                    records[owner.record["scope"]].append([dtype, algorithm, count])
+        return {scope: rows[0] for scope, rows in records.items() if len(rows) == 1 and rows[0][2] > 0}
 
     @staticmethod
     def task_flips(profile: Path) -> set[tuple[int, int, int]]:

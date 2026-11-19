@@ -29,6 +29,14 @@ class Connections:
     def finding(self, category, identity, **detail):
         self.findings.append((category, identity, detail))
 
+    @staticmethod
+    def communication_bounds(contents, index):
+        for piece in contents.work[index]:
+            if piece["kind"] == "collective":
+                return piece["start"], piece["finish"]
+        port = next(port for port in contents.graph["scopes"][index]["ports"] if "rendezvous" in port)
+        return port["rendezvous"], port["event"]
+
     def native(self, contents, raw, rank, instance, dependencies, identities):
         graph, owners = contents.graph, {}
         endpoints = []
@@ -126,10 +134,10 @@ class Connections:
 
             if communication := scope.get("communication"):
                 entered = next(port["event"] for port in scope["ports"] if port["name"] == "call.enter")
-                completion = next(port for port in scope["ports"] if "rendezvous" in port)
+                ready, complete = self.communication_bounds(contents, index)
                 endpoint = {
                     **communication, "entered": entered, "scope": (key, path), "work": identity,
-                    "ready": completion["rendezvous"], "complete": completion["event"],
+                    "ready": ready, "complete": complete,
                     "metadata": scope["role"] == "metadata_collective", "values": metadata.get(index),
                     "elements": scope["parameters"].get("elements"), "group_role": scope["bindings"].get("collective_group"),
                 }
@@ -176,6 +184,8 @@ class Connections:
                 rank = graph["resources"][graph["events"][entered]["resource"]]["rank"]
                 if communication["rank"] != rank:
                     raise ValueError("communication endpoint belongs to another worker")
+                ready, complete = self.communication_bounds(contents, index)
+                self.ready[key, path], self.complete[key, path] = events[ready], events[complete]
                 endpoint = {
                     **communication, "entered": events[entered], "scope": (key, path), "work": identity,
                     "metadata": scope["role"] == "metadata_collective", "values": None,
@@ -196,9 +206,6 @@ class Connections:
                         self.signal_outputs[port["signal"]] = label
                     else:
                         self.signal_reads[label] = self.signal_outputs.get(port["signal"]), identity
-                if "rendezvous" in port:
-                    self.ready[key, path] = events[port["rendezvous"]]
-                    self.complete[key, path] = events[port["event"]]
                 if port["use"] != "data":
                     continue
                 label = key, path, port["direction"], port["name"]

@@ -11,7 +11,7 @@ namespace markov {
 namespace {
 
 constexpr std::array<std::string_view, 3> resource_names{ "thread", "stream", "service" };
-constexpr std::array<std::string_view, 6> work_names{ "host", "device", "transfer", "communication", "wait", "boundary" };
+constexpr std::array<std::string_view, 7> work_names{ "host", "device", "transfer", "communication", "collective", "wait", "boundary" };
 constexpr std::array<std::string_view, 8> relation_names{ "order", "submission", "data", "signal", "control", "state", "communication", "observation" };
 constexpr std::array<std::string_view, 2> direction_names{ "input", "output" };
 constexpr std::array<std::string_view, 4> port_use_names{ "control", "data", "metadata", "signal" };

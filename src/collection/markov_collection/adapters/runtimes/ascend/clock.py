@@ -46,6 +46,7 @@ class AscendClock:
         self.counters = [sample["counter"] for sample in samples]
         self.midpoints = [(sample["begin_raw_ns"] + sample["end_raw_ns"]) // 2 for sample in samples]
         self.begin_ns, self.end_ns = self.midpoints[0], self.midpoints[-1]
+        self.radius_ns = max((sample["end_raw_ns"] - sample["begin_raw_ns"] + 1) // 2 for sample in samples) + 1
 
         # Keep the epoch offset exact; float-to-string conversion can lose several device counter ticks.
         start = json.loads((device / f"start_info.{physical}").read_text())

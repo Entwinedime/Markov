@@ -15,7 +15,7 @@
 namespace markov {
 
 enum class ResourceKind { Thread, Stream, Service };
-enum class WorkKind { Host, Device, Transfer, Communication, Wait, Boundary };
+enum class WorkKind { Host, Device, Transfer, Communication, Collective, Wait, Boundary };
 enum class Relation { Order, Submission, Data, Signal, Control, State, Communication, Observation };
 enum class Direction { Input, Output };
 enum class PortUse { Control, Data, Metadata, Signal };
