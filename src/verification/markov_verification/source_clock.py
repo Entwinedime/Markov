@@ -161,7 +161,9 @@ class ClockConstraints(DeviceCalibration):
                 "constraints": constraints}
 
     def window(self, event):
-        point = self.points[event]
+        return self.point_window(self.points[event])
+
+    def point_window(self, point):
         if point is None or not isinstance(point, CounterPoint):
             return None if point is None else (point, point)
         a, b, timestamp = self.form(point)
@@ -231,13 +233,29 @@ class ClockRealization:
                    for event, point in enumerate(clock.points) if point is not None]
         causal = graph.projected(anchors)
         for source, targets in causal.next.items():
-            rank, event = anchors[source]
             for target in targets:
-                peer, endpoint = anchors[target]
-                row, limit, support = self.difference((rank, clocks[rank].points[event]), (peer, clocks[peer].points[endpoint]))
-                self.measured += 1
-                if support > limit:
-                    self.restrict(row, limit)
+                self.constrain_order(anchors[source], anchors[target])
+
+    def constrain_order(self, source, target):
+        rank, event = source
+        peer, endpoint = target
+        begin = self.clocks[rank].points[event]
+        end = self.clocks[peer].points[endpoint]
+        self.measured += 1
+
+        # Neither a RAW edge nor two ordered ticks inside one positive-slope segment need a constraint.
+        if isinstance(begin, int) and isinstance(end, int):
+            if begin > end:
+                raise ValueError("native causal relation contradicts fixed RAW measurements")
+            return
+        if rank == peer and isinstance(begin, CounterPoint) and isinstance(end, CounterPoint) and begin.segment == end.segment:
+            if begin.position > end.position:
+                raise ValueError("native causal relation reverses ordered device ticks")
+            return
+
+        row, limit, support = self.difference((rank, begin), (peer, end))
+        if support > limit:
+            self.restrict(row, limit)
 
     def coefficients(self, rank, point):
         if not isinstance(point, CounterPoint):
@@ -277,11 +295,11 @@ class ClockRealization:
     def condition(self, rank, event, raw_ns):
         point = self.clocks[rank].points[event]
         if point is None:
-            raise ValueError("consumed completion has no original measurement")
+            raise ValueError("timed condition has no original measurement")
         self.conditioned += 1
         if not isinstance(point, CounterPoint):
             if raw_ns != point:
-                raise ValueError("consumed CPU boundary changes its original RAW measurement")
+                raise ValueError("timed CPU boundary changes its original RAW measurement")
             return
         self.samples[rank, point.segment].append((event, raw_ns))
 
@@ -306,6 +324,11 @@ class ClockRealization:
         return chain
 
     def solve(self):
+
+        # An existing exact map is sufficient when every new condition lies in its rounding cell.
+        if self.solution is not None and self.certifies_conditions():
+            return self
+
         from scipy.optimize import linprog
         from scipy.sparse import coo_matrix
         from sympy import Rational, SparseMatrix, linsolve, symbols
@@ -362,11 +385,14 @@ class ClockRealization:
         self.solution = {rank: [origin + offsets[self.columns[rank] + index] for index, origin in enumerate(origins)]
                          for rank, origins in self.origins.items()}
 
-        # Certify every original consumption, including duplicates, after compression and basis reconstruction.
-        for (rank, _), samples in self.samples.items():
-            if any(self.timestamp(rank, event) != raw_ns for event, raw_ns in samples):
-                raise ValueError("clock solver changes an original consumed completion")
+        # Certify every timing condition after compression and basis reconstruction.
+        if not self.certifies_conditions():
+            raise ValueError("clock solver changes a verified time condition")
         return self
+
+    def certifies_conditions(self):
+        return all(self.timestamp(rank, event) == raw_ns
+                   for (rank, _), samples in self.samples.items() for event, raw_ns in samples)
 
     def timestamp(self, rank, event):
         return self.raw_time(rank, self.clocks[rank].points[event])
@@ -385,7 +411,7 @@ class ClockRealization:
     def report(self):
         return {
             "status": "jointly_realized", "device_clocks": len({clock.device_id for clock in self.clocks.values()}),
-            "causal_constraints": self.measured, "consumed_measurements": self.conditioned,
+            "causal_constraints": self.measured, "conditioned_measurements": self.conditioned,
             "clock_maps": [{"rank": rank, "device": self.clocks[rank].device_id,
                             "snapshot_corrections_ns": [str(value) for value in corrections]}
                            for rank, corrections in self.solution.items()],

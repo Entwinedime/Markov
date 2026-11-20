@@ -59,7 +59,8 @@ class StructureVerification:
                     modeling.run_model("action-layouts", layouts / f"{rank}-layouts.json", reference.graphs / f"{rank}-graph.json")
             except (CalledProcessError, TimeoutError, TimeoutExpired, RuntimeError) as error:
                 return self.finish("action_layout_unavailable", stages | {"layout_error": str(error)})
-            extracted = NativeInputs(capture, reference.graphs, timing, layouts).run(reference)
+            inputs = NativeInputs(capture, reference.graphs, timing, layouts)
+            extracted = inputs.run(reference)
         wall_ns["timing"] = monotonic_ns() - started
         stages["timing_status"] = extracted["status"]
         if extracted["status"] != "extracted":
@@ -83,7 +84,12 @@ class StructureVerification:
 
         # Compare against the original reference, including actual condition consumption and independent causal evidence.
         started = monotonic_ns()
-        report = ActionComparison(reference, trace, self.output / "comparison", args.details).run()
+        try:
+            report = ActionComparison(reference, trace, self.output / "comparison", args.details,
+                                      realization=inputs.realization).run()
+        except ValueError as error:
+            wall_ns["comparison"] = monotonic_ns() - started
+            return self.finish("comparison_unverified", stages | {"comparison_error": str(error)})
         wall_ns["comparison"] = monotonic_ns() - started
         stages["comparison_status"] = report["status"]
         stages["coverage"] = report["coverage"]

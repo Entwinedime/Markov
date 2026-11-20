@@ -27,7 +27,7 @@ public:
                    std::optional<std::size_t> activation) override;
     void activated(std::size_t event, std::int64_t time_ns) override;
     void completed(std::size_t event, std::int64_t time_ns) override;
-    void constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> source_event) override;
+    void conditioned(const BoundaryCondition & condition) override;
     void initialized(const nlohmann::json & instances, const nlohmann::json & requests, std::int64_t clock_epoch_ns) override;
     void condition_used(std::string_view group, std::size_t step, std::string_view operation, const nlohmann::json & source) override;
     void input_read(const nlohmann::json & identity, std::span<const std::size_t> requests, bool in_flow, std::int64_t time_ns) override;

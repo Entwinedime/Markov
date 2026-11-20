@@ -33,9 +33,14 @@ class AscendDeployment:
         for path in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
             source = Path(path).resolve(strict=True)
             arguments.extend(["--mount", f"type=bind,src={source},dst={path},readonly"])
-        trace_events = Path("/sys/kernel/tracing/events")
-        if detailed_timing and trace_events.is_dir():
-            arguments.extend(["--mount", f"type=bind,src={trace_events},dst=/opt/markov/trace-events,readonly"])
+
+        if detailed_timing:
+
+            # Kernel wake recipients use the host PID namespace even though workers keep their private namespace.
+            arguments.extend([
+                "--mount", "type=bind,src=/sys/kernel/tracing/events,dst=/opt/markov/trace-events,readonly",
+                "--mount", "type=bind,src=/proc,dst=/opt/markov/host-proc,readonly",
+            ])
         for name, value in self.environment.items():
             arguments.extend(["--env", f"{name}={value}"])
         return arguments

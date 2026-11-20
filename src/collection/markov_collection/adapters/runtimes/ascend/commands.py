@@ -24,6 +24,7 @@ class StreamCommand:
     source: DeviceTask | NativeStreamCall
     begin: int
     end: int
+    post: Interval | None = None
 
     @property
     def stream(self) -> int:
@@ -198,30 +199,43 @@ class StreamCommands:
         # The same driver submissions observed through nested APIs represent one group, not extra work.
         return groups[0] if groups else []
 
+    def posting(self, command: StreamCommand) -> tuple[Interval, Interval]:
+        trace = self.trace
+        source = command.source
+        if isinstance(source, NativeStreamCall):
+            api = source.api
+            if command.post is None:
+                physical = trace.tasks.get(api.record["args"]["connection_id"])
+
+                # Elided waits retain their host condition with no physical queue service.
+                command.post = trace.queues.release(physical[0].record["args"]) if physical else source.native
+        else:
+            arguments = source.record["args"]
+            api = trace.apis[arguments["connection_id"]]
+            if command.post is None:
+                command.post = trace.queues.release(arguments)
+        return api, command.post
+
     def submission_frontiers(self) -> None:
         trace = self.trace
-        submitted: dict[int, list[tuple[int, StreamCommand]]] = defaultdict(list)
-        submitting = []
         groups = {}
         for command in self.commands:
             source = command.source
-            if isinstance(source, NativeStreamCall):
-                physical = trace.tasks.get(source.api.record["args"]["connection_id"])
-                begin, end = trace.queues.window(source.api, command.stream) if physical else (source.native.begin, source.native.end)
-                submitted[command.stream].append((end, command))
-                submitting.append(Interval(begin, end, command.stream, {}))
-                continue
-            connection = source.record["args"]["connection_id"]
-            if source.service is None and connection in trace.apis and connection not in trace.observer_connections and not trace.auxiliary(source) and not trace.outside_window(source):
-                key = command.stream, connection
-                if key not in groups or command.end > groups[key].end:
-                    groups[key] = command
+            if isinstance(source, DeviceTask):
+                connection = source.record["args"]["connection_id"]
+                if (source.service is not None or connection not in trace.apis or connection in trace.observer_connections
+                        or trace.auxiliary(source) or trace.outside_window(source)):
+                    continue
+            _, post = self.posting(command)
+            groups[command.stream, post.thread, post.begin] = command
 
-        # SDK correlations can group several tasks; driver evidence bounds acceptance of the entire group.
-        for (stream, connection), command in groups.items():
-            begin, end = trace.queues.window(trace.apis[connection], stream)
-            submitting.append(Interval(begin, end, stream, {}))
-            submitted[stream].append((end, command))
+        # Only one frontier is visible for the tasks released by each physical post.
+        submitted: dict[int, list[tuple[int, StreamCommand]]] = defaultdict(list)
+        submitting = []
+        for command in groups.values():
+            post = command.post
+            submitting.append(Interval(post.begin, post.end, command.stream, {}))
+            submitted[command.stream].append((post.end, command))
         self.submitting = ThreadIntervals(submitting)
         self.frontiers = {}
         for stream, values in submitted.items():
@@ -240,7 +254,7 @@ class StreamCommands:
         selected = self.frontiers if stream is None else {stream: self.frontiers[stream]}
         for stream, (starts, latest) in selected.items():
             if any(window.begin < before < window.end for window in self.submitting.overlapping(Interval(before, before, stream, {}))):
-                raise ValueError(f"stream {stream} fence overlaps a native command-group submission")
+                raise ValueError(f"stream {stream} fence overlaps a native queue submission")
             index = bisect_right(starts, before) - 1
             if index >= 0:
                 result.append(latest[index])

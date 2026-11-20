@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.clock import AscendClock, HostCounter
-from markov_collection.adapters.runtimes.ascend.queues import NativeQueues, ServiceExecutions
+from markov_collection.adapters.runtimes.ascend.queues import NativeQueues, ServiceExecutions, queue_marker
 
 
 @dataclass
@@ -177,12 +177,8 @@ class AscendTrace:
                 self.apis[connection] = interval
             elif "Task Type" in row.get("args", {}):
                 args = row["args"]
-                stream = int(args["Physic Stream Id"])
-
-                # Only an identified runtime flip is bookkeeping; other placeholder SQEs can perform memory work.
-                if args["Task Type"] == "PLACE_HOLDER_SQE" and (stream, int(args["Task Id"]), int(args["Batch Id"])) in flips:
-                    continue
-                streams[stream].append(interval)
+                if not queue_marker(args, flips):
+                    streams[int(args["Physic Stream Id"])].append(interval)
 
         # A zero-time wait still has distinct entry and completion. Wall-clock coincidence must not change graph topology.
         for tasks in streams.values():
@@ -214,7 +210,7 @@ class AscendTrace:
             if row["result"] != 0:
                 raise RuntimeError(f"native runtime call failed: {row['api']} ({row['result']})")
             self.runtime.append(self.native_interval(row))
-        self.queues = NativeQueues(self.runtime)
+        self.queues = NativeQueues(self.runtime, self.apis, rows, flips)
         self.services = ServiceExecutions(services, self.queues)
         for native in self.runtime:
             row = native.record

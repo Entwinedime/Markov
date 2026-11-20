@@ -4,12 +4,26 @@ from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+from markov_collection.adapters.runtimes.ascend.queues import queue_marker
+
+
+@dataclass(frozen=True, slots=True)
+class OmittedRecord:
+    thread: int
+    order: int
+    posted_ns: int
+    completed_device_ns: int
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceRelease:
     submitted: int
     previous: int | None
     preceding_window_ns: tuple[int, int] | None
+    first_command: bool
+    stream_wait: bool
+    wait_finish: int | None
+    omitted: tuple[OmittedRecord, ...]
 
 
 class SdkStreams:
@@ -22,13 +36,14 @@ class SdkStreams:
         self.connections = defaultdict(list)
         self.counts = Counter()
         self.logical_gaps = {}
+        self.logical_slots = {}
         streams = defaultdict(list)
         for row in rows:
             args = row.get("args", {})
             if row.get("ph") != "X" or "Task Type" not in args:
                 continue
             stream = int(args["Physic Stream Id"])
-            if args["Task Type"] == "PLACE_HOLDER_SQE" and (stream, int(args["Task Id"]), int(args["Batch Id"])) in flips:
+            if queue_marker(args, flips):
                 continue
             streams[stream].append(row)
 
@@ -56,21 +71,69 @@ class SdkStreams:
         position = occurrence + bisect_right(self.logical_gaps.get(stream, ()), occurrence)
         return 2 * position, 2 * position + 1
 
-    def release_evidence(self, graph, launches):
+    def task(self, stream, order):
+        slot = order // 2
+        logical = self.logical_slots.get(stream, ())
+        index = bisect_left(logical, slot)
+        if index < len(logical) and logical[index] == slot:
+            return None
+        return self.records[stream, slot - index]
+
+    def omitted_records(self, stream, ordinal, coordinates, queues, observer_joins):
+        records = []
+        resource = f"stream/{stream}"
+        boundary = self.span((stream, ordinal))[0]
+        for previous in range(ordinal - 1, -1, -1):
+            identity = stream, previous
+            begin, end = self.span(identity)
+            if end + 1 != boundary:
+                break
+            retained = coordinates.get((resource, end))
+            if retained is not None and retained not in observer_joins:
+                return retained, tuple(reversed(records))
+
+            # A projected observer join may still have recorded on the physical stream.
+            task = self.records[identity]
+            args = task["args"]
+            if args["Task Type"] != "EVENT_RECORD" or args["connection_id"] not in queues.apis:
+                break
+            completed = self.clock.interval(task)[1]
+            if not self.clock.begin_ns <= completed <= self.clock.end_ns:
+                break
+            try:
+                post = queues.release(args)
+            except ValueError:
+                break
+            records.append(OmittedRecord(post.thread, post.begin, post.record["begin_raw_ns"], completed))
+            boundary = begin
+        return None, ()
+
+    def release_evidence(self, graph, launches, queues, calibration, observer_joins):
         coordinates = {(graph["resources"][event["resource"]]["identity"], point["order"]): index
                        for index, (event, point) in enumerate(zip(graph["events"], graph["evidence"]["events"], strict=True))}
         releases = {}
-        for target, ((stream, ordinal), post) in launches.items():
+        for identity, (post, order) in launches.items():
+            stream, ordinal = identity
+            wait = self.records[identity]["args"]["Task Type"] == "EVENT_WAIT"
+            target = coordinates[f"stream/{stream}", order]
+            wait_finish = coordinates.get((f"stream/{stream}", self.span(identity)[1])) if wait else None
             submitted = coordinates[f"thread/{post.thread}", post.begin]
             preceding = stream, ordinal - 1
             prior = self.records.get(preceding)
-            previous, seen = None, None
+            previous, seen, omitted = None, None, ()
             if prior is not None:
                 previous = coordinates.get((f"stream/{stream}", self.span(preceding)[1]))
                 completed = self.clock.interval(prior)[1]
                 if self.clock.begin_ns <= completed <= self.clock.end_ns:
                     seen = self.clock.bounds(completed)
-            releases[target] = DeviceRelease(submitted, previous, seen)
+                    entered = post.record["begin_raw_ns"]
+                    if seen[1] > entered:
+
+                        # Retained causal edges tighten the same measured clock range.
+                        seen = calibration.point_window(calibration.point(completed, True))
+                        if seen[1] > entered and (previous is None or previous in observer_joins):
+                            previous, omitted = self.omitted_records(stream, ordinal, coordinates, queues, observer_joins)
+            releases[target] = DeviceRelease(submitted, previous, seen, ordinal == 0, wait, wait_finish, omitted)
         return releases
 
     def inspect_coordinates(self, facts, apis, commands):
@@ -113,6 +176,7 @@ class SdkStreams:
                     raise ValueError("elided native wait changes or lacks its unique raw SDK position")
 
         self.logical_gaps = {stream: [slot - index for index, slot in enumerate(slots)] for stream, slots in positions.items()}
+        self.logical_slots = positions
         for identity, span in commands.items():
             if span != self.span(identity):
                 raise ValueError("native command changes its actual SDK occurrence coordinate")
@@ -123,12 +187,8 @@ class SdkStreams:
             if resource["kind"] != "stream":
                 continue
             stream, order = int(resource["identity"].split("/")[1]), point["order"]
-            slot, side = divmod(order, 2)
-            slots = positions.get(stream, ())
-            measured = None
-            if slot not in logical.get(stream, ()):
-                occurrence = slot - bisect_left(slots, slot)
-                measured = self.clock.interval(self.records[stream, occurrence])[side]
+            task = self.task(stream, order)
+            measured = None if task is None else self.clock.interval(task)[order % 2]
             if point["time_ns"] != measured:
                 raise ValueError("device boundary changes or loses its original SDK measurement")
             checked += measured is not None

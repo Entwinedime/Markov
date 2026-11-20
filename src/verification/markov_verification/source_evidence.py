@@ -255,11 +255,11 @@ class ProductionEvidence:
         device_intervals = native_evidence.device_intervals()
         boundaries = native_evidence.inspect_boundaries(graph, device_intervals)
         services, private_streams = native_evidence.inspect_services()
-        submissions, links = native_evidence.inspect_submissions()
         launches = {} if retain_measurements else None
+        submissions, links = native_evidence.inspect_submissions(launches)
         payload_times = defaultdict(list) if retain_measurements else None
         payload = native_evidence.inspect_payload(graph, private_streams, device_intervals, links, launches, payload_times)
-        generations = native_evidence.event_generations()
+        generations = native_evidence.event_generations
         signals = native_evidence.inspect_signals(contents, native_case.dependencies[rank], generations)
         stream_roles = native_evidence.inspect_stream_roles(*PipelineABI.stream_declarations(native), generations[1])
         report = SourceEvidence(
@@ -277,22 +277,28 @@ class ProductionEvidence:
             from .fixed_context import FixedHostContext
 
             records = {key: facts[key] for key in ("resources", "environment", "measurements")}
-            context = FixedHostContext(self.capture, rank, native_evidence)
-            delays, resumptions, queues = context.project(graph, self.details)
-            report["native_host_queues"] = queues
-            records["fixed_host_delays"] = delays
-            records["host_fence_service"] = {pair: context.fence_service(call, sdk_entry)
-                                             for pair, (call, sdk_entry) in host_fences.items()}
-            records["device_releases"] = native_evidence.sdk.release_evidence(graph, launches)
-            records["device_payload_times"] = payload_times
-            records["fixed_queue_resumptions"] = resumptions
-            records["unbound_queue_notifications"] = queues["queue_completion_notifications"] - queues["bound_to_fixed_work"]
-
             # Timed work and published physical signals retain their actual measured endpoints.
             timed = {piece[side] for piece in graph["work"] for side in ("start", "finish")}
             timed.update(port["event"] for scope in graph["scopes"] for port in scope["ports"]
                          if port["use"] == "signal" and port["signal"].startswith("event/"))
             records["observer_joins"] = native_evidence.observer_joins - timed
+            releases = native_evidence.sdk.release_evidence(
+                graph, launches, native_evidence.queues, native_case.clocks[rank], records["observer_joins"]
+            )
+            omitted = {record for release in releases.values() for record in release.omitted}
+            context = FixedHostContext(self.capture, rank, native_evidence)
+            delays, waits, idle_inputs, posts, queues = context.project(graph, host_fences, omitted, self.details)
+            report["native_host_queues"] = queues
+            records["fixed_host_delays"] = delays
+            records["fixed_idle_inputs"] = idle_inputs
+            records["host_fences"] = host_fences
+            records["fixed_driver_posts"] = posts
+            records["device_releases"] = releases
+            records["device_payload_times"] = payload_times
+            records["fixed_host_waits"] = waits
+            records["kernel_threads"] = tuple(context.active.kernel_threads.values())
+            records["unbound_queue_notifications"] = queues["queue_completion_notifications"] - queues["bound_to_fixed_work"]
+
             native_case.measurements[rank] = records
         return report
 
@@ -397,8 +403,8 @@ class ProductionEvidence:
                 lines.extend(["", f"`{finding['category']}` {finding.get('reason', finding['kind'])}"])
         lines.extend([
             "", "Nominal inversions use original midpoint timestamps. Each rank uses one calibration across all measured relations, "
-            "including paths through logical waits. The original API and the absence of SDK tasks and driver submissions identify "
-            "pure logical waits, which carry ordering only. Physical work and externally visible completions require measured times. "
+            "including paths through logical waits. The original API, its observed prerequisites, and the absence of physical submissions "
+            "qualify logical waits and any data handed off at their returns. Work, resource accesses, and recorded signals require measured endpoints. "
             "Compatibility establishes a feasible calibration on the original graph and timestamps. Exact offsets, capture completeness, "
             "and SDK attribution require their own evidence. `unknown_time` marks a required measurement gap.",
             "", "Exit status 0 requires consistent mappings for every rank, consistent native group evidence, all required measurements, "

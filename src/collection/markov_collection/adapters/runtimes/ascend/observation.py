@@ -557,30 +557,14 @@ class AscendObservation:
                     "finish": self.endpoint(spans[scope], "end"),
                 })
 
-    def posting(self, task: StreamCommand, *, closed: bool = False) -> tuple[Interval, int]:
-        source = task.source
-        api = source.api if isinstance(source, NativeStreamCall) else self.trace.apis[source.record["args"]["connection_id"]]
-        if isinstance(source, NativeStreamCall) and not self.trace.tasks.get(api.record["args"]["connection_id"]):
-
-            # A runtime-elided wait retains its logical condition without inventing a driver submission.
-            return api, source.native.begin
-        if closed:
-            begin, _ = self.trace.queues.window(api, task.stream)
-            return api, begin
-
-        posts = self.trace.queues.inside(api, task.stream)
-        if len(posts) != 1:
-            raise ValueError(f"device command on stream {task.stream} needs a unique driver release: {api.record['name']}")
-        return api, posts[0].begin
-
-    def submission(self, task: StreamCommand, posting: tuple[Interval, int] | None = None) -> None:
-        api, begin = self.posting(task) if posting is None else posting
+    def submission(self, task: StreamCommand) -> None:
+        api, post = self.streams.posting(task)
         origin = self.trace.origin(api)
         source = task.source
         side = "end" if isinstance(source, NativeStreamCall) or source.record["args"]["Task Type"] == "EVENT_RECORD" else "begin"
 
         # Queue entry follows any CPU preparation inside the API; its outer entry is not a launch witness.
-        launched = self.host_anchor(Interval(begin, begin, api.thread, {}))
+        launched = self.host_anchor(Interval(post.begin, post.begin, post.thread, {}))
         if origin is not api:
 
             # A separate enqueue is visible before the worker submits. A direct call enters the queue at the driver boundary.
@@ -614,18 +598,16 @@ class AscendObservation:
             region = bisect_right(ordered[resource], task.begin) - 1
 
             # Closed collectives own their internal progress. Other work can start only at its actual queue post.
-            closed = span["kind"] == "collective"
-            if closed:
+            if span["kind"] == "collective":
                 release = ("collective", owner)
-                posting = None
             else:
-                posting = self.posting(task)
-                release = ("driver", posting[0].thread, posting[1])
+                _, post = self.streams.posting(task)
+                release = ("driver", post.thread, post.begin)
             key = resource, region, release
             if key != prior:
                 if last is not None:
                     self.submission_tail(last)
-                self.submission(task, self.posting(task, closed=True) if closed else posting)
+                self.submission(task)
                 prior = key
             last = task
 

@@ -203,13 +203,13 @@ nlohmann::json execute(const markov::CoarseGraph & graph, const nlohmann::json &
         if (value.is_null()) work_ns.push_back(std::nullopt);
         else work_ns.push_back(markov::read_parameters({ { "service_ns", value } }).at("service_ns"));
     }
-    std::vector<markov::BoundaryTime> boundaries;
+    std::vector<markov::BoundaryCondition> boundaries;
     if (timing.contains("boundaries")) {
         for (const auto & value : timing.at("boundaries").get_ref<const nlohmann::json::array_t &>()) {
             const auto fields = markov::read_parameters(value);
             if (fields.size() != 3 || fields.at("event") < 0)
                 throw std::invalid_argument("completion condition requires event, begin_ns and end_ns");
-            boundaries.push_back({ static_cast<std::size_t>(fields.at("event")), { fields.at("begin_ns"), fields.at("end_ns") } });
+            boundaries.push_back({ static_cast<std::size_t>(fields.at("event")), markov::TimeWindow{ fields.at("begin_ns"), fields.at("end_ns") } });
         }
     }
 

@@ -24,7 +24,7 @@ class GraphDependencies {
 public:
     GraphDependencies(KvPool & pool, ResourceService & resources, std::span<const Request> requests, ResourceObserver * observer = nullptr);
     std::vector<std::size_t> insert(const CoarseGraph & graph, Timeline & timeline, std::span<const ServiceDuration> durations,
-                                    const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryTime> boundaries = {});
+                                    const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryCondition> boundaries = {});
     void invalidate(const ResourceChanges & changes, const Timeline & timeline);
     std::optional<std::size_t> signal(const std::string & name) const;
     void observe_completion(std::size_t event);

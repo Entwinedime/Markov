@@ -155,12 +155,16 @@ class FixedPerformance:
         self.report["specialization_loads"] = reference.specialization_loads
         self.report["external_releases"] = [{"rank": rank, "event": event, "time_ns": stamp}
                                             for (rank, event), stamp in reference.entries.items()]
+        self.report["idle_ingress_releases"] = [
+            {"rank": rank, "predecessor": source, "successor": target,
+             "time_ns": cut.resumed_raw_ns - reference.origin_ns, "head_ns": cut.head_ns, "tail_ns": cut.tail_ns}
+            for ((rank, source), (_, target)), cut in reference.input_releases.items()
+        ]
         conditions = Counter()
         for row in reference.host_conditions.values():
             conditions.update(row)
         self.report["fixed_host_conditions"] = {"steps": len(reference.host_conditions), **conditions}
-        self.report["fixed_host_fences"] = {"qualified": len(reference.host_fences), "service_ns": sum(
-            head + tail for _, head, tail in reference.host_fences.values())}
+        self.report["fixed_host_fences"] = reference.fence_evidence
         self.report["fixed_device_dispatch"] = reference.device_dispatch
         model = ModelingProcess(args.binary, args.modeling_image, args.timeout)
         self.report["modeling_image"] = model.image

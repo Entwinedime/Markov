@@ -28,8 +28,9 @@ class ActionComparison:
         "native_tail_unexecuted",
     })
 
-    def __init__(self, reference, execution, output, details):
+    def __init__(self, reference, execution, output, details, *, realization=None):
         self.reference, self.execution, self.output, self.details = reference, execution, output, details
+        self.realization = realization
         self.capture, self.graphs = reference.capture, reference.graphs
         self.counts, self.findings = Counter(), []
 
@@ -163,8 +164,7 @@ class ActionComparison:
         ordering = ActionOrderComparison(keys, self.details)
         predicted_dependencies = {rank: CausalGraph() for rank in sources}
         native_evidence = native_case.report(self.details)
-        condition_inputs = ConsumedInputs(native_case, ingress)
-        sources.clear()
+        condition_inputs = ConsumedInputs(native_case, ingress, self.realization)
 
         # Compare contents independently of occurrence pairing, after native remote pools have their actual owners.
         contents = {key: source.snapshot(index, identity["group"]) for key, (source, index, identity) in expected.items()}

@@ -9,8 +9,8 @@ from markov_collection.adapters.runtimes.ascend.trace import Interval, ThreadInt
 
 
 class HostQueueEvidence:
-    def __init__(self, source, activity, runnable):
-        self.source = source
+    def __init__(self, source, activity):
+        self.source, self.activity = source, activity
         recorded = {"eventfd_read": [], "eventfd_write": []}
         for row in source.runtime:
             if row["api"] in recorded:
@@ -28,50 +28,41 @@ class HostQueueEvidence:
         for commands in self.completions.values():
             commands.sort()
 
-        self.sleep, self.native_threads, self.wakes = {}, {}, defaultdict(list)
-        for row in activity:
-            thread = row["thread"]
-            pauses = set(runnable[thread])
-            self.sleep[thread] = [
-                (out, resume) for (out, running), (resume, resumed) in pairwise(row["switches"])
-                if not running and resumed and (out, resume) not in pauses
-            ]
-            for kind, stamp, *payload in row.get("kernel_events", ()):
-                if kind == "switch_out":
-                    self.native_threads[thread] = payload[0]
-                elif kind == "wake":
-                    self.wakes[thread, payload[0]].append(stamp)
-        for stamps in self.wakes.values():
-            stamps.sort()
-
     def producer(self, read, sleep, resume):
         if any(other is not read and other.begin < read.end and read.begin < other.end
                for other in self.read_index.overlapping(read)):
             return None
 
-        # A single credit on this descriptor must wake the blocked consumer.
-        writes = [row for row in self.write_index.overlapping(read) if row.begin < read.end and read.begin < row.end]
-        if len(writes) != 1:
-            return None
-        write, = writes
-        if not (read.record["value"] == write.record["value"] == 1 and write.begin <= resume and sleep <= write.end):
+        # An eventfd read can consume several credits while its reader is off CPU.
+        writes = [row for row in self.write_index.overlapping(read)
+                  if row.begin < read.end and read.begin < row.end and row.record["value"] > 0]
+        if not writes or sum(row.record["value"] for row in writes) != read.record["value"]:
             return None
 
-        # A write can enter before the reader switches out. Its kernel wake identifies when the credit took effect.
-        peer = self.native_threads.get(read.record["thread"])
-        stamps = self.wakes.get((write.record["thread"], peer), ())
-        first = bisect_left(stamps, max(sleep, write.begin))
-        last = bisect_right(stamps, min(resume, write.end), lo=first)
-        if last == first + 1:
-            return write, stamps[first]
-        if sleep <= write.begin:
-            return write, write.begin
+        # The write that caused the wake can precede the switch-out record.
+        wakes = self.activity.waking(read.record["thread"], read.begin, resume)
+        if len(wakes) == 1:
+            wake, = wakes
+            matching = [write for write in writes if write.record["thread"] == wake.local_thread
+                        and write.begin <= wake.raw_ns <= write.end]
+            if len(matching) == 1:
+                return matching[0], wake
+
+        # With one write during the sleep, the owner is known even without an exact wake time.
+        if not wakes and len(writes) == 1 and sleep <= writes[0].begin <= resume:
+            return writes[0], None
         return None
 
     def stamp(self, command, side):
         return self.source.host_measurements[f"thread/{command.thread}", getattr(command, side)]
 
-    def notified_enqueue(self, read, write):
+    def unowned_enqueue(self, correlation):
+        command = self.source.enqueues[correlation]
+        if self.source.owner(command) is None:
+            return command.thread, self.stamp(command, "begin")
+        return None
+
+    def notified_take(self, read, write):
         takes = self.takes[read.thread]
         index = bisect_left(takes, read.end, key=lambda command: command.begin)
         if index == len(takes) or (index and takes[index - 1].end > read.begin):
@@ -83,60 +74,72 @@ class HostQueueEvidence:
 
         # The writer is inside the exact enqueue whose command the worker takes after the read.
         correlation = take.record["args"]["correlation_id"]
-        owner = self.source.owner(producer)
-        if producer is not self.source.enqueues[correlation] or owner is None or owner in self.source.closed_scopes:
-            return None
-        return correlation
+        if producer is self.source.enqueues[correlation]:
+            return take, producer
 
     def observe(self):
-        counts, notifications, arrivals = Counter(), [], set()
+        counts, notifications, arrivals, read_wakes = Counter(), [], set(), {}
         for read in self.reads:
             interval = self.source.interval(read.record)
             if not (self.source.window.begin <= interval.begin < interval.end <= self.source.window.end):
                 continue
             if self.source.excluded.enclosing(interval) is not None:
                 continue
-            if interval.thread in self.takes:
-                sleeps = self.blocked(read, interval.thread)
-                notice = self.producer(read, *sleeps[0]) if len(sleeps) == 1 else None
-                correlation = self.notified_enqueue(interval, notice[0]) if notice is not None else None
-                if correlation is not None:
-                    arrivals.add(correlation)
-                continue
+
+            reader = interval.thread
+            submission = reader in self.takes
             scope = self.source.owner(interval)
-            if scope is None or scope in self.source.closed_scopes:
-                continue
-            counts["reads"] += 1
-            if interval.thread not in self.sleep:
-                counts["unknown_thread_activity"] += 1
-                continue
-            sleeps = self.blocked(read, interval.thread)
+            if not submission:
+                if scope is None or scope in self.source.closed_scopes:
+                    continue
+                counts["reads"] += 1
+                if reader not in self.activity.sleep:
+                    counts["unknown_thread_activity"] += 1
+                    continue
+
+            sleeps = self.blocked(read, reader)
             if not sleeps:
                 continue
-            counts["blocked_reads"] += 1
+            if not submission:
+                counts["blocked_reads"] += 1
             notice = self.producer(read, *sleeps[0]) if len(sleeps) == 1 else None
             if notice is None:
-                counts["unpaired_notifications"] += 1
+                if not submission:
+                    counts["unpaired_notifications"] += 1
                 continue
-            write, released = notice
+
+            write, wake = notice
+            if wake is not None:
+                key = reader, sleeps[0]
+                self.source.require(read_wakes.setdefault(key, wake) == wake, "conflicting eventfd wake evidence")
+            if submission:
+                if pair := self.notified_take(interval, write):
+                    take, post = pair
+                    owner = self.source.owner(post)
+                    if owner is not None and owner not in self.source.closed_scopes:
+                        arrivals.add(take.record["args"]["correlation_id"])
+                continue
 
             # The SDK closes its dequeue mark before the repository retires the command and notifies the waiter.
             producer = write.record["thread"]
             commands = self.completions.get(producer, ())
             index = bisect_right(commands, write.begin, key=lambda command: command[0]) - 1
-            if index < 0 or producer == interval.thread:
+            if index < 0 or producer == reader:
                 counts["unpaired_queue_completions"] += 1
                 continue
             finish, correlation = commands[index]
+            take = self.source.dequeue_ids[correlation]
             enqueue = self.source.enqueues[correlation]
             if self.source.excluded.enclosing(enqueue) is not None:
                 counts["observer_producers"] += 1
                 continue
             counts["dequeue_mark_before_wait"] += finish < read.begin
+            released = wake.raw_ns if wake is not None else write.begin
             notifications.append({
                 "scope": scope, "site": self.source.native["scopes"][scope]["site"],
-                "descriptor": read.thread, "consumer": interval.thread, "producer": producer,
-                "sdk_correlation": correlation, "dequeue_order": self.source.dequeue_ids[correlation].end,
+                "descriptor": read.thread, "consumer": reader, "producer": producer,
+                "sdk_correlation": correlation, "dequeue_order": take.end,
+                "dequeue_started_ns": self.stamp(take, "begin"),
                 "dequeue_finished_ns": finish,
                 "wait_ns": [read.begin, read.end], "off_cpu_ns": list(sleeps[0]),
                 "notification_ns": [released, min(write.end, sleeps[0][1])],
@@ -148,42 +151,31 @@ class HostQueueEvidence:
             "queue_arrival_notifications": len(arrivals),
             "first": notifications[0] if notifications else None,
             "notifications": notifications,
-        }, arrivals
+        }, arrivals, read_wakes
 
     def blocked(self, read, thread):
-        return [(first, last) for first, last in ThreadService.within(self.sleep.get(thread, ()), read.begin, read.end)
+        return [(first, last) for first, last in ThreadService.within(self.activity.sleep.get(thread, ()), read.begin, read.end)
                 if read.begin <= first < last <= read.end]
 
-    def handoffs(self, graph, positions, arrivals, activity):
+    def handoffs(self, graph, positions, arrivals):
         delays, counts = {}, Counter()
-        edges = {(edge["source"], edge["target"], edge["kind"]) for edge in graph["edges"]
-                 if edge["kind"] in {"submission", "order"}}
+        edges = {(edge["source"], edge["target"]) for edge in graph["edges"] if edge["kind"] == "submission"}
         for takes in self.takes.values():
             for previous, take in pairwise([None, *takes]):
-                target = positions.get((take.thread, take.begin))
-                if target is None:
-                    continue
                 correlation = take.record["args"]["correlation_id"]
                 post = self.source.enqueues[correlation]
-                sender = positions.get((post.thread, post.begin))
-                if post.thread == take.thread or (sender, target, "submission") not in edges:
-                    continue
-
                 finish = self.stamp(take, "begin")
-                if correlation in arrivals or previous is None or previous.end <= post.begin:
-                    elapsed = finish - self.stamp(post, "begin")
-                    self.source.require(elapsed >= 0, "observed queue take precedes its original enqueue")
-                    delays[sender, target] = {"queue_handoff_ns": elapsed}
-                    counts["notified_active_takes"] += correlation in arrivals
+                if previous is not None and post.begin < previous.end and correlation not in arrivals:
+
+                    # Already submitted work follows the preceding dequeue on the same worker.
                     continue
 
-                # An already posted command follows the previous worker's measured retirement activity.
-                preceding = positions.get((take.thread, previous.end))
-                if post.end > previous.end or (preceding, target, "order") not in edges:
+                sender = positions.get((post.thread, post.begin))
+                target = positions.get((take.thread, take.begin))
+                if post.thread == take.thread or (sender, target) not in edges:
                     continue
-                begin = self.stamp(previous, "end")
-                running = activity.duration(take.thread, begin, finish, False)
-                if running is not None and running == finish - begin:
-                    delays[preceding, target] = {"queue_retirement_ns": running}
-                    counts["running_retirements"] += 1
-        return delays, dict(counts)
+                elapsed = finish - self.stamp(post, "begin")
+                self.source.require(elapsed >= 0, "observed queue take precedes its original enqueue")
+                delays[sender, target] = {"queue_handoff_ns": elapsed}
+                counts["notified_active_takes"] += correlation in arrivals
+        return delays, counts

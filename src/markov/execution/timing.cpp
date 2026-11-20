@@ -11,7 +11,7 @@
 
 namespace markov {
 
-GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries) {
+GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryCondition> boundaries) {
     if (work_ns.size() != graph.work.size()) throw std::invalid_argument("graph timing requires one service declaration per work interval");
     GraphTiming result{ std::move(work_ns), std::move(boundaries) };
     if (std::ranges::all_of(result.work_ns, [](const auto & value) { return value.has_value(); })) return result;
@@ -21,7 +21,8 @@ GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<Serv
     std::vector<std::optional<std::int64_t>> upper(graph.events.size());
     std::set<std::size_t> bounded;
     for (const auto & boundary : result.boundaries) {
-        upper.at(boundary.event) = boundary.window.end_ns;
+        if (!boundary.window) continue;
+        upper.at(boundary.event) = boundary.window->end_ns;
         bounded.insert(boundary.event);
     }
     for (const auto & edge : graph.edges) {
@@ -57,7 +58,7 @@ GraphTiming GraphTiming::conditioned(const CoarseGraph & graph, std::vector<Serv
 
         result.boundaries.push_back({
             work.finish,
-            { 0, *upper[work.finish] }
+            TimeWindow{ 0, *upper[work.finish] }
         });
         bounded.insert(work.finish);
     }

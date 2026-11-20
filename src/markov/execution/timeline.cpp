@@ -66,7 +66,7 @@ std::vector<std::int64_t> Timeline::replay(std::span<const std::int64_t> release
 }
 
 std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<const ServiceDuration> work_ns, std::span<const ExecutionInput> inputs,
-                                          std::span<const BoundaryTime> boundaries) {
+                                          std::span<const BoundaryCondition> boundaries) {
     if (work_ns.size() != graph.work.size()) throw std::invalid_argument("execution requires one service duration or completion condition per work interval");
     std::vector<std::size_t> resources;
     for (const auto & resource : graph.resources) {
@@ -80,17 +80,20 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     for (const auto & input : inputs) {
         if (!events_.contains(input.source) || input.target >= graph.events.size()) throw std::invalid_argument("undefined invocation input boundary");
     }
-    std::map<std::size_t, const BoundaryTime *> times;
+    std::map<std::size_t, const BoundaryCondition *> conditions;
     for (const auto & boundary : boundaries) {
-        const auto window = boundary.window;
-        if (boundary.event >= graph.events.size() || window.begin_ns < 0 || window.end_ns < std::max(now_ns_, window.begin_ns))
+        if (boundary.event >= graph.events.size() || (!boundary.window && !boundary.source_event))
+            throw std::invalid_argument("invalid invocation boundary condition");
+        if (const auto & window = boundary.window; window && (window->begin_ns < 0 || window->end_ns < std::max(now_ns_, window->begin_ns)))
             throw std::invalid_argument("invalid completion window for event " + std::to_string(boundary.event)
                                         + " at submission " + std::to_string(now_ns_));
-        if (!times.emplace(boundary.event, &boundary).second) throw std::invalid_argument("duplicate invocation completion condition");
+        if (!conditions.emplace(boundary.event, &boundary).second) throw std::invalid_argument("duplicate invocation boundary condition");
     }
 
     for (std::size_t index = 0; index < graph.work.size(); ++index) {
-        if (!work_ns[index] && !times.contains(graph.work[index].finish))
+        if (work_ns[index]) continue;
+        const auto finish = conditions.find(graph.work[index].finish);
+        if (finish == conditions.end() || !finish->second->window)
             throw std::invalid_argument("missing service cost and completion condition for work " + std::to_string(index)
                                         + " in scope " + std::to_string(graph.work[index].scope));
     }
@@ -116,12 +119,13 @@ std::vector<std::size_t> Timeline::insert(const CoarseGraph & graph, std::span<c
     unfinished_ += graph.events.size();
     work_count_ += graph.work.size();
     if (observer_) observer_->inserted(graph, identities, work_ns, now_ns_);
-    for (const auto & [event, boundary] : times) {
-        const auto window = boundary->window;
-        auto & node = events_.at(offset + event);
-        node.ready_ns = std::max(now_ns_, window.begin_ns);
-        node.latest_ns = window.end_ns;
-        if (observer_) observer_->constrained(offset + event, window.begin_ns, window.end_ns, boundary->source_event);
+    for (const auto & [event, boundary] : conditions) {
+        if (const auto & window = boundary->window) {
+            auto & node = events_.at(offset + event);
+            node.ready_ns = std::max(now_ns_, window->begin_ns);
+            node.latest_ns = window->end_ns;
+        }
+        if (observer_) observer_->conditioned({ offset + event, boundary->window, boundary->source_event });
     }
     std::vector<bool> has_previous(graph.events.size()), has_next(graph.events.size());
     for (const auto & edge : graph.edges) {
@@ -228,7 +232,7 @@ void Timeline::resolve(std::size_t event, std::span<const std::size_t> sources, 
             throw std::invalid_argument("boundary requires one ordered nonnegative time window");
         target.ready_ns = std::max(target.ready_ns, window->begin_ns);
         target.latest_ns = window->end_ns;
-        if (observer_) observer_->constrained(event, window->begin_ns, window->end_ns);
+        if (observer_) observer_->conditioned({ event, window });
     }
     const auto delay = service_ns ? *service_ns : 0;
     if (sources.empty()) target.ready_ns = std::max(target.ready_ns, after(now_ns_, delay));

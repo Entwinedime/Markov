@@ -90,7 +90,7 @@ void GraphDependencies::invalidate_slot(std::size_t slot, const std::string & fi
 }
 
 std::vector<std::size_t> GraphDependencies::insert(const CoarseGraph & graph, Timeline & timeline, std::span<const ServiceDuration> durations,
-                                                   const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryTime> boundaries) {
+                                                   const std::map<std::string, GraphDependencies *> & pools, std::span<const BoundaryCondition> boundaries) {
     std::set<std::string> exposed;
     for (const auto & port : graph.scopes.front().ports) {
         if (port.use == PortUse::Data && port.direction == Direction::Output) exposed.insert(port.tensor->storage);

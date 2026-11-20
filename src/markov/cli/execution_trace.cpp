@@ -69,14 +69,16 @@ void ExecutionTrace::completed(std::size_t event, std::int64_t time_ns) {
     } << '\n';
 }
 
-void ExecutionTrace::constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> source_event) {
+void ExecutionTrace::conditioned(const BoundaryCondition & condition) {
     nlohmann::json record{
-        {    "kind", "boundary_time" },
-        {   "event",           event },
-        { "begin_ns",       begin_ns },
-        { "end_ns",           end_ns }
+        { "kind", condition.window ? "boundary_time" : "logical_boundary" },
+        { "event", condition.event }
     };
-    if (source_event) record["source_event"] = *source_event;
+    if (condition.window) {
+        record["begin_ns"] = condition.window->begin_ns;
+        record["end_ns"] = condition.window->end_ns;
+    }
+    if (condition.source_event) record["source_event"] = *condition.source_event;
     stream_ << record << '\n';
 }
 

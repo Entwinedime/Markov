@@ -181,24 +181,31 @@ std::size_t boundary(const CoarseGraph & graph, const nlohmann::json & selector)
 GraphTiming InvocationInput::timing(const CoarseGraph & graph) const {
     if (layouts) {
         const auto layout = graph.action_layout();
-        const auto & timestamps = record.at("timestamps").get_ref<const nlohmann::json::array_t &>();
-        if (layout.identity != layouts->at(record.at("layout").get<std::size_t>()) || timestamps.size() != layout.events.size())
+        const auto & endpoints = record.at("endpoints").get_ref<const nlohmann::json::array_t &>();
+        if (layout.identity != layouts->at(record.at("layout").get<std::size_t>()) || endpoints.size() != layout.events.size())
             throw std::invalid_argument("first measured action layout divergence at " + position.group + " step " + std::to_string(position.step)
                                         + " (" + graph.scopes.front().info.site + ")");
 
-        // Observed endpoints constrain the time line directly without deriving a predecessor's finish from a later event.
+        // Timed endpoints pin a boundary; a pure order witness supplies only its original identity.
         GraphTiming result{ std::vector<ServiceDuration>(graph.work.size()), {} };
-        result.boundaries.reserve(timestamps.size());
+        result.boundaries.reserve(endpoints.size());
         std::set<std::size_t> native_events;
-        for (std::size_t index = 0; index < timestamps.size(); ++index) {
-            const auto & observation = timestamps[index];
-            if (!observation.is_array() || observation.size() != 2 || !observation[0].is_number_unsigned() || !observation[1].is_number_integer())
-                throw std::invalid_argument("full timing needs an original event and its realized nanoseconds");
+        for (std::size_t index = 0; index < endpoints.size(); ++index) {
+            const auto & observation = endpoints[index];
+            if (!observation.is_array() || observation.size() != 2 || !observation[0].is_number_unsigned())
+                throw std::invalid_argument("full timing needs a source event and its timing condition");
             const auto source = observation[0].get<std::size_t>();
-            const auto time = observation[1].get<std::int64_t>();
-            if (time < 0 || !native_events.insert(source).second)
-                throw std::invalid_argument("full timing has a negative time or a repeated native event");
-            result.boundaries.push_back({ layout.events[index], {time, time}, source });
+            if (!native_events.insert(source).second) throw std::invalid_argument("full timing repeats a native event");
+
+            std::optional<TimeWindow> observed;
+            const auto & selected = observation[1];
+            if (!selected.is_null()) {
+                if (!selected.is_number_integer() || selected.get<std::int64_t>() < 0)
+                    throw std::invalid_argument("measured endpoint time must be nonnegative integer nanoseconds");
+                const auto time = selected.get<std::int64_t>();
+                observed = TimeWindow{ time, time };
+            }
+            result.boundaries.push_back({ layout.events[index], observed, source });
         }
         std::map<std::pair<std::size_t, std::size_t>, std::int64_t> services;
         for (const auto & interval : record.at("services").get_ref<const nlohmann::json::array_t &>()) {
@@ -206,7 +213,8 @@ GraphTiming InvocationInput::timing(const CoarseGraph & graph) const {
                 throw std::invalid_argument("observed service requires two measured endpoint positions");
             const auto & start = result.boundaries.at(interval[0].get<std::size_t>());
             const auto & finish = result.boundaries.at(interval[1].get<std::size_t>());
-            if (const auto elapsed = finish.window.begin_ns - start.window.begin_ns;
+            if (!start.window || !finish.window) throw std::invalid_argument("observed service requires measured start and finish");
+            if (const auto elapsed = finish.window->begin_ns - start.window->begin_ns;
                 elapsed < 0 || !services.emplace(std::pair{start.event, finish.event}, elapsed).second)
                 throw std::invalid_argument("observed service reverses time or repeats an interval");
         }
@@ -236,7 +244,7 @@ GraphTiming InvocationInput::timing(const CoarseGraph & graph) const {
     }
     if (!names.contains({ "call.enter", Direction::Input }) || !names.contains({ "call.return", Direction::Output }))
         throw std::invalid_argument("controlled invocation requires its actual CPU entry and return conditions");
-    std::vector<BoundaryTime> boundaries;
+    std::vector<BoundaryCondition> boundaries;
     for (const auto & [event, value] : times) boundaries.push_back({ event, value });
     return GraphTiming::conditioned(graph, std::vector<ServiceDuration>(graph.work.size(), service(record)), std::move(boundaries));
 }

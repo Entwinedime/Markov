@@ -17,9 +17,12 @@ RUN bash /opt/markov/install-sglang.sh /opt/markov/sglang && rm /opt/markov/inst
 ENV ASCEND_USE_FA=true ASCEND_USE_FIA=false
 
 # The SDK dumper must publish its running flag before starting the background thread.
-COPY src/collection/native/runtimes/ascend /opt/markov/native/ascend
+COPY src/collection/native/runtimes/ascend/profiler /opt/markov/native/ascend/profiler
 RUN bash /opt/markov/native/ascend/profiler/install.sh
 
+COPY src/collection/native/runtimes/ascend/CMakeLists.txt \
+    src/collection/native/runtimes/ascend/*.cpp \
+    src/collection/native/runtimes/ascend/*.hpp /opt/markov/native/ascend/
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && cmake -S /opt/markov/native/ascend -B /tmp/markov-ascend -DCMAKE_BUILD_TYPE=Release \
         -DMARKOV_ASCEND_INCLUDE_DIR=/usr/local/Ascend/ascend-toolkit/latest/include \

@@ -94,23 +94,26 @@ class NativeCase:
 
                 # SDK dictionaries are no longer needed while projecting the retained causal graph.
                 del runtime, facts
-            self.logical[rank] = {
-                event for event, point in enumerate(graph["evidence"]["events"])
-                if point["time_ns"] is None and (
-                    graph["events"][event]["resource"], point["order"]
-                ) in logical_coordinates
-            }
+            logical = {}
+            for event, point in enumerate(graph["evidence"]["events"]):
+                coordinate = graph["events"][event]["resource"], point["order"]
+                if point["time_ns"] is None and coordinate in logical_coordinates:
+                    logical[event] = logical_coordinates[coordinate]
+            self.logical[rank] = set(logical)
 
-            # Elided waits gate order, not work or published data; those boundaries still require actual measurements.
-            data = {event for work in graph["work"] for event in (work["start"], work["finish"])}
+            # A proven wait return can hand off a value produced by earlier work. The work itself still needs both times.
+            measured = {event for work in graph["work"] for event in (work["start"], work["finish"])}
             for scope in graph["scopes"]:
-                data.update(port["event"] for port in scope["ports"] if port["use"] == "data"
-                            or port["use"] == "signal" and port["direction"] == "output")
-                data.update(port["rendezvous"] for port in scope["ports"] if "rendezvous" in port)
+                for port in scope["ports"]:
+                    if (port["use"] == "data" and (port["direction"] == "input" or logical.get(port["event"]) is None)
+                            or port["use"] == "signal" and port["direction"] == "output"):
+                        measured.add(port["event"])
+                    if "rendezvous" in port:
+                        measured.add(port["rendezvous"])
                 for access in scope["kv_accesses"] + scope["slot_accesses"]:
-                    data.update((access["start"], access["finish"]))
-            if data & self.logical[rank]:
-                raise ValueError("unmeasured stream wait also owns work, data or state")
+                    measured.update((access["start"], access["finish"]))
+            if invalid := measured & self.logical[rank]:
+                raise ValueError(f"elided waits at rank {rank} own measured boundaries: {sorted(invalid)}")
         dependencies = CausalGraph.observed(graph)
         clock = ClockConstraints(graph, raw["device_clock"])
         anchors = [event for event, point in enumerate(clock.points) if point is not None]
@@ -146,33 +149,6 @@ class NativeCase:
     def completion_boundaries(self, rank, scope):
         return [boundary for boundary in self.sources[rank][0].completion_boundaries(scope)
                 if boundary["event"] not in self.logical[rank]]
-
-    def logical_times(self, realization):
-        predecessors = {(rank, event): [] for rank, events in self.logical.items() for event in events}
-        if not predecessors:
-            return {}
-        for source, targets in self.graph.next.items():
-            for target in targets:
-                if target in predecessors:
-                    predecessors[target].append(source)
-
-        # A verified elided wait is ready once all real prerequisites are ready.
-        times = {}
-        for event in self.graph.positions:
-            if event not in predecessors:
-                continue
-            inputs = []
-            for source in predecessors[event]:
-                rank, boundary = source
-                if source in predecessors:
-                    inputs.append(times.get(source))
-                elif rank in self.clocks and 0 <= boundary < len(self.clocks[rank].points):
-                    inputs.append(realization.timestamp(rank, boundary))
-                else:
-                    inputs.append(None)
-            if inputs and None not in inputs:
-                times[event] = max(inputs)
-        return times
 
     def measured_service_pairs(self, rank, graph, raw, *, resources=None):
         if resources is None:

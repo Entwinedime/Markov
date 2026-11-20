@@ -16,10 +16,10 @@ struct TimeWindow {
     std::int64_t end_ns;
 };
 
-// The caller has already matched this invocation's boundary; execution never matches source and target ordinals.
-struct BoundaryTime {
+// A native witness without a window leaves readiness to the graph's dependencies.
+struct BoundaryCondition {
     std::size_t event;
-    TimeWindow window;
+    std::optional<TimeWindow> window;
     std::optional<std::size_t> source_event{};
 };
 
@@ -27,10 +27,10 @@ class CoarseGraph;
 
 struct GraphTiming {
     std::vector<ServiceDuration> work_ns;
-    std::vector<BoundaryTime> boundaries;
+    std::vector<BoundaryCondition> boundaries;
 
     // Unknown work needs its own condition or a bound from an actual causal successor; neither supplies its service cost.
-    static GraphTiming conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryTime> boundaries);
+    static GraphTiming conditioned(const CoarseGraph & graph, std::vector<ServiceDuration> work_ns, std::vector<BoundaryCondition> boundaries);
 };
 
 struct EventTiming {

@@ -21,7 +21,7 @@ public:
                            std::optional<std::size_t> activation) = 0;
     virtual void activated(std::size_t event, std::int64_t time_ns) = 0;
     virtual void completed(std::size_t event, std::int64_t time_ns) = 0;
-    virtual void constrained(std::size_t event, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> source_event = {}) = 0;
+    virtual void conditioned(const BoundaryCondition & condition) = 0;
 };
 
 } // namespace markov
