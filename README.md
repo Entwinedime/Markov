@@ -69,7 +69,9 @@ The single-host validation used SGLang on Ascend, dummy weights, and workloads w
 
 | Model | Dtype | Configuration | Checked cases |
 | --- | --- | --- | --- |
-| Qwen3-8B | BF16 | TP1 and TP2 with 16-token pages, TP8 with 32-token pages | Page boundaries, normal and burst traffic, chunked prefill, mixed batches, and first-level prefix-cache hits and eviction |
+| Qwen3-8B | BF16 | TP1 with 16-token pages | Page boundaries and normal and burst request traffic |
+| Qwen3-8B | BF16 | TP2 with 16-token pages | Dual-card serving, chunked prefill with mixed batches, and first-level prefix-cache hits and eviction |
+| Qwen3-8B | BF16 | TP8 with 32-token pages | Two staggered requests on eight cards |
 | Qwen3-8B | BF16 | Prefill TP1 and Decode TP2 with 16-token pages | Asymmetric disaggregation with KV and metadata handoffs |
 | Mistral 7B | FP16 | PP3 with 32-token pages and TP2 × PP3 with 16-token pages | Pipeline batches and combined tensor and pipeline parallelism. Host transfer timing is checked at the endpoints. |
 | Qwen3-30B-A3B | BF16 | TP4 × EP4 with 128-token pages | Expert parallelism with explicit routes in the workload |

@@ -1,6 +1,6 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-21。**当前在 M4。S11 已完成评分、固定图基线和分组归因，阶段交付后进入 S12 干净环境复现。**
+更新日期为 2026-11-21。**S12 已完成干净环境复现，D1–D6 的依据和范围均已核对，进入发布和关闭。**
 
 | 里程碑 | 阶段 | 当前交付 |
 | --- | --- | --- |
@@ -8,12 +8,12 @@
 | M1 多角色计时 | S1–S3 | 已交付，TP2 与 Prefill TP1、Decode TP2 完成计时和开发闭环 |
 | M2 配置集探索 | S4–S5 | 已交付，从空资产预测四个组合，换请求后完整复用 |
 | M3 单机覆盖 | S6–S7 | 已交付，具名 TP、PP、EP、PD、并行组合、分块混合和一级缓存完成开发回归。S8 第二框架暂缓 |
-| M4 独立验收与交付 | S9–S12 | S9 已交付。S10 新旧验证共二十一例通过全节点结构。S11 双卡固定图基线和替换归因通过，十三例取得完整自主评分。S12 已完成构建和复用示例预检 |
+| M4 独立验收与交付 | S9–S12 | S9 已交付。S10 新旧验证共二十一例通过全节点结构。S11 双卡固定图基线和替换归因通过，十三例取得完整自主评分。S12 干净检出构建、冷启动及换输入复用通过 |
 
-## 在跑任务和收尾顺序
+## 交付状态
 
 - EP4 与前缀缓存的两例新独立目标已完成全节点结构及自主评分。[独立对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-ep4-prefix-independent/comparisons.json) · [评分审计](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-topology.json)
-- PD 新留出已取得全节点结构对照和完整自主评分，Azure 并发 4 稳态复核已完成。M4 已用 108 次原生尝试，余五次预留给 S12 冷启动。阶段及整窗上限为 113、168 次，原生、后处理和存储上限为 36,000 秒、39,600 秒和 256 GiB。[PD 复核](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json) · [Azure 稳态复核](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-azure-steady-pair.json)
+- PD 新留出已取得全节点结构对照和完整自主评分，Azure 并发 4 稳态复核完成。M4 最终登记 112 次原生尝试，含 S12 四次，低于 113 次阶段上限。[PD 复核](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json) · [Azure 稳态复核](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-azure-steady-pair.json) · [S12 验证](../../../data/20261119T090556.273460Z_project-delivery/work/s12-release/verified.json)
 - 定向唤醒已接入原生详采。新 TP2 的固定图原结论有 28 个提前端点，其中一处为合并通知引起的 24.12 微秒局部差异。修订后使用同次记录重放，64,186 个实测端点全部对齐，41,606 项工作完成实测与成本配对。较早 TP2 的基线和全部成本替换结果逐项相同。两项结果记为开发回归。[冻结原结论](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/independent/fixed/result.json) · [修订回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/notification-count-regression/repair/result.json) · [旧例回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/notification-count-regression/unchanged/result.json)
 
 ## S10 独立结构验收
@@ -59,10 +59,11 @@ TP2 固定图在独立于模板与成本训练的原生留出上复核。64,178 
 - 严格 TP2 新留出记录 389,978 个内核事件，41,606 项工作均有实测和成本。隔离修订按实际 CPU 占用区分业务服务和固定活动，消除三处提交线程局部偏差。剩余一处控制线程阻塞为 423.13 微秒，观察到离核和恢复，缺唤醒者证据。较早 TP2 的完整基线继续通过，仍为开发证据。[冻结固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/fixed/result.json) · [四处原始诊断](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/local-causal-audit.json) · [隔离回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/host-service-partition/latest-tp2/result.json)
 - 正式查询覆盖 PD 原参考三 rank 的 8,912、22,403 和 22,387 项工作。旧参考的开发回归与新独立目标分别保留。[正式查询](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/admission-sequence/costs/costs.json) · [开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/development-pd-admission/case/result.json) · [新目标审计](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json)
 
-## S12 交付预检
+## S12 可复现交付
 
-- 独立干净检出重放冻结补丁后，Docker 构建 54.12 秒，主程序与冻结二进制的 SHA-256 相同。采集和控制镜像也已复建一致。默认示例离线规划两次详采来源、四个目标组合，复用输入通过合同核对。正式交付提交的干净检出、冷资产运行和换 workload 复用仍待执行。[构建回执](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/build.receipt.json) · [镜像预检](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/packaging/result.json) · [示例计划](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/planning.json)
-- 新版公开示例在复用轮新增一条较晚请求，保持每条请求的长度。用 S5 已发布资产运行正式入口，四个目标均预测完成且生成按需轨迹，原生尝试和来源、成本后处理均为零。另保留缩短输出后明确报告 KV 释放成本缺口的预检。[复用预检](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/reuse-late-request-preflight/result.json) · [覆盖边界](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/reuse-shorter-preflight/result.json)
+- 从远端提交 `605eb41` 干净检出，初始化 SGLang `4e155ecc`。复用已有 Ascend 基础环境镜像，正式构建采集、控制及 modeling 镜像，C++23 主程序 SHA-256 与 S11 冻结程序相同。构建墙钟为 529.58 秒，包含 Ubuntu 源下载和依赖安装。完整镜像 ID 和二进制校验值见回执。[复现回执](../../../data/20261119T090556.273460Z_project-delivery/work/s12-release/verified.json)
+- 单卡 Qwen3-8B 空目录冷启动完成 4/4 个组合，墙钟 665.72 秒，四次原生采集占 494.16 秒，来源和成本后处理占 66.21 秒。更换请求身份及到达时间并新增一条迟到请求后，四个目标继续使用冷运行资产。复用墙钟 106.87 秒，原生及后处理均为零，按需保留四份执行轨迹。逐目标输出、三项排序、精简结果和明细分别核对。[冷启动](../../../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration/summary.md) · [换请求复用](../../../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration-reuse/summary.md)
+- 保留零额度约束及缩短输出后明确报告 KV 释放成本缺口的预检。正式复用的两个 workload 输出总量按实际输入核对为六和五，原外层核对记录保留。[覆盖边界](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/reuse-shorter-preflight/result.json) · [复核回执](../../../data/20261119T090556.273460Z_project-delivery/work/s12-release/verified.json)
 
 ## 已交付基线
 
