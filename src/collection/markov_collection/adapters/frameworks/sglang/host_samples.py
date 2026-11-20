@@ -3,9 +3,11 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial, update_wrapper
+from inspect import signature
 from threading import get_native_id
 from time import CLOCK_MONOTONIC_RAW, clock_gettime_ns
 
+from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.groups import ParallelGroups
 from markov_adapters.sglang.metadata_transfers import MetadataTransfers
 from markov_adapters.sglang.pipeline import PipelineABI
@@ -59,7 +61,7 @@ class NativeHostSamples(ServingCuts):
             interval["end_raw_ns"] = clock_gettime_ns(CLOCK_MONOTONIC_RAW)
 
     @contextmanager
-    def scope(self, role, site, implementation, *, work=None, condition=None, parameters=None, bindings=None):
+    def scope(self, role, site, implementation, *, work=None, condition=None, parameters=None, bindings=None, dimensions=None):
         occurrence = {
             "id": len(self.scopes), "parent": self.parent.get(), "role": role, "site": site,
             "implementation": implementation, "work": {} if work is None else dict(work),
@@ -69,6 +71,8 @@ class NativeHostSamples(ServingCuts):
             occurrence["bindings"]["condition"] = condition
         if parameters is not None:
             occurrence["parameters"] = parameters
+        if dimensions is not None:
+            occurrence["dimensions"] = dimensions
         self.scopes.append(occurrence)
         previous = self.parent.set(occurrence["id"])
         begin = clock_gettime_ns(CLOCK_MONOTONIC_RAW)
@@ -138,37 +142,51 @@ class NativeHostSamples(ServingCuts):
             module = modules[site]
             implementation = f"{type(module).__module__}.{type(module).__qualname__}"
             forward = module.forward
-            module.forward = update_wrapper(partial(self.module, role, site, implementation, forward), forward)
+            body_signature = signature(forward) if role == "model_body" else None
+            module.forward = update_wrapper(partial(self.module, role, site, implementation, body_signature, forward), forward)
         return result
 
     def observe_expert_layers(self, experts):
         for site, module in experts.items():
             implementation = f"{type(module).__module__}.{type(module).__qualname__}"
             forward = module.forward
-            module.forward = update_wrapper(partial(self.module, "experts", site, implementation, forward), forward)
+            module.forward = update_wrapper(partial(self.module, "experts", site, implementation, None, forward), forward)
             compute = module.run_moe_core
             module.run_moe_core = update_wrapper(
-                partial(self.module, "expert_compute", compute.__qualname__, f"{compute.__module__}.{compute.__qualname__}", compute),
+                partial(self.module, "expert_compute", compute.__qualname__,
+                        f"{compute.__module__}.{compute.__qualname__}", None, compute),
                 compute,
             )
 
-    def module(self, role, site, implementation, original, *args, **kwargs):
+    def module(self, role, site, implementation, body_signature, original, *args, **kwargs):
         if not self.enabled:
             return original(*args, **kwargs)
-        with self.scope(role, site, implementation):
+        with self.scope(role, site, implementation) as scope:
+            if body_signature is not None:
+
+                # Read the tensors passed to the model after the native backend has applied padding.
+                with self.auxiliary():
+                    arguments = ModelScopes.bound_arguments(body_signature, args, kwargs)
+                    scope["dimensions"] = ModelScopes.model_dimensions(arguments)
             return original(*args, **kwargs)
 
     def run_batch(self, original, scheduler, batch, *args, **kwargs):
         if not self.enabled:
             return original(scheduler, batch, *args, **kwargs)
-        with self.native_call("run_batch", original, work=self.batch_work(batch)):
+        work = self.batch_work(batch)
+        with self.auxiliary():
+            members = work["members"]
+            dimensions = BatchTensors.input_dimensions(sum(member["new_tokens"] for member in members), len(members))
+        with self.native_call("run_batch", original, work=work, dimensions=dimensions):
             return original(scheduler, batch, *args, **kwargs)
 
-    def forward(self, original, runner, *args, **kwargs):
+    def forward(self, original, runner, batch, *args, **kwargs):
         if not self.enabled:
-            return original(runner, *args, **kwargs)
-        with self.native_call("model", original):
-            return original(runner, *args, **kwargs)
+            return original(runner, batch, *args, **kwargs)
+        with self.auxiliary():
+            dimensions = BatchTensors.input_dimensions(batch.input_ids.numel(), batch.batch_size)
+        with self.native_call("model", original, dimensions=dimensions):
+            return original(runner, batch, *args, **kwargs)
 
     def sample(self, original, runner, *args, **kwargs):
         if not self.enabled:

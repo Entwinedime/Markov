@@ -97,16 +97,37 @@ class ThreadService:
         return occupied - excluded
 
 
-class AscendHostAlignment:
-    def __init__(self, trace, scopes, pairs, commands, runtime, activity, auxiliary, queries):
-        self.trace = trace
-        self.misses = Counter()
+class HostCuts:
+    def __init__(self, service):
+        self.service = service
         self.points = {}
-        observed = {scope["id"]: Interval(*scope["raw_interval"], scope["thread"], scope) for scope in scopes[1:]}
-        parts = {source: observed[target] for source, target in pairs.items()}
+        self.misses = Counter()
+        self.scopes = set()
+
+    def point(self, thread, position, target_thread, target_position):
+        key, mapped = (thread, position), (target_thread, target_position)
+        if self.points.setdefault(key, mapped) != mapped:
+            self.points[key] = None
+
+    def anchors(self, source, target):
+        self.point(source.thread, source.begin, target.thread, target.begin)
+        self.point(source.thread, source.end, target.thread, target.end)
+
+    def duration(self, thread, begin, end, submission):
+        begin = self.points.get((thread, begin))
+        end = self.points.get((thread, end))
+        if begin is None or end is None or begin[0] != end[0]:
+            return None
+        return self.service.duration(begin[0], begin[1], end[1], submission)
+
+
+class AscendHostAlignment:
+    def __init__(self, trace, scopes, commands, runtime, activity, auxiliary):
+        self.trace = trace
+        self.observed = {scope["id"]: Interval(*scope["raw_interval"], scope["thread"], scope) for scope in scopes[1:]}
 
         # Unmatched children still own their records; they cannot transfer queue work to a matched parent.
-        owners = ThreadIntervals(list(observed.values()))
+        self.owners = ThreadIntervals(list(self.observed.values()))
         auxiliary = [Interval(begin, end, thread, {}) for thread, begin, end in auxiliary]
         excluded = ThreadIntervals(auxiliary)
         filtered = []
@@ -135,21 +156,7 @@ class AscendHostAlignment:
         self.apis = trace.host_waits | trace.stream_waits | {
             "aclrtMemcpy", "aclrtMemcpyAsync", "drvMemcpy", "halMemcpy", "halSqTaskSend",
         }
-        self.align_scopes(parts, owners, filtered)
-        for query in queries:
-            scope = query["scope"]
-            if scope in parts:
-                previous = self.trace.scopes[scope]
-                self.anchors(Interval(query["begin_counter"], query["end_counter"], previous.thread, {}), parts[scope])
-
-    def point(self, thread, position, target_thread, target_position):
-        key, mapped = (thread, position), (target_thread, target_position)
-        if self.points.setdefault(key, mapped) != mapped:
-            self.points[key] = None
-
-    def anchors(self, source, target):
-        self.point(source.thread, source.begin, target.thread, target.begin)
-        self.point(source.thread, source.end, target.thread, target.end)
+        self.previous, self.current = self.queues(filtered)
 
     @staticmethod
     def signature(call):
@@ -159,57 +166,74 @@ class AscendHostAlignment:
     def calls(self, values):
         return [row for row in values if row.record["api"] in self.apis]
 
-    def align_runtime(self, old, new):
+    def runtime_matches(self, cuts, old, new, strict):
         original = [self.signature(row) for row in old]
         measured = [self.signature(row) for row in new]
         if original != measured:
-            self.misses["runtime_sequence"] += 1
+            cuts.misses["runtime_sequence"] += 1
+            if strict:
+                return None
             left, right = Counter(original), Counter(measured)
             shared = {key for key, count in left.items() if count == right[key]}
 
             # A transient runtime call can disappear after warmup. Pair only cuts with equal multiplicity and preserved order.
             if [key for key in original if key in shared] != [key for key in measured if key in shared]:
-                return
+                return ()
             old = [row for row, key in zip(old, original, strict=True) if key in shared]
             new = [row for row, key in zip(new, measured, strict=True) if key in shared]
-        for previous, current in zip(old, new, strict=True):
-            self.anchors(previous, current)
+        return zip(old, new, strict=True)
 
-    def align_scopes(self, parts, owners, commands):
+    def queues(self, commands):
         previous, current = defaultdict(list), defaultdict(list)
         for key, enqueue in sorted(self.trace.enqueue.items(), key=lambda row: row[1].begin):
             scope = self.trace.owner(enqueue)
-            if scope not in parts or self.trace.excluded_ranges.enclosing(enqueue) is not None:
+            if scope is None or self.trace.excluded_ranges.enclosing(enqueue) is not None:
                 continue
             dequeue = self.trace.dequeue[key]
             name = dequeue.record["name"].removeprefix("Dequeue@")
             previous[scope].append((name, enqueue, dequeue))
         for name, enqueue, dequeue in sorted(commands, key=lambda row: row[1][1]):
             entered = Interval(enqueue[1], enqueue[2], enqueue[0], {})
-            owner = owners.enclosing(entered)
+            owner = self.owners.enclosing(entered)
             if owner is not None:
                 finished = Interval(dequeue[1], dequeue[2], dequeue[0], {})
                 current[owner.record["id"]].append((name, entered, finished))
+        return previous, current
 
-        for scope, measured in parts.items():
+    def cuts(self, pairs, queries, *, strict_runtime=False):
+        result = HostCuts(self.service)
+        for scope, target in pairs.items():
             old_scope = self.trace.scopes[scope]
-            old, new = previous[scope], current[measured.record["id"]]
+            measured = self.observed[target]
+            old, new = self.previous[scope], self.current[target]
             if [row[0] for row in old] != [row[0] for row in new]:
-                self.misses["queue_sequence"] += 1
+                result.misses["queue_sequence"] += 1
                 continue
-            self.anchors(old_scope, measured)
             old_runtime = [row for row in self.calls(self.trace.runtime_ranges.inside(old_scope))
                            if self.trace.owner(row) == scope and self.trace.excluded_ranges.enclosing(row) is None]
-            new_runtime = [row for row in self.calls(self.runtime.inside(measured)) if owners.enclosing(row) is measured]
-            self.align_runtime(old_runtime, new_runtime)
+            new_runtime = [row for row in self.calls(self.runtime.inside(measured)) if self.owners.enclosing(row) is measured]
+            ranges = [(old_runtime, new_runtime)]
+            enqueues = []
             for (_, entered, finished), (_, produced, consumed) in zip(old, new, strict=True):
-                self.anchors(entered, produced)
-                self.anchors(finished, consumed)
-                self.align_runtime(self.calls(self.trace.runtime_ranges.inside(finished)), self.calls(self.runtime.inside(consumed)))
+                enqueues.extend(((entered, produced), (finished, consumed)))
+                ranges.append((self.calls(self.trace.runtime_ranges.inside(finished)),
+                               self.calls(self.runtime.inside(consumed))))
+            runtime = [self.runtime_matches(result, before, after, strict_runtime) for before, after in ranges]
+            if None in runtime:
+                continue
 
-    def duration(self, thread, begin, end, submission):
-        begin = self.points.get((thread, begin))
-        end = self.points.get((thread, end))
-        if begin is None or end is None or begin[0] != end[0]:
-            return None
-        return self.service.duration(begin[0], begin[1], end[1], submission)
+            result.scopes.add(scope)
+            result.anchors(old_scope, measured)
+            for source, target in enqueues:
+                result.anchors(source, target)
+            for matches in runtime:
+                for source, target in matches:
+                    result.anchors(source, target)
+
+        for query in queries:
+            scope = query["scope"]
+            if scope in pairs and (not strict_runtime or scope in result.scopes):
+                previous = self.trace.scopes[scope]
+                result.anchors(Interval(query["begin_counter"], query["end_counter"], previous.thread, {}),
+                               self.observed[pairs[scope]])
+        return result

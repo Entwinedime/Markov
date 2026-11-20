@@ -6,6 +6,7 @@ import signal
 import socket
 import time
 import traceback
+from contextlib import contextmanager
 from multiprocessing.connection import wait
 from pathlib import Path
 
@@ -25,13 +26,46 @@ class ArrivalClock:
 
 
 class NativeRendezvous:
+    host = "127.0.0.1"
+
+    @classmethod
+    @contextmanager
+    def loopback_listener(cls):
+
+        # Port zero excludes other listeners but can still select a host NAT destination.
+        for _ in range(4):
+            with socket.socket() as listener:
+                listener.bind((cls.host, 0))
+                listener.listen(1)
+                listener.settimeout(0.25)
+                try:
+                    with socket.create_connection(listener.getsockname(), timeout=0.25) as probe:
+                        accepted, peer = listener.accept()
+                        with accepted:
+                            if peer != probe.getsockname():
+                                continue
+
+                            # The client closes first so the native server can rebind the checked port.
+                            probe.shutdown(socket.SHUT_WR)
+                            accepted.settimeout(0.25)
+                            accepted.recv(1)
+                except (ConnectionError, TimeoutError):
+                    continue
+
+                listener.settimeout(None)
+                yield listener
+                return
+        raise RuntimeError("no reachable owned loopback listener for the native session")
+
     def __init__(self) -> None:
         from torch.distributed import TCPStore
 
-        # Keep the bound server alive until every Engine worker has exited; no free-port handoff.
-        self.store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+        # TCPStore takes ownership of the checked socket until every Engine worker exits.
+        with self.loopback_listener() as listener:
+            self.store = TCPStore(self.host, listener.getsockname()[1], is_master=True,
+                                  wait_for_workers=False, master_listen_fd=listener.detach())
         self.environment = {
-            "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(self.store.port),
+            "MASTER_ADDR": self.host, "MASTER_PORT": str(self.store.port),
             "TORCHELASTIC_USE_AGENT_STORE": "True", "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE": "env://",
         }
 
@@ -88,9 +122,9 @@ class NativeServingSession:
             # Select the native HTTP bootstrap only after all store ports are already occupied.
             bootstrap = None
             if len(self.instances) > 1:
-                with socket.socket() as reservation:
-                    reservation.bind(("127.0.0.1", 0))
-                    bootstrap = {"host": "127.0.0.1", "port": reservation.getsockname()[1]}
+                with NativeRendezvous.loopback_listener() as reservation:
+                    host, port = reservation.getsockname()
+                    bootstrap = {"host": host, "port": port}
 
             for index, instance in enumerate(self.instances):
                 reader, writer = context.Pipe(duplex=False)

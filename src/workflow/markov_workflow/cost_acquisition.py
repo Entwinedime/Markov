@@ -220,18 +220,22 @@ class CostAcquisition:
 
         candidates = {(source, recipe): self.attempts(source.output / recipe)
                       for source in self.sources for recipe in source.recipes}
+        explicit = {str(path) for path in (*self.graphs, *self.gaps)}
+        focus = {point for point, targets in self.demand.points.items() if explicit.intersection(targets)}
         fitted, reused, counts, missing = self.fit()
         evidence = []
         deferred = set()
         while candidates and missing:
 
-            # A single native session can cover work required by multiple targets and ranks.
-            requested = {source: len(source.host_points & missing.keys()) for source in self.sources}
+            # Prefer caller-supplied demand when training-only points compete for a native attempt.
+            requested = {source: source.host_points & missing.keys() for source in self.sources}
             applicable = [(source, recipe) for source, recipe in candidates if requested[source]
                           and (source.cold or not source.recipes[recipe].requires_cold)]
             if not applicable:
                 break
-            source, recipe = max(applicable, key=lambda key: (bool(candidates[key]), requested[key[0]]))
+            source, recipe = max(applicable, key=lambda key: (
+                bool(candidates[key]), len(requested[key[0]] & focus), len(requested[key[0]]),
+            ))
             output = source.output / recipe
             previous = candidates[source, recipe]
             spent, attempts = self.usage()
@@ -241,7 +245,7 @@ class CostAcquisition:
                 break
 
             del candidates[source, recipe]
-            row = {"capture": str(output.relative_to(self.output)), "candidate_points": requested[source]}
+            row = {"capture": str(output.relative_to(self.output)), "candidate_points": len(requested[source])}
             evidence.append(row)
             if previous and previous[-1]["status"] == "failed":
                 row["status"] = "capture_failed"

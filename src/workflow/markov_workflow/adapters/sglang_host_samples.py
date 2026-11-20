@@ -9,6 +9,7 @@ from markov_adapters.pytorch import CpuProtocolWork
 from markov_adapters.sglang.configuration import CaptureInput
 from markov_collection.adapters.runtimes.ascend.host_alignment import AscendHostAlignment
 from markov_collection.adapters.runtimes.ascend.trace import AscendTrace
+from markov_workflow.adapters.sglang_host_scopes import NativeHostCalls
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.cost_samples import ServiceSamples, WorkCatalog
 
@@ -21,8 +22,6 @@ class HostRecipe:
 
 
 class HostCostSamples:
-    batch_roles = {"run_batch", "launch", "output_prepare", "output_skip"}
-
     def __init__(self, arguments):
         self.arguments = arguments
         self.qualification = Counter()
@@ -49,73 +48,6 @@ class HostCostSamples:
     @staticmethod
     def supports(work, resource):
         return work["kind"] == "host" or (work["kind"] == "collective" and resource["kind"] == "thread")
-
-    @classmethod
-    def identity(cls, scope):
-        role, work = scope["role"], scope["work"]
-        detail = None
-        if role in cls.batch_roles:
-            detail = [work["phase"], [{key: value for key, value in member.items() if key != "slot"} for member in work["members"]]]
-        elif role == "segment":
-            detail = [work["continuation"], scope["bindings"]["condition"]]
-        elif role in {"invocation", "query", "host_read", "batch_transform", "cache_match", "cache_insert", "kv_reservation"}:
-            detail = work.get("context")
-        elif role == "metadata_collective":
-            detail = [scope["parameters"], scope["bindings"]["condition"], work["context"].get("poll_requests")]
-        elif role in {"transfer_send", "transfer_receive"}:
-            detail = [work["context"]["message"], scope["bindings"]["dtype"]]
-        elif role in {"transfer_send_wait", "transfer_receive_wait", "signal_wait"}:
-            context = work["context"]
-            producer = context["producer"]
-            detail = [context["device_wait"], context.get("wait_stream"), producer.get("record_stream"), producer["message"]]
-        elif role == "stream_wait":
-            detail = work["context"]["streams"]
-        elif role == "signal_record":
-            detail = work["context"]["record_stream"]
-        elif role == "gather":
-            detail = scope["bindings"].get("collective")
-        return role, scope["implementation"], scope["site"], json.dumps(detail, sort_keys=True)
-
-    def index(self, scopes, paths, typed, excluded):
-        routes, children = {0: 0}, defaultdict(list)
-        identities = {0: None}
-        for scope in scopes[1:]:
-            identity, parent = scope["id"], scope["parent"]
-            if "service" in scope or identity in excluded or parent not in routes:
-                continue
-            call = self.identity(scope)
-            children[parent].append(call)
-            identities[identity] = call
-
-            # Batch geometry drives its model subtree; other enclosing queues only locate the local call.
-            component = call if scope["role"] in self.batch_roles else call[:3]
-            routes[identity] = paths.setdefault((routes[parent], component), len(paths) + 1)
-        indexed = defaultdict(list)
-        for identity, route in routes.items():
-            if not identity:
-                continue
-            call = identities[identity]
-            scope = scopes[identity]
-
-            # Declared local operands are sufficient even when the containing scheduler queue changes.
-            arguments = json.dumps(scope.get("parameters"), sort_keys=True) if call[:3] in typed else identities[scope["parent"]]
-            indexed[route, call, arguments, tuple(children[identity])].append(identity)
-        return indexed
-
-    def match(self, scopes, observed, excluded):
-        paths = {}
-        typed = {(scope["role"], scope["implementation"], scope["site"]) for scope in observed if "parameters" in scope}
-        source = self.index(scopes, paths, typed, ())
-        measured = self.index(observed, paths, typed, excluded)
-        pairs = {}
-        for call, previous in source.items():
-            timed = measured.get(call, ())
-
-            # Polling changes the number of invocations; each equally partitioned observation supplies one sample.
-            for original, occurrence in zip(previous, timed, strict=False):
-                pairs[original] = occurrence
-            self.qualification["unmatched_calls"] += max(0, len(previous) - len(timed))
-        return pairs
 
     @staticmethod
     def cold_scopes(probe):
@@ -149,7 +81,7 @@ class HostCostSamples:
                 continue
             local = members.index(rank)
             for participants in zip(*(actors[actor] for actor in members), strict=True):
-                if len({self.identity(scope) for scope in participants}) != 1:
+                if len({NativeHostCalls.identity(scope) for scope in participants}) != 1:
                     self.qualification["collective_operands"] += 1
                     continue
 
@@ -213,7 +145,11 @@ class HostCostSamples:
             raise ValueError("host samples do not match their declared measurement")
 
         excluded = self.cold_scopes(probe)
-        pairs = self.match(original["scopes"], probe["scopes"], excluded)
+        source_calls = NativeHostCalls(original["scopes"])
+        observed_calls = NativeHostCalls(probe["scopes"], excluded)
+        pairs, unmatched = source_calls.exact_pairs(observed_calls)
+        self.qualification["unmatched_calls"] += unmatched
+        local_pairs = source_calls.local_pairs(observed_calls, pairs)
         collectives = self.collectives(records, rank)
         timing = probe["timing"]
         directory = path.parent
@@ -223,9 +159,13 @@ class HostCostSamples:
         profile, = (source_root / "native" / f"rank-{rank}").glob("*_ascend_pt")
         trace = AscendTrace(profile, source_root / "runtime", original, self.arguments.trace)
         alignment = AscendHostAlignment(
-            trace, probe["scopes"], pairs, queues["commands"], self.records(directory / timing["runtime"]),
-            self.records(directory / timing["activity"]), probe["auxiliary_intervals"], original["state_queries"],
+            trace, probe["scopes"], queues["commands"], self.records(directory / timing["runtime"]),
+            self.records(directory / timing["activity"]), probe["auxiliary_intervals"],
         )
+        exact = alignment.cuts(pairs, original["state_queries"])
+        local = alignment.cuts(local_pairs, original["state_queries"], strict_runtime=True) if local_pairs else None
+        if local is not None:
+            local_pairs = {scope: local_pairs[scope] for scope in local.scopes}
 
         evidence = graph["evidence"]["events"]
         samples = ServiceSamples(catalog)
@@ -242,7 +182,12 @@ class HostCostSamples:
             else:
                 begin, end = (evidence[piece[side]]["order"] for side in ("start", "finish"))
                 thread = int(resource["identity"].split("/")[1])
-                duration = alignment.duration(thread, begin, end, resource["role"] == "submission")
+                submission = resource["role"] == "submission"
+                duration = exact.duration(thread, begin, end, submission)
+                if duration is None and local_pairs and source_calls.supports_local_work(scope, features, observed_calls, local_pairs):
+                    duration = local.duration(thread, begin, end, submission)
+                    if duration is not None:
+                        self.qualification["locally_matched_work"] += 1
             if duration is None:
                 missing[key] += 1
                 continue
@@ -268,6 +213,6 @@ class HostCostSamples:
             "excluded_cold_scopes": sorted(excluded),
             "queue_correction_ns": queues["raw_correction_ns"],
             "measured": dict(measured), "missing": dict(missing),
-            "alignment": dict(self.qualification + alignment.misses), "lost_threads": alignment.service.loss,
+            "alignment": dict(self.qualification + exact.misses), "lost_threads": alignment.service.loss,
         }
         write_json(self.arguments.output, report, replace=False)

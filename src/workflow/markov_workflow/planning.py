@@ -40,14 +40,15 @@ class PlanningProcess:
             lines.append(f"| {job['id']} | {selected['configuration']} / {', '.join(selected['workloads'])} | {cost['requests']} / {selected['submission_group_count']} | "
                          f"{cost['prompt_tokens']} / {cost['decode_tokens']} | {selected['original_tokens']} | {job['native_workers']} |")
         for job in plan["sources"]:
-            required = job["required_local_coverage"]
+            required = job["required_coverage"]
             if not required:
                 continue
             consumers = ["targets in this domain"] if job["configurations"] else []
             if "local_consumers" in job:
                 consumers.extend(f"source {item['source']}/{item['mode']}" for item in job["local_consumers"])
-            lines.append(f"\nJob {job['id']} supplies local operations for {', '.join(consumers)}. "
-                         f"Publishing the source requires observing {', '.join(required)}.")
+            coverage = ", ".join(f"{mode}: {', '.join(witnesses)}" for mode, witnesses in required.items())
+            lines.append(f"\nJob {job['id']} supplies evidence for {', '.join(consumers)}. "
+                         f"Publishing the source requires {coverage}.")
         lines.extend([
             "", "Native execution owns batching and the request lifecycle. Representative observation limits profiling and export. "
             "Every worker in the parallel protocol still runs.",

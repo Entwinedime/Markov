@@ -44,11 +44,16 @@ class BatchTensors:
         ]
 
     @staticmethod
+    def input_dimensions(tokens: int, members: int) -> dict[str, int]:
+        return {"input_tokens": int(tokens), "members": int(members)}
+
+    @staticmethod
     def parameters(batch: Any, tokens: int) -> dict[str, int]:
+        dimensions = BatchTensors.input_dimensions(tokens, len(batch.reqs))
         return {
             **BatchTensors.capacity(batch.token_to_kv_pool_allocator, batch.req_to_token_pool),
-            "members": len(batch.reqs), "input_tokens": int(tokens),
-            "model_tokens": int(tokens), "model_members": len(batch.reqs),
+            **dimensions,
+            "model_tokens": dimensions["input_tokens"], "model_members": dimensions["members"],
         }
 
     @staticmethod

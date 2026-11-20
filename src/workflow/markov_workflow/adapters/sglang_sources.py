@@ -208,18 +208,18 @@ class RepresentativeSources:
         return conditions
 
     @staticmethod
-    def model_coverage(mode, configuration, conditions):
-        if configuration["tp"] == 1 or NativeConfiguration.batch_capacity(configuration) == 1:
+    def model_phases(instance, conditions):
+        config = instance.configuration.values
+        if NativeConfiguration.batch_capacity(config) == 1:
             return set()
 
-        # PD consumes the transferred first token before choosing a Decode model batch.
-        if mode == "decode" and "decode" not in conditions:
-            return set()
-
-        # Ordinary batches need a declared input opportunity; PD readiness can combine separately admitted requests.
-        if mode == "null" and not {"null/multiple_prefill_inputs", "null/concurrent_decode_inputs"}.intersection(conditions):
-            return set()
-        return {"single_model_batch", "multiple_model_batch"}
+        mode = instance.mode
+        phases = set()
+        if mode != "decode" and config["tp"] > 1 and f"{mode}/multiple_prefill_inputs" in conditions:
+            phases.add("prefill")
+        if mode != "prefill" and f"{mode}/concurrent_decode_inputs" in conditions:
+            phases.add("decode")
+        return phases
 
     @staticmethod
     def cost(workload, instances) -> dict:
@@ -344,15 +344,17 @@ class RepresentativeSources:
                 normalized[name] = representative
                 covered.update(self.conditions(instances[configuration], representative) | self.length_evidence(representative, bounds))
             workload, submissions = self.combine(names, topologies, normalized)
-            single_model = any(self.model_coverage(instance.mode, instance.configuration.values, covered)
-                               for instance in instances[configuration])
-            probes.extend(workload, submissions, single_model=single_model)
+            phases = {instance.mode: self.model_phases(instance, covered) for instance in instances[configuration]}
+            probes.extend(workload, submissions, model_phases=set().union(*phases.values()))
+            requirements = {mode: sorted(f"{phase}/{size}" for phase in values for size in ("single", "multiple"))
+                            for mode, values in phases.items() if values}
             cost = self.cost(workload, instances[configuration])
             cost.pop("last_arrival_ns")
             requests = {request["id"]: request for request in workload["requests"]}
             cost["arrival_wait_ns"] = sum(max(requests[name]["arrival_ns"] for name in group) for group in submissions)
             choices.append({"configuration": configuration, "workloads": names,
                             "input_cost": cost, "input_conditions": sorted(covered),
+                            "required_coverage": requirements,
                             "original_tokens": sum(item["cost"]["prompt_tokens"] + item["cost"]["decode_tokens"] for item in selected),
                             "submission_group_count": len(submissions),
                             "targets": {target for target, required in targets.items() if required <= covered},

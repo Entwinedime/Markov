@@ -13,7 +13,6 @@ from markov_adapters.sglang.configuration import CaptureInput
 from markov_adapters.artifacts import write_json
 from markov_workflow.adapters.ascend import AscendDeployment
 from markov_workflow.adapters.sglang import SourceDomain
-from markov_workflow.adapters.sglang_local_sources import LocalSources
 from markov_workflow.capture import CaptureProcess
 from markov_workflow.limits import AllowanceExhausted, OperationLimit
 from markov_workflow.production import CaptureProduction
@@ -36,15 +35,19 @@ class SourceAcquisition:
                 raise ValueError("planned capture input lies outside its plan directory")
             job = json.loads(path.read_text())
             serving = CaptureInput(job)
-            if SourceDomain.requested(serving) != description["structure"]:
+            structure = description["structure"]
+            if SourceDomain.requested(serving) != structure:
                 raise ValueError("planned capture input differs from its source domain")
+            coverage = description["required_coverage"]
+            if coverage.keys() - structure["instances"].keys():
+                raise ValueError("planned source coverage names an undeclared serving mode")
             workers = sum(instance.configuration.tp * instance.configuration.pp for instance in serving.instances)
             placement = AscendDeployment(deployment, workers, len(serving.instances) > 1)
             model = Path(serving.model["path"]).resolve(strict=True)
             if self.output == model or model in self.output.parents:
                 raise ValueError("source collection must not write inside a model directory")
             self.jobs[identity] = job
-            self.descriptions[identity] = {"structure": description["structure"], "required_local_coverage": description["required_local_coverage"]}
+            self.descriptions[identity] = {"structure": structure, "required_coverage": coverage}
         if not self.jobs:
             raise ValueError("source acquisition needs a nonempty plan")
 
@@ -163,7 +166,7 @@ class SourceAcquisition:
         if expert_count is not None and any(layer["experts"] != expert_count
                                             for library in libraries for layer in library["domain"]["expert_layers"]):
             raise ValueError(f"source {identity} initialized a different expert count from its plan")
-        LocalSources.check(libraries, self.descriptions[identity]["required_local_coverage"])
+        SourceDomain.require_coverage(libraries, self.descriptions[identity]["required_coverage"])
 
     def run(self, *, allow_incomplete=False):
         self.output.mkdir(parents=True, exist_ok=True)

@@ -80,11 +80,12 @@ class SourcePlanning:
             for selected, workload, groups, targets in self.representatives.select(domain["inputs"], service_evidence=service_evidence):
                 identity = len(jobs)
                 instances = self.configurations[selected["configuration"]]["instances"]
+                required = selected.pop("required_coverage")
                 selected["input"] = f"sources/{identity}.json"
                 jobs.append({
                     "id": identity, "structure": domain["structure"],
                     "configurations": sorted({configuration for configuration, _ in targets}),
-                    "required_local_coverage": [], "source": selected,
+                    "required_coverage": required, "source": selected,
                     "native_workers": sum(instance["configuration"]["tp"] * instance["configuration"].get("pp", 1)
                                           for instance in instances),
                 })
@@ -113,6 +114,7 @@ class SourcePlanning:
                 "performance sources preserve prompt and final Decode context endpoints and retain work up to native resident batch capacity",
                        "selected mixed-batch workloads preserve their arriving requests for performance sampling; actual mixing still requires observation",
                        "representative lengths preserve prefix, page/chunk remainders and route transitions; padding is unchanged",
+                       "model batch sizes are checked by serving role and phase; short pairs exercise joint Decode within each primary source",
                        "cached local output1/2 pairs shorten Prefill below one page when possible; request routes shift at the Prefill/Decode boundary",
                        "fixed arrival gaps keep original lengths; other shortening must preserve declared input conditions",
                        "allocator path opportunities use a cold-input page bound, not predicted batches or branch coverage",

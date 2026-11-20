@@ -52,6 +52,31 @@ class SourceDomain:
                 raise ValueError("source representatives disagree about their instance structure")
         return result
 
+    @staticmethod
+    def require_coverage(libraries, coverage):
+        for library in libraries:
+            mode = library["domain"]["implementation"]["disaggregation_mode"]
+            required = coverage.get(mode)
+            if not required:
+                continue
+            observed = {entry["condition"]["transformation"]["effect"] for entry in library["entries"]
+                        if entry["action"] == "batch_transform" and entry["observations"]}
+
+            # PP launch exposes model geometry; padding alone cannot establish concurrent requests.
+            for entry in library["entries"]:
+                if entry["action"] not in {"run_batch", "launch"}:
+                    continue
+                phase = entry["condition"]["phase"]
+                for parameters in entry["observations"]:
+                    if parameters["members"] > 1:
+                        observed.add(f"{phase}/multiple")
+                    elif parameters["members"] == parameters["model_members"] == 1:
+                        observed.add(f"{phase}/single")
+            missing = set(required) - observed
+            if missing:
+                rank = library["resources"][0]["rank"]
+                raise ValueError(f"planned {mode} source rank {rank} did not observe {sorted(missing)}")
+
 
 class SGLangTask:
     role_fields = ("parallel", "kv_layout", "expert_layers", "kv_peers")

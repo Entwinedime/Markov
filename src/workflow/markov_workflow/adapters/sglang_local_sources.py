@@ -1,4 +1,4 @@
-"""Declare finite model and batch-operation witnesses for ordinary and PD consumers."""
+"""Plan a finite set of sources for closed native batch operations."""
 
 from markov_adapters.sglang.configuration import NativeConfiguration, ServingInput
 from markov_workflow.adapters.sglang import SourceDomain
@@ -13,70 +13,38 @@ class LocalSources:
         self.configurations = configurations
 
     def extend(self, jobs, captures):
-        needed = []
-        multiple = [workload for workload in self.workloads.values() if len(workload["requests"]) > 1]
-        outputs = max((request["output_tokens"] for workload in multiple for request in workload["requests"]), default=1)
-        for target in list(jobs):
+        if not any(len(workload["requests"]) > 1 and any(request["output_tokens"] > 1 for request in workload["requests"])
+                   for workload in self.workloads.values()):
+            return
+
+        groups = {}
+        for target in jobs:
             for mode, implementation in target["structure"]["instances"].items():
                 configurations = [instance["configuration"] for name in target["configurations"]
                                   for instance in self.configurations[name]["instances"] if instance["mode"] == mode]
-                slots = max(NativeConfiguration.batch_capacity(config) for config in configurations)
-                if not multiple or slots == 1:
-                    continue
-                required = set().union(*(RepresentativeSources.model_coverage(mode, config, target["source"]["input_conditions"])
-                                         for config in configurations))
-
-                if mode == "null":
-                    target["required_local_coverage"] = sorted(required)
-                    required = set()
-                if not required and outputs == 1:
+                if not any(NativeConfiguration.batch_capacity(config) > 1 for config in configurations):
                     continue
 
-                # Collect every consumer before choosing a recipe; equal implementation domains share one ordinary job.
-                structure = {"model": target["structure"]["model"], "instances": {"null": implementation}}
-                need = next((item for item in needed if item["structure"] == structure), None)
-                if need is None:
-                    instance = next(item for item in captures[target["id"]]["instances"] if item["mode"] == mode)
-                    need = {"structure": structure, "instance": instance, "required": set(), "consumers": []}
-                    needed.append(need)
-                need["required"].update(required)
-                need["consumers"].append({"source": target["id"], "mode": mode})
-
-        if outputs > 1:
-            shared = {}
-            for need in needed:
-                implementation = need["structure"]["instances"]["null"]
+                # Mixed operations own nested work; only ordinary closed batch arrays share across shard layouts.
                 independent = set() if implementation["mixed_batches"] else {"tp", "pp", "ep"}
                 key = tuple((name, value) for name, value in sorted(implementation.items()) if name not in independent)
-                shared.setdefault(key, []).append(need)
-            for group in shared.values():
+                instance = next(item for item in captures[target["id"]]["instances"] if item["mode"] == mode)
+                workers = implementation["tp"] * implementation["pp"]
+                group = groups.setdefault(key, {"instance": instance, "workers": workers, "consumers": []})
+                if workers < group["workers"]:
+                    group.update(instance=instance, workers=workers)
+                group["consumers"].append({"source": target["id"], "mode": mode})
 
-                # Mixed execution owns its nested merge; only ordinary batch arrays share across shard layouts.
-                donor = min(group, key=lambda item: (
-                    not item["required"],
-                    item["structure"]["instances"]["null"]["tp"] * item["structure"]["instances"]["null"]["pp"],
-                ))
-                operation = "mix" if donor["structure"]["instances"]["null"]["mixed_batches"] else "merge"
-                donor["required"].update((operation, "subset"))
-                donor["consumers"].extend(consumer for item in group if item is not donor for consumer in item["consumers"])
-
-        for need in needed:
-            if not need["required"]:
-                continue
-
-            # Matching topology alone cannot provide batch operations that the selected workload never planned to observe.
-            donor = next((job for job in jobs if job["structure"] == need["structure"]
-                          and need["required"] <= set(job["required_local_coverage"])), None)
-            if donor is None:
-                capture, selected = self.probe(need["instance"], need["required"], len(jobs))
-                serving = ServingInput(capture)
-                donor = {"id": len(jobs), "structure": SourceDomain.requested(serving), "configurations": [],
-                         "native_workers": serving.instances[0].configuration.tp * serving.instances[0].configuration.pp,
-                         "source": selected, "required_local_coverage": []}
-                jobs.append(donor)
-                captures[donor["id"]] = capture
-            donor.setdefault("local_consumers", []).extend(need["consumers"])
-            donor["required_local_coverage"] = sorted(set(donor["required_local_coverage"]) | need["required"])
+        for group in groups.values():
+            identity = len(jobs)
+            instance = group["instance"]
+            effect = "mix" if instance["configuration"].get("mixed_batches", False) else "merge"
+            required = [effect, "subset"]
+            capture, selected = self.probe(instance, required, identity)
+            jobs.append({"id": identity, "structure": SourceDomain.requested(ServingInput(capture)), "configurations": [],
+                         "native_workers": group["workers"], "source": selected, "required_coverage": {"null": required},
+                         "local_consumers": group["consumers"]})
+            captures[identity] = capture
 
     def probe(self, instance, required, identity):
         configuration = dict(instance["configuration"])
@@ -85,10 +53,9 @@ class LocalSources:
         instances = [{"id": "serving", "mode": "null", "configuration": configuration}]
         topology = configuration.get("ep")
         topologies = [] if topology is None else [topology["id"]]
-        outputs = 2 if "subset" in required else 1
         name, request = min(
             ((name, request) for name, workload in self.workloads.items() for request in workload["requests"]
-             if request["output_tokens"] >= outputs),
+             if request["output_tokens"] > 1 and all(key in workload.get("ep_routes", {}) for key in topologies)),
             key=lambda item: (item[1]["prompt_tokens"], item[1]["output_tokens"], item[0], item[1]["id"]),
         )
         original = self.workloads[name]
@@ -121,15 +88,10 @@ class LocalSources:
         # Each PP slot receives two pairs; unequal outputs also exercise survivor filtering and merging.
         workload = {**normalized, "id": "local-operations", "prefixes": [], "requests": [
             {**request, "id": f"batch-{index}", "arrival_ns": 0,
-             "output_tokens": 1 + index % outputs}
+             "output_tokens": 1 + index % 2}
             for index in range(4 * stages)
         ]}
         groups = [[member["id"] for member in workload["requests"]]]
-        if "single_model_batch" in required:
-
-            # The separate singleton supplies the degenerate layout without depending on Decode survivor timing.
-            workload["requests"].insert(0, {**request, "id": "single", "arrival_ns": 0, "output_tokens": 1})
-            groups.insert(0, ["single"])
         for topology in topologies:
             route = normalized["ep_routes"][topology]
             assignments = []
@@ -150,23 +112,3 @@ class LocalSources:
                     "submission_group_count": len(groups)}
         return {"model": self.model, "instances": instances, "workload": workload,
                 "observe_all_workers": False, "submission_groups": groups}, selected
-
-    @staticmethod
-    def check(libraries, required):
-        if not required:
-            return
-        for library in libraries:
-            observed = {entry["condition"]["transformation"]["effect"] for entry in library["entries"]
-                        if entry["action"] == "batch_transform" and entry["observations"]}
-
-            # PP launch owns the run_batch child and exposes the same observed model geometry.
-            members = {parameters["model_members"] for entry in library["entries"]
-                       if entry["action"] in {"run_batch", "launch"} for parameters in entry["observations"]}
-            if 1 in members:
-                observed.add("single_model_batch")
-            if any(count > 1 for count in members):
-                observed.add("multiple_model_batch")
-            missing = set(required) - observed
-            if missing:
-                rank = library["resources"][0]["rank"]
-                raise ValueError(f"planned local source rank {rank} did not observe {sorted(missing)}")

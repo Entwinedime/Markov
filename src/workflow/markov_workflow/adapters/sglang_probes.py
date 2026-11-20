@@ -73,7 +73,10 @@ class LifecycleProbes:
             source = workload["ep_routes"][topology]
             assignments = []
             for entry in source["assignments"]:
-                before, after = original[entry["request"]], requests[entry["request"]]
+                identity = entry["request"]
+                if identity not in requests:
+                    continue
+                before, after = original[identity], requests[identity]
                 tokens = []
                 for position in entry["tokens"]:
                     if position < before["prompt_tokens"]:
@@ -112,8 +115,15 @@ class LifecycleProbes:
         # A producer can cache its entire prompt; a consumer must leave its last token for model execution.
         return [request for identity, request in content.requests.items() if identity in shared and request["prompt_tokens"] > page_size]
 
-    def extend(self, workload, groups, *, single_model):
+    def extend(self, workload, groups, *, model_phases):
         requests = {request["id"]: request for request in workload["requests"]}
+        decodable = [request for request in requests.values() if request["output_tokens"] > 1]
+        if "decode" in model_phases:
+            source = min(decodable, key=lambda request: (request["output_tokens"] == 2,
+                         request["prompt_tokens"] + request["output_tokens"], request["id"]))
+
+            # Short prompts leave room for joint admission before both requests enter Decode.
+            self.append(workload, groups, source, "decode_pair", copies=2, prompt_tokens=1)
         if self.prefix_cache:
             content = WorkloadContent(workload["requests"], workload["prefixes"])
             candidates = self.shared_prefix_requests(content, self.page_size)
@@ -127,8 +137,9 @@ class LifecycleProbes:
                     self.append(workload, groups, source, "cache_seed")
                 self.append(workload, groups, source, "cache_reuse")
                 requests = {request["id"]: request for request in workload["requests"]}
-        candidates = [request for request in requests.values() if request["output_tokens"] >= 3]
-        if not candidates and single_model:
+        minimum_output = 2 if "decode" in model_phases else 3
+        candidates = [request for request in requests.values() if request["output_tokens"] >= minimum_output]
+        if not candidates and model_phases:
             candidates = list(requests.values())
         identities = {request["id"] for request in candidates}
         if not candidates or any(len(group) == 1 and group[0] in identities for group in groups):
@@ -139,10 +150,20 @@ class LifecycleProbes:
         # The same singleton supplies degenerate model geometry and, when present, Decode continuation.
         self.append(workload, groups, source, "isolated")
 
-    @staticmethod
-    def append(workload, groups, source, purpose):
-        identity = json.dumps(["probe", purpose, source["id"]], ensure_ascii=False, separators=(",", ":"))
-        workload["requests"].append({**source, "id": identity, "arrival_ns": 0})
-        groups.append([identity])
-        for route in workload.get("ep_routes", {}).values():
-            route["assignments"].extend([{**entry, "request": identity} for entry in route["assignments"] if entry["request"] == source["id"]])
+    def append(self, workload, groups, source, purpose, *, copies=1, prompt_tokens=None):
+        request = dict(source)
+        if prompt_tokens is not None:
+            request["prompt_tokens"] = prompt_tokens
+            request.pop("prefix_id", None)
+        seed = self.resize(workload, {source["id"]: request})
+
+        identities = []
+        for index in range(copies):
+            identity = json.dumps(["probe", purpose, index, source["id"]], ensure_ascii=False, separators=(",", ":"))
+            workload["requests"].append({**request, "id": identity, "arrival_ns": 0})
+            identities.append(identity)
+        groups.append(identities)
+        for topology, route in seed.get("ep_routes", {}).items():
+            workload["ep_routes"][topology]["assignments"].extend(
+                {**entry, "request": identity} for identity in identities for entry in route["assignments"]
+            )

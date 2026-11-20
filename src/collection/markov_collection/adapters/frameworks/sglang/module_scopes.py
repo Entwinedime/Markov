@@ -162,20 +162,28 @@ class ModelScopes:
     def proxy_shape(self, tensor):
         return [self.proxy_rows, *tensor.shape[1:]]
 
+    @staticmethod
+    def bound_arguments(signature, args, kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return bound.arguments
+
+    @staticmethod
+    def model_dimensions(arguments):
+        tokens = arguments["input_ids"]
+        if tokens is None:
+            tokens = arguments["pp_proxy_tensors"].tensors["hidden_states"]
+        return {"model_tokens": int(tokens.shape[0]), "model_members": int(arguments["forward_batch"].batch_size)}
+
     def invoke(self, path: str, original: Any, *args: Any, **kwargs: Any) -> Any:
         owner = self.observation
         if not owner.active or not owner.selected:
             return original(*args, **kwargs)
 
         spec = self.bindings[path]
-        bound = spec["signature"].bind(*args, **kwargs)
-        bound.apply_defaults()
-        arguments = bound.arguments
+        arguments = self.bound_arguments(spec["signature"], args, kwargs)
         if spec["role"] == "model_body":
-            tokens = arguments["input_ids"]
-            if tokens is None:
-                tokens = arguments["pp_proxy_tensors"].tensors["hidden_states"]
-            owner.model_geometry(tokens.shape[0], arguments["forward_batch"].batch_size)
+            owner.model_geometry(self.model_dimensions(arguments))
         inputs = []
         for name, value in arguments.items():
             if name == "forward_batch":

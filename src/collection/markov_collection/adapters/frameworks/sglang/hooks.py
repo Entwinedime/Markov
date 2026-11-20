@@ -272,17 +272,17 @@ class SGLangObservation:
                     owner = owners.setdefault(tensor.untyped_storage()._cdata, f"eager/{name}")
                     self.tensors.bind_buffer(tensor, owner)
         with self.call("model", original, device=True) as call:
-            call.record["parameters"].update(input_tokens=int(batch.input_ids.numel()), members=int(batch.batch_size))
+            call.record["parameters"].update(BatchTensors.input_dimensions(batch.input_ids.numel(), batch.batch_size))
             self.batch_ports(call, batch, "input")
             result = original(runner, batch, *args, **kwargs)
         self.capture.runtime.checkpoint()
         return result
 
-    def model_geometry(self, tokens: int, members: int) -> None:
+    def model_geometry(self, dimensions: dict[str, int]) -> None:
 
         # Check actual model tensors against the shared native padding contract, without replacing predicted features.
         parameters = self.capture.scopes[self.capture.current.get()]["parameters"]
-        if (tokens, members) != (parameters["model_tokens"], parameters["model_members"]):
+        if any(parameters[name] != actual for name, actual in dimensions.items()):
             raise ValueError("native model geometry differs from the declared eager batch layout")
 
     def result_outputs(self, call: Any, output: Any) -> None:
