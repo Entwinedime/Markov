@@ -621,3 +621,551 @@ TP2 的原生采集和参考图生产分别用时 135.81、58.65 秒。全节点
 **审查与交接** 沿采集解释、时间旁路、模板装配及独立评价核对职责和失败证据。确认 S9 冻结源码和三镜像，核对 13 份目标与 15 份模板来源、126 个样本文件的隔离。窗口目录保留原始观察和诊断，实占约 43 GiB。矩阵计费为 13 次原生、3,717.76 秒原生及 6,562.21 秒后处理，另有约 10 分钟离线归因。操作说明补齐示例时限和已具轻量采集证据的拓扑。S11 在同一快照上先做页边界、TP2 固定图，再完成 13 项自主预测观测。[冻结环境](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json) · [原生任务结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/targets.json)
 
 **结论与限制** Azure 四例停在运行时任务回绕的参考图生产，两个 PP 用例停在纯逻辑等待的时间条件，PD 和分块混合停在多成员 Decode 的模板覆盖。三条职责链在 S11 冻结证据齐备后集中修复，保留本轮结论并对受影响范围取得新的独立证据。
+
+## 2026-11-20 — 启动 S11 固定图验收
+
+**范围** S10 交付提交 `508ed9e` 已推送并核对远端，使用同一冻结代码、二进制和镜像。页边界与 TP2 都有合格独立结构和同轮主机活动，固定图基线先消费现有详采。轻量自主评分沿全部 13 个目标执行，保留各自完整性、实测资格及具体失败。已启动页边界的固定图验证。[步进记录](../../../data/20261119T090556.273460Z_project-delivery/logs/independent/m4-independent/qwen8-p16-boundaries/fixed.step.json)
+
+**证据** 两例分别得到 13,004、53,226 项业务服务，冻结成本可配对 12,237 和 40,380 项。两例均有请求在图窗口开启后进入，固定图入口当前只支持窗口开始前到达。TP2 另外有两个未合格图入口、76 个未分离的同步服务区间、两个未关联的队列通知。均停在实测基线资格。页边界首缺为 17 token 的缓存写入，TP2 两 rank 首缺为 17 token 的 Prefill 准备，均低于相应训练样本范围。固定图耗时共 59.81 秒，无新原生尝试。[固定图矩阵](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/fixed.json)
+
+**下一步** 自主评分首个 Azure 轻量采集已开始。固定图入口、外部到达、同步及实际成本覆盖等问题待本轮证据收齐后集中处理。[轻量采集步骤](../../../data/20261119T090556.273460Z_project-delivery/logs/independent/m4-independent/azure-normal-c4/latency.step.json)
+
+## 2026-11-20 — 追踪 S11 的到达边界、预热与首个成本缺口
+
+**固定图** 两例都留有开窗后的非空读取及随后派发的 RAW 时刻，控制线程图在读取期间没有对应端点。TP2 的后一条请求在约 4.24 毫秒提交、约 1.53 秒被调度器读到。固定图需要在经过验证的线程次序上承接接收边界，并保留提交、读取和后续派发的区分。TP2 的两个设备入口只连接流顺序，下一端点已有提交与信号前驱。首个同步失败区间的线程全程在 CPU 上，设备信号却在调用开始后才完成，说明 CPU 在核运行与可分离服务仍需分开核对。[到达与固定图证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/fixed-graph-ingress.json)
+
+**自主预测** Azure 常态并发 4 在 294.79 秒内完成轻量采集，24 条请求和 3,246 个输出 token 一致。预热和测量使用相同请求及到达间隔，测量窗口仍出现 `alloc_extend_kernel` 的 `(2, 16, 4096, 2048)` 首次加载。原生分配器按批次成员和工作量向上取二次幂选择特化，暖机覆盖需要依据实际组批执行。另用冻结输入及独立成本运行一次离线预测，23.57 秒定位到 `alloc_for_extend` 的样本范围不足，现有同一工作区间只覆盖 6,428–7,207 token，目标需 3,563 token。记录两侧缺口，保留首轮资格结论。[首轮原生资格](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/azure-normal-c4/result.json) · [离线预测步骤](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/azure-normal-c4-prediction.json) · [成本首缺](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/azure-normal-c4-prediction/cost-gap.json)
+
+常态并发 8、突发并发 4 均完成轻量采集，分别为 245.46、286.17 秒。两例无新增特化，提交最大偏差约 0.73、0.67 毫秒。自主预测在同一实现域、工作定义和区间 `ScheduleBatch.prepare_for_extend` 停止。该工作只有七个独立特征点，样本最多三成员、7,207 token。两目标分别需要五成员、7,972 token 和两成员、7,241 token。已有成本补采以来源图中实际观察到的工作点选配方，超出已观察几何的部分需要从代表来源计划补足。[常态并发 8 首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/azure-normal-c8/prediction/cost-gap.json) · [突发并发 4 首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/azure-burst-c4/prediction/cost-gap.json)
+
+## 2026-11-20 — 批量核对冻结成本覆盖
+
+**证据** 用冻结核心和成本对九组已生成的独立参考图求值，共核对 943,307 项图内工作，缺少 118,368 项。按工作种类计，CPU 缺 95,126 项，设备、搬运和 collective 分别缺 17,089、4,289、1,864 项。按 rank 留存定义、区间、阶段和缺失特征范围。后处理耗时 151.40 秒，全部取自已有留存图。[批量成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/observed-cost-coverage.json)
+
+**结论与限制** 工作数表明覆盖缺口的分布，性能影响需在合格固定图上评估。四例 Azure 参考图仍停在生产环节。自主预测中，突发并发 8 与并发 4 停在同一个 7,241 token 的 Prefill 准备点。页边界的轻量观测合格，预测首缺与固定图一致，均为 17 token 的缓存写入。[自主矩阵](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous.json) · [页边界首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/qwen8-p16-boundaries/prediction/cost-gap.json)
+
+TP2 的轻量观测也合格，自主预测在 17 token 的 Prefill 准备停下，该工作现有下界为 33 token。两例各用一次详采和一次轻量观测比较同一请求，详采相对轻量的逐请求 TTFT 倍数中位数为 1.70、2.06，TPOT 为 6.04、6.30。两种采集的观测方式和调度过程均可能造成差异，固定图的时延偏差和正式自主精度各按其证据资格判定。[TP2 首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/qwen8-tp2/prediction/cost-gap.json) · [两种原生测量](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/detailed-lightweight-latency.json)
+
+TP8 的参考图仅 400 项工作缺样本，自主预测仍停在必经的单成员 65 token `run_batch`，该区间只有 33 token 样本。PP3 停在两成员 96 token 的 Prefill 准备，该区间只测到 65 token。筛查 42 份历史成本相关文件，已登记的前六个首缺没有同一实施域、定义、区间、阶段和特征范围均匹配的候选。TP2 同步区间的局部复核区分了 CPU 离核、设备在 SDK 入口时尚未就绪和校时区间覆盖入口三类；正式固定图使用联合时钟收紧范围。[TP8 首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/qwen8-tp8/prediction/cost-gap.json) · [PP3 首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/mistral-pp3/prediction/cost-gap.json) · [历史候选](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/archived-cost-candidates.json) · [同步证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-diagnostics/fixed-graph-fences.json)
+
+## 2026-11-20 — 收齐 S11 首轮冻结矩阵
+
+**证据** 13 次轻量观测全部结束，共计 2,243.22 秒原生。自主预测步骤计费 415.35 秒，固定图两例计费 59.81 秒。两例固定图均停在实测基线资格。自主矩阵一例轻量观测因新增特化未获资格，另 12 例自主预测都在首个超出样本范围的 CPU 工作停止。代表缺口包含两成员 96 token 的 PP Prefill、三成员 EP4 Decode、分块混合的两成员 Prefill，以及前缀缓存 256 token 的插入分支。两项 MAPE 均无合格案例可汇总。[固定图矩阵](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/fixed.json) · [自主矩阵](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous.json) · [前缀缓存首缺](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/autonomous/qwen8-prefix-pressure/prediction/cost-gap.json)
+
+**结论与下一步** 同一冻结快照下的两轮结果均已保留。先以现有原始记录回归 PP 纯因果等待和固定图到达、同步边界，同时归并运行时物理提交、模板变体和成本覆盖问题。后续独立资格需新的留出证据。M4 已使用 31 次原生尝试，剩余五次仍预留给 S12。
+
+## 2026-11-20 — S10/S11 返修 · 原生端点条件与时间旁路
+
+**范围** 从冻结提交 `0de58e8` 定位 PP 两例的首个中断。保留端点身份、实测窗口、工作服务和必要依赖，复用 S10 留存的记录做开发回归。
+
+**改动** 端点条件同时表达实测时刻与纯因果见证。运行时已省去设备提交的等待只交接来源身份并沿执行依赖前进，删除借用前驱时间的旧推导。验证器按已声明的所有实测端点核对同一个校准，工作服务与其原始起止一致。比较和验收直接使用同一份原生事实，删除浅拷贝和清空调用者来源映射的操作。
+
+**验证** C++23 modeling 镜像集中构建通过。PP3 和 TP2×PP3 各完成 3 条请求、9 个 token。两例共匹配 3,313 个动作、85,695 项动作工作、130,812 个实测端点和 134 个纯因果端点。页边界再次匹配 238 个动作和全部 19,198 个实测端点。首轮本地比较暴露来源映射被提前清空，修正后复用执行记录完成比较。处理共约 282 秒，新增原生尝试为零。[PP3 对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/boundary-conditions/mistral-pp3/comparison/actions.json) · [组合对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/boundary-conditions/mistral-tp2-pp3/result.json) · [页边界对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/boundary-conditions/qwen8-p16-boundaries/comparison/actions.json)
+
+**结论与限制** 两个 PP 案例在开发回归中完成结构对照，跨进程 CPU 传输仍采用原生区间。独立验收保留首轮结果及新留出要求。固定图需要区分实际送达、调度器读取与 CPU 等待，继续沿原生端点和可分离服务核对实测基线。
+
+## 2026-11-20 — S10/S11 返修 · Ascend 队列提交归属
+
+**范围** 四个 Azure 留出用例的首轮参考图均止于同一类任务号回绕。离线沿 SDK 任务、同一次驱动发送和后续队列前沿检查提交归属。
+
+**改动** 运行时适配器在裁剪记账任务前按实际 SQE 数量和物理任务次序绑定驱动提交。带未关联记账项的分组要求相邻任务与驱动提交共同给出唯一边界。设备提交边和动态等待前沿使用同一绑定。独立检查从原始记录重建队列，核对图上的实际提交目标。
+
+**验证** 页边界的事实和粗图与冻结产物逐项一致，2,630 条提交边通过核对。EP4 四 rank 的原有通信图通过新核验，共核对 64,392 条提交边。常态并发 4 复用留存 SDK 导出完成解释和投影，10 个回绕点中六个业务任务保留实际提交边，四个记录事件及全部记账项均未产生设备提交边。四份 Azure 记录的重建及独立来源核验已启动，新增原生尝试为零。[页边界来源核验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/qwen8-p16-boundaries/source-evidence/source-evidence.json) · [EP4 来源核验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/qwen30moe-ep4/source-evidence/source-evidence.json) · [常态并发 4 回绕绑定](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-normal-c4/rollover-bindings.json)
+
+**结论与限制** 原先停住的常态并发 4 已生成参考图，来源核验与目标结构对照仍需取得结果。留存首轮冻结结论。
+
+## 2026-11-20 — S11 返修 · 固定图的入口就绪和线程取证
+
+**范围** 追踪页边界和 TP2 在首轮留下的窗口内到达。保留请求提交、接收空闲、线程唤醒和模型工作各自的观测口径。
+
+**改动** 空闲接收者的实测唤醒接入实际控制线程的串行边，保留唤醒前后测得的 CPU 进度。空闲等待结束后输入为空时，依据两侧原生空闲状态保留该等待区间。核对旧矩阵的协调容器缺少 host tracefs 映射，容器内无法启用内核 tracepoint，修正复用的启动装配。
+
+**验证** 页边界既有记录已进入实测重算，核对 19,360 个端点。首次重放早 28.6 微秒，与提交线程实测离核区间同长，该区间缺内核事件分类。另有一次空闲等待未进入首批重算。TP2 的后续请求在调度仍活跃时读取，缺少独立的入口可用事实，另保留设备等待入口、同步和队列通知缺口。[页边界首次重放](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/qwen8-p16-boundaries/result.json) · [TP2 证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/qwen8-tp2/result.json)
+
+**结论与限制** S4–S5 原 14 次额度已用七次，剩余七次转入 M4，整窗仍为 106 次。先用一次有界原生详采复核同一页边界请求、新增内核状态及相邻空闲控制边界，作为开发数据。上限为一次原生尝试、600 秒原生、1,200 秒后处理和 4 GiB，复用同一模型、逻辑配置、预热、源镜像和正式入口。S12 五次预留保留。
+
+单卡详采原生实耗 131.11 秒，构图和固定图核验耗时约 35 秒。内核状态已记录，控制空闲超时已进入参考时间线。696 处设备同步有 695 处取得自身服务。余下一处发生在控制线程持续在核的 SDK 同步中，实际信号在 SDK 入口之后才完成，需继续区分运行时等待和返回处理。本轮挂载首次预检失败发生在无设备的协调容器，未产生原生尝试。修正后的原生步骤只计一次。[单卡线程取证](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/thread-evidence/thread-evidence.json) · [固定图资格](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/thread-evidence/fixed/result.json)
+
+## 2026-11-20 — S10/S11 返修 · 按原生角色和阶段规划模板
+
+**范围** PD 缺少多成员 Decode 的分页分配，分块混合缺少多成员纯 Decode 的模型调用。两类证据都应来自能够真正执行该阶段的主来源。复用已有训练输入、普通补充模板和旧留出目标。
+
+**改动** 模板来源要求按原生角色和执行阶段声明。在已具备并发 Decode 输入机会的主来源内加入短请求对，保留两条请求继续生成，让原生代码自行组批。建库检查保留单请求的退化形状和多请求的真实成员数。普通补充来源只采共享的批次整理动作，删除跨角色借用模型几何资格的装配。
+
+**验证** 正式规划入口对已有训练输入生成 PD 的 Decode 和分块混合的普通 worker 取证要求。用旧模板核对，两组均准确报出缺多成员纯 Decode。下一步仅采各自的新主来源，分块混合复用输入相同的旧补充记录。原生两次，每次 600 秒，后处理总计 2,400 秒，新增数据上限 12 GiB。两例收齐模板阶段证据后，复用原 S10 真实目标做开发对照。原冻结目录保留。[PD 计划](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/pd-plan/plan.json) · [分块计划](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/chunk-plan/plan.json)
+
+两份主来源已发布，分别用时 177.70、155.29 秒原生，合计约 327.41 秒建库处理。PD 两个 Decode rank 都出现多请求分配，分块混合两个 rank 都出现单、双请求纯 Decode。后续仿真分别完成 3、11 条请求及 9、39 个 token。基于已有独立目标作开发回归，匹配全部 6,699、2,248 个动作，核对 53,702、194,070 项工作和 84,984、292,060 个端点。[PD 对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/pd-structure/comparison-certified/actions.json) · [分块对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/chunk-structure/result.json)
+
+PD 第一次对照的二次数值求解无法返回候选。修正后的单案例入口在每条时间声明满足共同校准时复用已认证的精确解，同时逐项核对预测实际完成时刻。重新读取原生参考和完整预测记录，确认两侧所有声明的时间条件和因果均符合该例口径。页边界通过更新后的完整入口核对全部 238 个动作，未新增原生尝试。首个求解失败及原仿真记录保留。期间沿正式规划、取得观察、发布和预测入口审查了职责，收掉普通补充来源的模型资格责任。SGLang 来源的核验由实施域 adapter 维护。[首次对照日志](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/pd-structure.log) · [页边界回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/model-phase-coverage/page-structure-certified/result.json)
+
+## 2026-11-20 — S11 返修 · 批量归并 Azure 成本需求
+
+**证据** 四份 Azure 参考图均由留存原始记录重建并通过来源核验。统一成本查询核对 6,695,900 项工作，其中 4,841,992 项超出已有采样范围，合并为 57,842 个工作特征点。主要缺口是 Decode 批次宽度，其次是上下文。批量需求处理约 661 秒，新增原生尝试为零。[成本需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/azure-demand/summary.json) · [突发并发 4 来源检查](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-burst-c4/source-evidence/source-evidence.json)
+
+**结论与限制** 两种已拟合的 Attention 图体分别有 16 和 21 个工作区间，前者的 Decode 样本覆盖到 8 个成员，后者只覆盖到 3 个成员。两者共用实现名，图体包含不同工作和依赖。后续需按图体和角色检查可复用的独立训练记录，再选择可同时覆盖多个缺口的批次几何。四份目标实测继续作为开发诊断和验证证据。
+
+覆盖 8 成员的样本来自上一窗口，现行来源样本都进入另一图体。保留的一份宽批训练原始记录在当前离线解释时停在释放索引宽度字段。后续核对发现，54 次非空直接释放在同线程调用范围内均有唯一宽度的拷贝依据，其中 35 次为 8 字节、19 次为 4 字节。原始记录无资源历史，释放目标原有内容的状态仍需其他原生证据。旧成本暂时保持原图体归属。[留存宽批记录的解释日志](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/retained-cohort-reprojection/interpret.log)
+
+## 2026-11-20 — S11 返修 · 现行单卡图体的宽批成本取证
+
+**范围** 复用上一窗口的训练输入，组合覆盖多种 Decode 宽度、长 Prefill、页边界和长上下文的提交组。按原分组执行预热和测量，使用现行单卡固定镜像、BF16 dummy 及页宽 16。四份冻结 Azure 图只提供待查需求，成本拟合仍读取独立训练观测。现有宽批原始记录继续保留。
+
+**额度** 先运行一次详细采集和一次轻量主机采样，各上限 900 秒。源生产与成本拟合分别留 2,400、4,800 秒，合计保留量上限 16 GiB。S2 原十次实际五次，S3 原十次实际九次，余六次调入 M4。整窗 106 次不变，M4 上限 49 次并继续预留 S12 的五次。
+
+**验证** 75 条训练请求按 13 组完成一次原生详采，用时 222.24 秒。首次生产由镜像中已安装的旧解释器运行，停在驱动提交归属，已完成的 SDK 导出及原始记录保留。用当前采集代码解释同一份导出成功，用时 76.46 秒。现有镜像的完整重建因基础框架安装时代理不可用而中断，使用本地源镜像单独更新采集包供开发生产。[首次生产回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/collection/status.json) · [解释回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/current-production/interpret.step.json) · [完整镜像构建日志](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/current-images/build.log)
+
+**结论与限制** 现行解释器可离线读取本次原始观察。图体、样本范围和新成本覆盖需由正式来源与成本生产核对。轻量采集尚未开始。
+
+## 2026-11-20 — S10 返修 · Azure 突发并发 8 结构对照
+
+**范围** 使用既有独立目标观察、重建参考图和冻结 TP1 训练模板检查当前修复。
+
+**验证** 仿真完成全部 24 请求和 2,630 个 token。全节点结构开发对照匹配 15,268 个动作和 1,271,636 项工作。仿真用时约 150 秒，比较用时约 945 秒，结构入口总计约 2,027 秒，未新增原生执行。[结构结论](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-burst-c8/structure/result.json) · [逐项对照汇总](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-burst-c8/structure/comparison/actions.json)
+
+**结论与限制** 本次比较使用已有留出用于开发回归，首轮冻结结论保留。其余三个 Azure 留出案例已发布参考图及来源核验。
+
+## 2026-11-20 — S11 返修 · 固定图同步条件及设备入口
+
+**范围** 用页边界及 TP2 的留存材料检查主机同步与设备等待的进入条件。
+
+**改动** 将在 SDK 调用内变为就绪的设备前沿用作同步返回的前置条件，单列后续 SDK 延迟。对固定图中有实际物理任务的 stream 等待，从已经核对的原始驱动提交取得入口依赖。
+
+**验证** 页边界的 696 处主机同步均可用于重放，重放全部 19,360 个端点后剩六处局部线程等待无可归因唤醒依据。TP2 已匹配原报告中两个缺失设备入口，核对出 1,758 条携带实际驱动提交的等待入口依赖，仍缺活跃期间接收、75 处主机同步和两个队列通知。[页边界重放](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/thread-evidence/fixed-fence-frontier-qualified/result.json) · [TP2 入口与剩余证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/tp2-wait-submission/result.json)
+
+**结论与限制** 两例均未取得固定图实测基线通过。所列依赖用于固定图重放，无需更改 serving 图或重采 TP2。
+
+## 2026-11-20 — S11 返修 · 线程唤醒与固定图实测基线
+
+**范围** 页边界开发对照的六处局部差异对应三段提交线程在核退役和三段真实阻塞。阻塞中有四次控制与提交线程相互唤醒，以及一次由图外线程发出的 futex 唤醒。
+
+**改动** 统一队列通知与已取证的内核唤醒。图内等待在两侧工作进度上建立因果边，图外的唤醒用原始记录作为固定条件。队列提交和提交线程退役各自保留前置关系。比较继续只替换原图工作自身的服务时长。
+
+**验证** 页边界实测基线核对 19,360 个端点，全部对齐。新成本资产下同样通过实测重放，已测 13,004 项工作中有 767 项估时缺口。使用原始录制和正式固定图入口，未新增原生尝试。[六处原始证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/thread-evidence/host-blocking-witnesses.json) · [重放与成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/thread-evidence/fixed-wide-costs/result.json)
+
+**结论与限制** 单卡页边界成立的范围是具有上述条件的固定图开发案例，完成替换归因前须覆盖剩余小长度。冻结留出及 TP2 基线结论仍未改变。
+
+## 2026-11-20 — S11 返修 · 宽批训练成本覆盖
+
+**范围** 已发布来源模板确认 Decode 1 至 8 成员均实际执行。四份 Azure 图提供成本需求，重新拟合仅使用既有独立训练样本和此次宽批训练。
+
+**验证** 复用原始来源生产耗时 178.35 秒。新增一次轻量主机运行用时 181.59 秒，详采和轻量执行的 100 个模型批次全部配对。成本资格处理用时 359.60 秒。四份 Azure 图的未覆盖工作降至 175 项，归并为延伸分配及前缀写入的两个结构定义、共 110 个工作特征点。用三份合格 Azure 轻量参考重跑自主预测，均推进到上述缺口。[正式来源生产](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/collection-current/result.json) · [训练与需求结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/costs/costs.json) · [常态并发 8 开发结论](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/autonomous-development/azure-normal-c8/result.json)
+
+**结论与限制** 当前 M4 共 36 次原生尝试。剩余 TP1 训练跨度包括短页边界、较长延伸与长前缀命中后的后缀插入。自主矩阵仍无完整留出分数。
+
+## 2026-11-20 — S11 返修 · 合并单卡边界训练
+
+**范围** 对照页边界全图的 767 项缺口集中在短请求的缓存写入与单成员 Attention。结合已知 Azure 剩余需求，一组训练同时覆盖页边界、一至两成员的延伸分配以及长前缀命中后的插入。真实目标只提供特征，训练使用另行生成的内容和 16 个独立提交组。[页边界需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/fixed-boundary-demand/demand.json) · [21 请求训练输入](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/plan/sources/0.json)
+
+**改动** 使用既有单卡镜像与部署，保持相同的模板和成本生产入口。限定一轮详采、一轮轻量主机取证，各最多 600 秒原生，源生产与成本处理最多 2,400、4,800 秒，新增保留不超过 12 GiB。实际批次和缓存行为以原生证据核对。
+
+**验证** 21 请求的原生详采已结束，用时 193.44 秒，其中预热 90.11 秒，观察 36.83 秒。来源生产已启动。对 TP2 留存材料并行离线核对，845 处同步每 rank 中，分别有 12、56 处能看到阻塞但缺少原始唤醒事件。其余七处同步的资格仍需核对前置关系。[详采回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/collection/sources/0/result.json) · [TP2 同步取证](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-inputs/tp2-fence-origins.json)
+
+**结论与限制** 两轮均使用 M4 剩余额度，正式矩阵保留原结论。样本发布后按批核对已有工作、成本范围和独立测量资格。
+
+## 2026-11-20 — S11 返修 · 单卡成本替换与完整自主评分
+
+**范围** 同一批边界样本覆盖先前 Azure 记录与单卡页边界固定图的需求。四项已有合格轻量实测的预测作为开发回归。
+
+**验证** 边界训练详采与轻量采样实际配对 46 个批次。轻量采样用时 174.45 秒，成本处理 287.56 秒。四份 Azure 图和页边界图的 6,708,904 项工作均有估时。页边界固定图完整替换 13,004 项成本，恢复 CPU 实测后，p95 TTFT、平均 TPOT 偏差绝对值分别从 286.37、225.21 毫秒降到 0.93、0.52 毫秒。[成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/costs/costs.json) · [固定图归因](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/development-validation/fixed-page/result.json)
+
+**结论与限制** 页边界、常态并发 8、突发并发 4 和 8 的 TTFT MAPE 分别为 2.99%、1.10%、2.39%、0.68%，TPOT MAPE 分别为 6.49%、1.91%、3.63%、2.38%。四例等权为 1.79%、3.61%。首轮留出评分保持原结论。常态并发 4 的新版结构对照已启动。标准采集和控制镜像在宿主代理网络下重建成功。[开发评分索引](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/development-validation/summary.json) · [镜像回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/wide-cost-training/current-images/host-network-build.log)
+
+## 2026-11-20 — S11 返修 · 多角色成本需求与来源复用
+
+**范围** 用当前 C++23 成本查询核对八个多角色目标，按实现域、工作定义、区间、阶段和特征归并需求。目标图仅声明特征。优先复用此前为多成员 Decode 建库时已取得的 PD 与分块混合训练原始记录。
+
+**验证** 冻结资产共缺 117,601 项工作，归并为 10,944 个工作特征点，批量离线核对用时 124.9 秒。两项离线增量拟合均为零原生尝试。PD 剩余未覆盖 6,741 项，其中 5,132 项主机工作已有训练形状。分块混合剩余未覆盖 18,410 项，其中 9,944 项已有训练形状。同一实现的 Attention 上下文缺口单独保留。[八域需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/summary.json) · [PD 离线复用](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/retained-refit/pd/costs.json) · [分块离线复用](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/retained-refit/chunk/costs.json)
+
+**结论与限制** 暂缓的 S8 尚余两次尝试转入 M4，整窗 106 次不变。PD 和分块混合各用一次轻量主机运行，复用各自已发布的训练来源和物理部署。每次原生上限 600 秒，各自后处理上限 2,400 秒，合计新增保留上限 8 GiB。按合格测量与新资产的全图覆盖收口本批。
+
+## 2026-11-20 — S10/S11 新留出 · 冻结首批单卡复验
+
+**范围** 在开展新一批验证前选定新的 Azure 常态及突发各 24 请求，分别使用原始记录第 35,851–35,874 行及第 65,088–65,111 行。排除先前开发及两轮留出已使用的行。首批冻结常态并发 4 和 8，以及新到达节奏与输出长度的页边界。突发并发对及其他受影响角色仍在后续。[输入选择](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-holdout-candidates/selection.json)
+
+**改动** 记录代码状态，固定新标准镜像、可执行文件、训练模板及成本资产。保留独立的首轮结论。本批六次原生尝试，原生上限 7,200 秒、后处理上限 12,000 秒，任务保留上限 24 GiB。新详细页边界采用线程唤醒取证，并供固定图验证。[冻结矩阵](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/frozen/matrix.json)
+
+**验证** 五份候选输入已通过正式输入合同和当前模板装配，其中三份进入本批。选择与装配未进行原生目标运行或成本评分。
+
+**结论与限制** 本批按现行全节点和稳态轻量资格验收。发布首批证据时继续保留所有未执行或受限的责任。
+
+来源核验已通过。协调容器第一次启动在挂载 tracefs 子目录时中断，改为只读挂载 tracefs 根目录，内核事件格式已可读取。该次启动中断未产生原生尝试。新页边界详采用时 125.23 秒，已发布参考粗图并核对线程文件记录了内核事件。[来源核验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/sources.json) · [详采回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/targets/m4-tp1-refresh/tp1-fresh-page/native/result.json)
+
+## 2026-11-20 — S11 返修 · 复核主机采样所属的目标
+
+**范围** 核对 PD 和分块混合新增轻量采样对具名目标的实际覆盖。使用已发布图体与相同训练输入，保留测量资格和覆盖差异。
+
+**验证** PD、分块轻量采样分别用时 159.96、128.38 秒，目标缺口从 6,741、18,410 项分别降至 6,682、18,368 项。PD 两个 Decode rank 各配对 12 个原批次中的八个，检测到一处需排除的冷作用域。分块来源的补充作业有 1,408 个可匹配训练特征点，目标精确匹配为零。主来源有 901 个候选点，其中 469 个来自目标需求。[PD 采样](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/retained-host/pd/costs.json) · [分块来源对比](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/retained-refit/chunk-source-priority.json)
+
+**改动** 在隔离副本调整候选收益，已有采样仍优先复用，新增采样按调用方声明的目标缺口排序。通过正式取证入口离线重放，确认选择主来源的 469 个目标点，消耗零次新原生尝试。
+
+**结论与限制** 修复候选已留存，生效前须完成当前冻结验证并纳入常规代码审查。PD 的条件配对和其余多角色特征仍按原生实测覆盖判定。[候选补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/cost-target-priority/cost-demand-priority.patch) · [选择回放](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/cost-target-priority/replay/selection-check.json)
+
+同一查询合同逐 rank 核对后，PD 共补齐 59 项工作，其中 31 项位于 Prefill。两个 Decode rank 各有 2,499 项缺少合格的双请求测量。详采中的两个短请求在轻量运行全程分别解码。另一组双请求只在轻量运行中出现，且触发了首次特化。另有 1,512 项 Attention 工作的双成员上下文超出原详采样本。服务来源计划保留 17/33 和 13/30 两对 prompt，等长输出延长到 15 和 12，详采与轻量取证使用相同提交组预热。离线通过角色、域和输入装配核对，实际批次和测量资格待原生记录确认。此项未增加尝试，当前先完成既定留出批次。[PD 逐项归因](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/pd-host-qualification/result.json) · [训练计划](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/pd-host-qualification/training-plan/plan.md)
+
+## 2026-11-20 — S10 返修 · Azure 常态并发 4 全节点开发回归
+
+**验证** 用留存原始观察和冻结训练库完成全节点对照，25,111 次调用全部配对，覆盖 2,129,391 项工作和 3,136,186 个执行端点。74,808 条动态队列前沿依赖一致。独立验证入口耗时 2,767.20 秒，新增原生尝试为零。[结构结论](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-normal-c4/structure/result.json) · [实测对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/driver-posts/azure-normal-c4/structure/comparison/actions.md)
+
+**结论与限制** 此项用于开发回归。新常态留出使用另一段 24 请求，仍按冻结输入与评价链验收。
+
+## 2026-11-20 — S11 返修 · 留存多卡测量复用与 PD 取证边界
+
+**验证** 检查 272 份历史样本文件，其中 255 份可追溯到明确的原生来源。通过当前注册的本地批次工作复用规则和 C++ 成本查询，前缀缓存新增 52 项主机覆盖，既有 108,278 项覆盖全部保留。其余七例的缺口未减少。TP8 八个 rank 的补充详采各出现 22 项目标合批工作，对应轻量采样使用逐请求提交，实际没有测得这些合批工作。另 224 项 Prefill 工作需要单请求 65 token，同长度此前只在多请求 Prefill 运行。[样本复用](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/archive-reuse/result.json) · [前缀全图覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/archive-reuse/prefix/coverage.json) · [TP8 来源重叠](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/archive-reuse/tp8/source-overlap.json)
+
+**额度与结束条件** 当前冻结单卡的原生观测完成后，执行一轮相同部署的 PD 训练详采。已保留的 PD 来源范围提供其他成本，新训练用于双请求 Decode 以及缺失的上下文。详采与轻量各上限 600 秒、各一次，合计后处理上限 3,600 秒、保留量上限 12 GiB。详采完成后先核对实际批次和 C++ 查询坐标，只有观测达到联合 Decode 且覆盖目标需求时启动轻量取证。M4 从 51 调为 53 次，整窗从 106 调为 108 次，其他原预算和 S12 五次预留沿用。
+
+PD 后台任务已等待本批冻结原生观测的完成回执。常态并发 4 的新参考图发布用时 1,163.33 秒，常态并发 8 已启动详采。[PD 协调回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/coordinator.json) · [新留出运行日志](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/targets-coordinator.log)
+
+## 2026-11-20 — S11 返修 · 归并已有工作形状和缺失测量
+
+**验证** 用当前工作身份核对八域留存图与目标缺口。确认 TP8 有 176 项合批主机工作已出现，PD 有 5,110 项主机工作已有形状，分块有 9,944 项主机工作已有形状。其余工作需要新形状、设备或传输证据；普通 TP2、PP3、TP2×PP3、EP4 的留存形状均无法补齐当前主机需求。该检查只判定训练机会，实测资格由原生配对和统一成本查询核对。[逐域训练机会](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/trainability/result.json)
+
+**额度与结束条件** 分块主来源和组批输入已发布，选择候选排序修订后只补一次轻量观测。沿用现行正式入口和镜像，在隔离副本使用该修订；累积上限 600 秒原生、1,800 秒后处理及 8 GiB，新冻结单卡和 PD 详采之后执行。按原生实际配对和完整目标图覆盖核对收益。M4 尝试额度增加至 54 次，整窗 109 次，原生秒数、后处理、存储总额度及 S12 预留沿用。
+
+**准备** 普通 TP2、PP3、TP2×PP3、EP4 和前缀缓存的下一批训练输入已按当前模型、角色和原生部署核对。TP2 单独提交短请求，PP 保留实际需要的长短微批，EP4 延长三路并发并显式轮换专家接收侧，前缀缓存先种入共享前缀、再用七条持续 Decode 请求覆盖批次宽度。所有训练与验证使用分开的请求身份和原生记录。此批当前只有输入，无新增运行。[训练候选输入](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/trainability/training-candidates/)
+
+分块任务已在正式采样入口排队。新留出常态并发 8 原生详采用时 603.37 秒，参考图生产在执行。[分块协调回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/chunk-service-training/coordinator.json) · [并发 8 详采回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/targets/m4-tp1-refresh/tp1-fresh-normal-c8/native/result.json)
+
+## 2026-11-20 — S12 预检 · 干净源码构建
+
+**验证** 只读挂载独立干净检出及冻结补丁，依照 README 的 modeling Docker 命令构建核心与局部验证程序。54.12 秒结束。主程序哈希与冻结二进制一致。原生冷启动和模板、成本资产复用留待最终提交完成后执行。[构建回执](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/build.receipt.json)
+
+## 2026-11-20 — S11 返修 · 双 rank 固定图取证
+
+**范围** 原 TP2 详情中的两份线程流均缺内核唤醒，还缺一次正在处理前批请求时的输入可用边界。这些记录保留各自的资格限制。新留出选同次提交的 35 和 67 token 请求核对双 rank 的主机服务、同步和 collective，用当前标准镜像取内核唤醒。输入与训练相互独立，已由正式输入及模板装配入口核对，固定图成本及评价器一同固定。[选择与原始缺口](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/frozen/selection.json)
+
+**额度与结束条件** 一次详采上限 600 秒，后处理上限 5,000 秒，保留量上限 8 GiB。来源核验先走 CPU，详采在单卡冻结观测和已排队的多卡训练后执行。结构达到全节点资格后才运行固定图基线及成本替换。现场发现的新缺口按工作和依据保留。M4 上限加至 55 次，整窗 110 次，保留 S12 五次额度。[冻结清单](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/frozen/matrix.json)
+
+**验证** 冻结后的两份 rank 模板经原来源核验通过，耗时 89.15 秒，代码及资产哈希一致。新目标等待原生设备队列，尚未消耗采集额度。[来源核验回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/sources.receipt.json) · [协调状态](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/coordinator.json)
+
+## 2026-11-20 — S12 预检 · 镜像构建与示例输入
+
+**发现与改动** 从干净检出确认，SGLang 子模块目录空置时，原构建脚本的 Git 命令会沿目录找到主项目，误取主项目提交作为原生框架版本。在隔离副本显式检查 Git 工作树根，未初始化时指向正式子模块命令，已初始化的源码继续要求干净。候选补丁留存于当前冻结范围之外。[构建入口候选补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/sglang-checkout.patch)
+
+**验证** 两种错误工作树均在启动 Docker 之前返回准确提示。用干净官方子模块、现有基础镜像及缓存重建采集和控制，两镜像与标准 ID 相同，上游提交一致，采集和控制入口帮助可用。临时别名已清理。默认配置集通过正式规划入口，形成两项单卡来源和四个目标。复用输入改了请求身份和到达时刻，四项输入均通过合同检查。该批预检消耗零次原生尝试。[构建核对](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/packaging/result.json) · [示例输入核对](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/planning.json)
+
+## 2026-11-20 — S10/S11 新留出 · 页边界结构与队列唤醒
+
+**验证** 三份新单卡留出参考图均已发布，冻结资产哈希一致。页边界全节点对照通过 261 个动作、15,137 项工作。固定图所有工作均有实测，首次重放有 13 处局部等待缺项，传播为 7,174 处提前。轻量原生观测独立完成，用时 123.75 秒，自主预测首缺为 16 token Prefill 的 `ModelRunner.forward`。[参考图回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/targets-coordinator.receipt.json) · [结构验收](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/cases/tp1-fresh-page/result.json) · [冻结自主结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/autonomous/tp1-fresh-page/result.json)
+
+**归因与改动** 同一 `eventfd` 的唯一匹配读写表明，生产线程在读线程的切出记录之前发出有效内核唤醒。有些写调用甚至在切出记录之前返回。在隔离副本按已匹配读写的交叠时段核对唤醒，仍要求同一描述符、写入一次及同一生产线程。复用原记录重放，22,515 个端点全部对齐，新增原生尝试为零。实测重放通过属于开发回归，原冻结基线差异保留。[原始配对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-fixed-wake-race/observed-credits.json) · [隔离补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-fixed-wake-race/queue-wake.patch) · [开发重放](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-fixed-wake-race/verified/result.json)
+
+**剩余** 固定图查询剩 38 项缺口，均为单成员 16 token Prefill、`block_table_strided=0` 的同一特征点，含 27 项主机工作、2 项搬运及 9 项设备工作。对应曲线当前只测过 15 token，核对的 34 份留存样本均无所需坐标。常态两例沿同一冻结资产独立运行。[全图成本需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-fixed-wake-race/verified/remaining-demand.json) · [留存样本核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-fixed-wake-race/page-service-samples.json)
+
+新常态并发 4 的轻量观测用时 289.67 秒，窗口内无新增特化。冻结自主预测完成全部 24 条请求与 3,191 个 token，TTFT、TPOT 的 MAPE 分别为 1.36%、2.67%，两项各有 24 条有效请求。常态并发 8 的轻量观测已启动。[正式评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/autonomous/tp1-fresh-normal-c4/result.json)
+
+## 2026-11-20 — S11 新留出 · 常态并发 8 与页边界样本核对
+
+**验证** 并发 8 轻量观测用时 264.87 秒，无新增特化，冻结自主预测匹配全部 24 条请求和 3,191 个 token。TTFT、TPOT 的 MAPE 为 1.32%、4.08%，两项各有 24 条有效请求。常态两例等权为 1.34%、3.38%，页边界保留成本缺口结论。三例的自主验证协调任务结束，冻结资产哈希一致。PD 新来源详采开始使用原生队列。[并发 8 评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/autonomous/tp1-fresh-normal-c8/result.json) · [冻结回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/autonomous-coordinator.receipt.json)
+
+**归因** 页边界训练详采的 16 token 请求与一条 17 token 请求共同进入 Prefill，批次共两个成员、33 token。逐批核对 `ModelRunner.forward` 后确认这份来源没有单成员 16 token Prefill，缺失的是实际组批后的工作形状。[训练来源](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-boundary-training/collection/sources/0/attempts/1/source/rank-0.json)
+
+## 2026-11-20 — S11 样本资格 · PD 双请求与单卡页对齐
+
+**范围** 核对真实批次是否提供待预测的工作特征。留出图提供工作定义和坐标，训练采集提供服务时延。
+
+**改动** 用两组独立提交的 16 token 单请求和一个普通双请求组构造单卡训练输入。预热与测量采用相同提交组。增加一次详采和一次由图资格触发的轻量采样，将 M4 与整窗尝试上限调整为 57、112 次。
+
+**验证** PD 一轮原生详采用时 207.90 秒，两个 Decode rank 各实际记录 27 个双请求批次。四份单卡训练详采的 Prefill 均没有 16 token 总量。新单卡训练输入已核对来源域、提交组、预热组以及与留出请求身份的隔离。[PD 原生回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/source/sources/0/result.json) · [单卡训练输入与目标需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-page-service-training/selection.json)
+
+**结论与限制** PD 双请求已经在原生执行中出现，待核对归一化工作和独立轻量时延。单卡新来源的实际工作仍待详采确认。
+
+## 2026-11-20 — S10/S11 · 分块成本与双 rank 同步对照
+
+**范围** 在同一冻结状态核对分块主来源的轻量配方、PD 训练图和新的双 rank 真实参考。
+
+**改动** 分块用隔离的目标需求优先规则选择已有主详采的配方。PD 按统一工作身份确认双请求作用域后启动配套轻量采样。对 TP2 用留存记录分解固定图同步资格。[分块配方回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/chunk-service-training/coordinator.json) · [PD 工作匹配](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/observed-cut/result.json)
+
+**验证** 分块轻量采样 145.20 秒，成本缺口由 18,368 降为 8,424，余项均为注意力。Prefill 的已处理上下文上界只到 128 token，目标为 239。双成员 Decode 的总上下文上界只到 268，目标为 530 和 532。混合批的注意力 token 配对数也超出测量范围。TP2 详采用时 131.54 秒，通过 354 个动作的全节点结构核对，41,606 项工作全部可估时。[注意力范围](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/chunk-service-training/attention-bounds.json) · [TP2 全节点对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/results/m4-tp2-fixed-refresh/cases/tp2-fresh-fixed/result.json)
+
+**结论与限制** TP2 固定图仍有 74 个同步边不具备重放资格。66 个同步调用存在实际离核区间，当前实现要求 SDK 调用全程在 CPU 上。另八个止于设备就绪前沿资格。一次队列通知未绑定。该批已结算分块、TP2 各一次原生运行，M4 累计 49 次，阶段额度 57 次。[固定图原结论](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/results/m4-tp2-fixed-refresh/fixed/tp2-fresh-fixed/result.json) · [同步分类依据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/fences.json)
+
+## 2026-11-20 — S11 · 主机采样配对与同步时序归因
+
+**范围** 使用已有 PD 详采和本批轻量配对核对主机样本，核对 TP2 同步边原始时序，确认单卡页边界短训练的采样资格。
+
+**改动** 按已观测批次的真实成员及上下文核对配对，不改冻结规则。[PD 批次记录](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/observed-cut/paired-geometry.json)
+
+**验证** PD 轻量采样 176.10 秒。两个 Decode rank 的详采各有 27 个双请求批，轻量采样各有 19 个，两轮上下文组合无重合。缺口减少 438 项，均为设备和搬运。TP2 的 74 个同步边中，54 个已有 SDK 调用内的实测就绪前沿，被主机离核条件排除。另有 15 个 SDK 返回晚于外层返回的记录及五个校准范围跨越 SDK 返回的前沿。单卡详采 138.69 秒，38 个待测特征点均与详采图精确匹配，随后开始同组轻量观测。M4 累计结算 51 次原生尝试。[PD 成本](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/host/acquisition/costs.json) · [TP2 同步诊断](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/fences.json) · [单卡图资格](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-page-service-training/observed-cut/result.json)
+
+**结论与限制** PD 剩 6,236 项主机工作。其中 5,126 项 Decode 主机工作自身未声明上下文长度或注意力配对数，当前配对仍继承整批上下文。能否复用已有轻量样本还需逐个工作核对作用域及本地测量边界。TP2 同步需区分设备等待、离核运行状态和 SDK 返回时间。页边界成本仍待轻量测量通过。[PD 局部特征统计](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/observed-cut/local-feature-summary.json)
+
+## 2026-11-20 — S10/S11 · 并发 4 结构验收与页边界双路径回归
+
+**范围** 对新常态并发 4 完成冻结结构对照。用新的独立训练样本和隔离的队列修订复跑原页边界证据，作为开发回归。
+
+**验证** 并发 4 的 24,710 个动作内容和依赖全部匹配。页边界一次轻量样本耗时 125.46 秒，补齐 38 个成本点，15,137 项工作均可估时。固定图基线重放覆盖全部 22,515 个端点。替换全部成本时 p95 TTFT 提前 355.60 毫秒，只恢复主机实测后提前 1.81 毫秒。自主预测的七个 token 全部匹配，TTFT、TPOT MAPE 为 2.72%、2.69%，分母为 3、2。[并发 4 结构](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/cases/tp1-fresh-normal-c4/result.json) · [固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-page-service-training/development/fixed/result.json) · [自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-page-service-training/development/autonomous/result.json)
+
+**结论与限制** 固定图本例的主要误差沿主机服务传播。页边界开发回归完成，保留原冻结失败。M4 本轮再结算一次原生尝试，累计 52 次，五次额度仍保留给 S12。并发 8 正沿原冻结状态做全节点结构对照。
+
+## 2026-11-20 — S11 · 固定图的同步、入队与设备提交
+
+**范围** 复用 TP2 留出详采和已闭合的单卡页边界，对固定图时间交接做隔离开发回归。保留原冻结结果。
+
+**改动** 原生同步调用按实测外层返回和已核验的设备完成前沿重放。后台队列通知保留真实入队及提交线程顺序。已核验的事件记录、集合通信提交纳入设备计时，实测等待的提交顺序参与共同时钟校准。[候选补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/device-publication-candidate/fixed-device-publication.patch) · [队列源证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/queue-producer.json)
+
+**验证** TP2 的 1,144 个同步边及 312 个队列通知均已绑定，局部设备缺口从 1,551 个降到两个。固定图以实测服务重算了 64,186 个端点。单卡页边界的 22,515 个端点仍全部对齐。开发回归原生尝试为零，工作树的冻结快照相同。[原设备缺口分类](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/dispatch.json) · [开发回归结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/device-publication-candidate/verification/result.json)
+
+**结论与限制** TP2 基线还有 52,419 个提前端点。用原始前驱时间定位，剩余局部缺口为 11 处控制、8 处提交及 2 处设备时序。已核对的主机例存在真实 `futex` 睡眠和唤醒，最长局部缺口约 14.8 毫秒，发生在两个业务工作之间。仍需把该类等待接入固定时间线，才能评分 TP2 固定图。[原始主机事件](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/host-gap-examples.json)
+
+## 2026-11-20 — S10/S11 · 主机等待归并与 TP2 自主评分
+
+**范围** 归并业务工作和普通顺序边上的主机等待。收齐当前单卡结构复验，并对同一新 TP2 留出补做一次独立轻量观测。
+
+**改动** 通用主机时间线接入已核验的睡眠和唤醒，队列的真实提交和取出记录提供间隔里实测的 CPU 开销。当前冻结任务全部结束后，将上述验证改动和按目标缺口排序的采样修订一并应用到工作树，核对文件与已验证的隔离版本逐字节相同。[固定图补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/host-progress-candidate/fixed-host-progress.patch)
+
+**验证** TP2 固定图局部缺口从 21 处降到三处，其中两个设备事件的前序命令在粗图中省略，另一个提交间隔的三次睡眠均已接入，仍短约 11 微秒。单卡页边界 22,515 个端点全部对齐。新常态并发 8 匹配 21,176 个结构动作。TP2 轻量观测 120.14 秒，两条请求的九个 token 全部匹配，预测 TPOT 分别较原生延后 9.86、9.15 毫秒，TTFT、TPOT MAPE 为 1.15%、10.38%。[固定图复验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/host-progress-candidate/verification/result.json) · [剩余时间依据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/host-progress.json) · [并发 8 结构](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp1-refresh/results/m4-tp1-refresh/cases/tp1-fresh-normal-c8/result.json) · [TP2 自主评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-autonomous-refresh/autonomous/result.json)
+
+**结论与限制** 新增三例独立自主评分等权均值为 TTFT 1.28%、TPOT 5.71%。TP2 固定图继续报告基线差异，误差归因仍待基线通过。M4 结算 53 次原生尝试。为 TP8 的两类联合形状安排一份详采和一次按资格执行的轻量采样，M4 与整窗额度分别调整为 60、115 次。[TP8 采集状态](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/coordinator.json)
+
+## 2026-11-20 — S11 · TP8 训练来源与 PD 局部计时证据
+
+**范围** 完成与 TP8 留出隔离的训练详采，复用 PD 详采和轻量记录检查各工作实际需要的匹配特征。
+
+**验证** TP8 八个 rank 各覆盖 50 项待补工作，总计 400 项。详采用时 150.60 秒，后处理 370.90 秒，快照核对通过。匹配的轻量采样用时 142.64 秒、后处理 238.17 秒。成本查询覆盖原独立参考图的 151,128 项工作。PD 两个 Decode rank 各在 17 个已有批次对中核实 23 个主机实测点，合计对应待补的 2,638 项工作。核实依据包括该作用域的本地特征、原生调用序列和实际计时切分。[TP8 详采](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/coordinator.json) · [TP8 轻量采样](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/host/coordinator.json) · [PD 局部配对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/observed-cut/local-alignment.json)
+
+**结论与限制** M4 已结算 55 次原生尝试。TP8 复用原留出轻量记录和结构模板，自主预测用时 82.74 秒，输出五个 token，TTFT、TPOT MAPE 分别为 63.00%、31.05%。两个首 token 分别比原生提前约 1.45 和 2.69 秒，后续需定位公共路径上的时延差异。该结果作为开发回归保留。PD 局部核对适用于特征仅依赖批次人数和新 token 数的工作。依赖上下文、模型输入或 KV 状态的工作仍需按自身特征核对。[TP8 开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/development/autonomous/result.json)
+
+## 2026-11-20 — S11 · TP8 首 token 偏差归因
+
+**范围** 对照留存的原生详采、轻量发布、独立主机训练及同快照自主图。按成员、阶段和上下文配对八个 rank 的四轮计算。
+
+**验证** 原留出轻量记录中，两条请求从调度器接收到首 token 发布分别约 2.24 和 2.14 秒。详采中的 `Scheduler.run_batch` 约 1.46 和 1.54 秒，自主图约 0.79 和 0.89 秒。两轮 Prefill 的普通设备任务在 rank 0 共约 16 毫秒，与自主图相近。在各轮的 74 次集合通信中，最后一个 rank 到齐后的耗时累计均约 5 毫秒。各 rank 到达的时间跨度累计在详采为 571、627 毫秒，在自主图为 107、211 毫秒。两份镜像的原生及环境层一致，安装的 Python 源码只在四处 Ascend 详采和解析文件有差异，轻量请求及计时入口相同。[分阶段证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/phase-audit/phases.json) · [镜像文件核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/phase-audit/images.json)
+
+**追加观测** 同进程的两组主机观测结算一次原生尝试，耗时 138.18 秒。两组都出现两个单请求 Prefill，八个 rank 的批次耗时在 850.30–889.22 毫秒，观测到的可运行状态被抢占时间至多 1.49 毫秒。每轮 Decode 约 106–112 毫秒。预热延续原请求和到达模式，重复两组使观测请求集合异于预热集合，因此诊断的预热走原生输出，原留出预热使用与测量相同的输出内容。[重复观测](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/phase-audit/repeated-host/timing-summary.json)
+
+**结论与限制** 详采可定位为各 rank 到达和主机阶段的差异，原轻量计分的额外偏差仍缺少同轮 CPU 切分。主机观测未复现两秒 Prefill。追加一个新留出轻量测量，恢复正式预热口径，以同一成本和结构资产得到独立对照。正式轻量结果及独立训练资产保持各自来源。
+
+## 2026-11-20 — S11 · TP8 轻量评分的组批资格
+
+**验证** 新留出使用同样的 2 毫秒到达间隔及代表预热。实测两次提交在 2.92 和 4.08 毫秒，两个请求均在 4.65 毫秒由调度器读到并同时发布首 token。八个 rank 在 9.82–11.92 毫秒首次特化同一双成员 KV 分配内核。评分入口保留实测并标为 `reference_loaded_specializations`。本次结算 131.80 秒，M4 累计 57 次。[新留出测量](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/fresh-autonomous/autonomous/result.json)
+
+**结论与限制** 2 毫秒的交错到达和实际提交波动处于同一量级。选择 50 毫秒的间隔覆盖 Prefill 期间到达的同一责任，并保留原小间隔的结论。一次新测量使用同一成本、结构和评分合同，M4 上限升至 63 次，S12 五次预留沿用。
+
+**并行准备** 在采集入口核对 PP3、TP2×PP3、EP4 和前缀缓存四份训练计划。前两份的长短请求满足双成员微批容量，EP4 使用既定路由。前缀作业以种子后的多请求 Decode 为观测条件，Prefill 仍由原生按上限调度。四份均与原留出请求身份隔离，预检消耗零次原生额度。[训练作业预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/trainability/source-preflight/result.json)
+
+**独立评分** 50 毫秒留出的两条请求分别约在 0.37、50.16 毫秒提交。第二条请求在第一条首 token 前已提交，由调度器下一轮接收。原生在观测窗内无首次特化。独立预测完成 151,128 次成本查询，匹配五个 token，TTFT、TPOT MAPE 为 3.74%、4.17%，两个指标的请求分母均为二。此次结算 132.91 秒，M4 累计 58 次。冻结代码、模板和成本核对通过，原 2 毫秒结论保留。[独立评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/staggered-autonomous/autonomous/result.json) · [快照回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp8-service-training/staggered-autonomous/coordinator.json)
+
+## 2026-11-20 — S11 · 流水并行训练来源资格
+
+**范围** 用独立长短请求组一次详采 PP3 和 TP2×PP3。沿目标的实际工作定义、角色和特征核对补充训练价值。
+
+**验证** PP3 三个 rank 完全匹配 1,067 个缺口特征点，其中 833 个主机点对应 3,263 项留出工作。TP2×PP3 六个 rank 完全匹配 2,467 个缺口特征点，其中 1,955 个主机点对应 9,222 项留出工作。详采累计 306.95 秒原生、255.34 秒后处理，代码快照一致。M4 结算 60 次，按两例的匹配条件启动各一次轻量观测。[详采回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/coordinator.json) · [PP3 成本点资格](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/pp3/observed-cut/result.json) · [TP2×PP3 成本点资格](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/tp2-pp3/observed-cut/result.json)
+
+**轻量采样** PP3 一次轻量观测用时 145.23 秒，后处理 35.23 秒。新的独立成本可估计三个 rank 的全部 21,695 项留出工作。启动复用首轮轻量证据的自主预测开发回归。M4 累计结算 61 次，组合场景继续采样。[PP3 成本](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/pp3/host/acquisition/costs.json) · [自主回归状态](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/development-coordinator.json)
+
+**结果** TP2×PP3 轻量观测耗时 153.25 秒，后处理 116.24 秒，补齐参考图全部 64,000 项工作。流水两例的开发回归各完成三条请求和九个 token，TTFT、TPOT MAPE 分别为 1.40%/1.46% 和 1.51%/3.21%。开发回归消耗零次原生尝试。M4 累计结算 62 次，新增四次额度用于两例新留出的详采与轻量观察。[PP3 开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/pp3/development/autonomous/result.json) · [TP2×PP3 开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-service-training/tp2-pp3/development/autonomous/result.json)
+
+## 2026-11-20 — S11 · 主机局部工作配对
+
+**改动** 在隔离副本把 SGLang 原生调用配对及 Ascend 实测切分分开。完整上下文仍可确定配对。对上下文不同的批次，按请求、阶段、新 token 及原生调用顺序配对，只让声明所需特征全部取得证据、且无 KV 和槽位访问的主机工作使用局部样本。局部配对还要求同一作用域及队列切口的 runtime 调用序列一致，复用同一份线程实测记录。[源码候选](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/scope-pairing/host-scope-pairing.patch)
+
+**验证** 以正式采样和拟合入口重放 PD 留存证据。两个 Decode rank 的 176,408 个既有时长全部保留，各补 23 个成本点。留出主机缺口从 6,236 降到 3,598 项，另外八项设备和搬运缺口仍在。另核对 PP3 rank 0 的 13,162 个既有时长和原生 CPU 协议成本。流水任务收尾后合入隔离副本中验证过的三个 Python 文件，逐字节核对。此次改动原生尝试为零。[PD 采样复验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/scope-pairing/strict-replay/receipt.json) · [成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/scope-pairing/strict-replay/costs.json) · [PP3 调用方](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/scope-pairing/pp3-caller/result.json) · [合入核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/scope-pairing/integration.json)
+
+## 2026-11-20 — S10/S11 · 流水留出启动与 PD 模型尺寸取证
+
+**流水留出** 两个版本的原生来源均通过资格核对。第一轮协调器缺失 Ascend 驱动挂载，两个采集在原生启动前报错，消耗零次设备额度。保留错误记录，复用正确的原生挂载和原冻结快照继续执行。原来源核验复用。[首轮启动记录](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-independent/initial-caller/targets.json) · [独立验证状态](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-independent/coordinator.json)
+
+**PD 预检** 两个 Decode rank 各有 166 个已有配对切口需要实测模型尺寸，合计能验证 2,236 项留出工作。隔离修订复用结构采集的原生输入解释，轻量记录实际张量行数及批次人数，读取开销纳入观察器区间。候选镜像沿用已固定的原生运行层并重新安装观察包。沿用同一详采和独立训练负载，按资格预留一次轻量样本。[待测证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/model-geometry/preflight.json) · [镜像回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/model-geometry/build.receipt.json)
+
+**结构对照** 流水新留出的 1,097、2,216 个动作均匹配内容和依赖，分别核对 21,695、64,000 项图内工作及 400、680 个 CPU 协议动作的调用边界。两例的 CPU 消息只具备发送、接收与消费给出的时间范围。102、172 个区间的中位宽度约为 229、254 微秒。保留已检查范围内结构通过，完整时间覆盖仍需要实际搬运完成证据。两次详采后，M4 已结算 64 次，轻量评分进行中。[结构结论](../../../data/20261119T090556.273460Z_project-delivery/results/m4-pipeline-refresh/comparisons.json) · [CPU 证据范围](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-independent/structure-scope.json)
+
+**自主评分** PP3 和 TP2×PP3 各三条请求、九个 token 全部匹配。TTFT、TPOT MAPE 分别为 0.49%/0.78% 和 2.37%/2.75%。六个已评分新留出的等权 MAPE 为 1.74%/4.14%。协调器四阶段快照核对通过。M4 累计 66 次原生尝试，两例评分结束后接续 PD 轻量采样。[流水评分](../../../data/20261119T090556.273460Z_project-delivery/results/m4-pipeline-refresh/autonomous.json) · [冻结回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pipeline-independent/coordinator.json)
+
+## 2026-11-20 — S11 · PD 前向证据与其余训练来源
+
+**验证** 轻量采样耗时 174.26 秒，三个 rank 分别记录 7、63、63 次模型前向尺寸。按工作点核对后，原留出参考图的未覆盖项从 3,606 减至 1,370。已审查结构观察、轻量采样和成本配对三个调用面，合入六个与隔离验证逐字节一致的文件。剩余 1,080 项注意力主机工作读取实际上下文，两份训练观测都未取得目标的同批坐标。其余缺口仍按实际工作特征记录。[运行与拟合](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/model-geometry/coordinator.json) · [合入核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/model-geometry/integration.json)
+
+**下一批证据** 分块混合原留出归并为四种实际注意力形状。对未覆盖的最新上下文上界只准备五个训练请求，分别用于触发分块尾部及两个长请求持续重叠。仓内既有来源能满足前缀缓存的其他注意力形状，七成员 Decode 是本批的主要需求。EP4 已开始取四个 rank 的详采，另外两份训练按共享设备锁排队。仅有命中的实际工作和可用坐标才追加轻量取证。[EP4 与缓存输入预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/multi-role-demand/trainability/source-preflight/result.json) · [分块训练依据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/chunk/shape-basis.json)
+
+## 2026-11-20 — S11 · 队列边界审查与训练资格
+
+**主机提交** 从原始线程活动、eventfd 信号以及同一入队和出队的记录核对到 11.08 微秒的队列处理。固定图统一计入已确认的唤醒后处理和积压命令交接，两者共享一次区间合并和实际 CPU 计时。TP2 消除局部主机提交差异，两个设备端点保留。单卡页边界的全量成本替换及分组归因与之前逐项一致，双文件已合入。[原始区间](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/unowned-submission.json) · [开发回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/submission-wake-candidate/integration.json)
+
+**设备队列** EP4 一次四 rank 原生作业消耗 229.10 秒，四个 rank 均有原始记录。标准解释器要求回绕两侧各只有一次 driver 提交，拒绝了一个全量 SQE 已归属同一 API、但有三次提交的相邻组。隔离修订以实际槽位数、关联标签和 host 提交顺序核对完整相邻组，在留存数据上唯一确定回绕归属，缺槽时保持拒绝。现从同一原始目录重做四 rank 生产，原生尝试为零。[原始槽位](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/rank-1-release-evidence.json) · [局部回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/release-candidate/slot-regression.json)
+
+**训练资格** 缓存和分块的详采分别耗时 142.54、162.18 秒，命中 801、116 个原留出仍需的工作点。对应的 633、82 个主机点覆盖留出中的 6,208、2,952 项工作。只取各自一轮轻量观测，最终覆盖以原生实际配对后的正式成本查询为准。累计结算 70 次原生尝试。[缓存训练](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix/qualification/result.json) · [分块训练](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/chunk/qualification/result.json)
+
+**后续实测** 前缀缓存轻量观测用时 132.26 秒，留出参考图的成本缺口从 8,038 降至 496，主要在 Prefill、批次合并和集合通信。累计结算 71 次原生尝试。TP2 另两处设备端点以共同校准约束缩小了前序 SDK 事件的完成范围，范围仍跨过各自 driver 的入口，固定图的时间资格保持原判。[缓存拟合回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix/cost-coordinator.json) · [设备时钟范围](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/device-prior-calibration.json)
+
+## 2026-11-20 — S11 · 分块开发回归与调度留出
+
+**分块** 一次轻量观测耗时 147.39 秒，两 rank 的 194,070 项原留出参考工作均通过正式成本查询。复用原目标发布记录做开发回归，11 条请求和 39 个 token 全部匹配，TTFT、TPOT MAPE 为 1.39%/8.46%，分母分别为 11/8。首轮冻结结论保留。[拟合回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/chunk/cost-coordinator.json) · [开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/chunk/development-autonomous/result.json)
+
+**EP4** 新解释器从留存采集完成四 rank 建库，后处理未调用新的原生采集。来源命中 2,543 个待补点，其中主机点对应 31,714 项工作。轻量采样与独立留出顺序使用同一设备锁。[四 rank 建库](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/release-candidate/coordinator.json) · [训练资格](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/release-candidate/qualification/result.json)
+
+**新留出** 使用未参与拟合的 Azure 突发行和新的分块请求内容，固定 26 份模板、成本、输入和程序产物，两个来源域均完成核验。样本请求独立，分块保留同一组长度及调度形状。M4 已结算 72 次，另外六次用于两类新留出的详采和轻量观测，阶段上限 84 次。[冻结范围](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/scheduler-independent/frozen/environment.json) · [来源与阶段回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/scheduler-independent/coordinator.json)
+
+## 2026-11-20 — S11 · 固定设备序列开发回归
+
+**机制** 验证器用原始 driver 提交、stream 顺序和 SDK 完成证据恢复连续的未发布记录，保持主机和设备两侧的因果。原生等待完成沿用实测返回处理，公共设备计数器证明同设备的相对先后，RAW 绝对范围仍受原校准约束。变更只用于固定图验证，独立批次继续使用冻结快照。[原始提交](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/device-post-provenance.json) · [连续设备事实](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/diagnostics/first-wait-following-tasks.json)
+
+**验证** TP2 实测重放的 64,186 个端点均落在各自实测范围内，41,606 项工作完成成本配对。按分组恢复实测后，p95 TTFT 的偏差从提前 161.67 毫秒收敛为恢复主机后延后 1.60 毫秒。单卡页边界 22,515 个端点及各项归因与此前逐项一致。零次新增原生。五个修订文件的补丁通过工作树应用检查，隔离版本及首轮冻结记录均保留。[回归与补丁核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/device-record-candidate/review.json)
+
+**采样队列** 缓存算例剩余 496 项工作归并为八请求的一个训练负载。原生预算允许两个新输入共用 Prefill，后续输入逐个准入。合同预检确认结构域一致。详采在已排定的 EP4 轻量测量之后，只在确认实际工作时启动轻量采样。调度留出已结算两次详采，M4 累计 74 次。[缓存输入预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix/turnover-plan/admission-basis.json) · [采样安排](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix-turnover/coordinator.json)
+
+## 2026-11-20 — S11 · PD 主机时长取证和训练输入
+
+**范围** 对 PD 剩余成本核对两个 Decode rank 的留存训练输入，并用独立单卡训练数据对照同次详采和轻量采样的主机服务。
+
+**改动** 仍由详采确认图体和特征，轻量观察提供训练时长。将双成员 Prefill、不同 Decode 上下文和两端释放组成一份 14 请求、八组的训练作业。同提交组内保持同到达，组间由原生 worker 空闲边界隔开。保留原实现域、部署和分工。[训练预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/preflight.json)
+
+**验证** 两个 Decode rank 各有 29 种详采、27 种轻量双请求上下文，只有一组交集，未命中需求的形状。单卡同负载、同部署对照匹配 650 个工作特征点，各测量方式对应 6,500 个区间。按点比较时，详采与轻量时长之比的中位数为 4.98，控制线程注意力工作为 5.24。PD 输入通过正式采集合同，训练与原留出没有重复请求身份或 prompt 内容。[上下文核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/same-run-cost-assessment/archive-geometry.json) · [时长对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/same-run-cost-assessment/result.json)
+
+**结论与限制** 本批 PD 诊断使用零次原生，训练排在调度留出、EP4 和缓存作业之后。详采取得匹配的主机工作后才执行轻量采样。已结算第三个调度留出的详采，M4 累计 75 次；含新训练额度的上限为 M4 88 次、整窗 143 次，S12 五次预留沿用。[PD 队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/coordinator.json)
+
+## 2026-11-20 — S10/S11 · 独立排序核对和固定图取证准备
+
+**范围** 核对六个完成自主评分的新留出、其训练来源，以及正在执行的分块混合独立结构对照。
+
+**改动** 按每条请求的实测发布记录复算单例 MAPE，再逐例等权汇总。按模型、到达序列和实际 token 内容确定可比较的配置。另准备页边界与 TP2 两个新固定图案例，沿用已发布的模板与成本，改用独立输入。[评分汇总](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-autonomous.json) · [固定图案例](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/release-plan.json)
+
+**验证** 六例 TTFT、TPOT MAPE 为 1.74%、4.14%，两项分母各 58 条请求。历史样本通过详采图的绝对观测窗、轻量时钟校准和采集合同补齐来源核对。Azure 常态并发 4/8 和两种流水线的三个指标排序均与实测点估计一致。分块混合的新独立结构匹配全部 2,248 个动作。两个固定图输入用现有成本离线预测完成 7、9 个 token，未新增原生采集。[历史样本依据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/retained-sources.json) · [分块结构结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-scheduler-refresh/cases/qwen8-fresh-chunk-mixed/result.json) · [预测预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/affordability.json)
+
+**结论与限制** 排序为单次观测的结果。两个新固定图仍需正式实测，预留两次详采和一次页边界轻量观测，M4 上限为 91 次、整窗 146 次。当前冻结批次继续运行。
+
+## 2026-11-20 — S11 · 固定图等待资格与校时准备
+
+**范围** 审查待合入的固定图修订，从原始设备 wait、主机 fence 的完成时刻追到验证器是否具备归因资格。同时核对结构对照的精确校时开销。
+
+**改动** 将已观测 wait 和 fence 的缺证据判定收口到同一完成时间入口。固定图只在必要的实测证据齐备时做成本归因。精确时钟约束只为仍受映射选择影响的关系做代数推导，同一 RAW 时钟和同一正斜率分段内的顺序直接判定。[待合入补丁](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/wait-qualification/integration-ready.json)
+
+**验证** TP2 的 1,480 个设备 wait 完成均有依据，64,186 个端点的基线和全部成本归因结果逐项一致。分块留出上的 401,310 条因果关系仍得到同样的 190 条求解不等式，300,074 个实测端点的时刻一致。约束准备由 41.14 秒降至 23.99 秒。PD、EP4、前缀缓存的新目标通过装配预检，分别改变 3、3、17 个 prompt 内容，保留原调度与路由条件。[等待资格复验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/wait-qualification/result.json) · [校时对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/clock-qualification-audit/result.json) · [新目标预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/preflight.json)
+
+**结论与限制** 五个文件的合并补丁通过语法和应用检查，当前冻结代码保持一致。耗时对照仅覆盖校时准备，正式的新固定图和多角色独立评分仍待运行。本批新增原生尝试为零。
+
+## 2026-11-20 — S10/S11 · TP2 与页边界的独立观测
+
+**验证** 在调度批次仅用 CPU 对照时，持同一设备锁分别采集 TP2 和页边界，原生耗时 130.31 秒和 132.73 秒。TP2 的 354 个动作和页边界的 261 个动作均通过全节点结构对照。两例都在固定图的实测基线资格处停止，M4 累计 77 次。[TP2 回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-independent/coordinator.json) · [页边界回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/page-independent/coordinator.json)
+
+**根因与修订** TP2 的验证器在一个保留为逻辑汇合的观察端点处停止追踪，遗漏跨过该端点的已观测 SDK 设备记录。固定图现在依据实际提交、完成和因果证据恢复记录链。复用这次 TP2 数据做开发回归，64,186 个端点整体通过，旧页边界回归的基线与归因逐项一致。新页边界的线程曾离核 257.89 微秒，已记录离核与返回，唤醒来源仍缺证据。[原始证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/physical-baseline-evidence.json) · [开发回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/observer-record-qualification/regression.json)
+
+**结论与限制** 两例保留原冻结结果。补丁通过应用检查，留在隔离副本等待调度批次结束。开发回归使用零次新增原生尝试。[合入候选](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/observer-record-qualification/integration-ready.json)
+
+## 2026-11-20 — S11 · 唤醒证据边界与独立复核预算
+
+**验证** 用冻结镜像的 CPU 活动采集器确认唤醒的观察范围。线程的切出和恢复在三种场景均有记录，同进程被观察线程唤醒时有生产者记录，另一进程及内核定时器唤醒时缺生产者记录。页边界实测仅能确定发生过阻塞，实际唤醒者仍未知。诊断使用零次 NPU 观测。[诊断结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/wake-coverage.json)
+
+**独立评分** 同一页边界留出另取一次轻量观测，原生耗时 122.55 秒。三个请求七个 token 全部匹配，TTFT、TPOT 分母分别为 3 和 2，MAPE 为 0.66% 和 3.12%。逐请求复算并确认 23 份训练样本与原生留出隔离，七例的等权 MAPE 更新为 1.58% 和 3.99%。M4 累计 78 次，运行前后的冻结快照一致。[任务回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/page-autonomous/coordinator.json) · [评分审查](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-page-refresh.json)
+
+**安排** 归因使用具备线程依赖证据的固定图。TP2 准备另一组等长、同批但实际 token 内容不同的请求，锁定既有模板、成本与编译产物，修订入选后执行一次独立复核。另为 EP4、前缀缓存和非对称 PD 各预留一次详采与一次轻量观测，启动前须确认对应成本覆盖。M4 上限由 91 增至 98 次，整窗由 146 增至 153 次，保留 S12 五次，其他上限沿用。[TP2 输入预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/preflight.json)
+
+**调度结构** 并发 8 的 Azure 突发留出通过 14,427 个动作的全节点结构对照。分块混合和两例突发合计对照 34,694 个动作。冻结快照核对通过，接续三例自主评分。[对照索引](../../../data/20261119T090556.273460Z_project-delivery/results/m4-scheduler-refresh/comparisons.json) · [阶段回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/scheduler-independent/coordinator.json)
+
+**分块评分** 新分块混合案例以 194,070 次独立成本查询完成 11 条请求和 39 个 token。逐请求复算 TTFT、TPOT MAPE 为 3.80%、11.86%，分母为 11、8，九份真实训练来源均与评分观测隔离。八例等权为 1.86%、4.98%。本次分块轻量观测耗时 129.60 秒，M4 累计 79 次。[分块评分](../../../data/20261119T090556.273460Z_project-delivery/results/m4-scheduler-refresh/autonomous/qwen8-fresh-chunk-mixed/result.json) · [分块评分审查](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-chunk-refresh.json)
+
+## 2026-11-20 — S11 · 调度批次收尾和 KV 释放成本范围
+
+**结论** 两例 Azure 突发均取得完整的原生发布数据，自主预测都停在 7,264 个索引的同一 KV 释放工作。冻结成本只覆盖到 7,200。两个真实结构各有一次同样的释放，七份同域成本均无法覆盖。两次轻量原生耗时 261.24、240.57 秒，M4 累计 81 次。原冻结快照全程一致，原始失败结论存档。[两例自主结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-scheduler-refresh/autonomous.json) · [真实释放条件](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/scheduler-independent/release-coverage.json) · [留存成本核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/scheduler-independent/release-archive-coverage.json)
+
+**根因** TP1 的长前缀淘汰与 EP4 的单页释放均在既有的模板上绑定了超出训练范围的参数。EP4 可用训练来源的最乐观范围仍漏 128 索引这一点，涉及四个 rank 的 20 项主机和 4 项设备工作。分别准备相互隔离的训练输入，TP1 用五个独立长前缀触发真实淘汰，EP4 保持三请求原生分组与路由形态并改变 prompt 内容。预检通过，尚未执行这两份训练。[EP4 范围](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/release-candidate/qualification/coverage-ceiling.json) · [训练预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-geometry-training/preflight.json)
+
+**合入与交付准备** 旧批次结束后合入隔离回归过的五个验证文件，核对文件内容和 Git 暂存区。复用合格的 TP2 来源并冻结新的独立固定图用例，EP4 训练先行。README 补齐换 workload 的复用命令，生成的输入与 S12 已预检资产一致。[合入回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/tp2-fixed-refresh/observer-record-qualification/integration.json) · [TP2 冻结矩阵](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/frozen/matrix.json)
+
+## 2026-11-20 — S11 · 全图成本需求与补充训练队列
+
+**验证** 对两个 Azure 突发共有的 39,751 个成本特征点运行正式查询。两例分别有 1,516,300、1,200,768 项工作可估时，各缺同一 KV 释放中的 8 项主机、2 项搬运和 1 项设备工作。EP4 轻量观测耗时 190.50 秒、后处理 776.42 秒。全图剩余 24 项，四个 rank 均为 128 索引的页释放和合并，验证了此前的范围判断。M4 已结算 82 次。[突发全图需求](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-geometry-training/burst-reference/demand.json) · [EP4 成本](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/ep4/release-candidate/costs/costs.json)
+
+**安排** 已启动排队协调，TP2 的独立详采在前缀与 PD 的已有队列后执行，两份范围训练可和 TP2 的 CPU 对照重叠。TP1 训练同时核对两个突发的完整需求，EP4 先核对四 rank 首个边界。每份训练各保留一次详采和一次轻量，实际详采必须命中所需工作。重新评分保留两次轻量，按独立 Azure 输入对照并发 4 和 8。新增六次额度，M4 上限 104 次，整窗上限 159 次，S12 五次预留与其他累计限额沿用。[TP2 队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/coordinator.json) · [范围训练](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-geometry-training/coordinator.json) · [留出选取](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-long-azure-holdout/selection.json)
+
+**缓存与分块取证** 前缀缓存详采耗时 154.05 秒，命中 342 个待补特征点，其中 270 个主机点对应 356 项工作。轻量原生观测耗时 143.49 秒，拟合后原目标剩 42 项缺口，其中 26 项属于前缀树节点切分，16 项属于两请求筛至一请求的批次变换。M4 累计结算 84 次。分块案例复用原资产生成执行明细，请求指标逐项一致。两 rank 各 22 个批次在自主与真实条件重放间完全对应，独立轻量的八个 TPOT 均偏高。批次细节来自详采，归因范围限于已对齐的批次结构及轻量请求指标。此诊断使用零次原生尝试。[缓存成本](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix-turnover/costs/costs.json) · [分块批次对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/chunk-timing-development/batch-timing.json)
+
+**队列恢复** 缓存成本已成功发布，协调器在读取保留量时退出。确认原进程结束，按源任务状态与已发布成本恢复终态和累计额度，PD 详采已接续。恢复使用零次原生尝试。[恢复回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix-turnover/coordinator.json)
+
+## 2026-11-20 — S11 · 前缀同批插入和筛选
+
+**根因** 原目标中短请求插入时把较长缓存节点分成 32、240 token 两段。上一份训练把两次 Prefill 分开提交，后续请求在 `match_prefix` 已完成切分。原目标的筛选发生在 Prefill 结束、进入 Decode 之前，前一批里的一个请求已生成最后 token。留存训练同批的两个短请求在首次发布后都还未结束。按实现域及正式模型范围核对五份同域成本，均覆盖不了剩余 42 个需求点。[留存资产检查](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix-turnover/retained-release-shapes.json)
+
+**安排** 两个新请求共享 32 token，输入长度为 273、257，输出长度为 2、1。按页合计占 560 token，低于正式场景的 1,024 token Prefill 预算。训练与留出实际 prompt 已核对隔离。新的详采与轻量各限一次，详采命中后才测主机。M4 上限升至 106 次，整窗 161 次。PD 原生详采结算 249.25 秒，M4 累计 85 次。[同批训练预检](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/remaining-topology-training/prefix-first-batch/preflight.json) · [PD 原生回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/source/sources/0/execution.json)
+
+## 2026-11-20 — S11 · PD 成本训练资格
+
+**验证** 两个 Decode rank 各记录 50 个双请求批次，各自包含待补的上下文 17 与 34 组合。Prefill rank 记录 14 个单请求批次，实际同批提交的请求也分开执行，双请求 Prefill 仍缺训练依据。详采对应原参考图 1,316 项待估时主机工作，已转入轻量阶段。成本覆盖待配对及正式查询。此时 TP2 复核和两份 KV 范围训练仍待设备。[批次证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/native-batch-shapes.json) · [同次提交记录](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/prefill-readiness.json) · [资格结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/qualification/result.json)
+
+## 2026-11-20 — S11 · 原生端口与固定图取证
+
+**PD 端口** 轻量观测耗时 329.58 秒，失败在 Engine 启动前。TCPStore 随机端口 39849 同时出现在宿主 NodePort 转发表，17 次握手失败与转发规则的 17 个连接包一致，返回的首四字节对应 HTTP/2 帧头。隔离修订先核对本地连接实际回到持有的监听器，再将套接字交给 TCPStore。PD 原生 HTTP 端口在交接前沿用同一检查。无卡验证覆盖连接错投、双 Store 独立、PD 引导端口重新绑定及双进程 Gloo。隔离镜像已构建，排队复用原详采作一次轻量恢复。M4 上限 107 次，整窗 162 次，其他累计额度沿用。[轻量失败](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/costs/sources/0/observed-submission/attempts/1/capture.log) · [隔离验证](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/native-loopback-endpoint/runtime.json) · [恢复队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/port-recovery/coordinator.json) · [PyTorch 套接字移交实现](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/csrc/distributed/c10d/TCPStoreLibUvBackend.cpp#L1154-L1179)
+
+**PD 选批** 六组同时到达的请求在 Prefill 首次选择前都只有第一个握手就绪。原留出先执行一个已就绪请求，随后在同一轮看到两个排队请求握手就绪，组合成 33 和 17 token 的 Prefill。后续补采取决于轻量恢复后的实际成本需求，输入设计按握手和准入条件安排。[原生准入证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/prefill-admission.json)
+
+**TP2 固定图** 新留出详采 131.01 秒，354 个动作的结构与全时间条件核对通过。固定图已有 41,606 项配对，rank 1 的两个 eventfd 唤醒归属受限，导致基线未进入重放。两个 SDK 出队落在同一个未计价提交线程区间，外部线程对二者的入队均晚于该区间起点。已有重放只能绑定已保留的出队端点或区间起点前已入队的工作。后续按同一进度表述保留区间中的入队就绪与出队边界，先复用已留存的三份固定图证据。[结构对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-tp2-fixed-evidence/comparisons.json) · [固定图结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-tp2-fixed-evidence/fixed/tp2-fixed-evidence-holdout/result.json) · [队列证据](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/queue-root/result.json)
+
+**Azure 突发** 详采与轻量分别耗时 122.62、118.65 秒，真实长前缀释放 7,424 或 7,488 个索引。原两例 1,516,311、1,200,779 项工作均能通过正式成本查询。旧并发 4 复用其发布数据，24 条请求全部匹配，开发评分为 TTFT 4.69%、TPOT 6.47%。已冻结另一段流量的 C4/C8 独立留出，冻结期间沿用原采集镜像，冻结前结果保持原结论。M4 累计结算 90 次，含已结束的 EP4 新详采。[成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-geometry-training/tp1-kv-long-leaves-training/costs/costs.json) · [开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-long-azure-holdout/development-c4/result.json) · [新留出冻结](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-long-azure-holdout/frozen/matrix.json)
+
+## 2026-11-20 — S11 · 固定图采集入口与剩余留出
+
+**固定图** 隔离修订把未计价提交线程中的真实出队起点接成外部就绪条件，以实测串行服务抵达出队完成，等待者依赖该完成点。原两份 TP2 的 313 和 314 个队列通知全部绑定，前一份的 64,186 个端点全部对齐，单卡页边界仍有六处偏差。较新 TP2 进入基线后发现 37 处局部偏差，全部落在原生实测 CPU 离核区间，其中 35 处差值等于对应离核时长。最新采集的两个 rank 都缺内核 tracepoint，较早双卡同镜像的两份记录含 367,420 个内核事件。调度信息缺失的记录保留受限结论。[候选回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/queue-fixed-candidate/receipt.json) · [离核归并](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/queue-root/host-gap-classification.json)
+
+**观察装配** 将详细采集的 tracepoint 挂载归到创建原生容器的 Ascend 适配器，取消从协调容器路径探测及其重复挂载。显式服务观测缺 tracepoint 时直接报错。无卡隔离验证复现了协调容器自身无 tracefs 的情况，真实记录到五个唤醒，并确认缺失路径会报错。冻结两个新 prompt 的 TP2 结构与固定图留出，保留旧数据和原结果。[装配核验](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-evidence-holdout/runtime-evidence-candidate/receipt.json) · [新留出](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/coordinator.json)
+
+**成本与独立目标** 端口隔离镜像在真实 PD 上完成 203.56 秒轻量观测，正式查询补齐 1,316 项，剩余 38/8/8 项。准备六条独立训练请求，让后续双请求在首批执行期间完成握手，同时命中两端的释放长度。EP4 和前缀缓存的旧图全部覆盖，复用发布数据完成开发回归。两例独立留出已按各自部署和最新训练资产冻结，来源核验通过。[PD 恢复](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/bounded-cohorts/port-recovery/coordinator.json) · [PD 准入训练](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/admission-sequence/preflight.json) · [独立矩阵](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/ep4-prefix-independent/frozen/matrix.json)
+
+**Azure 独立评分** 协调容器首轮缺驱动挂载，零原生尝试，保留启动记录并按原冻结清单补做。并发 8 匹配 24 条请求、2,786 个 token，TTFT、TPOT MAPE 为 6.72%、2.27%。训练来源与目标观测隔离，九例等权现为 2.40%、4.68%。并发 4 在观测开始后 4.86 毫秒首次加载宽度 2、页大小 16、延伸 token 档 4,096 的原生分配特化。预热增加一批该形状的两条请求，保留完整原工作负载、评价资产和原失败结论，仅追加一次稳态观察。M4 累计结算 97 次，阶段上限 111 次，整窗上限 166 次。[启动记录](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-long-azure-holdout/mounted-recovery/first-attempt.json) · [九例汇总](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-azure-long-kv.json) · [稳态观察](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-long-azure-holdout/c4-warmup-recheck/coordinator.json)
+
+**结构复核** EP4 与前缀缓存的新目标分别完成 934 与 1,950 个动作的独立全节点对照，覆盖 276,114 与 116,368 项工作，时间条件全部消费。前缀缓存核对了从初始空池到分配及释放的完整记录。两次详采已结算，M4 累计 98 次，轻量评分继续。[独立对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-ep4-prefix-independent/comparisons.json)
+
+## 2026-11-20 — S12 · 公开示例复用预检
+
+**预检** README 与维护说明共用五次冷采集预算。用 S5 的实际程序、镜像和资产运行公开入口，增加一条晚到请求的复用示例完成四个预测，原生尝试和来源、成本后处理均为零。按需轨迹已随四个预测生成。缩短独立请求的另一种变化会把 KV 释放长度从 19 改为 18，超出现有成本范围，结果明确标记对应工作。保留两份结果作为复用和错误定位预检，正式交付仍需用最终提交完成冷运行与复用。[复用结果](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/reuse-late-request-preflight/result.json) · [错误定位](../../../data/20261119T090556.273460Z_project-delivery/work/s12-preflight/example/reuse-shorter-preflight/result.json)
+
+## 2026-11-20 — S11 · EP4 与前缀缓存独立性能评分
+
+**结果** EP4 三条请求的 TTFT、TPOT MAPE 为 4.08%、2.07%。前缀缓存的两个指标分母为 18、7，误差为 1.20%、2.56%。两次独立轻量观测均无窗口内首次特化，训练来源与评估任务分离。前缀缓存的详采中，每个 rank 均有 24 次非空命中和一次 672 token 淘汰。累计十一例的等权 TTFT、TPOT MAPE 为 2.44%、4.25%，分母分别为 117 和 102。四次拓扑留出已结算，M4 累计 100 次。[评分和来源核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-topology.json)
+
+**PD 交接** 新训练详采命中全部 54 个待测特征点，进入轻量观测，M4 已结算 101 次。正式成本查询确认覆盖三个 rank 后，自动用旧参考做无卡开发回归。回归通过且前序设备任务结束后，使用已预留的两次额度执行新留出的详采及轻量观测。[详采匹配](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/admission-sequence/qualification/result.json) · [开发回归队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/development-pd-admission/coordinator.json) · [新目标队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/pd-independent/coordinator.json)
+
+**成本覆盖** 轻量原生观测用时 157.72 秒，成本后处理 131.35 秒。正式查询覆盖旧 PD 参考图全部 53,702 项工作，M4 累计结算 102 次。旧参考的无卡回归与 TP2 新留出的原生采集并行进行。[PD 成本回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/pd-service-training/admission-sequence/coordinator.json) · [双卡取证](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/coordinator.json)
+
+**开发回归** 使用 S11 冻结程序和原有轻量发布记录，29.80 秒完成三条请求与九个 token，TTFT、TPOT MAPE 为 1.45%、4.77%，原生尝试为零。该分数保留为开发证据。新独立 PD 用例达到启动条件，继续等待前序设备队列。[开发回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/development-pd-admission/case/result.json) · [新目标队列](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/topology-holdouts/pd-independent/coordinator.json)
+
+## 2026-11-21 — S11 · 按实测占用拆分固定图主机时间
+
+**证据** 严格 TP2 留出详采用时 131.42 秒，双 rank 共记录 389,978 个内核事件，无线程记录丢失。354 个动作通过全节点对照，41,606 项工作均有实测及模型时长。冻结固定图有四处局部提前，向后传播到 104 个端点。其中三处位于提交线程已恢复运行之后，另一处是控制线程实际阻塞。[结构验收](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/structure/result.json) · [冻结固定图](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/fixed/result.json) · [逐处诊断](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/local-causal-audit.json)
+
+**改动与回归** 固定图统一从实测在核占用扣除计价服务，将其它在核活动和已核对的观察开销交给时序重算。删除为部分队列活动单独累加固定耗时的路径。两份留存 TP2 使用同一隔离实现复核，较早记录的 64,186 个端点仍全部重放对齐。新留出的三处提交线程偏差消失，剩一处 423.13 微秒阻塞及其传播的 48 个端点。现有 tracepoint 按唤醒线程采样，未记录该次唤醒者。固定图资格仍需补足独立证据。[隔离修订及回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/host-service-partition/receipt.json)
+
+**Azure 稳态** 并发 4 补足预热后取得 24 条请求的完整评分，TTFT、TPOT MAPE 为 7.57%、5.43%。与相同 24 条请求下的并发 8 比较，实测和预测均显示并发 8 的 P95 TTFT 较低、并发 4 的平均 TPOT 较低。原生吞吐相差 1.37%，每个配置各一次观测。累计十二例的等权 MAPE 为 2.87%、4.34%，两个指标分母为 141、126。[两档评分及排序](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-azure-steady-pair.json)
+
+**PD 独立验收** 三 rank 通过 6,980 个动作、53,983 项工作及 85,611 个端点的全节点结构。六次 KV、六次 metadata 交接和九个发布值均完成核对。自主预测完成三条请求、九个 token，TTFT、TPOT MAPE 为 3.33%、8.52%。十三例等权 MAPE 为 2.91%、4.67%，请求分母为 144、129。M4 已结算 106 次，余五次保留给交付复现。[PD 独立验收](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json)
+
+**合入和证据边界** 全部冻结作业终态后，合入了端口所有权修订、详采挂载处理及固定图主机时间拆分，逐文件与隔离验证源码核对。剩余阻塞属于取证范围问题。无卡探针使用内核过滤器，仅记录指定被唤醒线程，核实了跨进程和内核定时器的唤醒。源镜像内只读查询自身线程，已核实容器线程号能映射到内核线程号。下一批围绕这条实际证据链实现，未知的唤醒仍保留为证据不足。[合入核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/host-service-partition/integration.json) · [无卡内核探针](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-probe.json)
+
+**补充取证额度** 新实现先用无卡环境核对目标线程筛选及真实唤醒。为新请求保留一次独立详采，M4 与整窗上限分别更新为 112、167 次。S12 的五次复现及其它累计额度按原约定执行。[定向取证可行性](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-probe.json)
+
+## 2026-11-21 — S11 · 定向唤醒取证
+
+**实现与回归** Ascend 详采在各 CPU 上按被唤醒线程取证，记录发起线程和中断上下文。验证器把图内唤醒关联到实际工作进度，归属已确认但工作进度未绑定的跨 rank 唤醒保留为证据缺口。无卡核对覆盖 96 个线程，确认三类唤醒和轻量采集的边界。旧 TP2 固定图的 64,186 个端点与分组替换结果保持一致。[无卡核对](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/probe/result.json) · [旧数据回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/prior/result.json)
+
+**独立留出** 采集和控制镜像完成构建，SGLang 官方源码版本为 `4e155ecc`。同一 TP2 配置使用不同 token 内容，目标未参与建库或成本训练。双卡原生最末一次详采耗时 129.73 秒，两 rank 均有定向唤醒记录。执行图生产用时 52.52 秒，结构对照用时 72.28 秒并通过。M4 已用 107 次，剩余五次均预留给 S12。[冻结与运行回执](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/independent/coordinator.json) · [结构对照](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/independent/structure/result.json)
+
+**固定图结论** 41,606 项工作均有实测和独立成本，基线检查发现 28 个提前端点且只有一处局部差异。rank 0 提交线程一次 `eventfd_read` 累计读取两次写入，实际唤醒落在首个写入内，早于内核切出标记 260 纳秒。现有验证只认可一次通知，普通等待匹配从切出标记开始，因此漏掉该次 24.12 微秒的离核区间。相关原生事实已保留，可先离线核对，归因结果仍待基线通过。[固定图结果](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/independent/fixed/result.json) · [原始通知记录](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/independent/native/attempts/1/source/runtime/102.jsonl)
+
+## 2026-11-21 — S11 · 合并通知的因果核对
+
+**范围** 修复固定图证据读取，复用上一次冻结双卡的详采图、实测服务和已冻结成本，同时核对较早通过的双卡基线。
+
+**改动** 通知核对按同一描述符的读写计数和实际唤醒识别释放方。提交线程和控制线程消费同一通知证据。实测释放方在图内时按已有工作进度连接，图外释放沿用实测条件。
+
+**验证** 两份留存记录的 64,186 个端点分别全部对齐。受影响双卡的 41,606 项工作完成成本配对，启动全量替换及四组恢复。较早用例基线、工作覆盖和替换结果逐项相同。本批复核使用零次原生采集。[受影响用例回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/notification-count-regression/repair/result.json) · [较早用例回归](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/fixed-holdouts/tp2-kernel-independent/target-wake-implementation/notification-count-regression/unchanged/result.json)
+
+**结论与限制** 保留原冻结失败和修订后的开发资格。新增一次不同 token 内容的双卡详采用于独立复核修订，M4 及整窗原生尝试上限调整为 113、168 次，S12 仍保留五次。其它累计额度沿用。
+
+## 2026-11-21 — S11 · 核对逻辑等待的输出交接与固定图就绪
+
+**范围** 新双卡留出冻结后完成一轮原生详采，耗时 129.15 秒，粗图生产 54.29 秒。原始结构验证在无物理提交的等待兼任层输出交接时停止。
+
+**改动** 无物理工作等待的返回同时要求原生提交和记录信号边。允许已核对的逻辑返回交接数据，计价工作、状态访问和物理信号仍需要实测。固定图沿经过核对的逻辑节点查找实际前驱，计算物理任务的发车条件，图保留原有的等待和依赖。
+
+**验证** 复用冻结采集、粗图、模板、成本和核心二进制。结构全部对应，固定图的 64,178 个有时间依据端点全部落在实测范围，八个逻辑端点按因果推进。41,606 项工作全部配对，执行全量成本替换及四组恢复。移除一个实测信号边会被拒绝，留存 TP2×PP3 的 86 个逻辑端点通过来源核验。[固定图资格及归因](../../../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/fixed-reference.json)
+
+**结论与限制** 原冻结失败留档，修订后读取同次真实案例。其原生观测与建库、拟合隔离，复用的是验证证据。归因以固定图为边界。当前 M4 累计 108 次，其余五次留给 S12。
+
+## 2026-11-21 — S11 · 阶段交付核对
+
+**范围** 自结构交付基线 `508ed9e` 审查采样资格与来源选择、采集到图的原生端点、C++ 时间消费与 Python 独立验证，以及用户入口和镜像装配。
+
+**改动** 同一调用与工作身份在详细和低开销采样中复用，共同核心不持有框架及内核记录。输入时间、观察条件和成本模型的职责分开。公开构建显式要求已初始化且干净的 SGLang 子模块，为下一阶段保留可执行示例。
+
+**验证** C++23 及最新采集、控制镜像此前已集中构建。审查本阶段跨层消费者、Python 源文件语法、已修改代码的英文内容及文档证据路径。保留冻结记录、校时、预算和回归所需资产。确认 `data`、构建、旧项目及研究引用变更在交付范围外。
+
+**结论与限制** 结构、固定图和自主评分三条路径均有当前资格与失败记录。流水线的 CPU 搬运维持两端界限，个别案例 MAPE 超过 6%。S12 以本次提交在干净检出中验证初始化、冷资产及换 workload 的零采样复用。

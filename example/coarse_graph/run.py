@@ -22,6 +22,7 @@ class TaskCommands:
             mounts.append((destination.resolve(strict=True), destination, True))
             for name in ("/usr/local/Ascend/driver", "/etc/ascend_install.info", "/etc/hccn.conf"):
                 mounts.append((Path(name).resolve(strict=True), Path(name), True))
+
         mounts.extend((path, path, readonly) for path, readonly in files if not path.is_relative_to(self.repository))
         mounts.extend([
             (Path("/var/run/docker.sock"), Path("/var/run/docker.sock"), False),
