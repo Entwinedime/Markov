@@ -161,10 +161,10 @@ nlohmann::json ResourceService::call(const nlohmann::json & message, const std::
         for (const auto page : pages) {
             if (page >= pool_.capacity().pages) throw std::invalid_argument("returned page lies outside its pool");
         }
-        pool_.return_pages(pages);
+        const auto destination_empty = pool_.return_pages(pages);
         changes_.returned_pages.insert(changes_.returned_pages.end(), pages.begin(), pages.end());
         changes_.capacity_increased |= !pages.empty();
-        return nullptr;
+        return destination_empty;
     }
     throw std::invalid_argument("unknown resource operation: " + kind);
 }

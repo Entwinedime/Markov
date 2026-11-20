@@ -313,17 +313,9 @@ nlohmann::json NativeTemplates::condition(std::string_view action, nlohmann::jso
             facts.erase("exit");
         }
 
-        if (owner == "allocation") {
-
-            // Between prefix expressions only the Python comprehension advances; backend dispatch follows the loop.
-            if (facts.at("entry") == "allocation_prefix" && facts.at("exit") == "allocation_prefix") facts.erase("allocation");
-            else {
-
-                // Both native Decode paths have the same coarse tensor ABI; members retain the actual page demand.
-                auto & allocation = facts.at("allocation");
-                if (allocation == "decode_tail" || allocation == "decode_pages") allocation = "decode_paged";
-            }
-        }
+        // Between prefix expressions only the Python comprehension advances; backend dispatch follows the loop.
+        if (owner == "allocation" && facts.at("entry") == "allocation_prefix" && facts.at("exit") == "allocation_prefix")
+            facts.erase("allocation");
 
         // These resource ABIs consume request/pool inputs, not the caller batch's forward mode.
         if (std::ranges::find(resource_calls, owner) != resource_calls.end()) facts.erase("phase");

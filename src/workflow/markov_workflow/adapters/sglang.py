@@ -92,12 +92,9 @@ class SGLangTask:
             })
         return participants
 
-    def document(self, source: dict, *, modeled: bool = False) -> dict:
-        fields = {"model", "instances", "workload"}
-        if not modeled:
-            fields.add("given_work_ns")
-        if source.keys() != fields:
-            raise ValueError(f"prediction input fields must match selected timing mode: {', '.join(sorted(fields))}")
+    def document(self, source: dict) -> dict:
+        if source.keys() != {"model", "instances", "workload"}:
+            raise ValueError("prediction requires model, instances and workload")
         serving = ServingInput(source)
         requested = SourceDomain.requested(serving)
         if SourceDomain.observed(self.production) != requested:
@@ -113,13 +110,7 @@ class SGLangTask:
                 "control": configuration.control(), "expert_routes": configuration.routes(serving.workload),
                 "participants": self.participants(selected, description),
             })
-        document = {
+        return {
             "instances": instances, "workload": serving.workload,
             "template_sources": list(range(len(self.libraries))),
         }
-        if not modeled:
-            duration = source["given_work_ns"]
-            if type(duration) is not int or not 0 <= duration < 1 << 63:
-                raise ValueError("given_work_ns must be nonnegative signed 64-bit nanoseconds")
-            document["given_work_ns"] = duration
-        return document

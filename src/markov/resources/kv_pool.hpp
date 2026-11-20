@@ -77,7 +77,7 @@ public:
     void declare_resources(std::size_t slots, PageReuse reuse);
     void bind_prefix(std::size_t request, std::size_t node, std::int64_t tokens);
     void release(std::size_t request);
-    void return_pages(std::span<const std::size_t> pages);
+    bool return_pages(std::span<const std::size_t> pages);
 
 private:
     KvAllocation plan(std::span<const KvDemand> demands) const;

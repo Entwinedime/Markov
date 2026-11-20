@@ -137,13 +137,16 @@ void KvPool::release(std::size_t request) {
     state = {};
 }
 
-void KvPool::return_pages(std::span<const std::size_t> pages) {
+bool KvPool::return_pages(std::span<const std::size_t> pages) {
 
     // Control returns logical ownership here; execution dependencies separately protect outstanding accesses.
     const auto reuse = reuse_.value();
-    const auto position = reuse == PageReuse::DeferredSorted ? free_pages_.end() : free_pages_.begin();
+    const bool deferred = reuse == PageReuse::DeferredSorted;
+    const bool destination_empty = deferred ? static_cast<std::size_t>(ordered_pages_) == free_pages_.size() : free_pages_.empty();
+    const auto position = deferred ? free_pages_.end() : free_pages_.begin();
     free_pages_.insert(position, pages.begin(), pages.end());
-    if (reuse == PageReuse::Prepend) ordered_pages_ += static_cast<std::int64_t>(pages.size());
+    if (!deferred) ordered_pages_ += static_cast<std::int64_t>(pages.size());
+    return destination_empty;
 }
 
 } // namespace markov

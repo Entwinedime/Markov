@@ -123,6 +123,35 @@ class ResourceCalls:
         with self.calls.call("eviction", original, parameters={"eviction_tokens": num_tokens}, host_only=True):
             return original(tree_cache, num_tokens)
 
+    def release(self, owner, original, signature, native, *args, **kwargs):
+        parent = self.calls.current.get()
+        if parent is None:
+            original(*args, **kwargs)
+            return
+
+        arguments = signature.bind(*args, **kwargs)
+        indices = arguments.arguments[next(iter(signature.parameters))]
+        tokens = int(indices.numel())
+        grouped = int(not owner.is_not_in_free_group)
+        width = indices.element_size() if tokens and not grouped else 0
+        parameters = {"page_size": owner.page_size, "release_tokens": tokens,
+                      "release_grouped": grouped, "release_index_bytes": width}
+        guards = [["eq", "release_tokens", 0] if tokens == 0 else ["lt", 0, "release_tokens"],
+                  ["eq", "release_grouped", grouped]]
+        if width:
+            guards.append(["eq", "release_index_bytes", width])
+
+        # The native splice has a different body when there are no existing entries to join.
+        condition = {}
+        if width and native:
+            destination = owner.release_pages if owner.need_sort else owner.free_pages
+            condition["release_target_empty"] = destination.numel() == 0
+        with self.calls.call("pages.free", original, parameters=parameters, work=parent.work, guards=tuple(guards),
+                             condition=condition) as frame:
+            destination_empty = original(*args, **kwargs)
+            if width and not native:
+                frame.condition["release_target_empty"] = destination_empty
+
     def invoke(self, operation, owner, original, signature, *args, **kwargs):
         parent = self.calls.current.get()
         if parent is None:
@@ -138,20 +167,7 @@ class ResourceCalls:
             work["context"] = {"request": self.calls.progress((request,))[0]}
             if cache_enabled:
                 parameters.update(CacheInputs.native(operation, owner, request))
-        if operation == "pages.free":
-            arguments = signature.bind(*args, **kwargs)
-            indices = arguments.arguments[next(iter(signature.parameters))]
-            tokens = int(indices.numel())
-            grouped = int(not owner.is_not_in_free_group)
-            width = indices.element_size() if tokens and not grouped else 0
-            parameters.update(release_tokens=tokens, release_grouped=grouped, release_index_bytes=width)
-
-            # The immediate path copies indices of their original dtype before combining pages.
-            guards = [["eq", "release_tokens", 0] if tokens == 0 else ["lt", 0, "release_tokens"],
-                      ["eq", "release_grouped", grouped]]
-            if width:
-                guards.append(["eq", "release_index_bytes", width])
-        elif operation == "pages.flush":
+        if operation == "pages.flush":
             parameters.update(
                 release_calls=len(owner.free_group),
                 release_tokens=sum(int(indices.numel()) for indices in owner.free_group),
@@ -213,11 +229,11 @@ class ResourceCalls:
                 boundary.guards += (["lt", 0, "split_prefix_tokens"] if prefix else ["eq", "split_prefix_tokens", 0],)
         return result
 
-    def bind(self, cache, allocator, slots, *, native_tree=True) -> None:
+    def bind(self, cache, allocator, slots, *, native=True) -> None:
         operations = {"match_prefix": "cache_match"}
         if not cache.disable:
             operations["insert"] = "cache_insert"
-            if native_tree:
+            if native:
                 split = cache._split_node
                 cache._split_node = update_wrapper(partial(self.split_node, split), split)
             else:
@@ -243,9 +259,11 @@ class ResourceCalls:
             self.bind_internal(owner, methods)
 
         # Select the actual objects through their shared ABI, rather than enumerating concrete cache classes.
+        free = allocator.free
+        allocator.free = update_wrapper(partial(self.release, allocator, free, inspect.signature(free), native), free)
         for owner, methods in (
             (cache, {"cache_finished_req": "cache.finished", "cache_unfinished_req": "cache.unfinished"}),
-            (allocator, {"free": "pages.free", "free_group_end": "pages.flush", "merge_and_sort_free": "pages.sort"}),
+            (allocator, {"free_group_end": "pages.flush", "merge_and_sort_free": "pages.sort"}),
             (slots, {"free": "slots.free"}),
         ):
             for name, operation in methods.items():

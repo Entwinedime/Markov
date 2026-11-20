@@ -34,7 +34,7 @@ class SourceProductions:
             return {"status": "source_missing", "message": "target implementation has no planned primary source"}
         return {"job": primary, **self.unavailable[str(primary)]}
 
-    def prepare(self, source, *, modeled=False):
+    def prepare(self, source):
         primary = self.select(source)
         if primary is None:
             raise ValueError("target implementation has no published primary source")
@@ -54,5 +54,5 @@ class SourceProductions:
                 templates.append(path)
                 libraries.append(json.loads(path.read_text()))
             productions.append(libraries)
-        document = SGLangTask(productions[0], productions[1:]).document(source, modeled=modeled)
+        document = SGLangTask(productions[0], productions[1:]).document(source)
         return templates, productions[0], document

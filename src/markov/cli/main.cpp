@@ -361,6 +361,7 @@ int main(int argc, char ** argv) {
             // Timing assets are immutable and selected at task startup; the core owns their decoding.
             const auto timing = options.contains("--execution-inputs") ? read_json(options.at("--execution-inputs")) : nlohmann::json();
             const auto costs = options.contains("--costs") ? read_json(options.at("--costs")) : nlohmann::json();
+            if (options.contains("--execution-inputs") && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
             if (options.contains("--costs") && !costs.is_object()) throw std::invalid_argument("cost asset requires an object");
             std::map<std::size_t, markov::TemplateLibrary> libraries;
             for (const auto & source : task.at("template_sources")) {

@@ -1,5 +1,6 @@
 """Lower native resource and shape declarations for projection and source checking."""
 
+from markov_adapters.sglang.batches import BatchTensors
 from markov_adapters.sglang.resources import ResourceInputs
 
 
@@ -7,6 +8,7 @@ class SGLangSourceScopes:
     relay_ports = {"run_batch": "output", "output_prepare": "input"}
     qwen_layer = "sglang.srt.models.qwen3.Qwen3DecoderLayer"
     rotary_layers = {qwen_layer, "sglang.srt.models.llama.LlamaDecoderLayer"}
+    model_calls = {"launch", "run_batch", "model"}
 
     def __init__(self, environment):
         self.environment = environment
@@ -39,8 +41,19 @@ class SGLangSourceScopes:
         return None
 
     def lower(self, scopes):
+        backend = self.environment["implementation"]["attention_backend"]
         result = []
         for scope in ResourceInputs.scopes(scopes, self.environment):
+            if scope["role"] in self.model_calls:
+                layout = BatchTensors.attention_layout(backend, scope["parameters"], scope["work"]["members"])
+                if layout:
+                    scope = {**scope, "parameters": scope["parameters"] | layout}
+                    if scopes[scope["parent"]]["role"] in self.model_calls:
+                        scope["arguments"] = scope["arguments"] | {name: name for name in layout}
+                    if scope["role"] == "model":
+                        guards = [["eq", name, value] for name, value in layout.items()]
+                        scope["guards"] = [*scope.get("guards", ()), *guards]
+
             operand = self.operands(scope)
             if operand is not None:
                 tensor, = (port["tensor"] for port in scope["ports"] if (port["name"], port["direction"]) == operand)

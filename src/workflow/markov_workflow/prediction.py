@@ -33,9 +33,19 @@ class PredictionProcess:
         self.limit.check()
         deadline = time.monotonic() + args.timeout
         source = json.loads(args.input.read_text()) if source is None else source
-        productions = SourceProductions(args.production) if productions is None else productions
-        templates, primary, document = productions.prepare(source, modeled=args.costs is not None)
         timing_asset = args.costs or args.execution_inputs
+        given_duration = None
+        if timing_asset is None:
+            source = dict(source)
+            given_duration = source.pop("given_work_ns", None)
+            if type(given_duration) is not int or not 0 <= given_duration < 1 << 63:
+                raise ValueError("select a timing asset or provide given_work_ns as nonnegative signed 64-bit nanoseconds")
+
+        productions = SourceProductions(args.production) if productions is None else productions
+        templates, primary, document = productions.prepare(source)
+        if given_duration is not None:
+            document["given_work_ns"] = given_duration
+
         timing_mount, timing_option = [], []
         if timing_asset is not None:
             option = "--costs" if args.costs is not None else "--execution-inputs"

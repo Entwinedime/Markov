@@ -50,14 +50,15 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
                      ResourceObserver * resource_observer, ControlObserver * control_observer) {
     const auto & workload = task.at("workload");
     auto requests = Request::read(workload.at("requests"));
+    const auto given = task.contains("given_work_ns");
+    if (given + !timing.is_null() + !costs.is_null() != 1)
+        throw std::invalid_argument("expected exactly one serving timing source");
+
     ServiceDuration duration;
-    if (costs.is_null()) {
+    if (given) {
         duration = read_parameters({ { "given_work_ns", task.at("given_work_ns") } }).at("given_work_ns");
         if (*duration < 0) throw std::invalid_argument("given work duration must be nonnegative nanoseconds");
-    } else if (!timing.is_null() || task.contains("given_work_ns")) {
-        throw std::invalid_argument("cost prediction requires an independent timing asset");
     }
-    if (!timing.is_null() && !timing.is_object()) throw std::invalid_argument("execution inputs require an object");
     std::optional<ExecutionInputs> inputs;
     if (!timing.is_null()) inputs.emplace(timing, control_observer);
     ServiceTimes service_times(duration, inputs ? &*inputs : nullptr, costs);
@@ -175,6 +176,7 @@ nlohmann::json serve(const std::map<std::size_t, TemplateLibrary> & libraries, c
             { "runtime", std::move(runtime) },
             { "model_config", implementation.at("model") },
             { "allocator", implementation.at("allocator") },
+            { "attention_backend", implementation.at("attention_backend") },
             { "expert_layout", implementation.value("expert_layout", nlohmann::json()) },
             { "dtype", implementation.at("dtype") },
             { "tp", tp },

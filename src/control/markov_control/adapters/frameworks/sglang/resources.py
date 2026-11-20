@@ -219,4 +219,4 @@ class PageAllocator:
         if not self.is_not_in_free_group:
             self.free_group.append(indices)
             return
-        self.peer.call("release_pages", pages=torch.unique(indices // self.page_size - 1).tolist())
+        return self.peer.call("release_pages", pages=torch.unique(indices // self.page_size - 1).tolist())

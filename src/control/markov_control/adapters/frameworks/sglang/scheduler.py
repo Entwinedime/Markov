@@ -35,6 +35,7 @@ class NativeScheduler(Scheduler):
         self.peer = peer
         self.clock_epoch_ns = settings["clock_epoch_ns"]
         self.instance_id = source["id"]
+        self.attention_backend = source["attention_backend"]
         worker = source["workers"][rank]
         self.graph_rank = worker["rank"]
         self.group = worker["group"]
@@ -176,6 +177,7 @@ class NativeScheduler(Scheduler):
     def model_work(self, batch):
         parameters, work = self.description(batch)
         parameters.update(BatchTensors.model_parameters(batch, parameters["input_tokens"]))
+        parameters.update(BatchTensors.attention_layout(self.attention_backend, parameters, work["members"]))
         if self.experts is not None:
             parameters.update(self.experts.parameters(work["members"], parameters["model_tokens"]))
             if self.experts.size > 1:

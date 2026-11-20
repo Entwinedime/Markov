@@ -74,3 +74,14 @@ class BatchTensors:
             if batch.forward_mode.is_decode():
                 model_members = model_tokens
         return {"model_tokens": model_tokens, "model_members": model_members}
+
+    @staticmethod
+    def attention_layout(backend, parameters, members):
+        if backend != "ascend":
+            return {}
+
+        # Ascend indexes a dense [batch, longest] table, then takes every page_size-th column.
+        longest = max((member["context_tokens"] + member["new_tokens"] for member in members), default=0)
+        page = parameters["page_size"]
+        strided = page > 1 and longest > 1 and (parameters["model_members"] > 1 or longest > page)
+        return {"block_table_strided": int(strided)}
