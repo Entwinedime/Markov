@@ -1,6 +1,6 @@
 # 项目主工作流
 
-更新于 2026-11-20。本页保存项目的精简工作记录、已结束窗口的总结和整体状态。记录以实际完成及证据范围为准。
+更新于 2026-11-21。本页保存项目的精简工作记录、已结束窗口的总结和整体状态。记录以实际完成及证据范围为准。
 
 本页的 data 入口指向本机保留的实验事实，不随 Git 提交；没有对应本地数据时，文字结论仅作为已声明范围内的历史记录。
 
@@ -8,15 +8,11 @@
 
 项目采用统一 workload、原生调度及共同资源状态。实测结构对照和自主性能预测共用模板展开、依赖、虚拟时钟和完成反馈。结构对照接入目标实测端点，自主预测按已绑定工作查询独立成本。
 
-交付窗口已完成单卡三条验证路径及代表性单机机制的开发闭环。冻结结构矩阵首轮已经收齐，13 例中五例通过全节点对照，其余有明确的首处阻断，现进入独立性能验收。[冻结结构结果](../data/20261119T090556.273460Z_project-delivery/results/m4-independent/comparisons.json)
+单机 SGLang/Ascend 已完成正式交付。输入为一个模型、候选配置集和请求 workload 集，程序在预算内准备和复用模板及成本，按 workload 输出 TTFT、TPOT、吞吐及配置排序。干净检出后的冷运行和换请求复用各完成四个目标。[冷启动](../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration/summary.md) · [复用](../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration-reuse/summary.md)
 
 执行结构调查覆盖七款模型及具名并行和资源场景。48 项调查中，32 项取得原冻结独立对应，13 项取得完整开发复核，3 项保留明确的原生算子限制。新增配置的结构资格由实际来源、已观察分支和端口合同决定。
 
-独立成本已接入 SGLang/Ascend 的 Qwen3-8B BF16 单实例 TP1 serving，实测使用 dummy 权重、16 token 页与两档并发。原四组真实流量组合取得全节点结构证据，新四组完成了自主预测与独立轻量实测，TTFT、TPOT 的等权 MAPE 均低于 6%。 [独立性能报告](../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-independent-performance/independent-results.json)
-
-多角色计时已在同模型的 TP2 和非对称 PD 开发例闭环。CPU 与设备 collective 在对端就绪后计费，PD 预约按实际到达推进，两个案例均可使用独立成本预测。 [TP2 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s2-tp2-performance.json) · [PD 开发对照](../data/20261119T090556.273460Z_project-delivery/results/s3-pd-performance.json)
-
-配置集正式入口统一准备模板和成本，在预算内逐目标自主预测并汇总排序。Qwen3-8B 的两个 TP1 配置及两组请求完成冷资产运行，换请求后用同一资产完成零采集复用。[冷启动](../data/20261119T122453.716218Z_exploration/summary.md) · [复用](../data/20261119T124125.641276Z_exploration/summary.md)
+结构、固定图和自主预测三条路径各有验收结果。21 个案例通过全节点结构对照，13 个独立自主评分案例的等权 TTFT MAPE 为 2.91%、TPOT MAPE 为 4.67%。流水线主机搬运保留端点界限，个别案例的指标高于 6%。[固定图证据](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/fixed-reference.json) · [自主评分](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json)
 
 历史实现主要在同一来源域内复用请求长度、成员、到达、并发及 KV 容量变化；模型、并行拓扑、dtype、backend 和 page_size 变化分别取得来源。新的支持边界须重新说明并验证，不将未实现变换写成理论上不可能。
 
@@ -279,3 +275,13 @@ PD512 复核沿用原五份模板库和 512 请求，使用 Prefill TP1、Decode
 固定修复后的程序、镜像、模板与成本，在两段全新留出上独立复核。每组 48 条请求和一次合格轻量实测，正式窗口内特化加载与提交反序均为零，最大提交偏差 1.36 毫秒。等权 TTFT MAPE **3.67%**、TPOT MAPE **4.92%**，均低于 6%。两类流量均复现原生配置排序，并发 8 的 P95 TTFT 较短、吞吐较高，并发 4 的平均 TPOT 较短。预测墙钟每组 131.19–194.29 秒，成本查询占 0.71%–0.88%。 [新留出登记](../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-independent-performance/selection.json) · [独立复核](../data/20261118T172915.294780940Z_real-workload-performance/targets/s7-independent-performance/independent-results.json)
 
 代码交付按采集、任务与离线成本处理、C++ 共同执行及示例审阅，较窗口起点的 `src` 净增 2,167 行，示例净增 361 行。性能资格限于上述实现域及各次实际观测的负载。跨模型、真实权重数据相关行为、多 rank 通信和相对批级模型的收益待另行验证。
+
+## 2026-11-19 至 11-21 — 单机多配置性能探索交付
+
+窗口完成，交付 D1–D6。具名范围包含 Qwen3-8B TP1、TP2、TP8 和 Prefill TP1/Decode TP2，Mistral 7B PP3 和 TP2×PP3，以及 Qwen3-30B-A3B TP4×EP4。验证了分块预填充、混合组批、一级前缀缓存命中及回收。采样和来源规划在正式入口内管理，Python 核验原始证据和拟合，C++23 统一展开、执行和求值。真实权重的数据相关行为、第二框架和原生多机部署留待单独验证。[拓扑与缓存证据](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-topology.json) · [非对称 PD](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json) · [分块混合](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-chunk-refresh.json)
+
+21 个案例取得全节点结构对照，原冻结矩阵的失败和范围限制保留。固定图归因使用与建库和拟合隔离的 TP2 留出，64,178 个有时间依据的端点重放对齐，八个逻辑端点沿真实前驱推进，41,606 项工作完成成本配对。该例全量成本替换使 P95 TTFT 提前 147.60 毫秒，恢复实测主机服务后只提前 5.24 毫秒。固定图复用封存原始观察修正验证器，另用 TP2×PP3 核验逻辑等待。PP3 和 TP2×PP3 的 CPU 搬运保留端点界限。[原冻结结果](../data/20261119T090556.273460Z_project-delivery/results/m4-independent/comparisons.json) · [固定图与归因](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/fixed-reference.json) · [流水线结构](../data/20261119T090556.273460Z_project-delivery/results/m4-pipeline-refresh/comparisons.json)
+
+13 个独立案例的自主预测按原始请求结果复算。等权 TTFT MAPE 为 **2.91%**，请求分母 144，等权 TPOT MAPE 为 **4.67%**，请求分母 129。精度结论限于实际窗口和具名输入条件。单卡 100、200 请求的执行生成分别用时 289.01、637.67 秒，双卡缓存压力 40 请求用时 43.95 秒。[逐案例及汇总](../data/20261119T090556.273460Z_project-delivery/work/s11-repair/release-evidence/independent-pd.json) · [规模测速](../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/summary.json)
+
+从远端提交 `605eb41` 干净检出并初始化官方 SGLang `4e155ecc`。构建所得 C++23 二进制与冻结程序相同，镜像和完整校验值见复现回执。冷启动四个组合耗时 665.72 秒，含四次原生采集共 494.16 秒和后处理 66.21 秒。更换请求并新增一条较晚请求后，四个组合全部复用原资产，耗时 106.87 秒，原生采集及后处理均为零。精简结果及四份按需轨迹已核对。M4 共结算 112 次原生尝试。交付记录为 `2cb0d3f`，数据保留在本地任务目录。[复现回执](../data/20261119T090556.273460Z_project-delivery/work/s12-release/verified.json) · [冷启动](../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration/summary.md) · [换请求复用](../data/20261119T090556.273460Z_project-delivery/work/s12-release/checkout/data/20261120T172737Z_exploration-reuse/summary.md)
