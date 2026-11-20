@@ -112,10 +112,9 @@ class MatrixInputs:
                 common = {"model": model["model"], "instances": configuration["instances"], "workload": workload}
                 native = {**common, "observe_all_workers": True}
                 CaptureInput(native)
-                prediction = {**common, "given_work_ns": 1}
                 if domain["id"] in sources:
-                    sources[domain["id"]].prepare(prediction)
-                inputs.append((case, native, prediction))
+                    sources[domain["id"]].prepare(common)
+                inputs.append((case, native, common))
 
             # A conflicting fixed source must not leave a partially published request draw.
             for case, native, prediction in inputs:

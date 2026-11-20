@@ -154,12 +154,13 @@ class LatencyComparison:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, nargs="+", required=True)
-    parser.add_argument("--prediction", type=Path, nargs="+", help="independent result JSONs in the capture order")
+    parser.add_argument("--prediction", type=Path, nargs="+", help="existing result JSONs for a publication-only comparison")
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     rows = [NativeLatencyMetrics(path).report() for path in arguments.capture]
     if arguments.prediction is not None:
         for row, prediction in zip(rows, arguments.prediction, strict=True):
+            row["comparison_basis"] = "token_publications_only"
             row["prediction"] = LatencyComparison(row, prediction).report()
     write_json(arguments.output, rows, indent=2, replace=False)
 

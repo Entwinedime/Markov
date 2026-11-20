@@ -3,10 +3,13 @@
 import argparse
 import json
 from pathlib import Path
-from subprocess import TimeoutExpired
+from subprocess import CalledProcessError, TimeoutExpired
+from tempfile import TemporaryDirectory
+from time import monotonic_ns
 from types import SimpleNamespace
 
 from markov_adapters.artifacts import write_json
+from markov_workflow.containers import ModelingProcess
 from markov_workflow.prediction import PredictionProcess
 from markov_workflow.source_productions import SourceProductions
 
@@ -28,22 +31,36 @@ class StructureVerification:
         args = self.arguments
         self.output.mkdir(parents=True)
         capture = args.capture.resolve(strict=True)
+        wall_ns = {}
         stages = {
             "capture": str(capture), "reference": str(args.reference.resolve(strict=True)),
-            "production": str(args.production.resolve()),
+            "production": str(args.production.resolve()), "wall_ns": wall_ns,
         }
+        started = monotonic_ns()
         checker = ProductionEvidence(args.reference, capture, self.output / "source-evidence", args.details)
         reference, evidence = checker.inspect()
         stages["reference_status"] = evidence["native_case"]["status"]
-        if checker.publish(evidence):
+        status = checker.publish(evidence)
+        wall_ns["reference"] = monotonic_ns() - started
+        if status:
             return self.finish("reference_unqualified", stages)
 
         source = json.loads(args.input.read_text())
         if difference := reference.input_difference(source):
             return self.finish("input_mismatch", stages | {"input_difference": difference})
 
+        started = monotonic_ns()
         timing = self.output / "timing"
-        extracted = NativeInputs(capture, reference.graphs, timing, args.layouts).run(reference)
+        with TemporaryDirectory(prefix=".action-layouts-", dir=self.output) as temporary:
+            layouts = Path(temporary)
+            modeling = ModelingProcess(args.binary, args.modeling_image, args.timeout)
+            try:
+                for rank in reference.sources:
+                    modeling.run_model("action-layouts", layouts / f"{rank}-layouts.json", reference.graphs / f"{rank}-graph.json")
+            except (CalledProcessError, TimeoutError, TimeoutExpired, RuntimeError) as error:
+                return self.finish("action_layout_unavailable", stages | {"layout_error": str(error)})
+            extracted = NativeInputs(capture, reference.graphs, timing, layouts).run(reference)
+        wall_ns["timing"] = monotonic_ns() - started
         stages["timing_status"] = extracted["status"]
         if extracted["status"] != "extracted":
             return self.finish("timing_unavailable", stages)
@@ -54,16 +71,20 @@ class StructureVerification:
         command = SimpleNamespace(input=args.input, production=args.production, output=prediction, timeout=args.timeout,
                                   binary=args.binary, modeling_image=args.modeling_image, control_image=args.control_image,
                                   execution_inputs=timing / "execution-inputs.json", costs=None, execution_trace=True)
+        started = monotonic_ns()
         try:
             PredictionProcess(command).run(source=source, productions=sources)
         except (RuntimeError, TimeoutError, TimeoutExpired) as error:
             stages["prediction_error"] = str(error)
+        wall_ns["prediction"] = monotonic_ns() - started
         trace = prediction / ("execution.partial.jsonl" if "prediction_error" in stages else "execution.jsonl")
         if not trace.is_file():
             return self.finish("prediction_no_trace", stages)
 
         # Compare against the original reference, including actual condition consumption and independent causal evidence.
+        started = monotonic_ns()
         report = ActionComparison(reference, trace, self.output / "comparison", args.details).run()
+        wall_ns["comparison"] = monotonic_ns() - started
         stages["comparison_status"] = report["status"]
         stages["coverage"] = report["coverage"]
         stages["actions_compared"] = report["actions_compared"]
@@ -80,8 +101,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("capture", "reference", "production", "input", "binary", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
-    parser.add_argument("--layouts", type=Path, help="observed action layouts for full-node timing")
-    parser.add_argument("--timeout", type=float, required=True, help="prediction allowance in seconds")
+    parser.add_argument("--timeout", type=float, required=True, help="allowance in seconds for each of layout preparation and prediction")
     parser.add_argument("--control-image", default="markov-next-control:ubuntu22.04")
     parser.add_argument("--modeling-image", default="markov-next-modeling:ubuntu24.04")
     parser.add_argument("--details", action="store_true", help="retain all evidence findings")

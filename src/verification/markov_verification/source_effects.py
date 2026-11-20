@@ -288,8 +288,9 @@ class NativeEffectEvidence:
             self.require(begin["thread"] == thread, f"scope {index} changes its native caller thread")
             ports = {port["name"]: port for port in scope["ports"]}
             kind = "wait" if "service" in raw else "boundary" if raw.get("envelope", False) else "host"
-            if "communication" in raw and "device_entry" not in raw:
-                kind = "communication"
+            exchange = raw.get("communication")
+            if exchange is not None and "device_entry" not in raw:
+                kind = "collective" if exchange["required"] == exchange["members"] else "communication"
             host = resources["thread", f"thread/{thread}"]
             if origin in self.queries:
                 self.require(spans[index, host, begin["begin_counter"], end["end_counter"], "boundary"] == 1,
