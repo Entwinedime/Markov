@@ -48,7 +48,7 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja 和 nlohman
 ```bash
 python3 example/coarse_graph/run.py \
   --deployment /path/to/deployment.json \
-  --native-budget-seconds 2520 --postprocessing-budget-seconds 1200 \
+  --timeout 420 --native-budget-seconds 2520 --postprocessing-budget-seconds 1200 \
   --attempt-limit 6 --storage-bytes 25769803776
 ```
 
@@ -179,7 +179,7 @@ bindings 在 run_batch 执行前及 PD prebuilt 准备结束时读取原生 req_
 
 单机采集的投递起点、投递偏移、入口接收、worker 接收轮次和资源操作统一使用 `CLOCK_MONOTONIC_RAW`。request-delivery 显式标明 `monotonic_raw_ns`。来源解释在入口按各自 SDK 的 collectionTimeBegin/clockMonotonicRaw 锚点还原 RAW 时间：框架/主机 API 使用 host/start_info，设备任务使用其 device 的 start_info；不能将两种导出偏移混用。显式原生 API 和传输服务已经使用 RAW，直接交接，不先加偏移再减回。stream 拓扑仍用原生顺序坐标，时间证据独立保留。
 
-单实例或一对 PD 实例的 dense TP、PP1 单组 workload 可用 `markov_workflow capture --latency-only` 采集性能真值。它复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库，关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。PD 以 Prefill 的实际提交为延迟起点，以 Decode 的实际发布为输出。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
+普通 serving 或一对 PD 实例可用 `markov_workflow capture --latency-only` 观测一个提交组的请求性能。已运行的单机拓扑包含 TP、PP、EP、TP×PP 和非对称 PD。轻量观测复用相同的 Engine、预热、请求内容和投递方式，启动时卸载原生观察库并关闭 profiler。实际发送端记录请求拉取、首 token 和终止 token 发送完成的 RAW 时间及 token 数，各 rank 记录本地编译特化。PD 以 Prefill 的实际提交为延迟起点，以 Decode 的实际发布为输出。评价时核对 `specialization_loads` 及 request-delivery 中实际提交的偏差与顺序。图与模板生产要求原生图观测。
 
 在 workflow 的 `PYTHONPATH` 中加入 `src/verification`，用 `python3 -m markov_verification.latency_metrics` 计算逐请求 TTFT、TPOT 和吞吐。原生 TTFT 从实际提交给 Engine 起算，仿真从 workload 声明的提交时刻起算，两边均在调度器发布首 token 时结束。调度器取入时刻单独保留，可查提交后的等待。
 
