@@ -1,6 +1,6 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-20。**S0–S7 已完成阶段验收。代表单机拓扑和四项调度、缓存机制均完成开发闭环，下一阶段是 S9 功能收口与冻结。**
+更新日期为 2026-11-20。**S0–S7 已验收并推送。S9 已冻结验收资产，S10 从冻结提交开始核对独立执行结构。**
 
 ## 进入窗口时已有证据
 
@@ -16,7 +16,7 @@
 | M1 多角色计时 | S1–S3 | 已验收，TP2 与非对称 PD 均完成开发闭环 |
 | M2 配置集探索 | S4–S5 | 已验收，冷资产创建与换请求后复用均完成 |
 | M3 正式支持范围 | S6–S7 | 开发验收完成。代表单机并行、分块、混合组批、前缀命中和淘汰均能用独立成本完成具名请求 |
-| M4 独立验收与交付 | S9–S12 | 待启动，以 S7 交付为 S9 的冻结准备基线 |
+| M4 独立验收与交付 | S9–S12 | S9 已冻结九组训练来源与成本和 13 个留出用例。S10 验收结构，S11 验收性能，S12 复现及交付 |
 
 ## 基线、当前能力与下一步
 
@@ -48,3 +48,9 @@ S5 正式入口用两个单卡池容量与两组短请求完成四项自主预�
 - Qwen3-8B TP2 的分块混合用例完成 13 请求、45 token 和 212,994 项工作。原生和预测均有 12 条请求分多批 Prefill，16 个混合批的成员数、Query token 数和上下文 token 数按次对应。[批次对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-mechanisms.json) · [自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-prediction/result.json)
 - 同模型 TP2 的缓存压力用例完成 18 请求、27 token 和 104,512 项工作。原生和预测均有 20 次非空命中及一次淘汰。预测在 rank 0 也展开了一次查找拆分和一次插入拆分。更大的 40 请求历史用例用于确认原生压力范围，包含当前 8 字节索引释放样本之外的 288 token 释放。[缓存开发对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-pressure-score.json) · [40 请求原生记录](../../../data/20261116T035124.971560Z_execution-structure-independent/targets/independent-b4/b4-s02/native/attempts/1/source/resources/rank-0.json)
 - 两案例的独立成本预测已完成。采用详细采集的原生发布边界评分，分块混合的 TTFT/TPOT MAPE 为 79.25%/86.67%，缓存压力为 73.01%/58.49%。该对照用于开发，采集介入与成本误差的归因及 6% 的正式留出验收在 M4 完成。S6–S7 累计 34 次、约 5,162 秒原生，使用了从暂缓 S8 调拨的四个尝试名额。[分块开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-score.json)
+
+## S9 冻结准备
+
+- 更新后的结构、自主评分入口通过具名开发检查。单卡 100、200 请求的执行生成分别用时 289.01、637.67 秒，双卡缓存压力 40 请求用时 43.95 秒。三组均完整输出声明的 token。[单卡测速](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/summary.json) · [双卡测速](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/multi-40/result.json)
+- 13 个留出输入已按正式预测入口装配。冻结成本覆盖新版训练图的 2,129,571 项工作，TP8 保留 640 项主机成本缺口，分块补充图保留 16,000 项范围外的主机工作。PD 三 rank 的同源对照通过 12,198 个动作和 59,177 项工作，独立成本也完成三请求的八个 token。[冻结清单](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/matrix.json) · [PD 结构回归](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-structure-audit/result.json)
+- M4 已结算 S9 的五次原生尝试，共 663.93 秒。S10 和 S11 共用冻结版本，计划各提交 13 次详细和轻量观测。固定图服务验证使用页边界、TP2 两项详细观测。[冻结环境与额度](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json)

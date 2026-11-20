@@ -469,3 +469,63 @@ EP4 新版两份四卡来源建库用时 625.00 秒，建库数据约 1.79 GiB�
 **验证** C++23 构建通过。分块混合和缓存正式来源分别覆盖 249,988、183,952 项工作。独立成本预测分别完成 13 请求、45 token 与 18 请求、27 token。分块的 16 个混合批、12 条分块请求对应原生，缓存有 20 次命中和一次淘汰。分块补充两次采样为 156.96、138.28 秒，S7 共 5 次、729.44 秒，两份最终来源后处理合计 370.12 秒。已核对镜像、源码、文档和产物引用，原始采集及必要失败保留。[分块成本](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-collection-costs/costs.json) · [缓存成本](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-ready-collection-costs/costs.json) · [混合批对照](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-mechanisms.json)
 
 **结论与限制** S7 开发验收成立。详细原生观测的评分偏差较大，分别保留两组评分和测量口径。40 请求压力的 288 token 淘汰叶超出当前同类释放样本。下一阶段从公开入口核对能力、速度、证据资格及冻结清单，正式泛化在冻结后评估。[分块开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/chunk-service-score.json) · [缓存开发评分](../../../data/20261119T090556.273460Z_project-delivery/work/s7-scheduling/prefix-pressure-score.json)
+
+## 2026-11-20 — S9 确认冻结准备基线
+
+**范围** 从已推送的 S7 交付提交 `9f924c1` 开始，盘点正式入口、镜像以及 M4 的 30 次原生、36,000 秒原生和 39,600 秒后处理额度。
+
+**改动** 为已验证的采集和无设备控制镜像恢复默认标签，对应镜像 ID 为 `5762869b8402` 和 `fc90d24fb399`。按相同文件层和环境安装历史确认实际 CANN 基础镜像 `717468ba134a`，恢复本机基础标签。
+
+**验证** 核对远端基线、默认 Compose 镜像、基础环境的 Torch、TorchNPU 和原生扩展实际版本。确认正式验证入口覆盖结构、固定图和自主评分，已有矩阵驱动主要服务结构验证。
+
+**结论与限制** 冻结准备已开始。冻结前需要按实际发布工作流复核近期的缓存、释放调用合同和旧来源的可用边界，确定留出资格、分配预算和测速口径。
+
+## 2026-11-20 — S9 核对两条验证入口与批次布局
+
+**范围** 用已有 Qwen3-8B TP2 分块混合开发案例核对正式入口，另按已知单卡测速来源计划重采两份原生观察。三次尝试耗时 404.98 秒，限额仍为 M4 的 30 次。
+
+**改动** 验证和自主预测共用模型、实例与请求的输入。结构入口从核对后的真实图生成端点布局，自主评分确认轻量实测的任务输入、交付及特化资格。新测速来源发现注意力页表切列后的布局条件尚未交给模型图。SDK 显示单请求 15 token 的页表视图省去了一次设备物化，另外五个 Prefill 均保留物化及提交。适配器以批次实际最长序列、模型批次行数和页宽推导该布局，来源与控制共用同一计算，并在模型子调用内选择变体。[SDK 任务对应](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-collection/speed-prefill-operations.json)
+
+**验证** 改动布局前，同源结构入口核对 422 个动作、28,070 项工作和 42,238 个端点。轻量实测和自主预测均输出 45 token，无窗口内特化，最大提交偏差 0.35 毫秒，TTFT/TPOT MAPE 为 11.88%/17.83%。仅改一条声明到达时刻即在启动预测前被识别。单卡来源首轮建库耗时 66.11 秒，停止于布局歧义，原始观察保留。[结构入口](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/chunk-structure/result.json) · [轻量评分](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/chunk-autonomous/result.json) · [建库结果](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-collection/status.json)
+
+**结论与限制** 双卡分块的结构结果复用同一原生观察，评分使用新轻量运行与开发请求。两者用于开发回归。单卡测速与留出资产资格待按新布局声明重建，优先沿用已保存的原生事实。
+
+## 2026-11-20 — S9 完成测速建库并选定留出输入
+
+**范围** 复用当轮原生记录，检查单卡测速来源的输入布局、分配分支及建库。留出输入在预测和目标采集前选定。
+
+**改动** 删除分页 Decode 的通用模板合并。原生尾页追加和申请新页共用数据端口，实际一批的设备工作数分别为 11–12 和 20–21。矩阵继续使用正式单例命令，新增同次详细服务的固定图入口及独立轻量实测入口。[分配分支证据](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-layout-collection/decode-page-operations.json)
+
+**验证** C++23 构建通过。使用本机代理所在的网络运行标准镜像构建，采集和控制 ID 为 `ec38718ef00e`、`72029f4987e0`，上游 SGLang 提交一致。两份单卡来源按现行声明建库通过，后处理耗时 88.34 秒。随后全节点开发回归核对 240 个动作、10,826 项工作和 16,011 个端点，复用同一原生观察。13 个留出目标通过输入合同检查；两个 Azure 窗口各 24 条，所选行分别为 22,043–22,066 和 62,403–62,426，与历史开发和留出窗口隔离。[建库状态](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-final-collection/status.json) · [单卡结构回归](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-local-structure/result.json) · [候选矩阵](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/inputs/holdout-candidates/matrix.json)
+
+**结论与限制** 26 次独立观察和五次冷复现的额度已登记。单卡 100、200 请求先后用给定耗时运行，均采用默认精简输出，分别用时 289.01、637.67 秒，完成 354.66、725.28 万个工作，分别保存 0.90、1.89 MB。200 请求比此前的 600 秒开发预算多约 38 秒。新旧图保留的工作数不同，历史秒数用作开发参考。留存多卡来源核对了 53 个 rank 记录，分页 Decode 的现场证据覆盖页尾追加，跨页申请新页另需对应来源。留出用例仍等待模板、成本和评价程序冻结。[单卡测速](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/summary.json) · [留存来源核查](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/inputs/retained-source-layout-audit.json)
+
+## 2026-11-20 — S9 核对双卡规模与当前成本资产
+
+**范围** 双卡缓存压力采用既有 40 请求开发输入。单卡独立成本复用来源域一致的 13 份历史训练样本，并在预算内按当前工作的需求采集主机服务。
+
+**改动** 从十份多卡原生记录中的同步设备到主机拷贝恢复索引宽度，用单独的派生输入离线重建。留存来源中的入参、实际复制及各派生文件可顺向核对。[派生来源索引](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/inputs/source-rebuilds/index.json)
+
+**验证** 双卡用给定耗时完成 40 请求、131 个 token 和 375,636 项工作，墙钟 43.95 秒，精简产物约 19 KB。该运行与来源后处理并行。TP1 两次主机采样累计 258.95 秒，后处理 52.15 秒，成本覆盖两份来源粗图的 110,363 项已知工作。新版成本驱动单卡 4 请求开发例完成 10,826 次成本查询，输出 6 个 token。M4 累计五次原生尝试、663.93 秒。[双卡结果](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/multi-40/result.json) · [TP1 成本覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/training-costs/tp1/costs.json) · [成本驱动预测](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/tp1-cost-prediction/result.json)
+
+**结论与限制** PD 来源的首个释放仅有 Cat 的类型转换，后续释放还执行 ConcatD。原生待排序列表从空开始，三次释放前分别有 0、2、4 页。当前释放模板收到索引类型与释放量，尚缺拼接目标的资源状态。按同一释放合同处理后才能冻结该域。[PD 原生设备操作](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/training-sources/pd/release-device-operations.json) · [释放队列依据](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/training-sources/pd/release-queue-evidence.json)
+
+## 2026-11-20 — S9 收口即时释放及多角色结构核验
+
+**范围** 复用非对称 PD 和其他训练来源的原始记录，核对释放执行体、验证器通信区间及新版图的测量资格。
+
+**改动** 资源服务在释放事务中返回目的列表原有状态，框架适配器把同一条件交给采集和预测的模板选择。验证器依据原生通信声明区分全组汇合与单向完成条件。旧训练记录的释放条件从实际资源记录恢复到派生输入，原始记录保留。[派生来源](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/inputs/release-sources/index.json) · [PD 状态依据](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/release-captures/pd/0/release-evidence.json)
+
+**验证** C++23 构建及采集、控制镜像重建通过。PD 三 rank 给定耗时完成三请求、八个 token。初次结构对照中，两 rank 的 CPU collective 被错误判为普通通信，保留原失败记录。修正后映射、因果和全节点结构通过，覆盖 12,198 个动作、59,177 项工作及 97,054 个已测边界，未测工作结束为零。新增原生尝试为零。[初次对照](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-structure/result.json) · [修正后对照](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-structure-audit/result.json) · [时间事实](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-structure-audit/timing/execution-inputs-report.json)
+
+**结论与限制** PD 结论用于同源开发回归。结构报告保留校准范围，独立目标仍等待冻结。训练成本按新版图的工作身份重新核对，分块来源主图已覆盖，其局部补充来源的部分 CPU 特征超出样本范围。[分块成本依据](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/final-costs/chunk/costs.json)
+
+## 2026-11-20 — S9 冻结交付验收资产
+
+**范围** 从 S7 交付提交 `9f924c1` 核对公开预测、原生采集、模板和资源交接、三个正式验证入口及外围矩阵。
+
+**改动** 一个请求组承接完整目标 workload 的声明到达时间，详细和轻量观测共用此提交口径。矩阵固定 13 个目标的部署、时间预算和证据职责。固定服务验证使用页边界和 TP2 两例，全部目标保留独立轻量观测责任。[冻结清单](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/matrix.json)
+
+**验证** 追踪源码调用和状态所有权，检查 C++23 构建、Python 语法、公开命令、镜像及冻结资产的原始依据。九组来源重建和实测成本复核耗时合计 3,712.03 秒，覆盖 2,129,571 项训练工作，新增原生尝试为零。PD 自主预测完成 48,244 项工作与八个 token。逐例装配 13 个目标并与 12 组可追溯训练请求的到达、长度和前缀组合核对，全部通过。[冻结环境](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json) · [PD 自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-costs/result.json)
+
+**结论与限制** 冻结资产用于 S10 和 S11。TP8 的主机成本缺口有 640 项，分块补充图有 16,000 项主机工作超出样本范围。合格范围和最终 6% 指标以独立结果为准。留出执行在推送阶段基线后开始。

@@ -269,7 +269,7 @@ SDK的任务编号及关联字段不是全局发生实例，编号复用不能�
 - instances：每项包含唯一 id、mode（null/prefill/decode）、configuration；配置字段与采集共用，包含拓扑、backend、页/容量及可选 chunk/mixed/prefix_cache。
 - workload：requests、可选 prefixes/ep_routes 和 id；不包含原生 batch 或完成时间。
 
-自主预测使用这三个字段，命令加 `--costs`。给定耗时模式在 JSON 增加 `given_work_ns`，单位为非负整数纳秒。实测结构对照沿用该四字段输入，命令加 `--execution-inputs`，实测条件按工作和端点进入执行。一个任务对应一个普通实例或一对 P/D 实例，微批次容量缺省时由原生调度器计算。
+自主预测和实测结构对照共用这三个字段，分别由 `--costs` 和 `--execution-inputs` 提供时间。给定耗时模式在 JSON 增加 `given_work_ns`，单位为非负整数纳秒。每次运行提交一种时间来源。一个任务对应一个普通实例或一对 P/D 实例，微批次容量缺省时由原生调度器计算。
 
 ```bash
 PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow predict \
@@ -280,7 +280,9 @@ PYTHONPATH=src/workflow:src/adapters:src/workload python3 -m markov_workflow pre
 
 --production 指定一份已由acquire-sources完整发布的来源集合。入口读取集合固定计划及生产索引，根据目标实施域和输入机会自动选完整来源及它的局部供体；未知输入仍由实际模板合同核对，不把规划机会标签变成额外支持门槛。模型专家数来自规划发布的元数据，纯预测不重新打开模型目录。模板路径必须位于各自生产目录内。主来源必须匹配模型/dtype及所有实例的backend、TP/PP/EP、页、缓存与chunk/mixed机制，再按worker_roles中的代表、parallel、kv_layout及expert_layers/kv_peers装配参与者；不匹配即拒绝，不从局部来源中另选完整任务。
 
-性能查询使用实际参与者的成本域、实例化的归一化工作及其参数。每个参与者独立绑定成本，同一结构代表可以由多 rank 共用。首个缺模型或超出样本范围的工作通过 `cost-gap.json` 报告。 模板选择的首个缺口通过 `template-gap.json` 记录实际动作和条件。预测完成后可用 `python3 -m markov_verification.latency_metrics --capture <轻量原生来源> --prediction <result.json> --output <报告.json>` 对照同一 workload 的逐请求误差和吞吐。
+性能查询使用实际参与者的成本域、实例化的归一化工作及其参数。每个参与者独立绑定成本，同一结构代表可以由多 rank 共用。首个缺模型或超出样本范围的工作由 `cost-gap.json` 报告，模板选择的首个缺口由 `template-gap.json` 记录。
+
+自主性能验证使用 `python3 -m markov_verification.autonomous --capture <轻量采集任务目录> --production <来源集合> --input <目标.json> --costs <成本资产> --binary <markov> --output <新目录> --timeout <秒>`。验证器先核对原生任务与目标的模型、配置及 workload，再检查轻量发布证据、提交次序及正式窗口的特化加载。相同目标输入和独立成本交给正式预测，产物保存逐请求和汇总误差。独立留出要在用例层另外固定与训练隔离的输入和来源。已有结果可用 `latency_metrics --prediction` 复核发布与指标，结论资格仅限两份结果的 token 对照。
 
 PD两端的worker必须来自同一主来源；局部来源即使实施域相同，也只能经既有合同导入批次动作或闭合内部实现，不能替换角色、资源或对端。用户不填写模板索引或逐worker环境；正式预测入口负责来源选择，示例不维护第二套装配规则。缺代表、重复代表或冲突环境直接报错，不扫描历史data、不选最新来源。worker可共用库，但资源和状态独立；同域匹配不表示任意参数范围已覆盖。
 
@@ -433,11 +435,11 @@ Event 返回 true 只说明完成不晚于查询返回，false 只说明完成�
 
 矩阵示例维护 `sources`、`targets` 和 `compare` 三个阶段。`sources` 规划、采集、生产并检查模板来源，`targets` 取得原生目标及其粗图，`compare` 每个案例调用一次正式结构验证入口。验证进程内复用核对后的目标参考。矩阵声明各域的 `exploration` 与 `deployment`，各目标的 `capture_input`、`prediction_input` 和 `configuration`，需要全节点对照时显式指定同目标 `layouts` 目录。`environment.json` 固定镜像及共享预算，同目录 `markov` 固定程序。建库只消费已声明来源。
 
-targets/compare先核对整个选中范围的capture/prediction是否使用相同model、instances和workload，目标以同一请求序列提交，不能夹入来源采集的多组idle屏障；已发布目标及显式observation还须与原生owner的完整输入一致。已有合格集合通过正式预测同一装配方法核对实际库和参与者，然后才启动第一个目标Engine或比较。模型身份沿正式引用合同，不因配置内容相同自动换路径。来源失败仍可单独取得目标事实，但未验证来源适用性不能记为预检通过。
+矩阵先核对整个选中范围的采集与预测是否使用相同的 model、instances 和 workload。每个目标以一个请求组按声明到达时间提交，组内保持同刻请求的声明顺序。已发布目标及显式 observation 仍须匹配原生任务的完整输入。已有合格来源集合通过正式预测装配核对实际库和参与者。来源不合格的案例仍可取得目标原生事实，并保留预测的资格缺口。
 
 代表 worker 的局部来源映射和共同校准须成立，整组原生资格单独记录。三阶段在 `results/<矩阵名>` 发布精简索引 `sources.json`、`targets.json` 和 `comparisons.json`，单案例验证输出位于 `cases/<案例名>`。有完整执行记录时检查 `execution.jsonl`，预测失败仍可用 `execution.partial.jsonl` 核对实际完成的前缀。完整结构结论由实际证据覆盖决定。
 
-调用形式为`python3 example/coarse_graph/matrix.py --root <运行根> --matrix <固定矩阵.json> --phase sources|targets|compare`。全调查共用预算锁和原生设备占用锁，CPU比较独立；已结束步骤不自动重试。普通失败与产物错误分别记录，执行状态不明时保留额度及进程身份并停止，检查真实进程后再恢复。工具代码不实现采集恢复、分配或模板规则，继续使用正式任务的唯一所有者。
+调用形式为 `python3 example/coarse_graph/matrix.py --root <运行根> --matrix <固定矩阵.json> --phase sources|targets|compare|fixed|autonomous`。`targets` 采集可供结构对照的真实图，声明 `detailed_capture: service-reference` 的用例同时供 `fixed` 使用。性能阶段读取域内的 `costs` 路径，`autonomous` 另取同一输入的轻量样本。全调查共用预算锁和原生设备占用锁，CPU 比较独立，已结束步骤不自动重试。普通失败与产物错误分别记录，执行状态不明时保留额度及进程身份并停止，检查真实进程后再恢复。采集、预测与验证由各自正式入口执行。
 
 输入准备使用`PYTHONPATH=src/workflow:src/adapters:src/collection:src/workload python3 example/coarse_graph/prepare_matrix.py --root <运行根> --specification <覆盖声明.json> --stage <阶段> --seed <冻结交付提交> --phase sources|targets`。覆盖声明保留配置、请求取值范围、固定来源探针及抽样方法；同域固定库先发布来源并取得终态，再生成目标请求，整批实际装配通过后才发布输入。跨域任务先生成用户输入，再交给来源规划。已发布文件只允许相同内容接续，不重新抽样替换。EP路由属于实验输入构造，仍经正式请求/路由合同检查，不在示例实现原生组批或图变换。
 
@@ -485,16 +487,16 @@ targets/compare先核对整个选中范围的capture/prediction是否使用相�
 | --- | --- | --- |
 | 真实时间下能否展开出同一执行 | `python3 -m markov_verification.structure` | 先确认参考材料、逐工作时间覆盖与消费，再找第一个动作、模板绑定、依赖或资源效果差异 |
 | 同一执行图上的成本是否合理 | `python3 -m markov_verification.fixed_graph` 调用 `markov work-costs` 和 `markov replay` | 先确认每项工作自身服务的测量资格，再核对实测基线、单元误差和影响输出的依赖链 |
-| 使用独立成本后实际结果如何 | `markov_workflow predict --costs`，用同口径原生输出评分 | 固定图基线通过后，看自主运行与固定图的第一处时序、控制或状态分歧 |
+| 使用独立成本后实际结果如何 | `python3 -m markov_verification.autonomous` 调用正式成本预测并对照轻量原生输出 | 固定图基线通过后，看自主运行与固定图的第一处时序、控制或状态分歧 |
 
 按请求、逻辑进度、动作和实际角色关联工作。先核对原生运行、初态、输入、参考依赖及测量资格，再比较从同一初态生成的结果。优先离线读取已确认可复用的原生观察，模型及模板资产仍与独立目标隔离。`actions_matched` 只代表报告所列结构检查通过，发布整例结论时还需核对 `condition_inputs` 的实际工作与端点覆盖、未消费输入和校准。单图入口目前不提供整次 serving 的真实图核验、成本身份映射、输出指标评分或误差归因。
 
-单案例结构入口在能调度建模和控制容器的 Python 环境中调用。`--reference` 指目标原生图的生产目录，`--production` 指预测使用的模板来源集合。完整端点对照传入由 `markov action-layouts` 产生的各 rank 布局目录。
+单案例结构入口在能调度建模和控制容器的 Python 环境中调用。`--reference` 指目标原生图的生产目录，`--production` 指预测使用的模板来源集合。验证器从已核对的真实图生成各 rank 的动作布局并提取实测条件，随后记录参考核验、时间提取、预测及结构比较各自的墙钟。
 
 ```bash
 PYTHONPATH=src/verification:src/workflow:src/collection:src/adapters:src/workload \
   python3 -m markov_verification.structure \
-  --capture <原生采集目录> --reference <真实图生产目录> --layouts <布局目录> \
+  --capture <原生采集目录> --reference <真实图生产目录> \
   --production <模板来源集合目录> --input <结构预测输入> \
   --binary <Docker构建的markov> --output <验证输出目录> --timeout 180
 ```
