@@ -529,3 +529,95 @@ EP4 新版两份四卡来源建库用时 625.00 秒，建库数据约 1.79 GiB�
 **验证** 追踪源码调用和状态所有权，检查 C++23 构建、Python 语法、公开命令、镜像及冻结资产的原始依据。九组来源重建和实测成本复核耗时合计 3,712.03 秒，覆盖 2,129,571 项训练工作，新增原生尝试为零。PD 自主预测完成 48,244 项工作与八个 token。逐例装配 13 个目标并与 12 组可追溯训练请求的到达、长度和前缀组合核对，全部通过。[冻结环境](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json) · [PD 自主预测](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-costs/result.json)
 
 **结论与限制** 冻结资产用于 S10 和 S11。TP8 的主机成本缺口有 640 项，分块补充图有 16,000 项主机工作超出样本范围。合格范围和最终 6% 指标以独立结果为准。留出执行在推送阶段基线后开始。
+
+## 2026-11-20 — S10 启动独立结构矩阵
+
+**范围** 从已推送并核对远端的 `0de58e8` 开始，在同一代码、镜像和训练资产上检查九个来源域及 13 个留出目标。
+
+**改动** 启动来源证据核验和独立目标详细采集，复用冻结的工作矩阵及单案例验证器。结构对照在取得目标粗图后运行。
+
+**验证** 确认冻结二进制与已构建产物一致，八卡在启动前无业务进程。单卡来源核验和 Azure 常态并发 4 的首个详细目标已进入实际运行。[冻结环境](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json) · [采集步骤](../../../data/20261119T090556.273460Z_project-delivery/logs/independent/m4-independent/azure-normal-c4/capture.step.json)
+
+**结论与限制** S10 已进入独立取证，还没有结构对照结论。执行期间固定评价器和所有训练资产，失败及受限案例按冻结清单收齐后统一分析。
+
+## 2026-11-20 — S10 完成冻结来源核验
+
+**范围** 对冻结的九个来源域检查图与原生证据的映射及时间兼容性，以发布的来源报告为结构对照前提。
+
+**改动** 用矩阵已有的逐域入口排队评价。每个域收齐目标结果后即可对照，和其余域的原生采集重叠。用户运行示例补齐必填的单任务时限参数。
+
+**验证** 15 份训练观察的 55 个 rank 均通过图映射和时间兼容性核验。13 份观察的跨 rank 证据一致，两份 TP8 旧观察缺少资源状态历史。来源核验累计用时 1,047.93 秒。[来源核验](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/sources.json)
+
+**结论与限制** 九个来源域均可用于结构对照。TP8 的资源结论以单独详采的留出目标为依据。首个 Azure 目标的详细采集用时 704.71 秒，参考图正在生产。[首个目标采集](../../../data/20261119T090556.273460Z_project-delivery/targets/m4-independent/azure-normal-c4/native/result.json)
+
+## 2026-11-20 — S10 定位任务号回绕处的提交归属失败
+
+**范围** 使用首个 Azure 常态、并发 4 目标的原始详采与已导出 SDK 文件，定位参考图生产的首个错误。
+
+**改动** 写出失败处的原生 API、两次驱动提交、SDK 任务顺序和设备原始回绕记录。原案例沿冻结矩阵记录为参考图生产失败，后续目标继续采集。
+
+**验证** stream 128 的层内复制为第 0 批任务 65,534。下一条是第 1 批任务 0 的占位命令，与原始 `TS_TASK_FLIP` 的 stream、任务号和批次相符。原生 `Node@launch` 内两次 `halSqTaskSend` 各提交一个 SQE，SDK 有一项连接到该 API 的业务工作。冻结解释器提前滤掉了回绕记账命令，随后的提交归属检查要求唯一候选，因而停止。首例诊断耗时 367.48 秒。[失败日志](../../../data/20261119T090556.273460Z_project-delivery/targets/m4-independent/azure-normal-c4/structure/logs/002-0-interpret.log) · [驱动记录](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-normal-c4-driver-release.json) · [回绕依据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-normal-c4-task-flip.json)
+
+常态并发 8 在 stream 178 出现同一检查错误。从两条出错 stream 的留存记录直接查到 16 处同形回绕，11 处在 `Node@launch`，5 处在事件记录。每处都出现两次各一个 SQE 的提交，对应一项业务命令和一项原始回绕标记。相邻业务的驱动提交均落在该组两个提交之外，组前后的原生顺序可用同一份证据核对。两次定向扫描合计约 74 秒，继续复用原始采集。[两组回绕证据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-normal-rollover-cohorts.json)
+
+两个突发用例也停在同一检查。对应两条出错 stream 的 14 处回绕均找到同形记录。四个目标共核对 30 处回绕，其中 19 处在算子启动，11 处在事件记录。突发记录的离线扫描耗时约 34 秒。[突发回绕证据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-burst-rollover-cohorts.json)
+
+**结论与限制** 四个 Azure 用例均在参考图生产阶段停止。修复应先用物理队列顺序、SQE 数和回绕标记确定提交归属，再投影业务工作。其结果由业务提交边和同步前沿共用，独立核验从原始记录复核对应关系。修复待冻结结果汇总后处理，其他目标的影响范围仍待确认。
+
+## 2026-11-20 — S10 核对真实流量的原生调度覆盖
+
+**范围** 复核四个 Azure 留出目标的请求提交、原生组批和 token 发布。
+
+**改动** 从已发布原始记录汇总每个用例的提交偏差、实测批次成员数与输出覆盖，供后续结构诊断和配置对照使用。
+
+**验证** 四例共 96 条请求和 11,752 个输出 token，逐请求输出数与冻结输入一致。常态与突发的到达跨度分别为约 901 和 636 毫秒，实际提交相对声明的最大延迟为 1.10 毫秒。每例 Decode 批次均达到配置的并发上限。离线汇总耗时约 76 秒。[原生调度覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-native-coverage.json)
+
+**结论与限制** 真实流量的原生输入和并发压力已确认。四例参考图生产均报告提交归属错误。独立运行时延和配置排名由 S11 的轻量观测核对。
+
+## 2026-11-20 — S10 完成页边界与 TP2 独立结构对照
+
+**范围** 检查页宽 16 下长度 15、16、17 的独立请求及 TP2 双 rank 用例，覆盖 Prefill 批次、页尾追加、新页分配和集合通信。
+
+**改动** 矩阵从冻结来源展开预测，使用新目标的同轮详采核对结构和时钟。两例的 CPU 活动同时供后续固定图服务验证使用。
+
+**验证** 原生采集和参考图生产分别用时 131.18、20.46 秒。全节点对照通过 238 个动作、13,004 项工作与 19,198 个端点，工作结束边界均有实测依据。已保留 5,427 个校准区间，全部实测条件完成消费。[结构对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-p16-boundaries/result.json) · [时间覆盖](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-p16-boundaries/timing/execution-inputs-report.json)
+
+TP2 的原生采集和参考图生产分别用时 135.81、58.65 秒。全节点对照通过 476 个动作、53,226 项工作和 79,786 个端点，独立参考核对了 444 次集合通信，未测工作结束为零。[TP2 结构对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp2/result.json) · [TP2 时间覆盖](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp2/timing/execution-inputs-report.json)
+
+**结论与限制** 两例均取得独立全节点结构结果。TP8 与其余拓扑待验收，固定图服务替换和自主预测精度由 S11 核对。
+
+## 2026-11-20 — S10 完成 TP8 对照并记录 PP3 验证异常
+
+**范围** 用冻结 TP8 来源展开八个 rank，核对单独详采目标的全节点、通信及资源状态，随后完成 PP3 对照。
+
+**验证** TP8 通过 1,200 个动作、151,128 项工作和 225,992 个实测端点的对照。八个 rank 共记录 112 项资源操作及 40 处绑定，未测工作结束为零。原生采集用时 143.73 秒，结构验证用时 324.33 秒。[TP8 对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp8/result.json) · [TP8 时间覆盖](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp8/timing/execution-inputs-report.json)
+
+**结论与限制** PP3 已生成原生参考图，提取 21,695 项工作的时长依据，随后在对照消费实测条件时触发 rank 1 的服务时长一致性错误，首个区间为 `9265..9266`。保留异常，待冻结结果汇总后与其他失败一起归因。[PP3 验证日志](../../../data/20261119T090556.273460Z_project-delivery/logs/independent/m4-independent/mistral-pp3/verify.step.log) · [矩阵结论](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/comparisons.json)
+
+## 2026-11-20 — 识别两个 PP 用例的首次预测中断
+
+**范围** 并排检查 PP3、TP2×PP3 的原生端点、时间输入、模拟前缀及对照报错。
+
+**证据** 两例首个中断均在 `Work.wait`。等待的设备入口是无实测时刻的资源顺序点，其唯一流前驱早于同一 rank 的上一次 CPU 返回。时间输入直接把前驱时刻作为入口点值，比仿真实际提交分别早 954,270 和 911,769 纳秒，核心拒绝在过去创建事件。两例随后被对照器报时长变化的设备区间都尚未执行。仅用已完成端点重建时钟，分别得到 16,899 和 1,059 纳秒，较输入各差一纳秒，证明第二个错误来自有限校时条件下的重选。离线复核约 48 秒。[两例输入与校时证据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/pp-wait-conditions.json)
+
+**结论与限制** 保留两例冻结结果。纯逻辑端点应根据调用提交和真实前驱推进。对照应区分已声明的条件、实际完成的端点与尚待执行的区间，保持独立校时及覆盖核验，再检查修复后完整 PP 结构是否对齐。
+
+## 2026-11-20 — 确认非对称 PD 的 Decode 分配模板缺口
+
+**证据** 仿真与留出参考配对检查了 6,545 个动作，随后停止在 `alloc_for_decode` 的 `eviction` 至返回片段。两个 Decode rank 的冻结来源均只有单请求的 `decode_tail`，各有五次。留出目标的双请求分支在每个 Decode rank 上均比单请求少一项主机工作、一项设备工作，源与目标的模板条件分别要求单 token 和多 token。这个差异来自原生工作，可解释正确守卫为何拒绝用单请求图预测两请求。[预测结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-p1-d2/result.json) · [形状分组与工作计数](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/pd-decode-family.json)
+
+**结论与限制** 待冻结结果汇总后，从代表来源选择和适配模板职责检查多成员分配覆盖。保留实际分支和独立目标隔离，进一步差异留待可展开后核对。
+
+## 2026-11-20 — 核对 EP4 和分块混合的留出机制
+
+**证据** EP4 四个 rank 均实际执行 240 次专家计算、240 次 dispatch 和 240 次 combine。全节点对照通过 934 个动作、276,114 项工作及 414,744 个端点。分块混合的两个 rank 都观察到 11 条分块请求和 13 个混合批。其仿真配对检查到 1,995 个动作，随后缺少两成员的纯 Decode `run_batch`。每 rank 的主样本与补充样本分别只有七次和一次单成员纯 Decode，留出记录另有两次双成员调用。[EP4 对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen30moe-ep4/result.json) · [原生机制覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/native-mechanism-coverage.json) · [分块模板覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/chunk-decode-family.json)
+
+**结论与限制** 分块来源资格把各阶段的 `model_members` 合并计数，多请求 Prefill 或混合批即可满足多成员条件。与 PD 缺口合并审查代表采集，按实际动作与阶段核对有结构意义的特征分支。冻结结果保留待统一修复和复验。
+
+## 2026-11-20 — 收口 S10 首轮冻结矩阵
+
+**证据** 前缀缓存通过 1,950 个动作、116,368 项工作与 174,892 个端点的对照，每个 rank 实测 24 次非空匹配和一次 672 token 淘汰。13 个目标均完成详采并产生结论。其中五例通过全节点结构对照，覆盖 4,798 个动作、609,840 项工作和 914,612 个实测端点，均为独立原生观察。[缓存结构对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-prefix-pressure/result.json) · [首轮结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/comparisons.json)
+
+**审查与交接** 沿采集解释、时间旁路、模板装配及独立评价核对职责和失败证据。确认 S9 冻结源码和三镜像，核对 13 份目标与 15 份模板来源、126 个样本文件的隔离。窗口目录保留原始观察和诊断，实占约 43 GiB。矩阵计费为 13 次原生、3,717.76 秒原生及 6,562.21 秒后处理，另有约 10 分钟离线归因。操作说明补齐示例时限和已具轻量采集证据的拓扑。S11 在同一快照上先做页边界、TP2 固定图，再完成 13 项自主预测观测。[冻结环境](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json) · [原生任务结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/targets.json)
+
+**结论与限制** Azure 四例停在运行时任务回绕的参考图生产，两个 PP 用例停在纯逻辑等待的时间条件，PD 和分块混合停在多成员 Decode 的模板覆盖。三条职责链在 S11 冻结证据齐备后集中修复，保留本轮结论并对受影响范围取得新的独立证据。

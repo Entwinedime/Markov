@@ -1,6 +1,6 @@
 # Markov 项目交付总窗口状态
 
-更新日期为 2026-11-20。**S0–S7 已验收并推送。S9 已冻结验收资产，S10 从冻结提交开始核对独立执行结构。**
+更新日期为 2026-11-20。**S0–S7 已验收并推送。S9 已冻结验收资产并推送 `0de58e8`，S10 独立结构验收正在运行。**
 
 ## 进入窗口时已有证据
 
@@ -16,7 +16,7 @@
 | M1 多角色计时 | S1–S3 | 已验收，TP2 与非对称 PD 均完成开发闭环 |
 | M2 配置集探索 | S4–S5 | 已验收，冷资产创建与换请求后复用均完成 |
 | M3 正式支持范围 | S6–S7 | 开发验收完成。代表单机并行、分块、混合组批、前缀命中和淘汰均能用独立成本完成具名请求 |
-| M4 独立验收与交付 | S9–S12 | S9 已冻结九组训练来源与成本和 13 个留出用例。S10 验收结构，S11 验收性能，S12 复现及交付 |
+| M4 独立验收与交付 | S9–S12 | S9 已交付，S10 首轮冻结矩阵已收齐，五例通过全节点结构对照，八例保留阻断。下一步是 S11 固定图及自主性能验收，之后统一修复并复验受影响范围，再进行 S12 复现与交付 |
 
 ## 基线、当前能力与下一步
 
@@ -54,3 +54,13 @@ S5 正式入口用两个单卡池容量与两组短请求完成四项自主预�
 - 更新后的结构、自主评分入口通过具名开发检查。单卡 100、200 请求的执行生成分别用时 289.01、637.67 秒，双卡缓存压力 40 请求用时 43.95 秒。三组均完整输出声明的 token。[单卡测速](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/summary.json) · [双卡测速](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/speed-results/multi-40/result.json)
 - 13 个留出输入已按正式预测入口装配。冻结成本覆盖新版训练图的 2,129,571 项工作，TP8 保留 640 项主机成本缺口，分块补充图保留 16,000 项范围外的主机工作。PD 三 rank 的同源对照通过 12,198 个动作和 59,177 项工作，独立成本也完成三请求的八个 token。[冻结清单](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/matrix.json) · [PD 结构回归](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/pd-release-structure-audit/result.json)
 - M4 已结算 S9 的五次原生尝试，共 663.93 秒。S10 和 S11 共用冻结版本，计划各提交 13 次详细和轻量观测。固定图服务验证使用页边界、TP2 两项详细观测。[冻结环境与额度](../../../data/20261119T090556.273460Z_project-delivery/work/s9-freeze/frozen/environment.json)
+
+## S10 独立结构验收
+
+- 九个来源域均已取得结构对照的来源资格。15 份观察覆盖 55 个 rank，图映射和时钟兼容性均通过。TP8 旧来源缺少的资源状态历史由留出目标独立取得。[来源核验](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/sources.json)
+- 四个 Azure 目标均完成详采，96 条请求的 11,752 个输出 token 全部对应，实际 Decode 批次达到每例的并发上限。四例参考图均停在同一提交归属检查，留存记录中的 30 处任务号回绕覆盖算子启动和事件记录。[原生调度覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-native-coverage.json) · [常态回绕](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-normal-rollover-cohorts.json) · [突发回绕](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/azure-burst-rollover-cohorts.json)
+- 页边界、TP2、TP8 均通过独立全节点结构对照，分别覆盖 238、476、1,200 个动作。TP8 独立目标在八个 rank 上记录了资源状态，核对 151,128 项工作，全部工作结束状态均有实测依据。页边界、TP2 的同轮 CPU 活动供 S11 固定图服务验收。[页边界对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-p16-boundaries/result.json) · [TP2 对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp2/result.json) · [TP8 对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-tp8/result.json)
+- PP3 和 TP2×PP3 参考图均已生成。两例都在时间旁路把纯逻辑等待端点固定到调用提交之前时停止预测。对照器随后基于已完成端点重新校时，误报未执行的设备工作时长发生变化。[等待端点与时钟证据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/pp-wait-conditions.json)
+- 非对称 PD 推进至两个请求合并 Decode，在原生 KV 分配中遇到冻结来源缺少的多成员模板。同一分配分支在两个 Decode rank 上均有另一种工作结构。[PD 结果](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-p1-d2/result.json) · [模板覆盖依据](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/pd-decode-family.json)
+- 分块混合实测 13 个混合批次。留出仿真在转入两请求的纯 Decode 时停止，主来源和互补来源的这一动作都只覆盖了单请求。EP4 和前缀缓存均通过全节点结构对照，分别覆盖 934 和 1,950 个动作。前缀缓存每个 rank 观察到 24 次命中和一次 672 token 的淘汰。[分块目标](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-chunk-mixed/result.json) · [EP4 对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen30moe-ep4/result.json) · [缓存对照](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/cases/qwen8-prefix-pressure/result.json) · [原生机制覆盖](../../../data/20261119T090556.273460Z_project-delivery/work/s10-diagnostics/native-mechanism-coverage.json)
+- 13 例均完成原生详采并取得首轮结论。五例共核对 4,798 个动作、609,840 项工作和 914,612 个实测端点。六例停在参考图或时间旁路，两例停在模板缺口。矩阵计费为 13 次原生、3,717.76 秒原生及 6,562.21 秒后处理，离线归因约 10 分钟。S11 保留 13 次轻量观测额度，固定图先使用页边界和 TP2 的同轮服务证据。[矩阵产出](../../../data/20261119T090556.273460Z_project-delivery/results/m4-independent/comparisons.json)
